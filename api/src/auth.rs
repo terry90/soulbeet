@@ -251,8 +251,9 @@ impl SsoLinkResult {
 pub struct SignInMethods {
     /// Name of the OpenID Connect provider, when single sign-on is set up
     pub sso_provider: Option<String>,
-    /// The account is linked to an identity at the provider
-    pub sso_linked: bool,
+    /// The provider's name for the identity the account is linked to, when
+    /// it is linked
+    pub sso_name: Option<String>,
     /// The account keeps a way in without the provider, so its owner may
     /// unlink it
     pub sso_unlink_allowed: bool,

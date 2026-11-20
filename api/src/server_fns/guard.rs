@@ -167,6 +167,7 @@ mod tests {
             credentials_version,
             oidc_issuer: None,
             oidc_subject: None,
+            oidc_username: None,
         }
     }
 

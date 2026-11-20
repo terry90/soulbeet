@@ -45,7 +45,7 @@ pub async fn get_sign_in_methods() -> Result<SignInMethods, ServerFnError> {
     let navidrome = CONFIG.navidrome_url().is_some();
     Ok(SignInMethods {
         sso_provider: CONFIG.oidc().map(|oidc| oidc.provider_name.clone()),
-        sso_linked: user.oidc_subject.is_some(),
+        sso_name: user.oidc_username.clone(),
         sso_unlink_allowed: keeps_a_way_in(&user, navidrome),
         navidrome,
     })
@@ -199,7 +199,7 @@ mod tests {
 
         // An account with its own password.
         let ann = User::create_in(&db, "ann", "pw").await.unwrap();
-        User::link_oidc_identity_in(&db, &ann.id, "https://id.example.com", "sub-ann")
+        User::link_oidc_identity_in(&db, &ann.id, "https://id.example.com", "sub-ann", "ann")
             .await
             .unwrap();
         unlink_sso_in(&db, &ctx(&ann), &ann.id, false)

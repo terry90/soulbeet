@@ -17,14 +17,15 @@ use crate::{FieldLook, TextInput};
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
 const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
 
-/// How an account signs in, when it is not just with a password.
-fn sign_in_tags(user: &UserSummary) -> Vec<&'static str> {
+/// How an account signs in, when it is not just with a password: the
+/// provider's name for its single sign-on identity, and a missing password.
+fn sign_in_tags(user: &UserSummary) -> Vec<String> {
     let mut tags = Vec::new();
-    if user.sso_linked {
-        tags.push("single sign-on");
+    if let Some(name) = &user.sso_name {
+        tags.push(format!("single sign-on: {name}"));
     }
     if !user.has_password {
-        tags.push("no password");
+        tags.push("no password".to_string());
     }
     tags
 }
@@ -337,7 +338,7 @@ pub fn UserManager() -> Element {
                                     },
                                     "Password"
                                   }
-                                  if user.sso_linked {
+                                  if user.sso_name.is_some() {
                                     button {
                                       class: LINK_BUTTON_CLASS,
                                       onclick: move |_| handle_unlink_sso(id_unlink.clone()),
@@ -366,23 +367,26 @@ pub fn UserManager() -> Element {
 mod tests {
     use super::*;
 
-    fn summary(has_password: bool, sso_linked: bool) -> UserSummary {
+    fn summary(has_password: bool, sso_name: Option<&str>) -> UserSummary {
         UserSummary {
             id: "u".into(),
             username: "ann".into(),
             role: Role::User,
             has_password,
-            sso_linked,
+            sso_name: sso_name.map(str::to_string),
         }
     }
 
     #[test]
-    fn the_list_tags_single_sign_on_and_missing_passwords() {
-        assert!(sign_in_tags(&summary(true, false)).is_empty());
-        assert_eq!(sign_in_tags(&summary(true, true)), ["single sign-on"]);
+    fn the_list_tags_the_linked_identity_and_missing_passwords() {
+        assert!(sign_in_tags(&summary(true, None)).is_empty());
         assert_eq!(
-            sign_in_tags(&summary(false, true)),
-            ["single sign-on", "no password"]
+            sign_in_tags(&summary(true, Some("ann@id"))),
+            ["single sign-on: ann@id"]
+        );
+        assert_eq!(
+            sign_in_tags(&summary(false, Some("ann@id"))),
+            ["single sign-on: ann@id", "no password"]
         );
     }
 }

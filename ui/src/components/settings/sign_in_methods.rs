@@ -70,20 +70,20 @@ pub(super) fn SingleSignOnSection(
         }
     };
 
-    if !methods.sso_linked && methods.sso_provider.is_none() {
+    if methods.sso_name.is_none() && methods.sso_provider.is_none() {
         return rsx! {};
     }
     let provider = methods
         .sso_provider
         .clone()
-        .unwrap_or_else(|| "single sign-on".to_string());
+        .unwrap_or_else(|| "the single sign-on provider".to_string());
 
     rsx! {
       div { class: "mt-6",
         label { class: LABEL_CLASS, "Single sign-on" }
         Messages { error: error(), success: success() }
-        if methods.sso_linked {
-          p { class: NOTE_CLASS, "This account signs in with {provider}." }
+        if let Some(name) = methods.sso_name.clone() {
+          p { class: NOTE_CLASS, "Linked to {name} at {provider}." }
           if methods.sso_unlink_allowed {
             button { class: "retro-btn mt-2 rounded", onclick: unlink, "Unlink" }
           } else {
@@ -204,11 +204,12 @@ mod tests {
     #[test]
     fn a_linked_account_unlinks_only_when_it_keeps_a_way_in() {
         let linked = SignInMethods {
-            sso_linked: true,
+            sso_name: Some("ann@id".into()),
             ..offered()
         };
         let html = render(linked.clone(), None);
-        assert!(html.contains("signs in with Pocket ID"), "{html}");
+        // The identity the provider vouched for, so the user can check it.
+        assert!(html.contains("Linked to ann@id at Pocket ID."), "{html}");
         assert!(
             html.contains("first set a password or connect Navidrome"),
             "{html}"
@@ -271,7 +272,7 @@ mod tests {
             "{html}"
         );
         let linked = SignInMethods {
-            sso_linked: true,
+            sso_name: Some("ann@id".into()),
             ..offered()
         };
         let html = render(linked, Some(SsoLinkResult::Linked));

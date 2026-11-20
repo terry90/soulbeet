@@ -64,8 +64,14 @@ pub(super) async fn link_from_session(
             SsoLinkResult::IdentityTaken
         });
     }
-    match User::link_oidc_identity_in(db, user_id, &identity.issuer, &identity.subject)
-        .await
+    match User::link_oidc_identity_in(
+        db,
+        user_id,
+        &identity.issuer,
+        &identity.subject,
+        &identity.username,
+    )
+    .await
         .map_err(failed)?
     {
         OidcLink::Linked => {}
@@ -169,11 +175,26 @@ async fn find_or_create_account(
     };
 
     match choose_account(by_identity, same_name, config) {
-        Account::Linked(user) => Ok(user),
+        Account::Linked(mut user) => {
+            // Shown in Settings: the name the provider gives it now.
+            if user.oidc_username.as_deref() != Some(identity.username.as_str()) {
+                User::note_oidc_username_in(db, &user.id, &identity.username)
+                    .await
+                    .map_err(db_error)?;
+                user.oidc_username = Some(identity.username.clone());
+            }
+            Ok(user)
+        }
         Account::Unlinked(user) => {
-            match User::link_oidc_identity_in(db, &user.id, &identity.issuer, &identity.subject)
-                .await
-                .map_err(db_error)?
+            match User::link_oidc_identity_in(
+                db,
+                &user.id,
+                &identity.issuer,
+                &identity.subject,
+                &identity.username,
+            )
+            .await
+            .map_err(db_error)?
             {
                 OidcLink::Linked => {}
                 // Linked by a concurrent sign-in in the meantime.
@@ -266,10 +287,17 @@ mod tests {
         let db = test_db::migrated().await;
         let created = sign_in(&db, "sub-a", "alice").await.unwrap();
         assert!(!created.has_password());
-        // Renamed at the provider: still the same account.
+        assert_eq!(created.oidc_username.as_deref(), Some("alice"));
+        // Renamed at the provider: still the same account, which shows the
+        // identity's new name.
         let again = sign_in(&db, "sub-a", "alice-renamed").await.unwrap();
         assert_eq!(again.id, created.id);
         assert_eq!(again.username, "alice");
+        assert_eq!(again.oidc_username.as_deref(), Some("alice-renamed"));
+        assert_eq!(
+            reread(&db, &again).await.oidc_username.as_deref(),
+            Some("alice-renamed")
+        );
     }
 
     #[tokio::test]
@@ -402,6 +430,7 @@ mod tests {
             .unwrap();
         assert_eq!(linked.id, local.id);
         assert_eq!(linked.oidc_subject.as_deref(), Some("sub-a"));
+        assert_eq!(linked.oidc_username.as_deref(), Some("Alice"));
         // Linking ends the sessions the account had, so whoever held the
         // name before is signed out.
         assert_eq!(linked.credentials_version, local.credentials_version + 1);
@@ -466,6 +495,8 @@ mod tests {
         assert_eq!(linked.id, ann.id);
         assert_eq!(linked.oidc_issuer.as_deref(), Some(ISSUER));
         assert_eq!(linked.oidc_subject.as_deref(), Some("sub-ann"));
+        // Shown in Settings, so the user sees which identity they linked.
+        assert_eq!(linked.oidc_username.as_deref(), Some("ann-at-the-provider"));
         assert!(linked.password_matches("pw"));
         // Every session of the account ended; this browser gets a new one.
         assert_eq!(linked.credentials_version, ann.credentials_version + 1);
