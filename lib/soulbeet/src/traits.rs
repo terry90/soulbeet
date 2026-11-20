@@ -544,7 +544,6 @@ pub trait MusicBrainzLookup: Send + Sync {
 pub struct GeneratorOutput {
     pub candidates: CandidateSet,
     pub signals: Vec<SignalReport>,
-    pub mbid_failures: usize,
     pub errors: SourceErrors,
 }
 

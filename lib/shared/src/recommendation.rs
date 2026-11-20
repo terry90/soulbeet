@@ -458,8 +458,6 @@ pub struct PipelineReport {
     pub name: String,
     pub signals: Vec<SignalReport>,
     pub total_candidates: usize,
-    #[serde(default)]
-    pub mbid_failures: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -563,12 +561,6 @@ impl EngineReport {
                 "\n--- {} ({} candidates) ---\n",
                 pr.name, pr.total_candidates
             ));
-            if pr.mbid_failures > 0 {
-                out.push_str(&format!(
-                    "  MBID resolution failures: {}\n",
-                    pr.mbid_failures
-                ));
-            }
             for sig in &pr.signals {
                 out.push_str(&format!(
                     "  {} -> {} candidates",

@@ -123,7 +123,6 @@ impl CandidateGenerator for DeezerGenerator {
         GeneratorOutput {
             candidates,
             signals,
-            mbid_failures: 0,
             errors,
         }
     }

@@ -165,7 +165,6 @@ pub async fn recommend(
             name: name.to_string(),
             signals: output.signals,
             total_candidates: output.candidates.len(),
-            mbid_failures: output.mbid_failures,
         });
         if !output.candidates.is_empty() {
             report.sources.push(generator.label().to_string());
@@ -307,7 +306,6 @@ pub(crate) struct Resolver<'a> {
     knowledge: &'a dyn MusicKnowledge,
     answers: HashMap<String, Option<String>>,
     failed: HashSet<String>,
-    pub(crate) failures: usize,
 }
 
 impl<'a> Resolver<'a> {
@@ -316,7 +314,6 @@ impl<'a> Resolver<'a> {
             knowledge,
             answers: HashMap::new(),
             failed: HashSet::new(),
-            failures: 0,
         }
     }
 
@@ -344,7 +341,6 @@ impl<'a> Resolver<'a> {
             }
             // A failed lookup is not "no such artist"; it is only skipped for this run.
             Err(e) => {
-                self.failures += 1;
                 errors.record(e.service(), &e);
                 self.failed.insert(key);
             }

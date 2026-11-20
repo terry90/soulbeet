@@ -41,7 +41,6 @@ pub struct ProfileBuild {
     /// The histories whose plays or stars made it into the profile.
     pub sources: Vec<String>,
     pub errors: SourceErrors,
-    pub mbid_failures: usize,
 }
 
 /// Builds one profile per history, in the order given, and merges those with
@@ -85,7 +84,6 @@ pub async fn build_profile(
         build.sources.push(history.name().to_string());
     }
     build.profile.known = known;
-    build.mbid_failures = resolver.failures;
     build
 }
 
@@ -640,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unresolvable_artist_is_counted_not_fatal() {
+    async fn an_unresolvable_artist_is_reported_not_fatal() {
         let listenbrainz = FakeHistory {
             name: "ListenBrainz",
             top_artists: vec![played("Static Harbor", None, 4)],
@@ -657,7 +655,6 @@ mod tests {
             b.profile.seed_artists[0].artist,
             artist("Static Harbor", None)
         );
-        assert_eq!(b.mbid_failures, 1);
         let errors = b.errors.into_vec();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].source, "ListenBrainz Labs");

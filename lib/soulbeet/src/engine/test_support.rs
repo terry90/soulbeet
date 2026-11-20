@@ -289,7 +289,6 @@ impl CandidateGenerator for FixedGenerator {
         GeneratorOutput {
             candidates,
             signals: Vec::new(),
-            mbid_failures: 0,
             errors: self.errors.clone(),
         }
     }

@@ -152,7 +152,6 @@ impl CandidateGenerator for ListenBrainzAccountGenerator {
         GeneratorOutput {
             candidates,
             signals,
-            mbid_failures: 0,
             errors,
         }
     }

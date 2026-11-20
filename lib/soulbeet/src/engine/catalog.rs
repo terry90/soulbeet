@@ -83,7 +83,6 @@ impl CandidateGenerator for CatalogGenerator {
         GeneratorOutput {
             candidates,
             signals,
-            mbid_failures: 0,
             errors: run.errors,
         }
     }
