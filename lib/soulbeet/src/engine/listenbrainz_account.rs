@@ -21,8 +21,6 @@ const NAME: &str = "listenbrainz_account";
 const WEIGHT: f64 = 0.2;
 const SIMILAR_USERS: usize = 10;
 const RECORDINGS_PER_USER: usize = 50;
-/// ln(0) is undefined, so a recording without listens still weighs a little.
-const NO_LISTENS_WEIGHT: f64 = 0.1;
 /// Troi orders a playlist best first, so scores fall from 1.0 toward 0.5 along it.
 const TROI_DECAY: f64 = 0.5;
 
@@ -64,10 +62,8 @@ impl ListenBrainzAccountGenerator {
                 }
             };
             for rec in recordings {
-                let listens = match rec.listen_count {
-                    0 => NO_LISTENS_WEIGHT,
-                    n => (n as f64).ln(),
-                };
+                // ln(1 + n) so one listen still counts and more listens always count more.
+                let listens = (rec.listen_count as f64).ln_1p();
                 let track = TrackRef {
                     artist: ArtistRef {
                         name: rec.artist_name,
@@ -259,7 +255,7 @@ mod tests {
         assert!(!candidates.contains_key(&CandidateSet::key("TM Juke", "Just for a Day (Sunday)")));
         let moving = &candidates[&CandidateSet::key("Pretty Lights", "Finally Moving")];
         // Both similar users play it, so both their shares count.
-        let expected = (0.5391550135659047 + 0.3320996942266951) * 227f64.ln();
+        let expected = (0.5391550135659047 + 0.3320996942266951) * 227f64.ln_1p();
         assert!((moving.score - expected).abs() < 1e-9, "{}", moving.score);
         assert_eq!(moving.signals, ["lb_collab_filter"]);
         assert_eq!(moving.source, "listenbrainz_account");
@@ -278,6 +274,25 @@ mod tests {
             .collect();
         assert_eq!(signals, [("lb_collab_filter", 1), ("lb_troi", 3)]);
         assert!(out.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recording_played_once_still_scores_by_similarity() {
+        let once = TOP_RECORDINGS.replace("\"listen_count\": 227", "\"listen_count\": 1");
+        let (out, _) = run(
+            vec![
+                ok(SIMILAR_USERS),
+                ok(&once),
+                ok(r#"{"payload":{"recordings":[]}}"#),
+                ok(r#"{"playlist_count":0,"playlists":[]}"#),
+            ],
+            &UserMusicProfile::default(),
+        )
+        .await;
+        let moving =
+            &out.candidates.candidates[&CandidateSet::key("Pretty Lights", "Finally Moving")];
+        let expected = 0.5391550135659047 * 2f64.ln();
+        assert!((moving.score - expected).abs() < 1e-9, "{}", moving.score);
     }
 
     #[tokio::test]
