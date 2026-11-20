@@ -17,8 +17,8 @@ use ui::{
 };
 use views::{
     leave_login, DashboardPage, LoginErrorPage, LoginErrorReturnPage, LoginPage, LoginReturnPage,
-    ReturnTo, SearchPage,
-    SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice, SsoLinkResultPage,
+    ReturnTo, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice,
+    SsoLinkResultPage,
 };
 
 mod auth;
@@ -536,6 +536,14 @@ mod tests {
             other => panic!("not the error page with a request: {other:?}"),
         }
         assert_eq!(route.to_string(), sent);
+
+        // A crafted error address cannot send the browser off the
+        // authorize path once signed in.
+        let crafted = SsoError::Failed.location(Some("//evil.example/oauth/authorize"));
+        match crafted.parse::<Route>().unwrap() {
+            Route::LoginErrorReturnPage { return_to, .. } => assert_eq!(return_to.accepted(), None),
+            other => panic!("not the error page with a request: {other:?}"),
+        }
 
         // Without one, the error page keeps its bare address.
         let sent = SsoError::Denied.location(None);

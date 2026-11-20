@@ -603,8 +603,10 @@ mod oidc_tests {
         assert!(parse(&vars).unwrap_err().contains("OIDC_ISSUER_URL"));
         vars[0].1 = "ftp://id.example.com";
         assert!(parse(&vars).unwrap_err().contains("OIDC_ISSUER_URL"));
-        let err = parse(&with_redirect("soulbeet.example.com/api/auth/oidc/callback"))
-            .unwrap_err();
+        let err = parse(&with_redirect(
+            "soulbeet.example.com/api/auth/oidc/callback",
+        ))
+        .unwrap_err();
         assert!(err.contains("OIDC_REDIRECT_URL"), "{err}");
     }
 
@@ -636,9 +638,8 @@ mod oidc_tests {
 
     #[test]
     fn auto_register_follows_registration_unless_set() {
-        let auto = |vars: &[(&str, &str)], mode| {
-            parse_with(vars, mode).unwrap().unwrap().auto_register
-        };
+        let auto =
+            |vars: &[(&str, &str)], mode| parse_with(vars, mode).unwrap().unwrap().auto_register;
         // Only open registration lets anyone the provider accepts in. In
         // navidrome mode only Navidrome users get accounts.
         assert!(auto(&REQUIRED, RegistrationMode::Open));

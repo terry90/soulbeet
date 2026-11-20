@@ -1868,7 +1868,10 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     fn the_callback_is_at_the_address_the_sign_in_starts_at() {
         // A LAN address, a name behind a proxy that says https, a bare name.
         for (pairs, callback) in [
-            (&[("host", "192.168.1.5:9765")][..], "http://192.168.1.5:9765"),
+            (
+                &[("host", "192.168.1.5:9765")][..],
+                "http://192.168.1.5:9765",
+            ),
             (
                 &[
                     ("host", "soulful:9765"),
@@ -1878,7 +1881,10 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
                 ][..],
                 "https://music.example.com",
             ),
-            (&[("host", "music.example.com")][..], "https://music.example.com"),
+            (
+                &[("host", "music.example.com")][..],
+                "https://music.example.com",
+            ),
         ] {
             let start = start(pairs);
             assert_eq!(
@@ -1895,7 +1901,10 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         // derives https. The button's form post carries the browser's Origin,
         // as a password login does.
         let start = start(&[("host", "nas:9765"), ("origin", "http://nas:9765")]);
-        assert_eq!(start.redirect_uri(), "http://nas:9765/api/auth/oidc/callback");
+        assert_eq!(
+            start.redirect_uri(),
+            "http://nas:9765/api/auth/oidc/callback"
+        );
         let flow = new_flow(Purpose::SignIn { return_to: None }, &start);
         // The flow cookie and the session cookie the callback sets from the
         // flow are not Secure, so the browser on http keeps them.
@@ -1924,11 +1933,7 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
     #[test]
     fn a_pinned_address_is_the_callback() {
         let lan = [("host", "192.168.1.5:9765")];
-        let callback = |pin, public_url| {
-            start_with(&lan, pin, public_url)
-                .unwrap()
-                .redirect_uri()
-        };
+        let callback = |pin, public_url| start_with(&lan, pin, public_url).unwrap().redirect_uri();
         assert_eq!(
             callback(None, Some("https://music.example.com")),
             "https://music.example.com/api/auth/oidc/callback"
@@ -1981,14 +1986,26 @@ MC4CAQAwBQYDK2VwBCIEIB+2XiVDwrLs+fb3j6GY6K1Ltn7QqMeBcNI5DUjMxJ9e
         // scheme), or without an Origin, as the redirect there does.
         let pinned = Some("https://music.example.com");
         for pairs in [
-            &[("host", "music.example.com"), ("origin", "https://music.example.com")][..],
-            &[("host", "music.example.com"), ("origin", "http://music.example.com")][..],
+            &[
+                ("host", "music.example.com"),
+                ("origin", "https://music.example.com"),
+            ][..],
+            &[
+                ("host", "music.example.com"),
+                ("origin", "http://music.example.com"),
+            ][..],
             &[("host", "soulful:9765")][..],
         ] {
-            assert!(!start_with(pairs, None, pinned).unwrap().elsewhere, "{pairs:?}");
+            assert!(
+                !start_with(pairs, None, pinned).unwrap().elsewhere,
+                "{pairs:?}"
+            );
         }
         // Without a pin, the callback is wherever the request came from.
-        let proxied = [("host", "soulful:9765"), ("origin", "https://music.example.com")];
+        let proxied = [
+            ("host", "soulful:9765"),
+            ("origin", "https://music.example.com"),
+        ];
         assert!(!start_with(&proxied, None, None).unwrap().elsewhere);
     }
 
