@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
+use tracing::info;
 
 use crate::polite::RemoteError;
 use crate::traits::KnowledgeCache;
@@ -113,16 +114,22 @@ where
     Ok(value)
 }
 
-/// The value stored under `key`; a value that does not parse is a cache error.
+/// The value stored under `key`. A value that does not parse reads as a
+/// miss: the cached types can change shape between releases, and the fresh
+/// answer then replaces the old entry.
 pub(crate) async fn read<T: DeserializeOwned>(
     cache: &dyn KnowledgeCache,
     key: &str,
 ) -> Result<Option<T>, KnowledgeError> {
-    match cache.get(key).await? {
-        Some(stored) => serde_json::from_str(&stored)
-            .map(Some)
-            .map_err(|e| CacheError(format!("unreadable cache entry {key}: {e}")).into()),
-        None => Ok(None),
+    let Some(stored) = cache.get(key).await? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&stored) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => {
+            info!("Cache entry {key} no longer reads, fetching it again: {e}");
+            Ok(None)
+        }
     }
 }
 
@@ -174,11 +181,11 @@ impl KnowledgeCache for MemoryCache {
             .map(|(_, v, _)| v.clone()))
     }
 
+    // Replaces the key's entry, as the SQLite cache does.
     async fn put(&self, key: &str, value: &str, ttl: Duration) -> Result<(), CacheError> {
-        self.0
-            .lock()
-            .unwrap()
-            .push((key.to_string(), value.to_string(), ttl));
+        let mut entries = self.0.lock().unwrap();
+        entries.retain(|(k, _, _)| k != key);
+        entries.push((key.to_string(), value.to_string(), ttl));
         Ok(())
     }
 }
@@ -195,6 +202,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn an_entry_of_an_older_shape_is_fetched_again_and_replaced() {
+        let cache = MemoryCache::default();
+        cache.put_now("kc1:t", r#"{"tracks":[1]}"#);
+        let got: Vec<u8> = cached(&cache, "kc1:t", TTL_TAG_TRACKS, async { Ok(vec![3]) })
+            .await
+            .unwrap();
+        assert_eq!(got, vec![3]);
+        assert_eq!(cache.get("kc1:t").await.unwrap().as_deref(), Some("[3]"));
     }
 
     #[tokio::test]
