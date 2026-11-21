@@ -79,6 +79,10 @@ pub struct AuthResponse {
     /// False while `NAVIDROME_URL` is set: usernames follow Navidrome.
     #[serde(default)]
     pub rename_allowed: bool,
+    /// The account still has the default password, so the session can do
+    /// nothing but choose a new one.
+    #[serde(default)]
+    pub password_change_required: bool,
 }
 
 /// Starts an OpenID Connect sign-in (a full page navigation, not a fetch).

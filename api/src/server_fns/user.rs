@@ -1,7 +1,8 @@
 #[cfg(feature = "server")]
 use super::{
     auth::{
-        prove_password_in, start_session, try_navidrome_auth, NavidromeAuthResult, SessionCookie,
+        name_taken_by_account, prove_password_in, start_session, try_navidrome_auth,
+        NavidromeAuthResult, SessionCookie,
     },
     failure_error, forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
@@ -13,7 +14,7 @@ use crate::{
     config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
     services::evict_navidrome_client,
-    AdminSession, AuthSession,
+    AdminSession, AuthSession, PasswordChangeSession,
 };
 #[cfg(feature = "server")]
 use axum::http::{HeaderMap, Uri};
@@ -53,9 +54,11 @@ pub async fn create_user(
         return Err(refusal_error("Username and password are required"));
     }
     check_username_length(&username)?;
-    User::create(&username, &password)
+    let user = User::create(&username, &password)
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(&user.username);
+    Ok(user)
 }
 
 #[post("/api/users/username", auth: AuthSession)]
@@ -71,7 +74,9 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     check_username_length(new_username.trim())?;
     models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(new_username.trim());
+    Ok(())
 }
 
 /// Refusals a person can act on are shown; database failures are not.
@@ -97,8 +102,9 @@ pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnEr
 /// the signed-in person's, as linking single sign-on does: a session left
 /// open is not enough to give someone a password to the account. An account
 /// with no password gets one from an admin. Keeps the account's single
-/// sign-on link and ends its sessions. `navidrome` asks Navidrome about the
-/// name it is given, as `prove_password_in` does.
+/// sign-on link and ends its sessions. The seeded admin cannot keep the
+/// default password. `navidrome` asks Navidrome about the name it is given,
+/// as `prove_password_in` does.
 #[cfg(feature = "server")]
 pub(crate) async fn change_password_in<F>(
     db: &sqlx::SqlitePool,
@@ -114,6 +120,11 @@ where
 {
     if password.is_empty() {
         return Err(refusal_error("Password cannot be empty"));
+    }
+    if crate::security::is_default_password(&user.id, password) {
+        return Err(refusal_error(
+            "Choose a password other than the default one.",
+        ));
     }
     prove_password_in(
         limiter,
@@ -131,8 +142,9 @@ where
 }
 
 /// Changes the signed-in user's password. The change ends every session of
-/// the account; this one is renewed.
-#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+/// the account; this one is renewed. The one thing a session still on the
+/// default password can do.
+#[post("/api/users/password", auth: PasswordChangeSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn change_password(
     current_password: String,
     password: String,
@@ -383,6 +395,41 @@ mod tests {
         .await
         .unwrap();
         assert!(reread(&db, &navi).await.password_matches("own"));
+    }
+
+    #[tokio::test]
+    async fn the_seeded_admin_cannot_keep_the_default_password() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let admin = User::find_by_id_in(&db, crate::security::SEEDED_ADMIN_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = change(
+            &db,
+            &limiter,
+            &admin,
+            "admin",
+            "admin",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await;
+        assert_eq!(code(refused), REFUSAL_CODE);
+        assert_eq!(
+            reread(&db, &admin).await.credentials_version,
+            admin.credentials_version
+        );
+        change(
+            &db,
+            &limiter,
+            &admin,
+            "admin",
+            "chosen",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(reread(&db, &admin).await.password_matches("chosen"));
     }
 
     #[tokio::test]

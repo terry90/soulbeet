@@ -424,6 +424,7 @@ mod tests {
                         navidrome_status: status,
                         role: Default::default(),
                         rename_allowed: false,
+                        password_change_required: false,
                     })
                 });
                 use_context_provider(|| crate::auth::Auth::new(signed_in));

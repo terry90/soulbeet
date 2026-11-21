@@ -9,12 +9,25 @@ import { dirname, join } from 'node:path';
 import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { audioFileName, type PeerShare } from '../fixtures/dataset.js';
-import { e2eRoot, mcpMusicDirForApp, musicDirForApp, musicDirOnHost, slskdApiKey } from './env.js';
+import {
+  appAdminPassword,
+  e2eRoot,
+  mcpMusicDirForApp,
+  musicDirForApp,
+  musicDirOnHost,
+  slskdApiKey,
+} from './env.js';
 
 export interface TestUser {
   username: string;
   password: string;
 }
+
+/** The seeded admin with the shipped password, which signs in only to choose a new one. */
+export const shippedAdmin: TestUser = { username: 'admin', password: 'admin' };
+
+/** The seeded admin once setup.app.ts chose its password. */
+export const admin: TestUser = { username: 'admin', password: appAdminPassword };
 
 export function uniqueUser(prefix = 'user'): TestUser {
   return {
@@ -54,6 +67,16 @@ export async function changePassword(
     data: { current_password: current, password },
   });
   expect(response.ok(), `change password: ${response.status()}`).toBeTruthy();
+}
+
+/**
+ * Signs `context` in to the seeded admin with the shipped password, then
+ * chooses `password`, as the first sign-in of a fresh install does. The
+ * context keeps the session the change renews.
+ */
+export async function chooseAdminPassword(context: BrowserContext, password: string): Promise<void> {
+  await loginViaApi(context, shippedAdmin);
+  await changePassword(context, shippedAdmin.password, password);
 }
 
 /**

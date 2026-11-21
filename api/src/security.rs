@@ -1,4 +1,6 @@
-//! Conditions that keep the MCP endpoint closed until the instance is safe to expose.
+//! Conditions that keep the MCP endpoint closed until the instance is safe to expose,
+//! and the seeded admin's default password, which also holds its sessions to
+//! choosing a new one.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +37,10 @@ pub struct SecurityStatus {
 #[cfg(feature = "server")]
 pub const SEEDED_ADMIN_ID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// The password the migration gives the seeded admin.
+#[cfg(feature = "server")]
+const DEFAULT_PASSWORD: &str = "admin";
+
 /// True until the startup check or a password change proves otherwise, so an
 /// unchecked state blocks.
 #[cfg(feature = "server")]
@@ -60,6 +66,25 @@ pub fn gate_reasons() -> Vec<GateReason> {
 #[cfg(feature = "server")]
 fn seeded_admin_has_default_password() -> bool {
     SEEDED_ADMIN_HAS_DEFAULT_PASSWORD.load(Ordering::Relaxed)
+}
+
+/// Whether a session of `user_id` may do nothing but set a new password:
+/// the seeded admin's, while it still has the default one. Never hashes.
+#[cfg(feature = "server")]
+pub fn password_change_required(user_id: &str) -> bool {
+    password_change_required_from(user_id, seeded_admin_has_default_password())
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn password_change_required_from(user_id: &str, default_admin_password: bool) -> bool {
+    default_admin_password && user_id == SEEDED_ADMIN_ID
+}
+
+/// Whether setting `password` on `user_id` would leave the seeded admin with
+/// the default password.
+#[cfg(feature = "server")]
+pub fn is_default_password(user_id: &str, password: &str) -> bool {
+    user_id == SEEDED_ADMIN_ID && password == DEFAULT_PASSWORD
 }
 
 #[cfg(feature = "server")]
@@ -88,7 +113,11 @@ pub(crate) fn seeded_hash_is_default(hash: &str) -> bool {
         Argon2,
     };
     PasswordHash::new(hash)
-        .map(|parsed| Argon2::default().verify_password(b"admin", &parsed).is_ok())
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(DEFAULT_PASSWORD.as_bytes(), &parsed)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -112,7 +141,10 @@ pub async fn check_seeded_admin() {
 #[cfg(feature = "server")]
 pub fn note_password_set(user_id: &str, new_password: &str) {
     if user_id == SEEDED_ADMIN_ID {
-        SEEDED_ADMIN_HAS_DEFAULT_PASSWORD.store(new_password == "admin", Ordering::Relaxed);
+        SEEDED_ADMIN_HAS_DEFAULT_PASSWORD.store(
+            is_default_password(user_id, new_password),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -162,5 +194,19 @@ mod tests {
         assert!(!seeded_admin_has_default_password());
         note_password_set("someone-else", "admin");
         assert!(!seeded_admin_has_default_password());
+    }
+
+    #[test]
+    fn only_the_seeded_admin_with_the_default_password_must_choose_one() {
+        assert!(password_change_required_from(SEEDED_ADMIN_ID, true));
+        assert!(!password_change_required_from(SEEDED_ADMIN_ID, false));
+        assert!(!password_change_required_from("someone-else", true));
+    }
+
+    #[test]
+    fn the_default_password_is_the_seeded_admins_only() {
+        assert!(is_default_password(SEEDED_ADMIN_ID, "admin"));
+        assert!(!is_default_password(SEEDED_ADMIN_ID, "Admin"));
+        assert!(!is_default_password("someone-else", "admin"));
     }
 }

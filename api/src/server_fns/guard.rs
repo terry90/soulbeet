@@ -16,6 +16,11 @@ pub struct AuthSession(pub UserCtx);
 /// A signed-in user whose row has the admin role.
 pub struct AdminSession(pub UserCtx);
 
+/// A signed-in user, also one whose session may do nothing but set a new
+/// password (`security::password_change_required`). Only reading who is
+/// signed in and changing the password take it.
+pub struct PasswordChangeSession(pub UserCtx);
+
 #[cfg(feature = "server")]
 pub const SESSION_GONE: &str = "Session ended: the account no longer exists";
 #[cfg(feature = "server")]
@@ -24,6 +29,9 @@ pub const SESSION_STALE: &str = "Session ended: sign in again";
 pub const SESSION_SIGNED_OUT: &str = "Session ended: signed out";
 #[cfg(feature = "server")]
 pub const ADMIN_ONLY: &str = "Only an admin can do this";
+#[cfg(feature = "server")]
+pub const PASSWORD_CHANGE_REQUIRED: &str =
+    "This account still has the default password. Choose a new one first.";
 
 /// The session a token's claims give, given the user's current row. A token
 /// issued before the row's last credential change no longer counts.
@@ -52,7 +60,22 @@ pub(crate) fn require_admin(ctx: UserCtx) -> Result<UserCtx, (StatusCode, String
     }
 }
 
-/// Verifies the auth cookie's token and builds the session from the user's row.
+/// Refuses the session of an account that must set a new password first,
+/// which `change_required` tells from the account's id.
+#[cfg(feature = "server")]
+pub(crate) fn require_password_set(
+    ctx: UserCtx,
+    change_required: impl Fn(&str) -> bool,
+) -> Result<UserCtx, (StatusCode, String)> {
+    if change_required(&ctx.user_id) {
+        Err((StatusCode::FORBIDDEN, PASSWORD_CHANGE_REQUIRED.to_string()))
+    } else {
+        Ok(ctx)
+    }
+}
+
+/// Verifies the auth cookie's token and builds the session from the user's
+/// row. A session that may only set a new password is refused.
 #[cfg(feature = "server")]
 pub(crate) async fn load_session(
     token: Option<&str>,
@@ -68,6 +91,19 @@ pub(crate) async fn load_session(
 /// the credentials version and the session it names still stand.
 #[cfg(feature = "server")]
 pub(crate) async fn load_session_claims(
+    token: Option<&str>,
+    db: &SqlitePool,
+    key: &SecretKey,
+) -> Result<(UserCtx, Claims), (StatusCode, String)> {
+    let (ctx, claims) = load_any_session_claims(token, db, key).await?;
+    let ctx = require_password_set(ctx, crate::security::password_change_required)?;
+    Ok((ctx, claims))
+}
+
+/// `load_session_claims`, also for a session that may only set a new
+/// password.
+#[cfg(feature = "server")]
+pub(crate) async fn load_any_session_claims(
     token: Option<&str>,
     db: &SqlitePool,
     key: &SecretKey,
@@ -100,6 +136,25 @@ pub(crate) async fn load_session_claims(
     Ok((ctx, claims))
 }
 
+/// The token of the request's auth cookie.
+#[cfg(feature = "server")]
+fn session_token(
+    parts: &axum::http::request::Parts,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let cookies = parts
+        .extensions
+        .get::<tower_cookies::Cookies>()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                String::from("Missing cookie middleware"),
+            )
+        })?;
+    Ok(cookies
+        .get(crate::AUTH_COOKIE_NAME)
+        .map(|c| c.value().to_string()))
+}
+
 #[cfg(feature = "server")]
 impl<S> FromRequestParts<S> for AuthSession
 where
@@ -111,23 +166,28 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let cookies = parts
-            .extensions
-            .get::<tower_cookies::Cookies>()
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    String::from("Missing cookie middleware"),
-                )
-            })?;
-
-        let token = cookies
-            .get(crate::AUTH_COOKIE_NAME)
-            .map(|c| c.value().to_string());
-
+        let token = session_token(parts)?;
         load_session(token.as_deref(), &DB, crate::secret_key::current())
             .await
             .map(AuthSession)
+    }
+}
+
+#[cfg(feature = "server")]
+impl<S> FromRequestParts<S> for PasswordChangeSession
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let token = session_token(parts)?;
+        load_any_session_claims(token.as_deref(), &DB, crate::secret_key::current())
+            .await
+            .map(|(ctx, _)| PasswordChangeSession(ctx))
     }
 }
 
@@ -321,10 +381,22 @@ mod tests {
     #[tokio::test]
     async fn an_admin_cookie_passes() {
         let db = db_with_user().await;
-        let ctx = load(Some(&create_token(SEEDED_ADMIN_ID, 0).unwrap()), &db)
+        let token = create_token(SEEDED_ADMIN_ID, 0).unwrap();
+        let (ctx, _) = load_any_session_claims(Some(&token), &db, &key())
             .await
             .unwrap();
         assert_eq!(require_admin(ctx).unwrap().role, Role::Admin);
+    }
+
+    #[test]
+    fn a_session_that_must_set_a_password_does_nothing_else() {
+        let held = require_password_set(ctx(Role::Admin), |id| id == "id-a").unwrap_err();
+        assert_eq!(
+            held,
+            (StatusCode::FORBIDDEN, PASSWORD_CHANGE_REQUIRED.to_string())
+        );
+        let other = require_password_set(ctx(Role::Admin), |id| id == "id-b").unwrap();
+        assert_eq!(other, ctx(Role::Admin));
     }
 
     #[tokio::test]
@@ -354,7 +426,9 @@ mod tests {
         for placeholder in ["secret", "a_secret_key", "change-me-in-production"] {
             let set = SecretKey::new(placeholder.into());
             let forged = create_token_with(&set, SEEDED_ADMIN_ID, 0).unwrap();
-            assert!(load_session(Some(&forged), &db, &set).await.is_ok());
+            assert!(load_any_session_claims(Some(&forged), &db, &set)
+                .await
+                .is_ok());
 
             let in_use =
                 crate::secret_key::resolve(Some(placeholder), dir.path(), "sqlite:soulbeet.db")
