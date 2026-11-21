@@ -443,15 +443,19 @@ fn DiscoveryTrackList() -> Element {
         tracks.restart();
     };
 
-    // A failed Drop puts the track back to pending, so the reload keeps its
-    // row, now with the reason under it.
+    // A failed Drop leaves the file in place, so the row stays as it is with
+    // its reason under it. A reload could move it to history, where the
+    // reason is not shown: the server may leave the track Removing.
     let handle_remove = move |track_id: String| async move {
         let req = api::TrackActionRequest {
             track_id: track_id.clone(),
         };
         let outcome = api::remove_discovery_track(req).await;
+        let dropped = outcome.is_ok();
         note_outcome(&mut action_errors.write(), track_id, outcome);
-        tracks.restart();
+        if dropped {
+            tracks.restart();
+        }
     };
 
     // Split into active (pending) and history (promoted/removed)
