@@ -325,7 +325,7 @@ pub(crate) fn native_songs(songs: &[(&str, bool)]) -> String {
 
 /// The rules of Soulful's discovery playlist for the Balanced profile, as Navidrome writes them
 /// back (`create_smart_playlist`, lib/soulbeet/src/navidrome/client.rs).
-pub(crate) const DISCOVERY_RULES: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Balanced"}}],"sort":"-dateAdded","order":"desc"}"#;
+pub(crate) const DISCOVERY_RULES: &str = r#"{"all":[{"is":{"library_id":1}},{"startsWith":{"filepath":"alice/Discovery/Balanced/"}}],"sort":"-dateAdded","order":"desc"}"#;
 
 /// alice's native `GET /api/playlist/{id}` record as Navidrome 0.64.2 writes model.Playlist
 /// (model/playlist.go:18-41): `song_count` rows, synced from a playlist file when `sync`, smart
