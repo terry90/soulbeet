@@ -135,14 +135,15 @@ jobs:
           echo "tags=$SUFFIXED_TAGS" >> $GITHUB_OUTPUT
           echo "Generated tags: $SUFFIXED_TAGS"
 
-      - name: Build and push platform-specific
+      # Pushed by digest only, with no tag: the per-arch tags are applied
+      # after the smoke test passes, so a broken image never moves a tag.
+      - name: Build and push platform-specific by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.platform-tags.outputs.tags }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           labels: ${{ needs.metadata.outputs.labels }}
           build-args: |
             TIER=${{ matrix.tier }}
@@ -153,10 +154,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.platform }}-${{ matrix.tier }}
 
       # Per-tier smoke test on both arches: each job runs on a native runner
-      # of its platform, and wheels and native libs differ per arch. Only
-      # when the build was actually pushed (PR builds skip push, so there is
-      # nothing to pull). A failure stops the merge job, so no multi-arch tag
-      # points at an image that failed it.
+      # of its platform, and wheels and native libs differ per arch. The
+      # image under test is pushed untagged and only tagged once this passes.
+      # PR builds push nothing, so there is nothing to pull.
       - name: Smoke test built image (push events only)
         if: github.event_name != 'pull_request'
         shell: bash
@@ -222,6 +222,20 @@ jobs:
               echo "full tier smoke OK"
               ;;
           esac
+
+      # --prefer-index=false copies the tested digest as is, so each tag
+      # points at exactly the image the smoke test ran. The merge job reads
+      # these tags, so it only ever composes tested images.
+      - name: Tag the tested image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -e
+          IFS=',' read -ra tags <<<"${{ steps.platform-tags.outputs.tags }}"
+          args=()
+          for t in "${tags[@]}"; do args+=(-t "$t"); done
+          docker buildx imagetools create --prefer-index=false "${args[@]}" \
+            "${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
 
   merge:
     needs: [metadata, build]
