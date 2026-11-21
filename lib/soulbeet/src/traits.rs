@@ -68,11 +68,6 @@ pub trait DownloadBackend: Send + Sync {
     /// backend's full list grows with its whole history, and every caller
     /// here is waiting on a specific batch (#78). This is the polling path.
     async fn get_downloads_for(&self, sources: &[String]) -> Result<Vec<DownloadProgress>>;
-
-    /// Every transfer the backend holds. Only for the case that genuinely
-    /// needs peers outside the batch: adopting a file retried from a source
-    /// nobody is tracking.
-    async fn get_downloads(&self) -> Result<Vec<DownloadProgress>>;
     /// The transfer `source` holds under `id`, as `get_downloads_for` reads it; None when the backend no longer has it.
     async fn get_download(&self, source: &str, id: &str) -> Result<Option<DownloadProgress>>;
     async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;

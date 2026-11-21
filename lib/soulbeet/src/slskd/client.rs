@@ -698,18 +698,6 @@ impl SoulseekClient {
             .copied()
     }
 
-    /// Every transfer slskd holds, across every peer.
-    ///
-    /// Unbounded on slskd's side, so this is reserved for the one case that
-    /// needs it: spotting a file retried from a peer this batch never asked.
-    /// Routine polling uses `get_downloads_for_users`.
-    pub async fn get_all_downloads(&self) -> Result<Vec<FileEntry>> {
-        let flattened: FlattenedFiles = self
-            .make_request(Method::GET, "transfers/downloads", None::<()>)
-            .await?;
-        Self::usable_files(flattened.files, flattened.errors)
-    }
-
     /// Report entries that failed to parse rather than dropping them: a
     /// silent skip is indistinguishable from "no downloads in progress",
     /// which is how the 0.26 schema drift went unnoticed (#73). Only a
@@ -1386,15 +1374,6 @@ impl crate::DownloadBackend for SoulseekClient {
     ) -> Result<Vec<shared::download::DownloadProgress>> {
         let limit = self.retry_limit().await?;
         let entries = self.get_downloads_for_users(sources).await?;
-        Ok(entries
-            .into_iter()
-            .map(|e| e.into_progress(limit))
-            .collect())
-    }
-
-    async fn get_downloads(&self) -> Result<Vec<shared::download::DownloadProgress>> {
-        let limit = self.retry_limit().await?;
-        let entries = self.get_all_downloads().await?;
         Ok(entries
             .into_iter()
             .map(|e| e.into_progress(limit))

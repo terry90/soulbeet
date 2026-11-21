@@ -267,7 +267,7 @@ impl StubBackend {
         self.presence_asked.lock().unwrap().clone()
     }
 
-    /// What `get_downloads_for` (filtered by peer) and `get_downloads` return.
+    /// What `get_downloads_for` returns, filtered by peer.
     pub fn set_listing(&self, listing: Vec<DownloadProgress>) {
         *self.listing.lock().unwrap() = listing;
     }
@@ -430,9 +430,6 @@ impl DownloadBackend for StubBackend {
             .filter(|t| sources.contains(&t.source))
             .cloned()
             .collect())
-    }
-    async fn get_downloads(&self) -> SoulResult<Vec<DownloadProgress>> {
-        Ok(self.listing.lock().unwrap().clone())
     }
     async fn get_download(&self, source: &str, id: &str) -> SoulResult<Option<DownloadProgress>> {
         Ok(self
