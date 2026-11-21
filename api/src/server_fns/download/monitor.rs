@@ -1775,6 +1775,53 @@ pub(crate) async fn cancel_abandoned(
     }
 }
 
+/// How long `await_ended` waits for slskd to end transfers it was told to
+/// cancel. A cancel of a live transfer only fires its token
+/// (`DownloadService.cs:998-1007`); the record turns Cancelled later, when
+/// the download task's catch fails it (`:1546-1550`, `:1045-1068`).
+pub(crate) const CANCEL_SETTLE: Duration = Duration::from_secs(10);
+
+/// Wait, for at most `CANCEL_SETTLE`, until slskd lists every one of
+/// `transfers` as ended or no longer lists it. slskd removes only a record
+/// that ended (`DownloadService.cs:977-981`), so `remove_ended_transfers`
+/// right after a cancel would miss the transfers it was meant for.
+pub(crate) async fn await_ended(
+    backend: &Arc<dyn DownloadBackend>,
+    transfers: &[(String, String)],
+) {
+    let peers = peers_of(transfers);
+    let deadline = Instant::now() + CANCEL_SETTLE;
+    loop {
+        // A listing that fails is asked again on the next tick.
+        if let Ok(downloads) = backend.get_downloads_for(&peers).await {
+            if transfers.iter().all(|(peer, id)| {
+                transfer_by_id(&downloads, peer, id).is_none_or(|dl| is_terminal_state(&dl.state))
+            }) {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "slskd had not ended every cancelled transfer after {:?}",
+                CANCEL_SETTLE
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The peers of `transfers`, each once.
+fn peers_of(transfers: &[(String, String)]) -> Vec<String> {
+    let mut peers: Vec<String> = Vec::new();
+    for (peer, _) in transfers {
+        if !peers.contains(peer) {
+            peers.push(peer.clone());
+        }
+    }
+    peers
+}
+
 /// Remove the records of `transfers`, the `(peer, transfer id)` pairs a
 /// watcher is done with, that ended without a file, and return the listing
 /// they were read from, or `None` when slskd could not list them.
@@ -1788,13 +1835,7 @@ pub(crate) async fn remove_ended_transfers(
     backend: &Arc<dyn DownloadBackend>,
     transfers: &[(String, String)],
 ) -> Option<Vec<DownloadProgress>> {
-    let mut peers: Vec<String> = Vec::new();
-    for (peer, _) in transfers {
-        if !peers.contains(peer) {
-            peers.push(peer.clone());
-        }
-    }
-    let downloads = match backend.get_downloads_for(&peers).await {
+    let downloads = match backend.get_downloads_for(&peers_of(transfers)).await {
         Ok(d) => d,
         Err(e) => {
             warn!("Could not list downloads for batch cleanup: {}", e);
