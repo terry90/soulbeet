@@ -18,11 +18,11 @@ use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
 use crate::core::library::library_roots_in;
-use crate::core::settings::{Setting, PROMOTE_THRESHOLDS};
+use crate::core::settings::Setting;
 use crate::core::time;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
-use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+use crate::models::user_settings::{UpdateUserSettings, UserSettings, PROMOTE_THRESHOLDS};
 
 /// The settings document (D14): what is saved, never a key or token.
 pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<String, Value> {
@@ -513,7 +513,7 @@ mod tests {
     }
 
     use crate::connection::test_util::{call_tool, document, mcp_app};
-    use crate::core::settings::{LIFETIME_DAYS, TRACK_COUNTS};
+    use crate::models::user_settings::{LIFETIME_DAYS, TRACK_COUNTS};
 
     #[tokio::test]
     async fn auto_delete_is_turned_on_only_in_soulfuls_settings() {

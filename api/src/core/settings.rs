@@ -4,12 +4,13 @@ use crate::auth::UserCtx;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::playlists::{discovery_key, lock};
 use crate::core::{database_failure, folders::owned_in};
-use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+use crate::models::user_settings::{
+    UpdateUserSettings, UserSettings, LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS,
+};
 use serde_json::Value;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::recommendation::DiscoveryProfile;
 use sqlx::SqlitePool;
-use std::ops::RangeInclusive;
 
 const PLAYLIST_NAME_MAX_CHARS: usize = 255;
 
@@ -70,13 +71,6 @@ fn unknown_profile(profile: &str) -> Failure {
         "Unknown discovery profile '{profile}': use Conservative, Balanced or Adventurous"
     ))
 }
-
-/// The track count each discovery profile may have.
-pub(crate) const TRACK_COUNTS: RangeInclusive<i64> = 1..=50;
-/// The days a discovery profile's tracks may wait for a rating.
-pub(crate) const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
-/// The rating at which the rating sync promotes a pending discovery track.
-pub(crate) const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
 
 /// `update` with its discovery values checked against the bounds the Settings inputs carry, and
 /// its playlist names trimmed (D14). Each map must name all three profiles.

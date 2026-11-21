@@ -6,6 +6,7 @@ mod folder_admin;
 mod folder_manager;
 mod panel;
 mod remote_access;
+mod save_setting;
 mod security_status;
 mod sign_in_methods;
 mod toggle;

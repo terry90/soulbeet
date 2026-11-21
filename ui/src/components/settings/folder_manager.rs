@@ -1,12 +1,57 @@
-use api::{create_user_folder, delete_folder, get_user_folders, update_folder};
+use std::ops::RangeInclusive;
+
+use api::models::user_settings::{LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS};
+use api::{create_user_folder, delete_folder, get_user_folders, update_folder, UserSettings};
 use dioxus::prelude::*;
+use serde_json::Value;
+use shared::recommendation::DiscoveryProfile;
 
 use super::panel::{
     ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
 };
+use super::save_setting::{typed_number, SettingSaver};
 use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
 use crate::{friendly_error, FieldLook, TextInput};
+
+/// The numbers typed for the Safe, Mix and Wild profiles as the JSON object the server stores, or
+/// why one of them cannot be saved. `what` names the number in that reason.
+fn typed_per_profile(
+    what: &str,
+    range: RangeInclusive<i64>,
+    [safe, mix, wild]: [String; 3],
+) -> Result<String, String> {
+    let read =
+        |label: &str, text: &str| typed_number(text, &format!("The {label} {what}"), range.clone());
+    Ok(serde_json::json!({
+        "Conservative": read("Safe", &safe)?,
+        "Balanced": read("Mix", &mix)?,
+        "Adventurous": read("Wild", &wild)?,
+    })
+    .to_string())
+}
+
+/// Puts in `field` the value `read` finds for `profile` in the stored JSON object `json`, of
+/// profile to value. A value it cannot find leaves the field as it is.
+fn show_profile(
+    json: &str,
+    profile: &str,
+    mut field: Signal<String>,
+    read: fn(&Value) -> Option<String>,
+) {
+    let map = serde_json::from_str::<Value>(json).ok();
+    if let Some(text) = map.as_ref().and_then(|m| m.get(profile)).and_then(read) {
+        field.set(text);
+    }
+}
+
+fn name_text(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_string)
+}
+
+fn number_text(value: &Value) -> Option<String> {
+    value.as_i64().map(|n| n.to_string())
+}
 
 #[component]
 pub fn FolderManager() -> Element {
@@ -34,80 +79,60 @@ pub fn FolderManager() -> Element {
     let mut discovery_enabled = use_signal(|| false);
     let mut discovery_folder_id = use_signal(String::new);
     let mut discovery_profiles = use_signal(|| "Conservative,Balanced,Adventurous".to_string());
-    let mut pl_name_safe = use_signal(|| "Comfort Zone".to_string());
-    let mut pl_name_mix = use_signal(|| "Fresh Picks".to_string());
-    let mut pl_name_wild = use_signal(|| "Deep Cuts".to_string());
+    let pl_name_safe = use_signal(|| "Comfort Zone".to_string());
+    let pl_name_mix = use_signal(|| "Fresh Picks".to_string());
+    let pl_name_wild = use_signal(|| "Deep Cuts".to_string());
     // Per-profile track counts and lifetimes
-    let mut tc_safe = use_signal(|| "10".to_string());
-    let mut tc_mix = use_signal(|| "10".to_string());
-    let mut tc_wild = use_signal(|| "10".to_string());
-    let mut lt_safe = use_signal(|| "7".to_string());
-    let mut lt_mix = use_signal(|| "7".to_string());
-    let mut lt_wild = use_signal(|| "7".to_string());
+    let tc_safe = use_signal(|| "10".to_string());
+    let tc_mix = use_signal(|| "10".to_string());
+    let tc_wild = use_signal(|| "10".to_string());
+    let lt_safe = use_signal(|| "7".to_string());
+    let lt_mix = use_signal(|| "7".to_string());
+    let lt_wild = use_signal(|| "7".to_string());
 
     let mut settings_resource = use_resource(|| async { api::get_user_settings().await });
+    let saver = SettingSaver {
+        stored: settings_resource,
+        error: library_error,
+    };
+
+    // Each puts one input's stored value in place: after a save only the saved input is
+    // refilled, so the reply never overwrites another field being typed in.
+    let mut show_threshold = move |s: &UserSettings| {
+        discovery_promote_threshold.set(s.discovery_promote_threshold.to_string())
+    };
+    let mut show_lb_username = move |s: &UserSettings| {
+        lb_username.set(s.listenbrainz_username.clone().unwrap_or_default())
+    };
+    let mut show_lb_token =
+        move |s: &UserSettings| lb_token.set(s.listenbrainz_token.clone().unwrap_or_default());
+    let mut show_discovery_folder = move |s: &UserSettings| {
+        discovery_folder_id.set(s.discovery_folder_id.clone().unwrap_or_default())
+    };
+    let mut show_profiles =
+        move |s: &UserSettings| discovery_profiles.set(s.discovery_profiles.clone());
 
     use_effect(move || {
-        if let Some(Ok(user_settings)) = &*settings_resource.read() {
-            auto_delete_enabled.set(user_settings.auto_delete_enabled);
-            discovery_promote_threshold.set(user_settings.discovery_promote_threshold.to_string());
-            lb_username.set(
-                user_settings
-                    .listenbrainz_username
-                    .clone()
-                    .unwrap_or_default(),
-            );
-            lb_token.set(user_settings.listenbrainz_token.clone().unwrap_or_default());
-            deezer_recommendations.set(user_settings.deezer_recommendations);
-            discovery_enabled.set(user_settings.discovery_enabled);
-            discovery_folder_id.set(
-                user_settings
-                    .discovery_folder_id
-                    .clone()
-                    .unwrap_or_default(),
-            );
-            discovery_profiles.set(user_settings.discovery_profiles.clone());
-            // Parse per-profile playlist names from JSON
-            if let Ok(names) = serde_json::from_str::<std::collections::HashMap<String, String>>(
-                &user_settings.discovery_playlist_name,
-            ) {
-                if let Some(n) = names.get("Conservative") {
-                    pl_name_safe.set(n.clone());
-                }
-                if let Some(n) = names.get("Balanced") {
-                    pl_name_mix.set(n.clone());
-                }
-                if let Some(n) = names.get("Adventurous") {
-                    pl_name_wild.set(n.clone());
-                }
-            }
-            // Parse per-profile track counts
-            if let Ok(counts) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
-                &user_settings.discovery_track_count,
-            ) {
-                if let Some(n) = counts.get("Conservative") {
-                    tc_safe.set(n.to_string());
-                }
-                if let Some(n) = counts.get("Balanced") {
-                    tc_mix.set(n.to_string());
-                }
-                if let Some(n) = counts.get("Adventurous") {
-                    tc_wild.set(n.to_string());
-                }
-            }
-            // Parse per-profile lifetime days
-            if let Ok(days) = serde_json::from_str::<std::collections::HashMap<String, u32>>(
-                &user_settings.discovery_lifetime_days,
-            ) {
-                if let Some(n) = days.get("Conservative") {
-                    lt_safe.set(n.to_string());
-                }
-                if let Some(n) = days.get("Balanced") {
-                    lt_mix.set(n.to_string());
-                }
-                if let Some(n) = days.get("Adventurous") {
-                    lt_wild.set(n.to_string());
-                }
+        if let Some(Ok(s)) = &*settings_resource.read() {
+            auto_delete_enabled.set(s.auto_delete_enabled);
+            deezer_recommendations.set(s.deezer_recommendations);
+            discovery_enabled.set(s.discovery_enabled);
+            show_threshold(s);
+            show_lb_username(s);
+            show_lb_token(s);
+            show_discovery_folder(s);
+            show_profiles(s);
+            let fields = [
+                (pl_name_safe, tc_safe, lt_safe),
+                (pl_name_mix, tc_mix, lt_mix),
+                (pl_name_wild, tc_wild, lt_wild),
+            ];
+            for (profile, (name, count, lifetime)) in
+                DiscoveryProfile::NAMES.into_iter().zip(fields)
+            {
+                show_profile(&s.discovery_playlist_name, profile, name, name_text);
+                show_profile(&s.discovery_track_count, profile, count, number_text);
+                show_profile(&s.discovery_lifetime_days, profile, lifetime, number_text);
             }
         }
     });
@@ -319,14 +344,14 @@ pub fn FolderManager() -> Element {
                                         select {
                                             class: "w-full p-2 rounded bg-beet-panel border border-white/10 text-white font-mono text-sm",
                                             value: "{discovery_folder_id}",
-                                            onchange: move |e| async move {
+                                            onchange: move |e| {
                                                 let val = e.value();
                                                 discovery_folder_id.set(val.clone());
-                                                let update = api::UpdateUserSettings {
+                                                let change = api::UpdateUserSettings {
                                                     discovery_folder_id: Some(val),
                                                     ..Default::default()
                                                 };
-                                                let _ = api::update_user_settings(update).await;
+                                                saver.save(Ok(change), show_discovery_folder)
                                             },
                                             option { value: "", "Select a folder..." }
                                             for f in folders.read().iter() {
@@ -364,7 +389,7 @@ pub fn FolderManager() -> Element {
                                                                     "shrink-0 w-16 py-0.5 text-xs font-mono rounded cursor-pointer transition-colors text-center {}",
                                                                     if active { "bg-white/15 text-white" } else { "bg-white/5 text-gray-500" }
                                                                 ),
-                                                                onclick: move |_| async move {
+                                                                onclick: move |_| {
                                                                     let current: Vec<String> = discovery_profiles().split(',')
                                                                         .map(|s| s.trim().to_string())
                                                                         .filter(|s| !s.is_empty())
@@ -378,11 +403,11 @@ pub fn FolderManager() -> Element {
                                                                         updated.join(",")
                                                                     };
                                                                     discovery_profiles.set(new_profiles.clone());
-                                                                    let update = api::UpdateUserSettings {
+                                                                    let change = api::UpdateUserSettings {
                                                                         discovery_profiles: Some(new_profiles),
                                                                         ..Default::default()
                                                                     };
-                                                                    let _ = api::update_user_settings(update).await;
+                                                                    saver.save(Ok(change), show_profiles)
                                                                 },
                                                                 "{label}"
                                                             }
@@ -395,17 +420,22 @@ pub fn FolderManager() -> Element {
                                                                     let signal = *name_signal;
                                                                     move |e: Event<FormData>| signal.clone().set(e.value())
                                                                 },
-                                                                onchange: move |_| async move {
-                                                                    let names = serde_json::json!({
-                                                                        "Conservative": pl_name_safe(),
-                                                                        "Balanced": pl_name_mix(),
-                                                                        "Adventurous": pl_name_wild(),
-                                                                    });
-                                                                    let update = api::UpdateUserSettings {
-                                                                        discovery_playlist_name: Some(names.to_string()),
-                                                                        ..Default::default()
-                                                                    };
-                                                                    let _ = api::update_user_settings(update).await;
+                                                                onchange: {
+                                                                    let field = *name_signal;
+                                                                    move |_: Event<FormData>| {
+                                                                        let names = serde_json::json!({
+                                                                            "Conservative": pl_name_safe(),
+                                                                            "Balanced": pl_name_mix(),
+                                                                            "Adventurous": pl_name_wild(),
+                                                                        });
+                                                                        let change = api::UpdateUserSettings {
+                                                                            discovery_playlist_name: Some(names.to_string()),
+                                                                            ..Default::default()
+                                                                        };
+                                                                        saver.save(Ok(change), move |s: &UserSettings| {
+                                                                            show_profile(&s.discovery_playlist_name, value, field, name_text)
+                                                                        })
+                                                                    }
                                                                 },
                                                                 placeholder: value,
                                                             }
@@ -418,24 +448,26 @@ pub fn FolderManager() -> Element {
                                                                     input {
                                                                         class: "w-12 p-0.5 rounded bg-beet-panel/50 border border-white/5 focus:border-beet-accent focus:outline-none text-white font-mono text-xs text-center",
                                                                         "type": "number",
-                                                                        min: "1",
-                                                                        max: "50",
+                                                                        min: TRACK_COUNTS.start().to_string(),
+                                                                        max: TRACK_COUNTS.end().to_string(),
                                                                         value: "{tc_signal}",
                                                                         oninput: {
                                                                             let sig = *tc_signal;
                                                                             move |e: Event<FormData>| sig.clone().set(e.value())
                                                                         },
-                                                                        onchange: move |_| async move {
-                                                                            let counts = serde_json::json!({
-                                                                                "Conservative": tc_safe().parse::<u32>().unwrap_or(10),
-                                                                                "Balanced": tc_mix().parse::<u32>().unwrap_or(10),
-                                                                                "Adventurous": tc_wild().parse::<u32>().unwrap_or(10),
-                                                                            });
-                                                                            let update = api::UpdateUserSettings {
-                                                                                discovery_track_count: Some(counts.to_string()),
-                                                                                ..Default::default()
-                                                                            };
-                                                                            let _ = api::update_user_settings(update).await;
+                                                                        onchange: {
+                                                                            let field = *tc_signal;
+                                                                            move |_: Event<FormData>| {
+                                                                                let counts = [tc_safe(), tc_mix(), tc_wild()];
+                                                                                let change = typed_per_profile("track count", TRACK_COUNTS, counts)
+                                                                                    .map(|counts| api::UpdateUserSettings {
+                                                                                        discovery_track_count: Some(counts),
+                                                                                        ..Default::default()
+                                                                                    });
+                                                                                saver.save(change, move |s: &UserSettings| {
+                                                                                    show_profile(&s.discovery_track_count, value, field, number_text)
+                                                                                })
+                                                                            }
                                                                         },
                                                                     }
                                                                 }
@@ -444,24 +476,26 @@ pub fn FolderManager() -> Element {
                                                                     input {
                                                                         class: "w-12 p-0.5 rounded bg-beet-panel/50 border border-white/5 focus:border-beet-accent focus:outline-none text-white font-mono text-xs text-center",
                                                                         "type": "number",
-                                                                        min: "1",
-                                                                        max: "90",
+                                                                        min: LIFETIME_DAYS.start().to_string(),
+                                                                        max: LIFETIME_DAYS.end().to_string(),
                                                                         value: "{lt_signal}",
                                                                         oninput: {
                                                                             let sig = *lt_signal;
                                                                             move |e: Event<FormData>| sig.clone().set(e.value())
                                                                         },
-                                                                        onchange: move |_| async move {
-                                                                            let days = serde_json::json!({
-                                                                                "Conservative": lt_safe().parse::<u32>().unwrap_or(7),
-                                                                                "Balanced": lt_mix().parse::<u32>().unwrap_or(7),
-                                                                                "Adventurous": lt_wild().parse::<u32>().unwrap_or(7),
-                                                                            });
-                                                                            let update = api::UpdateUserSettings {
-                                                                                discovery_lifetime_days: Some(days.to_string()),
-                                                                                ..Default::default()
-                                                                            };
-                                                                            let _ = api::update_user_settings(update).await;
+                                                                        onchange: {
+                                                                            let field = *lt_signal;
+                                                                            move |_: Event<FormData>| {
+                                                                                let days = [lt_safe(), lt_mix(), lt_wild()];
+                                                                                let change = typed_per_profile("lifetime in days", LIFETIME_DAYS, days)
+                                                                                    .map(|days| api::UpdateUserSettings {
+                                                                                        discovery_lifetime_days: Some(days),
+                                                                                        ..Default::default()
+                                                                                    });
+                                                                                saver.save(change, move |s: &UserSettings| {
+                                                                                    show_profile(&s.discovery_lifetime_days, value, field, number_text)
+                                                                                })
+                                                                            }
                                                                         },
                                                                     }
                                                                 }
@@ -485,12 +519,12 @@ pub fn FolderManager() -> Element {
                                 class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
                                 value: "{lb_username}",
                                 oninput: move |e| lb_username.set(e.value()),
-                                onchange: move |_| async move {
-                                    let update = api::UpdateUserSettings {
+                                onchange: move |_| {
+                                    let change = api::UpdateUserSettings {
                                         listenbrainz_username: Some(lb_username()),
                                         ..Default::default()
                                     };
-                                    let _ = api::update_user_settings(update).await;
+                                    saver.save(Ok(change), show_lb_username)
                                 },
                                 placeholder: "Enter ListenBrainz username",
                                 "type": "text",
@@ -508,12 +542,12 @@ pub fn FolderManager() -> Element {
                                 class: "w-full p-2 rounded bg-beet-panel border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono text-sm",
                                 value: "{lb_token}",
                                 oninput: move |e| lb_token.set(e.value()),
-                                onchange: move |_| async move {
-                                    let update = api::UpdateUserSettings {
+                                onchange: move |_| {
+                                    let change = api::UpdateUserSettings {
                                         listenbrainz_token: Some(lb_token()),
                                         ..Default::default()
                                     };
-                                    let _ = api::update_user_settings(update).await;
+                                    saver.save(Ok(change), show_lb_token)
                                 },
                                 placeholder: "Enter ListenBrainz token",
                                 "type": "password",
@@ -573,17 +607,21 @@ pub fn FolderManager() -> Element {
                             class: "w-16 p-2 rounded bg-beet-panel border border-white/10 text-white font-mono text-sm text-center",
                             value: "{discovery_promote_threshold}",
                             oninput: move |e| discovery_promote_threshold.set(e.value()),
-                            onchange: move |_| async move {
-                                let val: u8 = discovery_promote_threshold().parse().unwrap_or(3);
-                                let update = api::UpdateUserSettings {
-                                    discovery_promote_threshold: Some(val),
+                            onchange: move |_| {
+                                let change = typed_number(
+                                    &discovery_promote_threshold(),
+                                    "The discovery promote threshold",
+                                    PROMOTE_THRESHOLDS,
+                                )
+                                .map(|n| api::UpdateUserSettings {
+                                    discovery_promote_threshold: Some(n),
                                     ..Default::default()
-                                };
-                                let _ = api::update_user_settings(update).await;
+                                });
+                                saver.save(change, show_threshold)
                             },
                             "type": "number",
-                            min: "1",
-                            max: "5",
+                            min: PROMOTE_THRESHOLDS.start().to_string(),
+                            max: PROMOTE_THRESHOLDS.end().to_string(),
                         }
                     }
                 }
@@ -591,5 +629,40 @@ pub fn FolderManager() -> Element {
             }
         }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_profile_numbers_are_sent_only_when_each_one_reads() {
+        let counts = typed_per_profile(
+            "track count",
+            TRACK_COUNTS,
+            ["10".into(), "50".into(), " 1 ".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&counts).unwrap(),
+            serde_json::json!({"Conservative": 10, "Balanced": 50, "Adventurous": 1})
+        );
+        assert_eq!(
+            typed_per_profile(
+                "track count",
+                TRACK_COUNTS,
+                ["10".into(), "".into(), "10".into()]
+            ),
+            Err("The Mix track count must be a whole number from 1 to 50".to_string())
+        );
+        assert_eq!(
+            typed_per_profile(
+                "lifetime in days",
+                LIFETIME_DAYS,
+                ["7".into(), "7".into(), "91".into()]
+            ),
+            Err("The Wild lifetime in days must be a whole number from 1 to 90".to_string())
+        );
     }
 }
