@@ -396,6 +396,23 @@ fn EngineReportView() -> Element {
     }
 }
 
+/// Notes in `errors` how a Keep or Drop of `track_id` ended: a failure shows
+/// under the track's row until an action on it succeeds.
+fn note_outcome(
+    errors: &mut std::collections::HashMap<String, String>,
+    track_id: String,
+    outcome: Result<(), ServerFnError>,
+) {
+    match outcome {
+        Ok(()) => {
+            errors.remove(&track_id);
+        }
+        Err(e) => {
+            errors.insert(track_id, friendly_error(&e));
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PendingDrop {
     track_id: String,
@@ -413,29 +430,32 @@ fn DiscoveryTrackList() -> Element {
         _ => vec![],
     };
 
-    // Why the last Keep of a track failed, by track id.
-    let mut promote_errors: Signal<std::collections::HashMap<String, String>> =
+    // Why the last Keep or Drop of a track failed, by track id.
+    let mut action_errors: Signal<std::collections::HashMap<String, String>> =
         use_signal(Default::default);
 
     let handle_promote = move |track_id: String| async move {
         let req = api::TrackActionRequest {
             track_id: track_id.clone(),
         };
-        match api::promote_discovery_track(req).await {
-            Ok(()) => {
-                promote_errors.write().remove(&track_id);
-            }
-            Err(e) => {
-                promote_errors.write().insert(track_id, friendly_error(&e));
-            }
-        }
+        let outcome = api::promote_discovery_track(req).await;
+        note_outcome(&mut action_errors.write(), track_id, outcome);
         tracks.restart();
     };
 
+    // A failed Drop leaves the file in place, so the row stays as it is with
+    // its reason under it. A reload could move it to history, where the
+    // reason is not shown: the server may leave the track Removing.
     let handle_remove = move |track_id: String| async move {
-        let req = api::TrackActionRequest { track_id };
-        let _ = api::remove_discovery_track(req).await;
-        tracks.restart();
+        let req = api::TrackActionRequest {
+            track_id: track_id.clone(),
+        };
+        let outcome = api::remove_discovery_track(req).await;
+        let dropped = outcome.is_ok();
+        note_outcome(&mut action_errors.write(), track_id, outcome);
+        if dropped {
+            tracks.restart();
+        }
     };
 
     // Split into active (pending) and history (promoted/removed)
@@ -482,7 +502,7 @@ fn DiscoveryTrackList() -> Element {
                                     let id_remove = track.id.clone();
                                     let title_remove = track.title.clone();
                                     let artist_remove = track.artist.clone();
-                                    let promote_error = promote_errors.read().get(&track.id).cloned();
+                                    let action_error = action_errors.read().get(&track.id).cloned();
                                     rsx! {
                                         div { class: "p-2 bg-beet-panel border border-white/10 rounded text-sm",
                                             div { class: "flex items-center justify-between",
@@ -518,7 +538,7 @@ fn DiscoveryTrackList() -> Element {
                                                     }
                                                 }
                                             }
-                                            if let Some(error) = promote_error {
+                                            if let Some(error) = action_error {
                                                 p { class: "text-xs font-mono text-red-400 mt-1 break-words", "{error}" }
                                             }
                                         }
@@ -620,5 +640,26 @@ mod tests {
         let html = render_run(unread);
         assert!(!html.contains("Last run used"));
         assert!(html.contains("Navidrome failed: Discovery needs your Navidrome library"));
+    }
+
+    #[test]
+    fn a_failed_drop_shows_its_reason_until_an_action_on_the_track_succeeds() {
+        let mut errors = std::collections::HashMap::new();
+        // How remove_discovery_track's failure_error reaches the browser.
+        let refused = ServerFnError::ServerError {
+            message: "The file changed after it was checked".to_string(),
+            code: api::REFUSAL_CODE,
+            details: None,
+        };
+        note_outcome(&mut errors, "t1".to_string(), Err(refused));
+        note_outcome(&mut errors, "t2".to_string(), Ok(()));
+        assert_eq!(
+            errors.get("t1").map(String::as_str),
+            Some("The file changed after it was checked")
+        );
+        assert_eq!(errors.len(), 1);
+
+        note_outcome(&mut errors, "t1".to_string(), Ok(()));
+        assert!(errors.is_empty());
     }
 }

@@ -823,29 +823,17 @@ impl DownloadMonitor {
         });
     }
 
-    /// Stop the transfer a slot is about to stop watching, and remember it
-    /// so its record is removed at the end.
+    /// Stop the transfer a slot is about to stop watching (`cancel_abandoned`),
+    /// and remember it so its record is removed at the end.
     ///
     /// At the per-track timeout that transfer is still running, so leaving it
     /// alone would have two peers sending the same track, the abandoned one
     /// into this batch's folder. Even a dead transfer has to go: once no slot
-    /// points at it nothing else prunes it. slskd cancels by transfer id, and
-    /// a cancel that fails is not worth losing the retry over.
-    ///
-    /// The cancel keeps the record: the transfer may have just succeeded, and
-    /// removing a succeeded record before slskd moves its file strands the
-    /// file. End-of-run cleanup removes it once it shows Cancelled or Failed.
+    /// points at it nothing else prunes it. A cancel that fails is not worth
+    /// losing the retry over.
     async fn abandon(&mut self, slot: usize, backend: &Arc<dyn DownloadBackend>) {
         let tracked = &self.tracked_files[slot];
-        if let Err(e) = backend
-            .cancel_download(&tracked.source, &tracked.transfer_id, false)
-            .await
-        {
-            warn!(
-                "Failed to cancel abandoned transfer {} in slskd: {}",
-                tracked.transfer_id, e
-            );
-        }
+        cancel_abandoned(backend, &tracked.source, &tracked.transfer_id).await;
         self.abandoned
             .push((tracked.source.clone(), tracked.transfer_id.clone()));
     }
@@ -977,41 +965,15 @@ impl DownloadMonitor {
     }
 
     /// Remove the records of this batch's transfers, watched or abandoned,
-    /// that ended without a file. A succeeded record is only ever removed
-    /// by the handoff or album finish that found its file on disk: removing
-    /// it before that can strand the file in slskd's incomplete folder.
-    /// Only this batch's ids: another batch's record of the same file is
-    /// that batch's to remove. A failed attempt slskd says it will retry
-    /// ended without a file too, and with the batch done nobody would import
-    /// what a retry fetched.
-    async fn remove_batch_transfers(&mut self, backend: &Arc<dyn DownloadBackend>) {
-        let mut peers = self.sources();
-        for (peer, _) in &self.abandoned {
-            if !peers.contains(peer) {
-                peers.push(peer.clone());
-            }
-        }
-        let downloads = match backend.get_downloads_for(&peers).await {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("Could not list downloads for batch cleanup: {}", e);
-                return;
-            }
-        };
-
-        for entry in downloads.iter().filter(|entry| {
-            (is_failed(&entry.state) || entry.pending_retry.is_some()) && self.owns(entry)
-        }) {
-            if let Err(e) = backend
-                .cancel_download(&entry.source, &entry.id, true)
-                .await
-            {
-                warn!(
-                    "Failed to remove finished transfer {} from slskd: {}",
-                    entry.id, e
-                );
-            }
-        }
+    /// that ended without a file (`remove_ended_transfers`). A succeeded
+    /// record is only ever removed by the handoff or album finish that found
+    /// its file on disk.
+    async fn remove_batch_transfers(&self, backend: &Arc<dyn DownloadBackend>) {
+        let transfers: Vec<(String, String)> = (self.tracked_files.iter())
+            .map(|t| (t.source.clone(), t.transfer_id.clone()))
+            .chain(self.abandoned.iter().cloned())
+            .collect();
+        remove_ended_transfers(backend, &transfers).await;
     }
 
     /// Stop every watched slot whose transfer, or job, its user cancelled,
@@ -1913,6 +1875,115 @@ fn make_failed_progress(tracked: &TrackedFile, failure: Failure) -> DownloadProg
 /// Whether `dl` is the transfer slskd lists under `id` from `source`.
 fn is_transfer(dl: &DownloadProgress, source: &str, id: &str) -> bool {
     dl.source == source && dl.id == id
+}
+
+/// Stop `transfer_id` from `peer`, a transfer its watcher gives up on: left
+/// running it would still deliver into the watcher's folder with nobody to
+/// import the file. slskd cancels by transfer id, and a cancel that fails is
+/// only logged.
+///
+/// The cancel keeps the record: the transfer may have just succeeded, and
+/// removing a succeeded record before slskd moves its file strands the
+/// file. `remove_ended_transfers` removes it once it shows Cancelled or
+/// Failed.
+pub(crate) async fn cancel_abandoned(
+    backend: &Arc<dyn DownloadBackend>,
+    peer: &str,
+    transfer_id: &str,
+) {
+    if let Err(e) = backend.cancel_download(peer, transfer_id, false).await {
+        warn!(
+            "Failed to cancel abandoned transfer {} in slskd: {}",
+            transfer_id, e
+        );
+    }
+}
+
+/// How long `await_ended` waits for slskd to end transfers it was told to
+/// cancel. A cancel of a live transfer only fires its token
+/// (`DownloadService.cs:998-1007`); the record turns Cancelled later, when
+/// the download task's catch fails it (`:1546-1550`, `:1045-1068`).
+pub(crate) const CANCEL_SETTLE: Duration = Duration::from_secs(10);
+
+/// Wait, for at most `CANCEL_SETTLE`, until slskd lists every one of
+/// `transfers` as ended or no longer lists it. slskd removes only a record
+/// that ended (`DownloadService.cs:977-981`), so `remove_ended_transfers`
+/// right after a cancel would miss the transfers it was meant for.
+pub(crate) async fn await_ended(
+    backend: &Arc<dyn DownloadBackend>,
+    transfers: &[(String, String)],
+) {
+    let peers = peers_of(transfers);
+    let deadline = Instant::now() + CANCEL_SETTLE;
+    loop {
+        // A listing that fails is asked again on the next tick.
+        if let Ok(downloads) = backend.get_downloads_for(&peers).await {
+            if transfers.iter().all(|(peer, id)| {
+                transfer_by_id(&downloads, peer, id).is_none_or(|dl| is_terminal_state(&dl.state))
+            }) {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "slskd had not ended every cancelled transfer after {:?}",
+                CANCEL_SETTLE
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The peers of `transfers`, each once.
+fn peers_of(transfers: &[(String, String)]) -> Vec<String> {
+    let mut peers: Vec<String> = Vec::new();
+    for (peer, _) in transfers {
+        if !peers.contains(peer) {
+            peers.push(peer.clone());
+        }
+    }
+    peers
+}
+
+/// Remove the records of `transfers`, the `(peer, transfer id)` pairs a
+/// watcher is done with, that ended without a file, and return the listing
+/// they were read from, or `None` when slskd could not list them.
+///
+/// A succeeded record is left: removing it before its file is found on disk
+/// can strand the file in slskd's incomplete folder. Only these ids: another
+/// watcher's record of the same file is that watcher's to remove. A failed
+/// attempt slskd says it will retry ended without a file too, and with its
+/// watcher done nobody would import what a retry fetched.
+pub(crate) async fn remove_ended_transfers(
+    backend: &Arc<dyn DownloadBackend>,
+    transfers: &[(String, String)],
+) -> Option<Vec<DownloadProgress>> {
+    let downloads = match backend.get_downloads_for(&peers_of(transfers)).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Could not list downloads for batch cleanup: {}", e);
+            return None;
+        }
+    };
+
+    for entry in downloads.iter().filter(|entry| {
+        (is_failed(&entry.state) || entry.pending_retry.is_some())
+            && transfers
+                .iter()
+                .any(|(peer, id)| is_transfer(entry, peer, id))
+    }) {
+        if let Err(e) = backend
+            .cancel_download(&entry.source, &entry.id, true)
+            .await
+        {
+            warn!(
+                "Failed to remove finished transfer {} from slskd: {}",
+                entry.id, e
+            );
+        }
+    }
+    Some(downloads)
 }
 
 /// The transfer slskd lists under `id` from `source`.
@@ -2866,7 +2937,7 @@ mod tests {
     async fn cleanup_leaves_a_finished_transfer_whose_file_was_never_found() {
         // The monitor stopped before handing it off: slskd may not have moved
         // the file yet, and removing the record now would strand it.
-        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
+        let (m, _recorded) = monitor(vec!["peer_a"], vec!["dirA/aaa.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         stub.set_listing(vec![listed(

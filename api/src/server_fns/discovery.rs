@@ -51,7 +51,8 @@ use crate::server_fns::download::enqueue::{
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
 use crate::server_fns::download::monitor::{
-    read_pending_retry, transfer_by_id, FAILED_STATE_CONFIRM,
+    await_ended, cancel_abandoned, read_pending_retry, remove_ended_transfers, transfer_by_id,
+    FAILED_STATE_CONFIRM,
 };
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
@@ -277,6 +278,10 @@ struct QueuedTrack {
     retry_pending_since: Option<tokio::time::Instant>,
     /// Alternate peers for this track, and how many have been tried.
     pool: SourcePool,
+    /// The `(peer, transfer id)` of each attempt this track failed over
+    /// from. Each was cancelled at its failover, and `stop_waiting` removes
+    /// their records.
+    abandoned: Vec<(String, String)>,
 }
 
 /// The track's import is done or abandoned once it is dropped, so whoever
@@ -315,6 +320,11 @@ fn succeeded(state: &shared::download::DownloadState) -> bool {
 /// user asked for through the transfer registry, which is cancelled here
 /// unless it already finished. A track that settles without a file gives up
 /// its key.
+///
+/// A failed transfer is cancelled when its track moves on or runs out of
+/// peers (`cancel_abandoned`): one read as failed past `RETRY_PENDING_FOR`
+/// may still be in slskd's own retry, and a file it fetched late would land
+/// in the batch folder with nobody to import it.
 ///
 /// A failure counts only once it has persisted for `FAILED_STATE_CONFIRM`,
 /// the same window `DownloadMonitor` applies. slskd 0.26 retries failed
@@ -419,17 +429,58 @@ async fn settle_poll(
                             transfer_key(backend.id(), &next.source, &next.item),
                         );
                         registry.hand_over(&dead, &qt.key, &qt.batch.owner);
+                        cancel_abandoned(backend, &dead.peer, &id).await;
+                        qt.abandoned.push((dead.peer.clone(), id));
                         qt.transfer_id = next.id.clone();
                         qt.failing_since = None;
                         qt.retry_pending_since = None;
                         pending.insert(next.id);
                     }
                     None => {
+                        cancel_abandoned(backend, &qt.key.peer, &id).await;
                         registry.release(&qt.key, &qt.batch.owner);
                         failed.insert(id);
                     }
                 }
             }
+        }
+    }
+}
+
+/// End the wait on `queued` the way `DownloadMonitor` ends a batch: cancel
+/// the transfers still in `pending`, then remove the records of this run's
+/// transfers, current or failed over from, that ended without a file. Left
+/// running, a late transfer would land in its batch folder after its track
+/// was given up on, and nobody would import or delete it.
+///
+/// The removal waits for slskd to end the cancelled transfers
+/// (`await_ended`). A transfer that finished before its cancel reached
+/// slskd delivered its file, so it leaves `pending` and is imported like
+/// the rest.
+#[cfg(feature = "server")]
+async fn stop_waiting(
+    queued: &[QueuedTrack],
+    pending: &mut std::collections::HashSet<String>,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+) {
+    for qt in queued.iter().filter(|qt| pending.contains(&qt.transfer_id)) {
+        cancel_abandoned(backend, &qt.key.peer, &qt.transfer_id).await;
+    }
+    let transfers: Vec<(String, String)> = (queued.iter())
+        .flat_map(|qt| {
+            std::iter::once((qt.key.peer.clone(), qt.transfer_id.clone()))
+                .chain(qt.abandoned.iter().cloned())
+        })
+        .collect();
+    await_ended(backend, &transfers).await;
+    let Some(listed) = remove_ended_transfers(backend, &transfers).await else {
+        return;
+    };
+    for qt in queued {
+        if transfer_by_id(&listed, &qt.key.peer, &qt.transfer_id)
+            .is_some_and(|dl| succeeded(&dl.state))
+        {
+            pending.remove(&qt.transfer_id);
         }
     }
 }
@@ -813,6 +864,7 @@ pub async fn generate_discovery_playlist_internal(
                             // enqueued: earlier entries were already tried and
                             // rejected in this loop, and must not be retried.
                             pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
+                            abandoned: Vec::new(),
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -868,7 +920,7 @@ pub async fn generate_discovery_playlist_internal(
             // A slow peer (3 min queue wait + 8 min transfer) could exceed it. This is
             // acceptable because: (1) discovery tracks are single songs, not albums,
             // (2) most Soulseek transfers start quickly, and (3) timed-out tracks are
-            // recorded in stats with no data loss -- they can be rediscovered later.
+            // recorded in stats and their transfers cancelled (`stop_waiting`).
             let wait_start = tokio::time::Instant::now();
             let max_wait = tokio::time::Duration::from_secs(600);
             let mut pending_ids: std::collections::HashSet<String> =
@@ -913,6 +965,7 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
             }
+            stop_waiting(&queued, &mut pending_ids, &backend).await;
 
             stats.downloads_timed_out += pending_ids.len() as u32;
             stats.downloads_failed += failed_ids.len() as u32;
@@ -1519,14 +1572,14 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{
         discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
-        QueuedTrack, FAILED_STATE_CONFIRM,
+        stop_waiting, QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
     };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
-    use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
+    use crate::server_fns::download::monitor::{CANCEL_SETTLE, RETRY_PENDING_FOR};
     use crate::server_fns::download::test_support::{
         batch, item, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
@@ -1720,6 +1773,7 @@ mod tests {
             failing_since: None,
             retry_pending_since: None,
             pool: SourcePool::single(items),
+            abandoned: Vec::new(),
         }
     }
 
@@ -2158,6 +2212,182 @@ mod tests {
             .contains(&Cancel::only("peer_b", "t-b/07 - Wake Up.flac")));
         assert!(pending.is_empty());
         assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
+    }
+
+    // Paused: stop_waiting polls slskd with tokio::time::sleep until the
+    // cancel has ended the transfer.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_still_pending_at_the_deadline_is_cancelled_and_its_record_removed() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            "a/07 - Wake Up.flac",
+            "t-a/07 - Wake Up.flac",
+            DownloadState::InProgress,
+        )]);
+        // slskd lists the transfer Cancelled only once its download task
+        // has caught the cancel.
+        let slskd = stub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            slskd.set_listing(vec![transfer(
+                "peer_a",
+                "a/07 - Wake Up.flac",
+                "t-a/07 - Wake Up.flac",
+                DownloadState::Cancelled,
+            )]);
+        });
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![
+                Cancel::only("peer_a", "t-a/07 - Wake Up.flac"),
+                Cancel::removing("peer_a", "t-a/07 - Wake Up.flac"),
+            ]
+        );
+        assert_eq!(pending, pending_of(&queued), "it is not imported");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_slskd_never_ends_stops_the_wait_after_its_bound() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            "a/07 - Wake Up.flac",
+            "t-a/07 - Wake Up.flac",
+            DownloadState::InProgress,
+        )]);
+        let start = tokio::time::Instant::now();
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert!(start.elapsed() >= CANCEL_SETTLE);
+        assert!(start.elapsed() < CANCEL_SETTLE + std::time::Duration::from_secs(2));
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")],
+            "slskd removes only a record that ended"
+        );
+        assert_eq!(pending, pending_of(&queued), "it is not imported");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_failed_over_from_is_cancelled_then_and_its_record_removed_at_the_end() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+
+        settle_poll(
+            &mut queued,
+            &[failed("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        // slskd may still be retrying it, into this track's folder.
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+
+        stub.set_listing(vec![
+            failed("peer_a", "a/07 - Wake Up.flac"),
+            completed("peer_b", "b/07 - Wake Up.flac"),
+        ]);
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![
+                Cancel::only("peer_a", "t-a/07 - Wake Up.flac"),
+                Cancel::only("peer_b", "t-b/07 - Wake Up.flac"),
+                Cancel::removing("peer_a", "t-a/07 - Wake Up.flac"),
+            ]
+        );
+        assert!(pending.is_empty(), "the retry's file is imported");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_finished_before_its_cancel_is_imported_and_keeps_its_record() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![completed("peer_a", "a/07 - Wake Up.flac")]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")],
+            "its file may still be on its way out of the incomplete folder"
+        );
+        assert!(pending.is_empty(), "phase 3 imports it");
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_wait_removes_only_this_runs_records_that_ended_without_a_file() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![
+            queued_track(
+                vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+                &backend,
+            ),
+            queued_track(
+                vec![item("peer_b", "Wake Up", "b/07 - Wake Up.flac")],
+                &backend,
+            ),
+        ];
+        // The first failed out of peers, the second finished in time.
+        let mut pending = HashSet::new();
+        stub.set_listing(vec![
+            failed("peer_a", "a/07 - Wake Up.flac"),
+            completed("peer_b", "b/07 - Wake Up.flac"),
+            // An earlier run's record of the same file.
+            transfer(
+                "peer_a",
+                "a/07 - Wake Up.flac",
+                "t-earlier",
+                DownloadState::Cancelled,
+            ),
+        ]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
