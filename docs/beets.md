@@ -37,7 +37,7 @@ When beets handled the import as one task (one track, or one album folder that b
 
 ## Image tiers
 
-Soulbeet ships three image tiers: light (the default, MusicBrainz tagging only), medium (adds AcoustID fingerprint matching via the `chroma` plugin), and full (adds cover art, lyrics, ReplayGain, and more). `:latest`, `:latest-medium` and `:latest-full` are the newest release of each tier. `:light`, `:medium` and `:full` follow master instead: every commit to master moves them, so between releases they hold code that is not released yet, and `:light` is then a newer image than `:latest`. See [beets-plugins.md](beets-plugins.md#image-tags) for every tag, and for what each tier ships, how to switch, and how to drop in your own plugins.
+Soulbeet ships three image tiers: light (the default, MusicBrainz tagging only), medium (adds AcoustID fingerprint matching via the `chroma` plugin), and full (adds cover art, lyrics, ReplayGain, and more). `:latest`, `:latest-medium` and `:latest-full` are the newest release of each tier. `:light`, `:medium` and `:full` follow master instead: every commit to master and every release moves them, so between releases they hold code that is not released yet, and `:light` is then a newer image than `:latest`. See [beets-plugins.md](beets-plugins.md#image-tags) for every tag, and for what each tier ships, how to switch, and how to drop in your own plugins.
 
 ## Library management
 

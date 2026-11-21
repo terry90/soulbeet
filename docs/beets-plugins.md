@@ -26,9 +26,9 @@ Each tier is published under three kinds of tag:
 | medium | `:latest-medium` | `:v0.9.0-medium` | `:medium` |
 | full | `:latest-full` | `:v0.9.0-full` | `:full` |
 
-- A release moves the `:latest` tags and the master tags to its build, and adds its own version tags.
-- Every commit to master moves only `:light`, `:medium` and `:full`. Between releases they hold code that is not released yet, so `:light` is not the same image as `:latest`.
-- A test release such as `v1.2.3-rc.1` gets only its own tags (`:v1.2.3-rc.1`, `:v1.2.3-rc.1-medium`, `:v1.2.3-rc.1-full`) and moves none of the others.
+- A release moves the `:latest` tags and `:light`, `:medium` and `:full` to its build, and adds its own version tags.
+- Every commit to master moves `:light`, `:medium` and `:full` (and `:master` with its `-light`, `-medium` and `-full` variants), never the `:latest` tags. Between releases they hold code that is not released yet, so `:light` is not the same image as `:latest`.
+- A test release such as `v1.2.3-rc.1` gets only its own tags, such as `:v1.2.3-rc.1`, `:v1.2.3-rc.1-medium` and `:v1.2.3-rc.1-full`, and moves none of the others.
 
 To stay on releases, use a `:latest` tag or a version tag. Use `:light`, `:medium` or `:full` only if you want to run master.
 
