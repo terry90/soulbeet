@@ -360,8 +360,11 @@ pub struct DownloadMonitor {
     ledger: Ledger,
     /// Finished files of an album batch found on disk before it was watched
     /// (a resumed batch's): imported with the batch's album once every slot
-    /// settled, or failed with its slots when it stops early.
+    /// settled, or when it stops early (`stop_early`).
     found: Vec<ResolvedSlot>,
+    /// Each slot's transfer as the last readable listing showed it, paired
+    /// with the slot: what a batch that stops early knows finished.
+    last_listed: Vec<(usize, DownloadProgress)>,
 }
 
 impl DownloadMonitor {
@@ -408,13 +411,14 @@ impl DownloadMonitor {
             completed_seen: HashSet::new(),
             ledger,
             found: Vec::new(),
+            last_listed: Vec::new(),
         }
     }
 
     /// Hands an album batch `found`, finished files of it already on disk:
     /// they are imported with the files it watches once every one of those
-    /// settled, fail with them when the monitor stops before that, and are
-    /// never resolved again for another slot.
+    /// settled, or with the ones that finished when the monitor stops before
+    /// that, and are never resolved again for another slot.
     pub fn with_found(mut self, found: Vec<ResolvedSlot>) -> Self {
         let mut claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
         claimed.extend(found.iter().filter_map(|f| file_id(&f.path)));
@@ -587,8 +591,8 @@ impl DownloadMonitor {
         }
     }
 
-    /// Count a failed read of slskd's transfer list. Returns whether the
-    /// batch was failed, so the monitor must stop.
+    /// Count a failed read of slskd's transfer list. Returns the failure the
+    /// batch must stop with (`stop_early`), or None to keep polling.
     ///
     /// An unparseable list is fused by count (`MAX_INVALID_RESPONSES`).
     /// Every error is also fused by time: transport errors are deliberately
@@ -596,7 +600,7 @@ impl DownloadMonitor {
     /// while no list can be read no per-track deadline is ever evaluated and
     /// the monitor would poll for the life of the process (#78). The batch
     /// fails with the error that ended it.
-    fn poll_failed(&mut self, e: SoulseekError, invalid_responses: &mut u32) -> bool {
+    fn poll_failed(&self, e: SoulseekError, invalid_responses: &mut u32) -> Option<Failure> {
         if let SoulseekError::InvalidResponse(_) = e {
             // Schema drift: slskd answered but its downloads list no
             // longer parses. That will not fix itself, so fail the
@@ -609,14 +613,13 @@ impl DownloadMonitor {
                 invalid_responses, MAX_INVALID_RESPONSES, e
             );
             if *invalid_responses >= MAX_INVALID_RESPONSES {
-                self.fail_unprocessed_tracks(list_unreadable(&e));
-                return true;
+                return Some(list_unreadable(&e));
             }
         } else {
             warn!("Error fetching download status from slskd: {}", e);
         }
         if self.last_readable_poll.elapsed() <= BACKEND_STALL_TIMEOUT {
-            return false;
+            return None;
         }
         let failure = stalled(&e);
         warn!(
@@ -624,8 +627,7 @@ impl DownloadMonitor {
             failure.message,
             self.filenames()
         );
-        self.fail_unprocessed_tracks(failure);
-        true
+        Some(failure)
     }
 
     /// Attach alternate sources so failed transfers retry from another peer.
@@ -808,6 +810,9 @@ impl DownloadMonitor {
         let mut poll_count = 0;
         let mut backend_failures: u32 = 0;
         let mut invalid_responses: u32 = 0;
+        // The last backend looked up, which holds the records of the files a
+        // batch that stops early still imports.
+        let mut last_backend: Option<Arc<dyn DownloadBackend>> = None;
         self.last_readable_poll = Instant::now();
 
         // Poll immediately on first iteration
@@ -824,6 +829,7 @@ impl DownloadMonitor {
             let backend = match download_backend(None).await {
                 Ok(b) => {
                     backend_failures = 0;
+                    last_backend = Some(Arc::clone(&b));
                     b
                 }
                 Err(e) => {
@@ -833,7 +839,8 @@ impl DownloadMonitor {
                         backend_failures, MAX_BACKEND_FAILURES, e
                     );
                     if backend_failures >= MAX_BACKEND_FAILURES {
-                        self.fail_unprocessed_tracks(backend_unavailable(&e));
+                        self.stop_early(backend_unavailable(&e), last_backend.as_ref())
+                            .await;
                         break;
                     }
                     interval.tick().await;
@@ -878,7 +885,8 @@ impl DownloadMonitor {
                     }
                 }
                 Err(e) => {
-                    if self.poll_failed(e, &mut invalid_responses) {
+                    if let Some(failure) = self.poll_failed(e, &mut invalid_responses) {
+                        self.stop_early(failure, Some(&backend)).await;
                         break;
                     }
                 }
@@ -1015,6 +1023,7 @@ impl DownloadMonitor {
         }
 
         let matched = self.find_matching_downloads(&downloads, backend);
+        self.last_listed = matched.clone();
 
         let watched = (0..self.tracked_files.len())
             .filter(|slot| self.watching(*slot))
@@ -1549,34 +1558,63 @@ impl DownloadMonitor {
         !retried
     }
 
-    /// Mark every watched track as failed and notify the UI. Used when
+    /// Ends a batch that must stop before its transfers finished, `failure`
+    /// saying why: every watched slot still under way fails with it. An
+    /// album batch then imports what it has as a partial album, as it does
+    /// once every slot settled (`finish_album`): the slots the last readable
+    /// listing showed finished, with the files it was handed found. Its
+    /// other transfers may still run where Soulful cannot see, and stay
+    /// failed for a retry.
+    ///
+    /// `backend` is the one that listed those transfers, which removes their
+    /// records once their files are found. None when no backend was ever
+    /// looked up: then nothing was listed, no slot finished, and only the
+    /// found files are imported.
+    async fn stop_early(&mut self, failure: Failure, backend: Option<&Arc<dyn DownloadBackend>>) {
+        self.fail_unprocessed_tracks(failure);
+        if self.batch.import_mode != ImportMode::Album {
+            return;
+        }
+        match backend {
+            Some(backend) => {
+                let listed = std::mem::take(&mut self.last_listed);
+                self.finish_album(&listed, backend).await;
+            }
+            None => {
+                let found = std::mem::take(&mut self.found);
+                self.import_album(found).await;
+            }
+        }
+    }
+
+    /// Mark every watched track as failed and notify the UI, except a
+    /// finished one of an album batch (`stop_early` imports it). Used when
     /// monitoring must stop early so downloads are never left dangling. With
     /// no backend at hand their keys are released when the monitor drops.
-    ///
-    /// The files the batch was handed found on disk fail with them, as its
-    /// finished slots do: its transfers may still run where Soulful cannot
-    /// see, so no part of its album is imported, and the files stay where
-    /// they are.
     fn fail_unprocessed_tracks(&mut self, failure: Failure) {
+        let album = self.batch.import_mode == ImportMode::Album;
         let mut failed: Vec<DownloadProgress> = Vec::new();
         for slot in 0..self.tracked_files.len() {
-            if self.watching(slot) {
+            if self.watching(slot) && !(album && self.finished_in(slot, &self.last_listed)) {
                 self.track_states[slot].phase = SlotPhase::Settled;
                 let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
                 failed.push(self.stamp(slot, row));
             }
         }
-        failed.extend(
-            std::mem::take(&mut self.found)
-                .into_iter()
-                .map(|f| f.row.failed_with(failure.clone())),
-        );
         self.report(JobState::Failed, failed);
     }
 
+    /// Whether `matched` shows the transfer `slot` watches completed.
+    fn finished_in(&self, slot: usize, matched: &[(usize, DownloadProgress)]) -> bool {
+        matched
+            .iter()
+            .any(|(s, dl)| *s == slot && self.is_current(slot, dl) && is_completed(&dl.state))
+    }
+
     /// Check if all downloads are complete. Returns true if monitoring should stop.
-    /// It is the one place a batch is found finished, so the one place an
-    /// album batch imports its album: its watched slots, the ones joining
+    /// It is the one place a batch that runs to its end is found finished, so
+    /// the one place it imports its album (`stop_early` imports a partial one
+    /// for a batch that cannot): its watched slots, the ones joining
     /// requests added, and the files it was handed found.
     ///
     /// A track is settled when it left `Watching` or its transfer completed
@@ -1589,12 +1627,8 @@ impl DownloadMonitor {
         matched: &[(usize, DownloadProgress)],
         backend: &Arc<dyn DownloadBackend>,
     ) -> bool {
-        let all_settled = (0..self.tracked_files.len()).all(|slot| {
-            !self.watching(slot)
-                || matched.iter().any(|(s, dl)| {
-                    *s == slot && self.is_current(slot, dl) && is_completed(&dl.state)
-                })
-        });
+        let all_settled = (0..self.tracked_files.len())
+            .all(|slot| !self.watching(slot) || self.finished_in(slot, matched));
 
         // A joining request may still be enqueueing into this batch, or its
         // slots wait to be drained: finishing now would leave them unwatched.
@@ -2692,6 +2726,7 @@ mod tests {
         // instance (#78).
         let (tx, mut rx) = broadcast::channel(16);
         let (mut m, _recorded) = monitor_on(tx, vec!["peer_a", "peer_a"], vec!["a.flac", "b.flac"]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut invalid = 0;
         let circuit_open = || SoulseekError::Api {
             status: 503,
@@ -2699,15 +2734,15 @@ mod tests {
         };
 
         assert!(
-            !m.poll_failed(circuit_open(), &mut invalid),
+            m.poll_failed(circuit_open(), &mut invalid).is_none(),
             "gave up while slskd was fine"
         );
 
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
-        assert!(
-            m.poll_failed(circuit_open(), &mut invalid),
-            "polled a dead backend forever"
-        );
+        let failure = m
+            .poll_failed(circuit_open(), &mut invalid)
+            .expect("polled a dead backend forever");
+        m.stop_early(failure, Some(&backend)).await;
 
         assert!(
             (0..2).all(|slot| phase(&m, slot) == SlotPhase::Settled),
@@ -2742,11 +2777,13 @@ mod tests {
         let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
 
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let refused = SoulseekError::Api {
             status: 401,
             message: String::new(),
         };
-        assert!(m.poll_failed(refused, &mut 0));
+        let failure = m.poll_failed(refused, &mut 0).expect("the batch stops");
+        m.stop_early(failure, Some(&backend)).await;
 
         let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
             panic!("the UI was never told the batch died");
@@ -2771,11 +2808,15 @@ mod tests {
         let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
         let drift =
             || SoulseekError::InvalidResponse("JSON parse error: missing field `id`".into());
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut invalid = 0;
         for _ in 1..MAX_INVALID_RESPONSES {
-            assert!(!m.poll_failed(drift(), &mut invalid));
+            assert!(m.poll_failed(drift(), &mut invalid).is_none());
         }
-        assert!(m.poll_failed(drift(), &mut invalid));
+        let failure = m
+            .poll_failed(drift(), &mut invalid)
+            .expect("the fuse burns");
+        m.stop_early(failure, Some(&backend)).await;
 
         let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
             panic!("the UI was never told the batch died");
@@ -3976,8 +4017,24 @@ mod tests {
             .collect()
     }
 
+    /// slskd answering that it is unavailable.
+    fn slskd_unavailable() -> SoulseekError {
+        SoulseekError::Api {
+            status: 503,
+            message: "Circuit breaker is open - slskd appears to be unavailable".to_string(),
+        }
+    }
+
+    /// The items of each import job the import queue has sent back so far.
+    fn import_jobs(rx: &mut broadcast::Receiver<DownloadEvent>) -> Vec<Vec<String>> {
+        import_events(rx)
+            .into_iter()
+            .map(|rows| rows.into_iter().map(|r| r.item).collect())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_resumed_album_cut_off_from_slskd_fails_its_found_files_with_the_rest() {
+    async fn a_resumed_album_cut_off_from_slskd_imports_its_found_files_and_fails_the_rest() {
         let (m, base, mut imports, mut recorded) = disk_monitor(
             &UserId::new("monitor-album-found-stalled"),
             &["02.flac"],
@@ -3986,44 +4043,107 @@ mod tests {
         .await;
         let one = found_in(&m, base.path(), "01.flac", 1);
         let mut m = m.with_found(vec![one]);
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         // 02 may still be downloading in a slskd Soulful has not read for 10 minutes.
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
-        let unreachable = || SoulseekError::Api {
-            status: 503,
-            message: "Circuit breaker is open - slskd appears to be unavailable".to_string(),
-        };
 
-        assert!(m.poll_failed(unreachable(), &mut 0));
+        let failure = m
+            .poll_failed(slskd_unavailable(), &mut 0)
+            .expect("the batch stops");
+        m.stop_early(failure, Some(&backend)).await;
 
-        let mut rows = recorded_rows(&mut recorded);
-        rows.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(
-            rows,
-            vec![
-                (
-                    JobState::Failed,
-                    "01.flac".to_string(),
-                    Some(FailureCode::BackendUnreachable)
-                ),
-                (
-                    JobState::Failed,
-                    "02.flac".to_string(),
-                    Some(FailureCode::BackendUnreachable)
-                ),
-            ]
+            recorded_rows(&mut recorded),
+            vec![(
+                JobState::Failed,
+                "02.flac".to_string(),
+                Some(FailureCode::BackendUnreachable)
+            )]
         );
+        assert_eq!(import_jobs(&mut imports), vec![vec!["01.flac".to_string()]]);
         assert!(
             m.found.is_empty(),
             "nothing is left to import after the run"
         );
-        assert!(import_events(&mut imports).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_album_cut_off_from_slskd_imports_the_files_it_finished() {
+        let (mut m, _base, mut imports, mut recorded) = disk_monitor(
+            &UserId::new("monitor-album-finished-stalled"),
+            &["01.flac", "02.flac"],
+            &["01.flac"],
+        )
+        .await;
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let listing = vec![
+            listed("peer_a", "01.flac", DownloadState::Completed),
+            listed("peer_a", "02.flac", DownloadState::InProgress),
+        ];
+        let mut empty = 0;
         assert!(
-            base.path()
-                .join(&m.batch.destination)
-                .join("01.flac")
-                .exists(),
-            "the found file stays for a retry"
+            !m.process_poll_result(listing, &mut empty, 1, &backend)
+                .await
         );
+        assert!(
+            import_jobs(&mut imports).is_empty(),
+            "the album waits for 02"
+        );
+
+        // slskd then stays unreachable for 10 minutes.
+        m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
+        let failure = m
+            .poll_failed(slskd_unavailable(), &mut 0)
+            .expect("the batch stops");
+        m.stop_early(failure, Some(&backend)).await;
+
+        assert_eq!(import_jobs(&mut imports), vec![vec!["01.flac".to_string()]]);
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("01.flac"))],
+            "the finished record is removed once its file was found"
+        );
+        assert_eq!(
+            (phase(&m, 0), phase(&m, 1)),
+            (SlotPhase::HandedOff, SlotPhase::Settled)
+        );
+        let failed: Vec<_> = recorded_rows(&mut recorded)
+            .into_iter()
+            .filter(|(state, ..)| *state == JobState::Failed)
+            .collect();
+        assert_eq!(
+            failed,
+            vec![(
+                JobState::Failed,
+                "02.flac".to_string(),
+                Some(FailureCode::BackendUnreachable)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_album_that_never_had_a_backend_imports_its_found_files() {
+        let (m, base, mut imports, mut recorded) = disk_monitor(
+            &UserId::new("monitor-album-found-no-backend"),
+            &["02.flac"],
+            &["01.flac"],
+        )
+        .await;
+        let one = found_in(&m, base.path(), "01.flac", 1);
+        let mut m = m.with_found(vec![one]);
+
+        m.stop_early(backend_unavailable(&unset_key()), None).await;
+
+        assert_eq!(
+            recorded_rows(&mut recorded),
+            vec![(
+                JobState::Failed,
+                "02.flac".to_string(),
+                Some(FailureCode::BackendNotConfigured)
+            )]
+        );
+        assert_eq!(import_jobs(&mut imports), vec![vec!["01.flac".to_string()]]);
     }
 
     #[tokio::test]
