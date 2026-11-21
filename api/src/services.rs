@@ -1,7 +1,7 @@
 #[cfg(feature = "server")]
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
 
@@ -170,11 +170,30 @@ fn init_importer(id: &str) -> Result<Arc<dyn MusicImporter>, String> {
                 config: config.beets_config().clone(),
                 beet: config.beet_bin().to_path_buf(),
                 python: config.beets_python().map(Path::to_path_buf),
+                libraries: beets_libraries(config.database_url())?,
                 limits: Default::default(),
             })))
         }
         _ => Err(format!("Unknown importer: {}", id)),
     }
+}
+
+/// The folder of the beets library databases: `beets-libraries` next to the
+/// database file `database_url` names, as `secret.key` is, so they sit with
+/// Soulbeet's own data and not on the music's disk, often a network share
+/// that SQLite cannot lock. A relative database path is read against the
+/// working directory.
+#[cfg(feature = "server")]
+fn beets_libraries(database_url: &str) -> Result<PathBuf, String> {
+    crate::db::database_file(database_url)
+        .and_then(Path::parent)
+        .map(|dir| dir.join("beets-libraries"))
+        .ok_or_else(|| {
+            format!(
+                "DATABASE_URL '{database_url}' names no database file to keep the beets \
+                 libraries next to"
+            )
+        })
 }
 
 #[cfg(feature = "server")]
@@ -704,6 +723,19 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("Sign in again"), "{text}");
+    }
+
+    #[test]
+    fn the_beets_libraries_sit_next_to_the_database() {
+        assert_eq!(
+            beets_libraries("sqlite:/data/soulbeet.db"),
+            Ok(PathBuf::from("/data/beets-libraries"))
+        );
+        assert_eq!(
+            beets_libraries("sqlite:soulbeet.db"),
+            Ok(PathBuf::from("beets-libraries"))
+        );
+        assert!(beets_libraries("sqlite::memory:").is_err());
     }
 
     /// Each lookup error fails at the caller's stage: an unreadable settings

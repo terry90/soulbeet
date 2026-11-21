@@ -49,6 +49,12 @@ export const musicDirForApp = process.env.E2E_MUSIC_DIR ?? join(e2eRoot, '.runti
 /** The same music library root on the host, for file assertions. */
 export const musicDirOnHost = join(e2eRoot, '.runtime', 'music');
 
+/**
+ * The beets library databases on the host: `beets-libraries` next to the app's
+ * database, in `.runtime/data` natively and mounted there in compose.
+ */
+export const librariesDirOnHost = join(e2eRoot, '.runtime', 'data', 'beets-libraries');
+
 /** The shared downloads directory on the host. */
 export const downloadsDirOnHost = join(e2eRoot, '.runtime', 'downloads');
 

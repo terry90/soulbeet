@@ -391,6 +391,8 @@ failure_codes! {
     ImportTargetUnwritable => "import_target_unwritable",
     /// The disk beets writes to is full.
     ImportDiskFull => "import_disk_full",
+    /// The beets library database stayed locked past beets' own wait.
+    ImportLibraryLocked => "import_library_locked",
     ImportIdleTimeout => "import_idle_timeout",
     ImportTotalTimeout => "import_total_timeout",
     ImporterBroken => "importer_broken",
@@ -440,12 +442,12 @@ mod tests {
     /// Design section 7 and 13 codes, by stage, with `settings_unreadable`,
     /// `backend_response_unreadable`, `search_query_rejected`,
     /// `search_already_running`, `search_lost`, `import_disk_full`,
-    /// `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
+    /// `import_library_locked`, `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
     /// `sources_exhausted`, `result_rejected`, `search_stopped` and
     /// `no_listening_data`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 84] = [
+    const NAMES: [&str; 85] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -499,6 +501,7 @@ mod tests {
         "import_beets_failed",
         "import_target_unwritable",
         "import_disk_full",
+        "import_library_locked",
         "import_idle_timeout",
         "import_total_timeout",
         "importer_broken",

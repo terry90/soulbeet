@@ -215,6 +215,9 @@ pub enum FailKind {
     TargetUnwritable,
     /// The disk beets writes to is full.
     DiskFull,
+    /// SQLite kept the library database locked past beets' own wait: another
+    /// process held it, or its file system does not lock files (a network share).
+    LibraryLocked,
     AsIsMissingTags,
     ChoiceInvalid,
 }

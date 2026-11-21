@@ -790,7 +790,7 @@ pub(crate) async fn resume_unfinished(
 
     for Interrupted { user, import, rows } in kept {
         if let Err(refusal) = queue
-            .restore(ImportJob::from_stored(import, user.clone()))
+            .restore(ImportJob::from_stored(import, user.clone()), &rows)
             .await
         {
             let rows = rows
