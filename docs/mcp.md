@@ -524,6 +524,7 @@ The ones you are most likely to see:
 | `import_beets_failed` | `import` | beets failed; `cause` holds the end of its output. | Try again later; read beets' output. |
 | `import_target_unwritable` | `import` | beets cannot write into the library folder. | Fix the folder's permissions. |
 | `import_disk_full` | `import` | The disk beets writes to is full. User action `free_disk_space`. | Free disk space, then retry. |
+| `import_library_locked` | `import` | The beets library database stayed locked: another program had it open, or it sits on a network share, where SQLite cannot lock files. Soulbeet tries the import again by itself a few times; `retry_after_seconds` says when the next try is. | Wait for the next try. When the tries run out, close the other program, or keep Soulbeet's data folder on a local disk ([beets.md](beets.md#library-databases)), then retry. |
 | `import_idle_timeout` | `import` | beets printed nothing for too long and was stopped. | Try again later. |
 | `import_total_timeout` | `import` | beets ran past its time limit and was stopped. | Try again later. |
 | `importer_broken` | `import` | beets is not set up so that Soulbeet can run it. User action `fix_importer`. | Fix the beets setup; Settings > Config shows the problem. |

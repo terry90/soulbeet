@@ -1,5 +1,6 @@
 //! Reads tracks back out of soulbeet's per-folder beets libraries.
 
+use super::classify::LOCKED;
 use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
 use super::BeetsSettings;
 use crate::traits::{ForgetOutcome, Relocation};
@@ -7,6 +8,7 @@ use serde::Deserialize;
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use tracing::{info, warn};
 
 /// Starts every `beet ls` row, so text a plugin prints before it (a prompt
 /// without a newline) cannot be read as part of the row.
@@ -21,23 +23,124 @@ struct ExportedItem {
     path: PathBuf,
 }
 
-pub(crate) fn library_db(root: &Path) -> PathBuf {
-    root.join(".beets_library.db")
+/// The file name of a library database, in its folder under
+/// `BeetsSettings::libraries`, and at the root of the music folder itself in
+/// earlier versions.
+const LIBRARY_DB: &str = ".beets_library.db";
+
+/// The files SQLite may keep beside a database: its rollback journal, which
+/// after a crash holds what undoes a half-done write, or a write-ahead log and
+/// its index.
+const COMPANIONS: [&str; 3] = ["-journal", "-wal", "-shm"];
+
+/// The folder that holds the library database of the music folder `root`:
+/// `root`'s own path under `libraries`, so `/music/alice` has
+/// `{libraries}/music/alice/.beets_library.db`. `root` is canonical, as the
+/// import queue keys its libraries.
+pub(crate) fn library_folder(libraries: &Path, root: &Path) -> PathBuf {
+    let mut folder = libraries.to_path_buf();
+    folder.extend(
+        root.components()
+            .filter(|c| matches!(c, Component::Normal(_))),
+    );
+    folder
 }
 
-/// Whether the folder `root` has a library db. A folder that cannot be read
-/// is an error, not a folder without one.
-async fn has_library(root: &Path) -> Result<bool, String> {
-    let db = library_db(root);
-    tokio::fs::try_exists(&db)
+/// The library database of the music folder `root`, in its `library_folder`.
+/// One an earlier version kept at the root of the music folder is moved there
+/// first: music folders are often on a network share, where SQLite cannot
+/// lock its files. A folder that cannot be read is an error.
+pub(crate) async fn library_db(s: &BeetsSettings, root: &Path) -> Result<PathBuf, String> {
+    let folder = library_folder(&s.libraries, root);
+    let db = folder.join(LIBRARY_DB);
+    let earlier = root.join(LIBRARY_DB);
+    if exists(&db).await? || !exists(&earlier).await? {
+        return Ok(db);
+    }
+    move_database(&earlier, &folder, &db).await.map_err(|e| {
+        format!(
+            "Could not move the beets library database {} to {}: {e}",
+            earlier.display(),
+            db.display()
+        )
+    })?;
+    info!(
+        "Moved the beets library database {} to {}",
+        earlier.display(),
+        db.display()
+    );
+    Ok(db)
+}
+
+/// Whether `path` exists. A path that cannot be looked at is an error naming it.
+async fn exists(path: &Path) -> Result<bool, String> {
+    tokio::fs::try_exists(path)
         .await
-        .map_err(|e| format!("Could not read {}: {e}", db.display()))
+        .map_err(|e| format!("Could not read {}: {e}", path.display()))
+}
+
+/// Moves the database `from`, with the files SQLite keeps beside it, to `to`
+/// in `dir`, on another file system as a rule, so by copying. Each companion
+/// is copied, or a stale one at `to` removed, before the database itself is
+/// copied next to `to`, synced and renamed into place: `to` never holds part
+/// of a database. `from` goes last, and one left behind is only logged, as
+/// the copy at `to` is the one used from then on.
+async fn move_database(from: &Path, dir: &Path, to: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    for suffix in COMPANIONS {
+        let source = suffixed(from, suffix);
+        let target = suffixed(to, suffix);
+        match tokio::fs::try_exists(&source).await? {
+            true => copy_synced(&source, &target).await?,
+            false => remove_present(&target).await?,
+        }
+    }
+    let partial = suffixed(to, ".partial");
+    copy_synced(from, &partial).await?;
+    tokio::fs::rename(&partial, to).await?;
+    tokio::fs::File::open(dir).await?.sync_all().await?;
+    let sources = COMPANIONS.map(|suffix| suffixed(from, suffix));
+    for source in sources.iter().map(PathBuf::as_path).chain([from]) {
+        if let Err(e) = remove_present(source).await {
+            warn!(
+                "Could not remove {} after moving it to {}: {e}",
+                source.display(),
+                to.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `path` with `suffix` after its file name, as SQLite names a database's journal.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+async fn copy_synced(from: &Path, to: &Path) -> std::io::Result<()> {
+    tokio::fs::copy(from, to).await?;
+    tokio::fs::File::open(to).await?.sync_all().await
+}
+
+/// Removes the file at `path`, when there is one.
+async fn remove_present(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
+}
+
+/// Whether the music folder `root` has a library db.
+async fn has_library(s: &BeetsSettings, root: &Path) -> Result<bool, String> {
+    exists(&library_db(s, root).await?).await
 }
 
 /// Drops the item at exactly `file` from the library under `root`, leaving
 /// the file on disk.
 pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> ForgetOutcome {
-    match has_library(root).await {
+    match has_library(s, root).await {
         Ok(true) => {}
         Ok(false) => return ForgetOutcome::NotInLibrary,
         Err(e) => return ForgetOutcome::Failed(e),
@@ -332,6 +435,9 @@ async fn run_library(
     command: Vec<OsString>,
 ) -> Result<Vec<String>, RunFailure> {
     let subcommand = command[0].to_string_lossy().into_owned();
+    let db = library_db(s, root)
+        .await
+        .map_err(|text| RunFailure { text, output: None })?;
     let mut retried = false;
     loop {
         let mut rows = Vec::new();
@@ -347,7 +453,7 @@ async fn run_library(
                     rows.push(row.to_string());
                 }
             }
-            Stream::Stderr => locked |= line.contains("database is locked"),
+            Stream::Stderr => locked |= line.contains(LOCKED),
         };
         // beets 2.10+ stores paths relative to the library directory, so -d
         // must name it or they resolve under the config's `directory`.
@@ -355,7 +461,7 @@ async fn run_library(
             "-c".into(),
             s.config.clone().into(),
             "-l".into(),
-            library_db(root).into(),
+            db.clone().into(),
             "-d".into(),
             root.into(),
         ];
@@ -394,20 +500,108 @@ mod tests {
     /// Logs each call of the fake `beet` as one line of args.txt.
     const LOG: &str = "echo \"$*\" >> args.txt";
 
-    /// A folder holding an empty library db and a `beet` that runs `body`
+    /// A music folder with an empty library db and a `beet` that runs `body`
     /// inside it.
     async fn fake_library(body: &str) -> (tempfile::TempDir, BeetsSettings) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(library_db(dir.path()), b"").unwrap();
         let script = format!("cd '{}'\n{body}", dir.path().display());
         let beet = crate::beets::tests::script(dir.path(), "beet", &script).await;
         let settings = BeetsSettings {
             config: dir.path().join("config.yaml"),
             beet,
             python: None,
+            libraries: dir.path().join("libraries"),
             limits: RunLimits::default(),
         };
+        let db = db_of(&settings, dir.path());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"").unwrap();
         (dir, settings)
+    }
+
+    /// Where `s` keeps the library db of the music folder `root`.
+    fn db_of(s: &BeetsSettings, root: &Path) -> PathBuf {
+        library_folder(&s.libraries, root).join(LIBRARY_DB)
+    }
+
+    #[test]
+    fn a_library_db_lives_under_the_libraries_folder_at_its_music_folders_path() {
+        assert_eq!(
+            library_folder(
+                Path::new("/data/beets-libraries"),
+                Path::new("/music/alice")
+            ),
+            PathBuf::from("/data/beets-libraries/music/alice")
+        );
+        assert_eq!(
+            library_folder(Path::new("/data/beets-libraries"), Path::new("/")),
+            PathBuf::from("/data/beets-libraries")
+        );
+    }
+
+    /// Settings whose libraries folder is `dir/libraries`, for a music folder
+    /// at `dir/music`, which is returned.
+    fn moving(dir: &Path) -> (BeetsSettings, PathBuf) {
+        let root = dir.join("music");
+        std::fs::create_dir(&root).unwrap();
+        let settings = BeetsSettings {
+            config: dir.join("config.yaml"),
+            beet: dir.join("beet"),
+            python: None,
+            libraries: dir.join("libraries"),
+            limits: RunLimits::default(),
+        };
+        (settings, root)
+    }
+
+    #[tokio::test]
+    async fn a_db_at_the_root_of_the_music_folder_moves_to_the_libraries_folder_with_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (settings, root) = moving(dir.path());
+        let earlier = root.join(LIBRARY_DB);
+        std::fs::write(&earlier, b"items").unwrap();
+        // A hot journal undoes a write cut short, so it goes with the db.
+        std::fs::write(suffixed(&earlier, "-journal"), b"undo").unwrap();
+        // A log left from an earlier try, with no counterpart now, is not kept.
+        let db = db_of(&settings, &root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(suffixed(&db, "-wal"), b"stale").unwrap();
+
+        assert_eq!(library_db(&settings, &root).await, Ok(db.clone()));
+
+        assert_eq!(std::fs::read(&db).unwrap(), b"items");
+        assert_eq!(std::fs::read(suffixed(&db, "-journal")).unwrap(), b"undo");
+        assert!(!suffixed(&db, "-wal").exists());
+        assert!(!suffixed(&db, ".partial").exists());
+        assert!(!earlier.exists());
+        assert!(!suffixed(&earlier, "-journal").exists());
+        // Once moved, the db stays where it is.
+        assert_eq!(library_db(&settings, &root).await, Ok(db.clone()));
+        assert_eq!(std::fs::read(&db).unwrap(), b"items");
+    }
+
+    #[tokio::test]
+    async fn a_db_in_the_libraries_folder_wins_over_one_left_at_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (settings, root) = moving(dir.path());
+        let db = db_of(&settings, &root);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"moved").unwrap();
+        std::fs::write(root.join(LIBRARY_DB), b"left").unwrap();
+
+        assert_eq!(library_db(&settings, &root).await, Ok(db.clone()));
+        assert_eq!(std::fs::read(&db).unwrap(), b"moved");
+        assert_eq!(std::fs::read(root.join(LIBRARY_DB)).unwrap(), b"left");
+    }
+
+    #[tokio::test]
+    async fn a_music_folder_without_a_db_gets_none_until_beets_makes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (settings, root) = moving(dir.path());
+        let db = db_of(&settings, &root);
+        assert_eq!(library_db(&settings, &root).await, Ok(db));
+        assert!(!settings.libraries.exists());
+        assert_eq!(has_library(&settings, &root).await, Ok(false));
     }
 
     #[tokio::test]
@@ -428,7 +622,7 @@ mod tests {
         let base = format!(
             "-c {} -l {} -d {}",
             settings.config.display(),
-            super::library_db(dir.path()).display(),
+            db_of(&settings, dir.path()).display(),
             dir.path().display()
         );
         assert_eq!(
@@ -468,7 +662,7 @@ mod tests {
         let base = format!(
             "-c {} -l {} -d {}",
             settings.config.display(),
-            super::library_db(dir.path()).display(),
+            db_of(&settings, dir.path()).display(),
             dir.path().display()
         );
         assert_eq!(
@@ -819,7 +1013,7 @@ mod tests {
             forget_item(&settings, dir.path(), &dir.path().join("a.flac")).await,
             ForgetOutcome::NotInLibrary
         );
-        std::fs::remove_file(super::library_db(dir.path())).unwrap();
+        std::fs::remove_file(db_of(&settings, dir.path())).unwrap();
         assert_eq!(
             forget_item(&settings, dir.path(), &dir.path().join("a.flac")).await,
             ForgetOutcome::NotInLibrary
@@ -844,9 +1038,10 @@ mod tests {
             config: dir.path().join("config.yaml"),
             beet: dir.path().join("beet"),
             python: None,
+            libraries: dir.path().join("libraries"),
             limits: RunLimits::default(),
         };
-        let expected = format!("Could not read {}: ", library_db(&root).display());
+        let expected = format!("Could not read {}: ", root.join(LIBRARY_DB).display());
         assert!(matches!(
             forget_item(&settings, &root, &root.join("a.flac")).await,
             ForgetOutcome::Failed(e) if e.starts_with(&expected)

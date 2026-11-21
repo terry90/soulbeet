@@ -1,6 +1,6 @@
 # Beets
 
-This page covers how Soulbeet runs beets: the config file, the import flags, skipped imports, image tiers, per-folder libraries and album mode. The plugins each image tier ships are in [beets-plugins.md](beets-plugins.md).
+This page covers how Soulbeet runs beets: the config file, the import flags, skipped imports, image tiers, library databases and album mode. The plugins each image tier ships are in [beets-plugins.md](beets-plugins.md).
 
 ## Beets configuration
 
@@ -12,6 +12,7 @@ Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_c
 -   `mbtwopass` lives in `/opt/beets-plugins`. To keep it, set `pluginpath: [/opt/beets-plugins, /data/beets-plugins]`.
 -   `discogs` needs `discogs.user_token`.
 -   Soulbeet passes `--log`, which overrides `import.log`, and `--noincremental` and `--noresume`, which override `import.incremental` and `import.resume`.
+-   `library:` is not used: Soulbeet passes each music folder's own database with `-l` (see [Library databases](#library-databases)).
 
 Soulbeet runs every import through a small driver, `lib/soulbeet/src/beets/import.py`, with the Python that runs beets. The driver runs beets' own `beet` command line with the flags below and notes the matches beets weighed, so a skipped import can be finished with one of them (see [Skipped imports](#skipped-imports)). It supports beets 2.8 to 2.11; with a beets it cannot hook into, Soulbeet marks beets as broken.
 
@@ -22,7 +23,7 @@ Default `beet import` flags used:
 -   `--noincremental`: Import a folder again even if beets saw it before, so "Retry import" always runs
 -   `--noresume`: Ignore beets' saved progress from an interrupted run
 -   `-s`: Singleton mode (Default behavior unless `BEETS_ALBUM_MODE` is set)
--   `-l [library_path]`: Library database path (per-folder)
+-   `-l [library_path]`: The music folder's library database (see [Library databases](#library-databases))
 -   `-d [target_path]`: Import to the specific folder selected in the web UI.
 -   `--log [file]`: Where beets writes its import log
 
@@ -39,30 +40,44 @@ When beets handled the import as one task (one track, or one album folder that b
 
 Soulbeet ships three image tiers: `:light` (default, MusicBrainz tagging only), `:medium` (adds AcoustID fingerprint matching via the `chroma` plugin), and `:full` (adds cover art, lyrics, ReplayGain, and more). `:latest` is an alias for `:light` so existing installs keep their current behavior. See [beets-plugins.md](beets-plugins.md) for what each tier ships, how to switch, and how to drop in your own plugins.
 
-## Library management
+## Library databases
 
-**Important**: Each music folder you configure in Soulbeet has its own beets database (`.beets_library.db`) stored at the root of that folder. This enables:
+Each music folder you configure in Soulbeet has its own beets library database. beets uses it to find duplicates within that folder, and Soulbeet uses it to forget or move a track of that folder when it is deleted or replaced. One beets database cannot hold several music folders, which is why the `library:` setting of a beets config is not used.
 
-- Per-folder duplicate detection
-- Independent library management for each user/folder
-- Cross-library duplicate detection
+Soulbeet keeps these databases with its own data: in a `beets-libraries` folder next to the database file `DATABASE_URL` names, at each music folder's path. With `DATABASE_URL=sqlite:/data/soulbeet.db`, the library of `/music/Person1` is `/data/beets-libraries/music/Person1/.beets_library.db`.
+
+### Keep the library databases on a local disk
+
+beets stores its library in SQLite, and SQLite cannot lock a file on most network shares (NFS, SMB/CIFS). A library database on a share makes imports fail with "The beets library database is locked". Your music can stay on the share; only the folder mounted at `/data` needs to be on a local disk:
+
+```yaml
+volumes:
+  - ./data:/data              # local disk: soulbeet.db, secret.key, beets-libraries
+  - /mnt/nas/music:/music     # the share
+```
+
+Earlier versions kept the database at the root of the music folder (`/music/Person1/.beets_library.db`), so on the share. The first import, delete or replace in that folder after the upgrade moves it to `beets-libraries`, with its journal file if it has one.
+
+If you mount a music folder at another path later, move its folder under `beets-libraries` to the new path as well. Otherwise Soulbeet starts an empty library for it, and beets no longer sees the tracks already there as duplicates.
+
+### When the library database is locked
+
+A lock can also come from another program that has the database open, such as a `beet` command you started or a backup tool. When an import finds the database locked, its row says "The beets library database is locked" and when Soulbeet tries again: it imports the files again by itself after 1, 5 and 15 minutes. **Retry import** works during that time too. When the last try still finds it locked, close the other program or move the data folder to a local disk, then click **Retry import**. The automatic tries do not carry on after a restart; **Retry import** stays.
 
 ### Interacting with your library
 
-Each user can have multiple libraries. Each library is a folder that contains music files and a `.beets_library.db` file. This database is used to avoid duplicate tracks within the same library.
+Since each folder has its own database, tracks cannot be compared across libraries. You can still use the `beets` CLI on each library, for example to add tracks outside of Soulbeet and keep them in sync with your library.
 
-Since we use different databases, we can't directly compare tracks across libraries. However, we can use the `beets` CLI to interact with each library individually. This way you can add tracks outside of Soulbeet but keep them in sync with your library.
-
-To manually interact with a library (list tracks, modify tags, remove items, etc.), use the `beet` CLI with the `-l` flag pointing to the folder's database:
+To manually interact with a library (list tracks, modify tags, remove items, etc.), point `beet` at the folder's database with `-l` and at the folder itself with `-d`. beets stores each track's path relative to the folder, so without `-d` it looks for the files in the wrong place:
 
 ```bash
 # List all tracks in a library
-beet -l /music/Person1/.beets_library.db ls
+beet -l /data/beets-libraries/music/Person1/.beets_library.db -d /music/Person1 ls
 ```
 
 If using Docker, run these commands inside the container:
 ```bash
-docker exec -it <container_name> beet -l /music/Person1/.beets_library.db ls
+docker exec -it <container_name> beet -l /data/beets-libraries/music/Person1/.beets_library.db -d /music/Person1 ls
 ```
 
 For more beets commands, see the [beets documentation](https://beets.readthedocs.io/en/stable/reference/cli.html).
