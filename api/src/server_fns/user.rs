@@ -408,21 +408,17 @@ mod tests {
         assert!(reread(&db, &bob).await.password_matches("x"));
     }
 
-    /// Writes a staged file at `{root}/music/{rel}` for a pending discovery track.
-    fn staged(lib: &Library, rel: &str) -> std::path::PathBuf {
-        let path = lib.root.join("music").join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"audio").unwrap();
-        path
-    }
-
     #[tokio::test]
     async fn deleting_a_user_removes_their_staged_discovery_files_and_keeps_their_music() {
         let lib = Library::new().await;
-        let alices = staged(&lib, "alice/Discovery/Explore/Marrow Choir/03.flac");
+        lib.write("alice/Discovery/Explore/Marrow Choir/03.flac", b"audio");
+        let alices = lib
+            .root
+            .join("music/alice/Discovery/Explore/Marrow Choir/03.flac");
         lib.pending_track("t1", "alice-music", "Explore", &alices, None)
             .await;
-        let bobs = staged(&lib, "bob/Discovery/Explore/04.flac");
+        lib.write("bob/Discovery/Explore/04.flac", b"audio");
+        let bobs = lib.root.join("music/bob/Discovery/Explore/04.flac");
         lib.pending_track("t2", "bob-music", "Explore", &bobs, None)
             .await;
         delete_user_in(&lib.db, "alice").await.unwrap();
@@ -445,7 +441,8 @@ mod tests {
             .unwrap();
         lib.folder(&admin, "admin-music", "music/admin", false)
             .await;
-        let file = staged(&lib, "admin/Discovery/Explore/03.flac");
+        lib.write("admin/Discovery/Explore/03.flac", b"audio");
+        let file = lib.root.join("music/admin/Discovery/Explore/03.flac");
         lib.pending_track("t1", "admin-music", "Explore", &file, None)
             .await;
         assert_eq!(code(delete_user_in(&lib.db, &admin).await), REFUSAL_CODE);
