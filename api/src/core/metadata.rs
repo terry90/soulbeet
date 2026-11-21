@@ -57,7 +57,7 @@ pub(crate) fn provider_failure(e: &MetadataError) -> Failure {
     e.failure(Stage::Metadata, e.to_string())
 }
 
-/// Artists MusicBrainz finds by name.
+/// Artists MusicBrainz finds by name or alias.
 pub async fn artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, Failure> {
     musicbrainz::search_artists(query, limit)
         .await

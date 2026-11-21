@@ -176,27 +176,60 @@ where
     }
 }
 
-/// The `query=` parameter of a MusicBrainz search for `fields`, each
-/// `field:"value"`, joined by AND. Inside a quoted phrase only `"` and `\`
-/// mean anything to Lucene, so they are escaped; the whole query is then
-/// form-encoded, so `&`, `#`, `+` and `%` reach MusicBrainz as text.
+/// `field:"value"`. Inside a quoted phrase only `"` and `\` mean anything to
+/// Lucene, so they are escaped.
+fn phrase(field: &str, value: &str) -> String {
+    let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{field}:\"{value}\"")
+}
+
+/// The `query=` parameter of a MusicBrainz search for the Lucene query
+/// `lucene`, form-encoded so `&`, `#`, `+` and `%` reach MusicBrainz as text.
 /// lucene_query_builder 0.3.0 quotes only a value holding a space and escapes
 /// nothing (`QueryString`'s Display), and musicbrainz_rs appends the
 /// parameter to the URL as it is (src/api/search_query.rs:114-127).
-fn lucene_query(fields: &[(&str, &str)]) -> String {
-    let lucene = fields
-        .iter()
-        .map(|(field, value)| {
-            let value = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("{field}:\"{value}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+fn query_param(lucene: &str) -> String {
     format!(
         "query={}",
         url::form_urlencoded::byte_serialize(lucene.as_bytes()).collect::<String>()
     )
 }
+
+/// The artist search for `name`. Only the artist index holds aliases, such
+/// as "Shirō Sagisu" for 鷺巣詩郎, and its `artist` field is the name alone.
+fn artist_search_query(name: &str) -> String {
+    query_param(&format!(
+        "{} OR {}",
+        phrase("artist", name),
+        phrase("alias", name)
+    ))
+}
+
+/// A track or album search for `title` in `title_field`. With an artist
+/// filter, the artist's `name_field` holds the name as typed, or the artist
+/// is one of `found`, the artists the artist search found for that name.
+fn titled_query(
+    title_field: &str,
+    title: &str,
+    name_field: &str,
+    artist: Option<(&str, &[ArtistMatch])>,
+) -> String {
+    let title = phrase(title_field, title);
+    let lucene = match artist {
+        None => title,
+        Some((name, found)) => {
+            let by: Vec<String> = std::iter::once(phrase(name_field, name))
+                .chain(found.iter().map(|a| phrase("arid", &a.mbid)))
+                .collect();
+            format!("({}) AND {title}", by.join(" OR "))
+        }
+    };
+    query_param(&lucene)
+}
+
+/// Artists an artist filter can match by MBID: MusicBrainz's default page,
+/// which keeps their MBIDs within a short query URL.
+const FILTER_ARTISTS: u8 = 25;
 
 /// An enumeration to specify the type of search.
 #[derive(Debug)]
@@ -220,15 +253,20 @@ pub async fn search(
         search_type, query, artist
     );
 
+    // The recording and release group indexes hold artist names but no
+    // aliases, and one search cannot reach into another index, so an artist
+    // typed by an alias ("Shiro Sagisu" for 鷺巣詩郎) is found in the artist
+    // index first and then matched by MBID.
+    let found = match artist {
+        Some(name) => search_artists(name, FILTER_ARTISTS).await?,
+        None => Vec::new(),
+    };
+    let by_artist = artist.as_deref().map(|name| (name, found.as_slice()));
+
     match search_type {
         SearchType::Track => {
             let search_results = with_retry("MusicBrainz track search", || {
-                let mut fields: Vec<(&str, &str)> = artist
-                    .iter()
-                    .map(|artist| ("artistname", artist.as_str()))
-                    .collect();
-                fields.push(("recording", query));
-                let search_query = lucene_query(&fields);
+                let search_query = titled_query("recording", query, "artistname", by_artist);
                 async move {
                     Recording::search(search_query)
                         .limit(limit)
@@ -288,12 +326,7 @@ pub async fn search(
         }
         SearchType::Album => {
             let search_results = with_retry("MusicBrainz album search", || {
-                let mut fields: Vec<(&str, &str)> = artist
-                    .iter()
-                    .map(|artist| ("artist", artist.as_str()))
-                    .collect();
-                fields.push(("releasegroup", query));
-                let search_query = lucene_query(&fields);
+                let search_query = titled_query("releasegroup", query, "artist", by_artist);
                 async move {
                     ReleaseGroup::search(search_query)
                         .limit(limit)
@@ -472,11 +505,11 @@ pub struct RecordingReleases {
     pub releases: Vec<RecordingRelease>,
 }
 
-/// Searches MusicBrainz for artists by name.
+/// Searches MusicBrainz for artists by name or alias.
 pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, MetadataError> {
     let client = musicbrainz_client();
     let found = with_retry("MusicBrainz artist search", || {
-        let search_query = lucene_query(&[("artist", query)]);
+        let search_query = artist_search_query(query);
         async move {
             Artist::search(search_query)
                 .limit(limit)
@@ -953,7 +986,7 @@ mod tests {
     fn a_search_sends_its_text_as_text() {
         // Each of these is URL or Lucene syntax when sent as it is.
         let name = r##"Simon & Garfunkel + "#1" \ (live): a/b"##;
-        let url = Artist::search(lucene_query(&[("artist", name)]))
+        let url = Artist::search(query_param(&phrase("artist", name)))
             .limit(10)
             .as_api_request(musicbrainz_client())
             .url;
@@ -974,9 +1007,60 @@ mod tests {
                 ("limit".to_string(), "10".to_string())
             ]
         );
+        let none: &[ArtistMatch] = &[];
         assert_eq!(
-            lucene_query(&[("artistname", "Bing Crosby"), ("recording", "Silent Night")]),
-            "query=artistname%3A%22Bing+Crosby%22+AND+recording%3A%22Silent+Night%22"
+            titled_query(
+                "recording",
+                "Silent Night",
+                "artistname",
+                Some(("Bing Crosby", none))
+            ),
+            "query=%28artistname%3A%22Bing+Crosby%22%29+AND+recording%3A%22Silent+Night%22"
+        );
+    }
+
+    /// The Lucene query a `query=` parameter carries.
+    fn lucene(param: &str) -> String {
+        let (key, value) = url::form_urlencoded::parse(param.as_bytes())
+            .into_owned()
+            .next()
+            .unwrap();
+        assert_eq!(key, "query");
+        value
+    }
+
+    #[test]
+    fn an_artist_typed_by_an_alias_is_matched_by_mbid() {
+        assert_eq!(
+            lucene(&artist_search_query("Shiro Sagisu")),
+            r#"artist:"Shiro Sagisu" OR alias:"Shiro Sagisu""#
+        );
+        // GET https://musicbrainz.org/ws/2/artist?query=artist:"Shiro Sagisu" OR alias:"Shiro Sagisu"&limit=5&fmt=json,
+        // fetched 2026-11-21: 鷺巣詩郎, found by the alias "Shirô Sagisu" (the artist index ignores diacritics).
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/artist_search_shiro_sagisu.json"
+        ))
+        .unwrap();
+        let found = [artist_match(
+            serde_json::from_value(body["artists"][0].clone()).unwrap(),
+        )];
+        let artist = Some(("Shiro Sagisu", found.as_slice()));
+        assert_eq!(
+            lucene(&titled_query(
+                "recording",
+                "Here to Stay",
+                "artistname",
+                artist
+            )),
+            r#"(artistname:"Shiro Sagisu" OR arid:"9b127d23-f877-4541-83cd-44f46393dfb7") AND recording:"Here to Stay""#
+        );
+        assert_eq!(
+            lucene(&titled_query("releasegroup", "Bleach", "artist", artist)),
+            r#"(artist:"Shiro Sagisu" OR arid:"9b127d23-f877-4541-83cd-44f46393dfb7") AND releasegroup:"Bleach""#
+        );
+        assert_eq!(
+            lucene(&titled_query("releasegroup", "Bleach", "artist", None)),
+            r#"releasegroup:"Bleach""#
         );
     }
 
