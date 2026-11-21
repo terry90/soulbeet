@@ -222,7 +222,7 @@ impl ImportJob {
             choice: stored.choice,
             choices: stored.choices.map(Arc::new),
             last_run: stored.last_run.map(Arc::new),
-            // A restart does not carry on the automatic runs; Retry stays offered.
+            // A restart starts the automatic runs over (`ImportQueue::restore`).
             lock_retries: 0,
         }
     }
@@ -787,8 +787,8 @@ impl Shared {
 }
 
 /// How long until the queue runs `job` again by itself after a run that ended with `result`:
-/// when that run found the library database locked, the job is kept for a retry (`keep`, which
-/// only an owned job is), and `waits` has a wait left for it.
+/// when that run found the library database locked, the job is kept for a retry (`keep`) and has
+/// an owner, whose rows the retry store keeps, and `waits` has a wait left for it.
 fn lock_retry_wait(
     job: &ImportJob,
     result: &ImportResult,
@@ -1627,7 +1627,7 @@ mod tests {
         );
         let stored = kept.stored().expect("an owned job is stored");
         assert_eq!(
-            queue.restore(ImportJob::from_stored(stored, alice())).await,
+            queue.restore(ImportJob::from_stored(stored, alice()), &[]).await,
             Ok(())
         );
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
@@ -1650,7 +1650,7 @@ mod tests {
             &["a"],
         );
         let refused = queue
-            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()))
+            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()), &[])
             .await
             .unwrap_err();
         assert_eq!(refused, files_gone());
@@ -1899,7 +1899,7 @@ mod tests {
         assert_eq!(stored.duplicates, DuplicateRule::Skip);
         // What the restore after a restart does with the stored row.
         queue
-            .restore(ImportJob::from_stored(stored, alice()))
+            .restore(ImportJob::from_stored(stored, alice()), &[])
             .await
             .unwrap();
         queue

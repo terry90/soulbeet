@@ -884,12 +884,12 @@ pub(crate) fn undeletable_kept_file(acq: &Acquire) -> &'static str {
 /// `import` ended with nothing to pick: kept for a decision in the ledger, and in `acq`'s queue
 /// when `queued` (one a restart could not restore is in the ledger alone).
 async fn keep(acq: &Acquire, import: StoredImport, queued: bool) {
-    let rows = (import.rows.iter())
+    let rows: Vec<DownloadProgress> = (import.rows.iter())
         .map(|(_, row)| row.clone().with_state(DownloadState::ImportSkipped))
         .collect();
     if queued {
         acq.queue
-            .restore(ImportJob::from_stored(import.clone(), alice()))
+            .restore(ImportJob::from_stored(import.clone(), alice()), &rows)
             .await
             .expect("its sources hold audio");
     }

@@ -60,9 +60,11 @@ Earlier versions kept the database at the root of the music folder (`/music/Pers
 
 If you mount a music folder at another path later, move its folder under `beets-libraries` to the new path as well. Otherwise Soulbeet starts an empty library for it, and beets no longer sees the tracks already there as duplicates.
 
+If you delete a music folder to start it over, delete its folder under `beets-libraries` too (for `/music/Person1`, `/data/beets-libraries/music/Person1`). Otherwise beets still lists the deleted tracks and skips them as duplicates.
+
 ### When the library database is locked
 
-A lock can also come from another program that has the database open, such as a `beet` command you started or a backup tool. When an import finds the database locked, its row says "The beets library database is locked" and when Soulbeet tries again: it imports the files again by itself after 1, 5 and 15 minutes. **Retry import** works during that time too. When the last try still finds it locked, close the other program or move the data folder to a local disk, then click **Retry import**. The automatic tries do not carry on after a restart; **Retry import** stays.
+A lock can also come from another program that has the database open, such as a `beet` command you started or a backup tool. When an import finds the database locked, its row says "The beets library database is locked" and when Soulbeet tries again: it imports the files again by itself after 1, 5 and 15 minutes. **Retry import** works during that time too. When the last try still finds it locked, close the other program or move the data folder to a local disk, then click **Retry import**. A restart starts the tries over, from the 1 minute wait.
 
 ### Interacting with your library
 

@@ -63,10 +63,11 @@ export interface LibraryItem {
 
 /**
  * Every track in the folder's beets library, which the app keeps under
- * `beets-libraries` at the folder's path as the app sees it.
+ * `beets-libraries` at the folder's path as the app sees it: in the app's
+ * music root, `musicRootForApp` (the MCP instance's is `mcpMusicDirForApp`).
  */
-export function libraryItems(folderName: string): LibraryItem[] {
-  const path = join(librariesDirOnHost, musicDirForApp, folderName, '.beets_library.db');
+export function libraryItems(folderName: string, musicRootForApp: string = musicDirForApp): LibraryItem[] {
+  const path = join(librariesDirOnHost, musicRootForApp, folderName, '.beets_library.db');
   const db = new DatabaseSync(path, { readOnly: true });
   try {
     // beets may be writing its library: wait for its lock instead of failing.
