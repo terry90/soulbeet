@@ -1,9 +1,9 @@
-// Opens the MCP instance once, before the acceptance tests: the same app
-// configuration as the main suite's setup, then a new password for the
-// seeded admin, the last reason the security gate keeps MCP closed.
+// Opens the MCP instance once, before the acceptance tests: a new password
+// for the seeded admin, the last reason the security gate keeps MCP closed,
+// then the same app configuration as the main suite's setup.
 
 import { expect, test } from '@playwright/test';
-import { changePassword, configureInstance, loginViaUi } from '../helpers/app.js';
+import { chooseAdminPassword, configureInstance } from '../helpers/app.js';
 import {
   mcpAdminPassword,
   mcpBaseUrl,
@@ -41,10 +41,11 @@ test('open the MCP instance', async ({ page }) => {
       { timeout: 60_000 },
     )
     .toBe(200);
-  // Navidrome refuses admin/admin, so the login falls back to the seeded local account.
-  await loginViaUi(page, { username: 'admin', password: 'admin' });
+  // Navidrome refuses admin/admin, so the login falls back to the seeded local account,
+  // which signs in only to choose a new password.
+  await chooseAdminPassword(page.context(), mcpAdminPassword);
+  await page.goto('/');
   await configureInstance(page, mcpSlskdUrlForApp, mcpMusicDirForApp);
-  await changePassword(page.context(), 'admin', mcpAdminPassword);
 
   const open = await probe();
   expect(open.status()).toBe(200);

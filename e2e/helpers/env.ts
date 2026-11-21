@@ -58,6 +58,12 @@ export const shotsDir = process.env.E2E_SHOTS_DIR;
 /** Navidrome-dependent specs only run when the stack includes one. */
 export const navidromeEnabled = process.env.E2E_NAVIDROME === '1';
 
+/**
+ * The seeded admin's password once setup.app.ts chose it: the shipped
+ * admin/admin only signs in to choose a new one.
+ */
+export const appAdminPassword = 'e2e-app-admin-password';
+
 export const navidromeAdminUser = 'admin';
 export const navidromeAdminPassword = 'e2e-navidrome-admin';
 

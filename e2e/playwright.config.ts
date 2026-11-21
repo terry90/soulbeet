@@ -39,6 +39,7 @@ export default defineConfig({
         /imports\.spec\.ts/,
         /user90\.spec\.ts/,
         /navidrome\.spec\.ts/,
+        /admin-password\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -55,10 +56,20 @@ export default defineConfig({
       use: { ...devices['Pixel 7'] },
     },
     {
+      // Gives the seeded admin the shipped password and chooses a new one,
+      // so it runs while no other spec signs in as admin, and before the
+      // Navidrome spec links that account to Navidrome.
+      name: 'admin-password',
+      dependencies: ['chromium', 'mobile', 'user90'],
+      testMatch: /admin-password\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
       // Changes the seeded admin's password, so it runs while no other spec
       // signs in as admin.
       name: 'navidrome',
-      dependencies: ['chromium', 'mobile', 'user90'],
+      dependencies: ['chromium', 'mobile', 'user90', 'admin-password'],
       testMatch: /navidrome\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },

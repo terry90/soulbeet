@@ -9,7 +9,7 @@ use crate::{
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
     models,
     server_fns::{rate_limited_error, refusal_error, server_error, unauthorized_error},
-    AuthSession,
+    AuthSession, PasswordChangeSession,
 };
 
 #[cfg(feature = "server")]
@@ -508,6 +508,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             issue_session_cookie(&cookies, &session, &user)?;
 
             Ok(AuthResponse {
+                password_change_required: crate::security::password_change_required(&user.id),
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: NavidromeStatus::Connected,
@@ -533,6 +534,7 @@ pub async fn login(username: String, password: String) -> Result<AuthResponse, S
             let user = start_session(&cookies, &session, &user.id).await?;
 
             Ok(AuthResponse {
+                password_change_required: crate::security::password_change_required(&user.id),
                 username: user.username,
                 user_id: user.id,
                 navidrome_status: status,
@@ -771,7 +773,9 @@ pub async fn logout() -> Result<(), ServerFnError> {
     .map_err(server_error)
 }
 
-#[get("/api/auth/me", auth: AuthSession)]
+/// Who is signed in, also for a session that may only choose a new
+/// password, so the app can ask for one.
+#[get("/api/auth/me", auth: PasswordChangeSession)]
 pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
     let user = auth.0;
 
@@ -783,6 +787,7 @@ pub async fn get_current_user() -> Result<Option<AuthResponse>, ServerFnError> {
         .unwrap_or_default();
 
     Ok(Some(AuthResponse {
+        password_change_required: crate::security::password_change_required(&user.user_id),
         username: user.username,
         user_id: user.user_id,
         navidrome_status: status,
