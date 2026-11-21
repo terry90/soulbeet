@@ -169,7 +169,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(update_settings(state, caller, args)),

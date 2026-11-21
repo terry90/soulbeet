@@ -106,7 +106,7 @@ echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env
 3.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it. Use the same tag as the `image:` line above, since the shipped `plugins:` line depends on the tier (see [Image tiers](docs/beets.md#image-tiers)), and copy it again after you change tier:
 
 ```bash
-TAG=latest # the tag on your image: line (latest, light, medium or full)
+TAG=latest # the tag on your image: line, such as latest, latest-medium or latest-full
 mkdir -p beets
 docker create --name sb "docker.io/docccccc/soulbeet:$TAG"
 docker cp sb:/app/beets_config.yaml ./beets/config.yaml

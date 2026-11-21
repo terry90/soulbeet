@@ -8,26 +8,42 @@ This doc explains how to pick the right Soulbeet image for the plugins you want,
 
 Soulbeet ships three image tiers. They are strictly additive: `full` is a superset of `medium`, which is a superset of `light`.
 
-| Tag | Plugins enabled | Image size delta | Use when |
+| Tier | Plugins enabled | Image size delta | Use when |
 | --- | --- | --- | --- |
-| `:light` (= `:latest`) | `musicbrainz`, `mbtwopass` | baseline | You want the smallest image. Tagging via MusicBrainz only. |
-| `:medium` | `:light` + `chroma` | +~40-60 MB | You want fingerprint matching (AcoustID) to catch files MusicBrainz alone can't match by length. |
-| `:full` | `:medium` + `fetchart`, `embedart`, `lyrics`, `lastgenre`, `scrub`, `replaygain`[^rg], plus several zero-cost convenience plugins | +~150-200 MB on top of medium | You want a complete tagging pipeline: cover art, lyrics, genres, normalization. |
+| light | `musicbrainz`, `mbtwopass` | baseline | You want the smallest image. Tagging via MusicBrainz only. |
+| medium | light + `chroma` | +~40-60 MB | You want fingerprint matching (AcoustID) to catch files MusicBrainz alone can't match by length. |
+| full | medium + `fetchart`, `embedart`, `lyrics`, `lastgenre`, `scrub`, `replaygain`[^rg], plus several zero-cost convenience plugins | +~150-200 MB on top of medium | You want a complete tagging pipeline: cover art, lyrics, genres, normalization. |
 
 [^rg]: The full tier wires `replaygain: { backend: ffmpeg, overwrite: yes }` in its baked `beets_config.yaml`. Override with care. See "Per-plugin configuration" below.
 
+### Image tags
+
+Each tier is published under three kinds of tag:
+
+| Tier | Newest release | One release, fixed | Newest master build |
+| --- | --- | --- | --- |
+| light | `:latest` | `:v0.9.0` | `:light` |
+| medium | `:latest-medium` | `:v0.9.0-medium` | `:medium` |
+| full | `:latest-full` | `:v0.9.0-full` | `:full` |
+
+- A release moves the `:latest` tags and `:light`, `:medium` and `:full` to its build, and adds its own version tags.
+- Every commit to master moves `:light`, `:medium` and `:full` (and `:master` with its `-light`, `-medium` and `-full` variants), never the `:latest` tags. Between releases they hold code that is not released yet, so `:light` is not the same image as `:latest`.
+- A test release such as `v1.2.3-rc.1` gets only its own tags, such as `:v1.2.3-rc.1`, `:v1.2.3-rc.1-medium` and `:v1.2.3-rc.1-full`, and moves none of the others.
+
+To stay on releases, use a `:latest` tag or a version tag. Use `:light`, `:medium` or `:full` only if you want to run master.
+
 ### Picking a tier
 
-- New install, unsure → start with `:light`. You can switch later without losing data; only the image changes.
-- Library has files where MusicBrainz refuses to match because the track length is off → `:medium`. The `chroma` plugin uses AcoustID fingerprints, which bypass length checks.
-- You want covers embedded, lyrics fetched, normalized loudness, and the kitchen sink → `:full`.
+- New install, unsure → start with light (`:latest`). You can switch later without losing data; only the image changes.
+- Library has files where MusicBrainz refuses to match because the track length is off → medium. The `chroma` plugin uses AcoustID fingerprints, which bypass length checks.
+- You want covers embedded, lyrics fetched, normalized loudness, and the kitchen sink → full.
 
 Switch tiers by editing `image:` in your `docker-compose.yml` and recreating the container:
 
 ```yaml
 services:
   soulbeet:
-    image: docker.io/docccccc/soulbeet:medium  # was :latest
+    image: docker.io/docccccc/soulbeet:latest-medium  # was :latest
 ```
 
 ```sh
@@ -74,7 +90,7 @@ Available in `:full` but **not** enabled by default (need user config to be usef
 
 ### Option 1: Switch to a fatter tier (preferred)
 
-If the plugin is in `:full` but you're on `:light`, just pull `:full`. See above.
+If the plugin is in full but you're on light, switch to `:latest-full`. See above.
 
 ### Option 2: Drop a single Python file (pure-Python plugins only)
 
@@ -114,11 +130,11 @@ For plugins that need extra pip packages (e.g. [beetcamp](https://pypi.org/proje
 ```dockerfile
 # my-soulbeet/Dockerfile
 FROM python:3.11-slim-bookworm AS plugin-builder
-COPY --from=docker.io/docccccc/soulbeet:medium /opt/venv /opt/venv
+COPY --from=docker.io/docccccc/soulbeet:v0.9.0-medium /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir beetcamp beets-spotify
 
-FROM docker.io/docccccc/soulbeet:medium
+FROM docker.io/docccccc/soulbeet:v0.9.0-medium
 COPY --from=plugin-builder /opt/venv /opt/venv
 ```
 
@@ -131,12 +147,12 @@ docker build -t my-soulbeet:latest ./my-soulbeet
 ```yaml
 services:
   soulbeet:
-    image: my-soulbeet:latest  # was docker.io/docccccc/soulbeet:medium
+    image: my-soulbeet:latest  # was docker.io/docccccc/soulbeet:latest-medium
 ```
 
 Then enable the new plugin in your config file as usual.
 
-You'll rebuild this image each time you bump the base Soulbeet version.
+Both `FROM` lines name the same version tag. You'll rebuild this image each time you bump it to a newer Soulbeet version.
 
 ## What won't work
 
