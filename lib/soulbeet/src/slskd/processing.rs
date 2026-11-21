@@ -3,7 +3,7 @@ use crate::audio::is_audio_path;
 use crate::slskd::models::SearchResponse;
 use itertools::Itertools;
 use shared::slskd::{declared_extension, AlbumResult, MatchResult, SearchResult, TrackResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// The albums of a search's responses, and what was left out or flagged.
@@ -28,6 +28,26 @@ fn remote_folder(filename: &str) -> &str {
         .map_or("", |(folder, _)| folder)
 }
 
+/// The remote folder of the release a file is in: its own folder, or the one
+/// above it when its folder is one disc of the release.
+fn release_folder(filename: &str) -> &str {
+    let folder = remote_folder(filename);
+    let (above, name) = folder.rsplit_once(['\\', '/']).unwrap_or(("", folder));
+    if utils::is_disc_folder(name) {
+        above
+    } else {
+        folder
+    }
+}
+
+/// A file as one of the expected tracks it may be.
+struct Candidate {
+    /// The track's index in the expected tracks.
+    track: usize,
+    result: MatchResult,
+    below_floor: bool,
+}
+
 /// The albums found in `responses`. A file scored under MIN_SCORE_THRESHOLD
 /// is dropped, or with `keep_below_floor` kept and flagged `below_floor`.
 pub fn process_search_responses(
@@ -40,7 +60,7 @@ pub fn process_search_responses(
     const MIN_SCORE_THRESHOLD: f64 = 0.6;
     let mut not_audio = 0;
     let mut below_floor = 0;
-    let mut scored_files: Vec<(MatchResult, SearchResult, bool)> = Vec::new();
+    let mut scored_files: Vec<(Vec<Candidate>, SearchResult)> = Vec::new();
     for resp in responses {
         let mut folder_audio_files: HashMap<&str, u32> = HashMap::new();
         for file in resp.files.iter().filter(|f| kept_as_audio(&f.filename)) {
@@ -54,7 +74,7 @@ pub fn process_search_responses(
                 continue;
             }
 
-            let rank_result = utils::rank_match(
+            let ranked = utils::rank_match(
                 &file.filename,
                 Some(searched_artist),
                 searched_album,
@@ -62,7 +82,8 @@ pub fn process_search_responses(
                 file.length,
             );
 
-            let flagged = rank_result.total_score < MIN_SCORE_THRESHOLD;
+            // Best first, so the first is the file's own score.
+            let flagged = ranked[0].result.total_score < MIN_SCORE_THRESHOLD;
             if flagged {
                 below_floor += 1;
                 if !keep_below_floor {
@@ -85,7 +106,21 @@ pub fn process_search_responses(
                 declared_extension: file.extension.as_deref().and_then(declared_extension),
                 folder_audio_files: folder_audio_files[remote_folder(&file.filename)],
             };
-            scored_files.push((rank_result, search_result, flagged));
+            // A track the file scores below the floor as is one it may not be,
+            // unless the search keeps such files.
+            let candidates = ranked
+                .into_iter()
+                .filter_map(|r| {
+                    let under = r.result.total_score < MIN_SCORE_THRESHOLD;
+                    Some(Candidate {
+                        track: r.track?,
+                        result: r.result,
+                        below_floor: under,
+                    })
+                })
+                .filter(|c| keep_below_floor || !c.below_floor)
+                .collect();
+            scored_files.push((candidates, search_result));
         }
     }
 
@@ -97,53 +132,58 @@ pub fn process_search_responses(
 }
 
 fn find_best_albums(
-    scored_files: &[(MatchResult, SearchResult, bool)],
+    scored_files: &[(Vec<Candidate>, SearchResult)],
     expected_tracks: &[WantedTrack],
 ) -> Vec<AlbumResult> {
     if expected_tracks.is_empty() {
         return vec![];
     }
 
-    let album_groups = scored_files.iter().into_group_map_by(|(rank, search, _)| {
+    // One album per release folder of a peer, so the discs of a release are
+    // one album whatever names its folders.
+    let album_groups = scored_files.iter().into_group_map_by(|(_, search)| {
         (
             search.username.clone(),
-            rank.guessed_artist.clone(),
-            rank.guessed_album.clone(),
+            release_folder(&search.filename).to_string(),
         )
     });
 
     album_groups
         .into_iter()
-        .filter_map(|((username, artist, album_title), files_in_group)| {
-            // Specific search: find the single best file for each expected track.
-            let mut best_files_for_album = HashMap::new();
-
-            for expected in expected_tracks {
-                let expected_track_title = expected.title.as_str();
-                if let Some(best_file_for_track) = files_in_group
-                    .iter()
-                    // Find all files that matched this specific track
-                    .filter(|(rank, _, _)| rank.matched_track == expected_track_title)
-                    // Find the best one among them
-                    .max_by(|(r1, s1, _), (r2, s2, _)| {
-                        r1.total_score
-                            .partial_cmp(&r2.total_score)
+        .filter_map(|((username, _), files_in_group)| {
+            // Every file as every track it may be, best first.
+            let mut pairs: Vec<(&Candidate, &SearchResult)> = files_in_group
+                .iter()
+                .flat_map(|(candidates, search)| candidates.iter().map(move |c| (c, search)))
+                .collect();
+            pairs.sort_by(|(c1, s1), (c2, s2)| {
+                c2.result
+                    .total_score
+                    .partial_cmp(&c1.result.total_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        s2.quality_score()
+                            .partial_cmp(&s1.quality_score())
                             .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                s1.quality_score().partial_cmp(&s2.quality_score()).unwrap()
-                            })
                     })
-                {
-                    best_files_for_album.insert(expected_track_title, best_file_for_track);
+            });
+            // Each track takes the best file no other track took, so a title
+            // the album repeats gets a file per track, never one file twice.
+            let mut taken: Vec<Option<(&Candidate, &SearchResult)>> =
+                vec![None; expected_tracks.len()];
+            let mut used: HashSet<&str> = HashSet::new();
+            for (candidate, search) in pairs {
+                if taken[candidate.track].is_none() && used.insert(search.filename.as_str()) {
+                    taken[candidate.track] = Some((candidate, search));
                 }
             }
 
-            let final_tracks: Vec<_> = expected_tracks
-                .iter()
-                .filter_map(|t| best_files_for_album.get(t.title.as_str()))
-                .map(|(mr, sr, flagged)| TrackResult {
-                    below_floor: *flagged,
-                    ..TrackResult::new(sr.clone(), mr.clone())
+            let final_tracks: Vec<_> = taken
+                .into_iter()
+                .flatten()
+                .map(|(candidate, search)| TrackResult {
+                    below_floor: candidate.below_floor,
+                    ..TrackResult::new(search.clone(), candidate.result.clone())
                 })
                 .collect();
 
@@ -151,11 +191,7 @@ fn find_best_albums(
                 return None;
             }
 
-            let completeness = if !expected_tracks.is_empty() {
-                final_tracks.len() as f64 / expected_tracks.len() as f64
-            } else {
-                1.0
-            };
+            let completeness = final_tracks.len() as f64 / expected_tracks.len() as f64;
 
             let total_size: i64 = final_tracks.iter().map(|t| t.base.size).sum();
             let dominant_quality = final_tracks
@@ -180,6 +216,10 @@ fn find_best_albums(
 
             let album_quality_score =
                 (avg_score * 0.3) + (completeness * 0.3) + (avg_format_score * 0.4);
+
+            // Every file of a release folder guesses the same album.
+            let album_title = final_tracks[0].album.clone();
+            let artist = final_tracks[0].artist.clone();
 
             Some(AlbumResult {
                 username,
@@ -253,5 +293,117 @@ mod tests {
                 ("music/Singles/01 - Wake Up.flac".to_string(), 1),
             ]
         );
+    }
+
+    /// slskd's answer to `GET /api/v0/searches/{id}/responses` (`Search/Types/Response.cs:38-48`)
+    /// from a peer sharing a two-disc release, one folder per disc.
+    const TWO_DISCS: &str = include_str!("fixtures/search_two_discs.json");
+    /// The same from a peer whose second disc repeats a title of the first.
+    const REPEATED_TITLE: &str = include_str!("fixtures/search_two_discs_repeated_title.json");
+
+    fn wanted(tracks: &[(&str, u32)]) -> Vec<WantedTrack> {
+        tracks
+            .iter()
+            .map(|&(title, duration_s)| WantedTrack {
+                title: title.into(),
+                duration_s: Some(duration_s),
+            })
+            .collect()
+    }
+
+    fn album_files(album: &AlbumResult) -> Vec<&str> {
+        album.tracks.iter().map(|t| t.base.filename.as_str()).collect()
+    }
+
+    #[test]
+    fn a_two_disc_share_is_one_album_whatever_the_album_is_called() {
+        assert_eq!(release_folder("@@lq4ve\\Album\\CD1\\01.flac"), "@@lq4ve\\Album");
+        assert_eq!(release_folder("music/Album/Disc 2/01.flac"), "music/Album");
+        assert_eq!(release_folder("music/Album/01.flac"), "music/Album");
+        assert_eq!(release_folder("CD1/01.flac"), "");
+
+        let responses: Vec<SearchResponse> = serde_json::from_str(TWO_DISCS).unwrap();
+        // Bigger Than All of Us, MusicBrainz release cf554d3c-52be-4609-8f87-ea7fb47a82fe:
+        // three tracks of its first disc and two of its second.
+        let tracks = wanted(&[
+            ("Stepping In", 248),
+            ("Start a Fire", 229),
+            ("Carry Me Home", 256),
+            ("Start a Fire (extended mix)", 333),
+            ("Carry Me Home (extended mix)", 378),
+        ]);
+        let release =
+            "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]";
+        let in_release = |file: &str| format!("{release}\\{file}");
+        let both_discs = [
+            in_release("CD1\\01 - Stepping In.flac"),
+            in_release("CD1\\02 - Start a Fire.flac"),
+            in_release("CD1\\03 - Carry Me Home.flac"),
+            in_release("CD2\\01 - Start a Fire (Extended Mix).flac"),
+            in_release("CD2\\02 - Carry Me Home (Extended Mix).flac"),
+        ];
+        // The title the share names, and one no folder of it shares a word
+        // with, as a translated or romanised title does.
+        for title in ["Bigger Than All of Us", "Größer als wir alle"] {
+            let processed = process_search_responses(
+                &responses,
+                "Above & Beyond",
+                Some(title),
+                &tracks,
+                false,
+            );
+            assert_eq!(processed.albums.len(), 1, "{title}");
+            let album = &processed.albums[0];
+            assert_eq!(album_files(album), both_discs, "{title}");
+            assert_eq!(album.album_title, "Above & Beyond - Bigger Than All of Us");
+        }
+    }
+
+    #[test]
+    fn a_title_on_both_discs_takes_a_file_from_each() {
+        let responses: Vec<SearchResponse> = serde_json::from_str(REPEATED_TITLE).unwrap();
+        // The second "O Holy Night" is the live one of the second disc.
+        let deluxe = wanted(&[
+            ("O Holy Night", 263),
+            ("Silent Night", 149),
+            ("O Holy Night", 301),
+        ]);
+        let release = "@@kqzbm\\Music\\Marrow Choir\\Winter Songs (Deluxe Edition)";
+        let processed = process_search_responses(
+            &responses,
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &deluxe,
+            false,
+        );
+        assert_eq!(processed.albums.len(), 1);
+        assert_eq!(
+            album_files(&processed.albums[0]),
+            vec![
+                format!("{release}\\Disc 1\\03 - O Holy Night.flac"),
+                format!("{release}\\Disc 1\\04 - Silent Night.flac"),
+                format!("{release}\\Disc 2\\03 - O Holy Night.flac"),
+            ]
+        );
+
+        // Without lengths the two files cannot be told apart, and each track still takes one.
+        let unknown: Vec<WantedTrack> = deluxe
+            .iter()
+            .map(|t| WantedTrack {
+                duration_s: None,
+                ..t.clone()
+            })
+            .collect();
+        let processed = process_search_responses(
+            &responses,
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &unknown,
+            false,
+        );
+        let mut files = album_files(&processed.albums[0]);
+        files.sort();
+        files.dedup();
+        assert_eq!(files.len(), 3);
     }
 }
