@@ -8,11 +8,15 @@ import { appAdminPassword, musicDirForApp, slskdUrlForApp } from '../helpers/env
 
 test('configure slskd connection', async ({ page }) => {
   // The migration seeds admin/admin, which signs in only to choose a new
-  // password. A rerun against the same database finds it chosen.
+  // password. The change renews the session, so the page is signed in. A
+  // rerun against the same database finds the password chosen and signs in
+  // with it.
   const shipped = await page.request.post('/api/auth/login', { data: shippedAdmin });
   if (shipped.ok()) {
     await chooseAdminPassword(page.context(), appAdminPassword);
+    await page.goto('/');
+  } else {
+    await loginViaUi(page, admin);
   }
-  await loginViaUi(page, admin);
   await configureInstance(page, slskdUrlForApp, musicDirForApp);
 });

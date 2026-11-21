@@ -1,9 +1,12 @@
-// Opens the MCP instance once, before the acceptance tests: a new password
-// for the seeded admin, the last reason the security gate keeps MCP closed,
-// then the same app configuration as the main suite's setup.
+// Opens the MCP instance before the acceptance tests: a new password for the
+// seeded admin, the last reason the security gate keeps MCP closed, then the
+// same app configuration as the main suite's setup. The database outlives a
+// run, so a rerun signs in with the chosen password and configures again: an
+// open gate says only that the password was chosen, not that a run got as
+// far as the configuration.
 
 import { expect, test } from '@playwright/test';
-import { chooseAdminPassword, configureInstance } from '../helpers/app.js';
+import { chooseAdminPassword, configureInstance, loginViaApi, shippedAdmin } from '../helpers/app.js';
 import {
   mcpAdminPassword,
   mcpBaseUrl,
@@ -17,15 +20,6 @@ import {
 test('open the MCP instance', async ({ page }) => {
   const probe = () => page.request.get('/.well-known/oauth-protected-resource/mcp');
   const first = await probe();
-  // A run against this instance already opened it.
-  if (first.status() === 200) return;
-  expect(first.status()).toBe(503);
-  // An anonymous caller is not told which check fails; the 200 after the new admin password
-  // below shows it was the only one.
-  expect(await first.json()).toEqual({
-    error: 'mcp_unavailable',
-    message: 'MCP access stays off until the security checks in Settings pass',
-  });
 
   // Navidrome is slower to start than the app, and every test after this one signs in through it.
   await expect
@@ -43,7 +37,19 @@ test('open the MCP instance', async ({ page }) => {
     .toBe(200);
   // Navidrome refuses admin/admin, so the login falls back to the seeded local account,
   // which signs in only to choose a new password.
-  await chooseAdminPassword(page.context(), mcpAdminPassword);
+  const shipped = await page.request.post('/api/auth/login', { data: shippedAdmin });
+  if (shipped.ok()) {
+    expect(first.status()).toBe(503);
+    // An anonymous caller is not told which check fails; the 200 after the new admin password
+    // below shows it was the only one.
+    expect(await first.json()).toEqual({
+      error: 'mcp_unavailable',
+      message: 'MCP access stays off until the security checks in Settings pass',
+    });
+    await chooseAdminPassword(page.context(), mcpAdminPassword);
+  } else {
+    await loginViaApi(page.context(), { username: 'admin', password: mcpAdminPassword });
+  }
   await page.goto('/');
   await configureInstance(page, mcpSlskdUrlForApp, mcpMusicDirForApp);
 
