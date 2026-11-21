@@ -734,7 +734,8 @@ pub struct Ledger {
     changes: watch::Receiver<i64>,
     places: watch::Receiver<u64>,
     live: LiveRows,
-    /// The jobs whose failure the database kept refusing (`strand`), in memory only.
+    /// The jobs whose failure the database kept refusing, or that their runner could not read
+    /// (`strand`), in memory only.
     stranded: Arc<Mutex<HashSet<String>>>,
     /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
     #[cfg(test)]
@@ -773,8 +774,9 @@ impl Ledger {
         self.live.lock().unwrap().get(slot).cloned()
     }
 
-    /// `job`'s failure could not be written: it waits, searching or queued, with no runner until
-    /// the next start of the server, which forgets this, or until a transition of it is applied.
+    /// `job`'s failure could not be written, or its runner could not read it: it waits, searching
+    /// or queued, with no runner until the next start of the server, which forgets this, or until
+    /// a transition of it is applied.
     pub fn strand(&self, job: &str) {
         self.stranded.lock().unwrap().insert(job.to_string());
     }
@@ -2529,6 +2531,86 @@ mod tests {
             store::job_state(&db, "j1").await,
             Some(JobState::Searching | JobState::Dismissed)
         ));
+    }
+
+    // Each of these writes reads before it writes: begun with BEGIN IMMEDIATE it waits for
+    // another writer, a plain BEGIN fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_that_read_first_wait_for_another_writer() {
+        use crate::connection::test_util::behind_a_writer;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::test_db::migrated_file(dir.path()).await;
+        let alice = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let user = UserId::new("alice");
+        // create_batch reads the jobs of the same recording first.
+        let carol = NewJob {
+            picked: vec![(0, item("peer_a", "Carol 0", "01.flac"))],
+            ..queued_carols(1, &alice).remove(0)
+        };
+        let id = carol.id.clone();
+        let created = behind_a_writer(&db, {
+            let ledger = ledger.clone();
+            async move { ledger.create_batch(batch_of("b1"), vec![carol]).await }
+        })
+        .await;
+        assert_eq!(created, Ok(vec![Admitted::Created]));
+        // A slot's row reads the slot's timeline entry first.
+        let stored = behind_a_writer(&db, {
+            let ledger = ledger.clone();
+            let row = row_of(&id, 0, "01.flac", DownloadState::InProgress, 10);
+            async move {
+                let event = JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows: vec![row],
+                };
+                ledger.record_stored(event).await
+            }
+        })
+        .await;
+        assert_eq!(stored, Ok(()));
+        // A transition reads the job first.
+        let cancelled = behind_a_writer(&db, {
+            let (ledger, user, id) = (ledger.clone(), user.clone(), id.clone());
+            async move { ledger.transition(&user, &id, Transition::Cancel).await }
+        })
+        .await;
+        assert!(
+            matches!(
+                cancelled,
+                Ok(Transitioned::Applied {
+                    from: JobState::Downloading,
+                    to: JobState::Downloading,
+                    ..
+                })
+            ),
+            "{cancelled:?}"
+        );
+        // A claim reads the job waiting for the source first.
+        ledger
+            .create(
+                job(
+                    "j2",
+                    "alice",
+                    &alice,
+                    JobState::NeedsSourceChoice,
+                    Some("s1"),
+                ),
+                Some(search("s1", "alice")),
+            )
+            .await
+            .unwrap();
+        let claimed = behind_a_writer(&db, {
+            let (ledger, user, alice) = (ledger.clone(), user.clone(), alice.clone());
+            async move {
+                let picked = vec![(0, item("peer_a", "Two", "02.flac"))];
+                ledger
+                    .claim_source_choice(&user, "s1", &alice, picked)
+                    .await
+            }
+        })
+        .await;
+        assert_eq!(claimed.map(|c| c.map(|c| c.id)), Ok(Some("j2".to_string())));
     }
 
     #[tokio::test]
