@@ -571,8 +571,8 @@ pub struct QueuedDownload {
 pub enum DownloadEvent {
     /// Standard download progress updates
     Progress(Vec<DownloadProgress>),
-    /// The rows of every unfinished file, first on each socket and again after the socket
-    /// missed events. The client applies it with `apply_snapshot`.
+    /// The rows of every unfinished file, first on each socket opened with `snapshot=true` and
+    /// again after the socket missed events. The client applies it with `apply_snapshot`.
     Snapshot(Vec<DownloadProgress>),
     /// A track moved to another peer. The client keys rows by remote path and
     /// every peer serves the track under its own, so a plain progress update

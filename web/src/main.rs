@@ -183,7 +183,7 @@ fn WebNavbar() -> Element {
 
     #[cfg(feature = "web")]
     use_resilient_websocket(
-        || api::download_updates_ws(Some(true), WebSocketOptions::new()),
+        || api::download_updates_ws(Some(true), Some(true), WebSocketOptions::new()),
         move |event: DownloadEvent| {
             // This bundle may misread what another build sends.
             if *outdated.peek() {

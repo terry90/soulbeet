@@ -108,26 +108,36 @@ pub(crate) async fn session_still_valid(
         .is_ok_and(|ctx| ctx.id() == *user)
 }
 
-/// What a new download socket sends before the live events: the build frame when the client
-/// asked for it (a bundle older than the frame does not ask: it cannot decode the variant and
-/// would reconnect on every try), then the snapshot of the user's unfinished files, empty or not,
-/// since it replaces whatever an earlier socket left in the panel.
+/// What a new download socket sends before the live events. A frame goes only to a client that
+/// asked for it: a bundle older than the variant does not ask, since it cannot decode it and
+/// would reconnect on every try. The build frame comes first, then the user's unfinished files:
+/// as a snapshot, empty or not, since it replaces whatever an earlier socket left in the panel,
+/// or to an older bundle as progress rows when there are any.
 #[cfg(feature = "server")]
-fn first_frames(build_frame: Option<bool>, rows: Vec<DownloadProgress>) -> Vec<DownloadEvent> {
+fn first_frames(
+    build_frame: Option<bool>,
+    snapshot: Option<bool>,
+    rows: Vec<DownloadProgress>,
+) -> Vec<DownloadEvent> {
     let build = (build_frame == Some(true))
         .then(|| DownloadEvent::Build(crate::build_id::BUILD_ID.to_string()));
-    build
-        .into_iter()
-        .chain([DownloadEvent::Snapshot(rows)])
-        .collect()
+    let rows = if snapshot == Some(true) {
+        Some(DownloadEvent::Snapshot(rows))
+    } else {
+        (!rows.is_empty()).then_some(DownloadEvent::Progress(rows))
+    };
+    build.into_iter().chain(rows).collect()
 }
 
 /// What a socket sends for one receive from `user`'s channel, or why it closes. Events carry
-/// changed rows only, and the ones a lag skipped may hold a file's last row, so after a lag the
-/// socket sends the snapshot again; the events kept after the skipped ones still follow it.
+/// changed rows only, and the ones a lag skipped may hold a file's last row, so after a lag a
+/// client that asked for snapshots gets the snapshot again; the events kept after the skipped
+/// ones still follow it. An older bundle cannot decode one, so its socket closes and the client
+/// reconnects onto the unfinished rows.
 #[cfg(feature = "server")]
 async fn frame_for(
     received: Result<DownloadEvent, broadcast::error::RecvError>,
+    snapshot: Option<bool>,
     db: &sqlx::SqlitePool,
     user: &UserId,
 ) -> Result<DownloadEvent, String> {
@@ -135,6 +145,9 @@ async fn frame_for(
         Ok(event) => Ok(event),
         Err(broadcast::error::RecvError::Lagged(skipped)) => {
             warn!("Download updates of user {user} lagged, {skipped} events skipped");
+            if snapshot != Some(true) {
+                return Err("it lagged and its client takes no snapshot".to_string());
+            }
             crate::ledger::store::open_rows(db, user)
                 .await
                 .map(DownloadEvent::Snapshot)
@@ -149,10 +162,12 @@ async fn frame_for(
 
 /// WebSocket endpoint for real-time download updates.
 /// Uses WebSocket instead of HTTP streaming for more reliable delivery.
-/// A client that passes `build_frame=true` gets `DownloadEvent::Build` first.
-#[get("/api/downloads/updates?build_frame", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+/// A client that passes `build_frame=true` gets `DownloadEvent::Build` first, and one that
+/// passes `snapshot=true` gets `DownloadEvent::Snapshot` on opening and after a lag.
+#[get("/api/downloads/updates?build_frame&snapshot", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn download_updates_ws(
     build_frame: Option<bool>,
+    snapshot: Option<bool>,
     options: WebSocketOptions,
 ) -> Result<Websocket<(), DownloadEvent>, ServerFnError> {
     let user = auth.0.id();
@@ -202,7 +217,7 @@ pub async fn download_updates_ws(
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut rx = rx;
         info!("WebSocket connected for user: {}", user);
-        for frame in first_frames(build_frame, rows) {
+        for frame in first_frames(build_frame, snapshot, rows) {
             // A client already gone ends the loop below at its first receive.
             let _ = socket.send(frame).await;
         }
@@ -230,7 +245,7 @@ pub async fn download_updates_ws(
                 // Only the receive races the other arms: a snapshot read once a lag was taken
                 // must not be dropped for a tick.
                 result = rx.recv() => {
-                    let frame = match frame_for(result, &crate::db::DB, &user).await {
+                    let frame = match frame_for(result, snapshot, &crate::db::DB, &user).await {
                         Ok(frame) => frame,
                         Err(why) => {
                             info!("WebSocket closed for user {}: {}", user, why);
@@ -325,7 +340,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_socket_opens_with_the_build_then_the_snapshot_of_the_unfinished_rows() {
+    fn a_socket_opens_with_the_build_then_the_unfinished_rows_as_its_client_asked() {
         let row = DownloadProgress::queued("t-1".into(), "peer_a".into(), "01.flac".into(), 100);
         let kinds = |frames: Vec<DownloadEvent>| {
             frames
@@ -335,17 +350,34 @@ mod tests {
                         format!("build {}", id == crate::build_id::BUILD_ID)
                     }
                     DownloadEvent::Snapshot(rows) => format!("snapshot {}", rows.len()),
+                    DownloadEvent::Progress(rows) => format!("rows {}", rows.len()),
                     other => format!("{other:?}"),
                 })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            kinds(first_frames(Some(true), vec![row.clone()])),
+            kinds(first_frames(Some(true), Some(true), vec![row.clone()])),
             vec!["build true", "snapshot 1"]
         );
-        assert_eq!(kinds(first_frames(None, vec![row])), vec!["snapshot 1"]);
+        assert_eq!(
+            kinds(first_frames(None, Some(true), vec![row.clone()])),
+            vec!["snapshot 1"]
+        );
         // Empty, it still clears what an earlier socket left in the panel.
-        assert_eq!(kinds(first_frames(Some(false), vec![])), vec!["snapshot 0"]);
+        assert_eq!(
+            kinds(first_frames(Some(false), Some(true), vec![])),
+            vec!["snapshot 0"]
+        );
+        // A bundle older than the snapshot cannot decode one.
+        assert_eq!(
+            kinds(first_frames(Some(true), None, vec![row.clone()])),
+            vec!["build true", "rows 1"]
+        );
+        assert_eq!(
+            kinds(first_frames(None, Some(false), vec![row])),
+            vec!["rows 1"]
+        );
+        assert!(first_frames(None, None, vec![]).is_empty());
     }
 
     #[tokio::test]
@@ -390,6 +422,7 @@ mod tests {
 
         let alice = UserId::new("alice");
         let (tx, mut rx) = broadcast::channel(1);
+        let mut older_bundle = tx.subscribe();
         // The last row of a file, lost to the lag.
         let ended = DownloadProgress::queued("t-2".into(), "peer_a".into(), "02.flac".into(), 100)
             .with_state(DownloadState::Imported);
@@ -397,7 +430,7 @@ mod tests {
         tx.send(DownloadEvent::Progress(vec![running.clone()]))
             .unwrap();
 
-        match frame_for(rx.recv().await, &db, &alice).await {
+        match frame_for(rx.recv().await, Some(true), &db, &alice).await {
             Ok(DownloadEvent::Snapshot(rows)) => assert_eq!(
                 rows.iter()
                     .map(|r| (r.item.as_str(), r.state.clone()))
@@ -406,12 +439,18 @@ mod tests {
             ),
             other => panic!("not a snapshot: {other:?}"),
         }
-        match frame_for(rx.recv().await, &db, &alice).await {
+        match frame_for(rx.recv().await, Some(true), &db, &alice).await {
             Ok(DownloadEvent::Progress(rows)) => assert_eq!(rows, vec![running]),
             other => panic!("not the kept event: {other:?}"),
         }
+        // A bundle older than the snapshot cannot decode one: its socket closes instead.
+        assert!(frame_for(older_bundle.recv().await, None, &db, &alice)
+            .await
+            .is_err());
         drop(tx);
-        assert!(frame_for(rx.recv().await, &db, &alice).await.is_err());
+        assert!(frame_for(rx.recv().await, Some(true), &db, &alice)
+            .await
+            .is_err());
     }
 
     #[test]
