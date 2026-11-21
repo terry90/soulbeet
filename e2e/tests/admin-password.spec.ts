@@ -29,6 +29,16 @@ test('the shipped admin password signs in only to choose a new one', async ({ br
     expect(reset.ok(), `give admin the shipped password: ${reset.status()}`).toBeTruthy();
     shipped = true;
 
+    // While the shipped password is in place the connection endpoints say
+    // they are closed, not why.
+    const closed = await helper.request.get('/.well-known/oauth-protected-resource/mcp');
+    expect(closed.status()).toBe(503);
+    expect(await closed.json()).toEqual({
+      error: 'mcp_unavailable',
+      message: 'MCP access stays off until the security checks in Settings pass',
+    });
+    expect(closed.headers()['cache-control']).toBe('no-store');
+
     await page.goto('/login');
     await page.getByPlaceholder('Enter username').fill(shippedAdmin.username);
     await page.getByPlaceholder('Enter password').fill(shippedAdmin.password);
