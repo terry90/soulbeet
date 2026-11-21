@@ -12,7 +12,7 @@ use shared::download::DownloadEvent;
 #[cfg(feature = "server")]
 use tokio::sync::{broadcast, RwLock};
 #[cfg(feature = "server")]
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Interval for cleaning up stale user channels (5 minutes).
 #[cfg(feature = "server")]
@@ -343,7 +343,9 @@ async fn run_automation() {
         return;
     }
 
-    // 1. Sync ratings for each connected user
+    // 1. Sync ratings for each connected user. Expiry deletes only what this cycle's sync of the
+    // user found not rated to keep, so a user whose sync failed has no entry and nothing expires.
+    let mut expirable_by_user = HashMap::new();
     for user in &connected_users {
         info!("Automation: syncing ratings for user {}...", user.username);
         let ctx = crate::auth::UserCtx {
@@ -359,6 +361,7 @@ async fn run_automation() {
                     user.username, result.total_songs_scanned, result.deleted_tracks,
                     result.promoted_tracks, result.removed_tracks, result.kept_tracks
                 );
+                expirable_by_user.insert(user.id.clone(), report.expirable);
             }
             Err(f) => info!(
                 "Automation: sync failed for {}: {}",
@@ -409,51 +412,32 @@ async fn run_automation() {
             }
         };
 
-        if let Some(folder) = folder {
-            // Check each profile's pending tracks and expire those past their lifetime
-            let pending =
-                match crate::models::discovery_playlist::DiscoveryTrackRow::get_pending_by_folder(
-                    folder_id,
-                )
-                .await
-                {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-            let mut expired_count = 0u32;
-            for track in &pending {
-                let Some(expires) = crate::core::discovery::expires_at(track, &lifetime_map) else {
-                    continue;
-                };
-                if now < expires {
-                    continue;
-                }
-                match crate::core::delete_guard::staging::remove_staged_in(
+        match (folder, expirable_by_user.get(&user.id)) {
+            (None, _) => {}
+            (Some(_), None) => info!(
+                "Automation: the rating sync of user {} failed, so no track expires",
+                user.username
+            ),
+            (Some(folder), Some(expirable)) => {
+                let expired = crate::core::discovery::expire_in(
                     &crate::db::DB,
-                    track,
                     &folder,
-                    crate::core::delete_guard::staging::StagedOutcome::Expired,
+                    &lifetime_map,
+                    now,
+                    expirable,
                 )
-                .await
-                {
-                    Ok(()) => expired_count += 1,
-                    Err(f) if crate::core::discovery::is_not_pending(&f) => debug!(
-                        "Automation: {} of user {} is no longer pending, so it does not expire",
-                        track.title, user.username
-                    ),
-                    Err(f) => warn!(
-                        "Automation: could not expire {} for user {}: {}",
-                        track.title,
-                        user.username,
-                        crate::core::logged(&f)
-                    ),
+                .await;
+                match expired {
+                    Ok(0) => {}
+                    Ok(n) => info!("Automation: expired {n} tracks for user {}", user.username),
+                    Err(e) => {
+                        warn!(
+                            "Automation: pending tracks of user {} cannot be read, so no track expires: {e}",
+                            user.username
+                        );
+                        continue;
+                    }
                 }
-            }
-            if expired_count > 0 {
-                info!(
-                    "Automation: expired {} tracks for user {}",
-                    expired_count, user.username
-                );
             }
         }
 

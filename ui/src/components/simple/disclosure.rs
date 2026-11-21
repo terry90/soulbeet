@@ -104,26 +104,34 @@ impl ToggleDriver {
             1,
             "expected only the toggle to listen for clicks"
         );
-        Self {
+        let mut driver = Self {
             dom,
             toggle: clicks[0],
-        }
+        };
+        // What the first render started (a resource, an effect) ends before any click.
+        driver.settle();
+        driver
     }
 
-    /// Clicks the toggle and runs what that starts until nothing is left to do.
-    pub(crate) fn click(&mut self) {
-        use dioxus::html::{PlatformEventData, SerializedMouseData};
+    /// Runs what is pending until nothing is left to do.
+    fn settle(&mut self) {
         use futures::FutureExt;
-        use std::{any::Any, rc::Rc};
-        let data = PlatformEventData::new(Box::<SerializedMouseData>::default());
-        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
-        self.dom.runtime().handle_event("click", event, self.toggle);
         loop {
             self.dom.render_immediate(&mut dioxus::core::NoOpMutations);
             if self.dom.wait_for_work().now_or_never().is_none() {
                 break;
             }
         }
+    }
+
+    /// Clicks the toggle and runs what that starts until nothing is left to do.
+    pub(crate) fn click(&mut self) {
+        use dioxus::html::{PlatformEventData, SerializedMouseData};
+        use std::{any::Any, rc::Rc};
+        let data = PlatformEventData::new(Box::<SerializedMouseData>::default());
+        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
+        self.dom.runtime().handle_event("click", event, self.toggle);
+        self.settle();
     }
 
     pub(crate) fn html(&self) -> String {

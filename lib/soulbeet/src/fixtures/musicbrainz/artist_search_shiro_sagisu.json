@@ -1,0 +1,234 @@
+{
+ "created": "2026-11-21T03:17:27.519Z",
+ "count": 1,
+ "offset": 0,
+ "artists": [
+  {
+   "id": "9b127d23-f877-4541-83cd-44f46393dfb7",
+   "type": "Person",
+   "type-id": "b6e035f4-3ce9-331c-97df-83397230b0df",
+   "score": 100,
+   "gender-id": "36d3d30a-839d-3eda-8cb3-29be4384e4a9",
+   "name": "鷺巣詩郎",
+   "sort-name": "Sagisu, Shirō",
+   "gender": "male",
+   "country": "JP",
+   "area": {
+    "id": "2db42837-c832-3c27-b4a3-08198f75693c",
+    "type": "Country",
+    "type-id": "06dd0ae4-8c74-30bb-b43d-95dcedf961de",
+    "name": "Japan",
+    "sort-name": "Japan",
+    "life-span": {
+     "ended": null
+    }
+   },
+   "begin-area": {
+    "id": "1dcdfb34-fa66-496c-9823-51c329deddf6",
+    "type": "City",
+    "type-id": "6fd8f29a-3d0a-32fc-980d-ea697b69da78",
+    "name": "Setagaya",
+    "sort-name": "Setagaya",
+    "life-span": {
+     "ended": null
+    }
+   },
+   "disambiguation": "anime & film music composer",
+   "ipis": [
+    "00073418185",
+    "00422743574"
+   ],
+   "isnis": [
+    "0000000079950105"
+   ],
+   "life-span": {
+    "begin": "1957-08-29",
+    "ended": null
+   },
+   "aliases": [
+    {
+     "sort-name": "Shirô Sagisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shirô Sagisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "شيرو ساغيسو",
+     "type-id": "894afba6-2816-3c24-8072-eadb66bd04bc",
+     "name": "شيرو ساغيسو",
+     "locale": null,
+     "type": "Artist name",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Shiro Sagasu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shiro Sagasu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Shiro Sahisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shiro Sahisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Siro Sagisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Siro Sagisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Shirow Sagisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shirow Sagisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Shirou Sagisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shirou Sagisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Shiroh Sagisu",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "Shiroh Sagisu",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "さぎすしろう",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "さぎすしろう",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "さぎすしろう",
+     "type-id": "d4dcd0c0-b341-3612-a332-c0ce797b25cf",
+     "name": "鷺巣詩郎",
+     "locale": "ja",
+     "type": "Legal name",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "さぎすしろう",
+     "type-id": "894afba6-2816-3c24-8072-eadb66bd04bc",
+     "name": "鷺巣詩郎",
+     "locale": "ja",
+     "type": "Artist name",
+     "primary": true,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "Sagisu, Shirō",
+     "type-id": "894afba6-2816-3c24-8072-eadb66bd04bc",
+     "name": "Shirō Sagisu",
+     "locale": "en",
+     "type": "Artist name",
+     "primary": true,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "鷺巣詩朗",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "鷺巣詩朗",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    },
+    {
+     "sort-name": "鷲巣詩郎",
+     "type-id": "1937e404-b981-3cb7-8151-4c86ebfc8d8e",
+     "name": "鷲巣詩郎",
+     "locale": null,
+     "type": "Search hint",
+     "primary": null,
+     "begin-date": null,
+     "end-date": null
+    }
+   ],
+   "tags": [
+    {
+     "count": 1,
+     "name": "rock"
+    },
+    {
+     "count": 1,
+     "name": "electronic"
+    },
+    {
+     "count": 1,
+     "name": "pop"
+    },
+    {
+     "count": 3,
+     "name": "japanese"
+    },
+    {
+     "count": 1,
+     "name": "j-pop"
+    },
+    {
+     "count": 2,
+     "name": "composer"
+    },
+    {
+     "count": 1,
+     "name": "j-rock"
+    },
+    {
+     "count": 1,
+     "name": "japan"
+    },
+    {
+     "count": 1,
+     "name": "clean up"
+    },
+    {
+     "count": 0,
+     "name": "likedis auto"
+    }
+   ]
+  }
+ ]
+}

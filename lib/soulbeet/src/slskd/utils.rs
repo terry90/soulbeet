@@ -9,6 +9,14 @@ static RE_TRAIL_BRACKET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s*\[\s*[^\]]*\]\s*$").unwrap());
 static RE_TRAIL_YEAR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s*[-\(\[]?\d{4}[-\)\]]?\s*$").unwrap());
+static RE_DISC_FOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(cd|disc|disk)[\s._-]*\d{1,2}\b").unwrap());
+
+/// Whether a folder is one disc of a release (`CD1`, `Disc 2`, `Disk 1 - Live`),
+/// whose name is in the folder above it.
+pub(super) fn is_disc_folder(name: &str) -> bool {
+    RE_DISC_FOLDER.is_match(name.trim())
+}
 
 // A struct to hold pre-processed text for efficient comparisons.
 #[derive(Debug, Clone)]
@@ -108,6 +116,10 @@ impl PathInfo {
 
         let mut reversed_folders = parent_folders;
         reversed_folders.reverse();
+        // Every disc of a release then guesses the same artist and album.
+        if reversed_folders.last().is_some_and(|f| is_disc_folder(f)) {
+            reversed_folders.pop();
+        }
 
         Self {
             parent_folders: reversed_folders,
@@ -160,20 +172,17 @@ fn score_artist(
     folder_candidate
 }
 
-/// The best score among `expected_tracks` (not empty) and the index of that track.
-fn score_track(stem: &CleanedText, expected_tracks: &[CleanedText]) -> (f64, usize) {
+/// How well the title in `stem` matches each of `expected_tracks`.
+fn title_scores(stem: &CleanedText, expected_tracks: &[CleanedText]) -> Vec<f64> {
     let track_title_from_stem = CleanedText::new(&extract_track_title(&stem.original));
 
     expected_tracks
         .iter()
-        .enumerate()
-        .map(|(i, expected)| {
-            let score = (dice_sim(&track_title_from_stem, expected) * 0.6)
-                + (containment_sim(&track_title_from_stem, expected) * 0.4);
-            (score, i)
+        .map(|expected| {
+            (dice_sim(&track_title_from_stem, expected) * 0.6)
+                + (containment_sim(&track_title_from_stem, expected) * 0.4)
         })
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0.0, 0))
+        .collect()
 }
 
 /// A track the search is for, with its length when the metadata provider knows it.
@@ -200,13 +209,25 @@ fn duration_score(wanted_s: u32, file_s: u32) -> f64 {
     }
 }
 
+/// A file scored as one of the expected tracks.
+#[derive(Debug, Clone)]
+pub struct Ranked {
+    /// The track's index in the expected tracks; None when none is expected.
+    pub track: Option<usize>,
+    pub result: MatchResult,
+}
+
+/// `filename` scored as each expected track whose title it matches best, best
+/// first. That is several tracks when the album repeats a title, as two discs
+/// can, so that each of them can take its own file; the length tells them
+/// apart when it is known. With no expected track, one ranking as no track.
 pub fn rank_match(
     filename: &str,
     searched_artist: Option<&str>,
     searched_album: Option<&str>,
     expected_tracks: &[WantedTrack],
     file_length_s: Option<i32>,
-) -> MatchResult {
+) -> Vec<Ranked> {
     const ALBUM_WEIGHT: f64 = 0.4;
     const TRACK_WEIGHT: f64 = 0.4;
     const ARTIST_WEIGHT: f64 = 0.2;
@@ -236,68 +257,82 @@ pub fn rank_match(
         (0.0, CleanedText::new(""))
     };
 
-    let (track_score, best_track_match, matched_duration_s) = if !expected_tracks.is_empty() {
-        let expected_tracks_c: Vec<_> = expected_tracks
-            .iter()
-            .map(|t| CleanedText::new(&t.title))
-            .collect();
-        let (score, i) = score_track(&stem_c, &expected_tracks_c);
-        (
-            score,
-            expected_tracks_c[i].clone(),
-            expected_tracks[i].duration_s,
-        )
-    } else {
-        (
-            0.0,
-            CleanedText::new(&extract_track_title(&stem_c.original)),
-            None,
-        )
-    };
+    let file_s = file_length_s.and_then(|l| u32::try_from(l).ok());
+    // The file's score as a track of `track_score` and length `wanted_s`, or as no track.
+    let total_score = |track: Option<(f64, Option<u32>)>| {
+        let mut weighted_sum = 0.0;
+        let mut total_weight = 0.0;
 
-    let mut weighted_sum = 0.0;
-    let mut total_weight = 0.0;
-
-    if searched_artist.is_some() {
-        weighted_sum += artist_score * ARTIST_WEIGHT;
-        total_weight += ARTIST_WEIGHT;
-    }
-
-    if !expected_tracks.is_empty() {
-        weighted_sum += track_score * TRACK_WEIGHT;
-        total_weight += TRACK_WEIGHT;
-    }
-
-    if let (Some(wanted_s), Some(file_s)) = (
-        matched_duration_s,
-        file_length_s.and_then(|l| u32::try_from(l).ok()),
-    ) {
-        weighted_sum += duration_score(wanted_s, file_s) * DURATION_WEIGHT;
-        total_weight += DURATION_WEIGHT;
-    }
-
-    if searched_album.is_some() {
-        weighted_sum += album_score * ALBUM_WEIGHT;
-        if album_score > ALBUM_INFO_THRESHOLD {
-            total_weight += ALBUM_WEIGHT;
+        if searched_artist.is_some() {
+            weighted_sum += artist_score * ARTIST_WEIGHT;
+            total_weight += ARTIST_WEIGHT;
         }
-    }
 
-    let total_score = if total_weight > 0.0 {
-        weighted_sum / total_weight
-    } else {
-        0.0
+        if let Some((track_score, wanted_s)) = track {
+            weighted_sum += track_score * TRACK_WEIGHT;
+            total_weight += TRACK_WEIGHT;
+
+            if let (Some(wanted_s), Some(file_s)) = (wanted_s, file_s) {
+                weighted_sum += duration_score(wanted_s, file_s) * DURATION_WEIGHT;
+                total_weight += DURATION_WEIGHT;
+            }
+        }
+
+        if searched_album.is_some() {
+            weighted_sum += album_score * ALBUM_WEIGHT;
+            if album_score > ALBUM_INFO_THRESHOLD {
+                total_weight += ALBUM_WEIGHT;
+            }
+        }
+
+        if total_weight > 0.0 {
+            weighted_sum / total_weight
+        } else {
+            0.0
+        }
+    };
+    let ranked = |track, matched_track, track_score, total| Ranked {
+        track,
+        result: MatchResult {
+            guessed_artist: best_artist_guess.original.clone(),
+            guessed_album: best_album_folder.original.clone(),
+            matched_track,
+            artist_score,
+            album_score,
+            track_score,
+            total_score: total,
+        },
     };
 
-    MatchResult {
-        guessed_artist: best_artist_guess.original,
-        guessed_album: best_album_folder.original,
-        matched_track: best_track_match.original,
-        artist_score,
-        album_score,
-        track_score,
-        total_score,
+    if expected_tracks.is_empty() {
+        let title = extract_track_title(&stem_c.original);
+        return vec![ranked(None, title, 0.0, total_score(None))];
     }
+
+    let expected_tracks_c: Vec<_> = expected_tracks
+        .iter()
+        .map(|t| CleanedText::new(&t.title))
+        .collect();
+    let scores = title_scores(&stem_c, &expected_tracks_c);
+    let best = scores.iter().copied().fold(0.0, f64::max);
+    let mut matches: Vec<Ranked> = scores
+        .into_iter()
+        .enumerate()
+        // A repeated title scores the same for each of its tracks.
+        .filter(|&(_, score)| score == best)
+        .map(|(i, score)| {
+            let total = total_score(Some((score, expected_tracks[i].duration_s)));
+            ranked(Some(i), expected_tracks_c[i].original.clone(), score, total)
+        })
+        .collect();
+    // Stable, so equal scores keep the album's order.
+    matches.sort_by(|a, b| {
+        b.result
+            .total_score
+            .partial_cmp(&a.result.total_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    matches
 }
 
 #[cfg(test)]
@@ -316,7 +351,9 @@ mod tests {
     #[test]
     fn a_file_of_the_wanted_length_keeps_its_score() {
         let score = |wanted, length| {
-            rank_match(FILE, Some("Marrow Choir"), None, &night(wanted), length).total_score
+            rank_match(FILE, Some("Marrow Choir"), None, &night(wanted), length)[0]
+                .result
+                .total_score
         };
         assert!((score(Some(263), Some(263)) - 1.0).abs() < 1e-9);
         assert!((score(Some(263), Some(266)) - 1.0).abs() < 1e-9);
@@ -333,7 +370,8 @@ mod tests {
                 None,
                 &night(Some(263)),
                 Some(length),
-            )
+            )[0]
+            .result
             .total_score
         };
         assert!((score(273) - (0.6 + 0.3 * 20.0 / 27.0) / 0.9).abs() < 1e-9);
@@ -351,10 +389,75 @@ mod tests {
                 Some("Winter Songs"),
                 &night(Some(263)),
                 Some(length),
-            )
+            )[0]
+            .result
             .total_score
         };
         assert!((score(263) - 1.0).abs() < 1e-9);
         assert!((score(323) - 10.0 / 13.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_disc_folder_takes_the_artist_and_album_of_the_folder_above_it() {
+        for disc in ["CD1", "CD 2", "cd-01", "Disc 1", "disc02", "Disk 3 - Live"] {
+            assert!(is_disc_folder(disc), "{disc}");
+        }
+        for other in [
+            "CD Singles",
+            "Discography",
+            "Disco 2000",
+            "2CD",
+            "Winter Songs",
+        ] {
+            assert!(!is_disc_folder(other), "{other}");
+        }
+        // No folder names the album "Hikari no Uta", so every folder scores 0
+        // and the innermost one left is the guess: the release, not the disc.
+        let guess = |disc: &str| {
+            let file =
+                format!("@@kqzbm\\Music\\Marrow Choir - 光の歌 [FLAC]\\{disc}\\01 - Intro.flac");
+            let ranked = rank_match(
+                &file,
+                Some("Marrow Choir"),
+                Some("Hikari no Uta"),
+                &night(None),
+                None,
+            );
+            let best = &ranked[0].result;
+            (best.guessed_artist.clone(), best.guessed_album.clone())
+        };
+        assert_eq!(guess("CD1"), guess("CD2"));
+        assert_eq!(guess("CD1").1, "Marrow Choir - 光の歌");
+    }
+
+    #[test]
+    fn a_title_the_album_repeats_is_scored_as_each_of_its_tracks_by_length() {
+        let deluxe = [
+            WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: Some(263),
+            },
+            WantedTrack {
+                title: "Silent Night".into(),
+                duration_s: Some(149),
+            },
+            WantedTrack {
+                title: "O Holy Night".into(),
+                duration_s: Some(301),
+            },
+        ];
+        let tracks = |length| {
+            rank_match(FILE, Some("Marrow Choir"), None, &deluxe, Some(length))
+                .into_iter()
+                .map(|r| r.track)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tracks(263), vec![Some(0), Some(2)]);
+        assert_eq!(tracks(301), vec![Some(2), Some(0)]);
+        let unknown = rank_match(FILE, Some("Marrow Choir"), None, &deluxe, None);
+        assert_eq!(
+            unknown.iter().map(|r| r.track).collect::<Vec<_>>(),
+            vec![Some(0), Some(2)]
+        );
     }
 }

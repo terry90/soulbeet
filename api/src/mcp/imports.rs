@@ -68,7 +68,7 @@ pub(crate) const RESOLVE_IMPORT: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: false,
     call: |state, caller, args| Box::pin(resolve_import(state, caller, args)),

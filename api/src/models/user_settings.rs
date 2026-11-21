@@ -1,6 +1,16 @@
 #[cfg(feature = "server")]
 use crate::db::DB;
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
+
+// The bounds the server holds the discovery numbers to, shared with the Settings inputs so both
+// sides refuse the same values.
+/// The track count each discovery profile may have.
+pub const TRACK_COUNTS: RangeInclusive<i64> = 1..=50;
+/// The days a discovery profile's tracks may wait for a rating.
+pub const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
+/// The rating at which the rating sync promotes a pending discovery track.
+pub const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
@@ -182,26 +192,26 @@ impl UserSettings {
         Self::get_in(db, user_id).await
     }
 
-    /// Update the stored Navidrome playlist ID for a specific discovery profile.
-    pub async fn update_discovery_playlist_id(
+    /// Stores `playlist_id` as the Navidrome playlist of discovery `profile`. One statement sets
+    /// the key, so a write of another key meanwhile is kept; a value that is not JSON counts as
+    /// no ids, as get_playlist_id_for_profile reads it.
+    pub(crate) async fn update_discovery_playlist_id_in(
+        db: &sqlx::SqlitePool,
         user_id: &str,
         profile: &str,
         playlist_id: &str,
     ) -> Result<(), String> {
-        let current = Self::get(user_id).await?;
-        let mut ids: std::collections::HashMap<String, String> = current
-            .discovery_navidrome_playlist_id
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        ids.insert(profile.to_string(), playlist_id.to_string());
-        let json = serde_json::to_string(&ids).map_err(|e| e.to_string())?;
         sqlx::query(
-            "UPDATE user_settings SET discovery_navidrome_playlist_id = ? WHERE user_id = ?",
+            "UPDATE user_settings SET discovery_navidrome_playlist_id = json_set(
+                 CASE WHEN json_valid(discovery_navidrome_playlist_id)
+                      THEN discovery_navidrome_playlist_id ELSE '{}' END,
+                 ?, ?)
+             WHERE user_id = ?",
         )
-        .bind(&json)
+        .bind(format!("$.{profile}"))
+        .bind(playlist_id)
         .bind(user_id)
-        .execute(&*DB)
+        .execute(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -347,6 +357,53 @@ mod tests {
         assert_eq!(
             s.discovery_track_count,
             UserSettings::defaults("alice").discovery_track_count
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_id_is_stored_beside_the_others() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        UserSettings::upsert_in(&db, "alice", UpdateUserSettings::default())
+            .await
+            .unwrap();
+        let stored = |s: UserSettings| -> std::collections::HashMap<String, String> {
+            serde_json::from_str(&s.discovery_navidrome_playlist_id.unwrap()).unwrap()
+        };
+        // No ids yet, or a value that is not JSON: the id is the only one.
+        for start in [None, Some("not json")] {
+            sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+                .bind(start)
+                .execute(&db)
+                .await
+                .unwrap();
+            UserSettings::update_discovery_playlist_id_in(&db, "alice", "Balanced", "b1")
+                .await
+                .unwrap();
+            let s = UserSettings::get_in(&db, "alice").await.unwrap();
+            assert_eq!(
+                stored(s),
+                std::collections::HashMap::from([("Balanced".to_string(), "b1".to_string())])
+            );
+        }
+        // Two writes at once keep each other's id.
+        let (a, b) = tokio::join!(
+            UserSettings::update_discovery_playlist_id_in(&db, "alice", "Conservative", "c1"),
+            UserSettings::update_discovery_playlist_id_in(&db, "alice", "Adventurous", "a1")
+        );
+        a.unwrap();
+        b.unwrap();
+        UserSettings::update_discovery_playlist_id_in(&db, "alice", "Balanced", "b2")
+            .await
+            .unwrap();
+        let s = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(
+            stored(s),
+            std::collections::HashMap::from([
+                ("Conservative".to_string(), "c1".to_string()),
+                ("Adventurous".to_string(), "a1".to_string()),
+                ("Balanced".to_string(), "b2".to_string()),
+            ])
         );
     }
 

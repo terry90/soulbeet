@@ -79,6 +79,10 @@ pub struct AuthResponse {
     /// False while `NAVIDROME_URL` is set: usernames follow Navidrome.
     #[serde(default)]
     pub rename_allowed: bool,
+    /// The account still has the default password, so the session can do
+    /// nothing but choose a new one.
+    #[serde(default)]
+    pub password_change_required: bool,
 }
 
 /// Starts an OpenID Connect sign-in (a full page navigation, not a fetch).
@@ -103,9 +107,9 @@ pub enum SsoError {
     Denied,
     /// No account of that name and auto-registration is off
     NotRegistered,
-    /// An account of that name exists and was never linked, and
-    /// OIDC_LINK_BY_USERNAME is off: its owner links it from Settings after
-    /// signing in with its password
+    /// An account of that name exists and was never linked, and it is an
+    /// admin account or OIDC_LINK_BY_USERNAME is off: its owner links it from
+    /// Settings after signing in with its password
     AccountExists,
     /// The account of that name is linked to another identity
     Conflict,

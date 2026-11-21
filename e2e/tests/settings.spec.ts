@@ -3,7 +3,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import { loginViaApi, openSettings, registerUser, uniqueUser, type TestUser } from '../helpers/app.js';
+import { admin, loginViaApi, openSettings, registerUser, uniqueUser, type TestUser } from '../helpers/app.js';
 import { musicDirForApp } from '../helpers/env.js';
 
 
@@ -35,7 +35,7 @@ test('creates and deletes a music folder', async ({ page }) => {
 test('creates another user account', async ({ context, page }) => {
   // Only an admin may create users.
   await context.clearCookies();
-  await loginViaApi(context, { username: 'admin', password: 'admin' });
+  await loginViaApi(context, admin);
   await page.reload();
   await openSettings(page);
   await page.getByRole('button', { name: 'Users' }).click();

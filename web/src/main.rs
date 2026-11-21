@@ -183,7 +183,7 @@ fn WebNavbar() -> Element {
 
     #[cfg(feature = "web")]
     use_resilient_websocket(
-        || api::download_updates_ws(Some(true), WebSocketOptions::new()),
+        || api::download_updates_ws(Some(true), Some(true), WebSocketOptions::new()),
         move |event: DownloadEvent| {
             // This bundle may misread what another build sends.
             if *outdated.peek() {
@@ -195,6 +195,11 @@ fn WebNavbar() -> Element {
                     for file in data {
                         map.insert(file.item.clone(), file);
                     }
+                }
+                // First on every socket, a reconnect included, and again after the socket
+                // missed events.
+                DownloadEvent::Snapshot(rows) => {
+                    shared::download::apply_snapshot(&mut downloads.write(), rows);
                 }
                 DownloadEvent::Replaced {
                     previous_item,

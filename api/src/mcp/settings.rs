@@ -18,11 +18,11 @@ use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
 use crate::core::library::library_roots_in;
-use crate::core::settings::{Setting, PROMOTE_THRESHOLDS};
+use crate::core::settings::Setting;
 use crate::core::time;
 use crate::core::{folders, settings};
 use crate::models::folder::Folder;
-use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+use crate::models::user_settings::{UpdateUserSettings, UserSettings, PROMOTE_THRESHOLDS};
 
 /// The settings document (D14): what is saved, never a key or token.
 pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<String, Value> {
@@ -169,7 +169,7 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(update_settings(state, caller, args)),
@@ -494,7 +494,7 @@ mod tests {
         let db = test_db::migrated().await;
         let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
         // The forms the Settings page writes (ui/src/components/settings/folder_manager.rs:415,445) and the
-        // playlist sync stores (UserSettings::update_discovery_playlist_id, user_settings.rs).
+        // playlist sync stores (UserSettings::update_discovery_playlist_id_in, user_settings.rs).
         s.discovery_track_count = r#"{"Conservative":5,"Balanced":10,"Adventurous":15}"#.into();
         s.discovery_playlist_name =
             r#"{"Conservative":"Comfort Zone","Balanced":"Weekly Mix","Adventurous":"Deep Cuts"}"#
@@ -513,7 +513,7 @@ mod tests {
     }
 
     use crate::connection::test_util::{call_tool, document, mcp_app};
-    use crate::core::settings::{LIFETIME_DAYS, TRACK_COUNTS};
+    use crate::models::user_settings::{LIFETIME_DAYS, TRACK_COUNTS};
 
     #[tokio::test]
     async fn auto_delete_is_turned_on_only_in_soulfuls_settings() {

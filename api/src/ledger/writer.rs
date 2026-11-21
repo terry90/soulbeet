@@ -540,7 +540,7 @@ impl Writer {
                 return Ok(());
             }
         }
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         let mut jobs = HashSet::new();
         match event {
             JobEvent::NeedsSourceChoice { job } => {
@@ -1191,7 +1191,7 @@ impl Writer {
 
     /// Records the web UI's `job` as a batch of its own, and first `search` when given.
     async fn create(&mut self, job: NewJob, search: Option<NewSearch>) -> Result<(), LedgerError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         if let Some(search) = search {
             insert_search(&mut *tx, search).await?;
         }
@@ -1215,7 +1215,7 @@ impl Writer {
         batch: NewJobBatch,
         jobs: Vec<NewJob>,
     ) -> Result<Vec<Admitted>, LedgerError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         let mut written = false;
         let mut admitted = Vec::with_capacity(jobs.len());
         // What the jobs taken want, for a batch the caller did not name.
@@ -1267,7 +1267,7 @@ impl Writer {
         job: &str,
         change: Transition,
     ) -> Result<Transitioned, LedgerError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         // `sent`: a monitor batch or a backend request is recorded for the job's current pick,
         // so its files may have reached the backend.
         type Found = (
@@ -1531,7 +1531,7 @@ impl Writer {
         folder_id: &str,
         picked: &[(u32, DownloadableItem)],
     ) -> Result<Option<ClaimedJob>, LedgerError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         // created_at has one-second resolution: insertion order breaks its ties.
         let claimed: Option<(String, String)> = sqlx::query_as(
             "SELECT id, import_mode FROM jobs \
@@ -1555,7 +1555,7 @@ impl Writer {
     }
 
     async fn prune(&mut self, now: i64) -> Result<Pruned, LedgerError> {
-        let mut tx = self.db.begin().await?;
+        let mut tx = begin(&self.db).await?;
         let searches = sqlx::query("DELETE FROM searches WHERE expires_at <= ?")
             .bind(now)
             .execute(&mut *tx)
@@ -1785,6 +1785,14 @@ fn answer<T>(reply: Reply<T>, what: &str, result: Result<T, LedgerError>) {
         warn!("Could not {what} in the job ledger: {e}");
     }
     let _ = reply.send(result);
+}
+
+/// Begins one of the writer's transactions holding the write lock, so it waits up to the busy
+/// timeout for another connection's write. Begun deferred, one that reads first fails at once
+/// with "database is locked" when another connection writes before its first write: SQLite
+/// does not wait there, since waiting could deadlock.
+async fn begin(db: &SqlitePool) -> Result<sqlx::Transaction<'static, Sqlite>, sqlx::Error> {
+    db.begin_with("BEGIN IMMEDIATE").await
 }
 
 fn now() -> i64 {

@@ -1,9 +1,10 @@
 #[cfg(feature = "server")]
 use super::{
     auth::{
-        prove_password_in, start_session, try_navidrome_auth, NavidromeAuthResult, SessionCookie,
+        name_taken_by_account, prove_password_in, start_session, try_navidrome_auth,
+        NavidromeAuthResult, SessionCookie,
     },
-    forbidden_error, refusal_error, server_error, ADMIN_ONLY,
+    failure_error, forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
 use crate::auth::Role;
 use crate::models;
@@ -13,7 +14,7 @@ use crate::{
     config::CONFIG,
     login_limiter::{LoginLimiter, LOGIN_LIMITER},
     services::evict_navidrome_client,
-    AdminSession, AuthSession,
+    AdminSession, AuthSession, PasswordChangeSession,
 };
 #[cfg(feature = "server")]
 use axum::http::{HeaderMap, Uri};
@@ -53,9 +54,11 @@ pub async fn create_user(
         return Err(refusal_error("Username and password are required"));
     }
     check_username_length(&username)?;
-    User::create(&username, &password)
+    let user = User::create(&username, &password)
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(&user.username);
+    Ok(user)
 }
 
 #[post("/api/users/username", auth: AuthSession)]
@@ -71,7 +74,9 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     check_username_length(new_username.trim())?;
     models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(new_username.trim());
+    Ok(())
 }
 
 /// Refusals a person can act on are shown; database failures are not.
@@ -97,8 +102,9 @@ pub async fn set_user_role(user_id: String, role: Role) -> Result<(), ServerFnEr
 /// the signed-in person's, as linking single sign-on does: a session left
 /// open is not enough to give someone a password to the account. An account
 /// with no password gets one from an admin. Keeps the account's single
-/// sign-on link and ends its sessions. `navidrome` asks Navidrome about the
-/// name it is given, as `prove_password_in` does.
+/// sign-on link and ends its sessions. The seeded admin cannot keep the
+/// default password. `navidrome` asks Navidrome about the name it is given,
+/// as `prove_password_in` does.
 #[cfg(feature = "server")]
 pub(crate) async fn change_password_in<F>(
     db: &sqlx::SqlitePool,
@@ -114,6 +120,11 @@ where
 {
     if password.is_empty() {
         return Err(refusal_error("Password cannot be empty"));
+    }
+    if crate::security::is_default_password(&user.id, password) {
+        return Err(refusal_error(
+            "Choose a password other than the default one.",
+        ));
     }
     prove_password_in(
         limiter,
@@ -131,8 +142,9 @@ where
 }
 
 /// Changes the signed-in user's password. The change ends every session of
-/// the account; this one is renewed.
-#[post("/api/users/password", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
+/// the account; this one is renewed. The one thing a session still on the
+/// default password can do.
+#[post("/api/users/password", auth: PasswordChangeSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn change_password(
     current_password: String,
     password: String,
@@ -193,11 +205,30 @@ pub async fn set_user_password(user_id: String, password: String) -> Result<(), 
     Ok(())
 }
 
-#[delete("/api/users/delete", _: AdminSession)]
-pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
-    models::user::User::delete(&user_id)
+/// Deletes the account `user_id` once the staged files of its pending discovery tracks are
+/// removed (remove_staged_of_user_in): its folders and tracks go with it, so nothing would find
+/// those files after. Nothing is removed when the account cannot be deleted.
+#[cfg(feature = "server")]
+pub(crate) async fn delete_user_in(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<(), ServerFnError> {
+    use models::user::User;
+    User::deletable_in(db, user_id)
         .await
         .map_err(user_change_error)?;
+    crate::core::discovery::remove_staged_of_user_in(db, user_id)
+        .await
+        .map_err(failure_error)?;
+    User::delete_in(db, user_id)
+        .await
+        .map_err(user_change_error)
+}
+
+#[delete("/api/users/delete", _: AdminSession)]
+pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
+    delete_user_in(&crate::db::DB, &user_id).await?;
+    crate::security::note_user_deleted(&user_id);
     evict_navidrome_client(&user_id).await;
     Ok(())
 }
@@ -206,6 +237,7 @@ pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
 mod tests {
     use super::*;
     use crate::auth::NO_PASSWORD;
+    use crate::core::delete_guard::test_support::Library;
     use crate::db::test_db;
     use crate::server_fns::{FORBIDDEN_CODE, REFUSAL_CODE};
     use models::user::User;
@@ -366,6 +398,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_seeded_admin_cannot_keep_the_default_password() {
+        let db = test_db::migrated().await;
+        let limiter = LoginLimiter::new();
+        let admin = User::find_by_id_in(&db, crate::security::SEEDED_ADMIN_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = change(
+            &db,
+            &limiter,
+            &admin,
+            "admin",
+            "admin",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await;
+        assert_eq!(code(refused), REFUSAL_CODE);
+        assert_eq!(
+            reread(&db, &admin).await.credentials_version,
+            admin.credentials_version
+        );
+        change(
+            &db,
+            &limiter,
+            &admin,
+            "admin",
+            "chosen",
+            NavidromeAuthResult::NotConfigured,
+        )
+        .await
+        .unwrap();
+        assert!(reread(&db, &admin).await.password_matches("chosen"));
+    }
+
+    #[tokio::test]
     async fn an_admin_sets_the_password_of_other_accounts() {
         let db = test_db::migrated().await;
         let ann = User::create_in(&db, "ann", "ann-pw").await.unwrap();
@@ -386,5 +453,47 @@ mod tests {
             .await
             .unwrap();
         assert!(reread(&db, &bob).await.password_matches("x"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_removes_their_staged_discovery_files_and_keeps_their_music() {
+        let lib = Library::new().await;
+        lib.write("alice/Discovery/Explore/Marrow Choir/03.flac", b"audio");
+        let alices = lib
+            .root
+            .join("music/alice/Discovery/Explore/Marrow Choir/03.flac");
+        lib.pending_track("t1", "alice-music", "Explore", &alices, None)
+            .await;
+        lib.write("bob/Discovery/Explore/04.flac", b"audio");
+        let bobs = lib.root.join("music/bob/Discovery/Explore/04.flac");
+        lib.pending_track("t2", "bob-music", "Explore", &bobs, None)
+            .await;
+        delete_user_in(&lib.db, "alice").await.unwrap();
+        assert!(!alices.exists());
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert!(User::find_by_id_in(&lib.db, "alice")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(bobs.exists());
+        assert_eq!(lib.track_status("t2").await, "Pending");
+    }
+
+    #[tokio::test]
+    async fn a_refused_user_delete_keeps_their_staged_discovery_files() {
+        let lib = Library::new().await;
+        let admin: String = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin'")
+            .fetch_one(&lib.db)
+            .await
+            .unwrap();
+        lib.folder(&admin, "admin-music", "music/admin", false)
+            .await;
+        lib.write("admin/Discovery/Explore/03.flac", b"audio");
+        let file = lib.root.join("music/admin/Discovery/Explore/03.flac");
+        lib.pending_track("t1", "admin-music", "Explore", &file, None)
+            .await;
+        assert_eq!(code(delete_user_in(&lib.db, &admin).await), REFUSAL_CODE);
+        assert!(file.exists());
+        assert_eq!(lib.track_status("t1").await, "Pending");
     }
 }

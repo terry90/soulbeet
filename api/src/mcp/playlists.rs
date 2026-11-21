@@ -96,7 +96,7 @@ pub(crate) const UPDATE_PLAYLIST: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(update_playlist(state, caller, args)),
@@ -134,7 +134,7 @@ pub(crate) const SET_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(set_playlist_tracks(state, caller, args)),
@@ -153,7 +153,7 @@ pub(crate) const ADD_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: false,
     call: |state, caller, args| Box::pin(add_playlist_tracks(state, caller, args)),
@@ -172,7 +172,7 @@ pub(crate) const REMOVE_PLAYLIST_TRACKS: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: false,
     call: |state, caller, args| Box::pin(remove_playlist_tracks(state, caller, args)),

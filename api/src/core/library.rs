@@ -3,7 +3,7 @@
 //! folder show up there.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use sqlx::SqlitePool;
 
 use crate::auth::UserCtx;
 use crate::core::database_failure;
+use crate::core::delete_guard::paths::DEFAULT_LIBRARY_ID;
 use crate::core::index::{NavidromeOf, LOOKUP_PAGE};
 use crate::core::time;
 use crate::models::navidrome_library::NavidromeLibraryRow;
@@ -637,14 +638,82 @@ pub(crate) async fn library_roots_in(
     db: &SqlitePool,
     music_path: Option<&Path>,
 ) -> Result<Vec<PathBuf>, Failure> {
+    Ok(known_roots_in(db, music_path)
+        .await?
+        .into_iter()
+        .map(|(_, root)| root)
+        .collect())
+}
+
+/// library_roots_in, each root with its library's id: `music_path` is the default library's.
+pub(crate) async fn known_roots_in(
+    db: &SqlitePool,
+    music_path: Option<&Path>,
+) -> Result<Vec<(i64, PathBuf)>, Failure> {
     let learned = NavidromeLibraryRow::all_in(db)
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
     Ok(music_path
-        .map(Path::to_path_buf)
+        .map(|root| (DEFAULT_LIBRARY_ID, root.to_path_buf()))
         .into_iter()
-        .chain(learned.into_iter().map(|row| PathBuf::from(row.local_path)))
+        .chain(
+            learned
+                .into_iter()
+                .map(|row| (row.library_id, PathBuf::from(row.local_path))),
+        )
         .collect())
+}
+
+/// A folder's place in Navidrome: its library, and its path below the library's root as
+/// Navidrome writes media_file.path (`/` between names, empty for the root itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavidromePlace {
+    pub library_id: i64,
+    pub path: String,
+}
+
+impl NavidromePlace {
+    /// The place of the folder `name` inside this one.
+    pub(crate) fn child(&self, name: &str) -> NavidromePlace {
+        let path = match self.path.as_str() {
+            "" => name.to_string(),
+            path => format!("{path}/{name}"),
+        };
+        NavidromePlace {
+            library_id: self.library_id,
+            path,
+        }
+    }
+
+    /// What the path of every song in this folder starts with. The closing `/` keeps out a
+    /// sibling folder whose name only begins like this one's.
+    pub(crate) fn song_prefix(&self) -> String {
+        match self.path.as_str() {
+            "" => String::new(),
+            path => format!("{path}/"),
+        }
+    }
+}
+
+/// Where `dir` is in Navidrome: below the deepest of `roots` (library id, root) that is `dir`
+/// or one of its parents, by whole path components. None when no root holds it, or when the
+/// path below is not plain UTF-8 names, which Navidrome's paths could not be compared with.
+pub(crate) fn place_in(dir: &Path, roots: &[(i64, PathBuf)]) -> Option<NavidromePlace> {
+    let (library_id, below) = roots
+        .iter()
+        .filter_map(|(id, root)| Some((*id, dir.strip_prefix(root).ok()?)))
+        .min_by_key(|(_, below)| below.components().count())?;
+    let names = below
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()?;
+    Some(NavidromePlace {
+        library_id,
+        path: names.join("/"),
+    })
 }
 
 /// Listed when one of `roots` is `folder` or one of its parents, by whole
@@ -931,6 +1000,63 @@ mod tests {
                 PathBuf::from("/srv/bob")
             ]
         );
+        assert_eq!(
+            known_roots_in(&db, Some(Path::new("/data/music")))
+                .await
+                .unwrap(),
+            vec![
+                (1, PathBuf::from("/data/music")),
+                (1, PathBuf::from("/mnt/music")),
+                (2, PathBuf::from("/srv/bob"))
+            ]
+        );
+    }
+
+    #[test]
+    fn users_sharing_a_library_root_get_their_own_place_in_it() {
+        let roots = [(1, PathBuf::from("/music")), (2, PathBuf::from("/srv/bob"))];
+        let place = |dir: &str| place_in(Path::new(dir), &roots);
+        let at = |library_id: i64, path: &str| {
+            Some(NavidromePlace {
+                library_id,
+                path: path.into(),
+            })
+        };
+        assert_eq!(place("/music/alice/Discovery"), at(1, "alice/Discovery"));
+        assert_eq!(place("/music/carol//Discovery/"), at(1, "carol/Discovery"));
+        assert_eq!(place("/srv/bob/Discovery"), at(2, "Discovery"));
+        assert_eq!(place("/music"), at(1, ""));
+        assert_eq!(place("/music-archive/alice/Discovery"), None);
+        assert_eq!(place("/music/alice/../bob/Discovery"), None);
+        assert_eq!(place_in(Path::new("/music/alice"), &[]), None);
+
+        // A library inside another is the more precise place.
+        let nested = [
+            (1, PathBuf::from("/music")),
+            (3, PathBuf::from("/music/alice")),
+        ];
+        assert_eq!(
+            place_in(Path::new("/music/alice/Discovery"), &nested),
+            at(3, "Discovery")
+        );
+    }
+
+    #[test]
+    fn a_places_song_prefix_ends_at_its_own_folder() {
+        let alice = NavidromePlace {
+            library_id: 1,
+            path: "alice/Discovery".into(),
+        };
+        assert_eq!(
+            alice.child("Balanced").song_prefix(),
+            "alice/Discovery/Balanced/"
+        );
+        let root = NavidromePlace {
+            library_id: 1,
+            path: String::new(),
+        };
+        assert_eq!(root.song_prefix(), "");
+        assert_eq!(root.child("Discovery").song_prefix(), "Discovery/");
     }
 
     const MBID: &str = "0a2f7e4b-6c1d-4e8a-9b3f-5d7c1e2a4b6c";

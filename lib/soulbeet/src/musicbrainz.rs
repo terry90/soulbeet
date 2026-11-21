@@ -16,6 +16,7 @@ use shared::recommendation::fold_name;
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::MetadataError;
 
@@ -176,27 +177,84 @@ where
     }
 }
 
-/// The `query=` parameter of a MusicBrainz search for `fields`, each
-/// `field:"value"`, joined by AND. Inside a quoted phrase only `"` and `\`
-/// mean anything to Lucene, so they are escaped; the whole query is then
-/// form-encoded, so `&`, `#`, `+` and `%` reach MusicBrainz as text.
+/// `field:"value"`. Inside a quoted phrase only `"` and `\` mean anything to
+/// Lucene, so they are escaped.
+fn phrase(field: &str, value: &str) -> String {
+    let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{field}:\"{value}\"")
+}
+
+/// The `query=` parameter of a MusicBrainz search for the Lucene query
+/// `lucene`, form-encoded so `&`, `#`, `+` and `%` reach MusicBrainz as text.
 /// lucene_query_builder 0.3.0 quotes only a value holding a space and escapes
 /// nothing (`QueryString`'s Display), and musicbrainz_rs appends the
 /// parameter to the URL as it is (src/api/search_query.rs:114-127).
-fn lucene_query(fields: &[(&str, &str)]) -> String {
-    let lucene = fields
-        .iter()
-        .map(|(field, value)| {
-            let value = value.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("{field}:\"{value}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+fn query_param(lucene: &str) -> String {
     format!(
         "query={}",
         url::form_urlencoded::byte_serialize(lucene.as_bytes()).collect::<String>()
     )
 }
+
+/// The artist search for `name`. Only the artist index holds aliases, such
+/// as "Shirō Sagisu" for 鷺巣詩郎, and its `artist` field is the name alone.
+fn artist_search_query(name: &str) -> String {
+    query_param(&format!(
+        "{} OR {}",
+        phrase("artist", name),
+        phrase("alias", name)
+    ))
+}
+
+/// A track or album search for `title` in `title_field`. With an artist
+/// filter, the artist's `name_field` holds the name as typed, or the artist
+/// is one of `found`, the artists the artist search found for that name.
+fn titled_query(
+    title_field: &str,
+    title: &str,
+    name_field: &str,
+    artist: Option<(&str, &[ArtistMatch])>,
+) -> String {
+    let title = phrase(title_field, title);
+    let lucene = match artist {
+        None => title,
+        Some((name, found)) => {
+            let by: Vec<String> = std::iter::once(phrase(name_field, name))
+                .chain(found.iter().map(|a| phrase("arid", &a.mbid)))
+                .collect();
+            format!("({}) AND {title}", by.join(" OR "))
+        }
+    };
+    query_param(&lucene)
+}
+
+/// `s` folded as `fold_name` folds it, without combining marks: the artist
+/// index ignores them, so "Shiro Sagisu" finds the alias "Shirō Sagisu" and
+/// "フィッシュマンス" finds "フィッシュマンズ".
+fn search_fold(s: &str) -> String {
+    fold_name(&s.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>())
+}
+
+/// Whether `wanted`, folded by `search_fold`, is the name or an alias of `m`.
+fn carries_name(m: &ArtistMatch, wanted: &str) -> bool {
+    search_fold(&m.name) == wanted || m.aliases.iter().any(|a| search_fold(a) == wanted)
+}
+
+/// The artists of `found` that carry `name` whole. The artist search matches
+/// the name anywhere in a name or alias, so "Queen" also finds Ella
+/// Fitzgerald by her alias "Queen of Jazz".
+fn named_artists(name: &str, found: Vec<ArtistMatch>) -> Vec<ArtistMatch> {
+    let wanted = search_fold(name);
+    found
+        .into_iter()
+        .filter(|m| carries_name(m, &wanted))
+        .collect()
+}
+
+/// Artists the artist search returns for an artist filter, of which those
+/// that carry the typed name are matched by MBID: MusicBrainz's default page,
+/// which keeps their MBIDs within a short query URL.
+const FILTER_ARTISTS: u8 = 25;
 
 /// An enumeration to specify the type of search.
 #[derive(Debug)]
@@ -220,15 +278,21 @@ pub async fn search(
         search_type, query, artist
     );
 
+    // The recording and release group indexes hold artist names but no
+    // aliases, and one search cannot reach into another index, so an artist
+    // typed by an alias ("Shiro Sagisu" for 鷺巣詩郎) is found in the artist
+    // index first. Only the artists that carry the typed name are matched by
+    // MBID; the name clause still finds every result it found before.
+    let found = match artist {
+        Some(name) => named_artists(name, search_artists(name, FILTER_ARTISTS).await?),
+        None => Vec::new(),
+    };
+    let by_artist = artist.as_deref().map(|name| (name, found.as_slice()));
+
     match search_type {
         SearchType::Track => {
             let search_results = with_retry("MusicBrainz track search", || {
-                let mut fields: Vec<(&str, &str)> = artist
-                    .iter()
-                    .map(|artist| ("artistname", artist.as_str()))
-                    .collect();
-                fields.push(("recording", query));
-                let search_query = lucene_query(&fields);
+                let search_query = titled_query("recording", query, "artistname", by_artist);
                 async move {
                     Recording::search(search_query)
                         .limit(limit)
@@ -288,12 +352,7 @@ pub async fn search(
         }
         SearchType::Album => {
             let search_results = with_retry("MusicBrainz album search", || {
-                let mut fields: Vec<(&str, &str)> = artist
-                    .iter()
-                    .map(|artist| ("artist", artist.as_str()))
-                    .collect();
-                fields.push(("releasegroup", query));
-                let search_query = lucene_query(&fields);
+                let search_query = titled_query("releasegroup", query, "artist", by_artist);
                 async move {
                     ReleaseGroup::search(search_query)
                         .limit(limit)
@@ -322,15 +381,7 @@ pub async fn search(
                     continue;
                 }
 
-                if let Some(best_release) = release_group.releases.as_ref().and_then(|releases| {
-                    releases
-                        .iter()
-                        .filter(|r| r.status == Some(ReleaseStatus::Official))
-                        .min_by_key(|release| release.date.as_ref().map(|d| &d.0))
-                }) {
-                    // If no official release was found, take the first one available
-                    let final_release = best_release.clone();
-
+                if let Some(final_release) = album_release(&release_group) {
                     results.push(SearchResult::Album(Album {
                         id: final_release.id.clone(),
                         title: release_group.title.clone(),
@@ -346,6 +397,22 @@ pub async fn search(
     }
 
     Ok(results)
+}
+
+/// The release an album search shows for `group`: an official one titled as
+/// the group, else the first official one. A release titled otherwise is often
+/// another edition of the album, such as its extended mixes alone. A release
+/// group search sends each release's id, title and status but no date or
+/// tracklist, so the order MusicBrainz lists them in decides among the rest.
+fn album_release(group: &ReleaseGroup) -> Option<&Release> {
+    let official: Vec<&Release> = (group.releases.iter().flatten())
+        .filter(|r| r.status == Some(ReleaseStatus::Official))
+        .collect();
+    let group_title = group.title.to_lowercase();
+    (official.iter())
+        .find(|r| r.title.to_lowercase() == group_title)
+        .or(official.first())
+        .copied()
 }
 
 /// Fetches a release (album) by its ID and returns it with its full tracklist.
@@ -472,11 +539,11 @@ pub struct RecordingReleases {
     pub releases: Vec<RecordingRelease>,
 }
 
-/// Searches MusicBrainz for artists by name.
+/// Searches MusicBrainz for artists by name or alias.
 pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, MetadataError> {
     let client = musicbrainz_client();
     let found = with_retry("MusicBrainz artist search", || {
-        let search_query = lucene_query(&[("artist", query)]);
+        let search_query = artist_search_query(query);
         async move {
             Artist::search(search_query)
                 .limit(limit)
@@ -953,7 +1020,7 @@ mod tests {
     fn a_search_sends_its_text_as_text() {
         // Each of these is URL or Lucene syntax when sent as it is.
         let name = r##"Simon & Garfunkel + "#1" \ (live): a/b"##;
-        let url = Artist::search(lucene_query(&[("artist", name)]))
+        let url = Artist::search(query_param(&phrase("artist", name)))
             .limit(10)
             .as_api_request(musicbrainz_client())
             .url;
@@ -974,9 +1041,97 @@ mod tests {
                 ("limit".to_string(), "10".to_string())
             ]
         );
+        let none: &[ArtistMatch] = &[];
         assert_eq!(
-            lucene_query(&[("artistname", "Bing Crosby"), ("recording", "Silent Night")]),
-            "query=artistname%3A%22Bing+Crosby%22+AND+recording%3A%22Silent+Night%22"
+            titled_query(
+                "recording",
+                "Silent Night",
+                "artistname",
+                Some(("Bing Crosby", none))
+            ),
+            "query=%28artistname%3A%22Bing+Crosby%22%29+AND+recording%3A%22Silent+Night%22"
+        );
+    }
+
+    /// The Lucene query a `query=` parameter carries.
+    fn lucene(param: &str) -> String {
+        let (key, value) = url::form_urlencoded::parse(param.as_bytes())
+            .into_owned()
+            .next()
+            .unwrap();
+        assert_eq!(key, "query");
+        value
+    }
+
+    #[test]
+    fn an_artist_typed_by_an_alias_is_matched_by_mbid() {
+        assert_eq!(
+            lucene(&artist_search_query("Shiro Sagisu")),
+            r#"artist:"Shiro Sagisu" OR alias:"Shiro Sagisu""#
+        );
+        // GET https://musicbrainz.org/ws/2/artist?query=artist:"Shiro Sagisu" OR alias:"Shiro Sagisu"&limit=5&fmt=json,
+        // fetched 2026-11-21: 鷺巣詩郎, found by the alias "Shirô Sagisu" (the artist index ignores diacritics).
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/artist_search_shiro_sagisu.json"
+        ))
+        .unwrap();
+        let sagisu = artist_match(serde_json::from_value(body["artists"][0].clone()).unwrap());
+        let kept = named_artists(
+            "Shiro Sagisu",
+            vec![
+                found(
+                    "7c3fd8f4-6ef1-4f3b-9d3a-6c1e5a0d2b11",
+                    "Sagisu Tribute Band",
+                    &["Shiro Sagisu Orchestra"],
+                ),
+                sagisu.clone(),
+            ],
+        );
+        assert_eq!(kept, [sagisu]);
+        let artist = Some(("Shiro Sagisu", kept.as_slice()));
+        assert_eq!(
+            lucene(&titled_query(
+                "recording",
+                "Here to Stay",
+                "artistname",
+                artist
+            )),
+            r#"(artistname:"Shiro Sagisu" OR arid:"9b127d23-f877-4541-83cd-44f46393dfb7") AND recording:"Here to Stay""#
+        );
+        assert_eq!(
+            lucene(&titled_query("releasegroup", "Bleach", "artist", artist)),
+            r#"(artist:"Shiro Sagisu" OR arid:"9b127d23-f877-4541-83cd-44f46393dfb7") AND releasegroup:"Bleach""#
+        );
+        assert_eq!(
+            lucene(&titled_query("releasegroup", "Bleach", "artist", None)),
+            r#"releasegroup:"Bleach""#
+        );
+    }
+
+    #[test]
+    fn an_artist_whose_alias_only_holds_the_typed_name_is_not_matched() {
+        // The first two hits of artist:"Queen" OR alias:"Queen", fetched 2026-11-21.
+        let queen = found("0383dadf-2a4e-4d10-a46a-e9e041da8eb3", "Queen", &["クイーン"]);
+        let kept = named_artists(
+            "queen",
+            vec![
+                queen.clone(),
+                found(
+                    "54799c0e-eb45-4eea-996d-c4d71a63c499",
+                    "Ella Fitzgerald",
+                    &["Queen of Jazz"],
+                ),
+            ],
+        );
+        assert_eq!(kept, [queen]);
+        assert_eq!(
+            lucene(&titled_query(
+                "recording",
+                "Love",
+                "artistname",
+                Some(("queen", kept.as_slice()))
+            )),
+            r#"(artistname:"queen" OR arid:"0383dadf-2a4e-4d10-a46a-e9e041da8eb3") AND recording:"Love""#
         );
     }
 
@@ -1091,6 +1246,36 @@ mod tests {
                 .release_types,
             None
         );
+    }
+
+    /// GET https://musicbrainz.org/ws/2/release-group?query=releasegroup:%22Bigger%20Than%20All%20of%20Us%22%20AND%20artist:%22Above%20%26%20Beyond%22&inc=releases&limit=5&fmt=json,
+    /// fetched 2026-11-21, its first release group with the artist's aliases and the tags left out.
+    const RELEASE_GROUP: &str = r#"{"id":"58a8a8d6-3738-4339-b104-43bb75785dda","type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","score":100,"primary-type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","artist-credit-id":"ed3cc697-caa6-332d-bd10-789f9fd471b5","count":6,"title":"Bigger Than All of Us","first-release-date":"2025-07-18","primary-type":"Album","artist-credit":[{"name":"Above & Beyond","artist":{"id":"370bd5a3-4abf-4356-8576-3a8fc0c11d65","name":"Above & Beyond","sort-name":"Above & Beyond"}}],"releases":[{"id":"cf554d3c-52be-4609-8f87-ea7fb47a82fe","title":"Bigger Than All of Us"},{"id":"032e6446-2867-4ebe-b2d2-0a96ee460cd8","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us (extended mixes)","status":"Official"},{"id":"cfe38b07-2375-43ee-81eb-09cc1e4beb1e","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us (album & extended mixes)","status":"Official"},{"id":"e6f0e965-99cb-47ab-8ccd-616a11ce83e3","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"},{"id":"c44a58b2-025d-4835-bcd2-a8affc598d5d","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"},{"id":"14e4d22e-d686-4957-bb97-b686ec6459d2","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"}]}"#;
+
+    /// Issue #93: the search showed the extended mixes release (11 tracks), the
+    /// first official one listed, for the album.
+    #[test]
+    fn an_album_search_shows_the_official_release_titled_as_its_group() {
+        let group: ReleaseGroup = serde_json::from_str(RELEASE_GROUP).unwrap();
+        assert_eq!(
+            album_release(&group).map(|r| r.id.as_str()),
+            Some("e6f0e965-99cb-47ab-8ccd-616a11ce83e3")
+        );
+
+        let mut others: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+        others["title"] = "Bigger Than All of Us: The Remixes".into();
+        let others: ReleaseGroup = serde_json::from_value(others).unwrap();
+        assert_eq!(
+            album_release(&others).map(|r| r.id.as_str()),
+            Some("032e6446-2867-4ebe-b2d2-0a96ee460cd8")
+        );
+
+        // Only the release that has no status.
+        let mut unofficial: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+        let first = unofficial["releases"][0].clone();
+        unofficial["releases"] = serde_json::json!([first]);
+        let unofficial: ReleaseGroup = serde_json::from_value(unofficial).unwrap();
+        assert!(album_release(&unofficial).is_none());
     }
 
     #[test]

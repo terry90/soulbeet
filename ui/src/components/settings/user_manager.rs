@@ -12,7 +12,7 @@ use super::panel::{
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::{FieldLook, TextInput};
+use crate::{ConfirmModal, FieldLook, TextInput};
 
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
 const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
@@ -28,6 +28,15 @@ fn sign_in_tags(user: &UserSummary) -> Vec<String> {
         tags.push("no password".to_string());
     }
     tags
+}
+
+/// What the Delete button asks before it deletes the account named `username`.
+fn delete_prompt(username: &str) -> String {
+    format!(
+        "Delete {username}? This removes the account with its folder entries, settings, download \
+         jobs and connected apps, and deletes its pending discovery tracks from disk. The music \
+         in its folders stays."
+    )
 }
 
 /// What an admin's new password for the account `user` does besides.
@@ -121,6 +130,7 @@ pub fn UserManager() -> Element {
 
     let mut editing_user_id = use_signal(|| None::<String>);
     let mut edit_user_password = use_signal(|| "".to_string());
+    let mut pending_delete = use_signal(|| None::<UserSummary>);
 
     let mut error = use_signal(|| "".to_string());
     let mut success_msg = use_signal(|| "".to_string());
@@ -257,7 +267,7 @@ pub fn UserManager() -> Element {
                         let id_pw = user.id.clone();
                         let id_edit_pw = user.id.clone();
                         let id_role = user.id.clone();
-                        let id_delete = user.id.clone();
+                        let to_delete = user.clone();
                         let id_unlink = user.id.clone();
                         let tags = sign_in_tags(&user);
                         let reset_note = reset_note(&user);
@@ -330,7 +340,7 @@ pub fn UserManager() -> Element {
                                   }
                                   button {
                                     class: REMOVE_BUTTON_CLASS,
-                                    onclick: move |_| handle_delete_user(id_delete.clone()),
+                                    onclick: move |_| pending_delete.set(Some(to_delete.clone())),
                                     "Delete"
                                   }
                                 }
@@ -341,6 +351,19 @@ pub fn UserManager() -> Element {
                     })
             }
           }
+        }
+      }
+      if let Some(user) = pending_delete() {
+        ConfirmModal {
+          message: delete_prompt(&user.username),
+          confirm_label: "Delete",
+          danger: true,
+          on_confirm: move |_| {
+              let id = user.id.clone();
+              pending_delete.set(None);
+              spawn(handle_delete_user(id));
+          },
+          on_cancel: move |_| pending_delete.set(None),
         }
       }
     }
@@ -358,6 +381,16 @@ mod tests {
             has_password,
             sso_name: sso_name.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn deleting_a_user_asks_first_and_says_what_goes() {
+        assert_eq!(
+            delete_prompt("ann"),
+            "Delete ann? This removes the account with its folder entries, settings, download \
+             jobs and connected apps, and deletes its pending discovery tracks from disk. The \
+             music in its folders stays."
+        );
     }
 
     #[test]

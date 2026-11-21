@@ -51,7 +51,8 @@ use crate::server_fns::download::enqueue::{
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
 use crate::server_fns::download::monitor::{
-    read_pending_retry, transfer_by_id, FAILED_STATE_CONFIRM,
+    await_ended, cancel_abandoned, read_pending_retry, remove_ended_transfers, transfer_by_id,
+    FAILED_STATE_CONFIRM,
 };
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
@@ -277,6 +278,10 @@ struct QueuedTrack {
     retry_pending_since: Option<tokio::time::Instant>,
     /// Alternate peers for this track, and how many have been tried.
     pool: SourcePool,
+    /// The `(peer, transfer id)` of each attempt this track failed over
+    /// from. Each was cancelled at its failover, and `stop_waiting` removes
+    /// their records.
+    abandoned: Vec<(String, String)>,
 }
 
 /// The track's import is done or abandoned once it is dropped, so whoever
@@ -315,6 +320,11 @@ fn succeeded(state: &shared::download::DownloadState) -> bool {
 /// user asked for through the transfer registry, which is cancelled here
 /// unless it already finished. A track that settles without a file gives up
 /// its key.
+///
+/// A failed transfer is cancelled when its track moves on or runs out of
+/// peers (`cancel_abandoned`): one read as failed past `RETRY_PENDING_FOR`
+/// may still be in slskd's own retry, and a file it fetched late would land
+/// in the batch folder with nobody to import it.
 ///
 /// A failure counts only once it has persisted for `FAILED_STATE_CONFIRM`,
 /// the same window `DownloadMonitor` applies. slskd 0.26 retries failed
@@ -419,17 +429,58 @@ async fn settle_poll(
                             transfer_key(backend.id(), &next.source, &next.item),
                         );
                         registry.hand_over(&dead, &qt.key, &qt.batch.owner);
+                        cancel_abandoned(backend, &dead.peer, &id).await;
+                        qt.abandoned.push((dead.peer.clone(), id));
                         qt.transfer_id = next.id.clone();
                         qt.failing_since = None;
                         qt.retry_pending_since = None;
                         pending.insert(next.id);
                     }
                     None => {
+                        cancel_abandoned(backend, &qt.key.peer, &id).await;
                         registry.release(&qt.key, &qt.batch.owner);
                         failed.insert(id);
                     }
                 }
             }
+        }
+    }
+}
+
+/// End the wait on `queued` the way `DownloadMonitor` ends a batch: cancel
+/// the transfers still in `pending`, then remove the records of this run's
+/// transfers, current or failed over from, that ended without a file. Left
+/// running, a late transfer would land in its batch folder after its track
+/// was given up on, and nobody would import or delete it.
+///
+/// The removal waits for slskd to end the cancelled transfers
+/// (`await_ended`). A transfer that finished before its cancel reached
+/// slskd delivered its file, so it leaves `pending` and is imported like
+/// the rest.
+#[cfg(feature = "server")]
+async fn stop_waiting(
+    queued: &[QueuedTrack],
+    pending: &mut std::collections::HashSet<String>,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+) {
+    for qt in queued.iter().filter(|qt| pending.contains(&qt.transfer_id)) {
+        cancel_abandoned(backend, &qt.key.peer, &qt.transfer_id).await;
+    }
+    let transfers: Vec<(String, String)> = (queued.iter())
+        .flat_map(|qt| {
+            std::iter::once((qt.key.peer.clone(), qt.transfer_id.clone()))
+                .chain(qt.abandoned.iter().cloned())
+        })
+        .collect();
+    await_ended(backend, &transfers).await;
+    let Some(listed) = remove_ended_transfers(backend, &transfers).await else {
+        return;
+    };
+    for qt in queued {
+        if transfer_by_id(&listed, &qt.key.peer, &qt.transfer_id)
+            .is_some_and(|dl| succeeded(&dl.state))
+        {
+            pending.remove(&qt.transfer_id);
         }
     }
 }
@@ -813,6 +864,7 @@ pub async fn generate_discovery_playlist_internal(
                             // enqueued: earlier entries were already tried and
                             // rejected in this loop, and must not be retried.
                             pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
+                            abandoned: Vec::new(),
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -868,7 +920,7 @@ pub async fn generate_discovery_playlist_internal(
             // A slow peer (3 min queue wait + 8 min transfer) could exceed it. This is
             // acceptable because: (1) discovery tracks are single songs, not albums,
             // (2) most Soulseek transfers start quickly, and (3) timed-out tracks are
-            // recorded in stats with no data loss -- they can be rediscovered later.
+            // recorded in stats and their transfers cancelled (`stop_waiting`).
             let wait_start = tokio::time::Instant::now();
             let max_wait = tokio::time::Duration::from_secs(600);
             let mut pending_ids: std::collections::HashSet<String> =
@@ -913,6 +965,7 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
             }
+            stop_waiting(&queued, &mut pending_ids, &backend).await;
 
             stats.downloads_timed_out += pending_ids.len() as u32;
             stats.downloads_failed += failed_ids.len() as u32;
@@ -1175,12 +1228,36 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
 
 /// Create or update smart playlists in Navidrome for each discovery profile.
 ///
-/// Uses Navidrome's native API to create smart playlists with a filepath rule
-/// that matches the Discovery/{profile}/ directory. The playlist auto-updates
-/// as Navidrome scans new files. Owned by the authenticated user.
+/// Uses Navidrome's native API to create smart playlists of the songs in this
+/// user's Discovery/{profile}/ directory, in its library. The playlist
+/// auto-updates as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
-    let settings = UserSettings::get(user_id).await?;
+    reconcile_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
+        &UserId::new(user_id),
+    )
+    .await
+}
+
+/// reconcile_discovery_playlists on `db` and `navidrome`, `music_path` the root of Navidrome's
+/// default library here (NAVIDROME_MUSIC_PATH). Each playlist is changed in place, so its id
+/// stays the one clients hold. The error names every profile that failed.
+#[cfg(feature = "server")]
+async fn reconcile_in(
+    db: &sqlx::SqlitePool,
+    navidrome: &dyn crate::core::index::NavidromeOf,
+    music_path: Option<&std::path::Path>,
+    user: &UserId,
+) -> Result<(), String> {
+    use crate::core::playlists::{discovery_key, lock};
+
+    let user_id = user.to_string();
+    // Taken before the settings are read, so a run waiting for it reads the ids the other stored.
+    let _reconciling = lock(&discovery_key(&user_id)).await;
+    let settings = UserSettings::get_in(db, &user_id).await?;
     if !settings.discovery_enabled {
         return Ok(());
     }
@@ -1188,11 +1265,11 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         Some(id) => id.clone(),
         None => return Ok(()),
     };
-    Folder::get_by_id(&folder_id)
+    let folder = Folder::get_by_id_in(db, &folder_id)
         .await?
         .ok_or("Discovery folder not found")?;
 
-    let navi = match crate::services::navidrome_client_for_user(user_id).await {
+    let navi = match navidrome.navidrome_of(user).await {
         Ok(c) => c,
         Err(e) => {
             info!(
@@ -1203,77 +1280,141 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         }
     };
 
+    // Found before any playlist is touched, so an unknown place leaves them as they are.
+    let discovery = crate::core::discovery::discovery_place_in(db, &navi, music_path, &folder)
+        .await
+        .map_err(|f| crate::core::logged(&f))?;
+    let Some(discovery) = discovery else {
+        info!(
+            "Playlist reconciliation skipped: no Navidrome library Soulbeet knows holds {}",
+            folder.discovery_path()
+        );
+        return Ok(());
+    };
+
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
+    let mut failed = Vec::new();
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
-
-        // Delete stale playlist so we can recreate with the correct rule
-        if let Some(old_id) = UserSettings::get_playlist_id_for_profile(
+        let stored_id = UserSettings::get_playlist_id_for_profile(
             &settings.discovery_navidrome_playlist_id,
             &profile_name,
-        ) {
-            let _ = navi.delete_smart_playlist(&old_id).await;
-        }
+        );
 
         let playlist_name = UserSettings::get_playlist_name_for_profile(
             &settings.discovery_playlist_name,
             &profile_name,
         );
 
-        // Derive the Navidrome-relative path prefix by sampling a song from this profile's folder.
-        // The native API returns the raw media_file.path (relative to library root), which is what
-        // the filepath smart playlist operator matches against.
-        let profile_path = match navi.get_songs_by_path_prefix(&profile_name, 50).await {
-            Ok(songs) if !songs.is_empty() => {
-                // Extract the directory prefix from the first song's path.
-                // Song path looks like "Discovery/Balanced/Artist/Album/track.flac"
-                // or "staging/Discovery/Balanced/Artist/Album/track.flac"
-                // We want everything up to and including the profile name.
-                let song_path = &songs[0].path;
-                if let Some(idx) = song_path.find(&format!("{}/", profile_name)) {
-                    let end = idx + profile_name.len();
-                    song_path[..end].to_string()
-                } else {
-                    // Song matched but path doesn't contain profile name as a directory
-                    warn!(
-                        "Could not extract profile prefix from song path '{}', falling back to Discovery/{}",
-                        song_path, profile_name
-                    );
-                    format!("Discovery/{}", profile_name)
-                }
-            }
-            _ => {
-                // No songs imported yet (first run) or API error: use hardcoded default.
-                // This is correct because on first run the folder structure matches the default.
-                format!("Discovery/{}", profile_name)
-            }
-        };
+        let place = discovery.child(&profile_name);
         let comment = format!("Soulbeet discovery ({})", profile_name);
 
-        match navi
-            .create_smart_playlist(&playlist_name, &comment, &profile_path)
-            .await
-        {
-            Ok(playlist_id) => {
-                if let Err(e) =
-                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &playlist_id)
-                        .await
+        let reconciled = reconcile_playlist(
+            &navi,
+            stored_id.as_deref(),
+            &playlist_name,
+            &comment,
+            &place,
+        )
+        .await;
+        match reconciled {
+            Ok(Reconciled::Created(playlist_id)) => {
+                if let Err(e) = UserSettings::update_discovery_playlist_id_in(
+                    db,
+                    &user_id,
+                    &profile_name,
+                    &playlist_id,
+                )
+                .await
                 {
-                    warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
+                    // An id not stored makes the next run create the playlist again.
+                    let undone = match navi.delete_smart_playlist(&playlist_id).await {
+                        Ok(()) => "deleted".to_string(),
+                        Err(d) => format!("left in Navidrome: {d}"),
+                    };
+                    failed.push(format!(
+                        "{profile_name}: id {playlist_id} not saved ({e}), playlist {undone}"
+                    ));
+                    continue;
                 }
                 info!(
-                    "Created smart playlist '{}' (path filter: {}) for user {}",
-                    playlist_name, profile_path, user_id
+                    "Created smart playlist '{}' (library {}, path filter: {}) for user {}",
+                    playlist_name,
+                    place.library_id,
+                    place.song_prefix(),
+                    user_id
                 );
             }
+            Ok(Reconciled::Updated) => info!(
+                "Updated smart playlist '{}' (library {}, path filter: {}) for user {}",
+                playlist_name,
+                place.library_id,
+                place.song_prefix(),
+                user_id
+            ),
+            Ok(Reconciled::Unchanged) => {}
             Err(e) => {
-                warn!("Failed to create smart playlist '{}': {}", playlist_name, e);
+                warn!(
+                    "Failed to reconcile smart playlist '{}': {}",
+                    playlist_name, e
+                );
+                failed.push(format!("{profile_name}: {e}"));
             }
         }
     }
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
+/// What reconcile did to one profile's smart playlist.
+#[cfg(feature = "server")]
+enum Reconciled {
+    /// Navidrome had none by the stored id, or none was stored: made with this id.
+    Created(String),
+    Updated,
+    Unchanged,
+}
+
+/// Brings the smart playlist stored as `stored_id` to `name` and the rules of the songs in
+/// `place`, in place, so its id, comment and public flag stay. A playlist is made only when Navidrome says it
+/// has none by that id: after a failed lookup the old one may still be there and would be left
+/// beside the new one.
+#[cfg(feature = "server")]
+async fn reconcile_playlist(
+    navi: &soulbeet::navidrome::NavidromeClient,
+    stored_id: Option<&str>,
+    name: &str,
+    comment: &str,
+    place: &crate::core::library::NavidromePlace,
+) -> Result<Reconciled, soulbeet::NavidromeError> {
+    use soulbeet::navidrome::{filepath_rules, SmartPlaylistChange};
+
+    let prefix = place.song_prefix();
+    let existing = match stored_id {
+        Some(id) => navi.get_native_playlist(id).await?,
+        None => None,
+    };
+    let Some(playlist) = existing else {
+        let id = navi
+            .create_smart_playlist(name, comment, place.library_id, &prefix)
+            .await?;
+        return Ok(Reconciled::Created(id));
+    };
+    let rules = filepath_rules(place.library_id, &prefix);
+    let change = SmartPlaylistChange {
+        name: (playlist.name != name).then_some(name),
+        rules: (playlist.rules.as_ref() != Some(&rules)).then_some(&rules),
+    };
+    if change.name.is_none() && change.rules.is_none() {
+        return Ok(Reconciled::Unchanged);
+    }
+    navi.update_smart_playlist(&playlist.id, &change).await?;
+    Ok(Reconciled::Updated)
 }
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]
@@ -1431,14 +1572,14 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{
         discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
-        QueuedTrack, FAILED_STATE_CONFIRM,
+        stop_waiting, QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
     };
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
-    use crate::server_fns::download::monitor::RETRY_PENDING_FOR;
+    use crate::server_fns::download::monitor::{CANCEL_SETTLE, RETRY_PENDING_FOR};
     use crate::server_fns::download::test_support::{
         batch, item, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
@@ -1632,6 +1773,7 @@ mod tests {
             failing_since: None,
             retry_pending_since: None,
             pool: SourcePool::single(items),
+            abandoned: Vec::new(),
         }
     }
 
@@ -2072,6 +2214,182 @@ mod tests {
         assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
     }
 
+    // Paused: stop_waiting polls slskd with tokio::time::sleep until the
+    // cancel has ended the transfer.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfer_still_pending_at_the_deadline_is_cancelled_and_its_record_removed() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            "a/07 - Wake Up.flac",
+            "t-a/07 - Wake Up.flac",
+            DownloadState::InProgress,
+        )]);
+        // slskd lists the transfer Cancelled only once its download task
+        // has caught the cancel.
+        let slskd = stub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            slskd.set_listing(vec![transfer(
+                "peer_a",
+                "a/07 - Wake Up.flac",
+                "t-a/07 - Wake Up.flac",
+                DownloadState::Cancelled,
+            )]);
+        });
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![
+                Cancel::only("peer_a", "t-a/07 - Wake Up.flac"),
+                Cancel::removing("peer_a", "t-a/07 - Wake Up.flac"),
+            ]
+        );
+        assert_eq!(pending, pending_of(&queued), "it is not imported");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_slskd_never_ends_stops_the_wait_after_its_bound() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            "a/07 - Wake Up.flac",
+            "t-a/07 - Wake Up.flac",
+            DownloadState::InProgress,
+        )]);
+        let start = tokio::time::Instant::now();
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert!(start.elapsed() >= CANCEL_SETTLE);
+        assert!(start.elapsed() < CANCEL_SETTLE + std::time::Duration::from_secs(2));
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")],
+            "slskd removes only a record that ended"
+        );
+        assert_eq!(pending, pending_of(&queued), "it is not imported");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_failed_over_from_is_cancelled_then_and_its_record_removed_at_the_end() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let mut queued = vec![queued_track(
+            vec![
+                item("peer_a", "Wake Up", "a/07 - Wake Up.flac"),
+                item("peer_b", "Wake Up", "b/07 - Wake Up.flac"),
+            ],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        let mut failed_ids = HashSet::new();
+        already_confirmed_failing(&mut queued[0]);
+
+        settle_poll(
+            &mut queued,
+            &[failed("peer_a", "a/07 - Wake Up.flac")],
+            &mut pending,
+            &mut failed_ids,
+            &backend,
+        )
+        .await;
+
+        // slskd may still be retrying it, into this track's folder.
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+
+        stub.set_listing(vec![
+            failed("peer_a", "a/07 - Wake Up.flac"),
+            completed("peer_b", "b/07 - Wake Up.flac"),
+        ]);
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![
+                Cancel::only("peer_a", "t-a/07 - Wake Up.flac"),
+                Cancel::only("peer_b", "t-b/07 - Wake Up.flac"),
+                Cancel::removing("peer_a", "t-a/07 - Wake Up.flac"),
+            ]
+        );
+        assert!(pending.is_empty(), "the retry's file is imported");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_finished_before_its_cancel_is_imported_and_keeps_its_record() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![completed("peer_a", "a/07 - Wake Up.flac")]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")],
+            "its file may still be on its way out of the incomplete folder"
+        );
+        assert!(pending.is_empty(), "phase 3 imports it");
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_wait_removes_only_this_runs_records_that_ended_without_a_file() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![
+            queued_track(
+                vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+                &backend,
+            ),
+            queued_track(
+                vec![item("peer_b", "Wake Up", "b/07 - Wake Up.flac")],
+                &backend,
+            ),
+        ];
+        // The first failed out of peers, the second finished in time.
+        let mut pending = HashSet::new();
+        stub.set_listing(vec![
+            failed("peer_a", "a/07 - Wake Up.flac"),
+            completed("peer_b", "b/07 - Wake Up.flac"),
+            // An earlier run's record of the same file.
+            transfer(
+                "peer_a",
+                "a/07 - Wake Up.flac",
+                "t-earlier",
+                DownloadState::Cancelled,
+            ),
+        ]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+        assert!(pending.is_empty());
+    }
+
     #[tokio::test]
     async fn a_scan_status_that_cannot_be_read_still_starts_the_scan() {
         // getLastScanTime's `Internal Error` (server/subsonic/library_scanning.go:16-21); the scan
@@ -2083,5 +2401,243 @@ mod tests {
         );
         assert!(scan_imports(&navi.client(), 3).await);
         assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/startScan"]);
+    }
+
+    mod reconcile {
+        use super::super::reconcile_in;
+        use crate::auth::UserId;
+        use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+        use crate::test_navidrome::{
+            native_playlist, NavidromeFor, NavidromeStub, ADVENT, BAD_GATEWAY, DISCOVERY_RULES,
+        };
+        use serde_json::{json, Value};
+        use sqlx::SqlitePool;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        /// The rules a discovery playlist had before it was scoped to the user's folder in its
+        /// library: the profile's folder anywhere in a song's path.
+        const UNSCOPED: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Balanced"}}],"sort":"-dateAdded","order":"desc"}"#;
+
+        /// Where Soulbeet sees the root of Navidrome's default library, the parent of alice's
+        /// folder (core::folder_of), so her Balanced songs start with alice/Discovery/Balanced/.
+        const MUSIC: &str = "/music";
+
+        /// alice with discovery on for Balanced in her folder, `ids` stored as her playlists.
+        async fn discovering(ids: &str) -> SqlitePool {
+            let db = crate::db::test_db::migrated().await;
+            let folder = crate::core::folder_of(&db, "alice").await;
+            let update = UpdateUserSettings {
+                discovery_enabled: Some(true),
+                discovery_folder_id: Some(folder),
+                discovery_profiles: Some("Balanced".into()),
+                ..Default::default()
+            };
+            UserSettings::upsert_in(&db, "alice", update).await.unwrap();
+            sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+                .bind(ids)
+                .execute(&db)
+                .await
+                .unwrap();
+            db
+        }
+
+        /// reconcile_in for alice, with MUSIC as NAVIDROME_MUSIC_PATH.
+        async fn reconcile(db: &SqlitePool, of: &NavidromeFor) -> Result<(), String> {
+            reconcile_in(db, of, Some(Path::new(MUSIC)), &UserId::new("alice")).await
+        }
+
+        async fn stored_ids(db: &SqlitePool) -> HashMap<String, String> {
+            let s = UserSettings::get_in(db, "alice").await.unwrap();
+            serde_json::from_str(&s.discovery_navidrome_playlist_id.unwrap()).unwrap()
+        }
+
+        fn only_advent() -> HashMap<String, String> {
+            HashMap::from([("Balanced".to_string(), ADVENT.to_string())])
+        }
+
+        /// The bodies sent to `path`, Null for a read.
+        fn sent(navi: &NavidromeStub, path: &str) -> Vec<Value> {
+            (navi.posted(path).iter())
+                .map(|body| match body.is_empty() {
+                    true => Value::Null,
+                    false => serde_json::from_str(body).unwrap(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_that_matches_is_left_alone() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = NavidromeStub::start();
+            let path = format!("/api/playlist/{ADVENT}");
+            let playlist = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES));
+            navi.answer(&path, &[&playlist]);
+            let of = NavidromeFor(Ok(navi.client()));
+            reconcile(&db, &of).await.unwrap();
+            assert_eq!(navi.asked(), ["/auth/login", path.as_str()]);
+            assert_eq!(sent(&navi, &path), [Value::Null]);
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_with_another_name_or_rule_is_changed_in_place() {
+            // The unscoped rule is the one every playlist made before had, so it is brought
+            // to the scoped one in place.
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = NavidromeStub::start();
+            let path = format!("/api/playlist/{ADVENT}");
+            let renamed = native_playlist(ADVENT, "My mix", 2, false, Some(DISCOVERY_RULES));
+            let moved = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(UNSCOPED));
+            // Each read, then its update, which Navidrome answers with the playlist.
+            navi.answer(&path, &[&renamed, &renamed, &moved, &moved]);
+            let of = NavidromeFor(Ok(navi.client()));
+            reconcile(&db, &of).await.unwrap();
+            reconcile(&db, &of).await.unwrap();
+            let rules: Value = serde_json::from_str(DISCOVERY_RULES).unwrap();
+            assert_eq!(
+                sent(&navi, &path),
+                [
+                    Value::Null,
+                    json!({ "name": "Fresh Picks" }),
+                    Value::Null,
+                    json!({ "rules": rules }),
+                ]
+            );
+            assert!(
+                !navi.asked().contains(&"/api/playlist".to_string()),
+                "no playlist is made"
+            );
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_navidrome_no_longer_has_is_made_again() {
+            let db =
+                discovering(r#"{"Adventurous":"2kD8sP4vX7zQ1mN5bT3wYa","Balanced":"gone"}"#).await;
+            let navi = NavidromeStub::start();
+            // deluan/rest controller.go Get, as get_native_playlist reads it.
+            navi.answer_with_status(
+                "/api/playlist/gone",
+                &[(404, r#"{"error":"playlist(id:gone) not found"}"#)],
+            );
+            let made = native_playlist(ADVENT, "Fresh Picks", 0, false, Some(DISCOVERY_RULES));
+            navi.answer("/api/playlist", &[&made]);
+            let of = NavidromeFor(Ok(navi.client()));
+            reconcile(&db, &of).await.unwrap();
+            assert_eq!(
+                navi.asked(),
+                ["/auth/login", "/api/playlist/gone", "/api/playlist"]
+            );
+            let created = sent(&navi, "/api/playlist").remove(0);
+            let rules: Value = serde_json::from_str(DISCOVERY_RULES).unwrap();
+            assert_eq!(
+                (&created["name"], &created["rules"]),
+                (&json!("Fresh Picks"), &rules)
+            );
+            assert_eq!(
+                stored_ids(&db).await,
+                HashMap::from([
+                    (
+                        "Adventurous".to_string(),
+                        "2kD8sP4vX7zQ1mN5bT3wYa".to_string()
+                    ),
+                    ("Balanced".to_string(), ADVENT.to_string()),
+                ])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_read_or_update_is_an_error_and_makes_no_second_playlist() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = NavidromeStub::start();
+            let path = format!("/api/playlist/{ADVENT}");
+            let renamed = native_playlist(ADVENT, "My mix", 2, false, Some(DISCOVERY_RULES));
+            navi.answer_with_status(
+                &path,
+                &[
+                    (502, BAD_GATEWAY),
+                    (200, renamed.as_str()),
+                    (500, r#"{"error":"database is locked"}"#),
+                ],
+            );
+            let of = NavidromeFor(Ok(navi.client()));
+            let read = reconcile(&db, &of).await.unwrap_err();
+            assert!(
+                read.starts_with("Balanced: Get playlist failed: HTTP 502"),
+                "{read}"
+            );
+            let update = reconcile(&db, &of).await.unwrap_err();
+            assert!(
+                update.starts_with("Balanced: Update smart playlist failed: HTTP 500"),
+                "{update}"
+            );
+            assert!(
+                !navi.asked().contains(&"/api/playlist".to_string()),
+                "no playlist is made"
+            );
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_made_playlist_whose_id_cannot_be_saved_is_deleted_and_reported() {
+            let db = discovering("{}").await;
+            sqlx::query(
+                "CREATE TRIGGER no_ids BEFORE UPDATE OF discovery_navidrome_playlist_id
+                 ON user_settings BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+            let navi = NavidromeStub::start();
+            let made = native_playlist(ADVENT, "Fresh Picks", 0, false, Some(DISCOVERY_RULES));
+            navi.answer("/api/playlist", &[&made]);
+            let of = NavidromeFor(Ok(navi.client()));
+            let err = reconcile(&db, &of).await.unwrap_err();
+            assert!(err.contains(&format!("id {ADVENT} not saved")), "{err}");
+            assert!(err.contains("playlist deleted"), "{err}");
+            let path = format!("/api/playlist/{ADVENT}");
+            assert_eq!(
+                navi.asked(),
+                ["/auth/login", "/api/playlist", path.as_str()]
+            );
+            assert!(stored_ids(&db).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_reconcile_waits_for_the_one_running_for_the_same_user() {
+            use crate::core::playlists::{discovery_key, lock};
+
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = NavidromeStub::start();
+            let playlist = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES));
+            navi.answer(&format!("/api/playlist/{ADVENT}"), &[&playlist]);
+            let of = NavidromeFor(Ok(navi.client()));
+            let running = lock(&discovery_key("alice")).await;
+            let mut second =
+                tokio::spawn(async move { reconcile(&db, &of).await });
+            let short = std::time::Duration::from_millis(50);
+            assert!(
+                tokio::time::timeout(short, &mut second).await.is_err(),
+                "the second waits while the first runs"
+            );
+            assert!(navi.asked().is_empty());
+            drop(running);
+            second.await.unwrap().unwrap();
+            assert_eq!(navi.asked().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_discovery_folder_with_no_known_place_leaves_its_playlists_alone() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = NavidromeStub::start();
+            let of = NavidromeFor(Ok(navi.client()));
+            // No NAVIDROME_MUSIC_PATH, no learned root and no pending track to learn one from.
+            reconcile_in(&db, &of, None, &UserId::new("alice"))
+                .await
+                .unwrap();
+            assert!(navi.asked().is_empty(), "{:?}", navi.asked());
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
     }
 }

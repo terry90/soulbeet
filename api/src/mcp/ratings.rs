@@ -33,7 +33,7 @@ pub(crate) const SET_RATING: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(set_rating(state, caller, args)),
@@ -52,7 +52,7 @@ pub(crate) const SET_STAR: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: true,
     open_world: false,
     call: |state, caller, args| Box::pin(set_star(state, caller, args)),

@@ -106,7 +106,7 @@ echo "SECRET_KEY=$(openssl rand -hex 32)" >> .env
 3.  Seed the beets config. `BEETS_CONFIG` replaces the config shipped in the image, so start from a copy of it. Use the same tag as the `image:` line above, since the shipped `plugins:` line depends on the tier (see [Image tiers](docs/beets.md#image-tiers)), and copy it again after you change tier:
 
 ```bash
-TAG=latest # the tag on your image: line (latest, light, medium or full)
+TAG=latest # the tag on your image: line, such as latest, latest-medium or latest-full
 mkdir -p beets
 docker create --name sb "docker.io/docccccc/soulbeet:$TAG"
 docker cp sb:/app/beets_config.yaml ./beets/config.yaml
@@ -123,18 +123,17 @@ docker-compose up -d
 
 ### Initial Setup
 
-A fresh install has one account, `admin` with the password `admin`. It is the only admin. Everyone sees the Settings tabs, but only admins see user management in Settings > Users, the slskd settings and Security Checks in Settings > Config, and the folder administration in Settings > Library.
+A fresh install has one account, `admin` with the password `admin`. It is the only admin. That password only signs in to choose a new one: until it is changed, the account can do nothing else. Everyone sees the Settings tabs, but only admins see user management in Settings > Users, the slskd settings and Security Checks in Settings > Config, and the folder administration in Settings > Library.
 
-1.  Open `http://localhost:9765` and sign in as `admin` / `admin`, with or without Navidrome.
-2.  In **Settings > Users**, change the admin password. Until you do, Settings > Config lists it under Security Checks.
-3.  In **Settings > Config**, connect slskd (URL + API key). [How to get an slskd API key](https://github.com/slskd/slskd/blob/master/docs/config.md#yaml-24).
-4.  In **Settings > Library**, add your music folders (e.g. `/music`). Admins can add a folder anywhere.
-5.  Let the other users in:
+1.  Open `http://localhost:9765` and sign in as `admin` / `admin`, with or without Navidrome. Soulbeet asks for a new password before anything else; enter `admin` as the current password and choose yours.
+2.  In **Settings > Config**, connect slskd (URL + API key). [How to get an slskd API key](https://github.com/slskd/slskd/blob/master/docs/config.md#yaml-24).
+3.  In **Settings > Library**, add your music folders (e.g. `/music`). Admins can add a folder anywhere.
+4.  Let the other users in:
     - **With Navidrome** (`NAVIDROME_URL` set): everyone signs in with their **Navidrome credentials**, and their Soulbeet account is created on the first sign-in. To make your own Navidrome account an admin, sign in with it once, then sign in as `admin` and click **Make admin** next to it in Settings > Users.
     - **Without Navidrome**: create the accounts in Settings > Users.
     - **With a login provider** such as Pocket ID or Authelia: see [single sign-on](docs/sso.md).
-6.  Users who are not admins can only add folders inside a folder root an admin approved. Add one under **Approved Folder Roots** in Settings > Library, for example `/music`, so a user can add `/music/alice`. The root itself cannot be the folder of a user who is not an admin. If one of your own folders is that root (an admin folder at `/music`), tick **Shared** next to it, or every folder inside it is refused as being inside another user's folder.
-7.  That's it. Search for something and download it.
+5.  Users who are not admins can only add folders inside a folder root an admin approved. Add one under **Approved Folder Roots** in Settings > Library, for example `/music`, so a user can add `/music/alice`. The root itself cannot be the folder of a user who is not an admin. If one of your own folders is that root (an admin folder at `/music`), tick **Shared** next to it, or every folder inside it is refused as being inside another user's folder.
+6.  That's it. Search for something and download it.
 
 For discovery (optional): enable discovery on a folder in Settings > Library, pick your profiles, and hit Generate. Play or star some music in Navidrome first, since that is what discovery starts from. You can also add your ListenBrainz username there. [docs/discovery.md](docs/discovery.md) has the details.
 

@@ -11,6 +11,7 @@ use crate::db::DB;
 use crate::models::user::{NameMatch, OidcLink, User, UserChangeError};
 use crate::oauth::codes::{still_signed_in, SessionCheck};
 use crate::secret_key::SecretKey;
+use crate::server_fns::auth::name_taken_by_account;
 use crate::server_fns::guard::load_session_claims;
 
 /// The account `identity` signs in to.
@@ -149,12 +150,12 @@ async fn sync_navidrome_status(
 enum Account {
     /// Already linked to this identity
     Linked(User),
-    /// Has the username (ignoring case) and no identity yet, and a first
-    /// sign-in links such an account (OIDC_LINK_BY_USERNAME, on by default):
-    /// link it
+    /// A plain user account that has the username (ignoring case) and no
+    /// identity yet, and a first sign-in links such an account
+    /// (OIDC_LINK_BY_USERNAME, on by default): link it
     Unlinked(User),
-    /// Has the username and no identity yet, and OIDC_LINK_BY_USERNAME is
-    /// off: its owner links it from a session
+    /// Has the username and no identity yet, and is an admin account or
+    /// OIDC_LINK_BY_USERNAME is off: its owner links it from a session
     Exists,
     /// Nobody has the username: create the account
     New,
@@ -171,7 +172,11 @@ fn choose_account(by_identity: Option<User>, same_name: NameMatch, config: &Oidc
         return Account::Linked(user);
     }
     match same_name {
-        NameMatch::One(user) if user.oidc_subject.is_none() && config.link_by_username => {
+        // Never an admin account: a name at the provider is not proof enough
+        // to hand over the whole instance.
+        NameMatch::One(user)
+            if user.oidc_subject.is_none() && config.link_by_username && !user.role.is_admin() =>
+        {
             Account::Unlinked(*user)
         }
         NameMatch::One(user) if user.oidc_subject.is_none() => Account::Exists,
@@ -248,6 +253,7 @@ async fn enter_account(
                         "Created the account {} on OIDC sign-in",
                         loggable(&user.username)
                     );
+                    name_taken_by_account(&user.username);
                     Ok(user)
                 }
                 // Created by a concurrent sign-in or registration meanwhile.
@@ -258,8 +264,9 @@ async fn enter_account(
         Account::Exists => {
             tracing::warn!(
                 "OIDC sign-in refused: the account {} exists and is not linked to this OIDC \
-                 identity, and OIDC_LINK_BY_USERNAME is off. Its owner links it in Settings \
-                 after a password sign-in",
+                 identity, and it is an admin account (never linked by name) or \
+                 OIDC_LINK_BY_USERNAME is off. Its owner links it in Settings after a \
+                 password sign-in",
                 loggable(&identity.username)
             );
             Err(SsoError::AccountExists)
@@ -441,23 +448,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_provider_user_named_admin_does_not_get_the_admin_account_when_names_link_off() {
-        // A provider where users pick their own name (Pocket ID by default),
-        // so the admin set OIDC_LINK_BY_USERNAME=false: someone renames
-        // themselves to the seeded admin's name.
+    async fn a_provider_user_named_admin_does_not_get_the_admin_account() {
+        // Someone at the provider renames themselves to the seeded admin's
+        // name (Pocket ID lets users do so by default). The default settings
+        // refuse it as if the name were taken, as OIDC_LINK_BY_USERNAME=false
+        // does, with or without auto-register.
         let db = test_db::migrated().await;
         let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
             panic!("the seeded admin");
         };
-        assert_eq!(
-            sign_in_not_by_name(&db, "mallory", "Admin")
-                .await
-                .unwrap_err(),
-            SsoError::AccountExists
-        );
+        let closed = OidcConfig {
+            auto_register: false,
+            ..test_config()
+        };
+        for config in [test_config(), closed, not_by_name()] {
+            for name in ["admin", "Admin"] {
+                assert_eq!(
+                    find_or_create_account(&db, &identity("sub-mallory", name), &config)
+                        .await
+                        .unwrap_err(),
+                    SsoError::AccountExists
+                );
+            }
+        }
         let after = reread(&db, &admin).await;
         assert_eq!(after.oidc_subject, None);
         assert_eq!(after.credentials_version, admin.credentials_version);
+
+        // The admin links their own identity from Settings, and signs in with
+        // it from then on. The session guard reads the process-wide default
+        // password flag, so the admin first sets a password of their own, as
+        // they must before any session of theirs can link.
+        User::update_password_in(&db, &after.id, "chosen")
+            .await
+            .unwrap();
+        crate::security::note_password_set(crate::security::SEEDED_ADMIN_ID, "chosen");
+        let after = reread(&db, &admin).await;
+        let linked = link(
+            &db,
+            Some(&session_of(&after)),
+            &after,
+            &identity("sub-admin", "admin"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(linked.id, admin.id);
+        assert_eq!(
+            sign_in(&db, "sub-admin", "admin").await.unwrap().id,
+            admin.id
+        );
+        assert_eq!(
+            sign_in(&db, "sub-mallory", "admin").await.unwrap_err(),
+            SsoError::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn only_plain_user_accounts_link_by_name() {
+        // An account made admin later is not joined by name either.
+        let db = test_db::migrated().await;
+        let carol = User::create_in(&db, "carol", "pw").await.unwrap();
+        User::set_role_in(&db, &carol.id, crate::auth::Role::Admin)
+            .await
+            .unwrap();
+        assert_eq!(
+            sign_in(&db, "sub-carol", "carol").await.unwrap_err(),
+            SsoError::AccountExists
+        );
+        assert_eq!(reread(&db, &carol).await.oidc_subject, None);
+
+        // A plain user account still is, with the default settings.
+        let dave = User::create_in(&db, "dave", "pw").await.unwrap();
+        let linked = sign_in(&db, "sub-dave", "Dave").await.unwrap();
+        assert_eq!(linked.id, dave.id);
+        assert_eq!(linked.role, crate::auth::Role::User);
+        assert_eq!(linked.oidc_subject.as_deref(), Some("sub-dave"));
+
+        // So is carol's once she is a plain user again.
+        User::set_role_in(&db, &carol.id, crate::auth::Role::User)
+            .await
+            .unwrap();
+        assert_eq!(
+            sign_in(&db, "sub-carol", "carol").await.unwrap().id,
+            carol.id
+        );
     }
 
     #[tokio::test]
@@ -821,49 +895,55 @@ mod tests {
 
     #[tokio::test]
     async fn an_admin_takes_a_wrongly_linked_account_back_from_the_identity() {
-        // Mallory's identity ended up on the admin account: the admin left
-        // OIDC_LINK_BY_USERNAME on and Mallory chose the name at the
-        // provider. Removing the link ends her session, but keeps her out
-        // only once the setting is off or her name there is changed.
+        // Mallory's identity ended up on Bob's account: the admin left
+        // OIDC_LINK_BY_USERNAME on and Mallory chose the name "bob" at the
+        // provider before Bob's first single sign-on. Removing the link ends
+        // her session, but keeps her out only once the setting is off or her
+        // name there is changed.
         let db = test_db::migrated().await;
         let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
             panic!("the seeded admin");
         };
-        let taken = sign_in(&db, "sub-mallory", "admin").await.unwrap();
-        assert_eq!(taken.id, admin.id);
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        let taken = sign_in(&db, "sub-mallory", "bob").await.unwrap();
+        assert_eq!(taken.id, bob.id);
         let her_session = session_of(&taken);
 
-        admin_unlinks(&db, &admin).await;
+        admin_unlinks(&db, &admin, &bob).await;
         let key = session_key();
         assert!(load_session(Some(&her_session), &db, &key).await.is_err());
 
         // The setting still on, her next sign-in under that name takes the
         // account again.
-        let again = sign_in(&db, "sub-mallory", "admin").await.unwrap();
-        assert_eq!(again.id, admin.id);
-        admin_unlinks(&db, &admin).await;
+        let again = sign_in(&db, "sub-mallory", "bob").await.unwrap();
+        assert_eq!(again.id, bob.id);
+        admin_unlinks(&db, &admin, &bob).await;
 
         // Renamed at the provider, she gets an account of her own.
         let hers = sign_in(&db, "sub-mallory", "mallory").await.unwrap();
-        assert_ne!(hers.id, admin.id);
-        assert_eq!(reread(&db, &admin).await.oidc_subject, None);
+        assert_ne!(hers.id, bob.id);
+        assert_eq!(reread(&db, &bob).await.oidc_subject, None);
 
         // With the setting off, the name proves nothing.
         let db = test_db::migrated().await;
-        let taken = sign_in(&db, "sub-mallory", "admin").await.unwrap();
-        admin_unlinks(&db, &taken).await;
+        let NameMatch::One(admin) = User::find_by_name_in(&db, "admin").await.unwrap() else {
+            panic!("the seeded admin");
+        };
+        let bob = User::create_in(&db, "bob", "pw").await.unwrap();
+        sign_in(&db, "sub-mallory", "bob").await.unwrap();
+        admin_unlinks(&db, &admin, &bob).await;
         assert_eq!(
-            sign_in_not_by_name(&db, "sub-mallory", "admin")
+            sign_in_not_by_name(&db, "sub-mallory", "bob")
                 .await
                 .unwrap_err(),
             SsoError::AccountExists
         );
-        assert_eq!(reread(&db, &taken).await.oidc_subject, None);
+        assert_eq!(reread(&db, &bob).await.oidc_subject, None);
     }
 
-    /// The admin `admin` removes their own account's link.
-    async fn admin_unlinks(db: &SqlitePool, admin: &User) {
-        crate::server_fns::sso::unlink_sso_in(db, &ctx_of(admin), &admin.id, false)
+    /// The admin `admin` removes the link of the account `account`.
+    async fn admin_unlinks(db: &SqlitePool, admin: &User, account: &User) {
+        crate::server_fns::sso::unlink_sso_in(db, &ctx_of(admin), &account.id, false)
             .await
             .unwrap();
     }

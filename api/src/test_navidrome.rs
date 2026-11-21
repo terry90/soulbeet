@@ -28,7 +28,7 @@ type Answers = Arc<Mutex<Book>>;
 /// What the stand-in answers: the `when` rules first, then the bodies set per endpoint.
 #[derive(Default)]
 struct Book {
-    bodies: HashMap<String, VecDeque<String>>,
+    bodies: HashMap<String, VecDeque<(u16, String)>>,
     when: Vec<When>,
     /// Headers sent with every answer to an endpoint, as (name, value).
     headers: HashMap<String, Vec<(String, String)>>,
@@ -62,7 +62,7 @@ impl NavidromeStub {
         let answers: Answers = Arc::new(Mutex::new(Book {
             bodies: HashMap::from([(
                 "/auth/login".to_string(),
-                VecDeque::from([r#"{"token":"jwt"}"#.to_string()]),
+                VecDeque::from([(200, r#"{"token":"jwt"}"#.to_string())]),
             )]),
             when: Vec::new(),
             headers: HashMap::new(),
@@ -83,9 +83,17 @@ impl NavidromeStub {
     }
 
     pub fn answer(&self, endpoint: &str, bodies: &[&str]) {
+        let answers: Vec<(u16, &str)> = bodies.iter().map(|body| (200, *body)).collect();
+        self.answer_with_status(endpoint, &answers);
+    }
+
+    /// As `answer`, each body sent with its status.
+    pub fn answer_with_status(&self, endpoint: &str, answers: &[(u16, &str)]) {
         self.answers.lock().unwrap().bodies.insert(
             endpoint.to_string(),
-            bodies.iter().map(|body| body.to_string()).collect(),
+            (answers.iter())
+                .map(|(status, body)| (*status, body.to_string()))
+                .collect(),
         );
     }
 
@@ -208,12 +216,12 @@ impl Book {
         {
             return (when.status, when.body.clone());
         }
-        let body = match self.bodies.get_mut(endpoint) {
+        let answer = match self.bodies.get_mut(endpoint) {
             Some(bodies) if bodies.len() > 1 => bodies.pop_front(),
             Some(bodies) => bodies.front().cloned(),
             None => None,
         };
-        (200, body.unwrap_or_else(|| OK.to_string()))
+        answer.unwrap_or_else(|| (200, OK.to_string()))
     }
 }
 
@@ -325,7 +333,7 @@ pub(crate) fn native_songs(songs: &[(&str, bool)]) -> String {
 
 /// The rules of Soulful's discovery playlist for the Balanced profile, as Navidrome writes them
 /// back (`create_smart_playlist`, lib/soulbeet/src/navidrome/client.rs).
-pub(crate) const DISCOVERY_RULES: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Balanced"}}],"sort":"-dateAdded","order":"desc"}"#;
+pub(crate) const DISCOVERY_RULES: &str = r#"{"all":[{"is":{"library_id":1}},{"startsWith":{"filepath":"alice/Discovery/Balanced/"}}],"sort":"-dateAdded","order":"desc"}"#;
 
 /// alice's native `GET /api/playlist/{id}` record as Navidrome 0.64.2 writes model.Playlist
 /// (model/playlist.go:18-41): `song_count` rows, synced from a playlist file when `sync`, smart

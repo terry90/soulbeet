@@ -537,8 +537,8 @@ pub(crate) struct JobView {
     pub timeline: Vec<TimelineEntry>,
     /// The search the job reads its sources from, while it is kept.
     pub search: Option<StoredSearch>,
-    /// Its failure could not be written: it waits with no runner until the next start
-    /// (`Ledger::strand`).
+    /// Its failure could not be written, or its runner could not read it: it waits with no
+    /// runner until the next start (`Ledger::strand`).
     pub stranded: bool,
 }
 

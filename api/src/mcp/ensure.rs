@@ -95,7 +95,7 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: true,
     call: |state, caller, args| Box::pin(ensure_in_library(state, caller, args)),

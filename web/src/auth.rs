@@ -1,6 +1,6 @@
 use api::auth::AuthResponse;
 use dioxus::prelude::*;
-use ui::Auth;
+use ui::{Auth, ChoosePassword};
 
 pub fn use_auth() -> Auth {
     use_context::<Auth>()
@@ -23,7 +23,7 @@ pub fn AuthProvider(children: Element) -> Element {
         }
     });
 
-    use_context_provider(|| Auth::new(auth_signal));
+    let auth = use_context_provider(|| Auth::new(auth_signal));
 
     if !*initialized.read() {
         return rsx! {
@@ -33,6 +33,14 @@ pub fn AuthProvider(children: Element) -> Element {
                     "SoulBeet"
                 }
             }
+        };
+    }
+
+    // A session still on the default password can only choose a new one,
+    // so nothing that would call the server for more is mounted.
+    if auth.password_change_required() {
+        return rsx! {
+            ChoosePassword {}
         };
     }
 

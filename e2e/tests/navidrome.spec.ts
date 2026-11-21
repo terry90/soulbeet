@@ -4,6 +4,7 @@
 
 import { expect, test } from '@playwright/test';
 import {
+  admin,
   changePassword,
   loginViaApi,
   loginViaUi,
@@ -17,8 +18,8 @@ test.skip(!navidromeEnabled, 'stack has no Navidrome (set E2E_NAVIDROME=1)');
 
 test('authenticates through Navidrome and reports the connection', async ({ context, page }) => {
   // The seeded admin takes the Navidrome admin's password for this test.
-  await loginViaApi(context, { username: 'admin', password: 'admin' });
-  await changePassword(context, 'admin', navidromeAdminPassword);
+  await loginViaApi(context, admin);
+  await changePassword(context, admin.password, navidromeAdminPassword);
   await context.clearCookies();
 
   try {
@@ -29,10 +30,10 @@ test('authenticates through Navidrome and reports the connection', async ({ cont
 
     await expect(page.getByText('Connected', { exact: true })).toBeVisible({ timeout: 30_000 });
   } finally {
-    // Restore admin/admin so setup.app.ts keeps working on reruns.
+    // Restore the suite's admin password so setup.app.ts keeps working on reruns.
     await context.clearCookies();
     await loginViaApi(context, { username: 'admin', password: navidromeAdminPassword });
-    await changePassword(context, navidromeAdminPassword, 'admin');
+    await changePassword(context, navidromeAdminPassword, admin.password);
   }
 });
 

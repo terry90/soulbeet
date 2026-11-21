@@ -129,10 +129,11 @@ pub struct OidcConfig {
     /// Create an account on first sign-in for a username that has none;
     /// unset, only with `REGISTRATION=open`
     pub auto_register: bool,
-    /// On a first sign-in, link the one account whose name matches the
-    /// username claim and has no identity yet. On unless the admin turns it
-    /// off: right when the admin decides the names at the provider, wrong
-    /// when anyone else can take a name there, who then gets the account.
+    /// On a first sign-in, link the one plain user account whose name matches
+    /// the username claim and has no identity yet; an admin account is never
+    /// linked by name. On unless the admin turns it off: right when the admin
+    /// decides the names at the provider, wrong when anyone else can take a
+    /// name there, who then gets that user account.
     pub link_by_username: bool,
 }
 
