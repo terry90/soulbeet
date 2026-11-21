@@ -494,7 +494,7 @@ mod tests {
         let db = test_db::migrated().await;
         let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
         // The forms the Settings page writes (ui/src/components/settings/folder_manager.rs:415,445) and the
-        // playlist sync stores (UserSettings::update_discovery_playlist_id, user_settings.rs).
+        // playlist sync stores (UserSettings::update_discovery_playlist_id_in, user_settings.rs).
         s.discovery_track_count = r#"{"Conservative":5,"Balanced":10,"Adventurous":15}"#.into();
         s.discovery_playlist_name =
             r#"{"Conservative":"Comfort Zone","Balanced":"Weekly Mix","Adventurous":"Deep Cuts"}"#

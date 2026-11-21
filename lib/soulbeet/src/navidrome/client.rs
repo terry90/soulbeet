@@ -690,10 +690,7 @@ impl NavidromeClient {
     }
 
     /// Create a smart playlist via Navidrome's native API of the songs of library `library_id`
-    /// whose path below the library's root starts with `path_prefix`. Navidrome matches
-    /// `filepath` against media_file.path, which is relative to the library's root
-    /// (model/criteria/fields.go:37), and `startsWith` is `LIKE 'prefix%'`
-    /// (model/criteria/operators.go:166-180).
+    /// whose path below the library's root starts with `path_prefix` (filepath_rules).
     pub async fn create_smart_playlist(
         &self,
         name: &str,
@@ -707,15 +704,7 @@ impl NavidromeClient {
             "name": name,
             "comment": comment,
             "public": false,
-            "rules": {
-                "all": [
-                    // Two libraries can hold the same relative path.
-                    { "is": { "library_id": library_id } },
-                    { "startsWith": { "filepath": path_prefix } }
-                ],
-                "sort": "-dateAdded",
-                "order": "desc"
-            }
+            "rules": filepath_rules(library_id, path_prefix)
         });
 
         let resp = self
@@ -740,6 +729,37 @@ impl NavidromeClient {
 
         let pl: PlaylistResp = resp.json().await.map_err(parse)?;
         Ok(pl.id)
+    }
+
+    /// PUT /api/playlist/{id} with only the fields `change` sets. Navidrome writes just the
+    /// columns the body names (deluan/rest controller.go Put, persistence/playlist_repository.go
+    /// Update), so the comment and public flag stay as the user set them. A change that sets
+    /// nothing sends no request: Navidrome would write only updatedAt
+    /// (persistence/playlist_repository.go Update). An id that is empty, "." or ".." names no
+    /// playlist, a Parse error with no request.
+    pub async fn update_smart_playlist(
+        &self,
+        id: &str,
+        change: &SmartPlaylistChange<'_>,
+    ) -> Result<()> {
+        if change.name.is_none() && change.rules.is_none() {
+            return Ok(());
+        }
+        if matches!(id, "" | "." | "..") {
+            return Err(NavidromeError::Parse("No playlist id given".into()));
+        }
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "playlist", id]);
+        let resp = self
+            .native_request(self.client.put(url).json(change))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("Update smart playlist", resp).await);
+        }
+        Ok(())
     }
 
     /// Delete a smart playlist via Navidrome's native API.
@@ -1020,6 +1040,33 @@ pub struct PlaylistMeta<'a> {
     pub name: Option<&'a str>,
     pub comment: Option<&'a str>,
     pub public: Option<bool>,
+}
+
+/// The smart playlist fields update_smart_playlist changes; a field left None is not sent.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct SmartPlaylistChange<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<&'a serde_json::Value>,
+}
+
+/// The rules create_smart_playlist sends: the songs of library `library_id` whose path below the
+/// library's root starts with `path_prefix`, newest first. Navidrome matches `filepath` against
+/// media_file.path, which is relative to the library's root (model/criteria/fields.go:37), and
+/// `startsWith` is `LIKE 'prefix%'` (model/criteria/operators.go:166-180). Navidrome writes the
+/// rules back in this form (model/criteria/criteria.go MarshalJSON), so they compare equal to a
+/// playlist's `rules` until the library or the path changes.
+pub fn filepath_rules(library_id: i64, path_prefix: &str) -> serde_json::Value {
+    serde_json::json!({
+        "all": [
+            // Two libraries can hold the same relative path.
+            { "is": { "library_id": library_id } },
+            { "startsWith": { "filepath": path_prefix } }
+        ],
+        "sort": "-dateAdded",
+        "order": "desc"
+    })
 }
 
 /// A read's answer, None when Navidrome has no record the user can see (DATA_NOT_FOUND).
@@ -2248,6 +2295,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_smart_playlist_takes_the_songs_below_one_folder_of_one_library() {
+        // The rules compare equal to the ones Navidrome writes back, so an unchanged playlist
+        // is left alone, and differ for another library or folder.
+        let written: serde_json::Value = serde_json::from_str(SMART_RULES).unwrap();
+        assert_eq!(filepath_rules(1, "alice/Discovery/Explore/"), written);
+        assert_ne!(filepath_rules(2, "alice/Discovery/Explore/"), written);
+        assert_ne!(filepath_rules(1, "bob/Discovery/Explore/"), written);
+
         let (url, seen) = serve(vec![reply(LOGIN), reply(format!(r#"{{"id":"{ADVENT}"}}"#))]);
         let id = client(&url)
             .create_smart_playlist(
@@ -2265,8 +2319,7 @@ mod tests {
             ("POST", "/api/playlist")
         );
         let body: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
-        let rules: serde_json::Value = serde_json::from_str(SMART_RULES).unwrap();
-        assert_eq!(body["rules"], rules);
+        assert_eq!(body["rules"], written);
         assert_eq!(body["public"], false);
     }
 
@@ -2347,6 +2400,60 @@ mod tests {
             assert!(c.get_native_playlist(id).await.unwrap().is_none());
         }
         assert_eq!(seen.lock().unwrap().len(), 4, "those ids send nothing");
+    }
+
+    #[tokio::test]
+    async fn a_smart_playlist_update_sends_only_what_changes() {
+        let rules = filepath_rules(1, "alice/Discovery/Explore/");
+        let (url, seen) = serve(vec![
+            reply(LOGIN),
+            reply(NATIVE_PLAYLIST),
+            reply(NATIVE_PLAYLIST),
+            // Update's r.Get misses: model.ErrNotFound is not rest's, so a 500
+            // (persistence/playlist_repository.go Update, deluan/rest controller.go Put).
+            Reply {
+                status: 500,
+                body: r#"{"error":"data not found"}"#.into(),
+            },
+        ]);
+        let c = client(&url);
+        let renamed = SmartPlaylistChange {
+            name: Some("Fresh Picks"),
+            rules: None,
+        };
+        c.update_smart_playlist(ADVENT, &renamed).await.unwrap();
+        let rerouted = SmartPlaylistChange {
+            name: None,
+            rules: Some(&rules),
+        };
+        c.update_smart_playlist(ADVENT, &rerouted).await.unwrap();
+        // A change that sets nothing has nothing to write, so nothing is sent.
+        c.update_smart_playlist(ADVENT, &SmartPlaylistChange::default())
+            .await
+            .unwrap();
+        let err = c.update_smart_playlist("gone", &renamed).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                NavidromeError::Http {
+                    action: "Update smart playlist",
+                    status: 500,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(
+            (seen[1].method.as_str(), seen[1].target.as_str()),
+            ("PUT", "/api/playlist/6vN2bQ8rT4yH1kL9mX3zPa")
+        );
+        assert_eq!(seen[1].content_type.as_deref(), Some("application/json"));
+        let body = |i: usize| serde_json::from_str::<serde_json::Value>(&seen[i].body).unwrap();
+        assert_eq!(body(1), serde_json::json!({ "name": "Fresh Picks" }));
+        assert_eq!(body(2), serde_json::json!({ "rules": rules }));
+        assert_eq!(seen[3].target, "/api/playlist/gone");
     }
 
     /// What 0.64.2 writes for GET /api/song/{id}/playlists: `json.Marshal(model.Playlists)`

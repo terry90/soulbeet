@@ -2,6 +2,7 @@
 
 use crate::auth::UserCtx;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
+use crate::core::playlists::{discovery_key, lock};
 use crate::core::{database_failure, folders::owned_in};
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use serde_json::Value;
@@ -261,8 +262,17 @@ async fn cleanup_stale_discovery_playlists(
         return;
     }
 
-    let old_ids: std::collections::HashMap<String, String> = old
-        .discovery_navidrome_playlist_id
+    let user_id = ctx.user_id.as_str();
+    // A reconcile may have stored an id since `old` was read, so the ids are read under its lock.
+    let _reconciling = lock(&discovery_key(user_id)).await;
+    let stored = match UserSettings::get_in(db, user_id).await {
+        Ok(settings) => settings.discovery_navidrome_playlist_id,
+        Err(e) => {
+            warn!("Could not read the discovery playlist ids of user {user_id}: {e}");
+            return;
+        }
+    };
+    let old_ids: std::collections::HashMap<String, String> = stored
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
@@ -271,7 +281,6 @@ async fn cleanup_stale_discovery_playlists(
         return;
     }
 
-    let user_id = ctx.user_id.as_str();
     let navi = match navidrome.navidrome_of(&ctx.id()).await {
         Ok(c) => c,
         Err(_) => return,
@@ -293,39 +302,51 @@ async fn cleanup_stale_discovery_playlists(
             .collect()
     };
 
+    // An id is forgotten only once its playlist is gone, so a failed delete is tried again on
+    // the next change instead of leaving a playlist Soulful no longer knows.
+    let mut deleted = Vec::new();
     for profile in &profiles_to_delete {
         if let Some(playlist_id) = old_ids.get(profile) {
-            if let Err(e) = navi.delete_smart_playlist(playlist_id).await {
-                warn!(
-                    "Failed to delete playlist '{}' ({}): {}",
-                    profile, playlist_id, e
-                );
-            } else {
-                info!(
-                    "Deleted stale discovery playlist '{}' ({})",
-                    profile, playlist_id
-                );
+            match navi.delete_smart_playlist(playlist_id).await {
+                Ok(()) => {
+                    info!(
+                        "Deleted stale discovery playlist '{}' ({})",
+                        profile, playlist_id
+                    );
+                    deleted.push(profile);
+                }
+                // A non-admin's delete of an id Navidrome no longer has answers 500 "data not
+                // found" (persistence/playlist_repository.go Delete), so a read tells.
+                Err(e) => match navi.get_native_playlist(playlist_id).await {
+                    Ok(None) => deleted.push(profile),
+                    _ => warn!(
+                        "Failed to delete playlist '{}' ({}), its id is kept: {}",
+                        profile, playlist_id, e
+                    ),
+                },
             }
         }
     }
 
-    // Clear stale IDs from user_settings
     let remaining: std::collections::HashMap<String, String> = old_ids
         .into_iter()
-        .filter(|(k, _)| !profiles_to_delete.contains(k))
+        .filter(|(k, _)| !deleted.contains(&k))
         .collect();
     let new_json = if remaining.is_empty() {
         None
     } else {
         Some(serde_json::to_string(&remaining).unwrap_or_default())
     };
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         "UPDATE user_settings SET discovery_navidrome_playlist_id = ? WHERE user_id = ?",
     )
     .bind(&new_json)
     .bind(user_id)
     .execute(db)
-    .await;
+    .await
+    {
+        warn!("Could not clear the discovery playlist ids of user {user_id}: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +356,9 @@ mod tests {
     use crate::core::{folder_of, test_ctx};
     use crate::db::test_db;
     use crate::services::NavidromeLookupError;
-    use crate::test_navidrome::{NavidromeFor, NavidromeStub};
+    use crate::test_navidrome::{
+        native_playlist, NavidromeFor, NavidromeStub, ADVENT, DISCOVERY_RULES,
+    };
 
     const NOT_LINKED: NavidromeFor = NavidromeFor(Err(|| NavidromeLookupError::NotLinked));
 
@@ -477,6 +500,93 @@ mod tests {
         );
         let kept = UserSettings::get_in(&db, "alice").await.unwrap();
         assert_eq!(kept.discovery_navidrome_playlist_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_deletes_the_playlist_stored_after_the_settings_were_read() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let on = UpdateUserSettings {
+            discovery_enabled: Some(true),
+            ..Default::default()
+        };
+        let old = UserSettings::upsert_in(&db, "alice", on).await.unwrap();
+        // A reconcile stores this id between the read of `old` and the cleanup.
+        sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+            .bind(r#"{"Balanced":"9fR2kLm4NpQ7sT1vW3xY5z"}"#)
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        let off = UpdateUserSettings {
+            discovery_enabled: Some(false),
+            ..Default::default()
+        };
+        let of = NavidromeFor(Ok(navi.client()));
+        cleanup_stale_discovery_playlists(&db, &of, &test_ctx("alice"), &old, &off).await;
+        assert_eq!(
+            navi.asked(),
+            ["/auth/login", "/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z"]
+        );
+        let kept = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(kept.discovery_navidrome_playlist_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_playlist_whose_delete_failed_keeps_its_id_unless_navidrome_has_none() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let on = UpdateUserSettings {
+            discovery_enabled: Some(true),
+            ..Default::default()
+        };
+        let old = UserSettings::upsert_in(&db, "alice", on).await.unwrap();
+        sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+            .bind(format!(r#"{{"Balanced":"{ADVENT}","Adventurous":"gone"}}"#))
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        let kept_path = format!("/api/playlist/{ADVENT}");
+        let playlist = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES));
+        // Each delete fails, then the read finds the first playlist and not the second.
+        navi.answer_with_status(
+            &kept_path,
+            &[
+                (500, r#"{"error":"database is locked"}"#),
+                (200, playlist.as_str()),
+            ],
+        );
+        navi.answer_with_status(
+            "/api/playlist/gone",
+            &[
+                (500, r#"{"error":"data not found"}"#),
+                (404, r#"{"error":"playlist(id:gone) not found"}"#),
+            ],
+        );
+        let off = UpdateUserSettings {
+            discovery_enabled: Some(false),
+            ..Default::default()
+        };
+        let of = NavidromeFor(Ok(navi.client()));
+        cleanup_stale_discovery_playlists(&db, &of, &test_ctx("alice"), &old, &off).await;
+        let mut asked = navi.asked();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                kept_path.as_str(),
+                kept_path.as_str(),
+                "/api/playlist/gone",
+                "/api/playlist/gone",
+                "/auth/login"
+            ]
+        );
+        let kept = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(
+            kept.discovery_navidrome_playlist_id,
+            Some(format!(r#"{{"Balanced":"{ADVENT}"}}"#))
+        );
     }
 
     #[tokio::test]
