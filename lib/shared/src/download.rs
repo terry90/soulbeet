@@ -401,6 +401,35 @@ impl DownloadProgress {
         self.import_output = import_output;
         self
     }
+
+    /// Whether the server still moves this row on by itself: its transfer, its import or its
+    /// wait for Navidrome is not over. Any other row changes only when its user acts on it.
+    pub fn in_flight(&self) -> bool {
+        match self.state {
+            DownloadState::Queued
+            | DownloadState::InProgress
+            | DownloadState::Completed
+            | DownloadState::ImportQueued(_)
+            | DownloadState::Importing => true,
+            DownloadState::Imported => self.index == Some(IndexState::Waiting),
+            DownloadState::ImportSkipped | DownloadState::Failed(_) | DownloadState::Cancelled => {
+                false
+            }
+        }
+    }
+}
+
+/// Applies `rows`, a `DownloadEvent::Snapshot`, to the panel's rows. A row the panel holds in
+/// flight that the snapshot leaves out ended in a row the panel never got, so the snapshot
+/// replaces every row in flight. The rows already over stay until the user clears them.
+pub fn apply_snapshot(
+    panel: &mut std::collections::HashMap<String, DownloadProgress>,
+    rows: Vec<DownloadProgress>,
+) {
+    panel.retain(|_, row| !row.in_flight());
+    for row in rows {
+        panel.insert(row.item.clone(), row);
+    }
 }
 
 /// How a skipped import is run again.
@@ -542,6 +571,9 @@ pub struct QueuedDownload {
 pub enum DownloadEvent {
     /// Standard download progress updates
     Progress(Vec<DownloadProgress>),
+    /// The rows of every unfinished file, first on each socket and again after the socket
+    /// missed events. The client applies it with `apply_snapshot`.
+    Snapshot(Vec<DownloadProgress>),
     /// A track moved to another peer. The client keys rows by remote path and
     /// every peer serves the track under its own, so a plain progress update
     /// would leave the abandoned transfer's row sitting next to the retry's.
@@ -661,6 +693,76 @@ mod tests {
             serde_json::to_value(&q).unwrap().get("metadata_provider"),
             None
         );
+    }
+
+    fn row_in(item: &str, state: DownloadState) -> DownloadProgress {
+        DownloadProgress::queued(format!("t-{item}"), "p".into(), item.into(), 1).with_state(state)
+    }
+
+    #[test]
+    fn only_a_row_the_server_still_moves_on_is_in_flight() {
+        for state in [
+            DownloadState::Queued,
+            DownloadState::InProgress,
+            DownloadState::Completed,
+            DownloadState::ImportQueued(2),
+            DownloadState::Importing,
+        ] {
+            assert!(row_in("a.flac", state.clone()).in_flight(), "{state:?}");
+        }
+        for state in [
+            DownloadState::Imported,
+            DownloadState::ImportSkipped,
+            DownloadState::Failed("Per-track timeout".into()),
+            DownloadState::Cancelled,
+        ] {
+            assert!(!row_in("a.flac", state.clone()).in_flight(), "{state:?}");
+        }
+        let imported = |index| DownloadProgress {
+            index,
+            ..row_in("a.flac", DownloadState::Imported)
+        };
+        assert!(imported(Some(IndexState::Waiting)).in_flight());
+        assert!(!imported(Some(IndexState::Listed)).in_flight());
+    }
+
+    #[test]
+    fn a_snapshot_replaces_the_rows_in_flight_and_keeps_the_rows_already_over() {
+        let waiting = DownloadProgress {
+            index: Some(IndexState::Waiting),
+            ..row_in("waiting.flac", DownloadState::Imported)
+        };
+        let mut panel: std::collections::HashMap<String, DownloadProgress> = [
+            // Ended while the socket missed its last row.
+            row_in("ended.flac", DownloadState::InProgress),
+            row_in("running.flac", DownloadState::InProgress),
+            // Listed while the socket missed its last row.
+            waiting,
+            row_in(
+                "failed.flac",
+                DownloadState::Failed("Per-track timeout".into()),
+            ),
+            row_in("skipped.flac", DownloadState::ImportSkipped),
+        ]
+        .into_iter()
+        .map(|row| (row.item.clone(), row))
+        .collect();
+        let running = DownloadProgress {
+            percent: 60.0,
+            ..row_in("running.flac", DownloadState::InProgress)
+        };
+        let new = row_in("new.flac", DownloadState::Queued);
+
+        apply_snapshot(&mut panel, vec![running.clone(), new.clone()]);
+
+        let mut items: Vec<&str> = panel.keys().map(String::as_str).collect();
+        items.sort();
+        assert_eq!(
+            items,
+            vec!["failed.flac", "new.flac", "running.flac", "skipped.flac"]
+        );
+        assert_eq!(panel["running.flac"], running);
+        assert_eq!(panel["new.flac"], new);
     }
 
     #[test]

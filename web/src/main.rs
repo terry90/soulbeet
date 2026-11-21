@@ -196,6 +196,11 @@ fn WebNavbar() -> Element {
                         map.insert(file.item.clone(), file);
                     }
                 }
+                // First on every socket, a reconnect included, and again after the socket
+                // missed events.
+                DownloadEvent::Snapshot(rows) => {
+                    shared::download::apply_snapshot(&mut downloads.write(), rows);
+                }
                 DownloadEvent::Replaced {
                     previous_item,
                     entry,
