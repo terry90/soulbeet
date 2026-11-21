@@ -734,7 +734,8 @@ pub struct Ledger {
     changes: watch::Receiver<i64>,
     places: watch::Receiver<u64>,
     live: LiveRows,
-    /// The jobs whose failure the database kept refusing (`strand`), in memory only.
+    /// The jobs whose failure the database kept refusing, or that their runner could not read
+    /// (`strand`), in memory only.
     stranded: Arc<Mutex<HashSet<String>>>,
     /// No writer reads `writes`: requests are answered at once, events wait for `Recorded`.
     #[cfg(test)]
@@ -773,8 +774,9 @@ impl Ledger {
         self.live.lock().unwrap().get(slot).cloned()
     }
 
-    /// `job`'s failure could not be written: it waits, searching or queued, with no runner until
-    /// the next start of the server, which forgets this, or until a transition of it is applied.
+    /// `job`'s failure could not be written, or its runner could not read it: it waits, searching
+    /// or queued, with no runner until the next start of the server, which forgets this, or until
+    /// a transition of it is applied.
     pub fn strand(&self, job: &str) {
         self.stranded.lock().unwrap().insert(job.to_string());
     }
