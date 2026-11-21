@@ -25,13 +25,24 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
       }
       if (t.annotations?.readOnlyHint) expect(t.annotations.destructiveHint, t.name).toBe(false);
     }
-    // The tools that remove something; the Rust registry test owns the full list.
+    // The tools that may overwrite, remove or clear something; the Rust registry test owns the
+    // full list.
     expect(tools.filter((t) => t.annotations?.destructiveHint).map((t) => t.name).sort()).toEqual([
+      'add_playlist_tracks',
       'delete_playlist',
       'delete_tracks',
+      'dismiss_job',
+      'ensure_in_library',
       'promote_discovery_track',
       'remove_discovery_track',
+      'remove_playlist_tracks',
+      'resolve_import',
+      'set_playlist_tracks',
+      'set_rating',
+      'set_star',
       'sync_ratings',
+      'update_playlist',
+      'update_settings',
     ]);
 
     expect(await mcp.ok('get_status')).toMatchObject({

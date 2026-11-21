@@ -627,7 +627,7 @@ pub(crate) const DISMISS_JOB: ToolSpec = ToolSpec {
         "}}"
     ),
     read_only: false,
-    destructive: false,
+    destructive: true,
     idempotent: false,
     open_world: true,
     call: |state, caller, args| Box::pin(dismiss_job(state, caller, args)),
