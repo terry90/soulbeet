@@ -20,6 +20,19 @@ env:
   IMAGE_NAME: docccccc/soulbeet
 
 jobs:
+  # Nothing is pushed until the Rust tests and e2e pass on the commit that
+  # is built. Every checkout here uses github.sha, not github.ref: master can
+  # move while the tests run, and the image must be built from what they tested.
+  tests:
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
+  e2e:
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
   metadata:
     runs-on: ubuntu-latest
     outputs:
@@ -30,7 +43,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -58,7 +71,7 @@ jobs:
           echo "rolling=$rolling" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: metadata
+    needs: [metadata, tests, e2e]
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +92,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

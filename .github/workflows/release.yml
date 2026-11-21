@@ -50,9 +50,11 @@ jobs:
           git tag v${{ steps.bump.outputs.new_version }}
           git push origin v${{ steps.bump.outputs.new_version }}
 
+  # After the images, which only push once the tests pass, so a failing
+  # commit gets no release either.
   create-release:
-    needs: bump-version
-    if: always() && (needs.bump-version.result == 'success' || github.event_name == 'push')
+    needs: [bump-version, build-and-push]
+    if: always() && needs.build-and-push.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

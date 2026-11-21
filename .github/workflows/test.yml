@@ -5,9 +5,19 @@ on:
     branches: [ "master" ]
   pull_request:
   workflow_dispatch:
+  # The image workflow runs these before it pushes anything.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git reference to test"
+        required: false
+        type: string
 
 concurrency:
-  group: tests-${{ github.ref }}
+  # A called run gets its caller's github context, so the workflow name keeps
+  # it from cancelling this workflow's own run for the same push, or being
+  # cancelled by it.
+  group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -16,6 +26,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Install system packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
@@ -50,6 +62,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       # The image interpreter is 3.11, and probe.py and import.py need -P (3.11+).
       - name: Set up Python
@@ -69,6 +83,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
