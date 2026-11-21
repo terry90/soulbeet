@@ -2531,6 +2531,86 @@ mod tests {
         ));
     }
 
+    // Each of these writes reads before it writes: begun with BEGIN IMMEDIATE it waits for
+    // another writer, a plain BEGIN fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writes_that_read_first_wait_for_another_writer() {
+        use crate::connection::test_util::behind_a_writer;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::test_db::migrated_file(dir.path()).await;
+        let alice = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let user = UserId::new("alice");
+        // create_batch reads the jobs of the same recording first.
+        let carol = NewJob {
+            picked: vec![(0, item("peer_a", "Carol 0", "01.flac"))],
+            ..queued_carols(1, &alice).remove(0)
+        };
+        let id = carol.id.clone();
+        let created = behind_a_writer(&db, {
+            let ledger = ledger.clone();
+            async move { ledger.create_batch(batch_of("b1"), vec![carol]).await }
+        })
+        .await;
+        assert_eq!(created, Ok(vec![Admitted::Created]));
+        // A slot's row reads the slot's timeline entry first.
+        let stored = behind_a_writer(&db, {
+            let ledger = ledger.clone();
+            let row = row_of(&id, 0, "01.flac", DownloadState::InProgress, 10);
+            async move {
+                let event = JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows: vec![row],
+                };
+                ledger.record_stored(event).await
+            }
+        })
+        .await;
+        assert_eq!(stored, Ok(()));
+        // A transition reads the job first.
+        let cancelled = behind_a_writer(&db, {
+            let (ledger, user, id) = (ledger.clone(), user.clone(), id.clone());
+            async move { ledger.transition(&user, &id, Transition::Cancel).await }
+        })
+        .await;
+        assert!(
+            matches!(
+                cancelled,
+                Ok(Transitioned::Applied {
+                    from: JobState::Downloading,
+                    to: JobState::Downloading,
+                    ..
+                })
+            ),
+            "{cancelled:?}"
+        );
+        // A claim reads the job waiting for the source first.
+        ledger
+            .create(
+                job(
+                    "j2",
+                    "alice",
+                    &alice,
+                    JobState::NeedsSourceChoice,
+                    Some("s1"),
+                ),
+                Some(search("s1", "alice")),
+            )
+            .await
+            .unwrap();
+        let claimed = behind_a_writer(&db, {
+            let (ledger, user, alice) = (ledger.clone(), user.clone(), alice.clone());
+            async move {
+                let picked = vec![(0, item("peer_a", "Two", "02.flac"))];
+                ledger
+                    .claim_source_choice(&user, "s1", &alice, picked)
+                    .await
+            }
+        })
+        .await;
+        assert_eq!(claimed.map(|c| c.map(|c| c.id)), Ok(Some("j2".to_string())));
+    }
+
     #[tokio::test]
     async fn a_new_search_with_filters_keeps_the_jobs_replace_set() {
         let (ledger, db, alice, _) = ledger().await;
