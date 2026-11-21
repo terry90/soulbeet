@@ -16,6 +16,7 @@ use shared::recommendation::fold_name;
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::MetadataError;
 
@@ -227,7 +228,31 @@ fn titled_query(
     query_param(&lucene)
 }
 
-/// Artists an artist filter can match by MBID: MusicBrainz's default page,
+/// `s` folded as `fold_name` folds it, without combining marks: the artist
+/// index ignores them, so "Shiro Sagisu" finds the alias "Shirō Sagisu" and
+/// "フィッシュマンス" finds "フィッシュマンズ".
+fn search_fold(s: &str) -> String {
+    fold_name(&s.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>())
+}
+
+/// Whether `wanted`, folded by `search_fold`, is the name or an alias of `m`.
+fn carries_name(m: &ArtistMatch, wanted: &str) -> bool {
+    search_fold(&m.name) == wanted || m.aliases.iter().any(|a| search_fold(a) == wanted)
+}
+
+/// The artists of `found` that carry `name` whole. The artist search matches
+/// the name anywhere in a name or alias, so "Queen" also finds Ella
+/// Fitzgerald by her alias "Queen of Jazz".
+fn named_artists(name: &str, found: Vec<ArtistMatch>) -> Vec<ArtistMatch> {
+    let wanted = search_fold(name);
+    found
+        .into_iter()
+        .filter(|m| carries_name(m, &wanted))
+        .collect()
+}
+
+/// Artists the artist search returns for an artist filter, of which those
+/// that carry the typed name are matched by MBID: MusicBrainz's default page,
 /// which keeps their MBIDs within a short query URL.
 const FILTER_ARTISTS: u8 = 25;
 
@@ -256,9 +281,10 @@ pub async fn search(
     // The recording and release group indexes hold artist names but no
     // aliases, and one search cannot reach into another index, so an artist
     // typed by an alias ("Shiro Sagisu" for 鷺巣詩郎) is found in the artist
-    // index first and then matched by MBID.
+    // index first. Only the artists that carry the typed name are matched by
+    // MBID; the name clause still finds every result it found before.
     let found = match artist {
-        Some(name) => search_artists(name, FILTER_ARTISTS).await?,
+        Some(name) => named_artists(name, search_artists(name, FILTER_ARTISTS).await?),
         None => Vec::new(),
     };
     let by_artist = artist.as_deref().map(|name| (name, found.as_slice()));
@@ -1041,10 +1067,20 @@ mod tests {
             "fixtures/musicbrainz/artist_search_shiro_sagisu.json"
         ))
         .unwrap();
-        let found = [artist_match(
-            serde_json::from_value(body["artists"][0].clone()).unwrap(),
-        )];
-        let artist = Some(("Shiro Sagisu", found.as_slice()));
+        let sagisu = artist_match(serde_json::from_value(body["artists"][0].clone()).unwrap());
+        let kept = named_artists(
+            "Shiro Sagisu",
+            vec![
+                found(
+                    "7c3fd8f4-6ef1-4f3b-9d3a-6c1e5a0d2b11",
+                    "Sagisu Tribute Band",
+                    &["Shiro Sagisu Orchestra"],
+                ),
+                sagisu.clone(),
+            ],
+        );
+        assert_eq!(kept, [sagisu]);
+        let artist = Some(("Shiro Sagisu", kept.as_slice()));
         assert_eq!(
             lucene(&titled_query(
                 "recording",
@@ -1061,6 +1097,33 @@ mod tests {
         assert_eq!(
             lucene(&titled_query("releasegroup", "Bleach", "artist", None)),
             r#"releasegroup:"Bleach""#
+        );
+    }
+
+    #[test]
+    fn an_artist_whose_alias_only_holds_the_typed_name_is_not_matched() {
+        // The first two hits of artist:"Queen" OR alias:"Queen", fetched 2026-11-21.
+        let queen = found("0383dadf-2a4e-4d10-a46a-e9e041da8eb3", "Queen", &["クイーン"]);
+        let kept = named_artists(
+            "queen",
+            vec![
+                queen.clone(),
+                found(
+                    "54799c0e-eb45-4eea-996d-c4d71a63c499",
+                    "Ella Fitzgerald",
+                    &["Queen of Jazz"],
+                ),
+            ],
+        );
+        assert_eq!(kept, [queen]);
+        assert_eq!(
+            lucene(&titled_query(
+                "recording",
+                "Love",
+                "artistname",
+                Some(("queen", kept.as_slice()))
+            )),
+            r#"(artistname:"queen" OR arid:"0383dadf-2a4e-4d10-a46a-e9e041da8eb3") AND recording:"Love""#
         );
     }
 
