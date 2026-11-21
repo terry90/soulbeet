@@ -625,6 +625,16 @@ mod tests {
         assert_eq!(sign_in(&db, "sub-a", "alice").await.unwrap().id, local.id);
     }
 
+    #[tokio::test]
+    async fn of_accounts_that_differ_only_in_case_the_exact_name_is_linked() {
+        let db = test_db::colliding(&["bob", "Bob"]).await;
+        assert_eq!(sign_in(&db, "sub-b", "Bob").await.unwrap().id, "id-Bob");
+        assert_eq!(
+            sign_in(&db, "sub-x", "BOB").await.unwrap_err(),
+            SsoError::Conflict
+        );
+    }
+
     /// Two first sign-ins of `ann`'s identity at once: each chose what to do
     /// before the other wrote. `planned` is what the slower one chose.
     async fn first_sign_ins_at_once(

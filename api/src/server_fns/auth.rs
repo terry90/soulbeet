@@ -227,12 +227,13 @@ fn ping_verdict(ping: &Result<(), soulbeet::NavidromeError>) -> NavidromeAuthRes
     }
 }
 
-/// Why a name that matches several accounts cannot sign in.
+/// Why a name that matches several accounts, none of them exactly, cannot
+/// sign in.
 #[cfg(feature = "server")]
 fn several_accounts(username: &str) -> String {
     format!(
-        "Several Soulbeet accounts match '{username}' when letter case is ignored, so none of \
-         them can sign in. Ask an admin to delete the accounts that are not yours."
+        "Several Soulbeet accounts match '{username}' when letter case is ignored. Sign in \
+         with the exact name of your account, and ask an admin to delete the others."
     )
 }
 
@@ -1947,27 +1948,50 @@ mod tests {
         assert!(row(&db, "Bob").await.is_none());
     }
 
-    /// The migrated database plus rows whose names differ only in letter
-    /// case, as an install from before the rule can hold.
-    async fn colliding(names: &[&str]) -> sqlx::SqlitePool {
-        let db = test_db::migrated_before(test_db::USERNAME_CASE).await;
-        for name in names {
-            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
-                .bind(format!("id-{name}"))
-                .bind(name)
-                .execute(&db)
+    #[tokio::test]
+    async fn colliding_accounts_sign_in_with_their_exact_names() {
+        // Before names ignored case, a Navidrome sign-in as ANNA made an
+        // account next to anna's. Each still signs in with its exact name, so
+        // an admin among them can delete the other.
+        let db = test_db::colliding(&["anna", "ANNA"]).await;
+        for name in ["anna", "ANNA"] {
+            let id = format!("id-{name}");
+            User::update_password_in(&db, &id, "pw").await.unwrap();
+            User::link_navidrome_in(&db, &id, "enc-old", "connected")
                 .await
                 .unwrap();
         }
-        test_db::apply_from(&db, test_db::USERNAME_CASE).await;
-        db
+        let before = user_count(&db).await;
+        let limiter = LoginLimiter::new();
+        for name in ["anna", "ANNA"] {
+            let id = format!("id-{name}");
+            let u = signed_in(
+                apply_navidrome_login(&db, name, "pw", "enc", RegistrationMode::Navidrome)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(u.id, id);
+            // While Navidrome is away, with the account's own password.
+            let local = sign_in(
+                &db,
+                &limiter,
+                name,
+                "pw",
+                Instant::now(),
+                NavidromeAuthResult::Unreachable,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(local, Credentials::Local { user, .. } if user.id == id));
+        }
+        assert_eq!(user_count(&db).await, before);
     }
 
     #[tokio::test]
-    async fn names_that_collide_without_case_are_refused_everywhere() {
-        let db = colliding(&["bob", "Bob"]).await;
+    async fn other_cases_of_colliding_names_are_refused_everywhere() {
+        let db = test_db::colliding(&["bob", "Bob"]).await;
         let before = user_count(&db).await;
-        for name in ["bob", "Bob", "BOB"] {
+        for name in ["BOB", "bOB"] {
             let outcome =
                 apply_navidrome_login(&db, name, "pw", "enc", RegistrationMode::Navidrome)
                     .await
@@ -1987,7 +2011,7 @@ mod tests {
             let err = sign_in(
                 &db,
                 &limiter,
-                "bob",
+                "BOB",
                 "pw",
                 now,
                 NavidromeAuthResult::NotConfigured,
@@ -2002,7 +2026,7 @@ mod tests {
             );
         }
         // A refusal is not a wrong password, so nothing was counted.
-        assert!(limiter.begin("bob", now).is_ok());
+        assert!(limiter.begin("BOB", now).is_ok());
     }
 
     #[tokio::test]

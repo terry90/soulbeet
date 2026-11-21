@@ -109,8 +109,9 @@ pub fn username_fits(username: &str) -> bool {
 pub enum NameMatch {
     None,
     One(Box<User>),
-    /// Rows from before the rule whose names differ only in letter case.
-    /// None of them can sign in until an admin deletes the extra ones.
+    /// Rows from before the rule whose names differ only in letter case,
+    /// none of them exactly this name. Each signs in only with its exact
+    /// name until an admin deletes the extra ones.
     Several,
 }
 
@@ -341,7 +342,10 @@ impl User {
         }
     }
 
-    /// The account a name belongs to, matched without ASCII letter case.
+    /// The account a name belongs to, matched without ASCII letter case. Of
+    /// rows from before the rule that differ only in case, the one with
+    /// exactly this name, so an admin among them can still sign in and
+    /// delete the others.
     pub(crate) async fn find_by_name_in(
         db: &SqlitePool,
         username: &str,
@@ -355,7 +359,11 @@ impl User {
         Ok(match rows.len() {
             0 => NameMatch::None,
             1 => NameMatch::One(Box::new(rows.remove(0))),
-            _ => NameMatch::Several,
+            // `username` is UNIQUE, so at most one row has exactly the name.
+            _ => match rows.iter().position(|u| u.username == username) {
+                Some(exact) => NameMatch::One(Box::new(rows.swap_remove(exact))),
+                None => NameMatch::Several,
+            },
         })
     }
 
@@ -607,14 +615,15 @@ impl User {
     }
 }
 
-/// Startup check: accounts whose names differ only in letter case cannot
-/// sign in until an admin deletes the extra ones.
+/// Startup check: accounts whose names differ only in letter case sign in
+/// only with their exact names until an admin deletes the extra ones.
 #[cfg(feature = "server")]
 pub async fn log_username_collisions() {
     match User::case_collisions_in(&DB).await {
         Ok(names) if !names.is_empty() => tracing::warn!(
-            "These accounts cannot sign in because their names differ only in letter case: {}. \
-             An admin can delete the ones that are not used in Settings > Users.",
+            "These accounts have names that differ only in letter case, so each signs in only \
+             with its exact name: {}. An admin can delete the ones that are not used in \
+             Settings > Users.",
             names.join(", ")
         ),
         Ok(_) => {}
@@ -905,19 +914,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rows_that_collide_from_before_the_rule_are_several_and_listed() {
-        let db = test_db::migrated_before(test_db::USERNAME_CASE).await;
-        for (id, name) in [("u1", "bob"), ("u2", "Bob"), ("u3", "eve")] {
-            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
-                .bind(id)
-                .bind(name)
-                .execute(&db)
-                .await
-                .unwrap();
-        }
-        test_db::apply_from(&db, test_db::USERNAME_CASE).await;
+    async fn only_ascii_letters_ignore_case_as_in_navidrome() {
+        // Navidrome finds users with `COLLATE NOCASE`, which folds ASCII
+        // letters only, so `Ángel` and `ángel` can be two of its users.
+        let db = test_db::migrated().await;
+        let angel = User::create_in(&db, "ángel", "pw").await.unwrap();
         assert!(matches!(
-            User::find_by_name_in(&db, "bob").await.unwrap(),
+            User::find_by_name_in(&db, "áNGEL").await.unwrap(),
+            NameMatch::One(u) if u.id == angel.id
+        ));
+        assert!(matches!(
+            User::find_by_name_in(&db, "ÁNGEL").await.unwrap(),
+            NameMatch::None
+        ));
+        User::create_in(&db, "Ángel", "pw").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rows_that_collide_from_before_the_rule_are_found_by_exact_name_and_listed() {
+        let db = test_db::colliding(&["bob", "Bob", "eve"]).await;
+        for name in ["bob", "Bob"] {
+            assert!(matches!(
+                User::find_by_name_in(&db, name).await.unwrap(),
+                NameMatch::One(u) if u.id == format!("id-{name}")
+            ));
+        }
+        assert!(matches!(
+            User::find_by_name_in(&db, "BOB").await.unwrap(),
             NameMatch::Several
         ));
         assert_eq!(
