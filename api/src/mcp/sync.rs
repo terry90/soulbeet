@@ -230,6 +230,7 @@ mod tests {
             kept: 1,
             kept_not_stored: None,
             not_pending: 0,
+            expirable: Default::default(),
             tracks: vec![
                 done("s1", SyncAction::Delete),
                 SyncedTrack {
@@ -282,6 +283,7 @@ mod tests {
             kept: 0,
             kept_not_stored: Some(database_failure(Stage::Delete, "disk I/O error")),
             not_pending: 0,
+            expirable: Default::default(),
             tracks: vec![done("s1", SyncAction::Delete)],
         };
         let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
@@ -316,6 +318,7 @@ mod tests {
             kept: 200,
             kept_not_stored: None,
             not_pending: 0,
+            expirable: Default::default(),
             tracks,
         };
         let text = text_of(&report_result(&report)).to_string();
@@ -358,6 +361,7 @@ mod tests {
             kept: 1,
             kept_not_stored: None,
             not_pending: 0,
+            expirable: Default::default(),
             tracks,
         };
         let doc: Value = from_str(text_of(&report_result(&report))).unwrap();
@@ -380,6 +384,7 @@ mod tests {
             kept: 0,
             kept_not_stored: None,
             not_pending: 0,
+            expirable: Default::default(),
             tracks: vec![],
         })));
         let (db, app, token) = alice_app(ConnectionState {
