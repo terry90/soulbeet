@@ -2,6 +2,7 @@
 
 use crate::auth::UserCtx;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
+use crate::core::playlists::{discovery_key, lock};
 use crate::core::{database_failure, folders::owned_in};
 use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use serde_json::Value;
@@ -261,8 +262,17 @@ async fn cleanup_stale_discovery_playlists(
         return;
     }
 
-    let old_ids: std::collections::HashMap<String, String> = old
-        .discovery_navidrome_playlist_id
+    let user_id = ctx.user_id.as_str();
+    // A reconcile may have stored an id since `old` was read, so the ids are read under its lock.
+    let _reconciling = lock(&discovery_key(user_id)).await;
+    let stored = match UserSettings::get_in(db, user_id).await {
+        Ok(settings) => settings.discovery_navidrome_playlist_id,
+        Err(e) => {
+            warn!("Could not read the discovery playlist ids of user {user_id}: {e}");
+            return;
+        }
+    };
+    let old_ids: std::collections::HashMap<String, String> = stored
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
@@ -271,7 +281,6 @@ async fn cleanup_stale_discovery_playlists(
         return;
     }
 
-    let user_id = ctx.user_id.as_str();
     let navi = match navidrome.navidrome_of(&ctx.id()).await {
         Ok(c) => c,
         Err(_) => return,
@@ -474,6 +483,36 @@ mod tests {
         assert_eq!(
             navi.asked().last().map(String::as_str),
             Some("/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z")
+        );
+        let kept = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(kept.discovery_navidrome_playlist_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_deletes_the_playlist_stored_after_the_settings_were_read() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let on = UpdateUserSettings {
+            discovery_enabled: Some(true),
+            ..Default::default()
+        };
+        let old = UserSettings::upsert_in(&db, "alice", on).await.unwrap();
+        // A reconcile stores this id between the read of `old` and the cleanup.
+        sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+            .bind(r#"{"Balanced":"9fR2kLm4NpQ7sT1vW3xY5z"}"#)
+            .execute(&db)
+            .await
+            .unwrap();
+        let navi = NavidromeStub::start();
+        let off = UpdateUserSettings {
+            discovery_enabled: Some(false),
+            ..Default::default()
+        };
+        let of = NavidromeFor(Ok(navi.client()));
+        cleanup_stale_discovery_playlists(&db, &of, &test_ctx("alice"), &old, &off).await;
+        assert_eq!(
+            navi.asked(),
+            ["/auth/login", "/api/playlist/9fR2kLm4NpQ7sT1vW3xY5z"]
         );
         let kept = UserSettings::get_in(&db, "alice").await.unwrap();
         assert_eq!(kept.discovery_navidrome_playlist_id, None);

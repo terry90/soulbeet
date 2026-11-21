@@ -1180,7 +1180,28 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
 /// as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
-    let settings = UserSettings::get(user_id).await?;
+    reconcile_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        &UserId::new(user_id),
+    )
+    .await
+}
+
+/// reconcile_discovery_playlists on `db` and `navidrome`. Each playlist is changed in place, so
+/// its id stays the one clients hold. The error names every profile that failed.
+#[cfg(feature = "server")]
+async fn reconcile_in(
+    db: &sqlx::SqlitePool,
+    navidrome: &dyn crate::core::index::NavidromeOf,
+    user: &UserId,
+) -> Result<(), String> {
+    use crate::core::playlists::{discovery_key, lock};
+
+    let user_id = user.to_string();
+    // Taken before the settings are read, so a run waiting for it reads the ids the other stored.
+    let _reconciling = lock(&discovery_key(&user_id)).await;
+    let settings = UserSettings::get_in(db, &user_id).await?;
     if !settings.discovery_enabled {
         return Ok(());
     }
@@ -1188,11 +1209,11 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         Some(id) => id.clone(),
         None => return Ok(()),
     };
-    Folder::get_by_id(&folder_id)
+    Folder::get_by_id_in(db, &folder_id)
         .await?
         .ok_or("Discovery folder not found")?;
 
-    let navi = match crate::services::navidrome_client_for_user(user_id).await {
+    let navi = match navidrome.navidrome_of(user).await {
         Ok(c) => c,
         Err(e) => {
             info!(
@@ -1204,17 +1225,14 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
     };
 
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
+    let mut failed = Vec::new();
 
     for profile in &selected_profiles {
         let profile_name = profile.to_string();
-
-        // Delete stale playlist so we can recreate with the correct rule
-        if let Some(old_id) = UserSettings::get_playlist_id_for_profile(
+        let stored_id = UserSettings::get_playlist_id_for_profile(
             &settings.discovery_navidrome_playlist_id,
             &profile_name,
-        ) {
-            let _ = navi.delete_smart_playlist(&old_id).await;
-        }
+        );
 
         let playlist_name = UserSettings::get_playlist_name_for_profile(
             &settings.discovery_playlist_name,
@@ -1251,29 +1269,104 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         };
         let comment = format!("Soulbeet discovery ({})", profile_name);
 
-        match navi
-            .create_smart_playlist(&playlist_name, &comment, &profile_path)
-            .await
-        {
-            Ok(playlist_id) => {
-                if let Err(e) =
-                    UserSettings::update_discovery_playlist_id(user_id, &profile_name, &playlist_id)
-                        .await
+        let reconciled = reconcile_playlist(
+            &navi,
+            stored_id.as_deref(),
+            &playlist_name,
+            &comment,
+            &profile_path,
+        )
+        .await;
+        match reconciled {
+            Ok(Reconciled::Created(playlist_id)) => {
+                if let Err(e) = UserSettings::update_discovery_playlist_id_in(
+                    db,
+                    &user_id,
+                    &profile_name,
+                    &playlist_id,
+                )
+                .await
                 {
-                    warn!("Failed to save playlist ID for '{}': {}", profile_name, e);
+                    // An id not stored makes the next run create the playlist again.
+                    let undone = match navi.delete_smart_playlist(&playlist_id).await {
+                        Ok(()) => "deleted".to_string(),
+                        Err(d) => format!("left in Navidrome: {d}"),
+                    };
+                    failed.push(format!(
+                        "{profile_name}: id {playlist_id} not saved ({e}), playlist {undone}"
+                    ));
+                    continue;
                 }
                 info!(
                     "Created smart playlist '{}' (path filter: {}) for user {}",
                     playlist_name, profile_path, user_id
                 );
             }
+            Ok(Reconciled::Updated) => info!(
+                "Updated smart playlist '{}' (path filter: {}) for user {}",
+                playlist_name, profile_path, user_id
+            ),
+            Ok(Reconciled::Unchanged) => {}
             Err(e) => {
-                warn!("Failed to create smart playlist '{}': {}", playlist_name, e);
+                warn!(
+                    "Failed to reconcile smart playlist '{}': {}",
+                    playlist_name, e
+                );
+                failed.push(format!("{profile_name}: {e}"));
             }
         }
     }
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
+/// What reconcile did to one profile's smart playlist.
+#[cfg(feature = "server")]
+enum Reconciled {
+    /// Navidrome had none by the stored id, or none was stored: made with this id.
+    Created(String),
+    Updated,
+    Unchanged,
+}
+
+/// Brings the smart playlist stored as `stored_id` to `name` and the rules of `profile_path`, in
+/// place, so its id, comment and public flag stay. A playlist is made only when Navidrome says it
+/// has none by that id: after a failed lookup the old one may still be there and would be left
+/// beside the new one.
+#[cfg(feature = "server")]
+async fn reconcile_playlist(
+    navi: &soulbeet::navidrome::NavidromeClient,
+    stored_id: Option<&str>,
+    name: &str,
+    comment: &str,
+    profile_path: &str,
+) -> Result<Reconciled, soulbeet::NavidromeError> {
+    use soulbeet::navidrome::{filepath_rules, SmartPlaylistChange};
+
+    let existing = match stored_id {
+        Some(id) => navi.get_native_playlist(id).await?,
+        None => None,
+    };
+    let Some(playlist) = existing else {
+        let id = navi
+            .create_smart_playlist(name, comment, profile_path)
+            .await?;
+        return Ok(Reconciled::Created(id));
+    };
+    let rules = filepath_rules(profile_path);
+    let change = SmartPlaylistChange {
+        name: (playlist.name != name).then_some(name),
+        rules: (playlist.rules.as_ref() != Some(&rules)).then_some(&rules),
+    };
+    if change.name.is_none() && change.rules.is_none() {
+        return Ok(Reconciled::Unchanged);
+    }
+    navi.update_smart_playlist(&playlist.id, &change).await?;
+    Ok(Reconciled::Updated)
 }
 
 #[post("/api/discovery/generate-recommendations", auth: AuthSession)]
@@ -2083,5 +2176,206 @@ mod tests {
         );
         assert!(scan_imports(&navi.client(), 3).await);
         assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/startScan"]);
+    }
+
+    mod reconcile {
+        use super::super::reconcile_in;
+        use crate::auth::UserId;
+        use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+        use crate::test_navidrome::{
+            native_playlist, NavidromeFor, NavidromeStub, ADVENT, BAD_GATEWAY, DISCOVERY_RULES,
+        };
+        use serde_json::{json, Value};
+        use sqlx::SqlitePool;
+        use std::collections::HashMap;
+
+        /// The rules of DISCOVERY_RULES for another folder.
+        const ELSEWHERE: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Explore"}}],"sort":"-dateAdded","order":"desc"}"#;
+
+        /// alice with discovery on for Balanced in her folder, `ids` stored as her playlists.
+        async fn discovering(ids: &str) -> SqlitePool {
+            let db = crate::db::test_db::migrated().await;
+            let folder = crate::core::folder_of(&db, "alice").await;
+            let update = UpdateUserSettings {
+                discovery_enabled: Some(true),
+                discovery_folder_id: Some(folder),
+                discovery_profiles: Some("Balanced".into()),
+                ..Default::default()
+            };
+            UserSettings::upsert_in(&db, "alice", update).await.unwrap();
+            sqlx::query("UPDATE user_settings SET discovery_navidrome_playlist_id = ?")
+                .bind(ids)
+                .execute(&db)
+                .await
+                .unwrap();
+            db
+        }
+
+        /// A Navidrome whose discovery folder has no song yet, so the rule is DISCOVERY_RULES.
+        fn navidrome() -> NavidromeStub {
+            let navi = NavidromeStub::start();
+            navi.answer("/api/song", &["[]"]);
+            navi
+        }
+
+        async fn stored_ids(db: &SqlitePool) -> HashMap<String, String> {
+            let s = UserSettings::get_in(db, "alice").await.unwrap();
+            serde_json::from_str(&s.discovery_navidrome_playlist_id.unwrap()).unwrap()
+        }
+
+        fn only_advent() -> HashMap<String, String> {
+            HashMap::from([("Balanced".to_string(), ADVENT.to_string())])
+        }
+
+        /// The bodies sent to `path`, Null for a read.
+        fn sent(navi: &NavidromeStub, path: &str) -> Vec<Value> {
+            (navi.posted(path).iter())
+                .map(|body| match body.is_empty() {
+                    true => Value::Null,
+                    false => serde_json::from_str(body).unwrap(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_that_matches_is_left_alone() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = navidrome();
+            let path = format!("/api/playlist/{ADVENT}");
+            let playlist = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES));
+            navi.answer(&path, &[&playlist]);
+            let of = NavidromeFor(Ok(navi.client()));
+            reconcile_in(&db, &of, &UserId::new("alice")).await.unwrap();
+            assert_eq!(navi.asked(), ["/auth/login", "/api/song", path.as_str()]);
+            assert_eq!(sent(&navi, &path), [Value::Null]);
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_with_another_name_or_rule_is_changed_in_place() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = navidrome();
+            let path = format!("/api/playlist/{ADVENT}");
+            let renamed = native_playlist(ADVENT, "My mix", 2, false, Some(DISCOVERY_RULES));
+            let moved = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(ELSEWHERE));
+            // Each read, then its update, which Navidrome answers with the playlist.
+            navi.answer(&path, &[&renamed, &renamed, &moved, &moved]);
+            let of = NavidromeFor(Ok(navi.client()));
+            let alice = UserId::new("alice");
+            reconcile_in(&db, &of, &alice).await.unwrap();
+            reconcile_in(&db, &of, &alice).await.unwrap();
+            let rules: Value = serde_json::from_str(DISCOVERY_RULES).unwrap();
+            assert_eq!(
+                sent(&navi, &path),
+                [
+                    Value::Null,
+                    json!({ "name": "Fresh Picks" }),
+                    Value::Null,
+                    json!({ "rules": rules }),
+                ]
+            );
+            assert!(
+                !navi.asked().contains(&"/api/playlist".to_string()),
+                "no playlist is made"
+            );
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_discovery_playlist_navidrome_no_longer_has_is_made_again() {
+            let db =
+                discovering(r#"{"Adventurous":"2kD8sP4vX7zQ1mN5bT3wYa","Balanced":"gone"}"#).await;
+            let navi = navidrome();
+            // deluan/rest controller.go Get, as get_native_playlist reads it.
+            navi.answer_with_status(
+                "/api/playlist/gone",
+                &[(404, r#"{"error":"playlist(id:gone) not found"}"#)],
+            );
+            let made = native_playlist(ADVENT, "Fresh Picks", 0, false, Some(DISCOVERY_RULES));
+            navi.answer("/api/playlist", &[&made]);
+            let of = NavidromeFor(Ok(navi.client()));
+            reconcile_in(&db, &of, &UserId::new("alice")).await.unwrap();
+            assert_eq!(
+                navi.asked(),
+                [
+                    "/auth/login",
+                    "/api/song",
+                    "/api/playlist/gone",
+                    "/api/playlist"
+                ]
+            );
+            let created = sent(&navi, "/api/playlist").remove(0);
+            let rules: Value = serde_json::from_str(DISCOVERY_RULES).unwrap();
+            assert_eq!(
+                (&created["name"], &created["rules"]),
+                (&json!("Fresh Picks"), &rules)
+            );
+            assert_eq!(
+                stored_ids(&db).await,
+                HashMap::from([
+                    (
+                        "Adventurous".to_string(),
+                        "2kD8sP4vX7zQ1mN5bT3wYa".to_string()
+                    ),
+                    ("Balanced".to_string(), ADVENT.to_string()),
+                ])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_read_or_update_is_an_error_and_makes_no_second_playlist() {
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = navidrome();
+            let path = format!("/api/playlist/{ADVENT}");
+            let renamed = native_playlist(ADVENT, "My mix", 2, false, Some(DISCOVERY_RULES));
+            navi.answer_with_status(
+                &path,
+                &[
+                    (502, BAD_GATEWAY),
+                    (200, renamed.as_str()),
+                    (500, r#"{"error":"database is locked"}"#),
+                ],
+            );
+            let of = NavidromeFor(Ok(navi.client()));
+            let alice = UserId::new("alice");
+            let read = reconcile_in(&db, &of, &alice).await.unwrap_err();
+            assert!(
+                read.starts_with("Balanced: Get playlist failed: HTTP 502"),
+                "{read}"
+            );
+            let update = reconcile_in(&db, &of, &alice).await.unwrap_err();
+            assert!(
+                update.starts_with("Balanced: Update smart playlist failed: HTTP 500"),
+                "{update}"
+            );
+            assert!(
+                !navi.asked().contains(&"/api/playlist".to_string()),
+                "no playlist is made"
+            );
+            assert_eq!(stored_ids(&db).await, only_advent());
+        }
+
+        #[tokio::test]
+        async fn a_reconcile_waits_for_the_one_running_for_the_same_user() {
+            use crate::core::playlists::{discovery_key, lock};
+
+            let db = discovering(&format!(r#"{{"Balanced":"{ADVENT}"}}"#)).await;
+            let navi = navidrome();
+            let playlist = native_playlist(ADVENT, "Fresh Picks", 2, false, Some(DISCOVERY_RULES));
+            navi.answer(&format!("/api/playlist/{ADVENT}"), &[&playlist]);
+            let of = NavidromeFor(Ok(navi.client()));
+            let running = lock(&discovery_key("alice")).await;
+            let mut second =
+                tokio::spawn(async move { reconcile_in(&db, &of, &UserId::new("alice")).await });
+            let short = std::time::Duration::from_millis(50);
+            assert!(
+                tokio::time::timeout(short, &mut second).await.is_err(),
+                "the second waits while the first runs"
+            );
+            assert!(navi.asked().is_empty());
+            drop(running);
+            second.await.unwrap().unwrap();
+            assert_eq!(navi.asked().len(), 3);
+        }
     }
 }

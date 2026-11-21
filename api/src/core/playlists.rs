@@ -67,6 +67,12 @@ pub(crate) fn names_key(ctx: &UserCtx) -> String {
     format!("names:{}", ctx.user_id)
 }
 
+/// The lock key of a user's discovery smart playlists and the ids stored for them: a reconcile
+/// or a settings cleanup reads the ids and writes both under it.
+pub(crate) fn discovery_key(user_id: &str) -> String {
+    format!("discovery:{user_id}")
+}
+
 /// A playlist as the tools report it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlaylistFacts {
