@@ -237,19 +237,34 @@ impl SourcePool {
     }
 }
 
-/// The items of `rest` offering `track` (same normalized title), in `rest`'s
-/// order. `rest` must be sorted by descending score, so the best group comes
-/// first. Matching is by title, never by filename: the same track has a
-/// completely different remote path on each peer.
+/// The item of each group of `rest` offering `track` (same normalized title),
+/// in `rest`'s order. `rest` must be sorted by descending score, so the best
+/// group comes first. Matching is by title, never by filename: the same track
+/// has a completely different remote path on each peer. A group offers a title
+/// twice only when its album has it twice, one file per track, as two discs
+/// can: then the file closest to the track's length is that track's own.
 pub fn alternates_for(
     track: &DownloadableItem,
     rest: &[DownloadableGroup],
 ) -> Vec<DownloadableItem> {
     let wanted = shared::recommendation::normalize_for_matching(&track.title);
+    // How far a file's length is from the track's, unknown last.
+    let distance = |candidate: &DownloadableItem| {
+        let diff = track
+            .duration
+            .zip(candidate.duration)
+            .map(|(t, c)| t.abs_diff(c));
+        (diff.is_none(), diff)
+    };
     rest.iter()
-        .flat_map(|group| group.items.iter())
-        .filter(|candidate| {
-            shared::recommendation::normalize_for_matching(&candidate.title) == wanted
+        .filter_map(|group| {
+            group
+                .items
+                .iter()
+                .filter(|candidate| {
+                    shared::recommendation::normalize_for_matching(&candidate.title) == wanted
+                })
+                .min_by_key(|&candidate| distance(candidate))
         })
         .cloned()
         .collect()
@@ -549,6 +564,46 @@ mod tests {
 
         let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn a_title_a_group_offers_twice_is_the_file_of_the_tracks_length() {
+        let night = |source: &str, id: &str, duration: u32| DownloadableItem {
+            duration: Some(duration),
+            ..item(source, "O Holy Night", id)
+        };
+        // Each album has a studio "O Holy Night" on disc 1 and a longer live one on disc 2.
+        let rest = vec![
+            group(
+                "peer_b",
+                vec![
+                    night("peer_b", "b/CD1/03.flac", 263),
+                    night("peer_b", "b/CD2/03.flac", 301),
+                ],
+                0.9,
+            ),
+            group(
+                "peer_c",
+                vec![
+                    night("peer_c", "c/CD1/03.flac", 262),
+                    night("peer_c", "c/CD2/03.flac", 300),
+                ],
+                0.8,
+            ),
+        ];
+        let tracks = vec![
+            Some(night("peer_a", "a/CD1/03.flac", 263)),
+            Some(night("peer_a", "a/CD2/03.flac", 301)),
+        ];
+
+        let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
+        let ids = |pool: &mut SourcePool, slot: usize| -> Vec<String> {
+            std::iter::from_fn(|| pool.take_next(slot))
+                .map(|i| i.id)
+                .collect()
+        };
+        assert_eq!(ids(&mut pool, 0), vec!["b/CD1/03.flac", "c/CD1/03.flac"]);
+        assert_eq!(ids(&mut pool, 1), vec!["b/CD2/03.flac", "c/CD2/03.flac"]);
     }
 
     #[test]

@@ -90,11 +90,16 @@ fn file_fields(item: Option<&DownloadableItem>, wanted: &DownloadQuery) -> Map<S
     fields
 }
 
+const SEPARATORS: [char; 2] = ['\\', '/'];
+
+/// The folder of `id`, a remote path with `\` or `/` between its parts.
+fn parent(id: &str) -> &str {
+    &id[..id.rfind(SEPARATORS).unwrap_or(0)]
+}
+
 /// The folder holding every one of `ids`, each a remote path with `\` or `/` between its
 /// parts: their longest common parent.
 fn common_parent<'a>(mut ids: impl Iterator<Item = &'a str>) -> String {
-    let separators = ['\\', '/'];
-    let parent = |id: &'a str| &id[..id.rfind(separators).unwrap_or(0)];
     let Some(first) = ids.next() else {
         return String::new();
     };
@@ -105,9 +110,9 @@ fn common_parent<'a>(mut ids: impl Iterator<Item = &'a str>) -> String {
             || folder == common
             || folder
                 .strip_prefix(common)
-                .is_some_and(|rest| rest.starts_with(separators)))
+                .is_some_and(|rest| rest.starts_with(SEPARATORS)))
         {
-            common = &common[..common.rfind(separators).unwrap_or(0)];
+            common = parent(common);
         }
     }
     common.to_string()
@@ -130,6 +135,10 @@ pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) 
             doc.insert("artist".into(), json!(cut(&item.artist)));
             doc.insert("album".into(), json!(cut(&item.album)));
             doc.extend(file_fields(Some(item), wanted));
+            doc.insert(
+                "folder_track_count".into(),
+                json!(item.facts.folder_audio_files),
+            );
         }
         items => {
             doc.insert("download_scope".into(), json!("folder"));
@@ -149,6 +158,15 @@ pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) 
                 .map(|item| Value::Object(file_fields(Some(item), wanted)))
                 .collect();
             doc.insert("files".into(), Value::Array(files));
+            // A group can span folders, one per disc of a release: each is counted once.
+            let per_folder: HashMap<&str, Option<u32>> = items
+                .iter()
+                .map(|i| (parent(&i.id), i.facts.folder_audio_files))
+                .collect();
+            doc.insert(
+                "folder_track_count".into(),
+                json!(per_folder.into_values().sum::<Option<u32>>()),
+            );
             if wanted.album.is_some() {
                 let found: Vec<String> = items
                     .iter()
@@ -168,10 +186,6 @@ pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) 
     }
     let facts = first.map(|item| &item.facts);
     doc.insert("score".into(), json!(group.score));
-    doc.insert(
-        "folder_track_count".into(),
-        json!(facts.and_then(|f| f.folder_audio_files)),
-    );
     doc.insert(
         "peer_has_free_slot".into(),
         json!(facts.and_then(|f| f.source_has_free_slot)),
@@ -1677,6 +1691,44 @@ mod tests {
         let declared = doc["backend_facts"]["declared_extension"].as_str().unwrap();
         assert!(declared.chars().count() <= TEXT_MAX_CHARS);
         assert!(doc.get("files").is_none() && doc.get("tracks_found").is_none());
+    }
+
+    #[test]
+    fn a_candidate_of_two_disc_folders_counts_the_audio_files_of_both() {
+        let wanted = DownloadQuery::new(vec![
+            track("Kowloon", "Wake Up"),
+            track("Kowloon", "Come Over"),
+            track("Kowloon", "Wake Up (extended mix)"),
+        ]);
+        let file = |title: &str, id: &str, folder_audio_files: u32| DownloadableItem {
+            facts: FileFacts {
+                folder_audio_files: Some(folder_audio_files),
+                ..FileFacts::default()
+            },
+            ..item("peer_a", title, id)
+        };
+        let candidate = Candidate {
+            id: "s1:0".into(),
+            group: group(
+                "peer_a",
+                vec![
+                    file("Wake Up", "a\\Come Over\\CD1\\07.flac", 16),
+                    file("Come Over", "a\\Come Over\\CD1\\08.flac", 16),
+                    file("Wake Up (extended mix)", "a\\Come Over\\CD2\\01.flac", 11),
+                ],
+                0.8,
+            ),
+            recent_failures: 0,
+        };
+        let doc = candidate_document(&candidate, &wanted);
+        assert_eq!(
+            (
+                doc["download_scope"].as_str(),
+                doc["remote_folder"].as_str(),
+                doc["folder_track_count"].as_u64()
+            ),
+            (Some("folder"), Some("a\\Come Over"), Some(27))
+        );
     }
 
     #[test]
