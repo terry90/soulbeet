@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use shared::recommendation::without_marks;
 
 #[cfg(feature = "server")]
 use crate::db::DB;
@@ -85,9 +86,11 @@ impl DiscoveryHistoryRow {
 
 /// The key a Discovery run dedupes a track by. History, deletions and candidates all
 /// go through here, so their keys match. Folded in Rust: SQLite's lower() folds ASCII
-/// letters only.
+/// letters only. Combining marks are dropped, so a track suggested as "SKÁLD" is not
+/// suggested again as "SKALD".
 pub fn seen_key(artist: &str, track: &str) -> String {
-    format!("{}:{}", artist.to_lowercase(), track.to_lowercase())
+    let fold = |s: &str| without_marks(&s.to_lowercase());
+    format!("{}:{}", fold(artist), fold(track))
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -135,15 +138,16 @@ mod tests {
     }
 
     #[test]
-    fn seen_key_folds_letters_of_any_script() {
+    fn seen_key_folds_letters_of_any_script_and_drops_their_marks() {
         assert_eq!(
             seen_key("Мумий Тролль", "Контрабанды"),
-            "мумий тролль:контрабанды"
+            "мумии тролль:контрабанды"
         );
         assert_eq!(
             seen_key("Till Lindemann", "Übers Meer"),
-            "till lindemann:übers meer"
+            "till lindemann:ubers meer"
         );
+        assert_eq!(seen_key("SKÁLD", "Ódinn"), seen_key("Skald", "Odinn"));
         assert_eq!(
             seen_key("Marrow Choir", "O Holy Night"),
             "marrow choir:o holy night"

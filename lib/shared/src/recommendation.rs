@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt::Display;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 /// A single listen/scrobble event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +193,17 @@ pub fn normalize_for_matching(s: &str) -> String {
         .join(" ")
 }
 
+/// `s` without its combining marks, so "SKÁLD" reads as "SKALD" and "Shirō" as "Shiro".
+pub fn without_marks(s: &str) -> String {
+    s.nfd().filter(|c| !is_combining_mark(*c)).collect()
+}
+
+/// `s` as Discovery matches a name or a title: normalize_for_matching without combining
+/// marks, since one source writes "SKÁLD" where another writes "SKALD".
+pub fn discovery_name(s: &str) -> String {
+    normalize_for_matching(&without_marks(s))
+}
+
 /// An artist as a source names it, with its MusicBrainz id when known.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArtistRef {
@@ -236,7 +248,7 @@ pub struct KnownMusic {
 
 impl KnownMusic {
     pub fn add_artist(&mut self, a: &ArtistRef) {
-        self.artist_names.insert(normalize_for_matching(&a.name));
+        self.artist_names.insert(discovery_name(&a.name));
         if let Some(m) = &a.mbid {
             self.artist_mbids.insert(m.to_lowercase());
         }
@@ -252,7 +264,7 @@ impl KnownMusic {
     }
 
     pub fn knows_artist(&self, a: &ArtistRef) -> bool {
-        self.artist_names.contains(&normalize_for_matching(&a.name))
+        self.artist_names.contains(&discovery_name(&a.name))
             || a.mbid
                 .as_ref()
                 .is_some_and(|m| self.artist_mbids.contains(&m.to_lowercase()))
@@ -371,8 +383,8 @@ impl CandidateSet {
     pub fn key(artist: &str, track: &str) -> String {
         format!(
             "{}:{}",
-            normalize_for_matching(artist),
-            normalize_for_matching(track)
+            discovery_name(artist),
+            discovery_name(track)
         )
     }
 
@@ -766,6 +778,33 @@ mod tests {
         assert_eq!(
             grouped.into_vec(),
             [error("Deezer", "first", 5), error("MusicBrainz", "mb", 1)]
+        );
+    }
+
+    #[test]
+    fn a_library_track_is_known_however_a_source_accents_its_names() {
+        let mut known = KnownMusic::default();
+        known.add_track(&TrackRef {
+            artist: ArtistRef {
+                name: "SKÁLD".into(),
+                mbid: None,
+            },
+            title: "Ódinn".into(),
+            mbid: None,
+        });
+        let unaccented = TrackRef {
+            artist: ArtistRef {
+                name: "Skald".into(),
+                mbid: None,
+            },
+            title: "Odinn".into(),
+            mbid: None,
+        };
+        assert!(known.knows_artist(&unaccented.artist));
+        assert!(known.knows_track(&unaccented));
+        assert_eq!(
+            CandidateSet::key("SKÁLD", "Ódinn"),
+            CandidateSet::key("SKALD", "Odinn")
         );
     }
 
