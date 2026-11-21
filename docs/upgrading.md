@@ -2,6 +2,10 @@
 
 This page lists what changes on the first start after an upgrade, and what to do where something needs doing.
 
+## Upgrading to library databases in the data folder
+
+-   **The beets library databases move out of the music folders.** Each music folder's `.beets_library.db` moves from the root of that folder to `beets-libraries` next to Soulbeet's database (`/data/beets-libraries/music/Person1/.beets_library.db` for `/music/Person1`), on the first import, delete or replace in that folder. A database on a network share made imports fail with "database is locked"; keep `/data` on a local disk, and your music can stay on the share. Back up `beets-libraries` with the database from now on. If you run `beet` yourself, point `-l` at the new path and pass `-d` with the music folder (see [Library databases](beets.md#library-databases)).
+
 ## Upgrading to roles and folder roots
 
 The release that adds admin roles changes a few things on the first start:

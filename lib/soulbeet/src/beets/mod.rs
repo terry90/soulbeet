@@ -34,6 +34,10 @@ pub struct BeetsSettings {
     pub beet: PathBuf,
     /// The interpreter that runs `beet`, for the config check and imports.
     pub python: Option<PathBuf>,
+    /// The folder that holds each music folder's library database, on the
+    /// disk of Soulbeet's own data rather than with the music
+    /// (`library::library_folder`).
+    pub libraries: PathBuf,
     pub limits: RunLimits,
 }
 
@@ -92,13 +96,27 @@ impl BeetsImporter {
                 "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into(),
             );
         };
-        // beets prompts instead of creating a missing library db directory.
         if let Err(e) = tokio::fs::create_dir_all(target).await {
             return ImportResult::failed(
                 FailKind::TargetUnwritable,
                 format!("Could not create library folder {}: {e}", target.display()),
             );
         }
+        // beets prompts instead of creating a missing library db directory.
+        let db_folder = library::library_folder(&s.libraries, target);
+        if let Err(e) = tokio::fs::create_dir_all(&db_folder).await {
+            return ImportResult::failed(
+                FailKind::Setup,
+                format!(
+                    "Could not create the folder of the beets library database {}: {e}",
+                    db_folder.display()
+                ),
+            );
+        }
+        let db = match library::library_db(s, target).await {
+            Ok(db) => db,
+            Err(e) => return ImportResult::failed(FailKind::Setup, e),
+        };
         let submitted = count_audio_files(sources).await;
         let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
             (Ok(log), Ok(report)) => (log, report),
@@ -120,7 +138,7 @@ impl BeetsImporter {
         );
         let started = Instant::now();
         let mut classifier = Classifier::new(mode, target, submitted, autotag_off);
-        let beet_args = import_args(s, sources, target, mode, &run_log.0);
+        let beet_args = import_args(s, &db, sources, target, mode, &run_log.0);
         let spec = RunSpec {
             program: python,
             args: driver_args(&report_file.0, duplicates, choice, beet_args),
@@ -191,8 +209,10 @@ impl Drop for TempFile {
     }
 }
 
+/// `beet import` of `sources` into `target`, whose library database is `db`.
 fn import_args(
     s: &BeetsSettings,
+    db: &Path,
     sources: &[&Path],
     target: &Path,
     mode: ImportMode,
@@ -203,7 +223,7 @@ fn import_args(
         "-c".into(),
         s.config.clone().into(),
         "-l".into(),
-        library::library_db(target).into(),
+        db.into(),
         "-d".into(),
         target.into(),
         "import".into(),
@@ -460,6 +480,7 @@ mod tests {
             config,
             beet,
             python,
+            libraries: dir.join("libraries"),
             limits: SHORT,
         }
     }
@@ -652,7 +673,7 @@ mod tests {
                 assert_eq!(args[after], "--");
 
                 let beet_args = &args[after + 1..];
-                let db = target.join(".beets_library.db");
+                let db = library::library_folder(&s.libraries, &target).join(".beets_library.db");
                 let expected_head = [
                     "-v",
                     "-c",
@@ -967,6 +988,37 @@ mod tests {
             )),
             "{text}"
         );
+    }
+
+    /// A library db an earlier version kept in the music folder, often a
+    /// network share, is moved to the libraries folder before beets opens it.
+    #[tokio::test]
+    async fn an_import_uses_the_folders_db_moved_out_of_the_music_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let importer = driver_importer(d).await;
+        stage(d, DriverRun::default());
+        let target = d.join("lib");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join(".beets_library.db"), b"items").unwrap();
+
+        importer
+            .import(
+                &[&d.join("src")],
+                &target,
+                ImportMode::Album,
+                &DriverChoice::Auto,
+                DuplicateRun::AsConfigured,
+            )
+            .await;
+
+        let db = library::library_folder(&importer.settings.libraries, &target)
+            .join(".beets_library.db");
+        assert_eq!(std::fs::read(&db).unwrap(), b"items");
+        assert!(!target.join(".beets_library.db").exists());
+        let args = driver_args_seen(d);
+        let l = args.iter().position(|a| a == "-l").expect("no -l");
+        assert_eq!(args[l + 1], db.to_string_lossy());
     }
 
     #[tokio::test]

@@ -158,6 +158,7 @@ pub fn import_job(
         choices: None,
         duplicates: Duplicates::of(duplicates, user),
         last_run: None,
+        lock_retries: 0,
     }
 }
 

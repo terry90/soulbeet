@@ -5,6 +5,7 @@ use super::{ImportJob, JobOutcome};
 use shared::download::{DownloadProgress, DownloadState, SkipKind};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{FailKind, ImportMode, ImportOutcome, ImportResult, SkipReason, TimeoutKind};
+use std::time::Duration;
 
 pub fn row_state(outcome: &ImportOutcome) -> DownloadState {
     match outcome {
@@ -58,6 +59,11 @@ pub(crate) fn import_failure(result: &ImportResult) -> Option<Failure> {
                 RetryAdvice::NotRetryable,
             ),
             FailKind::DiskFull => (FailureCode::ImportDiskFull, RetryAdvice::NeedsUser),
+            // A lock is let go: the queue runs the import again by itself.
+            FailKind::LibraryLocked => (
+                FailureCode::ImportLibraryLocked,
+                RetryAdvice::SameSourceLater,
+            ),
             FailKind::AsIsMissingTags => (
                 FailureCode::ImportAsIsMissingTags,
                 RetryAdvice::NeedsDecision,
@@ -126,7 +132,10 @@ pub fn rows_for_done(
         ImportOutcome::Skipped(reason) => Some(SkipKind::from(reason)),
         _ => None,
     };
-    let failure = import_failure(result);
+    let failure = import_failure(result).map(|failure| match done.retry_in {
+        Some(wait) => retried_in(failure, wait),
+        None => failure,
+    });
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
@@ -145,6 +154,19 @@ pub fn rows_for_done(
             }
         })
         .collect()
+}
+
+/// `failure`, of a run the queue makes again by itself after `wait`, saying so.
+fn retried_in(failure: Failure, wait: Duration) -> Failure {
+    let secs = wait.as_secs();
+    let when = match secs >= 60 && secs.is_multiple_of(60) {
+        true => format!("{} min", secs / 60),
+        false => format!("{secs} s"),
+    };
+    let message = format!("{}; Soulbeet tries again in {when}", failure.message);
+    failure
+        .with_message(message)
+        .with_retry_after(u32::try_from(secs).unwrap_or(u32::MAX))
 }
 
 /// The folder holding the files a job did not import.
@@ -230,6 +252,7 @@ mod tests {
             choices: None,
             duplicates: crate::import_queue::Duplicates::AsConfigured,
             last_run: None,
+            lock_retries: 0,
         }
     }
 
@@ -240,6 +263,7 @@ mod tests {
             ran: true,
             replaced: vec![],
             not_replaced: vec![],
+            retry_in: None,
         }
     }
 
@@ -442,6 +466,16 @@ mod tests {
             ),
             (
                 ImportOutcome::Failed {
+                    kind: FailKind::LibraryLocked,
+                    message: "The beets library database is locked: sqlite3.OperationalError: \
+                              database is locked"
+                        .into(),
+                },
+                FailureCode::ImportLibraryLocked,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                ImportOutcome::Failed {
                     kind: FailKind::AsIsMissingTags,
                     message: "Import as-is needs tags".into(),
                 },
@@ -544,6 +578,45 @@ mod tests {
             (&rows[0].failure, rows[0].skip, &rows[0].error),
             (&None, None, &None)
         );
+    }
+
+    /// The row of a run the queue makes again by itself says when, and the
+    /// failure carries the wait for an app.
+    #[test]
+    fn a_locked_library_row_says_when_the_queue_tries_again() {
+        let message = "The beets library database is locked: sqlite3.OperationalError: database \
+                       is locked";
+        let locked = ImportResult::failed(FailKind::LibraryLocked, message.into());
+        let rows = rows_for_done(
+            &[row("a")],
+            &job("/dl/a.flac", ImportMode::Singleton),
+            &JobOutcome {
+                retry_in: Some(Duration::from_secs(300)),
+                ..done(locked.clone())
+            },
+        );
+        let text = format!("{message}; Soulbeet tries again in 5 min");
+        assert_eq!(rows[0].state, DownloadState::Failed(text.clone()));
+        let failure = rows[0].failure.as_ref().unwrap();
+        assert_eq!(
+            (failure.code, failure.retry, failure.retry_after_seconds),
+            (
+                FailureCode::ImportLibraryLocked,
+                RetryAdvice::SameSourceLater,
+                Some(300)
+            )
+        );
+        assert_eq!(failure.message, text);
+        assert!(rows[0].retryable);
+
+        // The last run says only what failed.
+        let last = rows_for_done(
+            &[row("a")],
+            &job("/dl/a.flac", ImportMode::Singleton),
+            &done(locked),
+        );
+        assert_eq!(last[0].state, DownloadState::Failed(message.into()));
+        assert_eq!(last[0].failure.as_ref().unwrap().retry_after_seconds, None);
     }
 
     #[test]

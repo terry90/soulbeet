@@ -649,7 +649,7 @@ test('the Christmas playlist is filled through every injected failure by followi
     // delete_tracks queues the beets forget on the folder's import worker and does not wait for it.
     await expect
       .poll(() => {
-        const titles = libraryItems(folder.name).map((i) => i.title);
+        const titles = libraryItems(folder.name, mcpMusicDirForApp).map((i) => i.title);
         return [titles.includes('In the Bleak Midwinter'), titles.includes('O Holy Night')];
       })
       .toEqual([false, true]);
@@ -723,7 +723,7 @@ test('the Christmas playlist is filled through every injected failure by followi
       [harkOnHost],
     );
     expect(statSync(harkOnHost).ino).not.toBe(oldInode);
-    expect(libraryItems(folder.name).filter((i) => i.title === 'Hark the Herald Angels Sing')).toHaveLength(1);
+    expect(libraryItems(folder.name, mcpMusicDirForApp).filter((i) => i.title === 'Hark the Herald Angels Sing')).toHaveLength(1);
     expect(await rowOf(harkId)).toMatchObject({
       title: 'Hark the Herald Angels Sing',
       reason: 'replaced',
