@@ -61,20 +61,92 @@ impl DiscoveryHistoryRow {
         Ok(count > 0)
     }
 
-    /// Build a set of all previously suggested track keys (lowercased "artist:track") for fast lookup.
+    /// Every track ever suggested to the user, as `seen_key`s.
     pub async fn get_suggested_keys(
         user_id: &str,
     ) -> Result<std::collections::HashSet<String>, String> {
+        Self::get_suggested_keys_in(&DB, user_id).await
+    }
+
+    pub(crate) async fn get_suggested_keys_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<std::collections::HashSet<String>, String> {
         let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT lower(artist), lower(track) FROM discovery_history WHERE user_id = ?",
+            "SELECT artist, track FROM discovery_history WHERE user_id = ?",
         )
         .bind(user_id)
-        .fetch_all(&*DB)
+        .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;
-        Ok(rows
-            .into_iter()
-            .map(|(a, t)| format!("{}:{}", a, t))
-            .collect())
+        Ok(rows.iter().map(|(a, t)| seen_key(a, t)).collect())
+    }
+}
+
+/// The key a Discovery run dedupes a track by. History, deletions and candidates all
+/// go through here, so their keys match. Folded in Rust: SQLite's lower() folds ASCII
+/// letters only.
+pub fn seen_key(artist: &str, track: &str) -> String {
+    format!("{}:{}", artist.to_lowercase(), track.to_lowercase())
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use crate::db::test_db;
+
+    async fn suggest(db: &sqlx::SqlitePool, artist: &str, track: &str) {
+        sqlx::query(
+            "INSERT INTO discovery_history (id, user_id, artist, track, profile) \
+             VALUES (?, 'alice', ?, ?, 'Conservative')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(artist)
+        .bind(track)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_suggested_track_is_seen_under_its_candidate_key_in_any_script() {
+        let db = test_db::migrated().await;
+        let tracks = [
+            ("Мумий Тролль", "Контрабанды"),
+            ("Till Lindemann", "Übers Meer"),
+            ("Marrow Choir", "O Holy Night"),
+        ];
+        for (artist, track) in tracks {
+            suggest(&db, artist, track).await;
+        }
+
+        let seen = DiscoveryHistoryRow::get_suggested_keys_in(&db, "alice")
+            .await
+            .unwrap();
+
+        for (artist, track) in tracks {
+            assert!(
+                seen.contains(&seen_key(artist, track)),
+                "{artist} - {track} not in {seen:?}"
+            );
+        }
+        // The engine may name it in another case.
+        assert!(seen.contains(&seen_key("МУМИЙ ТРОЛЛЬ", "КОНТРАБАНДЫ")));
+    }
+
+    #[test]
+    fn seen_key_folds_letters_of_any_script() {
+        assert_eq!(
+            seen_key("Мумий Тролль", "Контрабанды"),
+            "мумий тролль:контрабанды"
+        );
+        assert_eq!(
+            seen_key("Till Lindemann", "Übers Meer"),
+            "till lindemann:übers meer"
+        );
+        assert_eq!(
+            seen_key("Marrow Choir", "O Holy Night"),
+            "marrow choir:o holy night"
+        );
     }
 }
