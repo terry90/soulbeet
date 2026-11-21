@@ -10,7 +10,7 @@ Discovery and search no longer use Last.fm, and you can sign in through an OpenI
 - **Import your Last.fm history now**: Last.fm keys stop working on December 1 unless their owner pays for Pro, so bring your scrobbles into ListenBrainz before then with its importer at https://listenbrainz.org/settings/import/, which needs only your Last.fm username.
 - **Last.fm is gone**: Search uses MusicBrainz only and the Last.fm settings are removed; a download left from before the upgrade whose album came from a Last.fm search fails, and the log and `get_jobs` say to search for it again; for AI assistants `search_music` no longer takes `provider`, see Upgrading in docs/mcp.md.
 - **Sign in with your login provider**: Once an admin sets it up, the login page has a button to sign in through your provider, and an account made that way connects to Navidrome when you enter your Navidrome password in Connect Navidrome in Settings > Users.
-- **Same name, same account**: A first sign-in joins the account with the same name, so set OIDC_LINK_BY_USERNAME=false if the names at your provider are not under your control, and linking from Settings > Users still asks for your current password and shows the name you linked.
+- **Same name, same account**: A first sign-in joins the plain user account with the same name, never an admin account (an admin links single sign-on in Settings > Users), so set OIDC_LINK_BY_USERNAME=false if the names at your provider are not under your control, and linking from Settings > Users still asks for your current password and shows the name you linked.
 
 [How to set up single sign-on](https://github.com/terry90/soulbeet/blob/master/docs/sso.md)
 
