@@ -48,8 +48,9 @@ struct Candidate {
     below_floor: bool,
 }
 
-/// The albums found in `responses`. A file scored under MIN_SCORE_THRESHOLD
-/// is dropped, or with `keep_below_floor` kept and flagged `below_floor`.
+/// The albums found in `responses`. A file scored under MIN_SCORE_THRESHOLD,
+/// or matching no word of any wanted title, is dropped, or with
+/// `keep_below_floor` kept and flagged `below_floor`.
 pub fn process_search_responses(
     responses: &[SearchResponse],
     searched_artist: &str,
@@ -61,6 +62,13 @@ pub fn process_search_responses(
     let mut not_audio = 0;
     let mut below_floor = 0;
     let mut scored_files: Vec<(Vec<Candidate>, SearchResult)> = Vec::new();
+    // A file that shares no word with any wanted title is none of them,
+    // whatever its folder and length say. Every ranking of a file has the
+    // same title score.
+    let under = |r: &utils::Ranked| {
+        r.result.total_score < MIN_SCORE_THRESHOLD
+            || (r.track.is_some() && r.result.track_score == 0.0)
+    };
     for resp in responses {
         let mut folder_audio_files: HashMap<&str, u32> = HashMap::new();
         for file in resp.files.iter().filter(|f| kept_as_audio(&f.filename)) {
@@ -83,7 +91,7 @@ pub fn process_search_responses(
             );
 
             // Best first, so the first is the file's own score.
-            let flagged = ranked[0].result.total_score < MIN_SCORE_THRESHOLD;
+            let flagged = under(&ranked[0]);
             if flagged {
                 below_floor += 1;
                 if !keep_below_floor {
@@ -111,11 +119,10 @@ pub fn process_search_responses(
             let candidates = ranked
                 .into_iter()
                 .filter_map(|r| {
-                    let under = r.result.total_score < MIN_SCORE_THRESHOLD;
                     Some(Candidate {
+                        below_floor: under(&r),
                         track: r.track?,
                         result: r.result,
-                        below_floor: under,
                     })
                 })
                 .filter(|c| keep_below_floor || !c.below_floor)
@@ -295,6 +302,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_file_matching_no_wanted_title_fills_no_track() {
+        let file = |name: &str, length: i32| SearchResponseFile {
+            filename: format!("@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\{name}"),
+            size: 1,
+            bit_rate: None,
+            length: Some(length),
+            sample_rate: None,
+            bit_depth: None,
+            extension: None,
+            is_variable_bit_rate: None,
+        };
+        // The peer lacks "Away in a Manger" and shares an interview of its length.
+        let response = SearchResponse {
+            username: "carol_shares".into(),
+            files: vec![
+                file("03 - O Holy Night.flac", 263),
+                file("04 - Silent Night.flac", 149),
+                file("12 - Interview.flac", 181),
+            ],
+            has_free_upload_slot: true,
+            upload_speed: 1,
+            queue_length: 0,
+            locked_file_count: 0,
+        };
+        let tracks = wanted(&[
+            ("O Holy Night", 263),
+            ("Silent Night", 149),
+            ("Away in a Manger", 181),
+        ]);
+        let processed = process_search_responses(
+            &[response],
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &tracks,
+            false,
+        );
+        assert_eq!(processed.below_floor, 1);
+        assert_eq!(processed.albums.len(), 1);
+        assert_eq!(
+            album_files(&processed.albums[0]),
+            vec![
+                "@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\03 - O Holy Night.flac",
+                "@@kqzbm\\Music\\Marrow Choir\\Winter Songs\\04 - Silent Night.flac",
+            ]
+        );
+    }
+
     /// slskd's answer to `GET /api/v0/searches/{id}/responses` (`Search/Types/Response.cs:38-48`)
     /// from a peer sharing a two-disc release, one folder per disc.
     const TWO_DISCS: &str = include_str!("fixtures/search_two_discs.json");
@@ -312,12 +367,19 @@ mod tests {
     }
 
     fn album_files(album: &AlbumResult) -> Vec<&str> {
-        album.tracks.iter().map(|t| t.base.filename.as_str()).collect()
+        album
+            .tracks
+            .iter()
+            .map(|t| t.base.filename.as_str())
+            .collect()
     }
 
     #[test]
     fn a_two_disc_share_is_one_album_whatever_the_album_is_called() {
-        assert_eq!(release_folder("@@lq4ve\\Album\\CD1\\01.flac"), "@@lq4ve\\Album");
+        assert_eq!(
+            release_folder("@@lq4ve\\Album\\CD1\\01.flac"),
+            "@@lq4ve\\Album"
+        );
         assert_eq!(release_folder("music/Album/Disc 2/01.flac"), "music/Album");
         assert_eq!(release_folder("music/Album/01.flac"), "music/Album");
         assert_eq!(release_folder("CD1/01.flac"), "");
@@ -345,13 +407,8 @@ mod tests {
         // The title the share names, and one no folder of it shares a word
         // with, as a translated or romanised title does.
         for title in ["Bigger Than All of Us", "Größer als wir alle"] {
-            let processed = process_search_responses(
-                &responses,
-                "Above & Beyond",
-                Some(title),
-                &tracks,
-                false,
-            );
+            let processed =
+                process_search_responses(&responses, "Above & Beyond", Some(title), &tracks, false);
             assert_eq!(processed.albums.len(), 1, "{title}");
             let album = &processed.albums[0];
             assert_eq!(album_files(album), both_discs, "{title}");

@@ -322,12 +322,7 @@ pub fn rank_match(
         .filter(|&(_, score)| score == best)
         .map(|(i, score)| {
             let total = total_score(Some((score, expected_tracks[i].duration_s)));
-            ranked(
-                Some(i),
-                expected_tracks_c[i].original.clone(),
-                score,
-                total,
-            )
+            ranked(Some(i), expected_tracks_c[i].original.clone(), score, total)
         })
         .collect();
     // Stable, so equal scores keep the album's order.
@@ -407,13 +402,20 @@ mod tests {
         for disc in ["CD1", "CD 2", "cd-01", "Disc 1", "disc02", "Disk 3 - Live"] {
             assert!(is_disc_folder(disc), "{disc}");
         }
-        for other in ["CD Singles", "Discography", "Disco 2000", "2CD", "Winter Songs"] {
+        for other in [
+            "CD Singles",
+            "Discography",
+            "Disco 2000",
+            "2CD",
+            "Winter Songs",
+        ] {
             assert!(!is_disc_folder(other), "{other}");
         }
         // No folder names the album "Hikari no Uta", so every folder scores 0
         // and the innermost one left is the guess: the release, not the disc.
         let guess = |disc: &str| {
-            let file = format!("@@kqzbm\\Music\\Marrow Choir - 光の歌 [FLAC]\\{disc}\\01 - Intro.flac");
+            let file =
+                format!("@@kqzbm\\Music\\Marrow Choir - 光の歌 [FLAC]\\{disc}\\01 - Intro.flac");
             let ranked = rank_match(
                 &file,
                 Some("Marrow Choir"),
