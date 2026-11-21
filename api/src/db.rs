@@ -1,7 +1,12 @@
 #[cfg(feature = "server")]
 use dioxus::fullstack::Lazy;
 #[cfg(feature = "server")]
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    SqlitePool,
+};
+#[cfg(feature = "server")]
+use std::{str::FromStr, time::Duration};
 
 #[cfg(feature = "server")]
 use crate::config::CONFIG;
@@ -17,6 +22,39 @@ pub(crate) fn database_file(database_url: &str) -> Option<&std::path::Path> {
     (!path.is_empty() && path != ":memory:").then(|| std::path::Path::new(path))
 }
 
+/// How long a statement waits for another connection's write lock before it
+/// fails with "database is locked". SQLite's writers take turns; a search, a
+/// job and the session checks of every page load write at the same time.
+#[cfg(feature = "server")]
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A connection idle this long is closed, and none lives longer than
+/// `MAX_LIFETIME`, so a connection left holding a lock does not hold it
+/// until the server restarts.
+#[cfg(feature = "server")]
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(feature = "server")]
+pub(crate) const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// The connection settings for `database_url`: WAL, so readers never wait for
+/// a writer (session checks no longer fail while a search is being recorded),
+/// and `BUSY_TIMEOUT` for writers waiting on each other. WAL is stored in the
+/// database file, so an existing database switches on its next start.
+#[cfg(feature = "server")]
+pub(crate) fn connect_options(database_url: &str) -> Result<SqliteConnectOptions, sqlx::Error> {
+    Ok(SqliteConnectOptions::from_str(database_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(BUSY_TIMEOUT))
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn pool_options() -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(5)
+        .idle_timeout(IDLE_TIMEOUT)
+        .max_lifetime(MAX_LIFETIME)
+}
+
 #[cfg(feature = "server")]
 pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
     let database_url = CONFIG.database_url();
@@ -30,9 +68,9 @@ pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
         }
     }
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
+    let options = connect_options(database_url).expect("Invalid DATABASE_URL");
+    let pool = pool_options()
+        .connect_with(options)
         .await
         .expect("Failed to connect to database");
 
@@ -159,6 +197,60 @@ pub(crate) mod test_db {
 mod tests {
     use super::test_db;
     use sqlx::SqlitePool;
+
+    /// A database file opened the way the server opens `DATABASE_URL`.
+    async fn server_pool(dir: &std::path::Path) -> SqlitePool {
+        let path = dir.join("soulbeet.db");
+        std::fs::File::create(&path).unwrap();
+        let url = format!("sqlite:{}", path.display());
+        super::pool_options()
+            .connect_with(super::connect_options(&url).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_server_database_uses_wal_and_waits_for_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = server_pool(dir.path()).await;
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(timeout, super::BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[tokio::test]
+    async fn a_reader_does_not_wait_for_an_open_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = server_pool(dir.path()).await;
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&db)
+            .await
+            .unwrap();
+        // EXCLUSIVE holds the lock a rollback-journal commit takes. Without
+        // WAL this read waits for it, then fails with "database is locked";
+        // in WAL mode it does not stop readers.
+        let mut writer = db.begin_with("BEGIN EXCLUSIVE").await.unwrap();
+        sqlx::query("INSERT INTO t (x) VALUES (1)")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let seen = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM t").fetch_one(&db),
+        )
+        .await
+        .expect("the read waited for the writer")
+        .unwrap();
+        assert_eq!(seen, 0);
+        writer.commit().await.unwrap();
+    }
 
     const SEEDED: &str = "00000000-0000-0000-0000-000000000000";
 
