@@ -170,6 +170,23 @@ pub(crate) mod test_db {
         pool
     }
 
+    /// The migrated database plus accounts whose names differ only in letter
+    /// case, as an install from before the rule can hold. Each has the id
+    /// `id-<name>` and a password hash that no password matches.
+    pub async fn colliding(names: &[&str]) -> SqlitePool {
+        let pool = migrated_before(USERNAME_CASE).await;
+        for name in names {
+            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+                .bind(format!("id-{name}"))
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("user");
+        }
+        apply_from(&pool, USERNAME_CASE).await;
+        pool
+    }
+
     /// Applies the migration `version` and every later one, as an upgrade to
     /// this build does.
     pub async fn apply_from(pool: &SqlitePool, version: i64) {
