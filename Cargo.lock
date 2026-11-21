@@ -4219,6 +4219,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -4346,7 +4347,6 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tracing",
- "unicode-normalization",
  "url",
  "uuid",
 ]

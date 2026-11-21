@@ -4,7 +4,7 @@ use rand::seq::SliceRandom;
 use tracing::info;
 
 use shared::recommendation::{
-    normalize_for_matching, Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary,
+    discovery_name, Candidate, CandidateSet, CandidateSnapshot, DiversifierSummary,
     ProfileConfig, UserMusicProfile,
 };
 
@@ -215,7 +215,7 @@ pub fn diversify(
 fn artist_key(c: &Candidate) -> String {
     match &c.artist_mbid {
         Some(mbid) => format!("mbid:{}", mbid.to_lowercase()),
-        None => format!("name:{}", normalize_for_matching(&c.artist)),
+        None => format!("name:{}", discovery_name(&c.artist)),
     }
 }
 

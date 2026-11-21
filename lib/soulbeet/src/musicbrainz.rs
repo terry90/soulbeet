@@ -12,11 +12,10 @@ use musicbrainz_rs::{
 use serde::Serialize;
 use shared::failure::{cut_chars, Service, RAW_MAX_CHARS};
 use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
-use shared::recommendation::fold_name;
+use shared::recommendation::{fold_name, without_marks};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
-use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::MetadataError;
 
@@ -232,7 +231,7 @@ fn titled_query(
 /// index ignores them, so "Shiro Sagisu" finds the alias "Shirō Sagisu" and
 /// "フィッシュマンス" finds "フィッシュマンズ".
 fn search_fold(s: &str) -> String {
-    fold_name(&s.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>())
+    fold_name(&without_marks(s))
 }
 
 /// Whether `wanted`, folded by `search_fold`, is the name or an alias of `m`.
