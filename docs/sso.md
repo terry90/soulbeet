@@ -38,14 +38,15 @@ Read the [warning about names](#warning-the-same-name-joins-the-same-account) be
 | `OIDC_SCOPES` | Scopes to request (`openid` is always added) | `openid profile email` |
 | `OIDC_USERNAME_CLAIM` | ID token claim used as the Soulbeet username | `preferred_username` |
 | `OIDC_AUTO_REGISTER` | Create an account on first sign-in when none has that username | `true` with `REGISTRATION=open`, else `false` |
-| `OIDC_LINK_BY_USERNAME` | On a first sign-in, link the existing account of that username. Set `false` to refuse such a sign-in instead. Read the [warning](#warning-the-same-name-joins-the-same-account) | `true` |
+| `OIDC_LINK_BY_USERNAME` | On a first sign-in, link the existing plain user account of that username. Admin accounts are never linked this way. Set `false` to refuse such a sign-in instead. Read the [warning](#warning-the-same-name-joins-the-same-account) | `true` |
 
 `PUBLIC_URL`, `REGISTRATION` and the other variables are in [configuration.md](configuration.md).
 
 ## How accounts are matched
 
 -   An account is tied to the provider's user (its issuer and `sub`), so renaming the user at the provider does not change accounts.
--   **The same name joins the same account**: when an account already has the name `OIDC_USERNAME_CLAIM` gives (ignoring letter case, like every sign-in) and no single sign-on link yet, a first sign-in joins that account and links it, which signs the account out of its other sessions. An account linked to another identity is never joined. Read the [warning](#warning-the-same-name-joins-the-same-account) on when to turn this off.
+-   **The same name joins the same account**: when a plain user account already has the name `OIDC_USERNAME_CLAIM` gives (ignoring letter case, like every sign-in) and no single sign-on link yet, a first sign-in joins that account and links it, which signs the account out of its other sessions. An account linked to another identity is never joined. Read the [warning](#warning-the-same-name-joins-the-same-account) on when to turn this off.
+-   **Admin accounts are never joined by name**: a first sign-in under the name of an admin account is refused, as if `OIDC_LINK_BY_USERNAME` were `false`. The admin signs in with their password and links single sign-on in Settings > Users.
 -   **No account of that name**: a first sign-in creates one as a plain user when `OIDC_AUTO_REGISTER` is on. `OIDC_AUTO_REGISTER` is on by default only with `REGISTRATION=open`.
     -   With Navidrome, an account that single sign-on creates takes that name: if the Navidrome user of that name is someone else, they cannot sign in until an admin deletes that account.
     -   When `OIDC_AUTO_REGISTER` is off, the sign-in is refused and the user gets an account the way they would without single sign-on: with `REGISTRATION=navidrome` by signing in once with their Navidrome password, with `REGISTRATION=admin` from an admin in Settings > Users. Their next single sign-on then joins that account, or, with `OIDC_LINK_BY_USERNAME=false`, they sign in with that password and link single sign-on in Settings.
@@ -53,7 +54,7 @@ Read the [warning about names](#warning-the-same-name-joins-the-same-account) be
 
 ## Warning: the same name joins the same account
 
-**By default, whoever holds a name at the provider gets the Soulbeet account of that name, admin accounts included.** Unlinking an account taken this way, or an admin setting its password (which removes the link), only helps once `OIDC_LINK_BY_USERNAME` is `false` or the name at the provider is changed: the next sign-in under that name links it again.
+**By default, whoever holds a name at the provider gets the plain user account of that name in Soulbeet.** Admin accounts are the exception: they are never joined by name, so someone at the provider who picks the name `admin` does not become a Soulbeet admin. Unlinking a user account taken this way, or an admin setting its password (which removes the link), only helps once `OIDC_LINK_BY_USERNAME` is `false` or the name at the provider is changed: the next sign-in under that name links it again.
 
 ### When the default is fine
 
@@ -69,7 +70,6 @@ Set `OIDC_LINK_BY_USERNAME=false` if any of these is true:
 -   The provider is shared with people who should not all get into Soulbeet, such as a company or public provider.
 -   Soulbeet runs with `REGISTRATION=open`, or strangers can create accounts in it some other way. Someone can register a name with a password first; the real person's first single sign-on then joins that account, and the stranger keeps the password.
 -   Soulbeet runs with `REGISTRATION=navidrome`, and a Navidrome user may have the same name as a different person at the provider. A Navidrome user who signed in to Soulbeet once has an account, and the first single sign-on under that name joins it, with that user's Navidrome library, ratings and playlists.
--   Someone at the provider holds the name of a Soulbeet admin (the seeded one is `admin`) without being that admin. They would sign in as that admin.
 
 With it off, a first sign-in under the name of an existing account is refused. The owner signs in with their password and links single sign-on in Settings > Users.
 
@@ -82,7 +82,7 @@ With it off, a first sign-in under the name of an existing account is refused. T
 -   **Changing their own password** asks for the current one the same way, so such a session cannot set a new one first. A user who changes their own password keeps their link.
 -   **Unlinking**: a user can unlink their own account in Settings > Users while it keeps another way in (a password of its own, or a stored Navidrome password).
 -   **Admins** see in Settings > Users which accounts use single sign-on, with the name of the identity at the provider, and which have no password, and can unlink any of them. An admin who sets the password of another account also removes its link, so whoever held that identity is out (see the [warning](#warning-the-same-name-joins-the-same-account) for a link made by name).
--   **An account with no password at all** gets one from an admin, which also removes its single sign-on link, so the user's next single sign-on joins it again by name, or they link it in Settings.
+-   **An account with no password at all** gets one from an admin, which also removes its single sign-on link, so the user's next single sign-on joins it again by name (a plain user account only), or they link it in Settings.
 -   Linking, unlinking or a new password signs the account out everywhere else.
 
 ## Navidrome
@@ -93,4 +93,4 @@ An account created through single sign-on has no password and no Navidrome passw
 
 -   **Signing out** of Soulbeet does not sign you out of the provider. On a shared computer, sign out at the provider too, or the next person to click **Sign in with ...** gets your account.
 -   **MCP clients**: signing in from an MCP client's authorization page goes back to it afterwards, as a password sign-in does, also after a failed single sign-on: the error page keeps the request. See [mcp.md](mcp.md).
--   **Changing provider**: unlink each account in Settings > Users, set a password on the accounts marked as having none, and have users sign in with the new provider, which joins accounts by name, or link it in Settings.
+-   **Changing provider**: unlink each account in Settings > Users, set a password on the accounts marked as having none, and have users sign in with the new provider, which joins plain user accounts by name, or link it in Settings. Admins link theirs in Settings.

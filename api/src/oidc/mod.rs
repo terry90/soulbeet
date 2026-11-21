@@ -16,11 +16,11 @@
 //! A successful sign-in starts the same session as a password login. An
 //! account is found by its OIDC identity (issuer and subject). A first
 //! sign-in creates an account for a name nobody has (when auto-register is
-//! on), and links the one unlinked account of that name (ignoring ASCII
-//! case, as every sign-in does). That trusts the admin's provider with the
-//! names, since a claimed name proves nothing by itself (OpenID Connect Core
-//! 1.0, section 5.7); with OIDC_LINK_BY_USERNAME=false it never takes an
-//! existing account.
+//! on), and links the one unlinked plain user account of that name (ignoring
+//! ASCII case, as every sign-in does). That trusts the admin's provider with
+//! the names, since a claimed name proves nothing by itself (OpenID Connect
+//! Core 1.0, section 5.7). An admin account is never linked by name, and
+//! with OIDC_LINK_BY_USERNAME=false no existing account is.
 //!
 //! A sign-in started from the login page of an app's authorize request
 //! (`/login/return`) goes back to that request afterwards.

@@ -10,7 +10,7 @@ import { createNavidromeUser } from '../helpers/navidrome.js';
 // issues a token. The app on 9765 runs with REGISTRATION=open, so a first
 // sign-in under a new name creates an account, and leaves
 // OIDC_LINK_BY_USERNAME at its default, so a first sign-in under the name of
-// an account that has no single sign-on link joins that account.
+// a plain user account that has no single sign-on link joins that account.
 
 interface ProviderUser {
   username: string;
