@@ -96,6 +96,7 @@ fn main() {
                     api::connection::ConnectionState::live(),
                 ))
                 .merge(api::oidc::router())
+                .merge(api::healthz::router())
                 .layer(CookieManagerLayer::new()))
         });
     }

@@ -145,6 +145,7 @@ For discovery (optional): enable discovery on a folder in Settings > Library, pi
 - [Configuration](docs/configuration.md): the environment variables and their defaults (the `OIDC_*` ones are in Single sign-on), how sign-in works with Navidrome, and which settings live in the web UI.
 - [Single sign-on](docs/sso.md): signing in through an OpenID Connect provider (Pocket ID, Authelia, Authentik, Keycloak), how accounts are matched, and when to turn off linking by name.
 - [Upgrading](docs/upgrading.md): what changes on the first start after the release that adds admin roles and folder roots.
+- [Health check](docs/health-check.md): the `/healthz` address for Docker and Kubernetes health checks, with a compose `healthcheck` and Kubernetes probes.
 - [Beets](docs/beets.md): the beets config file, import flags, skipped imports, image tiers, per-folder libraries and album mode.
 - [Beets plugins](docs/beets-plugins.md): the plugins each image tier ships, switching tiers, and adding your own plugins.
 - [Discovery](docs/discovery.md): setting up discovery, how its playlists and 6-hour cycle work, and auto-delete.
