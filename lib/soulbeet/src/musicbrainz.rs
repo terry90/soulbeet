@@ -381,15 +381,7 @@ pub async fn search(
                     continue;
                 }
 
-                if let Some(best_release) = release_group.releases.as_ref().and_then(|releases| {
-                    releases
-                        .iter()
-                        .filter(|r| r.status == Some(ReleaseStatus::Official))
-                        .min_by_key(|release| release.date.as_ref().map(|d| &d.0))
-                }) {
-                    // If no official release was found, take the first one available
-                    let final_release = best_release.clone();
-
+                if let Some(final_release) = album_release(&release_group) {
                     results.push(SearchResult::Album(Album {
                         id: final_release.id.clone(),
                         title: release_group.title.clone(),
@@ -405,6 +397,22 @@ pub async fn search(
     }
 
     Ok(results)
+}
+
+/// The release an album search shows for `group`: an official one titled as
+/// the group, else the first official one. A release titled otherwise is often
+/// another edition of the album, such as its extended mixes alone. A release
+/// group search sends each release's id, title and status but no date or
+/// tracklist, so the order MusicBrainz lists them in decides among the rest.
+fn album_release(group: &ReleaseGroup) -> Option<&Release> {
+    let official: Vec<&Release> = (group.releases.iter().flatten())
+        .filter(|r| r.status == Some(ReleaseStatus::Official))
+        .collect();
+    let group_title = group.title.to_lowercase();
+    (official.iter())
+        .find(|r| r.title.to_lowercase() == group_title)
+        .or(official.first())
+        .copied()
 }
 
 /// Fetches a release (album) by its ID and returns it with its full tracklist.
@@ -1238,6 +1246,36 @@ mod tests {
                 .release_types,
             None
         );
+    }
+
+    /// GET https://musicbrainz.org/ws/2/release-group?query=releasegroup:%22Bigger%20Than%20All%20of%20Us%22%20AND%20artist:%22Above%20%26%20Beyond%22&inc=releases&limit=5&fmt=json,
+    /// fetched 2026-11-21, its first release group with the artist's aliases and the tags left out.
+    const RELEASE_GROUP: &str = r#"{"id":"58a8a8d6-3738-4339-b104-43bb75785dda","type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","score":100,"primary-type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","artist-credit-id":"ed3cc697-caa6-332d-bd10-789f9fd471b5","count":6,"title":"Bigger Than All of Us","first-release-date":"2025-07-18","primary-type":"Album","artist-credit":[{"name":"Above & Beyond","artist":{"id":"370bd5a3-4abf-4356-8576-3a8fc0c11d65","name":"Above & Beyond","sort-name":"Above & Beyond"}}],"releases":[{"id":"cf554d3c-52be-4609-8f87-ea7fb47a82fe","title":"Bigger Than All of Us"},{"id":"032e6446-2867-4ebe-b2d2-0a96ee460cd8","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us (extended mixes)","status":"Official"},{"id":"cfe38b07-2375-43ee-81eb-09cc1e4beb1e","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us (album & extended mixes)","status":"Official"},{"id":"e6f0e965-99cb-47ab-8ccd-616a11ce83e3","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"},{"id":"c44a58b2-025d-4835-bcd2-a8affc598d5d","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"},{"id":"14e4d22e-d686-4957-bb97-b686ec6459d2","status-id":"4e304316-386d-3409-af2e-78857eec5cfe","title":"Bigger Than All of Us","status":"Official"}]}"#;
+
+    /// Issue #93: the search showed the extended mixes release (11 tracks), the
+    /// first official one listed, for the album.
+    #[test]
+    fn an_album_search_shows_the_official_release_titled_as_its_group() {
+        let group: ReleaseGroup = serde_json::from_str(RELEASE_GROUP).unwrap();
+        assert_eq!(
+            album_release(&group).map(|r| r.id.as_str()),
+            Some("e6f0e965-99cb-47ab-8ccd-616a11ce83e3")
+        );
+
+        let mut others: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+        others["title"] = "Bigger Than All of Us: The Remixes".into();
+        let others: ReleaseGroup = serde_json::from_value(others).unwrap();
+        assert_eq!(
+            album_release(&others).map(|r| r.id.as_str()),
+            Some("032e6446-2867-4ebe-b2d2-0a96ee460cd8")
+        );
+
+        // Only the release that has no status.
+        let mut unofficial: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+        let first = unofficial["releases"][0].clone();
+        unofficial["releases"] = serde_json::json!([first]);
+        let unofficial: ReleaseGroup = serde_json::from_value(unofficial).unwrap();
+        assert!(album_release(&unofficial).is_none());
     }
 
     #[test]

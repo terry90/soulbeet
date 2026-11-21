@@ -1,0 +1,44 @@
+[
+  {
+    "fileCount": 3,
+    "files": [
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@kqzbm\\Music\\Marrow Choir\\Winter Songs (Deluxe Edition)\\Disc 1\\03 - O Holy Night.flac",
+        "isLocked": false,
+        "length": 263,
+        "sampleRate": 44100,
+        "size": 29565671
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@kqzbm\\Music\\Marrow Choir\\Winter Songs (Deluxe Edition)\\Disc 1\\04 - Silent Night.flac",
+        "isLocked": false,
+        "length": 149,
+        "sampleRate": 44100,
+        "size": 16750133
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@kqzbm\\Music\\Marrow Choir\\Winter Songs (Deluxe Edition)\\Disc 2\\03 - O Holy Night.flac",
+        "isLocked": false,
+        "length": 301,
+        "sampleRate": 44100,
+        "size": 33837517
+      }
+    ],
+    "hasFreeUploadSlot": true,
+    "lockedFileCount": 0,
+    "lockedFiles": [],
+    "queueLength": 0,
+    "token": 52742,
+    "uploadSpeed": 2621440,
+    "username": "carol_shares"
+  }
+]

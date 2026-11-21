@@ -1,0 +1,71 @@
+[
+  {
+    "fileCount": 6,
+    "files": [
+      {
+        "code": 1,
+        "extension": "jpg",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\cover.jpg",
+        "isLocked": false,
+        "size": 412886
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\CD1\\01 - Stepping In.flac",
+        "isLocked": false,
+        "length": 248,
+        "sampleRate": 44100,
+        "size": 27879416
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\CD1\\02 - Start a Fire.flac",
+        "isLocked": false,
+        "length": 229,
+        "sampleRate": 44100,
+        "size": 25743493
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\CD1\\03 - Carry Me Home.flac",
+        "isLocked": false,
+        "length": 256,
+        "sampleRate": 44100,
+        "size": 28778752
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\CD2\\01 - Start a Fire (Extended Mix).flac",
+        "isLocked": false,
+        "length": 333,
+        "sampleRate": 44100,
+        "size": 37434861
+      },
+      {
+        "bitDepth": 16,
+        "code": 1,
+        "extension": "flac",
+        "filename": "@@lq4ve\\Music\\Above & Beyond\\Above & Beyond - Bigger Than All of Us (2026) [FLAC]\\CD2\\02 - Carry Me Home (Extended Mix).flac",
+        "isLocked": false,
+        "length": 378,
+        "sampleRate": 44100,
+        "size": 42493626
+      }
+    ],
+    "hasFreeUploadSlot": true,
+    "lockedFileCount": 0,
+    "lockedFiles": [],
+    "queueLength": 0,
+    "token": 52741,
+    "uploadSpeed": 2621440,
+    "username": "mira_flac"
+  }
+]
