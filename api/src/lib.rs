@@ -15,6 +15,8 @@ pub mod db;
 pub mod folder_policy;
 pub mod globals;
 #[cfg(feature = "server")]
+pub mod healthz;
+#[cfg(feature = "server")]
 pub mod import_queue;
 #[cfg(feature = "server")]
 pub mod importer_health;
