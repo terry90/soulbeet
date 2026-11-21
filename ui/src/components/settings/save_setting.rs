@@ -6,16 +6,48 @@ use std::str::FromStr;
 use api::{UpdateUserSettings, UserSettings};
 use dioxus::prelude::*;
 
-/// Saves a change made in a settings input, so the inputs then show what the server holds: the
-/// saved settings, or after a refusal the stored ones loaded again, with the reason in `error`.
-/// A change that could not be read (`Err`) is not sent.
-pub(super) async fn save_setting<F>(
+/// Where a settings panel's inputs save: `stored` holds the settings the panel loaded, `error`
+/// shows why a save failed.
+#[derive(Clone, Copy)]
+pub(super) struct SettingSaver {
+    pub(super) stored: Resource<Result<UserSettings, ServerFnError>>,
+    pub(super) error: Signal<String>,
+}
+
+impl SettingSaver {
+    /// save_setting with the server's own save and load.
+    pub(super) async fn save(
+        self,
+        change: Result<UpdateUserSettings, String>,
+        show: impl FnOnce(&UserSettings),
+    ) {
+        save_setting(
+            self.stored,
+            self.error,
+            change,
+            api::update_user_settings,
+            api::get_user_settings,
+            show,
+        )
+        .await
+    }
+}
+
+/// Saves a change made in one settings input, then has `show` put what the server holds into
+/// that input only: the saved settings, or after a refusal the stored ones loaded again, with the
+/// reason in `error`. Only that input is refilled, so a reply never overwrites another field the
+/// user is typing in. When the stored settings cannot be loaded, `stored` takes that error and
+/// the panel shows its load error. A change that could not be read (`Err`) is not sent.
+pub(super) async fn save_setting<S, L>(
     mut stored: Resource<Result<UserSettings, ServerFnError>>,
     mut error: Signal<String>,
     change: Result<UpdateUserSettings, String>,
-    save: impl FnOnce(UpdateUserSettings) -> F,
+    save: impl FnOnce(UpdateUserSettings) -> S,
+    load: impl FnOnce() -> L,
+    show: impl FnOnce(&UserSettings),
 ) where
-    F: Future<Output = Result<UserSettings, ServerFnError>>,
+    S: Future<Output = Result<UserSettings, ServerFnError>>,
+    L: Future<Output = Result<UserSettings, ServerFnError>>,
 {
     let saved = match change {
         Ok(change) => save(change).await.map_err(|e| crate::friendly_error(&e)),
@@ -24,11 +56,14 @@ pub(super) async fn save_setting<F>(
     match saved {
         Ok(settings) => {
             error.set(String::new());
-            stored.set(Some(Ok(settings)));
+            show(&settings);
         }
         Err(why) => {
             error.set(why);
-            stored.restart();
+            match load().await {
+                Ok(settings) => show(&settings),
+                Err(e) => stored.set(Some(Err(e))),
+            }
         }
     }
 }
@@ -51,9 +86,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
     use super::*;
     use crate::components::simple::ToggleDriver;
 
@@ -68,59 +100,84 @@ mod tests {
     enum Server {
         Saves,
         Refuses,
+        RefusesAndCannotLoad,
     }
 
-    /// A promote threshold field where a click types `typed` and saves it. The server holds 3 on
-    /// the first load and 4 on every later one, as if another tab changed it, so a reload shows.
+    /// A promote threshold field where a click types `typed` and saves it, next to another field
+    /// the user is typing in meanwhile. The panel loaded 3; a later load finds 4, as if another
+    /// tab changed it, so a reload shows.
     fn threshold_field(typed: &'static str, server: Server) -> ToggleDriver {
         ToggleDriver::new(VirtualDom::new_with_props(
             |(typed, server): (&'static str, Server)| {
-                let loads = use_hook(|| Rc::new(Cell::new(0u8)));
-                let stored = use_resource(move || {
-                    let loads = loads.clone();
-                    async move {
-                        loads.set(loads.get() + 1);
-                        Ok::<_, ServerFnError>(settings(2 + loads.get().min(2)))
-                    }
-                });
+                let stored = use_resource(|| async { Ok::<_, ServerFnError>(settings(3)) });
                 let error = use_signal(|| "an old error".to_string());
                 let mut shown = use_signal(String::new);
+                let mut other = use_signal(String::new);
                 let mut asked = use_signal(|| false);
                 use_effect(move || {
                     if let Some(Ok(s)) = &*stored.read() {
                         shown.set(s.discovery_promote_threshold.to_string());
+                        other.set(s.discovery_promote_threshold.to_string());
                     }
                 });
+                let loaded = match &*stored.read() {
+                    Some(Ok(s)) => s.discovery_promote_threshold.to_string(),
+                    Some(Err(_)) => "a load error".to_string(),
+                    None => "loading".to_string(),
+                };
                 rsx! {
                     button {
                         onclick: move |_| {
                             shown.set(typed.to_string());
+                            other.set("being typed".to_string());
                             let change = typed_number(typed, "The threshold", 1..=5u8).map(|n| {
                                 UpdateUserSettings {
                                     discovery_promote_threshold: Some(n),
                                     ..Default::default()
                                 }
                             });
-                            save_setting(stored, error, change, move |update| {
-                                asked.set(true);
-                                async move {
-                                    match server {
-                                        Server::Saves => Ok(settings(
-                                            update.discovery_promote_threshold.unwrap_or_default(),
-                                        )),
-                                        Server::Refuses => Err(ServerFnError::ServerError {
-                                            message: "Folder not found".into(),
-                                            code: api::REFUSAL_CODE,
-                                            details: None,
-                                        }),
+                            save_setting(
+                                stored,
+                                error,
+                                change,
+                                move |update| {
+                                    asked.set(true);
+                                    async move {
+                                        match server {
+                                            Server::Saves => Ok(settings(
+                                                update.discovery_promote_threshold.unwrap_or_default(),
+                                            )),
+                                            Server::Refuses | Server::RefusesAndCannotLoad => {
+                                                Err(ServerFnError::ServerError {
+                                                    message: "Folder not found".into(),
+                                                    code: api::REFUSAL_CODE,
+                                                    details: None,
+                                                })
+                                            }
+                                        }
                                     }
-                                }
-                            })
+                                },
+                                move || async move {
+                                    match server {
+                                        Server::RefusesAndCannotLoad => {
+                                            Err(ServerFnError::ServerError {
+                                                message: "Database is locked".into(),
+                                                code: 500,
+                                                details: None,
+                                            })
+                                        }
+                                        Server::Saves | Server::Refuses => Ok(settings(4)),
+                                    }
+                                },
+                                move |s| shown.set(s.discovery_promote_threshold.to_string()),
+                            )
                         },
                     }
                     p { "shown={shown}" }
+                    p { "other={other}" }
                     p { "error={error}" }
                     p { "asked={asked}" }
+                    p { "stored={loaded}" }
                 }
             },
             (typed, server),
@@ -134,6 +191,7 @@ mod tests {
         let html = field.html();
         assert!(html.contains("shown=5"), "{html}");
         assert!(!html.contains("an old error"), "{html}");
+        assert!(html.contains("other=being typed"), "{html}");
     }
 
     #[test]
@@ -142,6 +200,16 @@ mod tests {
         field.click();
         let html = field.html();
         assert!(html.contains("shown=4"), "{html}");
+        assert!(html.contains("error=Folder not found"), "{html}");
+        assert!(html.contains("other=being typed"), "{html}");
+    }
+
+    #[test]
+    fn a_refusal_whose_reload_fails_shows_the_load_error() {
+        let mut field = threshold_field("5", Server::RefusesAndCannotLoad);
+        field.click();
+        let html = field.html();
+        assert!(html.contains("stored=a load error"), "{html}");
         assert!(html.contains("error=Folder not found"), "{html}");
     }
 
@@ -162,9 +230,9 @@ mod tests {
 
     #[test]
     fn typed_numbers_are_read_inside_their_range() {
-        assert_eq!(typed_number(" 7 ", "The count", 1..=50u32), Ok(7));
+        assert_eq!(typed_number(" 7 ", "The count", 1..=50i64), Ok(7));
         assert_eq!(
-            typed_number("51", "The count", 1..=50u32),
+            typed_number("51", "The count", 1..=50i64),
             Err("The count must be a whole number from 1 to 50".to_string())
         );
     }

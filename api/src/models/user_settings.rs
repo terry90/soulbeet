@@ -1,6 +1,16 @@
 #[cfg(feature = "server")]
 use crate::db::DB;
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
+
+// The bounds the server holds the discovery numbers to, shared with the Settings inputs so both
+// sides refuse the same values.
+/// The track count each discovery profile may have.
+pub const TRACK_COUNTS: RangeInclusive<i64> = 1..=50;
+/// The days a discovery profile's tracks may wait for a rating.
+pub const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
+/// The rating at which the rating sync promotes a pending discovery track.
+pub const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
