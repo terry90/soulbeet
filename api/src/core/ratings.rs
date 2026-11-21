@@ -18,7 +18,9 @@ use crate::core::delete_guard::paths::NO_LIBRARY_ROOT;
 use crate::core::delete_guard::staging::{remove_staged_in, StagedOutcome};
 use crate::core::delete_guard::{paths, pending_track_of, song_not_found};
 use crate::core::delete_guard::{ForgetVia, Guard, NotRemoved, Origin, Verdict};
-use crate::core::discovery::{is_not_pending, promote, DiscoveryEffects, NotDone, Replace};
+use crate::core::discovery::{
+    is_not_pending, promote, promote_file_gone, DiscoveryEffects, NotDone, Replace,
+};
 use crate::core::folders::folder_not_found;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::library::{album_not_found, navidrome_failure, navidrome_for};
@@ -314,25 +316,39 @@ fn write_failure(target: &Target, e: &NavidromeError) -> Failure {
     }
 }
 
+/// What pending_songs told of the songs the sync acts on.
+pub(crate) struct PendingSongs<'p> {
+    /// The pending track each song is, keyed by song id.
+    pub found: HashMap<String, &'p DiscoveryTrack>,
+    /// The ids of the pending tracks that a song at the promote threshold or above may be, when
+    /// its record or file could not be read: those whose staged file has its size, or all when
+    /// search3 gave none.
+    pub untold: HashSet<String>,
+}
+
 /// The pending track of `pending` each song of `songs` is, for the songs whose rating the sync
-/// acts on (at `promote_threshold` or above, or 1), keyed by song id: told as the guard tells it
+/// acts on (at `promote_threshold` or above, or 1): told as the guard tells it
 /// (pending_track_of), by the track's song id, else by `actor`'s native record of the song naming
 /// the track's staged file. A song whose size no staged file has cannot be one, so its record is
-/// not read. A song whose record or file cannot be read is none: the sync leaves it.
+/// not read. A song whose record or file cannot be read is none: the sync leaves it, and at the
+/// promote threshold or above the tracks it may be are `untold`.
 pub(crate) async fn pending_songs<'p>(
     guard: &Guard<'_>,
     actor: &UserId,
     songs: &[SubsonicSong],
     pending: &'p [DiscoveryTrack],
     promote_threshold: u8,
-) -> HashMap<String, &'p DiscoveryTrack> {
-    let mut staged_sizes = HashSet::new();
+) -> PendingSongs<'p> {
+    let mut staged_sizes = HashMap::new();
     for track in pending {
         if let Ok(meta) = tokio::fs::metadata(&track.path).await {
-            staged_sizes.insert(meta.len());
+            staged_sizes.insert(track.id.as_str(), meta.len());
         }
     }
-    let mut found = HashMap::new();
+    let mut told = PendingSongs {
+        found: HashMap::new(),
+        untold: HashSet::new(),
+    };
     for song in songs {
         let acted_on = song
             .user_rating
@@ -344,37 +360,45 @@ pub(crate) async fn pending_songs<'p>(
             .iter()
             .find(|t| t.song_id.as_ref() == Some(&song.id))
         {
-            found.insert(song.id.clone(), track);
+            told.found.insert(song.id.clone(), track);
             continue;
         }
-        if song.size.is_some_and(|size| !staged_sizes.contains(&size)) {
+        if song
+            .size
+            .is_some_and(|size| !staged_sizes.values().any(|s| *s == size))
+        {
             continue;
         }
-        let native = match guard.read_song(actor, &song.id).await {
-            Ok(Some(native)) => native,
+        let read = match guard.read_song(actor, &song.id).await {
+            Ok(Some(native)) => {
+                pending_track_of(guard.db, guard.music_path, actor, &native, pending).await
+            }
             Ok(None) => continue,
+            Err(f) => Err(f),
+        };
+        match read {
+            Ok(Some(track)) => {
+                told.found.insert(song.id.clone(), track);
+            }
+            Ok(None) => {}
             Err(f) => {
                 info!(
                     "Could not tell whether {} is a pending discovery track: {}",
                     song.title,
                     logged(&f)
                 );
-                continue;
+                // The owner may have rated one of these to keep it: expiry must not take it.
+                if song.user_rating.is_some_and(|r| r >= promote_threshold) {
+                    let may_be = (pending.iter()).filter(|t| match song.size {
+                        Some(size) => staged_sizes.get(t.id.as_str()) == Some(&size),
+                        None => true,
+                    });
+                    told.untold.extend(may_be.map(|t| t.id.clone()));
+                }
             }
-        };
-        match pending_track_of(guard.db, guard.music_path, actor, &native, pending).await {
-            Ok(Some(track)) => {
-                found.insert(song.id.clone(), track);
-            }
-            Ok(None) => {}
-            Err(f) => info!(
-                "Could not tell whether {} is a pending discovery track: {}",
-                song.title,
-                logged(&f)
-            ),
         }
     }
-    found
+    told
 }
 
 /// What the rating sync does with a pending discovery track the user rated.
@@ -481,6 +505,11 @@ pub(crate) struct SyncReport {
     /// Why Settings does not list the kept tracks: replace_in failed, so it still lists the
     /// previous sync's. None when they were stored, or auto-delete did not run.
     pub kept_not_stored: Option<Failure>,
+    /// The ids of the discovery folder's pending tracks this sync read and found not rated at
+    /// the promote threshold or above, and not `untold` by pending_songs: the only ones expiry may
+    /// delete after it. A track it found so rated is not one, whatever its promote did, unless the
+    /// promote found its file gone.
+    pub expirable: HashSet<String>,
 }
 
 impl SyncReport {
@@ -560,7 +589,8 @@ pub(crate) struct SyncDeps<'a> {
 /// `Replace::Never`, so no library copy is replaced either. Every failure comes before any
 /// action; a failure of an action is its track's entry, and a failure to store the kept tracks
 /// is `kept_not_stored`. Entries in that order. A pending track another promote or removal took
-/// first is no entry: it is counted in `not_pending`.
+/// first is no entry: it is counted in `not_pending`. The report names the tracks expiry may
+/// delete after it (`expirable`).
 pub(crate) async fn sync_in(
     deps: &SyncDeps<'_>,
     ctx: &UserCtx,
@@ -580,7 +610,14 @@ pub(crate) async fn sync_in(
         }
         None => vec![],
     };
-    let pending = pending_songs(deps.guard, &user, &songs, &tracks_of_folder, threshold).await;
+    let PendingSongs {
+        found: pending,
+        untold,
+    } = pending_songs(deps.guard, &user, &songs, &tracks_of_folder, threshold).await;
+    let mut expirable: HashSet<String> = (tracks_of_folder.iter())
+        .map(|t| t.id.clone())
+        .filter(|id| !untold.contains(id))
+        .collect();
 
     let mut tracks = remove_disliked_pending_in(deps.db, &songs, &pending, threshold).await;
     let origin = match &permit {
@@ -601,6 +638,11 @@ pub(crate) async fn sync_in(
                 }
                 Err(e) => warn!("Failed to promote track {}: {}", track.title, e.message),
                 Ok(_) => {}
+            }
+            // The owner rated it to keep, so a promote that failed leaves it for the next sync.
+            // A file already gone holds nothing to keep, and expiry ends its track.
+            if result.as_ref().err() != Some(&promote_file_gone()) {
+                expirable.remove(&track.id);
             }
             let entry = SyncedTrack::of(song, SyncAction::Promote, Some(track));
             tracks.push(entry.with_failure(result.err()));
@@ -645,6 +687,7 @@ pub(crate) async fn sync_in(
         not_pending,
         kept,
         kept_not_stored,
+        expirable,
     };
     let c = report.counts();
     info!(
@@ -875,7 +918,6 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::blocked_by_other_user;
     use crate::core::delete_guard::test_support::Library;
-    use crate::core::discovery::promote_file_gone;
     use crate::core::discovery::test_support::TestDiscovery;
     use crate::core::test_ctx;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
@@ -1270,7 +1312,9 @@ mod tests {
             rated("s8", 3, 5),
         ];
         let pending = std::slice::from_ref(&track);
-        let found = pending_songs(&lib.guard(), &lib.alice(), &songs, pending, 4).await;
+        let found = pending_songs(&lib.guard(), &lib.alice(), &songs, pending, 4)
+            .await
+            .found;
         assert_eq!(
             found
                 .iter()
@@ -1285,7 +1329,9 @@ mod tests {
             ..track.clone()
         };
         let tracks = [by_id];
-        let found = pending_songs(&lib.guard(), &lib.alice(), &songs[1..2], &tracks, 4).await;
+        let found = pending_songs(&lib.guard(), &lib.alice(), &songs[1..2], &tracks, 4)
+            .await
+            .found;
         assert_eq!(found.keys().collect::<Vec<_>>(), ["s6"]);
         assert_eq!(lib.fake.reads_by("alice"), 2);
     }
@@ -1555,7 +1601,9 @@ mod tests {
         };
         let songs = std::slice::from_ref(&song);
         let tracks = vec![track];
-        let pending = pending_songs(&lib.guard(), &lib.alice(), songs, &tracks, 3).await;
+        let pending = pending_songs(&lib.guard(), &lib.alice(), songs, &tracks, 3)
+            .await
+            .found;
         assert!(
             matches!(pending_action(&song, &pending, 1), Some(PendingAction::Promote(t)) if t.id == "t1")
         );
@@ -2114,6 +2162,101 @@ mod tests {
         );
         assert_eq!(report.tracks[0].failure, Some(promote_file_gone()));
         assert_eq!(lib.track_status("t1").await, "Pending");
+    }
+
+    #[tokio::test]
+    async fn expiry_after_a_sync_takes_no_track_the_owner_rated_to_keep() {
+        let lib = Library::new().await;
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-music".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let explore = lib.root.join("music/alice/Discovery/Explore");
+        std::fs::create_dir_all(&explore).unwrap();
+        let (kept, gone, low, untold) = (
+            explore.join("03.flac"),
+            explore.join("04.flac"),
+            explore.join("05.flac"),
+            explore.join("06.flac"),
+        );
+        // Sizes other than the unreadable song's, so only t4 may be that song.
+        std::fs::write(&kept, b"kept audio").unwrap();
+        std::fs::write(&low, b"other audio").unwrap();
+        std::fs::write(&untold, b"audio").unwrap();
+        // t1 rated 5, its import fails; t2 rated 5, its file is gone; t3 rated 2; t4 has no
+        // song id, and the 5-star song of its size cannot be read.
+        for (id, path, song) in [
+            ("t1", &kept, Some("s5")),
+            ("t2", &gone, Some("s6")),
+            ("t3", &low, Some("s7")),
+            ("t4", &untold, None),
+        ] {
+            lib.pending_track(id, "alice-music", "Explore", path, song)
+                .await;
+        }
+        let mut body: serde_json::Value = serde_json::from_str(&search3_body(&[
+            ("s5", "O Holy Night", 5),
+            ("s6", "Silent Night", 5),
+            ("s7", "Away in a Manger", 2),
+            ("s8", "The Holly and the Ivy", 5),
+        ]))
+        .unwrap();
+        body["subsonic-response"]["searchResult3"]["song"][3]["size"] = serde_json::json!(5);
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/search3", &[&body.to_string()]);
+        lib.fake.unreadable("alice", || {
+            NavidromeLookupError::Client(NavidromeError::CircuitOpen)
+        });
+        let test = Arc::new(TestDiscovery::default());
+        test.fail_imports(Failure::new(
+            FailureCode::ImportBeetsFailed,
+            Stage::Import,
+            RetryAdvice::SameSourceLater,
+            "beets stopped",
+        ));
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            test.clone() as Arc<dyn DiscoveryEffects>,
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.expirable,
+            HashSet::from(["t2".to_string(), "t3".to_string()])
+        );
+
+        let folder = Folder::get_by_id_in(&lib.db, "alice-music")
+            .await
+            .unwrap()
+            .unwrap();
+        let later = chrono::Utc::now() + chrono::Duration::days(8);
+        let expired = crate::core::discovery::expire_in(
+            &lib.db,
+            &folder,
+            &HashMap::new(),
+            later,
+            &report.expirable,
+        )
+        .await;
+        assert_eq!(expired, Ok(2));
+        for (id, status) in [
+            ("t1", "Pending"),
+            ("t2", "Removed"),
+            ("t3", "Removed"),
+            ("t4", "Pending"),
+        ] {
+            assert_eq!(lib.track_status(id).await, status, "{id}");
+        }
+        assert!(kept.exists() && untold.exists() && !low.exists());
     }
 
     #[tokio::test]

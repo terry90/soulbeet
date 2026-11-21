@@ -1,7 +1,7 @@
 //! Discovery for one user: its runs, its pending tracks and their expiry, and keeping or
 //! removing a pending track. The web UI's server functions and the MCP tools call the same code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,11 +14,13 @@ use shared::navidrome::{
 };
 use shared::recommendation::DiscoveryProfile;
 use sqlx::SqlitePool;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::database_failure;
-use crate::core::delete_guard::staging::{claim_removal_in, remove_claimed_in, StagedOutcome};
+use crate::core::delete_guard::staging::{
+    claim_removal_in, remove_claimed_in, remove_staged_in, StagedOutcome,
+};
 use crate::core::delete_guard::Origin;
 use crate::core::folders::folder_not_found;
 use crate::models::discovery_history::DiscoveryHistoryRow;
@@ -203,6 +205,46 @@ pub(crate) fn expires_at(
 /// `profile`'s lifetime in days in `lifetime_days`, 7 when it has none.
 pub(crate) fn lifetime_of(lifetime_days: &HashMap<String, u32>, profile: &str) -> u32 {
     lifetime_days.get(profile).copied().unwrap_or(7)
+}
+
+/// Removes, as expired (remove_staged_in), each pending track of `folder` in `expirable` whose
+/// expires_at is at or before `now`. `expirable` is what the cycle's rating sync found not rated
+/// to keep (SyncReport::expirable): any other track waits for a sync that tells. A track that
+/// cannot be removed is logged and stays. The number expired.
+pub(crate) async fn expire_in(
+    db: &SqlitePool,
+    folder: &Folder,
+    lifetime_days: &HashMap<String, u32>,
+    now: DateTime<Utc>,
+    expirable: &HashSet<String>,
+) -> Result<u32, String> {
+    let pending = DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id).await?;
+    let mut expired = 0;
+    for track in &pending {
+        if !expirable.contains(&track.id) {
+            continue;
+        }
+        let Some(expires) = expires_at(track, lifetime_days) else {
+            continue;
+        };
+        if now < expires {
+            continue;
+        }
+        match remove_staged_in(db, track, folder, StagedOutcome::Expired).await {
+            Ok(()) => expired += 1,
+            Err(f) if is_not_pending(&f) => debug!(
+                "{} of user {} is no longer pending, so it does not expire",
+                track.title, folder.user_id
+            ),
+            Err(f) => warn!(
+                "Could not expire {} for user {}: {}",
+                track.title,
+                folder.user_id,
+                crate::core::logged(&f)
+            ),
+        }
+    }
+    Ok(expired)
 }
 
 /// Checks that `ctx` can start a run (discovery on, a discovery folder chosen), claims it on
@@ -907,6 +949,47 @@ mod tests {
             assert!(staged.exists());
             assert_ne!(lib.history_outcome("t1").await, "removed");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_track_the_sync_found_expirable_expires_and_only_past_its_lifetime() {
+        let lib = Library::new().await;
+        let mut staged = vec![];
+        for (id, name) in [("t1", "03.flac"), ("t2", "04.flac")] {
+            let path = lib.root.join("music/alice/Discovery/Explore").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"audio").unwrap();
+            lib.pending_track(id, "alice-music", "Explore", &path, None)
+                .await;
+            staged.push(path);
+        }
+        let folder = Folder::get_by_id_in(&lib.db, "alice-music")
+            .await
+            .unwrap()
+            .unwrap();
+        // t2 is one the sync found rated to keep, or could not tell.
+        let expirable = HashSet::from(["t1".to_string()]);
+        let lifetimes = HashMap::new();
+        assert_eq!(
+            expire_in(&lib.db, &folder, &lifetimes, Utc::now(), &expirable).await,
+            Ok(0)
+        );
+        assert!(staged[0].exists());
+        let later = Utc::now() + Duration::days(8);
+        assert_eq!(
+            expire_in(&lib.db, &folder, &lifetimes, later, &expirable).await,
+            Ok(1)
+        );
+        assert_eq!(
+            (
+                lib.track_status("t1").await,
+                lib.history_outcome("t1").await
+            ),
+            ("Removed".into(), "expired".into())
+        );
+        assert!(!staged[0].exists());
+        assert_eq!(lib.track_status("t2").await, "Pending");
+        assert!(staged[1].exists());
     }
 
     #[tokio::test]
