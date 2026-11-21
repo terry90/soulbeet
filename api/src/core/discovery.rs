@@ -13,16 +13,21 @@ use shared::navidrome::{
     ProfileProgress,
 };
 use shared::recommendation::DiscoveryProfile;
+use soulbeet::navidrome::NavidromeClient;
+use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::database_failure;
+use crate::core::delete_guard::paths;
 use crate::core::delete_guard::staging::{
     claim_removal_in, remove_claimed_in, remove_staged_in, StagedOutcome,
 };
 use crate::core::delete_guard::Origin;
 use crate::core::folders::folder_not_found;
+use crate::core::index::library_songs;
+use crate::core::library::{known_roots_in, navidrome_failure, place_in, NavidromePlace};
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::engine_report::EngineReportRow;
@@ -537,6 +542,60 @@ pub(crate) async fn remove_in(
     })
 }
 
+/// Where `folder`'s Discovery folder is in Navidrome (place_in over the known roots). When no
+/// known root holds it, the folder's pending tracks teach one as Navidrome lists them, the way
+/// an import's index wait learns a root (index::listed), until a root holds the folder. None
+/// when none does: Navidrome's paths of the folder's songs are then unknown.
+pub(crate) async fn discovery_place_in(
+    db: &SqlitePool,
+    navi: &NavidromeClient,
+    music_path: Option<&Path>,
+    folder: &Folder,
+) -> Result<Option<NavidromePlace>, Failure> {
+    let discovery = PathBuf::from(folder.discovery_path());
+    if let Some(place) = place_in(&discovery, &known_roots_in(db, music_path).await?) {
+        return Ok(Some(place));
+    }
+    let library = Path::new(&folder.path);
+    let tracks = DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id)
+        .await
+        .map_err(|e| database_failure(Stage::Playlist, e))?;
+    for track in tracks {
+        let local = PathBuf::from(&track.path);
+        let Ok(path) = local.strip_prefix(library) else {
+            continue;
+        };
+        let item = ImportedItem {
+            path: path.to_path_buf(),
+            recording_mbid: None,
+            artist: track.artist,
+            title: track.title,
+            album: track.album,
+            beets_id: None,
+            release_mbid: None,
+            match_per_mille: None,
+        };
+        let found = library_songs(navi, library, &item)
+            .await
+            .map_err(|e| navidrome_failure(Stage::Playlist, &e))?;
+        match paths::learn_in(db, &found, &local).await {
+            Ok(learned) if learned.is_empty() => continue,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "Could not learn where Navidrome's libraries are on this machine from {}: {e}",
+                    local.display()
+                );
+                continue;
+            }
+        }
+        if let Some(place) = place_in(&discovery, &known_roots_in(db, music_path).await?) {
+            return Ok(Some(place));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::HashMap;
@@ -630,6 +689,7 @@ mod tests {
     use crate::core::delete_guard::test_support::Library;
     use crate::core::test_ctx;
     use crate::models::user_settings::{UpdateUserSettings, UserSettings};
+    use crate::test_navidrome::NavidromeStub;
 
     #[test]
     fn a_track_expires_its_profiles_lifetime_after_it_was_made() {
@@ -855,6 +915,100 @@ mod tests {
             start_in(&lib.db, &effects, &ctx).await.unwrap_err().message,
             "Discovery generation already in progress"
         );
+    }
+
+    /// The native `GET /api/song` answer of one song of library 1 (at /navidrome/music, which
+    /// is no folder here) at `path`, 5 bytes, modified at mtime() as the test files are.
+    fn listed_song(path: &str) -> String {
+        format!(
+            r#"[{{"id":"f2c4d1a8b0e94c37a6d5e8b1c2a3f405","libraryId":1,"libraryPath":"/navidrome/music","path":"{path}",
+        "title":"t1","album":"Winter Songs","artist":"Marrow Choir","albumArtist":"Marrow Choir","size":5,"suffix":"flac","missing":false,
+        "updatedAt":"2026-11-15T10:01:30.123456789Z"}}]"#
+        )
+    }
+
+    async fn folder(lib: &Library, id: &str) -> Folder {
+        Folder::get_by_id_in(&lib.db, id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn each_users_discovery_folder_is_placed_in_the_library_a_listed_track_teaches() {
+        let lib = Library::new().await;
+        lib.write("alice/Discovery/Balanced/Marrow Choir/03.flac", b"audio");
+        let staged = lib
+            .root
+            .join("music/alice/Discovery/Balanced/Marrow Choir/03.flac");
+        lib.pending_track("t1", "alice-music", "Balanced", &staged, None)
+            .await;
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/api/song",
+            &[&listed_song(
+                "alice/Discovery/Balanced/Marrow Choir/03.flac",
+            )],
+        );
+        let alice = folder(&lib, "alice-music").await;
+        let alice = discovery_place_in(&lib.db, &navi.client(), None, &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            alice,
+            NavidromePlace {
+                library_id: 1,
+                path: "alice/Discovery".into()
+            }
+        );
+        assert_eq!(
+            alice.child("Balanced").song_prefix(),
+            "alice/Discovery/Balanced/"
+        );
+        let asked = navi.asked().len();
+
+        // bob's folder is in the root alice's track taught, so Navidrome is not asked again.
+        let bob = folder(&lib, "bob-music").await;
+        let bob = discovery_place_in(&lib.db, &navi.client(), None, &bob)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bob.child("Balanced").song_prefix(),
+            "bob/Discovery/Balanced/"
+        );
+        assert_eq!(navi.asked().len(), asked);
+    }
+
+    #[tokio::test]
+    async fn a_discovery_folder_navidrome_lists_no_track_of_has_no_place() {
+        let lib = Library::new().await;
+        lib.write("alice/Discovery/Balanced/Marrow Choir/03.flac", b"audio");
+        let staged = lib
+            .root
+            .join("music/alice/Discovery/Balanced/Marrow Choir/03.flac");
+        lib.pending_track("t1", "alice-music", "Balanced", &staged, None)
+            .await;
+        let navi = NavidromeStub::start();
+        navi.answer("/api/song", &["[]"]);
+        let alice = folder(&lib, "alice-music").await;
+        assert_eq!(
+            discovery_place_in(&lib.db, &navi.client(), None, &alice)
+                .await
+                .unwrap(),
+            None
+        );
+        // NAVIDROME_MUSIC_PATH places it without asking Navidrome.
+        let asked = navi.asked().len();
+        let music = lib.root.join("music");
+        assert_eq!(
+            discovery_place_in(&lib.db, &navi.client(), Some(music.as_path()), &alice)
+                .await
+                .unwrap(),
+            Some(NavidromePlace {
+                library_id: 1,
+                path: "alice/Discovery".into()
+            })
+        );
+        assert_eq!(navi.asked().len(), asked);
     }
 
     fn staged_file(lib: &Library) -> PathBuf {

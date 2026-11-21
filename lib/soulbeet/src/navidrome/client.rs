@@ -689,12 +689,17 @@ impl NavidromeClient {
         Ok(resp)
     }
 
-    /// Create a smart playlist via Navidrome's native API.
+    /// Create a smart playlist via Navidrome's native API of the songs of library `library_id`
+    /// whose path below the library's root starts with `path_prefix`. Navidrome matches
+    /// `filepath` against media_file.path, which is relative to the library's root
+    /// (model/criteria/fields.go:37), and `startsWith` is `LIKE 'prefix%'`
+    /// (model/criteria/operators.go:166-180).
     pub async fn create_smart_playlist(
         &self,
         name: &str,
         comment: &str,
-        filepath_contains: &str,
+        library_id: i64,
+        path_prefix: &str,
     ) -> Result<String> {
         let url = self.base_url.join("api/playlist")?;
 
@@ -704,7 +709,9 @@ impl NavidromeClient {
             "public": false,
             "rules": {
                 "all": [
-                    { "contains": { "filepath": filepath_contains } }
+                    // Two libraries can hold the same relative path.
+                    { "is": { "library_id": library_id } },
+                    { "startsWith": { "filepath": path_prefix } }
                 ],
                 "sort": "-dateAdded",
                 "order": "desc"
@@ -748,37 +755,6 @@ impl NavidromeClient {
         }
 
         Ok(())
-    }
-
-    /// Query songs via the native API, filtered to a specific path prefix.
-    /// Returns up to `limit` songs whose path contains the given prefix.
-    /// The native API returns raw `media_file.path` values (relative to library root).
-    pub async fn get_songs_by_path_prefix(
-        &self,
-        prefix: &str,
-        limit: u32,
-    ) -> Result<Vec<NativeSong>> {
-        let url = self.base_url.join("api/song")?;
-
-        let resp = self
-            .native_request(self.client.get(url).query(&[
-                ("_start", "0".to_string()),
-                ("_end", limit.to_string()),
-                ("_sort", "path".to_string()),
-                ("_order", "ASC".to_string()),
-            ]))
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(native_failure("Get songs", resp).await);
-        }
-
-        let songs: Vec<NativeSong> = resp.json().await.map_err(parse)?;
-
-        Ok(songs
-            .into_iter()
-            .filter(|s| s.path.contains(prefix))
-            .collect())
     }
 
     /// Present songs (missing=false) the native `title` filter matches for `text`, ordered by id,
@@ -2091,7 +2067,7 @@ mod tests {
     /// model.Playlist as 0.64.2 marshals it (model/playlist.go:18-41).
     const NATIVE_PLAYLIST: &str = r#"{"id":"6vN2bQ8rT4yH1kL9mX3zPa","name":"Advent","comment":"","duration":263,"size":28734112,"songCount":1,"ownerName":"alice","ownerId":"8uY3tR6eW9qA2sD5fG8hJ1","public":false,"path":"","sync":false,"uploadedImage":"","createdAt":"2026-11-15T09:00:00.123456Z","updatedAt":"2026-11-15T09:00:04.5Z","rules":null,"evaluatedAt":null}"#;
     /// The rules create_smart_playlist sends, as Navidrome writes them back.
-    const SMART_RULES: &str = r#"{"all":[{"contains":{"filepath":"Discovery/Explore"}}],"sort":"-dateAdded","order":"desc"}"#;
+    const SMART_RULES: &str = r#"{"all":[{"is":{"library_id":1}},{"startsWith":{"filepath":"alice/Discovery/Explore/"}}],"sort":"-dateAdded","order":"desc"}"#;
 
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -2268,6 +2244,30 @@ mod tests {
         );
         assert!(!err.is_not_found());
         assert!(!c.delete_playlist("gone").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_smart_playlist_takes_the_songs_below_one_folder_of_one_library() {
+        let (url, seen) = serve(vec![reply(LOGIN), reply(format!(r#"{{"id":"{ADVENT}"}}"#))]);
+        let id = client(&url)
+            .create_smart_playlist(
+                "Discovery",
+                "Soulbeet discovery (Explore)",
+                1,
+                "alice/Discovery/Explore/",
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, ADVENT);
+        let sent = seen.lock().unwrap()[1].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("POST", "/api/playlist")
+        );
+        let body: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
+        let rules: serde_json::Value = serde_json::from_str(SMART_RULES).unwrap();
+        assert_eq!(body["rules"], rules);
+        assert_eq!(body["public"], false);
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ Discovery starts from the songs you played, starred or rated 4 or 5 stars in Nav
 
 - Discovery creates a `Discovery/` directory inside your chosen folder, with subdirectories per profile (e.g., `Discovery/Balanced/`, `Discovery/Adventurous/`).
 - Tracks are downloaded from Soulseek, imported via beets into the profile subdirectory, and tagged properly.
-- A smart playlist is created in Navidrome (via the native API) for each profile, filtered by the folder path. The playlist auto-updates as Navidrome scans new files.
+- A smart playlist is created in Navidrome (via the native API) for each profile. It holds the songs of your own `Discovery/<profile>/` folder only, by its path in Navidrome's library, so users who share one library each get their own tracks. To know that path Soulbeet needs the library's root: it learns it from an import, from one of your discovery tracks once Navidrome lists it, or from `NAVIDROME_MUSIC_PATH`. Until then no playlist is made. The playlist auto-updates as Navidrome scans new files.
 - Every 6 hours, an automation task syncs ratings, creates playlists if missing, and regenerates expired discovery batches. A pending track expires only when that cycle's rating sync read it and found it below your promote threshold: when the sync fails, or the promote of a track you rated fails, the track stays until a later cycle. Recommendations for the profiles you selected are refreshed on their own 6-hour cycle, only for users with discovery on and a discovery folder chosen. The cycle starts at a random point in the first 6 hours after Soulbeet starts.
 
 ## Auto-delete

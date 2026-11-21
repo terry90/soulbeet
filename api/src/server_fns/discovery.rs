@@ -1175,9 +1175,9 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
 
 /// Create or update smart playlists in Navidrome for each discovery profile.
 ///
-/// Uses Navidrome's native API to create smart playlists with a filepath rule
-/// that matches the Discovery/{profile}/ directory. The playlist auto-updates
-/// as Navidrome scans new files. Owned by the authenticated user.
+/// Uses Navidrome's native API to create smart playlists of the songs in this
+/// user's Discovery/{profile}/ directory, in its library. The playlist
+/// auto-updates as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
     let settings = UserSettings::get(user_id).await?;
@@ -1188,7 +1188,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         Some(id) => id.clone(),
         None => return Ok(()),
     };
-    Folder::get_by_id(&folder_id)
+    let folder = Folder::get_by_id(&folder_id)
         .await?
         .ok_or("Discovery folder not found")?;
 
@@ -1201,6 +1201,23 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
             );
             return Ok(());
         }
+    };
+
+    // Found before any playlist is deleted, so an unknown place keeps the old ones.
+    let discovery = crate::core::discovery::discovery_place_in(
+        &crate::db::DB,
+        &navi,
+        crate::config::CONFIG.navidrome_music_path(),
+        &folder,
+    )
+    .await
+    .map_err(|f| crate::core::logged(&f))?;
+    let Some(discovery) = discovery else {
+        info!(
+            "Playlist reconciliation skipped: no Navidrome library Soulbeet knows holds {}",
+            folder.discovery_path()
+        );
+        return Ok(());
     };
 
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
@@ -1221,38 +1238,12 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
             &profile_name,
         );
 
-        // Derive the Navidrome-relative path prefix by sampling a song from this profile's folder.
-        // The native API returns the raw media_file.path (relative to library root), which is what
-        // the filepath smart playlist operator matches against.
-        let profile_path = match navi.get_songs_by_path_prefix(&profile_name, 50).await {
-            Ok(songs) if !songs.is_empty() => {
-                // Extract the directory prefix from the first song's path.
-                // Song path looks like "Discovery/Balanced/Artist/Album/track.flac"
-                // or "staging/Discovery/Balanced/Artist/Album/track.flac"
-                // We want everything up to and including the profile name.
-                let song_path = &songs[0].path;
-                if let Some(idx) = song_path.find(&format!("{}/", profile_name)) {
-                    let end = idx + profile_name.len();
-                    song_path[..end].to_string()
-                } else {
-                    // Song matched but path doesn't contain profile name as a directory
-                    warn!(
-                        "Could not extract profile prefix from song path '{}', falling back to Discovery/{}",
-                        song_path, profile_name
-                    );
-                    format!("Discovery/{}", profile_name)
-                }
-            }
-            _ => {
-                // No songs imported yet (first run) or API error: use hardcoded default.
-                // This is correct because on first run the folder structure matches the default.
-                format!("Discovery/{}", profile_name)
-            }
-        };
+        let place = discovery.child(&profile_name);
+        let profile_path = place.song_prefix();
         let comment = format!("Soulbeet discovery ({})", profile_name);
 
         match navi
-            .create_smart_playlist(&playlist_name, &comment, &profile_path)
+            .create_smart_playlist(&playlist_name, &comment, place.library_id, &profile_path)
             .await
         {
             Ok(playlist_id) => {
