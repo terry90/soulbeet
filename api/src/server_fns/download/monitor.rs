@@ -43,7 +43,12 @@ const POLL_INTERVAL_SECS: u64 = 2;
 /// Grace period for downloads to appear in slskd (30 seconds = 15 * 2s intervals).
 const MAX_CONSECUTIVE_EMPTY: usize = 15;
 
-/// Per-track timeout duration (1 hour).
+/// How long a watched transfer may go without progress before the slot
+/// moves to another source (1 hour). Progress is bytes moved since the last
+/// poll, and waiting in its source's queue while that source sends this
+/// slskd another file: a peer sends one file at a time, so the last tracks
+/// of an album wait there for as long as the ones before them take, and a
+/// slow peer that keeps sending is never cut off.
 const PER_TRACK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// How long a transfer may wait in its source's own queue before the slot
@@ -154,7 +159,7 @@ fn disappeared() -> Failure {
     )
 }
 
-/// A slot that ran past `PER_TRACK_TIMEOUT` with no peer left.
+/// A slot that went `PER_TRACK_TIMEOUT` without progress with no peer left.
 fn per_track_timeout() -> Failure {
     transfer_failure(
         FailureCode::TransferTimedOut,
@@ -235,8 +240,15 @@ struct TrackState {
     /// absent on the same poll, because the alternate's transfer cannot
     /// appear in a transfer list that was fetched before it was enqueued.
     bound_at: Instant,
-    /// When the track was first seen in slskd's download list.
-    first_seen: Option<Instant>,
+    /// Whether slskd's download list showed the track's transfer since it
+    /// was bound.
+    seen: bool,
+    /// The bytes the transfer had moved on the last poll that listed it.
+    transferred: u64,
+    /// Since when the transfer has made no progress (`PER_TRACK_TIMEOUT`).
+    /// Cleared on any poll that shows it moved bytes or waiting behind a
+    /// file its source sends this slskd (`peers_sending`).
+    stalled_since: Option<Instant>,
     /// When the track went missing from slskd's list after being seen.
     missing_since: Option<Instant>,
     /// When the track's transfer was first seen in a failed terminal state.
@@ -259,7 +271,9 @@ impl TrackState {
     fn bound_now() -> Self {
         Self {
             bound_at: Instant::now(),
-            first_seen: None,
+            seen: false,
+            transferred: 0,
+            stalled_since: None,
             missing_since: None,
             failing_since: None,
             queued_at_source_since: None,
@@ -1024,10 +1038,7 @@ impl DownloadMonitor {
         // Handle grace period for downloads to appear. A handoff removes its
         // slot's record, so a batch that was seen before can list nothing
         // and still be under way; its absent slots are judged one by one.
-        let never_seen = self
-            .track_states
-            .iter()
-            .all(|state| state.first_seen.is_none());
+        let never_seen = self.track_states.iter().all(|state| !state.seen);
         if matched.is_empty() && never_seen {
             *consecutive_empty += 1;
             if *consecutive_empty >= MAX_CONSECUTIVE_EMPTY {
@@ -1302,26 +1313,21 @@ impl DownloadMonitor {
     ) {
         for (slot, download) in matched {
             let slot = *slot;
-            if self.track_states[slot].first_seen.is_none() {
-                self.track_states[slot].first_seen = Some(Instant::now());
-            }
+            self.track_states[slot].seen = true;
 
             if !self.watching(slot) {
                 continue;
             }
 
-            // Check per-track timeout
-            if let Some(first_seen) = self.track_states[slot].first_seen {
-                if first_seen.elapsed() > PER_TRACK_TIMEOUT && !is_terminal_state(&download.state) {
-                    warn!(
-                        "Track timed out after {} minutes: {}",
-                        first_seen.elapsed().as_secs() / 60,
-                        download.item
-                    );
-                    self.time_out(slot, download, per_track_timeout(), backend)
-                        .await;
-                    continue;
-                }
+            if self.made_no_progress(slot, download, sending) {
+                warn!(
+                    "Track made no progress for {} minutes: {}",
+                    PER_TRACK_TIMEOUT.as_secs() / 60,
+                    download.item
+                );
+                self.time_out(slot, download, per_track_timeout(), backend)
+                    .await;
+                continue;
             }
 
             // A peer can hold its queue for hours; another source may send
@@ -1376,6 +1382,27 @@ impl DownloadMonitor {
                 self.track_states[slot].failing_since = None;
             }
         }
+    }
+
+    /// Whether `slot`'s unfinished transfer, as `download` shows it on this
+    /// poll, went `PER_TRACK_TIMEOUT` without progress. Its clock restarts
+    /// on a poll that shows it moved bytes, or waiting in its source's queue
+    /// while that source is in `sending` (`peers_sending`): then it waits
+    /// its turn, as the remote queue limit also judges it.
+    fn made_no_progress(
+        &mut self,
+        slot: usize,
+        download: &DownloadProgress,
+        sending: &HashSet<String>,
+    ) -> bool {
+        let track = &mut self.track_states[slot];
+        let moved = download.transferred > track.transferred;
+        track.transferred = download.transferred;
+        if moved || (download.queued_at_source && sending.contains(&download.source)) {
+            track.stalled_since = None;
+        }
+        let since = *track.stalled_since.get_or_insert_with(Instant::now);
+        since.elapsed() > PER_TRACK_TIMEOUT && !is_terminal_state(&download.state)
     }
 
     /// Fail `slot` over to its next source, or else cancel its transfer,
@@ -1456,17 +1483,14 @@ impl DownloadMonitor {
             // source's queue.
             self.track_states[slot].queued_at_source_since = None;
 
-            let absent = match self.track_states[slot].first_seen {
-                None if self.track_states[slot].bound_at.elapsed() > ABSENT_TRACK_TIMEOUT => {
-                    Some(never_appeared())
-                }
-                Some(_) => {
-                    let missing_since = self.track_states[slot]
-                        .missing_since
-                        .get_or_insert_with(Instant::now);
-                    (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT).then(disappeared)
-                }
-                None => None,
+            let absent = if self.track_states[slot].seen {
+                let missing_since = self.track_states[slot]
+                    .missing_since
+                    .get_or_insert_with(Instant::now);
+                (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT).then(disappeared)
+            } else {
+                (self.track_states[slot].bound_at.elapsed() > ABSENT_TRACK_TIMEOUT)
+                    .then(never_appeared)
             };
 
             if let Some(failure) = absent {
@@ -2622,7 +2646,7 @@ mod tests {
         let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
-        m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+        m.track_states[0].stalled_since = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
         poll_tracks(
             &mut m,
             &[listed("peer_a", "one.flac", DownloadState::InProgress)],
@@ -2788,7 +2812,7 @@ mod tests {
         let (mut m, _rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
-        m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].stalled_since = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(1)));
 
         poll_tracks(
             &mut m,
@@ -2820,7 +2844,8 @@ mod tests {
             let backend: Arc<dyn DownloadBackend> = stub.clone();
             let held = key(&backend, "peer_a", "one.flac");
             TransferRegistry::global().claim(std::slice::from_ref(&held), &m.batch);
-            m.track_states[0].first_seen = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+            m.track_states[0].stalled_since =
+                Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
             let listing = || {
                 vec![
                     listed("peer_a", "one.flac", DownloadState::InProgress),
@@ -2861,11 +2886,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_slot_queued_behind_a_file_its_peer_sends_is_not_timed_out() {
+        // The peer sends one file at a time: two.flac has waited in its
+        // queue for over an hour while the tracks before it came in.
+        let (mut m, _recorded) = monitor(vec!["peer_a", "peer_a"], vec!["one.flac", "two.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        m.track_states[1].seen = true;
+        m.track_states[1].stalled_since = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+
+        poll_tracks(
+            &mut m,
+            &[
+                listed("peer_a", "one.flac", DownloadState::InProgress),
+                at_source("peer_a", "two.flac"),
+            ],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(phase(&m, 1), SlotPhase::Watching);
+        assert!(stub.cancelled().is_empty());
+        assert!(m.track_states[1]
+            .stalled_since
+            .is_some_and(|since| since.elapsed() < PER_TRACK_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_timed_out_only_once_it_stops_moving() {
+        let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let at = |transferred| DownloadProgress {
+            transferred,
+            ..listed("peer_a", "one.flac", DownloadState::InProgress)
+        };
+        m.track_states[0].transferred = 1_000;
+
+        // A slow peer, still sending over an hour after the transfer started.
+        m.track_states[0].stalled_since = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+        poll_tracks(&mut m, &[at(2_000)], &backend).await;
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+        assert!(stub.cancelled().is_empty());
+
+        // An hour without a byte since.
+        m.track_states[0].stalled_since = Some(ago(PER_TRACK_TIMEOUT + Duration::from_secs(60)));
+        poll_tracks(&mut m, &[at(2_000)], &backend).await;
+        assert_eq!(phase(&m, 0), SlotPhase::TimedOut);
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", &id_of("one.flac"))]
+        );
+    }
+
+    #[tokio::test]
     async fn a_slot_waiting_in_the_source_queue_too_long_fails_over() {
         let (mut m, _rx, _recorded) = failover_monitor();
         let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
-        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].seen = true;
         m.track_states[0].queued_at_source_since =
             Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
 
@@ -2883,7 +2962,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(16);
         let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
-        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].seen = true;
         m.track_states[0].queued_at_source_since =
             Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
 
@@ -2905,7 +2984,7 @@ mod tests {
         let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let stub = StubBackend::new(vec![]);
         let backend: Arc<dyn DownloadBackend> = stub.clone();
-        m.track_states[0].first_seen = Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
+        m.track_states[0].seen = true;
         m.track_states[0].queued_at_source_since =
             Some(ago(REMOTE_QUEUE_TIMEOUT + Duration::from_secs(1)));
 
@@ -3012,7 +3091,7 @@ mod tests {
     async fn a_poll_that_does_not_list_a_slot_stops_its_remote_queue_clock() {
         let (mut m, _recorded) = monitor(vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
-        m.track_states[0].first_seen = Some(Instant::now());
+        m.track_states[0].seen = true;
         m.track_states[0].queued_at_source_since = Some(ago(Duration::from_secs(60)));
 
         poll_tracks(&mut m, &[], &backend).await;
@@ -3203,7 +3282,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(16);
         let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["one.flac"]);
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
-        m.track_states[0].first_seen = Some(ago(Duration::from_secs(5)));
+        m.track_states[0].seen = true;
         m.track_states[0].missing_since = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
 
         poll_tracks(&mut m, &[], &backend).await;
@@ -3494,8 +3573,7 @@ mod tests {
         let own = key(&backend, "peer_a", "one.flac");
         registry.claim(std::slice::from_ref(&own), &m.batch);
         for slot in 0..2 {
-            m.track_states[slot].first_seen =
-                Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(2)));
+            m.track_states[slot].seen = true;
             m.track_states[slot].missing_since =
                 Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
         }
