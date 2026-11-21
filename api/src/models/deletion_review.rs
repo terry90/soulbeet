@@ -1,6 +1,8 @@
 #[cfg(feature = "server")]
 use crate::db::DB;
 #[cfg(feature = "server")]
+use crate::models::discovery_history::seen_key;
+#[cfg(feature = "server")]
 use shared::navidrome::{DeletionReason, DeletionReview};
 #[cfg(feature = "server")]
 use sqlx::SqlitePool;
@@ -165,8 +167,8 @@ impl DeletionReviewRow {
         .await
         .map_err(|e| e.to_string())?;
         Ok(rows
-            .into_iter()
-            .map(|(artist, title)| format!("{}:{}", artist.to_lowercase(), title.to_lowercase()))
+            .iter()
+            .map(|(artist, title)| seen_key(artist, title))
             .collect())
     }
 }

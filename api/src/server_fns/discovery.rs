@@ -440,7 +440,7 @@ pub async fn generate_discovery_playlist_internal(
 ) -> Result<shared::navidrome::GenerationResult, Failure> {
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
-    use crate::models::discovery_history::DiscoveryHistoryRow;
+    use crate::models::discovery_history::{seen_key, DiscoveryHistoryRow};
     use crate::services::download_backend;
     use shared::navidrome::{GenerationResult, ProfileGenerationStats};
 
@@ -638,11 +638,7 @@ pub async fn generate_discovery_playlist_internal(
                     break;
                 }
 
-                let key = format!(
-                    "{}:{}",
-                    candidate.artist.to_lowercase(),
-                    candidate.track.to_lowercase()
-                );
+                let key = seen_key(&candidate.artist, &candidate.track);
                 if seen.contains(&key) {
                     stats.candidates_skipped_seen += 1;
                     continue;
