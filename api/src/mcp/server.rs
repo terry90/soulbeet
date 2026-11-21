@@ -41,9 +41,12 @@ pub(crate) struct ToolSpec {
     /// The JSON Schema of the arguments, as JSON text.
     pub input_schema: &'static str,
     pub read_only: bool,
-    /// True when a call may overwrite, remove or clear anything, even with only some
-    /// arguments: MCP reads false as "only additive updates", and a client may ask the user
-    /// before it calls a destructive tool.
+    /// True when a call may overwrite, remove or clear the user's data (library files, pending
+    /// discovery tracks, a download kept for an import decision, playlist entries or details,
+    /// ratings, stars, settings), even with only some arguments. Soulbeet's own working state
+    /// does not count: searches and transfers, its discovery playlists brought back to the name
+    /// and rules the settings hold, downloads nothing can import any more. MCP reads false as
+    /// "only additive updates", and a client may ask the user before it calls a destructive tool.
     pub destructive: bool,
     pub idempotent: bool,
     pub open_world: bool,
