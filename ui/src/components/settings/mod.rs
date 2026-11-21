@@ -1,4 +1,5 @@
 mod app_config;
+mod choose_password;
 mod connected_apps;
 mod connection_status_row;
 mod deletion_checks;
@@ -13,6 +14,7 @@ mod toggle;
 mod user_manager;
 
 pub use app_config::{AppConfigManager, ConnectionStatusPanel};
+pub use choose_password::ChoosePassword;
 pub use connected_apps::ConnectedAppsPanel;
 pub use deletion_checks::DeletionChecksPanel;
 pub use folder_admin::FolderAdminPanel;

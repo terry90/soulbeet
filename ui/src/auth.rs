@@ -84,6 +84,23 @@ impl Auth {
         self.state.read().is_some()
     }
 
+    /// Signed in to an account that still has the default password: the
+    /// session can do nothing but choose a new one.
+    pub fn password_change_required(&self) -> bool {
+        self.state
+            .read()
+            .as_ref()
+            .is_some_and(|a| a.password_change_required)
+    }
+
+    /// Follows the new password the session chose: it may do everything
+    /// again.
+    pub fn password_chosen(&mut self) {
+        if let Some(state) = self.state.write().as_mut() {
+            state.password_change_required = false;
+        }
+    }
+
     pub fn navidrome_status(&self) -> shared::system::NavidromeStatus {
         self.state
             .read()
@@ -112,6 +129,7 @@ mod tests {
                 navidrome_status: NavidromeStatus::NotLinked,
                 role: Default::default(),
                 rename_allowed: false,
+                password_change_required: false,
             })));
             auth.set_navidrome_status(NavidromeStatus::Connected);
             assert_eq!(auth.navidrome_status(), NavidromeStatus::Connected);
@@ -132,6 +150,7 @@ mod tests {
                 navidrome_status: Default::default(),
                 role: Default::default(),
                 rename_allowed: false,
+                password_change_required: false,
             })));
 
             let failed = auth.signed_out(Err(ServerFnError::ServerError {
@@ -144,6 +163,25 @@ mod tests {
 
             auth.signed_out(Ok(())).unwrap();
             assert!(!auth.is_logged_in());
+        });
+    }
+
+    #[test]
+    fn a_chosen_password_frees_the_session() {
+        let dom = VirtualDom::new(|| rsx! {});
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut auth = Auth::new(Signal::new(Some(AuthResponse {
+                username: "admin".to_string(),
+                user_id: "u1".to_string(),
+                navidrome_status: Default::default(),
+                role: Default::default(),
+                rename_allowed: false,
+                password_change_required: true,
+            })));
+            assert!(auth.password_change_required());
+            auth.password_chosen();
+            assert!(!auth.password_change_required());
+            assert!(auth.is_logged_in());
         });
     }
 }

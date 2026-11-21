@@ -11,6 +11,7 @@ use crate::db::DB;
 use crate::models::user::{NameMatch, OidcLink, User, UserChangeError};
 use crate::oauth::codes::{still_signed_in, SessionCheck};
 use crate::secret_key::SecretKey;
+use crate::server_fns::auth::name_taken_by_account;
 use crate::server_fns::guard::load_session_claims;
 
 /// The account `identity` signs in to.
@@ -252,6 +253,7 @@ async fn enter_account(
                         "Created the account {} on OIDC sign-in",
                         loggable(&user.username)
                     );
+                    name_taken_by_account(&user.username);
                     Ok(user)
                 }
                 // Created by a concurrent sign-in or registration meanwhile.
@@ -474,7 +476,14 @@ mod tests {
         assert_eq!(after.credentials_version, admin.credentials_version);
 
         // The admin links their own identity from Settings, and signs in with
-        // it from then on.
+        // it from then on. The session guard reads the process-wide default
+        // password flag, so the admin first sets a password of their own, as
+        // they must before any session of theirs can link.
+        User::update_password_in(&db, &after.id, "chosen")
+            .await
+            .unwrap();
+        crate::security::note_password_set(crate::security::SEEDED_ADMIN_ID, "chosen");
+        let after = reread(&db, &admin).await;
         let linked = link(
             &db,
             Some(&session_of(&after)),

@@ -32,7 +32,7 @@ Long work goes on in Soulbeet after the chat ends: a batch of downloads keeps ru
 - **Soulbeet at the root of that name.** Soulbeet cannot run under a sub-path: `https://music.example.com` works, `https://example.com/music` does not.
 - **The Security Checks in Settings > Config pass.** Until they do, the OAuth and `/mcp` endpoints answer `mcp_unavailable`. The two checks are:
   - `SECRET_KEY` is unset (Soulbeet then generates a key) or at least 32 bytes. A shorter one is not used at all: Soulbeet signs sessions with the key in `secret.key` instead. Settings shows: "SECRET_KEY is shorter than 32 bytes, so Soulbeet does not use it and signs sessions with the key stored in secret.key next to the database. Remove SECRET_KEY, or set it to a random value of at least 32 bytes, for example the output of `openssl rand -hex 32`. Setting a new SECRET_KEY ends every session and makes the stored Navidrome passwords unreadable: each user enters theirs again once, by signing in with it or under Connect Navidrome in Settings > Users."
-  - The seeded `admin` account no longer has the password `admin`. Settings shows: "The seeded admin account still has the password 'admin'. Change it in Settings > Users."
+  - The seeded `admin` account no longer has the password `admin`. Signing in with that password asks for a new one before anything else. Settings shows: "The seeded admin account still has the password 'admin'. Change it in Settings > Users."
 
 Two environment variables concern MCP access:
 
