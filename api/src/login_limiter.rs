@@ -1,8 +1,8 @@
 //! Slows repeated failed sign-ins: a growing wait per name and a failure
 //! budget for the whole server, of which names with no account can spend only
-//! part. Password proofs of signed-in sessions have a wait per account of
-//! their own and no server budget, so failures at the login form never hold
-//! them back. Nothing depends on the client address.
+//! part. Password proofs of signed-in sessions have a wait per account and a
+//! server budget of their own, so failures at the login form never hold them
+//! back, nor theirs the form. Nothing depends on the client address.
 //!
 //! An attempt is admitted by its name, then counted against the server's
 //! budget before its credentials are checked. From each step on it counts as
@@ -82,6 +82,8 @@ impl Account {
 
 #[derive(Default)]
 struct State {
+    /// What the attempts are, for the log.
+    kind: &'static str,
     accounts: HashMap<String, Account>,
     window_start: Option<Instant>,
     /// Failures of counted attempts in the window, of every name.
@@ -97,6 +99,13 @@ struct State {
 }
 
 impl State {
+    fn of(kind: &'static str) -> Mutex<Self> {
+        Mutex::new(State {
+            kind,
+            ..State::default()
+        })
+    }
+
     /// The account's entry, with failures older than `FAILURE_MEMORY` dropped.
     fn account(&mut self, key: &str, now: Instant) -> &mut Account {
         let account = self.accounts.entry(key.to_owned()).or_insert(Account {
@@ -152,7 +161,10 @@ impl State {
         if self.spent(now).0 >= SERVER_FAILURES_PER_MINUTE {
             if !self.server_block_logged {
                 self.server_block_logged = true;
-                tracing::warn!("Too many failed sign-ins on this server, refusing all sign-ins");
+                tracing::warn!(
+                    "Too many failed {} on this server, refusing all of them",
+                    self.kind
+                );
             }
         } else if !self.no_account_block_logged {
             self.no_account_block_logged = true;
@@ -230,6 +242,15 @@ impl State {
         }
     }
 
+    /// Drops the failures of the name `key`. An attempt still in flight
+    /// keeps its slot, and its failure is recorded when it settles.
+    fn forget(&mut self, key: &str) {
+        self.clear(key);
+        if self.accounts.get(key).is_some_and(|a| a.in_flight == 0) {
+            self.accounts.remove(key);
+        }
+    }
+
     /// Frees the slots an attempt held. An entry with nothing left to
     /// remember is removed.
     fn release(&mut self, key: &str, budget: Option<Budget>) {
@@ -248,13 +269,21 @@ impl State {
     }
 }
 
-#[derive(Default)]
 pub struct LoginLimiter {
     /// Sign-ins at the login form, by name.
     form: Mutex<State>,
-    /// Password proofs of signed-in sessions, by account id. None of them
-    /// is counted against a server budget, so nothing fills this one's.
+    /// Password proofs of signed-in sessions, by account id, with a server
+    /// budget that only they fill.
     proofs: Mutex<State>,
+}
+
+impl Default for LoginLimiter {
+    fn default() -> Self {
+        Self {
+            form: State::of("sign-ins"),
+            proofs: State::of("password proofs"),
+        }
+    }
 }
 
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -287,15 +316,21 @@ impl LoginLimiter {
     }
 
     /// Admits a signed-in session's proof of the password of the account
-    /// `account_id` and holds its slot until it settles. Failed sign-ins of
-    /// the account's name do not hold it back, and its failures do not hold
-    /// those back.
+    /// `account_id` and counts it against the proofs' server budget until it
+    /// settles. Failed sign-ins at the login form do not hold it back, and
+    /// its failures do not hold those back.
     pub fn begin_proof(
         &self,
         account_id: &str,
         now: Instant,
     ) -> Result<LoginAttempt<'_>, LoginBlock> {
-        Self::begin_in(&self.proofs, account_id.to_owned(), now)
+        Self::begin_in(&self.proofs, account_id.to_owned(), now)?.count(Budget::Account, now)
+    }
+
+    /// Forgets the failed sign-ins of `username` at the login form, once an
+    /// account takes that name.
+    pub fn forget(&self, username: &str) {
+        lock(&self.form).forget(&key(username));
     }
 
     fn begin_in(
@@ -637,7 +672,8 @@ mod tests {
         // Bob's session still proves his password.
         l.begin_proof("id-bob", t0).unwrap().succeeded();
 
-        // Its failures wait on their own and never close the server.
+        // Its failures wait on their own, and fill a server budget that
+        // closes only the proofs.
         let l = LoginLimiter::new();
         for _ in 0..=FREE_FAILURES {
             l.begin_proof("id-bob", t0).unwrap().failed(t0);
@@ -647,11 +683,34 @@ mod tests {
             Some(LoginBlock::Account { .. })
         ));
         assert!(l.begin("bob", t0).is_ok());
-        for i in 0..SERVER_FAILURES_PER_MINUTE {
+        for i in FREE_FAILURES + 1..SERVER_FAILURES_PER_MINUTE {
             l.begin_proof(&format!("id-{i}"), t0).unwrap().failed(t0);
         }
-        assert!(l.begin_proof("id-ann", t0).is_ok());
+        assert_eq!(
+            l.begin_proof("id-ann", t0).err(),
+            Some(LoginBlock::Server {
+                retry_after: SERVER_WINDOW
+            })
+        );
         assert!(l.begin("ann", t0).is_ok());
+    }
+
+    #[test]
+    fn a_forgotten_name_starts_clean() {
+        let t0 = Instant::now();
+        let l = LoginLimiter::new();
+        fail(&l, "ghost", 10, t0);
+        l.forget(" Ghost");
+        assert!(l.begin("ghost", t0).is_ok());
+
+        // An attempt admitted before it was forgotten still settles.
+        let pending = l.begin("ghost", t0).unwrap();
+        l.forget("ghost");
+        pending.failed(t0);
+        assert!(l.begin("ghost", t0).is_ok());
+        let state = lock(&l.form);
+        let ghost = &state.accounts["ghost"];
+        assert_eq!((ghost.failures, ghost.in_flight), (1, 0));
     }
 
     #[test]

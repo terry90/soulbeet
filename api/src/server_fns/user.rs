@@ -1,7 +1,8 @@
 #[cfg(feature = "server")]
 use super::{
     auth::{
-        prove_password_in, start_session, try_navidrome_auth, NavidromeAuthResult, SessionCookie,
+        name_taken_by_account, prove_password_in, start_session, try_navidrome_auth,
+        NavidromeAuthResult, SessionCookie,
     },
     forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
@@ -53,9 +54,11 @@ pub async fn create_user(
         return Err(refusal_error("Username and password are required"));
     }
     check_username_length(&username)?;
-    User::create(&username, &password)
+    let user = User::create(&username, &password)
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(&user.username);
+    Ok(user)
 }
 
 #[post("/api/users/username", auth: AuthSession)]
@@ -71,7 +74,9 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
     check_username_length(new_username.trim())?;
     models::user::User::update_username(&auth.0.user_id, new_username.trim())
         .await
-        .map_err(user_change_error)
+        .map_err(user_change_error)?;
+    name_taken_by_account(new_username.trim());
+    Ok(())
 }
 
 /// Refusals a person can act on are shown; database failures are not.

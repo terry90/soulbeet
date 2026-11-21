@@ -11,6 +11,7 @@ use crate::db::DB;
 use crate::models::user::{NameMatch, OidcLink, User, UserChangeError};
 use crate::oauth::codes::{still_signed_in, SessionCheck};
 use crate::secret_key::SecretKey;
+use crate::server_fns::auth::name_taken_by_account;
 use crate::server_fns::guard::load_session_claims;
 
 /// The account `identity` signs in to.
@@ -252,6 +253,7 @@ async fn enter_account(
                         "Created the account {} on OIDC sign-in",
                         loggable(&user.username)
                     );
+                    name_taken_by_account(&user.username);
                     Ok(user)
                 }
                 // Created by a concurrent sign-in or registration meanwhile.
