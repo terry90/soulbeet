@@ -4,8 +4,6 @@ use crate::auth::Role;
 #[cfg(feature = "server")]
 use crate::db::DB;
 #[cfg(feature = "server")]
-use crate::security;
-#[cfg(feature = "server")]
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -136,6 +134,11 @@ const NO_PASSWORD: &str = "";
 /// What the triggers of the username migration raise for a taken name.
 #[cfg(feature = "server")]
 const USERNAME_TAKEN_RAISED: &str = "username taken";
+
+/// The `users` rows delete_in may remove, with the id bound: any account but the last admin.
+#[cfg(feature = "server")]
+const DELETABLE: &str =
+    "id = ? AND (role <> 'admin' OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)";
 
 #[cfg(feature = "server")]
 fn change_error(e: sqlx::Error) -> UserChangeError {
@@ -281,22 +284,25 @@ impl User {
         Ok(())
     }
 
-    pub async fn delete(id: &str) -> Result<(), UserChangeError> {
-        Self::delete_in(&DB, id).await?;
-        security::note_user_deleted(id);
-        Ok(())
+    pub(crate) async fn delete_in(db: &SqlitePool, id: &str) -> Result<(), UserChangeError> {
+        let done = sqlx::query(&format!("DELETE FROM users WHERE {DELETABLE}"))
+            .bind(id)
+            .execute(db)
+            .await
+            .map_err(|e| UserChangeError::Db(e.to_string()))?;
+        Self::refusal_for_untouched(db, id, done.rows_affected()).await
     }
 
-    pub(crate) async fn delete_in(db: &SqlitePool, id: &str) -> Result<(), UserChangeError> {
-        let done = sqlx::query(
-            "DELETE FROM users WHERE id = ? AND (role <> 'admin' \
-             OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)",
-        )
-        .bind(id)
-        .execute(db)
-        .await
-        .map_err(|e| UserChangeError::Db(e.to_string()))?;
-        Self::refusal_for_untouched(db, id, done.rows_affected()).await
+    /// What delete_in would do to the account `id` now, changing nothing: Ok when it would
+    /// delete it, else its refusal.
+    pub(crate) async fn deletable_in(db: &SqlitePool, id: &str) -> Result<(), UserChangeError> {
+        let found: Option<i64> =
+            sqlx::query_scalar(&format!("SELECT 1 FROM users WHERE {DELETABLE}"))
+                .bind(id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| UserChangeError::Db(e.to_string()))?;
+        Self::refusal_for_untouched(db, id, u64::from(found.is_some())).await
     }
 
     pub async fn set_role(id: &str, role: Role) -> Result<(), UserChangeError> {
@@ -833,6 +839,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
+            User::deletable_in(&db, &admin).await,
+            Err(UserChangeError::LastAdmin)
+        );
+        assert_eq!(
             User::delete_in(&db, &admin).await,
             Err(UserChangeError::LastAdmin)
         );
@@ -845,6 +855,8 @@ mod tests {
             .await
             .unwrap();
         User::set_role_in(&db, &admin, Role::User).await.unwrap();
+        assert_eq!(User::deletable_in(&db, &admin).await, Ok(()));
+        assert!(User::find_by_id_in(&db, &admin).await.unwrap().is_some());
         User::delete_in(&db, &admin).await.unwrap();
         assert!(User::find_by_id_in(&db, &admin).await.unwrap().is_none());
     }
@@ -852,6 +864,10 @@ mod tests {
     #[tokio::test]
     async fn a_missing_user_is_not_found() {
         let db = test_db::migrated().await;
+        assert_eq!(
+            User::deletable_in(&db, "nobody").await,
+            Err(UserChangeError::NotFound)
+        );
         assert_eq!(
             User::delete_in(&db, "nobody").await,
             Err(UserChangeError::NotFound)

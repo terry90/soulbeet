@@ -252,6 +252,37 @@ pub(crate) async fn expire_in(
     Ok(expired)
 }
 
+/// Removes (remove_staged_in) the staged file of each pending track in every folder of the
+/// account `user_id`, before that account is deleted: its folders and tracks go with it, and no
+/// expiry would find those files again. A track that cannot be removed is logged and keeps its
+/// file, as in expire_in.
+pub(crate) async fn remove_staged_of_user_in(
+    db: &SqlitePool,
+    user_id: &str,
+) -> Result<(), Failure> {
+    let folders = (Folder::get_all_by_user_in(db, user_id).await)
+        .map_err(|e| database_failure(Stage::Delete, e))?;
+    for folder in &folders {
+        let pending = (DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id).await)
+            .map_err(|e| database_failure(Stage::Delete, e))?;
+        for track in &pending {
+            match remove_staged_in(db, track, folder, StagedOutcome::Removed).await {
+                Ok(()) => {}
+                Err(f) if is_not_pending(&f) => debug!(
+                    "{} of user {user_id} is no longer pending, so its file stays",
+                    track.title
+                ),
+                Err(f) => warn!(
+                    "Could not remove {} of user {user_id}, whose account is being deleted: {}",
+                    track.title,
+                    crate::core::logged(&f)
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks that `ctx` can start a run (discovery on, a discovery folder chosen), claims it on
 /// `effects` with each selected profile waiting, or skipped when it already holds its track
 /// count of pending tracks, and starts the generation. The progress claimed.

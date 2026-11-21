@@ -3,7 +3,7 @@ use super::{
     auth::{
         prove_password_in, start_session, try_navidrome_auth, NavidromeAuthResult, SessionCookie,
     },
-    forbidden_error, refusal_error, server_error, ADMIN_ONLY,
+    failure_error, forbidden_error, refusal_error, server_error, ADMIN_ONLY,
 };
 use crate::auth::Role;
 use crate::models;
@@ -193,11 +193,30 @@ pub async fn set_user_password(user_id: String, password: String) -> Result<(), 
     Ok(())
 }
 
-#[delete("/api/users/delete", _: AdminSession)]
-pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
-    models::user::User::delete(&user_id)
+/// Deletes the account `user_id` once the staged files of its pending discovery tracks are
+/// removed (remove_staged_of_user_in): its folders and tracks go with it, so nothing would find
+/// those files after. Nothing is removed when the account cannot be deleted.
+#[cfg(feature = "server")]
+pub(crate) async fn delete_user_in(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<(), ServerFnError> {
+    use models::user::User;
+    User::deletable_in(db, user_id)
         .await
         .map_err(user_change_error)?;
+    crate::core::discovery::remove_staged_of_user_in(db, user_id)
+        .await
+        .map_err(failure_error)?;
+    User::delete_in(db, user_id)
+        .await
+        .map_err(user_change_error)
+}
+
+#[delete("/api/users/delete", _: AdminSession)]
+pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
+    delete_user_in(&crate::db::DB, &user_id).await?;
+    crate::security::note_user_deleted(&user_id);
     evict_navidrome_client(&user_id).await;
     Ok(())
 }
@@ -206,6 +225,7 @@ pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
 mod tests {
     use super::*;
     use crate::auth::NO_PASSWORD;
+    use crate::core::delete_guard::test_support::Library;
     use crate::db::test_db;
     use crate::server_fns::{FORBIDDEN_CODE, REFUSAL_CODE};
     use models::user::User;
@@ -386,5 +406,50 @@ mod tests {
             .await
             .unwrap();
         assert!(reread(&db, &bob).await.password_matches("x"));
+    }
+
+    /// Writes a staged file at `{root}/music/{rel}` for a pending discovery track.
+    fn staged(lib: &Library, rel: &str) -> std::path::PathBuf {
+        let path = lib.root.join("music").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"audio").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_removes_their_staged_discovery_files_and_keeps_their_music() {
+        let lib = Library::new().await;
+        let alices = staged(&lib, "alice/Discovery/Explore/Marrow Choir/03.flac");
+        lib.pending_track("t1", "alice-music", "Explore", &alices, None)
+            .await;
+        let bobs = staged(&lib, "bob/Discovery/Explore/04.flac");
+        lib.pending_track("t2", "bob-music", "Explore", &bobs, None)
+            .await;
+        delete_user_in(&lib.db, "alice").await.unwrap();
+        assert!(!alices.exists());
+        assert!(lib.root.join("music/alice/A/x.flac").exists());
+        assert!(User::find_by_id_in(&lib.db, "alice")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(bobs.exists());
+        assert_eq!(lib.track_status("t2").await, "Pending");
+    }
+
+    #[tokio::test]
+    async fn a_refused_user_delete_keeps_their_staged_discovery_files() {
+        let lib = Library::new().await;
+        let admin: String = sqlx::query_scalar("SELECT id FROM users WHERE role = 'admin'")
+            .fetch_one(&lib.db)
+            .await
+            .unwrap();
+        lib.folder(&admin, "admin-music", "music/admin", false)
+            .await;
+        let file = staged(&lib, "admin/Discovery/Explore/03.flac");
+        lib.pending_track("t1", "admin-music", "Explore", &file, None)
+            .await;
+        assert_eq!(code(delete_user_in(&lib.db, &admin).await), REFUSAL_CODE);
+        assert!(file.exists());
+        assert_eq!(lib.track_status("t1").await, "Pending");
     }
 }
