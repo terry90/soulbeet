@@ -5,9 +5,19 @@ on:
     branches: [ "master" ]
   pull_request:
   workflow_dispatch:
+  # The image workflow runs these before it pushes anything.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git reference to test"
+        required: false
+        type: string
 
 concurrency:
-  group: e2e-${{ github.ref }}
+  # A called run gets its caller's github context, so the workflow name keeps
+  # it from cancelling this workflow's own run for the same push, or being
+  # cancelled by it.
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -39,6 +49,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Set up Node
         uses: actions/setup-node@v4

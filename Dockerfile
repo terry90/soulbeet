@@ -35,8 +35,10 @@ COPY lib/soulbeet/Cargo.toml lib/soulbeet/
 # Copy source code
 COPY . .
 
-# Install Tailwind dependencies (clean install to avoid npm optional dep bug on arm64)
-RUN rm -rf node_modules package-lock.json && npm install
+# Install Tailwind from the committed lockfile, so every build of a commit gets
+# the same Tailwind. The lock lists the oxide and lightningcss native packages
+# of every platform, and npm ci installs the one for this arch (amd64 or arm64).
+RUN npm ci --no-audit --no-fund
 
 # Build the Tailwind CSS
 RUN npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
