@@ -51,7 +51,8 @@ use crate::server_fns::download::enqueue::{
 use crate::server_fns::download::failover::{self, SourcePool};
 #[cfg(feature = "server")]
 use crate::server_fns::download::monitor::{
-    read_pending_retry, transfer_by_id, FAILED_STATE_CONFIRM,
+    cancel_abandoned, read_pending_retry, remove_ended_transfers, transfer_by_id,
+    FAILED_STATE_CONFIRM,
 };
 #[cfg(feature = "server")]
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner, TransferRegistry};
@@ -430,6 +431,38 @@ async fn settle_poll(
                     }
                 }
             }
+        }
+    }
+}
+
+/// End the wait on `queued` the way `DownloadMonitor` ends a batch: cancel
+/// the transfers still in `pending`, then remove the records of the ones
+/// that ended without a file. Left running, a late transfer would land in
+/// its batch folder after its track was given up on, and nobody would
+/// import or delete it.
+///
+/// A transfer that finished before its cancel reached slskd delivered its
+/// file, so it leaves `pending` and is imported like the rest.
+#[cfg(feature = "server")]
+async fn stop_waiting(
+    queued: &[QueuedTrack],
+    pending: &mut std::collections::HashSet<String>,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+) {
+    for qt in queued.iter().filter(|qt| pending.contains(&qt.transfer_id)) {
+        cancel_abandoned(backend, &qt.key.peer, &qt.transfer_id).await;
+    }
+    let transfers: Vec<(String, String)> = (queued.iter())
+        .map(|qt| (qt.key.peer.clone(), qt.transfer_id.clone()))
+        .collect();
+    let Some(listed) = remove_ended_transfers(backend, &transfers).await else {
+        return;
+    };
+    for qt in queued {
+        if transfer_by_id(&listed, &qt.key.peer, &qt.transfer_id)
+            .is_some_and(|dl| succeeded(&dl.state))
+        {
+            pending.remove(&qt.transfer_id);
         }
     }
 }
@@ -868,7 +901,7 @@ pub async fn generate_discovery_playlist_internal(
             // A slow peer (3 min queue wait + 8 min transfer) could exceed it. This is
             // acceptable because: (1) discovery tracks are single songs, not albums,
             // (2) most Soulseek transfers start quickly, and (3) timed-out tracks are
-            // recorded in stats with no data loss -- they can be rediscovered later.
+            // recorded in stats and their transfers cancelled (`stop_waiting`).
             let wait_start = tokio::time::Instant::now();
             let max_wait = tokio::time::Duration::from_secs(600);
             let mut pending_ids: std::collections::HashSet<String> =
@@ -913,6 +946,7 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
             }
+            stop_waiting(&queued, &mut pending_ids, &backend).await;
 
             stats.downloads_timed_out += pending_ids.len() as u32;
             stats.downloads_failed += failed_ids.len() as u32;
@@ -1519,7 +1553,7 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 mod tests {
     use super::{
         discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
-        QueuedTrack, FAILED_STATE_CONFIRM,
+        stop_waiting, QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
@@ -2158,6 +2192,93 @@ mod tests {
             .contains(&Cancel::only("peer_b", "t-b/07 - Wake Up.flac")));
         assert!(pending.is_empty());
         assert!(failed_ids.contains("t-b/07 - Wake Up.flac"));
+    }
+
+    #[tokio::test]
+    async fn a_transfer_still_pending_at_the_deadline_is_cancelled_and_its_record_removed() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        // How slskd lists it once the cancel landed.
+        stub.set_listing(vec![transfer(
+            "peer_a",
+            "a/07 - Wake Up.flac",
+            "t-a/07 - Wake Up.flac",
+            DownloadState::Cancelled,
+        )]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![
+                Cancel::only("peer_a", "t-a/07 - Wake Up.flac"),
+                Cancel::removing("peer_a", "t-a/07 - Wake Up.flac"),
+            ]
+        );
+        assert_eq!(pending, pending_of(&queued), "it is not imported");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_finished_before_its_cancel_is_imported_and_keeps_its_record() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![queued_track(
+            vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+            &backend,
+        )];
+        let mut pending = pending_of(&queued);
+        stub.set_listing(vec![completed("peer_a", "a/07 - Wake Up.flac")]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::only("peer_a", "t-a/07 - Wake Up.flac")],
+            "its file may still be on its way out of the incomplete folder"
+        );
+        assert!(pending.is_empty(), "phase 3 imports it");
+    }
+
+    #[tokio::test]
+    async fn the_end_of_the_wait_removes_only_this_runs_records_that_ended_without_a_file() {
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let queued = vec![
+            queued_track(
+                vec![item("peer_a", "Wake Up", "a/07 - Wake Up.flac")],
+                &backend,
+            ),
+            queued_track(
+                vec![item("peer_b", "Wake Up", "b/07 - Wake Up.flac")],
+                &backend,
+            ),
+        ];
+        // The first failed out of peers, the second finished in time.
+        let mut pending = HashSet::new();
+        stub.set_listing(vec![
+            failed("peer_a", "a/07 - Wake Up.flac"),
+            completed("peer_b", "b/07 - Wake Up.flac"),
+            // An earlier run's record of the same file.
+            transfer(
+                "peer_a",
+                "a/07 - Wake Up.flac",
+                "t-earlier",
+                DownloadState::Cancelled,
+            ),
+        ]);
+
+        stop_waiting(&queued, &mut pending, &backend).await;
+
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", "t-a/07 - Wake Up.flac")]
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
