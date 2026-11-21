@@ -732,8 +732,9 @@ impl NavidromeClient {
     /// PUT /api/playlist/{id} with only the fields `change` sets. Navidrome writes just the
     /// columns the body names (deluan/rest controller.go Put, persistence/playlist_repository.go
     /// Update), so the comment and public flag stay as the user set them. A change that sets
-    /// nothing sends no request: a body naming no field would rewrite every column. An id that
-    /// is empty, "." or ".." names no playlist, a Parse error with no request.
+    /// nothing sends no request: Navidrome would write only updatedAt
+    /// (persistence/playlist_repository.go Update). An id that is empty, "." or ".." names no
+    /// playlist, a Parse error with no request.
     pub async fn update_smart_playlist(
         &self,
         id: &str,
@@ -2445,7 +2446,7 @@ mod tests {
             rules: Some(&rules),
         };
         c.update_smart_playlist(ADVENT, &rerouted).await.unwrap();
-        // A body naming no field would rewrite every column, so nothing is sent.
+        // A change that sets nothing has nothing to write, so nothing is sent.
         c.update_smart_playlist(ADVENT, &SmartPlaylistChange::default())
             .await
             .unwrap();

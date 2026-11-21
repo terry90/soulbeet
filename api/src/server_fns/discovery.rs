@@ -2356,6 +2356,33 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_made_playlist_whose_id_cannot_be_saved_is_deleted_and_reported() {
+            let db = discovering("{}").await;
+            sqlx::query(
+                "CREATE TRIGGER no_ids BEFORE UPDATE OF discovery_navidrome_playlist_id
+                 ON user_settings BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+            let navi = navidrome();
+            let made = native_playlist(ADVENT, "Fresh Picks", 0, false, Some(DISCOVERY_RULES));
+            navi.answer("/api/playlist", &[&made]);
+            let of = NavidromeFor(Ok(navi.client()));
+            let err = reconcile_in(&db, &of, &UserId::new("alice"))
+                .await
+                .unwrap_err();
+            assert!(err.contains(&format!("id {ADVENT} not saved")), "{err}");
+            assert!(err.contains("playlist deleted"), "{err}");
+            let path = format!("/api/playlist/{ADVENT}");
+            assert_eq!(
+                navi.asked(),
+                ["/auth/login", "/api/song", "/api/playlist", path.as_str()]
+            );
+            assert!(stored_ids(&db).await.is_empty());
+        }
+
+        #[tokio::test]
         async fn a_reconcile_waits_for_the_one_running_for_the_same_user() {
             use crate::core::playlists::{discovery_key, lock};
 
