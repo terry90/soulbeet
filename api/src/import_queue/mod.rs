@@ -34,6 +34,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
@@ -73,6 +74,9 @@ pub struct ImportJob {
     pub duplicates: Duplicates,
     /// What the last run of these files knew; None before the importer first ran them.
     pub last_run: Option<Arc<KeptRun>>,
+    /// The runs the queue already made of these files by itself after one found their library
+    /// database locked (`LOCK_RETRY_WAITS`); a person's retry starts again from none.
+    pub lock_retries: usize,
 }
 
 /// What the last run of a kept import knew (design 11.6).
@@ -90,6 +94,16 @@ pub struct KeptRun {
 /// How many files of a run a kept import keeps: their tags are a peer's text, stored with the
 /// import, and an album folder rarely holds more.
 const KEPT_FILES_MAX: usize = 200;
+
+/// How long the queue waits before each run it makes by itself of a kept import whose library
+/// database was locked. Another program lets its lock go, so a few runs spread over some minutes
+/// import what a person's retry would; a lock that stays (a network share SQLite cannot lock)
+/// ends as a failure the person retries.
+const LOCK_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+];
 
 /// How an import treats the library's earlier copy of what it imports.
 #[derive(Debug, Clone)]
@@ -208,6 +222,8 @@ impl ImportJob {
             choice: stored.choice,
             choices: stored.choices.map(Arc::new),
             last_run: stored.last_run.map(Arc::new),
+            // A restart starts the automatic runs over (`ImportQueue::restore`).
+            lock_retries: 0,
         }
     }
 
@@ -231,6 +247,9 @@ pub struct JobOutcome {
     replaced: Vec<Replacement>,
     /// A replacing run's previewed songs whose copy it did not delete (replace::Settled).
     not_replaced: Vec<String>,
+    /// When the queue runs these files again by itself, after their library database was
+    /// locked (`lock_retry_wait`).
+    retry_in: Option<Duration>,
 }
 
 impl JobOutcome {
@@ -242,6 +261,7 @@ impl JobOutcome {
             ran: false,
             replaced: vec![],
             not_replaced: vec![],
+            retry_in: None,
         }
     }
 }
@@ -329,6 +349,8 @@ struct Shared {
     /// at that moment, so a late event can never show an older state.
     emit_lock: tokio::sync::Mutex<()>,
     retries: RetryStore,
+    /// `LOCK_RETRY_WAITS`, shorter in tests.
+    lock_waits: Vec<Duration>,
 }
 
 /// A handle on the queue; clones share it.
@@ -339,6 +361,12 @@ pub struct ImportQueue {
 
 impl ImportQueue {
     pub fn new(deps: Arc<dyn QueueDeps>) -> Self {
+        Self::with_lock_waits(deps, LOCK_RETRY_WAITS.to_vec())
+    }
+
+    /// A queue that runs a kept import whose library database was locked again by itself after
+    /// each of `lock_waits` in turn.
+    fn with_lock_waits(deps: Arc<dyn QueueDeps>, lock_waits: Vec<Duration>) -> Self {
         ImportQueue {
             shared: Arc::new(Shared {
                 targets: Mutex::new(HashMap::new()),
@@ -346,6 +374,7 @@ impl ImportQueue {
                 deps,
                 emit_lock: tokio::sync::Mutex::new(()),
                 retries: RetryStore::default(),
+                lock_waits,
             }),
         }
     }
@@ -654,6 +683,7 @@ impl Shared {
             ran: true,
             replaced,
             not_replaced,
+            retry_in: None,
         }
     }
 
@@ -665,13 +695,14 @@ impl Shared {
     }
 
     /// Ends `job`, imported into `library` (its canonical target): cleans up,
-    /// keeps it for a retry when its outcome says so, and sends and records
-    /// its rows.
+    /// keeps it for a retry when its outcome says so, runs it again later by
+    /// itself when its library database was locked, and sends and records its
+    /// rows.
     async fn finish(
-        &self,
+        self: &Arc<Self>,
         library: &Path,
         job: &ImportJob,
-        outcome: JobOutcome,
+        mut outcome: JobOutcome,
         state: &watch::Sender<JobState>,
     ) {
         match &outcome.result.outcome {
@@ -691,6 +722,7 @@ impl Shared {
             ),
         }
         let keep = keeps_retry(&outcome.result.outcome, &job.duplicates);
+        outcome.retry_in = lock_retry_wait(job, &outcome.result, keep, &self.lock_waits);
         // Every owned download job has a cleanup root (`process::import_job`). A promote has
         // none: with Skip, its staged file stays where it is and the track goes back to pending.
         if let Some(root) = &job.cleanup_root {
@@ -744,7 +776,35 @@ impl Shared {
                 .await;
         }
         self.dismiss(dropped);
+        if let Some(wait) = outcome.retry_in {
+            let queue = ImportQueue {
+                shared: self.clone(),
+            };
+            queue.retry_later(job.clone(), wait);
+        }
         state.send_replace(JobState::Done(Box::new(outcome)));
+    }
+}
+
+/// How long until the queue runs `job` again by itself after a run that ended with `result`:
+/// when that run found the library database locked, the job is kept for a retry (`keep`) and has
+/// an owner, whose rows the retry store keeps, and `waits` has a wait left for it.
+fn lock_retry_wait(
+    job: &ImportJob,
+    result: &ImportResult,
+    keep: bool,
+    waits: &[Duration],
+) -> Option<Duration> {
+    let locked = matches!(
+        result.outcome,
+        ImportOutcome::Failed {
+            kind: FailKind::LibraryLocked,
+            ..
+        }
+    );
+    match locked && keep && job.owner.is_some() {
+        true => waits.get(job.lock_retries).copied(),
+        false => None,
     }
 }
 
@@ -885,6 +945,7 @@ pub async fn import_to_library(
             choices: None,
             duplicates,
             last_run: None,
+            lock_retries: 0,
         })
         .await
         .wait()
@@ -972,6 +1033,7 @@ mod tests {
             choices: None,
             duplicates: Duplicates::AsConfigured,
             last_run: None,
+            lock_retries: 0,
         }
     }
 
@@ -1565,7 +1627,7 @@ mod tests {
         );
         let stored = kept.stored().expect("an owned job is stored");
         assert_eq!(
-            queue.restore(ImportJob::from_stored(stored, alice())).await,
+            queue.restore(ImportJob::from_stored(stored, alice()), &[]).await,
             Ok(())
         );
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
@@ -1588,7 +1650,7 @@ mod tests {
             &["a"],
         );
         let refused = queue
-            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()))
+            .restore(ImportJob::from_stored(gone.stored().unwrap(), alice()), &[])
             .await
             .unwrap_err();
         assert_eq!(refused, files_gone());
@@ -1837,7 +1899,7 @@ mod tests {
         assert_eq!(stored.duplicates, DuplicateRule::Skip);
         // What the restore after a restart does with the stored row.
         queue
-            .restore(ImportJob::from_stored(stored, alice()))
+            .restore(ImportJob::from_stored(stored, alice()), &[])
             .await
             .unwrap();
         queue

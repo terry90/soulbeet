@@ -18,6 +18,8 @@ services:
       - NAVIDROME_URL=http://localhost:4533 # Your Navidrome server URL
       # - BEETS_CONFIG=/config/config.yaml # Needs the ./beets:/config volume below
     volumes:
+      # Soulbeet's database, secret.key and the beets library databases. Keep it
+      # on a local disk: SQLite cannot lock files on most network shares.
       - soulbeet_data:/data
       # Map the download folder.
       # IMPORTANT: This must be the SAME physical folder that slskd writes to.

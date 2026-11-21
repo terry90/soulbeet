@@ -39,6 +39,9 @@ const TASK_CREATED: &str = "Sending event: import_task_created";
 const ALBUM_IMPORTED: &str = "Sending event: album_imported";
 const ITEM_IMPORTED: &str = "Sending event: item_imported";
 const TRACEBACK: &str = "Traceback (most recent call last):";
+/// SQLite's text for a database another connection keeps locked past the
+/// connection's timeout (beets' `timeout`, 5 s by default).
+pub(crate) const LOCKED: &str = "database is locked";
 const CHAINED: [&str; 2] = [
     "The above exception was the direct cause of the following exception:",
     "During handling of the above exception, another exception occurred:",
@@ -53,19 +56,24 @@ const CHAINED: [&str; 2] = [
 /// - `configuration error:` is a config file confuse could not use, and
 ///   `can't be both quiet and timid` is the user's `import.timid` against
 ///   Soulful's `import -q`: the beets setup.
+/// - `error: database file {path} cannot not be opened: database is locked`
+///   is the library database locked when beets opens it (`_open_library`).
 /// - `database access error:` is one of beets' two `DBAccessError` texts,
-///   both a library database it cannot open or write. That database sits in
-///   the library folder (`library::library_db`).
+///   both a library database it cannot open or write, which Soulbeet keeps
+///   for the library folder (`library::library_db`).
 /// - `Error: {reason} while creating {path}` is `util.mkdirall`. Inside the
 ///   library folder that folder is unwritable. Outside it, the folder is a
 ///   plugin's (`smartplaylist`, `importfeeds` and `convert` write their own
 ///   folders), set in the beets config.
 ///
-/// A move or copy failure names both ends, and a lowercase `error:` is any
-/// `UserError`, so those stay beets failures.
+/// A move or copy failure names both ends, and any other lowercase `error:`
+/// is a `UserError`, so those stay beets failures.
 fn fatal_kind(line: &str, target: &Path) -> FailKind {
     let filesystem = line.strip_prefix("Error: ");
-    if filesystem.is_some_and(|reason| DISK_FULL.iter().any(|full| reason.starts_with(full))) {
+    if line.starts_with("error: ") && line.ends_with(LOCKED) {
+        FailKind::LibraryLocked
+    } else if filesystem.is_some_and(|reason| DISK_FULL.iter().any(|full| reason.starts_with(full)))
+    {
         FailKind::DiskFull
     } else if line.starts_with("configuration error: ")
         || line == "error: can't be both quiet and timid"
@@ -82,15 +90,30 @@ fn fatal_kind(line: &str, target: &Path) -> FailKind {
     }
 }
 
+/// The failure beets' fatal or exception `line` of `kind` is: the line, which
+/// for a locked library database is SQLite's text and does not say which
+/// database, so the message says it.
+fn failed(kind: FailKind, line: String) -> ImportOutcome {
+    let message = match kind {
+        FailKind::LibraryLocked => format!("The beets library database is locked: {line}"),
+        _ => line,
+    };
+    ImportOutcome::Failed { kind, message }
+}
+
 /// The OS texts of a full disk, as Python's `strerror` gives them on Linux.
 const DISK_FULL: [&str; 2] = ["No space left on device ", "Disk quota exceeded "];
 
-/// What the last exception line of a beets traceback says failed: a full
-/// disk for Python's `OSError` of ENOSPC or EDQUOT (`OSError: [Errno 28] No
-/// space left on device: '{path}'`) and SQLite's `database or disk is full`,
-/// else beets itself.
+/// What the last exception line of a beets traceback says failed: a locked
+/// library database for SQLite's `sqlite3.OperationalError: database is
+/// locked`, which beets 2.11 passes on unhandled from a write during the
+/// import, a full disk for Python's `OSError` of ENOSPC or EDQUOT (`OSError:
+/// [Errno 28] No space left on device: '{path}'`) and SQLite's `database or
+/// disk is full`, else beets itself.
 fn exception_kind(line: &str) -> FailKind {
-    if line.contains("[Errno 28] No space left on device")
+    if line.ends_with(LOCKED) {
+        FailKind::LibraryLocked
+    } else if line.contains("[Errno 28] No space left on device")
         || line.contains("[Errno 122] Disk quota exceeded")
         || line.ends_with("database or disk is full")
     {
@@ -317,14 +340,8 @@ impl Classifier {
                 last_line: self.last_line,
             },
             RunEnd::Exited(status) if !status.success() => match (self.fatal, self.exception) {
-                (Some(line), _) => ImportOutcome::Failed {
-                    kind: fatal_kind(&line, &self.target),
-                    message: line,
-                },
-                (None, Some(line)) => ImportOutcome::Failed {
-                    kind: exception_kind(&line),
-                    message: line,
-                },
+                (Some(line), _) => failed(fatal_kind(&line, &self.target), line),
+                (None, Some(line)) => failed(exception_kind(&line), line),
                 (None, None) => ImportOutcome::Failed {
                     kind: FailKind::Beets,
                     message: match (status.code(), status.signal()) {
@@ -749,7 +766,7 @@ mod tests {
     }
 
     /// beets' two `DBAccessError` texts (`dbcore/db.py`, beets 2.11). The
-    /// library database sits in the library folder.
+    /// library database is the library folder's own.
     #[test]
     fn a_library_database_beets_cannot_write_is_an_unwritable_target() {
         for line in [
@@ -768,6 +785,45 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// beets 2.11 words a lock two ways: a `UserError` when opening the
+    /// library (`ui._open_library`), and SQLite's own exception when a write
+    /// during the import meets it (`dbcore/db.py` turns only "unable to open"
+    /// and "readonly" into `DBAccessError`). Neither is an unwritable folder.
+    #[test]
+    fn a_locked_library_database_is_its_own_failure() {
+        let opening = "error: database file /data/beets-libraries/music/.beets_library.db \
+                       cannot not be opened: database is locked";
+        assert_eq!(
+            failed_with(opening),
+            ImportOutcome::Failed {
+                kind: FailKind::LibraryLocked,
+                message: format!("The beets library database is locked: {opening}")
+            }
+        );
+
+        let mut c = Classifier::new(ImportMode::Album, Path::new("/music"), 1, false);
+        c.feed(Stream::Stderr, "Sending event: import_task_created");
+        c.feed(Stream::Stderr, TRACEBACK);
+        c.feed(
+            Stream::Stderr,
+            "  File \"beets/dbcore/db.py\", line 1047, in mutate",
+        );
+        c.feed(
+            Stream::Stderr,
+            "sqlite3.OperationalError: database is locked",
+        );
+        let result = c.finish(&exited(1), &RunLimits::default(), &[], String::new());
+        assert_eq!(
+            result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::LibraryLocked,
+                message: "The beets library database is locked: sqlite3.OperationalError: \
+                          database is locked"
+                    .to_string()
+            }
+        );
     }
 
     fn failed_with(line: &str) -> ImportOutcome {

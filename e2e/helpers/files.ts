@@ -4,7 +4,7 @@
 import { existsSync, readdirSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { expect } from '@playwright/test';
-import { musicDirOnHost } from './env.js';
+import { librariesDirOnHost, musicDirForApp, musicDirOnHost } from './env.js';
 import { DatabaseSync } from './sqlite.js';
 
 /**
@@ -61,11 +61,14 @@ export interface LibraryItem {
   mbTrackId: string;
 }
 
-/** Every track in the folder's beets library (`.beets_library.db` at its root). */
-export function libraryItems(folderName: string): LibraryItem[] {
-  const db = new DatabaseSync(join(musicDirOnHost, folderName, '.beets_library.db'), {
-    readOnly: true,
-  });
+/**
+ * Every track in the folder's beets library, which the app keeps under
+ * `beets-libraries` at the folder's path as the app sees it: in the app's
+ * music root, `musicRootForApp` (the MCP instance's is `mcpMusicDirForApp`).
+ */
+export function libraryItems(folderName: string, musicRootForApp: string = musicDirForApp): LibraryItem[] {
+  const path = join(librariesDirOnHost, musicRootForApp, folderName, '.beets_library.db');
+  const db = new DatabaseSync(path, { readOnly: true });
   try {
     // beets may be writing its library: wait for its lock instead of failing.
     db.exec('PRAGMA busy_timeout = 5000');

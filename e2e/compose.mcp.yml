@@ -23,6 +23,8 @@ services:
       - mcp-data:/data
       - ./.runtime/downloads:/downloads
       - ./.runtime/music:/music
+      # The beets library databases, which the specs read on the host.
+      - ./.runtime/data/beets-libraries:/data/beets-libraries
       - ./.fixtures/beets-e2e.yaml:/app/beets-e2e.yaml:ro
     depends_on:
       - stubs

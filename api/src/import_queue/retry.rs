@@ -7,13 +7,16 @@ use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::core::discovery::Replace;
 use crate::ledger::{self, JobEvent};
-use shared::download::{ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind};
+use shared::download::{
+    DownloadProgress, ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind,
+};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tracing::warn;
+use std::time::Duration;
+use tracing::{info, warn};
 
 /// Rows a client loses on reload are never forgotten by it, so each user
 /// keeps at most this many, the oldest dropped first.
@@ -37,6 +40,17 @@ pub(super) fn skipped_duplicate(outcome: &ImportOutcome, duplicates: &Duplicates
             outcome,
             ImportOutcome::Skipped(SkipReason::AlreadyInLibrary { .. })
         )
+}
+
+/// Whether `rows` tell their person the queue runs their import again by itself after its
+/// library database was locked (`rows::retried_in`).
+fn promises_lock_retry(rows: &[DownloadProgress]) -> bool {
+    rows.iter().any(|row| {
+        row.failure.as_ref().is_some_and(|failure| {
+            failure.code == FailureCode::ImportLibraryLocked
+                && failure.retry_after_seconds.is_some()
+        })
+    })
 }
 
 /// A kept import discarded: the job, and its files the OS refused to delete.
@@ -233,20 +247,68 @@ impl ImportQueue {
         choice: ImportChoice,
         rule: impl FnOnce(Duplicates) -> Duplicates,
     ) -> Result<(), ImportRefusal> {
+        self.resubmit(user, item, |kept| {
+            Ok(ImportJob {
+                choice: resolve(&choice, kept)?,
+                duplicates: rule(kept.duplicates.clone()),
+                // A person's retry gets every automatic run again.
+                lock_retries: 0,
+                ..kept.clone()
+            })
+        })
+        .await
+    }
+
+    /// Starts `retry_locked` of `job` after `wait`. Not async, as `enqueue` is not: the run's
+    /// future awaits a finish, so the check that it is `Send` cannot sit in a finish.
+    pub(super) fn retry_later(self, job: Arc<ImportJob>, wait: Duration) {
+        tokio::spawn(self.retry_locked(job, wait));
+    }
+
+    /// Runs `job`, kept for its rows' Retry after a run found its library database locked,
+    /// again after `wait`, as a retry would, unless a person retried, discarded or replaced it
+    /// meanwhile.
+    async fn retry_locked(self, job: Arc<ImportJob>, wait: Duration) {
+        tokio::time::sleep(wait).await;
+        let Some(owner) = &job.owner else {
+            return;
+        };
+        let Some(row) = owner.rows.first() else {
+            return;
+        };
+        let retried = self
+            .resubmit(&owner.user_id, &row.item, |kept| {
+                match std::ptr::eq(kept, Arc::as_ptr(&job)) {
+                    true => Ok(ImportJob {
+                        lock_retries: kept.lock_retries + 1,
+                        ..kept.clone()
+                    }),
+                    false => Err(nothing_to_retry()),
+                }
+            })
+            .await;
+        if let Err(refusal) = retried {
+            info!(
+                "No automatic run of {:?} after its library database was locked: {}",
+                job.sources, refusal.failure.message
+            );
+        }
+    }
+
+    /// Takes the kept job of `item` once `next` builds the job to submit from it, and submits
+    /// that one. A job `next` refuses stays kept.
+    async fn resubmit(
+        &self,
+        user: &UserId,
+        item: &str,
+        next: impl FnOnce(&ImportJob) -> Result<ImportJob, ImportRefusal>,
+    ) -> Result<(), ImportRefusal> {
         let job = {
             // A finish recording what it kept cannot be split by the take.
             let _emit = self.shared.emit_lock.lock().await;
-            let (job, choice, dropped) = self
-                .shared
-                .retries
-                .take(user, item, |job| resolve(&choice, job))?;
+            let (_, job, dropped) = self.shared.retries.take(user, item, next)?;
             self.shared.dismiss(dropped);
-            let job = Arc::unwrap_or_clone(job);
-            ImportJob {
-                choice,
-                duplicates: rule(job.duplicates.clone()),
-                ..job
-            }
+            job
         };
         if !job.holds_audio().await {
             let refusal = files_gone();
@@ -270,14 +332,26 @@ impl ImportQueue {
 
     /// Keeps `job` for its rows' Retry as a finished automatic run would have
     /// (a kept import read back after a restart), when its sources still hold
-    /// audio; files_gone() otherwise, keeping nothing.
-    pub async fn restore(&self, job: ImportJob) -> Result<(), ImportRefusal> {
+    /// audio; files_gone() otherwise, keeping nothing. When `shown`, the rows
+    /// its last run left, say the queue runs it again by itself after its
+    /// library database was locked, the queue does, from its first wait.
+    pub async fn restore(
+        &self,
+        job: ImportJob,
+        shown: &[DownloadProgress],
+    ) -> Result<(), ImportRefusal> {
         if !job.holds_audio().await {
             return Err(files_gone());
         }
+        let job = Arc::new(job);
         let _emit = self.shared.emit_lock.lock().await;
-        let dropped = self.shared.retries.record(&Arc::new(job), true);
+        let dropped = self.shared.retries.record(&job, true);
         self.shared.dismiss(dropped);
+        let wait = self.shared.lock_waits.get(job.lock_retries).copied();
+        if let Some(wait) = wait.filter(|_| promises_lock_retry(shown)) {
+            // The Arc the store keeps, which `retry_locked` looks for.
+            self.clone().retry_later(job, wait);
+        }
         Ok(())
     }
 
@@ -373,6 +447,7 @@ mod tests {
     use shared::download::{
         DownloadProgress, DownloadState, ImportChoice, JobSlot, MatchChoices, MatchKind,
     };
+    use shared::failure::FailureCode;
     use soulbeet::{DriverChoice, FailKind, ImportResult};
     use std::sync::Arc;
     use std::time::Duration;
@@ -619,6 +694,166 @@ mod tests {
         );
     }
 
+    fn locked() -> ImportResult {
+        ImportResult::failed(
+            FailKind::LibraryLocked,
+            "The beets library database is locked: sqlite3.OperationalError: database is locked"
+                .into(),
+        )
+    }
+
+    /// A queue whose runs after a locked library db wait `waits`.
+    fn locking_queue(waits: Vec<Duration>) -> (ImportQueue, Arc<StubImporter>, Arc<RecordingDeps>) {
+        let stub = Arc::new(StubImporter::new());
+        let deps = RecordingDeps::new(stub.clone());
+        (
+            ImportQueue::with_lock_waits(deps.clone(), waits),
+            stub,
+            deps,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_locked_library_is_imported_again_by_the_queue_after_each_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wait = Duration::from_millis(20);
+        let (queue, stub, deps) = locking_queue(vec![wait, wait]);
+        stub.script(locked());
+        stub.script(locked());
+        let locking = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        finish(queue.submit(locking).await).await;
+
+        until_imported(&deps, "a").await;
+        assert_eq!(stub.calls(), 3);
+        assert_eq!(stub.choices(), vec![DriverChoice::Auto; 3]);
+        for runs in [1, 2] {
+            let row = done_row(&deps, "a", runs).await;
+            let failure = row.failure.expect("a failure");
+            assert_eq!(failure.code, FailureCode::ImportLibraryLocked);
+            assert_eq!(
+                failure.message,
+                format!("{}; Soulbeet tries again in 0 s", locked())
+            );
+            assert_eq!(failure.retry_after_seconds, Some(0));
+            assert!(row.retryable);
+        }
+        assert_eq!(queue.import_choices(&alice(), "a"), Err(nothing_to_retry()));
+    }
+
+    #[tokio::test]
+    async fn a_lock_that_outlasts_the_waits_is_left_for_a_person_to_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wait = Duration::from_millis(20);
+        let (queue, stub, deps) = locking_queue(vec![wait]);
+        stub.script(locked());
+        stub.script(locked());
+        let locking = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        finish(queue.submit(locking).await).await;
+
+        let last = done_row(&deps, "a", 2).await;
+        assert_eq!(last.state, DownloadState::Failed(locked().to_string()));
+        assert!(last.retryable);
+        tokio::time::sleep(wait * 5).await;
+        assert_eq!(stub.calls(), 2);
+
+        // A person's retry gets the automatic runs again.
+        stub.script(locked());
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
+        until_imported(&deps, "a").await;
+        assert_eq!(stub.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_retry_during_the_wait_leaves_the_queue_nothing_to_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wait = Duration::from_millis(100);
+        let (queue, stub, deps) = locking_queue(vec![wait]);
+        stub.script(locked());
+        let locking = owned(
+            job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")),
+            &alice(),
+            &["a"],
+        );
+        finish(queue.submit(locking).await).await;
+
+        assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));
+        until_imported(&deps, "a").await;
+        tokio::time::sleep(wait * 3).await;
+        assert_eq!(stub.calls(), 2);
+    }
+
+    /// Only a kept job is run again: one without rows has no Retry to keep.
+    #[tokio::test]
+    async fn a_locked_import_without_rows_is_not_run_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wait = Duration::from_millis(10);
+        let (queue, stub, _) = locking_queue(vec![wait]);
+        stub.script(locked());
+        let outcome = finish(
+            queue
+                .submit(job(file(tmp.path(), "dl/a.flac"), &tmp.path().join("lib")))
+                .await,
+        )
+        .await;
+        assert_eq!(outcome.result, locked());
+        tokio::time::sleep(wait * 10).await;
+        assert_eq!(stub.calls(), 1);
+    }
+
+    /// A locked import kept by a queue that waits `waits`, with the row its run left.
+    async fn locked_before_a_restart(
+        tmp: &std::path::Path,
+        waits: Vec<Duration>,
+    ) -> (ImportJob, DownloadProgress) {
+        let (queue, stub, deps) = locking_queue(waits);
+        stub.script(locked());
+        let locking = owned(
+            job(file(tmp, "dl/a.flac"), &tmp.join("lib")),
+            &alice(),
+            &["a"],
+        );
+        finish(queue.submit(locking.clone()).await).await;
+        let restored = ImportJob::from_stored(locking.stored().unwrap(), alice());
+        (restored, done_row(&deps, "a", 1).await)
+    }
+
+    #[tokio::test]
+    async fn a_locked_import_restored_after_a_restart_is_imported_again_by_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (restored, shown) =
+            locked_before_a_restart(tmp.path(), vec![Duration::from_secs(3600)]).await;
+        let promised = shown.failure.as_ref().and_then(|f| f.retry_after_seconds);
+        assert_eq!(promised, Some(3600));
+
+        let (queue, stub, deps) = locking_queue(vec![Duration::from_millis(20)]);
+        assert_eq!(queue.restore(restored, &[shown]).await, Ok(()));
+        until_imported(&deps, "a").await;
+        assert_eq!(stub.calls(), 1);
+        assert_eq!(queue.import_choices(&alice(), "a"), Err(nothing_to_retry()));
+    }
+
+    #[tokio::test]
+    async fn a_locked_import_out_of_tries_is_only_kept_after_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (restored, shown) = locked_before_a_restart(tmp.path(), vec![]).await;
+        assert_eq!(shown.failure.as_ref().unwrap().retry_after_seconds, None);
+
+        let wait = Duration::from_millis(20);
+        let (queue, stub, _) = locking_queue(vec![wait]);
+        assert_eq!(queue.restore(restored, &[shown]).await, Ok(()));
+        tokio::time::sleep(wait * 5).await;
+        assert_eq!(stub.calls(), 0);
+        assert!(queue.import_choices(&alice(), "a").is_ok());
+    }
+
     #[tokio::test]
     async fn retry_resubmits_the_stored_job_and_forgets_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -765,6 +1000,7 @@ mod tests {
             choices: None,
             duplicates: crate::import_queue::Duplicates::AsConfigured,
             last_run: None,
+            lock_retries: 0,
         })
     }
 
@@ -837,7 +1073,7 @@ mod tests {
             let source = file(tmp.path(), &format!("{dir}/a.flac"));
             let kept = under(owned(job(source, &lib), &alice(), &["a"]), id);
             let restored = ImportJob::from_stored(kept.stored().unwrap(), alice());
-            assert_eq!(queue.restore(restored).await, Ok(()));
+            assert_eq!(queue.restore(restored, &[]).await, Ok(()));
         }
         assert_eq!(dismissed(&deps), vec![first("j1")]);
     }

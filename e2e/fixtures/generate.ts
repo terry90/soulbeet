@@ -93,7 +93,15 @@ function generateBeetsConfig(): void {
 }
 
 function createRuntimeDirs(): void {
-  for (const dir of ['downloads', 'music', 'data', 'navidrome', 'user90-config', 'music-user90']) {
+  for (const dir of [
+    'downloads',
+    'music',
+    'data',
+    'data/beets-libraries',
+    'navidrome',
+    'user90-config',
+    'music-user90',
+  ]) {
     mkdirSync(join(runtimeDir, dir), { recursive: true });
   }
 }
