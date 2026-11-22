@@ -126,25 +126,26 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     rsx! {
         div {
             key: "{album.group_id}",
-            class: "bg-white/5 border border-white/5 p-4 rounded-md",
+            class: "bg-white/5 border border-white/5 p-3 sm:p-4 rounded-md",
 
             // Clickable header for expand/collapse
             div {
-                class: "flex justify-between items-center mb-2 cursor-pointer",
+                class: "flex justify-between items-center gap-3 cursor-pointer",
                 onclick: move |_| is_expanded.toggle(),
 
-                div { class: "flex-grow",
-                    div { class: "flex items-center gap-2",
-                        h4 { class: "text-md font-bold text-beet-leaf", "{album.title}" }
-                        if props.is_best {
-                            span {
-                                class: "text-[10px] font-mono px-1.5 py-0.5 rounded border bg-beet-accent/20 text-beet-accent border-beet-accent/40 uppercase shrink-0",
-                                "Best match"
-                            }
+                div { class: "flex-grow min-w-0",
+                    if props.is_best {
+                        span {
+                            class: "inline-block mb-2 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-beet-accent/20 text-beet-accent border-beet-accent/40 uppercase",
+                            "Best match"
                         }
                     }
-                    p { class: "text-sm text-gray-400 font-mono",
-                        "{album.artist.clone().unwrap_or_default()} - Quality: {album.quality}, Score: {album.score:.2}"
+                    h4 { class: "text-base leading-snug font-bold text-beet-leaf break-words", "{album.title}" }
+                    if let Some(artist) = album.artist.as_ref().filter(|a| !a.is_empty()) {
+                        p { class: "mt-1 text-sm text-gray-300 font-mono break-words", "{artist}" }
+                    }
+                    p { class: "mt-1 text-xs text-gray-400 font-mono uppercase tracking-wide",
+                        "{album.quality} · Score {album.score:.2}"
                     }
                 }
 
@@ -167,7 +168,7 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
             // Track list and Select All only visible when expanded
             if *is_expanded.read() {
                 button {
-                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 mb-2 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
+                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 mt-4 mb-2 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
@@ -267,7 +268,7 @@ pub fn DownloadResults(props: Props) -> Element {
     };
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 text-white p-6 sm:p-8 rounded-lg shadow-2xl w-full max-w-2xl mx-auto my-10 font-display relative",
+        div { class: "bg-beet-panel border border-white/10 text-white p-4 sm:p-8 rounded-lg shadow-2xl w-full max-w-2xl mx-auto my-10 font-display relative",
             div { class: "relative mb-6",
                 button {
                     class: "absolute left-0 top-1/2 -translate-y-1/2 p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer",
