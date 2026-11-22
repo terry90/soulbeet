@@ -420,6 +420,24 @@ pub enum ForgetOutcome {
     Failed(String),
 }
 
+/// What became of a request to drop from a library the items whose file is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// The folder has no library.
+    NoLibrary,
+    /// The items whose file is gone were dropped: `removed` of them; the library keeps `kept`.
+    Pruned {
+        removed: u64,
+        kept: u64,
+    },
+    /// Some items' files are gone and none of the library's `items` has its file there, so the
+    /// folder may be a share that is not mounted: nothing was dropped.
+    Unproven {
+        items: u64,
+    },
+    Failed(String),
+}
+
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
     async fn import(
@@ -442,6 +460,10 @@ pub trait MusicImporter: Send + Sync {
     /// Removes the item at exactly `file` from the library of `library`,
     /// leaving the file alone.
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome;
+
+    /// Removes from the library of `library` every item whose file is gone, leaving every file
+    /// alone; none while no item of the library has its file there.
+    async fn prune(&self, library: &Path) -> PruneOutcome;
 
     /// The last known health, without waiting. `Checking` before the first check.
     fn health(&self) -> ImporterHealth;

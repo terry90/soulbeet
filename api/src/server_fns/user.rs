@@ -211,13 +211,14 @@ pub async fn set_user_password(user_id: String, password: String) -> Result<(), 
 #[cfg(feature = "server")]
 pub(crate) async fn delete_user_in(
     db: &sqlx::SqlitePool,
+    queue: &crate::import_queue::ImportQueue,
     user_id: &str,
 ) -> Result<(), ServerFnError> {
     use models::user::User;
     User::deletable_in(db, user_id)
         .await
         .map_err(user_change_error)?;
-    crate::core::discovery::remove_staged_of_user_in(db, user_id)
+    crate::core::discovery::remove_staged_of_user_in(db, queue, user_id)
         .await
         .map_err(failure_error)?;
     User::delete_in(db, user_id)
@@ -227,7 +228,7 @@ pub(crate) async fn delete_user_in(
 
 #[delete("/api/users/delete", _: AdminSession)]
 pub async fn delete_user(user_id: String) -> Result<(), ServerFnError> {
-    delete_user_in(&crate::db::DB, &user_id).await?;
+    delete_user_in(&crate::db::DB, &crate::import_queue::IMPORT_QUEUE, &user_id).await?;
     crate::security::note_user_deleted(&user_id);
     evict_navidrome_client(&user_id).await;
     Ok(())
@@ -239,6 +240,7 @@ mod tests {
     use crate::auth::NO_PASSWORD;
     use crate::core::delete_guard::test_support::Library;
     use crate::db::test_db;
+    use crate::import_queue::test_support::stub_queue;
     use crate::server_fns::{FORBIDDEN_CODE, REFUSAL_CODE};
     use models::user::User;
     use std::time::Instant;
@@ -468,7 +470,13 @@ mod tests {
         let bobs = lib.root.join("music/bob/Discovery/Explore/04.flac");
         lib.pending_track("t2", "bob-music", "Explore", &bobs, None)
             .await;
-        delete_user_in(&lib.db, "alice").await.unwrap();
+        let profile =
+            std::fs::canonicalize(lib.root.join("music/alice/Discovery/Explore")).unwrap();
+        let staged = std::fs::canonicalize(&alices).unwrap();
+        let (queue, stub) = stub_queue();
+        delete_user_in(&lib.db, &queue, "alice").await.unwrap();
+        // Its item leaves the profile folder's library too.
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, staged)]);
         assert!(!alices.exists());
         assert!(lib.root.join("music/alice/A/x.flac").exists());
         assert!(User::find_by_id_in(&lib.db, "alice")
@@ -492,7 +500,12 @@ mod tests {
         let file = lib.root.join("music/admin/Discovery/Explore/03.flac");
         lib.pending_track("t1", "admin-music", "Explore", &file, None)
             .await;
-        assert_eq!(code(delete_user_in(&lib.db, &admin).await), REFUSAL_CODE);
+        let (queue, stub) = stub_queue();
+        assert_eq!(
+            code(delete_user_in(&lib.db, &queue, &admin).await),
+            REFUSAL_CODE
+        );
+        assert!(stub.forgets().is_empty());
         assert!(file.exists());
         assert_eq!(lib.track_status("t1").await, "Pending");
     }

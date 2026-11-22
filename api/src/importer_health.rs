@@ -84,7 +84,8 @@ mod tests {
     use shared::failure::{FailureCode, RetryAdvice, Stage};
     use shared::system::HealthIssue;
     use soulbeet::{
-        DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportResult, Relocation,
+        DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportResult, PruneOutcome,
+        Relocation,
     };
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -125,6 +126,9 @@ mod tests {
             unreachable!()
         }
         async fn forget(&self, _: &Path, _: &Path) -> ForgetOutcome {
+            unreachable!()
+        }
+        async fn prune(&self, _: &Path) -> PruneOutcome {
             unreachable!()
         }
         fn health(&self) -> ImporterHealth {

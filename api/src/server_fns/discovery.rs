@@ -153,6 +153,7 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
     promote(
         &crate::db::DB,
         &effects,
+        &IMPORT_QUEUE,
         &auth.0.id(),
         &req.track_id,
         replace,
@@ -164,7 +165,7 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
 
 #[post("/api/discovery/remove", auth: AuthSession)]
 pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    remove_in(&crate::db::DB, &auth.0.id(), &req.track_id)
+    remove_in(&crate::db::DB, &IMPORT_QUEUE, &auth.0.id(), &req.track_id)
         .await
         .map(|_| ())
         .map_err(|n| failure_error(n.into_failure()))

@@ -24,10 +24,11 @@ use crate::core::delete_guard::paths;
 use crate::core::delete_guard::staging::{
     claim_removal_in, remove_claimed_in, remove_staged_in, StagedOutcome,
 };
-use crate::core::delete_guard::Origin;
+use crate::core::delete_guard::{forget_detached, Origin};
 use crate::core::folders::folder_not_found;
 use crate::core::index::library_songs;
 use crate::core::library::{known_roots_in, navidrome_failure, place_in, NavidromePlace};
+use crate::import_queue::ImportQueue;
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::engine_report::EngineReportRow;
@@ -218,6 +219,7 @@ pub(crate) fn lifetime_of(lifetime_days: &HashMap<String, u32>, profile: &str) -
 /// cannot be removed is logged and stays. The number expired.
 pub(crate) async fn expire_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     folder: &Folder,
     lifetime_days: &HashMap<String, u32>,
     now: DateTime<Utc>,
@@ -235,7 +237,7 @@ pub(crate) async fn expire_in(
         if now < expires {
             continue;
         }
-        match remove_staged_in(db, track, folder, StagedOutcome::Expired).await {
+        match remove_staged_in(db, queue, track, folder, StagedOutcome::Expired).await {
             Ok(()) => expired += 1,
             Err(f) if is_not_pending(&f) => debug!(
                 "{} of user {} is no longer pending, so it does not expire",
@@ -258,6 +260,7 @@ pub(crate) async fn expire_in(
 /// file, as in expire_in.
 pub(crate) async fn remove_staged_of_user_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     user_id: &str,
 ) -> Result<(), Failure> {
     let folders = (Folder::get_all_by_user_in(db, user_id).await)
@@ -266,7 +269,7 @@ pub(crate) async fn remove_staged_of_user_in(
         let pending = (DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id).await)
             .map_err(|e| database_failure(Stage::Delete, e))?;
         for track in &pending {
-            match remove_staged_in(db, track, folder, StagedOutcome::Removed).await {
+            match remove_staged_in(db, queue, track, folder, StagedOutcome::Removed).await {
                 Ok(()) => {}
                 Err(f) if is_not_pending(&f) => debug!(
                     "{} of user {user_id} is no longer pending, so its file stays",
@@ -451,45 +454,54 @@ impl NotDone {
 }
 
 /// Moves `user`'s pending track `track_id` into its folder's library through `effects.import`
-/// with `replace`, claiming it first (D16). Runs in its own task, so the status and history
-/// updates always follow the import even when the caller goes away while the import waits in
-/// the library's queue. The track as promoted.
+/// with `replace`, claiming it first (D16), and drops its item from its profile folder's library
+/// through `queue`. Runs in its own task, so the status and history updates always follow the
+/// import even when the caller goes away while the import waits in the library's queue. The
+/// track as promoted.
 pub(crate) async fn promote(
     db: &SqlitePool,
     effects: &Arc<dyn DiscoveryEffects>,
+    queue: &ImportQueue,
     user: &UserId,
     track_id: &str,
     replace: Replace,
 ) -> Result<DiscoveryTrack, NotDone> {
-    let (db, effects, user, track_id) = (
+    let (db, effects, queue, user, track_id) = (
         db.clone(),
         effects.clone(),
+        queue.clone(),
         user.clone(),
         track_id.to_string(),
     );
-    tokio::spawn(async move { promote_detached(&db, &*effects, &user, &track_id, replace).await })
-        .await
-        .unwrap_or_else(|e| Err(NotDone::Claimed(promote_stopped(&e))))
+    tokio::spawn(async move {
+        promote_detached(&db, &*effects, &queue, &user, &track_id, replace).await
+    })
+    .await
+    .unwrap_or_else(|e| Err(NotDone::Claimed(promote_stopped(&e))))
 }
 
 async fn promote_detached(
     db: &SqlitePool,
     effects: &dyn DiscoveryEffects,
+    queue: &ImportQueue,
     user: &UserId,
     track_id: &str,
     replace: Replace,
 ) -> Result<DiscoveryTrack, NotDone> {
     let (track, folder) = (claim_for_promote_in(db, track_id, &user.to_string()).await)
         .map_err(NotDone::Unclaimed)?;
-    promote_claimed(db, effects, user, track, folder, replace)
+    promote_claimed(db, effects, queue, user, track, folder, replace)
         .await
         .map_err(NotDone::Claimed)
 }
 
-/// The promote of `track`, which claim_for_promote_in claimed.
+/// The promote of `track`, which claim_for_promote_in claimed. Once the import moved the staged
+/// file out of its profile folder, the file's item is dropped from that folder's library
+/// (forget_detached); a file the import left there, as beets' copy does, keeps its item.
 async fn promote_claimed(
     db: &SqlitePool,
     effects: &dyn DiscoveryEffects,
+    queue: &ImportQueue,
     user: &UserId,
     track: DiscoveryTrack,
     folder: Folder,
@@ -505,12 +517,13 @@ async fn promote_claimed(
     };
 
     let src = PathBuf::from(&track.path);
-    if !src.exists() {
+    // The path beets has the file at: discovery imported it into the canonical profile folder.
+    let Ok(staged) = tokio::fs::canonicalize(&src).await else {
         // Pending again, so the expiry handles it.
         back_to_pending().await;
         warn!("Promote of '{}': {} is gone", track.title, track.path);
         return Err(promote_file_gone());
-    }
+    };
 
     let target = PathBuf::from(&folder.path);
     if let Err(failure) = effects.import(&src, &target, user, replace).await {
@@ -518,9 +531,12 @@ async fn promote_claimed(
         return Err(failure);
     }
 
+    let profile_root = PathBuf::from(folder.discovery_profile_path(&track.profile));
     if let Some(parent) = src.parent() {
-        let profile_root = folder.discovery_profile_path(&track.profile);
-        let _ = crate::server_fns::cleanup_empty_ancestors(parent, Path::new(&profile_root)).await;
+        let _ = crate::server_fns::cleanup_empty_ancestors(parent, &profile_root).await;
+    }
+    if matches!(tokio::fs::try_exists(&staged).await, Ok(false)) {
+        forget_detached(queue, staged, profile_root);
     }
 
     DiscoveryTrackRow::update_status_in(db, track_id, &DiscoveryStatus::Promoted)
@@ -556,6 +572,7 @@ async fn promote_claimed(
 /// claiming it first (claim_removal_in, D16). The track as removed.
 pub(crate) async fn remove_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     user: &UserId,
     track_id: &str,
 ) -> Result<DiscoveryTrack, NotDone> {
@@ -565,7 +582,7 @@ pub(crate) async fn remove_in(
     claim_removal_in(db, &track)
         .await
         .map_err(NotDone::Unclaimed)?;
-    (remove_claimed_in(db, &track, &folder, StagedOutcome::Removed).await)
+    (remove_claimed_in(db, queue, &track, &folder, StagedOutcome::Removed).await)
         .map_err(NotDone::Claimed)?;
     Ok(DiscoveryTrack {
         status: DiscoveryStatus::Removed,
@@ -719,6 +736,7 @@ mod tests {
     use super::*;
     use crate::core::delete_guard::test_support::Library;
     use crate::core::test_ctx;
+    use crate::import_queue::test_support::stub_queue;
     use crate::models::user_settings::{UpdateUserSettings, UserSettings};
     use crate::test_navidrome::NavidromeStub;
 
@@ -1056,25 +1074,33 @@ mod tests {
         lib.pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
         let effects: Arc<dyn DiscoveryEffects> = Arc::new(TestDiscovery::default());
+        let (queue, stub) = stub_queue();
         let bob = UserId::new("bob");
         let ui = Replace::Guarded(Origin::Ui);
         assert_eq!(
-            promote(&lib.db, &effects, &bob, "t1", ui)
+            promote(&lib.db, &effects, &queue, &bob, "t1", ui)
                 .await
                 .unwrap_err(),
             NotDone::Unclaimed(discovery_track_not_found())
         );
         assert_eq!(
-            remove_in(&lib.db, &bob, "t1").await.unwrap_err(),
+            remove_in(&lib.db, &queue, &bob, "t1").await.unwrap_err(),
             NotDone::Unclaimed(discovery_track_not_found())
         );
         assert!(staged.exists());
         assert_eq!(lib.track_status("t1").await, "Pending");
+        assert!(stub.forgets().is_empty());
+        let profile = std::fs::canonicalize(staged.parent().unwrap()).unwrap();
+        let canonical = std::fs::canonicalize(&staged).unwrap();
         assert_eq!(
-            remove_in(&lib.db, &lib.alice(), "t1").await.unwrap().id,
+            remove_in(&lib.db, &queue, &lib.alice(), "t1")
+                .await
+                .unwrap()
+                .id,
             "t1"
         );
         assert!(!staged.exists());
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, canonical)]);
     }
 
     #[tokio::test]
@@ -1086,22 +1112,25 @@ mod tests {
         let test = Arc::new(TestDiscovery::default());
         let (reached, release) = test.hold_imports();
         let effects: Arc<dyn DiscoveryEffects> = test.clone();
+        let (queue, stub) = stub_queue();
         let ui = Replace::Guarded(Origin::Ui);
         let first = tokio::spawn({
             let (db, effects, alice) = (lib.db.clone(), effects.clone(), lib.alice());
-            let ui = ui.clone();
-            async move { promote(&db, &effects, &alice, "t1", ui).await }
+            let (queue, ui) = (queue.clone(), ui.clone());
+            async move { promote(&db, &effects, &queue, &alice, "t1", ui).await }
         });
         // The first holds the claim and waits in its import.
         reached.notified().await;
         assert_eq!(
-            promote(&lib.db, &effects, &lib.alice(), "t1", ui)
+            promote(&lib.db, &effects, &queue, &lib.alice(), "t1", ui)
                 .await
                 .unwrap_err(),
             NotDone::Unclaimed(track_not_pending())
         );
         assert_eq!(
-            remove_in(&lib.db, &lib.alice(), "t1").await.unwrap_err(),
+            remove_in(&lib.db, &queue, &lib.alice(), "t1")
+                .await
+                .unwrap_err(),
             NotDone::Unclaimed(track_not_pending())
         );
         assert!(staged.exists());
@@ -1111,6 +1140,35 @@ mod tests {
             (lib.track_status("t1").await, test.imports().len()),
             ("Promoted".into(), 1)
         );
+        // The import left the staged file where it was, as beets' copy does, so its item stays.
+        assert!(staged.exists() && stub.forgets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_promote_that_moved_the_staged_file_drops_its_item_from_the_profiles_library() {
+        let lib = Library::new().await;
+        let staged = staged_file(&lib);
+        lib.pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        let profile = std::fs::canonicalize(staged.parent().unwrap()).unwrap();
+        let canonical = std::fs::canonicalize(&staged).unwrap();
+        let test = Arc::new(TestDiscovery::default());
+        let (reached, release) = test.hold_imports();
+        let effects: Arc<dyn DiscoveryEffects> = test.clone();
+        let (queue, stub) = stub_queue();
+        let promoting = tokio::spawn({
+            let (db, alice) = (lib.db.clone(), lib.alice());
+            let (effects, queue) = (effects.clone(), queue.clone());
+            let ui = Replace::Guarded(Origin::Ui);
+            async move { promote(&db, &effects, &queue, &alice, "t1", ui).await }
+        });
+        // beets moves the file into the library, as `move: yes` does.
+        reached.notified().await;
+        std::fs::remove_file(&staged).unwrap();
+        release.notify_one();
+        assert_eq!(promoting.await.unwrap().unwrap().id, "t1");
+        assert_eq!(lib.track_status("t1").await, "Promoted");
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, canonical)]);
     }
 
     #[tokio::test]
@@ -1119,6 +1177,7 @@ mod tests {
         let staged = staged_file(&lib);
         lib.pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
+        let (queue, stub) = stub_queue();
         for status in ["Promoting", "Promoted", "Removing", "Removed"] {
             sqlx::query("UPDATE discovery_tracks SET status = ? WHERE id = 't1'")
                 .bind(status)
@@ -1126,7 +1185,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                remove_in(&lib.db, &lib.alice(), "t1").await.unwrap_err(),
+                remove_in(&lib.db, &queue, &lib.alice(), "t1")
+                    .await
+                    .unwrap_err(),
                 NotDone::Unclaimed(track_not_pending()),
                 "{status}"
             );
@@ -1134,6 +1195,7 @@ mod tests {
             assert!(staged.exists());
             assert_ne!(lib.history_outcome("t1").await, "removed");
         }
+        assert!(stub.forgets().is_empty());
     }
 
     #[tokio::test]
@@ -1154,15 +1216,18 @@ mod tests {
             .unwrap();
         // t2 is one the sync found rated to keep, or could not tell.
         let expirable = HashSet::from(["t1".to_string()]);
+        let (queue, stub) = stub_queue();
+        let profile = std::fs::canonicalize(staged[0].parent().unwrap()).unwrap();
+        let canonical = std::fs::canonicalize(&staged[0]).unwrap();
         let lifetimes = HashMap::new();
         assert_eq!(
-            expire_in(&lib.db, &folder, &lifetimes, Utc::now(), &expirable).await,
+            expire_in(&lib.db, &queue, &folder, &lifetimes, Utc::now(), &expirable).await,
             Ok(0)
         );
         assert!(staged[0].exists());
         let later = Utc::now() + Duration::days(8);
         assert_eq!(
-            expire_in(&lib.db, &folder, &lifetimes, later, &expirable).await,
+            expire_in(&lib.db, &queue, &folder, &lifetimes, later, &expirable).await,
             Ok(1)
         );
         assert_eq!(
@@ -1175,6 +1240,7 @@ mod tests {
         assert!(!staged[0].exists());
         assert_eq!(lib.track_status("t2").await, "Pending");
         assert!(staged[1].exists());
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, canonical)]);
     }
 
     #[tokio::test]
@@ -1193,6 +1259,7 @@ mod tests {
             promote(
                 &lib.db,
                 &effects,
+                &stub_queue().0,
                 &lib.alice(),
                 "t1",
                 Replace::Guarded(Origin::Ui)

@@ -56,11 +56,15 @@ volumes:
   - /mnt/nas/music:/music     # the share
 ```
 
-Earlier versions kept the database at the root of the music folder (`/music/Person1/.beets_library.db`), so on the share. The first import, delete or replace in that folder after the upgrade moves it to `beets-libraries`, with its journal file if it has one.
+Earlier versions kept the database at the root of the music folder (`/music/Person1/.beets_library.db`), so on the share. The first start after the upgrade moves it to `beets-libraries`, with its journal file if it has one; for a folder that is not there at that start, its first import, delete or replace does.
 
 If you mount a music folder at another path later, move its folder under `beets-libraries` to the new path as well. Otherwise Soulbeet starts an empty library for it, and beets no longer sees the tracks already there as duplicates.
 
 If you delete a music folder to start it over, delete its folder under `beets-libraries` too (for `/music/Person1`, `/data/beets-libraries/music/Person1`). Otherwise beets still lists the deleted tracks and skips them as duplicates.
+
+### Tracks whose file is gone
+
+Each Discovery profile folder (`Discovery/Balanced` and the others) has a library of its own too. Soulbeet drops a track from its folder's library when it deletes the file, and from its profile folder's library when a discovery track is removed, expires or is kept. On each start it also drops, from the library of each music folder and of each of its profile folders, the tracks whose file is gone. Only the library entries go: no file is touched. A library some of whose tracks are gone and none of whose tracks has its file there is left as it is, since a share that is not mounted looks the same, and so is a track in a folder Soulbeet cannot read.
 
 ### When the library database is locked
 

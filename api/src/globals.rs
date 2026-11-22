@@ -421,6 +421,7 @@ async fn run_automation() {
             (Some(folder), Some(expirable)) => {
                 let expired = crate::core::discovery::expire_in(
                     &crate::db::DB,
+                    &crate::import_queue::IMPORT_QUEUE,
                     &folder,
                     &lifetime_map,
                     now,

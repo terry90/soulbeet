@@ -317,8 +317,9 @@ async fn promote_discovery_track(
     };
     let call = args.as_value();
     let (db, effects, user) = (state.db.clone(), state.discovery.clone(), caller.ctx.id());
+    let queue = state.acquire.queue.clone();
     let work = async move {
-        let promoted = discovery::promote(&db, &effects, &user, &track_id, replace).await;
+        let promoted = discovery::promote(&db, &effects, &queue, &user, &track_id, replace).await;
         track_answer(&args, &track_id, promoted, "promoted")
     };
     let name = PROMOTE_DISCOVERY_TRACK.name;
@@ -337,9 +338,13 @@ async fn remove_discovery_track(
         Err(e) => return failed(e),
     };
     let call = args.as_value();
-    let (db, user) = (state.db.clone(), caller.ctx.id());
+    let (db, queue, user) = (
+        state.db.clone(),
+        state.acquire.queue.clone(),
+        caller.ctx.id(),
+    );
     let work = async move {
-        let removed = discovery::remove_in(&db, &user, &track_id).await;
+        let removed = discovery::remove_in(&db, &queue, &user, &track_id).await;
         track_answer(&args, &track_id, removed, "removed")
     };
     let name = REMOVE_DISCOVERY_TRACK.name;

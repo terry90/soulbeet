@@ -1,6 +1,6 @@
 //! A scripted importer and recording deps for the queue's tests.
 
-use super::QueueDeps;
+use super::{ImportQueue, QueueDeps};
 use crate::auth::UserId;
 use crate::core::delete_guard::test_support::FakeNavidrome;
 use crate::core::delete_guard::Guard;
@@ -12,7 +12,7 @@ use shared::download::{
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
     DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    ImportedItem, MusicImporter, Relocation, SkipReason, TaskCount,
+    ImportedItem, MusicImporter, PruneOutcome, Relocation, SkipReason, TaskCount,
 };
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
@@ -139,6 +139,8 @@ pub struct StubImporter {
     duplicate_runs: Mutex<Vec<DuplicateRun>>,
     forget_answer: Mutex<ForgetOutcome>,
     forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
+    prune_answer: Mutex<PruneOutcome>,
+    prunes: Mutex<Vec<PathBuf>>,
     relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
     relocate_answer: Mutex<Relocation>,
 }
@@ -160,6 +162,11 @@ impl StubImporter {
             duplicate_runs: Mutex::new(vec![]),
             forget_answer: Mutex::new(ForgetOutcome::Removed),
             forgets: Mutex::new(vec![]),
+            prune_answer: Mutex::new(PruneOutcome::Pruned {
+                removed: 0,
+                kept: 0,
+            }),
+            prunes: Mutex::new(vec![]),
             relocations: Mutex::new(vec![]),
             relocate_answer: Mutex::new(Relocation {
                 now: vec![],
@@ -203,6 +210,10 @@ impl StubImporter {
         *self.forget_answer.lock().unwrap() = outcome;
     }
 
+    pub fn script_prune(&self, outcome: PruneOutcome) {
+        *self.prune_answer.lock().unwrap() = outcome;
+    }
+
     pub fn script_relocate(&self, answer: Relocation) {
         *self.relocate_answer.lock().unwrap() = answer;
     }
@@ -231,6 +242,23 @@ impl StubImporter {
     /// Library and file of every forget, in call order.
     pub fn forgets(&self) -> Vec<(PathBuf, PathBuf)> {
         self.forgets.lock().unwrap().clone()
+    }
+
+    /// The forgets once there are `n` of them, which a spawned task queues; panics after 10 s.
+    pub async fn forgets_once(&self, n: usize) -> Vec<(PathBuf, PathBuf)> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.forgets.lock().unwrap().len() < n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the forgets never came");
+        self.forgets()
+    }
+
+    /// The library of every prune, in call order.
+    pub fn prunes(&self) -> Vec<PathBuf> {
+        self.prunes.lock().unwrap().clone()
     }
 
     /// The choice of every import, in call order.
@@ -331,6 +359,11 @@ impl MusicImporter for StubImporter {
             .unwrap()
             .push((library.to_path_buf(), file.to_path_buf()));
         self.forget_answer.lock().unwrap().clone()
+    }
+
+    async fn prune(&self, library: &Path) -> PruneOutcome {
+        self.prunes.lock().unwrap().push(library.to_path_buf());
+        self.prune_answer.lock().unwrap().clone()
     }
 
     fn health(&self) -> ImporterHealth {
@@ -450,6 +483,12 @@ impl QueueDeps for RecordingDeps {
             .expect("this test gives the import queue no delete guard");
         Guard::new(db, fake.as_ref(), None)
     }
+}
+
+/// A queue on a new StubImporter, whose removals no guard settles, and that importer.
+pub fn stub_queue() -> (ImportQueue, Arc<StubImporter>) {
+    let stub = Arc::new(StubImporter::new());
+    (ImportQueue::new(RecordingDeps::new(stub.clone())), stub)
 }
 
 /// Two users whose ids differ from any display name they could have.
