@@ -119,7 +119,8 @@ pub(crate) fn chosen_folder(id: Option<String>) -> Option<String> {
     id.filter(|id| !id.is_empty())
 }
 
-/// The user's own admin role, read here, is also what scan_by knows of their account.
+/// The user's own admin role, read here, is also what an import knows of their account; of the
+/// other linked accounts scan_by uses only what Navidrome said before.
 async fn navidrome_facts(db: &SqlitePool, ctx: &UserCtx) -> Option<NavidromeFacts> {
     let client = navidrome_client_for_user(&ctx.user_id).await.ok()?;
     let (user, scan) = tokio::join!(client.get_own_user(), client.get_scan_status());
@@ -129,7 +130,7 @@ async fn navidrome_facts(db: &SqlitePool, ctx: &UserCtx) -> Option<NavidromeFact
         Ok(admin) => {
             let id = ctx.id();
             SCAN_ROLES.learn(&id, &client, *admin, Instant::now());
-            scan_by(db, &ServerNavidrome, &SCAN_ROLES, &id, &client)
+            scan_by(db, &ServerNavidrome, &SCAN_ROLES, &id, *admin)
                 .await
                 .map_err(|e| e.failure(Stage::LibraryCheck, e.to_string()))
         }
@@ -578,6 +579,25 @@ mod tests {
         );
         let nobody = Value::Object(status_fields(&sample_facts(), &alice_caller(false)));
         let note = nobody["navidrome"]["scan_note"].as_str().unwrap();
+        assert!(note.contains("Navidrome's next own scan"), "{note}");
+    }
+
+    #[test]
+    fn a_scan_no_one_knows_yet_who_may_start_is_null_and_explained() {
+        let mut facts = sample_facts();
+        if let Some(navidrome) = facts.navidrome.as_mut() {
+            navidrome.scan_by = Ok(ScanBy::Unknown);
+        }
+        let doc = Value::Object(status_fields(&facts, &alice_caller(false)));
+        assert_eq!(
+            (
+                &doc["navidrome"]["can_trigger_scan"],
+                &doc["navidrome"]["can_trigger_scan_failure"],
+                &doc["navidrome"]["scan_note"]
+            ),
+            (&Value::Null, &Value::Null, &json!(ScanBy::Unknown.note()))
+        );
+        let note = ScanBy::Unknown.note();
         assert!(note.contains("Navidrome's next own scan"), "{note}");
     }
 

@@ -1706,13 +1706,13 @@ mod tests {
         own.answer("/rest/getScanStatus", &[IDLE]);
         own.answer("/api/song", &["[]"]);
         own.answer("/rest/getUser", &[&user_body(false)]);
-        other.answer("/rest/getUser", &[&user_body(true)]);
         let navidrome = NavidromeEach::of(&[(&user, &own), (&admin, &other)]);
         let mut runner = IndexRunner::default();
         index_round(&db, &ledger, &navidrome, &mut runner, 1_005).await;
         ledger.settled().await;
         assert_eq!(scans_asked(&own), 0);
-        assert_eq!(other.asked(), vec!["/rest/getUser", "/rest/startScan"]);
+        // The other account is asked only to scan.
+        assert_eq!(other.asked(), vec!["/rest/startScan"]);
         let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
             panic!()
         };
@@ -1736,7 +1736,7 @@ mod tests {
         index_round(&db, &ledger, &navidrome, &mut runner, 1_010).await;
         ledger.settled().await;
         assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
-        assert_eq!(other.asked().len(), 2);
+        assert_eq!(other.asked(), vec!["/rest/startScan"]);
     }
 
     #[tokio::test]

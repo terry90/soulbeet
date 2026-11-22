@@ -6,9 +6,10 @@
 //! whoever asks (scanner/controller.go:108-123, 149-183; persistence/library_repository.go:
 //! 276-281 reads them unfiltered). So when the user's own account may not start one, Soulbeet
 //! starts it with another linked account that may. Every linked account signs in to the one
-//! NAVIDROME_URL (services::navidrome_client_for_user), so all are on the user's server. Of
-//! another account Soulbeet only reads whether it is an admin, with its own getUser (SubsonicUser
-//! keeps adminRole only), and calls startScan: nothing of it reaches the user.
+//! NAVIDROME_URL (services::navidrome_client_for_user), so all are on the user's server. Whether
+//! the user's own account may is read with their own getUser (SubsonicUser keeps adminRole
+//! only). Another account is only ever sent startScan, and whether it may start one is learnt
+//! from that answer: nothing is read with it, and nothing of it reaches the user.
 
 use crate::auth::UserId;
 use crate::core::index::NavidromeOf;
@@ -98,17 +99,24 @@ pub(crate) enum ScanStart {
     NoAccount,
 }
 
-/// Whose account starts the scans after a user's imports.
+/// Whose account starts the scans after a user's imports, as far as Navidrome said.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ScanBy {
     Own,
     Another,
     Nobody,
+    /// The user's own account may not, and nothing is known yet of another linked one.
+    Unknown,
 }
 
 impl ScanBy {
-    pub(crate) fn can_scan(self) -> bool {
-        self != ScanBy::Nobody
+    /// Whether Soulbeet can start a scan after the user's imports; None while unknown.
+    pub(crate) fn can_scan(self) -> Option<bool> {
+        match self {
+            ScanBy::Own | ScanBy::Another => Some(true),
+            ScanBy::Nobody => Some(false),
+            ScanBy::Unknown => None,
+        }
     }
 
     /// What it means for the user's imports.
@@ -117,12 +125,14 @@ impl ScanBy {
             ScanBy::Own => "Your Navidrome account is an admin, so Soulbeet starts a Navidrome scan after your imports.",
             ScanBy::Another => "Your Navidrome account is not an admin, so Soulbeet starts the Navidrome scan after your imports with another linked account that is.",
             ScanBy::Nobody => "No Navidrome account linked to Soulbeet may start a scan, so new tracks appear at Navidrome's next own scan (its file watcher or scan schedule). Signing in to Soulbeet once as a Navidrome admin lets Soulbeet start one.",
+            ScanBy::Unknown => "Your Navidrome account is not an admin. Soulbeet learns at your next import whether another linked account may start the Navidrome scan; if none may, new tracks appear at Navidrome's next own scan (its file watcher or scan schedule).",
         }
     }
 }
 
-/// Starts a Navidrome scan for `user`, whose own client is `own`, with the account scanner gives.
-/// An account Navidrome refuses is noted as one that may not, and the next one is asked.
+/// Starts a Navidrome scan for `user`, whose own client is `own`: with their own account when it
+/// may, else with the other linked accounts other_scanners gives, in its order, until Navidrome
+/// takes one. An account Navidrome refuses is noted as one that may not.
 pub(crate) async fn start_scan_for(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -130,96 +140,96 @@ pub(crate) async fn start_scan_for(
     user: &UserId,
     own: &Arc<NavidromeClient>,
 ) -> Result<ScanStart, NavidromeLookupError> {
-    // Each refusal notes an account that may not, which scanner then passes over.
-    while let Some((by, client)) = scanner(db, navidrome, roles, user, own).await? {
-        match client.start_scan().await {
-            Ok(()) => {
-                roles.learn(&by, &client, true, Instant::now());
-                if by != *user {
-                    debug!("Started a Navidrome scan for {user} with the account of {by}");
-                }
-                return Ok(ScanStart::Started);
-            }
-            Err(e) if refused(&e, &by, user) => {
-                debug!("Navidrome does not let the account of {by} start a scan: {e}");
-                roles.learn(&by, &client, false, Instant::now());
-            }
-            Err(e) => return Err(NavidromeLookupError::Client(e)),
+    let own_may = may_scan(roles, user, own)
+        .await
+        .map_err(NavidromeLookupError::Client)?;
+    if own_may && scan_with(roles, user, own, user).await? {
+        return Ok(ScanStart::Started);
+    }
+    for (other, client, _) in other_scanners(db, navidrome, roles, user).await? {
+        if scan_with(roles, &other, &client, user).await? {
+            debug!("Started a Navidrome scan for {user} with the account of {other}");
+            return Ok(ScanStart::Started);
         }
     }
     Ok(ScanStart::NoAccount)
 }
 
-/// Whose account starts the scans after `user`'s imports, `own` their client.
+/// Whose account starts the scans after `user`'s imports, `admin` their own adminRole, from what
+/// Navidrome said of the other linked accounts alone: none is asked anything.
 pub(crate) async fn scan_by(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
     roles: &ScanRoles,
     user: &UserId,
-    own: &Arc<NavidromeClient>,
+    admin: bool,
 ) -> Result<ScanBy, NavidromeLookupError> {
-    Ok(match scanner(db, navidrome, roles, user, own).await? {
-        Some((by, _)) if by == *user => ScanBy::Own,
-        Some(_) => ScanBy::Another,
+    if admin {
+        return Ok(ScanBy::Own);
+    }
+    Ok(match other_scanners(db, navidrome, roles, user).await?.first() {
         None => ScanBy::Nobody,
+        Some((_, _, Some(true))) => ScanBy::Another,
+        Some(_) => ScanBy::Unknown,
     })
 }
 
-/// The first account that may start a scan for `user`: their own (`own`), else another linked
-/// one, those Navidrome last said may first. Another account that cannot be signed in with, or
-/// whose credentials Navidrome refuses, may not. Another failure reading one is the server's,
-/// which the user's own requests meet too: it is returned when no account may.
-async fn scanner(
+/// The other linked accounts that may start a scan for `user`, with what Navidrome last said of
+/// each: those it said may first, then those nothing is known of. Those it said may not, and
+/// those that cannot be signed in with, are left out. No request is made.
+async fn other_scanners(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
     roles: &ScanRoles,
     user: &UserId,
-    own: &Arc<NavidromeClient>,
-) -> Result<Option<(UserId, Arc<NavidromeClient>)>, NavidromeLookupError> {
-    if may_scan(roles, user, own)
-        .await
-        .map_err(NavidromeLookupError::Client)?
-    {
-        return Ok(Some((user.clone(), own.clone())));
-    }
+) -> Result<Vec<(UserId, Arc<NavidromeClient>, Option<bool>)>, NavidromeLookupError> {
     let linked = User::linked_to_navidrome_in(db)
         .await
         .map_err(NavidromeLookupError::Database)?;
+    let now = Instant::now();
     let mut others = Vec::new();
     for other in linked.iter().map(|u| UserId::new(&u.id)) {
         if other == *user {
             continue;
         }
         match navidrome.navidrome_of(&other).await {
-            Ok(client) => others.push((other, client)),
+            Ok(client) => {
+                let known = roles.known(&other, &client, now);
+                if known != Some(false) {
+                    others.push((other, client, known));
+                }
+            }
             Err(e) => debug!("The Navidrome account of {other} cannot start a scan: {e}"),
         }
     }
-    let now = Instant::now();
-    others.sort_by_key(|(other, client)| roles.known(other, client, now) != Some(true));
-    let mut failed = None;
-    for (other, client) in others {
-        match may_scan(roles, &other, &client).await {
-            Ok(true) => return Ok(Some((other, client))),
-            Ok(false) => {}
-            Err(e) if refused(&e, &other, user) => {
-                debug!("The Navidrome account of {other} cannot start a scan: {e}");
-                roles.learn(&other, &client, false, Instant::now());
-            }
-            Err(e) => {
-                debug!("Could not read whether the Navidrome account of {other} is an admin: {e}");
-                failed.get_or_insert(e);
-            }
+    others.sort_by_key(|(_, _, known)| *known != Some(true));
+    Ok(others)
+}
+
+/// Asks the account of `by`, signed in as `client`, to start a scan for `user`, and notes what
+/// Navidrome's answer says of it. Ok(false) when Navidrome refuses it.
+async fn scan_with(
+    roles: &ScanRoles,
+    by: &UserId,
+    client: &Arc<NavidromeClient>,
+    user: &UserId,
+) -> Result<bool, NavidromeLookupError> {
+    match client.start_scan().await {
+        Ok(()) => {
+            roles.learn(by, client, true, Instant::now());
+            Ok(true)
         }
-    }
-    match failed {
-        Some(e) => Err(NavidromeLookupError::Client(e)),
-        None => Ok(None),
+        Err(e) if refused(&e, by, user) => {
+            debug!("Navidrome does not let the account of {by} start a scan: {e}");
+            roles.learn(by, client, false, Instant::now());
+            Ok(false)
+        }
+        Err(e) => Err(NavidromeLookupError::Client(e)),
     }
 }
 
-/// Whether Navidrome lets `user`'s account signed in as `client` start a scan: what it said last,
-/// else its getUser adminRole.
+/// Whether Navidrome lets `user`'s own account signed in as `client` start a scan: what it said
+/// last, else its getUser adminRole.
 async fn may_scan(
     roles: &ScanRoles,
     user: &UserId,
@@ -277,7 +287,7 @@ mod tests {
     async fn an_admin_account_starts_its_own_scan_and_no_other_is_asked() {
         let db = crate::db::test_db::migrated().await;
         let (alice, bob) = (linked(&db, "alice").await, linked(&db, "bob").await);
-        let (own, other) = (account(true), account(true));
+        let (own, other) = (account(true), NavidromeStub::start());
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
         let roles = ScanRoles::default();
         let started =
@@ -288,46 +298,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_user_who_may_not_scan_has_it_started_by_a_linked_admin_who_is_asked_nothing_else() {
+    async fn a_user_who_may_not_scan_has_it_started_by_a_linked_admin_who_is_asked_only_to_scan() {
         let db = crate::db::test_db::migrated().await;
         let (alice, bob, carol) = (
             linked(&db, "alice").await,
             linked(&db, "bob").await,
             linked(&db, "carol").await,
         );
-        let (own, plain, admin) = (account(false), account(false), account(true));
+        let (own, plain, admin) = (account(false), NavidromeStub::start(), NavidromeStub::start());
+        plain.answer("/rest/startScan", &[&subsonic_failed(REFUSED.0, REFUSED.1)]);
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &plain), (&carol, &admin)]);
         let roles = ScanRoles::default();
         let own_client = navidrome.client(&alice);
+        assert_eq!(
+            scan_by(&db, &navidrome, &roles, &alice, false)
+                .await
+                .unwrap(),
+            ScanBy::Unknown
+        );
         let started = start_scan_for(&db, &navidrome, &roles, &alice, &own_client).await;
         assert_eq!(started.unwrap(), ScanStart::Started);
         assert_eq!(own.asked(), vec!["/rest/getUser"]);
-        // bob is asked whether he is an admin when the database lists him before carol.
+        // bob is asked first when the database lists him before carol, and refuses.
         let plain_asked = plain.asked();
-        assert!(plain_asked.iter().all(|path| path == "/rest/getUser"));
+        assert!(plain_asked.iter().all(|path| path == "/rest/startScan"));
         assert!(plain_asked.len() <= 1, "{plain_asked:?}");
-        assert_eq!(admin.asked(), vec!["/rest/getUser", "/rest/startScan"]);
+        assert_eq!(admin.asked(), vec!["/rest/startScan"]);
         // Known now: the next import asks only the admin, and only to scan.
         let again = start_scan_for(&db, &navidrome, &roles, &alice, &own_client).await;
         assert_eq!(again.unwrap(), ScanStart::Started);
         assert_eq!((own.asked().len(), plain.asked()), (1, plain_asked));
+        assert_eq!(admin.asked(), vec!["/rest/startScan", "/rest/startScan"]);
         assert_eq!(
-            admin.asked(),
-            vec!["/rest/getUser", "/rest/startScan", "/rest/startScan"]
-        );
-        assert_eq!(
-            scan_by(&db, &navidrome, &roles, &alice, &own_client)
+            scan_by(&db, &navidrome, &roles, &alice, false)
                 .await
                 .unwrap(),
             ScanBy::Another
         );
+        assert_eq!(admin.asked().len(), 2);
     }
 
     #[tokio::test]
     async fn with_no_admin_no_scan_is_asked_for_and_navidrome_is_not_asked_again() {
         let db = crate::db::test_db::migrated().await;
         let (alice, bob) = (linked(&db, "alice").await, linked(&db, "bob").await);
-        let (own, other) = (account(false), account(false));
+        let (own, other) = (account(false), NavidromeStub::start());
+        other.answer("/rest/startScan", &[&subsonic_failed(REFUSED.0, REFUSED.1)]);
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
         let roles = ScanRoles::default();
         let own_client = navidrome.client(&alice);
@@ -336,13 +352,41 @@ mod tests {
             assert_eq!(started.unwrap(), ScanStart::NoAccount);
         }
         assert_eq!(own.asked(), vec!["/rest/getUser"]);
-        assert_eq!(other.asked(), vec!["/rest/getUser"]);
+        assert_eq!(other.asked(), vec!["/rest/startScan"]);
         assert_eq!(
-            scan_by(&db, &navidrome, &roles, &alice, &own_client)
+            scan_by(&db, &navidrome, &roles, &alice, false)
                 .await
                 .unwrap(),
             ScanBy::Nobody
         );
+        assert_eq!(other.asked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn status_says_from_what_is_known_alone_who_starts_the_scans() {
+        let db = crate::db::test_db::migrated().await;
+        let alice = linked(&db, "alice").await;
+        let (own, other) = (NavidromeStub::start(), NavidromeStub::start());
+        let roles = ScanRoles::default();
+        let alone = NavidromeEach::of(&[(&alice, &own)]);
+        let by = scan_by(&db, &alone, &roles, &alice, true).await;
+        assert_eq!(by.unwrap(), ScanBy::Own);
+        let by = scan_by(&db, &alone, &roles, &alice, false).await;
+        assert_eq!(by.unwrap(), ScanBy::Nobody);
+        // Nothing is known of bob's account until an import sends it startScan.
+        let bob = linked(&db, "bob").await;
+        let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
+        let by = scan_by(&db, &navidrome, &roles, &alice, false).await;
+        assert_eq!(by.unwrap(), ScanBy::Unknown);
+        assert_eq!(ScanBy::Unknown.can_scan(), None);
+        let bob_client = navidrome.client(&bob);
+        roles.learn(&bob, &bob_client, false, Instant::now());
+        let by = scan_by(&db, &navidrome, &roles, &alice, false).await;
+        assert_eq!(by.unwrap(), ScanBy::Nobody);
+        roles.learn(&bob, &bob_client, true, Instant::now());
+        let by = scan_by(&db, &navidrome, &roles, &alice, false).await;
+        assert_eq!(by.unwrap(), ScanBy::Another);
+        assert!(own.asked().is_empty() && other.asked().is_empty());
     }
 
     #[tokio::test]
@@ -350,7 +394,7 @@ mod tests {
         let db = crate::db::test_db::migrated().await;
         let (alice, bob) = (linked(&db, "alice").await, linked(&db, "bob").await);
         // alice's getUser still says admin, as Navidrome said before she lost the role.
-        let (own, other) = (account(true), account(true));
+        let (own, other) = (account(true), NavidromeStub::start());
         own.answer("/rest/startScan", &[&subsonic_failed(REFUSED.0, REFUSED.1)]);
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
         let roles = ScanRoles::default();
@@ -358,7 +402,7 @@ mod tests {
         let started = start_scan_for(&db, &navidrome, &roles, &alice, &own_client).await;
         assert_eq!(started.unwrap(), ScanStart::Started);
         assert_eq!(own.asked(), vec!["/rest/getUser", "/rest/startScan"]);
-        assert_eq!(other.asked(), vec!["/rest/getUser", "/rest/startScan"]);
+        assert_eq!(other.asked(), vec!["/rest/startScan"]);
         assert_eq!(
             roles.known(&alice, &own_client, Instant::now()),
             Some(false)
@@ -371,7 +415,7 @@ mod tests {
         let (alice, bob) = (linked(&db, "alice").await, linked(&db, "bob").await);
         let (own, other) = (account(false), NavidromeStub::start());
         other.answer(
-            "/rest/getUser",
+            "/rest/startScan",
             &[&subsonic_failed(40, "Wrong username or password")],
         );
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
@@ -379,13 +423,14 @@ mod tests {
         let own_client = navidrome.client(&alice);
         let started = start_scan_for(&db, &navidrome, &roles, &alice, &own_client).await;
         assert_eq!(started.unwrap(), ScanStart::NoAccount);
+        assert_eq!(other.asked(), vec!["/rest/startScan"]);
         assert_eq!(
             roles.known(&bob, &navidrome.client(&bob), Instant::now()),
             Some(false)
         );
         // Navidrome's internal error says nothing of bob's account: the next import asks again.
         let (own, other) = (account(false), NavidromeStub::start());
-        other.answer("/rest/getUser", &[&subsonic_failed(0, "Internal error")]);
+        other.answer("/rest/startScan", &[&subsonic_failed(0, "Internal error")]);
         let navidrome = NavidromeEach::of(&[(&alice, &own), (&bob, &other)]);
         let own_client = navidrome.client(&alice);
         let failed = start_scan_for(&db, &navidrome, &roles, &alice, &own_client).await;
