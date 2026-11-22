@@ -132,6 +132,12 @@ pub struct SearchStats {
     pub not_audio: u32,
     /// Audio files scored below the floor, kept or not.
     pub below_floor: u32,
+    /// The texts the backend sent after `query_text` drew no response at all, in order; the
+    /// counts are those of the last text sent.
+    pub retried_texts: Vec<String>,
+    /// Why a search no source answered may have found nothing, in the backend's words; None
+    /// when a source answered or the backend has nothing to add.
+    pub unanswered_note: Option<String>,
 }
 
 /// A group of downloadable items (e.g., album from one source)
@@ -643,6 +649,7 @@ mod tests {
             (stats.file_count, stats.not_audio, stats.below_floor),
             (23, 0, 0)
         );
+        assert!(stats.retried_texts.is_empty() && stats.unanswered_note.is_none());
         let facts: FileFacts = serde_json::from_str(r#"{"extension": "flac"}"#).unwrap();
         assert_eq!(
             facts,

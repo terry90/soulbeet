@@ -741,6 +741,7 @@ mod tests {
                 locked_file_count: 2,
                 not_audio: 3,
                 below_floor: 20,
+                ..Default::default()
             },
             ..search_result("search", SearchState::Completed, vec![])
         })]);
