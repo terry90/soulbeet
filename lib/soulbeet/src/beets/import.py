@@ -74,6 +74,7 @@ import beets.ui
 from beets import config, util
 from beets.autotag.hooks import AlbumMatch
 from beets.autotag.match import Recommendation
+from beets.dbcore import types
 from beets.importer import Action
 from beets.importer.tasks import ImportTask, ImportTaskFactory, SingletonImportTask
 from beets.plugins import BeetsPlugin
@@ -205,7 +206,9 @@ class KnownTags(BeetsPlugin):
     one, or "0000" for a year of 0 (mediafile/fields.py _set_date_tuple). It
     deletes a tag whose value is None instead, the file's old one included
     (MediaFile.update), so a value beets stores as it stores the null goes as
-    None. That takes in [""], which a list type stores as "", like [].
+    None. That takes in [""], which a list type stores as "", like [], and
+    the "" a file's empty initial key reads as, though MusicalKey's null is
+    None (dbcore/types.py MusicalKey).
 
     Item.write sends the write event before it opens the file, for each write
     in the run, the plugins' own (scrub, embedart, replaygain...) included.
@@ -231,10 +234,11 @@ class KnownTags(BeetsPlugin):
     def leave_out_nulls(self, item, tags):
         for key, value in tags.items():
             kind = item._type(key)
-            if (
-                value is not None
-                and not isinstance(kind.null, bool)
-                and kind.to_sql(value) == kind.to_sql(kind.null)
+            if value is None or isinstance(kind.null, bool):
+                continue
+            # A String whose null is None (MusicalKey) still reads "" from a file.
+            if kind.to_sql(value) == kind.to_sql(kind.null) or (
+                isinstance(kind, types.String) and value == ""
             ):
                 tags[key] = None
 

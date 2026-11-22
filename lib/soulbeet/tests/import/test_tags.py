@@ -16,6 +16,7 @@ VORBIS = {
     "bpm": "bpm",
     "arranger": "arranger",
     "grouping": "grouping",
+    "initial_key": "initialkey",
     "comp": "compilation",
     "rg_track_gain": "replaygain_track_gain",
     "r128_track_gain": "r128_track_gain",
@@ -46,6 +47,7 @@ KEYS = {
         "bpm": "tmpo",
         "arranger": "----:com.apple.iTunes:Arranger",
         "grouping": "\xa9grp",
+        "initial_key": "----:com.apple.iTunes:initialkey",
         "comp": "cpil",
         "rg_track_gain": "----:com.apple.iTunes:replaygain_track_gain",
         "r128_track_gain": "----:com.apple.iTunes:R128_TRACK_GAIN",
@@ -55,8 +57,14 @@ KEYS = {
 MATCHED = {"title": "Song Number 1", "artist": "Zzqx Artist"}
 
 # Values with no meaning a tagger leaves behind. mutagen does not save an
-# empty ID3 text frame, so the mp3 has no empty grouping.
-PLACEHOLDERS = {"original_date": "0000", "bpm": "0", "arranger": "", "grouping": ""}
+# empty ID3 text frame, so the mp3 has no empty grouping or initial key.
+PLACEHOLDERS = {
+    "original_date": "0000",
+    "bpm": "0",
+    "arranger": "",
+    "grouping": "",
+    "initial_key": "",
+}
 
 # Real values, among them a year alone (month and day unknown) and zero gains.
 REAL = {
