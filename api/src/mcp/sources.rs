@@ -54,7 +54,7 @@ pub(crate) const FIND_SOURCES: ToolSpec = ToolSpec {
     title: "Find download sources",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Searches the download backend (slskd, the Soulseek network) for a track or an album and ranks what it finds. Takes a reference ({{artist, title, album?, recording_mbid?, duration_s?}} for a track, or {{kind: \"album\", artist, title, release_mbid}} for an album, whose tracklist is read from MusicBrainz), optional query_text to send instead of \"artist title\", quality filters (formats, min_bitrate_kbps, lossless_only, max_queue_length) and include_below_floor to keep weak matches, flagged. Returns candidates with candidate_id, source, remote file or folder, extension, size, bitrate, sample rate, bit depth, duration and its difference from the wanted one, match and quality scores, for albums the tracks found and the missing titles, folder_track_count (the audio files of its folder in the source's answer: a source answers only files whose path holds every word searched, so a track search counts about one), the source's free slot, speed, queue and its failed transfers in the last 24 hours (3 or more: flagged, never picked automatically). Waits up to 45 seconds; a longer search answers state pending with search_id for get_sources. Searches run one at a time for the whole server, every user's included: pending says how many run or wait before this one (searches_ahead), and a user with {FINDS_WAITING_PER_USER} searches waiting is answered rate_limited with their search_ids. A repeat with the same request_key answers the first call's result instead of searching again, unless that call was refused before its search started: then the repeat runs. Search ids and candidate ids stay valid 24 hours. Failure codes: {common}, backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), search_no_results (nothing on the network), search_all_filtered (found, but scored out or filtered; the facts say how many of each), search_timeout, search_query_rejected, search_already_running, search_lost, search_rate_limited, already_running (a call with this request_key still runs).")
+        format!("Searches the download backend (slskd, the Soulseek network) for a track or an album and ranks what it finds. Takes a reference ({{artist, title, album?, recording_mbid?, duration_s?}} for a track, or {{kind: \"album\", artist, title, release_mbid}} for an album, whose tracklist is read from MusicBrainz), optional query_text to send instead of \"artist title\", quality filters (formats, min_bitrate_kbps, lossless_only, max_queue_length) and include_below_floor to keep weak matches, flagged. The Soulseek server silently drops searches that contain a phrase on its exclusion list (often a well known artist name or title), so they get no response at all; Soulbeet then searches again with wildcards on its own (facts.query_texts_retried). In a query_text of your own, a word can be written with * in place of its first letter (\"*GMT Kids\", \"Ella Fitzgerald *inter Wonderland\") or left out. Returns candidates with candidate_id, source, remote file or folder, extension, size, bitrate, sample rate, bit depth, duration and its difference from the wanted one, match and quality scores, for albums the tracks found and the missing titles, folder_track_count (the audio files of its folder in the source's answer: a source answers only files whose path holds every word searched, so a track search counts about one), the source's free slot, speed, queue and its failed transfers in the last 24 hours (3 or more: flagged, never picked automatically). Waits up to 45 seconds; a longer search answers state pending with search_id for get_sources. Searches run one at a time for the whole server, every user's included: pending says how many run or wait before this one (searches_ahead), and a user with {FINDS_WAITING_PER_USER} searches waiting is answered rate_limited with their search_ids. A repeat with the same request_key answers the first call's result instead of searching again, unless that call was refused before its search started: then the repeat runs. Search ids and candidate ids stay valid 24 hours. Failure codes: {common}, backend_not_configured, backend_unreachable, metadata_not_found, metadata_unavailable (album tracklist), search_no_results (nothing on the network; when no peer answered at all, the message says the server may be blocking the search), search_all_filtered (found, but scored out or filtered; the facts say how many of each), search_timeout, search_query_rejected, search_already_running, search_lost, search_rate_limited, already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["reference"], "properties": {"reference": "#,
@@ -790,6 +790,60 @@ mod tests {
                 {"tool": "find_sources", "args": {"reference": reference}, "needs": ["query_text"]}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn a_search_no_peer_answered_says_the_server_may_block_it_and_what_was_retried() {
+        let (db, acq, effects, token) = app_with_acquire().await;
+        effects.stub().script_polls(vec![Ok(SearchResult {
+            stats: SearchStats {
+                query_text: "Marrow Choir O Holy Night".into(),
+                retried_texts: vec![
+                    "*arrow Choir O *oly Night".into(),
+                    "Marrow *hoir O Holy *ight".into(),
+                ],
+                unanswered_note: Some("The server may be blocking this one.".into()),
+                ..Default::default()
+            },
+            ..search_result("search", SearchState::Completed, vec![])
+        })]);
+        let reference = json!({"artist": "Marrow Choir", "title": "O Holy Night"});
+        let result = call_tool(
+            app_of(&db, &acq),
+            &token,
+            "find_sources",
+            json!({"reference": reference}),
+        )
+        .await;
+        let error = &document(&result)["error"];
+        assert_eq!(
+            (error["code"].as_str(), error["message"].as_str()),
+            (
+                Some("search_no_results"),
+                Some("No results found. The server may be blocking this one.")
+            )
+        );
+        assert_eq!(
+            error["facts"]["query_texts_retried"],
+            json!(["*arrow Choir O *oly Night", "Marrow *hoir O Holy *ight"])
+        );
+        let reference = json!({"kind": "track", "artist": "Marrow Choir", "title": "O Holy Night"});
+        assert_eq!(
+            error["next"],
+            json!([{"tool": "find_sources", "args": {"reference": reference}, "needs": ["query_text"]}])
+        );
+    }
+
+    /// The user asked for it: a client learns that the server drops searches and how to word
+    /// a search around it.
+    #[test]
+    fn the_wildcard_advice_is_in_the_instructions_and_the_free_text_tools() {
+        use crate::mcp::jobs::RETRY_JOB;
+        use crate::mcp::server::INSTRUCTIONS;
+        assert!(INSTRUCTIONS.contains("exclusion list") && INSTRUCTIONS.contains("*GMT Kids"));
+        let find = (FIND_SOURCES.description)(120);
+        assert!(find.contains("exclusion list") && find.contains("\"*GMT Kids\""));
+        assert!((RETRY_JOB.description)(120).contains("wildcards as find_sources describes"));
     }
 
     #[tokio::test]

@@ -308,7 +308,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Downloads
 
-- `find_sources`: searches Soulseek through slskd for a track or an album and ranks what it finds; searches run one at a time for the whole server.
+- `find_sources`: searches Soulseek through slskd for a track or an album and ranks what it finds; searches run one at a time for the whole server. A search no peer answers at all is sent again with wildcards (see [Known limits](#known-limits)), and `facts.query_texts_retried` lists the texts sent after `query_text_sent`.
 - `get_sources`: reads a search `find_sources` started, a page at a time.
 - `get_jobs`: shows jobs by id or by batch: state, current download, earlier attempts, import, and the calls that can be made next.
 - `get_batch`: follows a batch, and can wait up to 30 seconds for a change; for a batch with a playlist, how far the playlist is.
@@ -497,7 +497,7 @@ The ones you are most likely to see:
 | `settings_unreadable` | any | Soulbeet could not read its own database. | Check the server's disk and log; try again later. |
 | `backend_response_unreadable` | `source_search`, `enqueue`, `transfer`, `metadata` | slskd, or MusicBrainz, answered something Soulbeet cannot read. For slskd, user action `update_soulful_or_backend`. | Update Soulbeet or slskd so that their versions match. |
 | `search_rate_limited` | `source_search` | slskd refused the search for too many requests. | Try again later. |
-| `search_no_results` | `source_search` | Nothing on the Soulseek network matched. | Search with other words. |
+| `search_no_results` | `source_search` | Nothing on the Soulseek network matched, or the Soulseek server dropped the search. When no peer answered at all, even with the wildcards Soulbeet tried, the message says the server may be blocking it. | Search with other words: write a word with `*` in place of its first letter (`*GMT Kids`), or leave a word out. |
 | `search_all_filtered` | `source_search` | Results came back, but each one scored too low or was cut by the filters; the facts count each. | Loosen the filters (for example `lossless_only`) or change the query. |
 | `search_timeout` | `source_search` | The search did not end in time. | Try again later. |
 | `search_query_rejected` | `source_search` | slskd refused the search text as unusable, for example one of exclusion terms only. | Search with other words. |
@@ -616,24 +616,25 @@ Downloads and imports:
 18. A kept import stored before its files were recorded has none: `dismiss_job` and `resolve_import` with `discard` end it and delete nothing.
 19. A kept import stays on disk until someone decides it, as in the web page. A file the system refuses to delete stays too and is listed in `files_left`.
 20. beets reports every file of a run; a kept import keeps the first 200 and counts the rest in `files_omitted`.
+21. The Soulseek server keeps a list of excluded phrases and silently drops every search that holds all the words of one of them, in any order. slskd receives the list but exposes it through no API, so such a search looks like one with no response at all. When no peer answers, Soulbeet sends the search again, at most twice, with some words written as wildcards (`*` in place of the first letter, which the server does not match against the list): first every other word of the artist and of the title, starting with the first (`*lla Fitzgerald *inter Wonderland`), then the others. A word of one character is never a wildcard, and a text of three words or more keeps one plain word, since peers answer junk to wildcards alone. Each search that gets no answer takes about 15 seconds. Discovery stops searching for a track whose search found nothing in 3 runs.
 
 Ratings, discovery and playlists:
 
-21. A connected app's rating is refused when it could lead to a deletion later, whatever its switch and your settings: a 1-star song rating, and any rating of a pending discovery track other than clearing it. No app can change the discovery folder or the promote threshold. While you have pending discovery tracks, a rating also needs Soulbeet to find the song's file, and is refused when it cannot (the music folder or `NAVIDROME_MUSIC_PATH` is wrong).
-22. Navidrome's scanner can give a newly staged discovery file the id and rating of a missing library song. An app's earlier 5-star rating of that song then reads as the track's, and the next sync, yours or the 6-hourly one, promotes the track and replaces any earlier copy as Soulbeet's own deletion, outside the app's daily limit. This is rare and not closed.
-23. A batch whose playlist could not begin, and whose removal then failed, shows in `list_batches` until it is pruned, 30 days after it was made.
+22. A connected app's rating is refused when it could lead to a deletion later, whatever its switch and your settings: a 1-star song rating, and any rating of a pending discovery track other than clearing it. No app can change the discovery folder or the promote threshold. While you have pending discovery tracks, a rating also needs Soulbeet to find the song's file, and is refused when it cannot (the music folder or `NAVIDROME_MUSIC_PATH` is wrong).
+23. Navidrome's scanner can give a newly staged discovery file the id and rating of a missing library song. An app's earlier 5-star rating of that song then reads as the track's, and the next sync, yours or the 6-hourly one, promotes the track and replaces any earlier copy as Soulbeet's own deletion, outside the app's daily limit. This is rare and not closed.
+24. A batch whose playlist could not begin, and whose removal then failed, shows in `list_batches` until it is pruned, 30 days after it was made.
 
 The delete tools:
 
-24. A song added or removed while `find_duplicates` reads, or with Navidrome's `RecentlyAddedByModTime` a file that changes, can shift Navidrome's pages, and the search then fails with `navidrome_unreachable` ("Navidrome counts {total} songs, and its pages held {read}. Search again."). A song removed while it reads can let another pass unseen, so search again after deleting.
-25. A deletion whose task stopped before it reported is recorded outside the day's count, so an app's count can reach 101 once.
-26. `replace_existing` replaces only for track items whose previewed file is inside the folder the jobs import into. A previewed copy beets finds no duplicate of stays and is listed in `not_replaced`, as is every copy a job did not replace within its 24 hours.
-27. `preview_delete_tracks`, `delete_tracks` and `get_deletion_history` show the absolute paths of the files, which are in the user's own folders.
+25. A song added or removed while `find_duplicates` reads, or with Navidrome's `RecentlyAddedByModTime` a file that changes, can shift Navidrome's pages, and the search then fails with `navidrome_unreachable` ("Navidrome counts {total} songs, and its pages held {read}. Search again."). A song removed while it reads can let another pass unseen, so search again after deleting.
+26. A deletion whose task stopped before it reported is recorded outside the day's count, so an app's count can reach 101 once.
+27. `replace_existing` replaces only for track items whose previewed file is inside the folder the jobs import into. A previewed copy beets finds no duplicate of stays and is listed in `not_replaced`, as is every copy a job did not replace within its 24 hours.
+28. `preview_delete_tracks`, `delete_tracks` and `get_deletion_history` show the absolute paths of the files, which are in the user's own folders.
 
 Proxies and MCP clients:
 
-28. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. The assistant follows long work by calling again.
-29. `get_tag_tracks` (tracks of a genre or tag from ListenBrainz) is not built.
+29. A tool call waits at most 30 seconds for running work, since claude.ai was seen to drop a call after 90 seconds and many proxies end a silent answer after 60. The assistant follows long work by calling again.
+30. `get_tag_tracks` (tracks of a genre or tag from ListenBrainz) is not built.
 
 ## Security
 

@@ -217,7 +217,8 @@ async fn poll_backend_search(
 }
 
 /// Why a search of `first` and `rest` found nothing: when any backend
-/// finished, an empty search, or one whose files were all scored out when its
+/// finished, an empty search, with what the backend says of a search no
+/// source answered, or one whose files were all scored out when its
 /// responses held files; else a timeout when any timed out, else the first
 /// backend's own failure.
 fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
@@ -243,12 +244,20 @@ fn no_results_failure(first: &SearchStop, rest: &[SearchStop]) -> Failure {
             MESSAGE,
         ),
         SearchStop::Finished {
-            stats: SearchStats { file_count: 0, .. },
+            stats:
+                SearchStats {
+                    file_count: 0,
+                    unanswered_note,
+                    ..
+                },
         } => Failure::new(
             FailureCode::SearchNoResults,
             Stage::SourceSearch,
             RetryAdvice::OtherQuery,
-            MESSAGE,
+            match unanswered_note {
+                Some(note) => format!("{MESSAGE}. {note}"),
+                None => MESSAGE.to_string(),
+            },
         ),
         SearchStop::TimedOut => Failure::new(
             FailureCode::SearchTimeout,
@@ -1110,6 +1119,28 @@ mod tests {
         assert_eq!(
             no_results_failure(&finished_empty(), &[]).code,
             FailureCode::SearchNoResults
+        );
+    }
+
+    /// The backend knows why no source may have answered (slskd: the Soulseek server drops
+    /// searches holding an excluded phrase); the failure says it in the backend's words.
+    #[test]
+    fn an_empty_search_no_source_answered_says_what_the_backend_says_of_it() {
+        let unanswered = SearchStop::Finished {
+            stats: SearchStats {
+                retried_texts: vec!["*GMT *ids".into()],
+                unanswered_note: Some("The server may be blocking this one.".into()),
+                ..Default::default()
+            },
+        };
+        let f = no_results_failure(&unanswered, &[]);
+        assert_eq!(
+            (f.code, f.retry, f.message.as_str()),
+            (
+                FailureCode::SearchNoResults,
+                RetryAdvice::OtherQuery,
+                "No results found. The server may be blocking this one."
+            )
         );
     }
 
