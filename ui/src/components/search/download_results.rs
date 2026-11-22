@@ -66,6 +66,8 @@ fn quality_badge(item: &DownloadableItem) -> Element {
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     pub results: Vec<DownloadableGroup>,
+    /// Shown under "No results found": why no source may have answered.
+    pub unanswered_note: Option<String>,
     pub is_searching: bool,
     pub is_downloading: Signal<bool>,
     #[props(into)]
@@ -313,7 +315,12 @@ pub fn DownloadResults(props: Props) -> Element {
                         }
                     }
                 } else if results.is_empty() {
-                    div { class: "text-center text-gray-500 py-8 font-mono", "No results found" }
+                    div { class: "text-center text-gray-500 py-8 font-mono",
+                        p { "No results found" }
+                        if let Some(note) = &props.unanswered_note {
+                            p { class: "text-sm mt-2", "{note}" }
+                        }
+                    }
                 }
                 for (idx, album) in results.iter().enumerate() {
                     AlbumResultItem {

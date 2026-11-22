@@ -31,6 +31,7 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
     let choices = SourceChoices {
         search_id: toast.search_id.clone(),
         groups: toast.results.clone(),
+        unanswered_note: None,
     };
 
     rsx! {
