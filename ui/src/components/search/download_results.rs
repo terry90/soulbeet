@@ -143,7 +143,7 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                             }
                         }
                     }
-                    p { class: "text-sm text-gray-400 font-mono",
+                    p { class: "mt-1 text-sm text-gray-400 font-mono",
                         "{album.artist.clone().unwrap_or_default()} - Quality: {album.quality}, Score: {album.score:.2}"
                     }
                 }
