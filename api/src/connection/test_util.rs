@@ -27,6 +27,7 @@ use crate::core::discovery::test_support::TestDiscovery;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::runner::{Acquire, TestEffects};
 use crate::core::ratings::{sync_running, AutoDeletePermit, SyncReport};
+use crate::core::scan::ScanBy;
 use crate::db::test_db;
 use crate::ledger::store::RunningBatch;
 use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource};
@@ -685,8 +686,8 @@ impl RatingSync for FixedSync {
 }
 
 /// A status where everything answers: slskd online, beets degraded by Soulful's
-/// own probe issue, alice not a Navidrome admin, one default folder inside the
-/// one known library root, one running batch.
+/// own probe issue, alice not a Navidrome admin and no linked account one, one
+/// default folder inside the one known library root, one running batch.
 pub(crate) fn sample_facts() -> StatusFacts {
     StatusFacts {
         health: SystemHealth {
@@ -707,6 +708,7 @@ pub(crate) fn sample_facts() -> StatusFacts {
         },
         navidrome: Some(NavidromeFacts {
             admin: Ok(false),
+            scan_by: Ok(ScanBy::Nobody),
             scan: Ok(ScanStatus {
                 scanning: false,
                 count: 1342,

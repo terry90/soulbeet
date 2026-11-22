@@ -211,6 +211,12 @@ How accounts appear depends on `REGISTRATION` (see [configuration.md](configurat
 
 A user whose account is not linked to Navidrome can still use the tools that do not read Navidrome; those that do answer `navidrome_not_linked`.
 
+## Navidrome scans
+
+After an import Soulbeet waits until Navidrome lists the new files, and asks Navidrome to scan when it does not yet. Navidrome lets only its admins start a scan, and a scan covers every library for every user. So when your own Navidrome account is not an admin, Soulbeet starts the scan with the account of another Soulbeet user linked to the same Navidrome who is an admin there. Every linked account signs in to the one `NAVIDROME_URL`. With that account Soulbeet only reads whether it is an admin and starts the scan; nothing else is read with it, and nothing of it is shown to you. The wait still reads the scan with your own account.
+
+Soulbeet remembers what Navidrome said of each account for 15 minutes, so it does not ask before every import. A user made an admin in Navidrome is used within 15 minutes, a new Navidrome password or sign-in makes Soulbeet ask again at once, and an account deleted in Soulbeet is no longer used. An account whose stored password Navidrome refuses is passed over. When no linked account is an admin, Soulbeet sends no scan request and logs no warning: new tracks appear at Navidrome's next own scan, by its file watcher or its scan schedule. `get_status` says which case holds: `can_trigger_scan` and `scan_note` ("Your Navidrome account is an admin, ...", "Your Navidrome account is not an admin, so Soulbeet starts the Navidrome scan after your imports with another linked account that is.", or "No Navidrome account linked to Soulbeet may start a scan, so new tracks appear at Navidrome's next own scan (its file watcher or scan schedule). ..."). To let Soulbeet scan, sign in to Soulbeet once as a Navidrome admin.
+
 ## Connected apps
 
 **Settings > Users > Connected apps** lists the apps you connected. Each row shows the app's host (for example `claude.ai`), "It calls itself "{name}"." when the app gave a name, "Last used {date}" or "Never used", the **Allow deleting music** box (only on your own apps) and **Disconnect**.
@@ -280,7 +286,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Status, settings and folders
 
-- `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
+- `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, whether Soulbeet can start a Navidrome scan after the user's imports (`can_trigger_scan`, with `scan_note` saying how, see [Navidrome scans](#navidrome-scans)), the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
 - `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings, with `discovery.deezer_recommendations` (whether the names of artists the user plays go to Deezer).
 - `list_folders`: the user's library folders with ids, paths, free space, whether shared, `in_navidrome`, and which is the default.
 
@@ -532,7 +538,7 @@ The ones you are most likely to see:
 | `import_choice_invalid` | `input`, `import` | The chosen candidate is not one beets found, or a MusicBrainz link names the wrong kind of entry. | Choose again. |
 | `import_files_gone` | `import` | The downloaded files kept for the decision were deleted. | Dismiss the job, or download again. |
 | `index_not_found_after_scan` | `index` | Navidrome scanned after the import and does not list the file. | Check that a Navidrome library holds the folder (`in_navidrome`), then retry with `index_only`. |
-| `index_no_scan_possible` | `index` | Navidrome has not scanned for 10 minutes since the import, and this account cannot start a scan. User action `enable_indexing`. | Make the Navidrome account an admin, turn on Navidrome's file watcher, or set a scan schedule. |
+| `index_no_scan_possible` | `index` | Navidrome has not scanned for 10 minutes since the import, and no Navidrome account linked to Soulbeet may start a scan. User action `enable_indexing`. | Sign in to Soulbeet once as a Navidrome admin, turn on Navidrome's file watcher, or set a scan schedule. |
 | `scan_failed` | `index` | Navidrome's scan failed. | Try again later. |
 | `playlist_not_found` | `playlist` | No such playlist, or another user's private one. | List the playlists again. |
 | `playlist_not_owner` | `playlist` | Only the owner of the playlist can change it. | Make a copy of your own. |
@@ -572,7 +578,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 | `relink_navidrome` | "Enter your current Navidrome password under Connect Navidrome", "Sign in to Soulbeet once as a Navidrome admin, so Soulbeet can list Navidrome's users", or "Have every Navidrome user sign in to Soulbeet once, so Soulbeet can read their ratings" | "Soulbeet's Settings > Users" for the first, "Soulbeet sign-in" for the others |
 | `configure_navidrome` | "Set NAVIDROME_URL to the address of your Navidrome server", "Make Navidrome's music folder readable by Soulbeet at Navidrome's library path, or set NAVIDROME_MUSIC_PATH to where Soulbeet sees Navidrome's default library", or "Give every Navidrome account linked to Soulbeet access to this track's library, so Soulbeet can read their ratings of it" | "Soulbeet's environment", or "Navidrome's user settings" |
 | `enable_deletion` | "Allow deleting music for this app" | "Settings > Users > Connected apps" |
-| `enable_indexing` | "Make this Navidrome account an admin, enable Navidrome's file watcher, or set a scan schedule" | "Navidrome" |
+| `enable_indexing` | "Sign in to Soulbeet once as a Navidrome admin, enable Navidrome's file watcher, or set a scan schedule" | "Soulbeet sign-in or Navidrome" |
 | `add_folder` | "Add a library folder", or "Choose a discovery folder" | "Settings > Library", or "Settings > Library > Discovery" |
 | `rate_in_navidrome` | "Rate the song 1 star yourself in Navidrome", or "Rate the song yourself in Navidrome" | "Navidrome" |
 | `enable_auto_delete` | "Turn on auto-delete yourself" | "Soulbeet Settings > Library" |

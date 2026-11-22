@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -23,7 +23,9 @@ use super::paging::fit_whole;
 use super::McpCaller;
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
+use crate::core::index::ServerNavidrome;
 use crate::core::library::{library_roots_in, listing, navidrome_failure};
+use crate::core::scan::{scan_by, ScanBy, SCAN_ROLES};
 use crate::core::time;
 use crate::core::{database_failure, folders, health::system_health, settings};
 use crate::ledger::store::{running_batches, RunningBatch};
@@ -49,6 +51,8 @@ fn no_answer(wait: Duration) -> String {
 #[derive(Clone)]
 pub(crate) struct NavidromeFacts {
     pub admin: Result<bool, Failure>,
+    /// Whose account starts the scans after the user's imports (core::scan).
+    pub scan_by: Result<ScanBy, Failure>,
     pub scan: Result<ScanStatus, Failure>,
 }
 
@@ -92,7 +96,7 @@ impl StatusSource for LiveStatus {
         let user = ctx.id();
         let (health, navidrome, folders, library_roots, settings, batches) = tokio::join!(
             system_health(ctx),
-            navidrome_facts(ctx),
+            navidrome_facts(&self.db, ctx),
             async { Ok::<_, Failure>(with_free_space(folders::list(ctx).await?).await) },
             library_roots_in(&self.db, crate::config::CONFIG.navidrome_music_path()),
             settings::get(ctx),
@@ -115,12 +119,25 @@ pub(crate) fn chosen_folder(id: Option<String>) -> Option<String> {
     id.filter(|id| !id.is_empty())
 }
 
-async fn navidrome_facts(ctx: &UserCtx) -> Option<NavidromeFacts> {
+/// The user's own admin role, read here, is also what scan_by knows of their account.
+async fn navidrome_facts(db: &SqlitePool, ctx: &UserCtx) -> Option<NavidromeFacts> {
     let client = navidrome_client_for_user(&ctx.user_id).await.ok()?;
     let (user, scan) = tokio::join!(client.get_own_user(), client.get_scan_status());
     let failure = |e: soulbeet::NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
+    let admin = user.map(|u| u.admin_role).map_err(failure);
+    let scanner = match &admin {
+        Ok(admin) => {
+            let id = ctx.id();
+            SCAN_ROLES.learn(&id, &client, *admin, Instant::now());
+            scan_by(db, &ServerNavidrome, &SCAN_ROLES, &id, &client)
+                .await
+                .map_err(|e| e.failure(Stage::LibraryCheck, e.to_string()))
+        }
+        Err(f) => Err(f.clone()),
+    };
     Some(NavidromeFacts {
-        admin: user.map(|u| u.admin_role).map_err(failure),
+        admin,
+        scan_by: scanner,
         scan: scan.map_err(failure),
     })
 }
@@ -287,6 +304,9 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
     let health = &facts.health;
     let navidrome = facts.navidrome.as_ref();
     let (admin, admin_failure) = read(navidrome.map(|n| &n.admin), |admin| json!(admin));
+    let (can_trigger_scan, can_trigger_scan_failure) =
+        read(navidrome.map(|n| &n.scan_by), |by| json!(by.can_scan()));
+    let scan_note = navidrome.and_then(|n| n.scan_by.as_ref().ok().map(|by| by.note()));
     let (scan, scan_failure) = read(navidrome.map(|n| &n.scan), scan_document);
     let issues: Vec<Value> = health
         .importer
@@ -328,8 +348,11 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
         "navidrome": {
             "connected": health.navidrome_online,
             "failure": health.navidrome_failure,
-            // startScan is admin only (navidrome/server/subsonic/library_scanning.go:43-45).
-            "can_trigger_scan": admin.clone(),
+            // startScan is admin only (navidrome/server/subsonic/library_scanning.go:43-45), so
+            // another linked account may start the user's (core::scan).
+            "can_trigger_scan": can_trigger_scan,
+            "can_trigger_scan_failure": can_trigger_scan_failure,
+            "scan_note": scan_note,
             "admin": admin,
             "admin_failure": admin_failure,
             "scan": scan,
@@ -417,6 +440,7 @@ mod tests {
                 "importer": {"level": "degraded", "issues": [{"severity": "degraded", "title": "beets config check timed out",
                              "detail": "A plugin may be waiting on the network or for input."}]},
                 "navidrome": {"connected": true, "failure": null, "admin": false, "admin_failure": null, "can_trigger_scan": false,
+                              "can_trigger_scan_failure": null, "scan_note": ScanBy::Nobody.note(),
                               "scan": {"scanning": false, "songs": 1342, "files_scanned": null,
                                        "last_scan": "2026-11-14T21:03:11Z", "error": null},
                               "scan_failure": null},
@@ -456,6 +480,7 @@ mod tests {
         facts.health.navidrome_failure = Some(circuit());
         facts.navidrome = Some(NavidromeFacts {
             admin: Err(circuit()),
+            scan_by: Err(circuit()),
             scan: Err(circuit()),
         });
         facts.folders[0].free = Err("no answer within 2 seconds".into());
@@ -469,7 +494,8 @@ mod tests {
         assert_eq!(
             doc["navidrome"],
             json!({"connected": false, "failure": failure(&circuit()), "admin": null,
-                "admin_failure": failure(&circuit()), "can_trigger_scan": null, "scan": null,
+                "admin_failure": failure(&circuit()), "can_trigger_scan": null,
+                "can_trigger_scan_failure": failure(&circuit()), "scan_note": null, "scan": null,
                 "scan_failure": failure(&circuit())})
         );
         assert_eq!(
@@ -485,6 +511,8 @@ mod tests {
             "admin",
             "admin_failure",
             "can_trigger_scan",
+            "can_trigger_scan_failure",
+            "scan_note",
             "scan",
             "scan_failure",
         ] {
@@ -510,6 +538,7 @@ mod tests {
         let mut facts = sample_facts();
         facts.navidrome = Some(NavidromeFacts {
             admin: Ok(true),
+            scan_by: Ok(ScanBy::Own),
             scan: Ok(ScanStatus {
                 scanning: false,
                 count: 0,
@@ -530,6 +559,26 @@ mod tests {
             ),
             (Some(true), Some(true))
         );
+    }
+
+    #[test]
+    fn a_user_who_is_no_admin_can_have_a_scan_started_by_another_account() {
+        let mut facts = sample_facts();
+        if let Some(navidrome) = facts.navidrome.as_mut() {
+            navidrome.scan_by = Ok(ScanBy::Another);
+        }
+        let doc = Value::Object(status_fields(&facts, &alice_caller(false)));
+        assert_eq!(
+            (
+                &doc["navidrome"]["admin"],
+                &doc["navidrome"]["can_trigger_scan"],
+                &doc["navidrome"]["scan_note"]
+            ),
+            (&json!(false), &json!(true), &json!(ScanBy::Another.note()))
+        );
+        let nobody = Value::Object(status_fields(&sample_facts(), &alice_caller(false)));
+        let note = nobody["navidrome"]["scan_note"].as_str().unwrap();
+        assert!(note.contains("Navidrome's next own scan"), "{note}");
     }
 
     #[test]

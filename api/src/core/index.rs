@@ -2,6 +2,7 @@
 
 use super::delete_guard::paths;
 use super::library::SongFacts;
+use super::scan::{self, ScanStart};
 use crate::auth::UserId;
 use crate::globals::send_user_event;
 use crate::ledger::store::{self, IndexingSlot};
@@ -12,7 +13,6 @@ use shared::download::{DownloadEvent, DownloadProgress, IndexState, JobSlot};
 use shared::failure::{
     Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
 };
-use soulbeet::navidrome::error::NOT_AUTHORIZED;
 use soulbeet::navidrome::models::NativeSong;
 use soulbeet::navidrome::{NavidromeClient, ScanStatus};
 use soulbeet::{ImportedItem, NavidromeError};
@@ -301,12 +301,12 @@ pub(crate) fn no_scan_possible() -> Failure {
         FailureCode::IndexNoScanPossible,
         Stage::Index,
         RetryAdvice::NeedsUser,
-        "Navidrome has not scanned for 10 minutes since this import and this account cannot start a scan",
+        "Navidrome has not scanned for 10 minutes since this import, and no Navidrome account linked to Soulbeet may start a scan",
     )
     .with_user_action(UserAction::new(
         UserActionCode::EnableIndexing,
-        "Make this Navidrome account an admin, enable Navidrome's file watcher, or set a scan schedule",
-        "Navidrome",
+        "Sign in to Soulbeet once as a Navidrome admin, enable Navidrome's file watcher, or set a scan schedule",
+        "Soulbeet sign-in or Navidrome",
     ))
 }
 
@@ -402,12 +402,14 @@ impl Import {
 ///   with index Waiting.
 /// - listed() runs when Navidrome is idle and its lastScan differs from `checked` (which it
 ///   then becomes).
-/// - StartScan: start_scan is called once for every import of the user that asks for it. A
-///   refusal (Subsonic 50, `StartScan`'s ErrorAuthorizationFail,
-///   server/subsonic/library_scanning.go:43-44) leaves the wait to the watcher or a schedule.
-///   Another start_scan error keeps the wait without the new baseline, so the next idle round
-///   asks again, and fails it as a status error does once given up; it is logged at warn once
-///   per wait, then at debug.
+/// - StartScan: scan::start_scan_for is called once for every import of the user that asks for
+///   it, which starts the scan with the user's own account or another linked one Navidrome lets
+///   start it. The scan and getScanStatus are the server's (core::scan), so the baseline read
+///   with the user's account holds for a scan another account starts. When no linked account
+///   may start one (NoAccount) the wait keeps its baseline and is left to the watcher or a
+///   schedule. An error keeps the wait without the new baseline, so the next idle round asks
+///   again, and fails it as a status error does once given up; it is logged at warn once per
+///   wait, then at debug.
 /// - Listed: rows with index Listed, Settled { Done } with each slot's result listing the songs
 ///   listed() found. Fail(f): rows with index Failed(f), Slots { Failed }. A changed wait:
 ///   Indexing. Rows go out with send_user_event.
@@ -493,7 +495,7 @@ pub(crate) async fn index_round(
                     }
                 }
                 if !scan.is_empty() {
-                    start_scan(ledger, runner, &user, &navi, scan, now).await;
+                    start_scan(db, navidrome, ledger, runner, &read, scan, now).await;
                 }
             }
             Err(failure) => {
@@ -569,7 +571,7 @@ struct ScanAsk {
 /// A user's Navidrome as one round read it: the user, the client and its scan status.
 struct Reading<'a> {
     user: &'a UserId,
-    navi: &'a NavidromeClient,
+    navi: &'a Arc<NavidromeClient>,
     status: &'a ScanStatus,
 }
 
@@ -618,35 +620,30 @@ async fn advance(
     None
 }
 
-/// Asks Navidrome for one scan for every import of `user` in `asks`, and keeps or gives up each
+/// Asks for one scan for every import of the user `read` is of in `asks`, with
+/// scan::start_scan_for and the linked accounts `navidrome` gives, and keeps or gives up each
 /// wait by the answer.
 async fn start_scan(
+    db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
     ledger: &Ledger,
     runner: &mut IndexRunner,
-    user: &UserId,
-    navi: &NavidromeClient,
+    read: &Reading<'_>,
     asks: Vec<ScanAsk>,
     now: i64,
 ) {
-    match navi.start_scan().await {
-        Ok(()) => {
+    let user = read.user;
+    match scan::start_scan_for(db, navidrome, &scan::SCAN_ROLES, user, read.navi).await {
+        Ok(started) => {
+            // Navidrome's watcher or its schedule may still scan.
+            if started == ScanStart::NoAccount {
+                debug!("No Navidrome account linked to Soulbeet may start a scan for {user}");
+            }
             for ask in asks {
                 keep(ledger, runner, ask.import, ask.started);
             }
         }
-        // A non-admin account is refused (Subsonic 50, server/subsonic/library_scanning.go:43-44):
-        // Navidrome's watcher or its schedule may still scan.
-        Err(NavidromeError::Subsonic {
-            code: NOT_AUTHORIZED,
-            ..
-        }) => {
-            debug!("Navidrome does not let {user} start a scan");
-            for ask in asks {
-                keep(ledger, runner, ask.import, ask.started);
-            }
-        }
-        // Any other error says nothing of the account: without the baseline the next idle round
-        // asks again.
+        // Without the baseline the next idle round asks again.
         Err(e) => {
             let slots: Vec<JobSlot> = asks.iter().flat_map(|ask| ask.import.slots()).collect();
             if slots.iter().any(|slot| !runner.scan_warned.contains(slot)) {
@@ -823,7 +820,7 @@ mod tests {
     use crate::models::navidrome_library::NavidromeLibraryRow;
     use crate::server_fns::download::test_support::item;
     use crate::services::NavidromeLookupError;
-    use crate::test_navidrome::{NavidromeFor, NavidromeStub};
+    use crate::test_navidrome::{user_body, NavidromeEach, NavidromeFor, NavidromeStub};
     use shared::download::{
         DownloadEvent, DownloadProgress, DownloadQuery, DownloadState, IndexState, JobSlot,
     };
@@ -1605,6 +1602,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getScanStatus", &[IDLE]);
         navi.answer("/api/song", &["[]"]);
+        navi.answer("/rest/getUser", &[&user_body(true)]);
         index_round(
             &db,
             &ledger,
@@ -1640,11 +1638,13 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getScanStatus", &[IDLE]);
         navi.answer("/api/song", &["[]"]);
+        // An admin when Navidrome last said so, refused since:
         // StartScan's ErrorAuthorizationFail (server/subsonic/library_scanning.go:43-44, responses/errors.go:20).
         navi.answer(
             "/rest/startScan",
             &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"error":{"code":50,"message":"User is not authorized for the given operation"}}}"#],
         );
+        navi.answer("/rest/getUser", &[&user_body(true)]);
         let mut runner = IndexRunner::default();
         for now in [1_005, 1_010] {
             index_round(
@@ -1665,6 +1665,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_account_navidrome_says_is_no_admin_is_not_asked_to_scan_and_the_wait_keeps_its_baseline(
+    ) {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, _) = indexing(imported_in(library.path())).await;
+        let navi = NavidromeStub::start();
+        navi.answer("/rest/getScanStatus", &[IDLE]);
+        navi.answer("/api/song", &["[]"]);
+        navi.answer("/rest/getUser", &[&user_body(false)]);
+        index_round(
+            &db,
+            &ledger,
+            &NavidromeFor(Ok(navi.client())),
+            &mut IndexRunner::default(),
+            1_005,
+        )
+        .await;
+        ledger.settled().await;
+        assert_eq!(scans_asked(&navi), 0);
+        let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
+            panic!()
+        };
+        assert!(slot.wait.baseline.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_scan_another_linked_admin_starts_is_waited_for_with_the_users_own_account() {
+        let library = tempfile::tempdir().unwrap();
+        let (ledger, db, _rx, user) = indexing(imported_in(library.path())).await;
+        let admin = UserId::new(&format!("bob-{}", uuid::Uuid::new_v4()));
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, navidrome_token) VALUES (?, ?, 'x', 'cipher')",
+        )
+        .bind(admin.to_string())
+        .bind(admin.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+        let (own, other) = (NavidromeStub::start(), NavidromeStub::start());
+        own.answer("/rest/getScanStatus", &[IDLE]);
+        own.answer("/api/song", &["[]"]);
+        own.answer("/rest/getUser", &[&user_body(false)]);
+        other.answer("/rest/getUser", &[&user_body(true)]);
+        let navidrome = NavidromeEach::of(&[(&user, &own), (&admin, &other)]);
+        let mut runner = IndexRunner::default();
+        index_round(&db, &ledger, &navidrome, &mut runner, 1_005).await;
+        ledger.settled().await;
+        assert_eq!(scans_asked(&own), 0);
+        assert_eq!(other.asked(), vec!["/rest/getUser", "/rest/startScan"]);
+        let [slot] = &store::indexing_slots(&db).await.unwrap().slots[..] else {
+            panic!()
+        };
+        // The baseline is the user's own read of the server's scan status.
+        assert_eq!(
+            slot.wait.baseline.map(|b| b.started),
+            Some(at("2026-11-15T10:01:56Z"))
+        );
+        // That scan ended at 10:03 and listed the file, as the user's own account reads it.
+        own.answer(
+            "/rest/getScanStatus",
+            &[&IDLE.replace("10:02:00Z", "10:03:00Z")],
+        );
+        own.answer(
+            "/api/song",
+            &[&song_json(
+                "alice/Zzqx Artist/Qzz Album/01 Song Number 1.mp3",
+                4,
+            )],
+        );
+        index_round(&db, &ledger, &navidrome, &mut runner, 1_010).await;
+        ledger.settled().await;
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Done));
+        assert_eq!(other.asked().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_scan_request_that_fails_otherwise_is_asked_again_until_the_wait_gives_up() {
         let library = tempfile::tempdir().unwrap();
         let (ledger, db, mut rx, _) = indexing(imported_in(library.path())).await;
@@ -1676,6 +1751,7 @@ mod tests {
             "/rest/startScan",
             &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","type":"navidrome","serverVersion":"0.59.0","openSubsonic":true,"error":{"code":0,"message":"Internal error"}}}"#],
         );
+        navi.answer("/rest/getUser", &[&user_body(true)]);
         let mut runner = IndexRunner::default();
         index_round(
             &db,
@@ -2031,6 +2107,7 @@ mod tests {
         let navi = NavidromeStub::start();
         navi.answer("/rest/getScanStatus", &[IDLE]);
         navi.answer("/api/song", &["[]"]);
+        navi.answer("/rest/getUser", &[&user_body(true)]);
         index_round(
             &db,
             &ledger,
