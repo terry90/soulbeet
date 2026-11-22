@@ -75,6 +75,8 @@ fn main() {
             api::oauth::start_prune_task();
             // Check the beets config in the background; never awaited here.
             api::importer_health::start_startup_probe();
+            // Drops the beets items whose file is gone, in the background.
+            api::import_queue::start_library_prune();
 
             api::security::check_seeded_admin().await;
             api::folder_policy::log_folder_conflicts().await;

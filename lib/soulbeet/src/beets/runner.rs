@@ -60,6 +60,14 @@ impl RunLimits {
         total: Duration::from_secs(5 * 60),
         drain: Duration::from_secs(3),
     };
+
+    /// prune.py on a library, which looks at every item's file, on a network share as a rule,
+    /// before it prints anything.
+    pub const LIBRARY_PRUNE: RunLimits = RunLimits {
+        idle: Duration::from_secs(10 * 60),
+        total: Duration::from_secs(30 * 60),
+        drain: Duration::from_secs(3),
+    };
 }
 
 impl Default for RunLimits {

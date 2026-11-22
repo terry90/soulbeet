@@ -3,6 +3,7 @@
 //! instead of reading "Importing".
 
 mod choice;
+mod prune;
 mod replace;
 mod retry;
 mod rows;
@@ -10,6 +11,7 @@ mod rows;
 pub(crate) mod test_support;
 
 pub(crate) use choice::{files_gone, nothing_to_retry};
+pub use prune::start_library_prune;
 pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded, FileLeft};
 pub(crate) use rows::import_failure;
 
@@ -27,7 +29,7 @@ use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
     DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter, SkipReason, SourceFile, TaskCount,
+    MusicImporter, PruneOutcome, SkipReason, SourceFile, TaskCount,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -318,6 +320,10 @@ enum Work {
         file: PathBuf,
         done: oneshot::Sender<ForgetOutcome>,
     },
+    /// Drops the items whose file is gone from the target's library.
+    Prune {
+        done: oneshot::Sender<PruneOutcome>,
+    },
 }
 
 impl Work {
@@ -325,7 +331,7 @@ impl Work {
     fn owner(&self) -> Option<&JobOwner> {
         match self {
             Work::Import(waiting) => waiting.job.owner.as_ref(),
-            Work::Forget { .. } => None,
+            Work::Forget { .. } | Work::Prune { .. } => None,
         }
     }
 }
@@ -421,14 +427,9 @@ impl ImportQueue {
     /// that library before it has run. A library folder that does not exist
     /// is not created.
     pub async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
-        let key = match tokio::fs::canonicalize(library).await {
+        let key = match existing_key(library).await {
             Ok(key) => key,
-            Err(e) => {
-                return ForgetOutcome::Failed(format!(
-                    "Could not resolve {}: {e}",
-                    library.display()
-                ))
-            }
+            Err(e) => return ForgetOutcome::Failed(e),
         };
         let (done, outcome) = oneshot::channel();
         self.enqueue(
@@ -441,6 +442,20 @@ impl ImportQueue {
         outcome
             .await
             .unwrap_or_else(|_| ForgetOutcome::Failed(WORKER_STOPPED.into()))
+    }
+
+    /// Drops the items whose file is gone from the library of `library` once the work queued
+    /// on that library before it has run. A library folder that does not exist is not created.
+    pub async fn prune(&self, library: &Path) -> PruneOutcome {
+        let key = match existing_key(library).await {
+            Ok(key) => key,
+            Err(e) => return PruneOutcome::Failed(e),
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(key, Work::Prune { done });
+        outcome
+            .await
+            .unwrap_or_else(|_| PruneOutcome::Failed(WORKER_STOPPED.into()))
     }
 
     /// Queues `item` on `key`, starting the target's worker if none runs. An
@@ -546,6 +561,16 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                     });
                 let _ = done.send(outcome);
             }
+            Work::Prune { done } => {
+                let outcome = AssertUnwindSafe(shared.prune(&key))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Pruning the library of {} panicked", key.display());
+                        PruneOutcome::Failed(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
         }
     }
 }
@@ -593,6 +618,13 @@ impl Shared {
         match self.deps.importer().await {
             Ok(importer) => importer.forget(library, file).await,
             Err(e) => ForgetOutcome::Failed(e),
+        }
+    }
+
+    async fn prune(&self, library: &Path) -> PruneOutcome {
+        match self.deps.importer().await {
+            Ok(importer) => importer.prune(library).await,
+            Err(e) => PruneOutcome::Failed(e),
         }
     }
 
@@ -924,6 +956,13 @@ pub async fn canonical_target(target: &Path) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(target).await
 }
 
+/// The key of the library folder `library`, which must exist: it is not created.
+async fn existing_key(library: &Path) -> Result<PathBuf, String> {
+    tokio::fs::canonicalize(library)
+        .await
+        .map_err(|e| format!("Could not resolve {}: {e}", library.display()))
+}
+
 /// Imports one file into a library folder and waits for it (promote), treating an earlier
 /// copy by `duplicates`. Ok when the file imported, its warnings logged since no row shows
 /// them, else the outcome's failure.
@@ -1001,7 +1040,9 @@ mod tests {
     use crate::core::deletion::REPLACE_CONSENT_SECS;
     use crate::ledger::ReplacementOutcome;
     use shared::download::{DownloadState, ImportChoice, JobSlot};
-    use soulbeet::{ForgetOutcome, ImportOutcome, ImportedItem, SkipReason, SourceFile, TaskCount};
+    use soulbeet::{
+        ForgetOutcome, ImportOutcome, ImportedItem, PruneOutcome, SkipReason, SourceFile, TaskCount,
+    };
     use std::time::Duration;
 
     pub(super) fn queue(
@@ -1538,6 +1579,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prune_waits_for_the_import_running_on_its_library_and_answers_what_it_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new().held());
+        stub.script_prune(PruneOutcome::Pruned {
+            removed: 3,
+            kept: 4,
+        });
+        let queue = Arc::new(queue);
+        let handle = queue
+            .submit(job(file(dir.path(), "src/a.flac"), &dir.path().join("lib")))
+            .await;
+        let prune = tokio::spawn({
+            let (queue, lib) = (queue.clone(), dir.path().join("lib"));
+            async move { queue.prune(&lib).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(stub.prunes().is_empty());
+        stub.release(1);
+        handle.wait().await;
+        assert_eq!(
+            prune.await.unwrap(),
+            PruneOutcome::Pruned {
+                removed: 3,
+                kept: 4
+            }
+        );
+        let lib = std::fs::canonicalize(dir.path().join("lib")).unwrap();
+        assert_eq!(stub.prunes(), vec![lib]);
+    }
+
+    #[tokio::test]
+    async fn a_prune_of_a_missing_library_fails_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let lib = dir.path().join("lib");
+        assert!(matches!(queue.prune(&lib).await, PruneOutcome::Failed(_)));
+        assert!(!lib.exists());
+        assert!(stub.prunes().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_owned_import_tells_the_ledger_it_queued_and_how_it_ended() {
         use crate::ledger::JobState as LedgerState;
         let tmp = tempfile::tempdir().unwrap();
@@ -1627,7 +1709,9 @@ mod tests {
         );
         let stored = kept.stored().expect("an owned job is stored");
         assert_eq!(
-            queue.restore(ImportJob::from_stored(stored, alice()), &[]).await,
+            queue
+                .restore(ImportJob::from_stored(stored, alice()), &[])
+                .await,
             Ok(())
         );
         assert_eq!(queue.retry(&alice(), "a", ImportChoice::Auto).await, Ok(()));

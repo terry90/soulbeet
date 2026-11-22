@@ -10,7 +10,7 @@ pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 use crate::audio::count_audio_files;
 use crate::{
     DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter, Relocation,
+    MusicImporter, PruneOutcome, Relocation,
 };
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const IMPORT_PY: &str = include_str!("import.py");
+
+/// Why a run that needs the Python of beet cannot start.
+const NO_PYTHON: &str = "Cannot determine the Python that runs beet. Set BEETS_PYTHON.";
 
 /// Where beets is and how to run it. Resolved once at startup.
 #[derive(Debug, Clone)]
@@ -91,10 +94,7 @@ impl BeetsImporter {
     ) -> ImportResult {
         let s = &self.settings;
         let Some(python) = s.python.as_deref() else {
-            return ImportResult::failed(
-                FailKind::Setup,
-                "Cannot determine the Python that runs beet. Set BEETS_PYTHON.".into(),
-            );
+            return ImportResult::failed(FailKind::Setup, NO_PYTHON.into());
         };
         if let Err(e) = tokio::fs::create_dir_all(target).await {
             return ImportResult::failed(
@@ -344,6 +344,10 @@ impl MusicImporter for BeetsImporter {
 
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
         library::forget_item(&self.settings, library, file).await
+    }
+
+    async fn prune(&self, library: &Path) -> PruneOutcome {
+        library::prune_items(&self.settings, library).await
     }
 
     fn health(&self) -> ImporterHealth {

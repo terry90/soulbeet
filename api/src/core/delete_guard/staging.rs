@@ -3,12 +3,14 @@
 
 use super::unlink::{unlink_if_same, FileId, UnlinkError};
 use super::{
-    changed_since_check, delete_failed, not_a_track, outside_library, prune, rules, NOT_A_FILE,
+    changed_since_check, delete_failed, forget_detached, not_a_track, outside_library, prune,
+    rules, NOT_A_FILE,
 };
 use crate::auth::UserId;
 use crate::core::database_failure;
 use crate::core::discovery::track_not_pending;
 use crate::folder_policy::{canonical_folder_path, PolicyRows};
+use crate::import_queue::ImportQueue;
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::folder::Folder;
@@ -40,12 +42,13 @@ impl StagedOutcome {
 /// remove_claimed_in.
 pub(crate) async fn remove_staged_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     track: &DiscoveryTrack,
     folder: &Folder,
     outcome: StagedOutcome,
 ) -> Result<(), Failure> {
     claim_removal_in(db, track).await?;
-    remove_claimed_in(db, track, folder, outcome).await
+    remove_claimed_in(db, queue, track, folder, outcome).await
 }
 
 /// Claims `track` for its removal, Pending to Removing (D16): `track_not_pending` when another
@@ -71,16 +74,18 @@ pub(crate) async fn claim_removal_in(
 /// track is Pending again when the removal fails. The stored path must canonicalize to a regular
 /// file strictly inside the canonical `Discovery/<profile>` of `folder`, in no deeper folder of
 /// another user; a file already gone is only marked. The file goes through unlink_if_same with
-/// the identity read just before; empty parents are pruned up to the profile folder.
+/// the identity read just before; empty parents are pruned up to the profile folder, and the
+/// file's item is dropped from the profile folder's library through `queue` (forget_detached).
 pub(crate) async fn remove_claimed_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     track: &DiscoveryTrack,
     folder: &Folder,
     outcome: StagedOutcome,
 ) -> Result<(), Failure> {
     let stored = Path::new(&track.path);
     let removed = match tokio::fs::canonicalize(stored).await {
-        Ok(path) => remove_contained(db, &path, track, folder).await,
+        Ok(path) => remove_contained(db, queue, &path, track, folder).await,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(delete_failed(&e)),
     };
@@ -121,9 +126,11 @@ pub(crate) async fn remove_claimed_in(
 }
 
 /// Unlinks the canonical file `path` of `track` when it is a regular file strictly inside the
-/// track's canonical profile folder and rule 1 gives it to the folder's owner, then prunes.
+/// track's canonical profile folder and rule 1 gives it to the folder's owner, then prunes and
+/// queues the forget of its item in the profile folder's library.
 async fn remove_contained(
     db: &SqlitePool,
+    queue: &ImportQueue,
     path: &Path,
     track: &DiscoveryTrack,
     folder: &Folder,
@@ -161,6 +168,8 @@ async fn remove_contained(
         Err(e) => return Err(delete_failed(&std::io::Error::other(e))),
     }
     prune(path, &profile).await;
+    // beets imported it into the profile folder's own library (discovery's import target).
+    forget_detached(queue, path.to_path_buf(), profile);
     Ok(())
 }
 
@@ -168,7 +177,9 @@ async fn remove_contained(
 mod tests {
     use super::super::test_support::Library;
     use super::*;
+    use crate::import_queue::test_support::stub_queue;
     use shared::failure::FailureCode;
+    use soulbeet::ForgetOutcome;
 
     fn alices_folder(lib: &Library) -> Folder {
         Folder {
@@ -183,16 +194,20 @@ mod tests {
     #[tokio::test]
     async fn a_staged_file_is_removed_only_from_inside_its_profile_folder() {
         let lib = Library::new().await;
+        let (queue, stub) = stub_queue();
         let staged = lib
             .root
             .join("music/alice/Discovery/Explore/Marrow Choir/03.flac");
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::write(&staged, b"audio").unwrap();
+        let profile =
+            std::fs::canonicalize(lib.root.join("music/alice/Discovery/Explore")).unwrap();
+        let canonical = std::fs::canonicalize(&staged).unwrap();
         let folder = alices_folder(&lib);
         let track = lib
             .pending_track("t1", "alice-music", "Explore", &staged, None)
             .await;
-        remove_staged_in(&lib.db, &track, &folder, StagedOutcome::Removed)
+        remove_staged_in(&lib.db, &queue, &track, &folder, StagedOutcome::Removed)
             .await
             .unwrap();
         assert!(
@@ -207,12 +222,14 @@ mod tests {
             ),
             ("Removed".into(), "removed".into())
         );
+        // Its item leaves the library of the profile folder it was imported into.
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, canonical)]);
 
         let library_file = lib.root.join("music/alice/A/x.flac");
         let outside = lib
             .pending_track("t2", "alice-music", "Explore", &library_file, None)
             .await;
-        let f = remove_staged_in(&lib.db, &outside, &folder, StagedOutcome::Removed)
+        let f = remove_staged_in(&lib.db, &queue, &outside, &folder, StagedOutcome::Removed)
             .await
             .unwrap_err();
         assert_eq!(
@@ -235,7 +252,7 @@ mod tests {
                 None,
             )
             .await;
-        remove_staged_in(&lib.db, &gone, &folder, StagedOutcome::Expired)
+        remove_staged_in(&lib.db, &queue, &gone, &folder, StagedOutcome::Expired)
             .await
             .unwrap();
         assert_eq!(
@@ -245,6 +262,34 @@ mod tests {
             ),
             ("Removed".into(), "expired".into())
         );
+        // A file kept, or already gone, has no forget queued: a gone one's item waits for the
+        // prune at the next start, which first proves the folder is there.
+        assert_eq!(stub.forgets().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_removal_whose_forget_fails_is_still_done() {
+        let lib = Library::new().await;
+        let (queue, stub) = stub_queue();
+        stub.script_forget(ForgetOutcome::Failed("database is locked".into()));
+        let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        let track = lib
+            .pending_track("t1", "alice-music", "Explore", &staged, None)
+            .await;
+        remove_staged_in(
+            &lib.db,
+            &queue,
+            &track,
+            &alices_folder(&lib),
+            StagedOutcome::Expired,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stub.forgets_once(1).await.len(), 1);
+        assert!(!staged.exists());
+        assert_eq!(lib.track_status("t1").await, "Removed");
     }
 
     #[tokio::test]
@@ -272,6 +317,7 @@ mod tests {
             .await;
         let f = remove_staged_in(
             &lib.db,
+            &stub_queue().0,
             &track,
             &alices_folder(&lib),
             StagedOutcome::Removed,
@@ -318,6 +364,7 @@ mod tests {
         assert_eq!(lib.track_status("t1").await, "Pending");
         remove_staged_in(
             &lib.db,
+            &stub_queue().0,
             &track,
             &alices_folder(&lib),
             StagedOutcome::Expired,
@@ -338,6 +385,7 @@ mod tests {
             .await;
         let f = remove_staged_in(
             &lib.db,
+            &stub_queue().0,
             &track,
             &alices_folder(&lib),
             StagedOutcome::Expired,

@@ -19,6 +19,7 @@ pub mod playlists;
 pub mod ratings;
 pub(crate) mod recommend;
 pub mod reconcile;
+pub(crate) mod scan;
 pub mod settings;
 pub mod sources;
 pub(crate) mod time;

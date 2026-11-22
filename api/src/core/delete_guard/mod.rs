@@ -705,11 +705,24 @@ async fn forget_queued(queue: ImportQueue, path: PathBuf, folder: PathBuf, left:
     if left == Left::AnotherFile {
         return;
     }
-    let outcome = queue.forget(&folder, &path).await;
-    if let Some(note) = forget_note(&outcome, &path, &folder) {
+    forget_logged(&queue, &path, &folder).await;
+    prune(&path, &folder).await;
+}
+
+/// Queues the forget of `path`, a file that is gone, on the worker of `library`'s library in a
+/// spawned task, without waiting for it, and logs a forget that did not remove one item.
+pub(crate) fn forget_detached(queue: &ImportQueue, path: PathBuf, library: PathBuf) {
+    let queue = queue.clone();
+    tokio::spawn(async move { forget_logged(&queue, &path, &library).await });
+}
+
+/// Forgets `path` on the worker of `library`'s library and logs a forget that did not remove
+/// one item.
+async fn forget_logged(queue: &ImportQueue, path: &Path, library: &Path) {
+    let outcome = queue.forget(library, path).await;
+    if let Some(note) = forget_note(&outcome, path, library) {
         warn!("{note}");
     }
-    prune(&path, &folder).await;
 }
 
 /// When the removal of `path` left nothing there (`left`): forgets it through `importer` in

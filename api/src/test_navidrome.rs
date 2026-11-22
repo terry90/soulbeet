@@ -235,6 +235,44 @@ impl NavidromeOf for NavidromeFor {
     }
 }
 
+/// Hands each user the client made once from their own stand-in, and NotLinked to anyone else.
+pub(crate) struct NavidromeEach(HashMap<UserId, Arc<NavidromeClient>>);
+
+impl NavidromeEach {
+    pub fn of(stubs: &[(&UserId, &NavidromeStub)]) -> NavidromeEach {
+        NavidromeEach(
+            (stubs.iter())
+                .map(|(user, stub)| ((*user).clone(), stub.client()))
+                .collect(),
+        )
+    }
+
+    /// The client handed to `user`.
+    pub fn client(&self, user: &UserId) -> Arc<NavidromeClient> {
+        self.0[user].clone()
+    }
+}
+
+#[async_trait]
+impl NavidromeOf for NavidromeEach {
+    async fn navidrome_of(
+        &self,
+        user: &UserId,
+    ) -> Result<Arc<NavidromeClient>, NavidromeLookupError> {
+        self.0
+            .get(user)
+            .cloned()
+            .ok_or(NavidromeLookupError::NotLinked)
+    }
+}
+
+/// getUser's answer for alice (server/subsonic/users.go:15-33), a Navidrome admin when `admin`.
+pub(crate) fn user_body(admin: bool) -> String {
+    subsonic_ok(&format!(
+        r#""user":{{"username":"alice","adminRole":{admin},"email":"","streamRole":true,"scrobblingEnabled":true,"downloadRole":true,"shareRole":false,"folder":[1]}}"#
+    ))
+}
+
 /// Subsonic's `ok` envelope as Navidrome 0.64.2 sends it, around `body` (one or more
 /// `"name":value` members).
 pub(crate) fn subsonic_ok(body: &str) -> String {

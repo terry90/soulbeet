@@ -45,15 +45,19 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
       'update_settings',
     ]);
 
-    expect(await mcp.ok('get_status')).toMatchObject({
+    const status = await mcp.ok('get_status');
+    expect(status).toMatchObject({
       ok: true,
       base_url: mcpBaseUrl,
       mcp_url: mcpUrl,
       user: { username: user.username, role: 'user' },
       download_backend: { backend: 'slskd', online: true },
-      navidrome: { connected: true, admin: false, can_trigger_scan: false },
+      navidrome: { connected: true, admin: false },
       deletion_enabled: false,
     });
+    // No linked account is a Navidrome admin: false once Navidrome refused the others, null
+    // until then.
+    expect(status.navidrome).not.toMatchObject({ can_trigger_scan: true });
   } finally {
     await mcp.close();
     await context.close();

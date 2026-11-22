@@ -22,6 +22,6 @@ pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use traits::{
     CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
     GeneratorOutput, ImportMode, ImportOutcome, ImportResult, ImportedItem, KnowledgeCache,
-    ListeningHistory, MetadataProvider, MusicImporter, MusicKnowledge, Relocation, SkipReason,
-    SourceFile, TaskCount, TimeoutKind, WantedRemoval,
+    ListeningHistory, MetadataProvider, MusicImporter, MusicKnowledge, PruneOutcome, Relocation,
+    SkipReason, SourceFile, TaskCount, TimeoutKind, WantedRemoval,
 };

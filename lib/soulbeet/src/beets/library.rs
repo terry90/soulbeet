@@ -2,8 +2,8 @@
 
 use super::classify::LOCKED;
 use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
-use super::BeetsSettings;
-use crate::traits::{ForgetOutcome, Relocation};
+use super::{BeetsSettings, NO_PYTHON};
+use crate::traits::{ForgetOutcome, PruneOutcome, Relocation};
 use serde::Deserialize;
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use std::ffi::OsString;
@@ -14,6 +14,10 @@ use tracing::{info, warn};
 /// without a newline) cannot be read as part of the row.
 const ROW_MARKER: &str = "@@sb@@";
 const ID_FORMAT: &str = "@@sb@@$id";
+
+const PRUNE_PY: &str = include_str!("prune.py");
+/// The command prune.py adds to beets.
+const PRUNE_COMMAND: &str = "soulbeet-prune";
 
 /// One item as `beet export -l -f jsonlines -i id,path` prints it: beets' formatted values,
 /// so the id is text (beetsplug/export.py, beetsplug/info.py library_data_emitter).
@@ -148,7 +152,7 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     let mut query = OsString::from("path:");
     query.push(file);
     let ls = vec!["ls".into(), "-f".into(), ID_FORMAT.into(), query];
-    let ids = match run_library(s, root, None, ls).await {
+    let ids = match run_library(s, root, Program::Beet(None), ls).await {
         Ok(ids) => ids,
         Err(e) => return ForgetOutcome::Failed(e.into()),
     };
@@ -166,10 +170,52 @@ pub(crate) async fn forget_item(s: &BeetsSettings, root: &Path, file: &Path) -> 
     };
     // Without remove's own -d, beets leaves the file alone; -f skips the prompt.
     let remove = vec!["remove".into(), "-f".into(), format!("id:{id}").into()];
-    match run_library(s, root, None, remove).await {
+    match run_library(s, root, Program::Beet(None), remove).await {
         Ok(_) => ForgetOutcome::Removed,
         Err(e) => ForgetOutcome::Failed(e.into()),
     }
+}
+
+/// Drops from the library under `root` the items whose file is gone, leaving every file alone:
+/// one run of prune.py, which lists the items, looks at their files and removes the gone ones,
+/// none while no item has its file there.
+pub(crate) async fn prune_items(s: &BeetsSettings, root: &Path) -> PruneOutcome {
+    match has_library(s, root).await {
+        Ok(true) => {}
+        Ok(false) => return PruneOutcome::NoLibrary,
+        Err(e) => return PruneOutcome::Failed(e),
+    }
+    let driver = Program::Driver {
+        script: PRUNE_PY,
+        limits: RunLimits::LIBRARY_PRUNE,
+    };
+    match run_library(s, root, driver, vec![PRUNE_COMMAND.into()]).await {
+        Ok(rows) => pruned(&rows),
+        Err(e) => PruneOutcome::Failed(e.into()),
+    }
+}
+
+/// What prune.py's one summary row says.
+fn pruned(rows: &[String]) -> PruneOutcome {
+    let words: Vec<&str> = match rows {
+        [row] => row.split(' ').collect(),
+        _ => vec![],
+    };
+    let read = match words.as_slice() {
+        ["pruned", removed, kept] => (removed.parse::<u64>().ok())
+            .zip(kept.parse::<u64>().ok())
+            .map(|(removed, kept)| PruneOutcome::Pruned { removed, kept }),
+        ["unproven", items] => {
+            (items.parse::<u64>().ok()).map(|items| PruneOutcome::Unproven { items })
+        }
+        _ => None,
+    };
+    read.unwrap_or_else(|| {
+        PruneOutcome::Failed(format!(
+            "prune.py gave no summary Soulbeet can read: {}",
+            rows.join("\n")
+        ))
+    })
 }
 
 /// Moves the items with `item_ids` of the library under `root` to the paths beets gives them
@@ -195,7 +241,7 @@ pub(crate) async fn move_items(s: &BeetsSettings, root: &Path, item_ids: &[u64])
     }
     let mut command: Vec<OsString> = vec!["move".into()];
     command.extend(ids_query(item_ids));
-    let moved = run_library(s, root, None, command).await;
+    let moved = run_library(s, root, Program::Beet(None), command).await;
     let (now, unread) = read_paths(s, root, item_ids).await;
     let mut problems = Vec::new();
     if let Err(e) = &moved {
@@ -386,7 +432,7 @@ async fn export(
         .map(OsString::from)
         .to_vec();
     command.extend(ids_query(item_ids));
-    run_library(s, root, Some("export"), command).await
+    run_library(s, root, Program::Beet(Some("export")), command).await
 }
 
 /// The id and path of one `beet export` row.
@@ -424,20 +470,42 @@ impl From<RunFailure> for String {
     }
 }
 
-/// Runs `beet {command}` on the library under `root` and returns its rows: the
-/// text after the row marker of each line that has one, or, with `plugin`,
-/// every line, as `beet -p {plugin}` loads that plugin alone and no other one
-/// can print to stdout. Retried once when the library db is locked.
+/// What runs a library command.
+enum Program<'a> {
+    /// `beet` itself, loading only the named plugin when there is one.
+    Beet(Option<&'a str>),
+    /// A driver script, run by the Python that runs beet with beet's own arguments, within
+    /// `limits`.
+    Driver { script: &'a str, limits: RunLimits },
+}
+
+/// Runs `beet {command}` (or the driver with that command) on the library
+/// under `root` and returns its rows: the text after the row marker of each
+/// line that has one, or, with a plugin, every line, as `beet -p {plugin}`
+/// loads that plugin alone and no other one can print to stdout. Retried once
+/// when the library db is locked.
 async fn run_library(
     s: &BeetsSettings,
     root: &Path,
-    plugin: Option<&str>,
+    program: Program<'_>,
     command: Vec<OsString>,
 ) -> Result<Vec<String>, RunFailure> {
     let subcommand = command[0].to_string_lossy().into_owned();
     let db = library_db(s, root)
         .await
         .map_err(|text| RunFailure { text, output: None })?;
+    let (executable, script, plugin, limits) = match program {
+        Program::Beet(plugin) => (s.beet.as_path(), None, plugin, RunLimits::LIBRARY_LS),
+        Program::Driver { script, limits } => match s.python.as_deref() {
+            Some(python) => (python, Some(script), None, limits),
+            None => {
+                return Err(RunFailure {
+                    text: NO_PYTHON.into(),
+                    output: None,
+                })
+            }
+        },
+    };
     let mut retried = false;
     loop {
         let mut rows = Vec::new();
@@ -455,24 +523,28 @@ async fn run_library(
             }
             Stream::Stderr => locked |= line.contains(LOCKED),
         };
+        let mut args: Vec<OsString> = match script {
+            Some(script) => vec!["-P".into(), "-c".into(), script.into()],
+            None => vec![],
+        };
         // beets 2.10+ stores paths relative to the library directory, so -d
         // must name it or they resolve under the config's `directory`.
-        let mut args: Vec<OsString> = vec![
+        args.extend([
             "-c".into(),
             s.config.clone().into(),
             "-l".into(),
             db.clone().into(),
             "-d".into(),
             root.into(),
-        ];
+        ]);
         if let Some(plugin) = plugin {
             args.extend(["-p".into(), plugin.into()]);
         }
         args.extend(command.iter().cloned());
         let spec = RunSpec {
-            program: &s.beet,
+            program: executable,
             args,
-            limits: RunLimits::LIBRARY_LS,
+            limits,
         };
         let outcome = run_beet(spec, &mut on_line).await;
 
@@ -1025,6 +1097,91 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// `fake_library` with a python standing in for prune.py: it keeps the script it was given
+    /// in script.py, logs the args after it as one line of args.txt and runs `body`.
+    async fn fake_driver(body: &str) -> (tempfile::TempDir, BeetsSettings) {
+        let (dir, mut settings) = fake_library("").await;
+        let python = format!(
+            "cd '{}'\nprintf '%s' \"$3\" > script.py\nshift 3\n{LOG}\n{body}",
+            dir.path().display()
+        );
+        settings.python = Some(crate::beets::tests::script(dir.path(), "python", &python).await);
+        (dir, settings)
+    }
+
+    #[tokio::test]
+    async fn a_prune_is_one_run_of_prune_py_on_the_library() {
+        let (dir, settings) = fake_driver(
+            "echo 'soulbeet: dropped /m/a.flac'; echo 'soulbeet: dropped /m/b.flac'; \
+             echo '@@sb@@pruned 2 5'",
+        )
+        .await;
+        assert_eq!(
+            prune_items(&settings, dir.path()).await,
+            PruneOutcome::Pruned {
+                removed: 2,
+                kept: 5
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("script.py")).unwrap(),
+            PRUNE_PY
+        );
+        let calls = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            vec![format!(
+                "-c {} -l {} -d {} soulbeet-prune",
+                settings.config.display(),
+                db_of(&settings, dir.path()).display(),
+                dir.path().display()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_none_of_whose_files_is_there_is_left_whole() {
+        let (dir, settings) = fake_driver("echo '@@sb@@unproven 2200'").await;
+        assert_eq!(
+            prune_items(&settings, dir.path()).await,
+            PruneOutcome::Unproven { items: 2200 }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prune_without_a_library_or_a_summary_drops_nothing() {
+        for printed in [
+            "",
+            "echo '@@sb@@pruned two 5'",
+            "echo '@@sb@@pruned 1 5'; echo '@@sb@@pruned 1 5'",
+        ] {
+            let (dir, settings) = fake_driver(printed).await;
+            let outcome = prune_items(&settings, dir.path()).await;
+            assert!(
+                matches!(&outcome, PruneOutcome::Failed(e)
+                    if e.starts_with("prune.py gave no summary Soulbeet can read")),
+                "{printed}: {outcome:?}"
+            );
+        }
+        let (dir, settings) = fake_driver("echo '@@sb@@pruned 0 0'").await;
+        std::fs::remove_file(db_of(&settings, dir.path())).unwrap();
+        assert_eq!(
+            prune_items(&settings, dir.path()).await,
+            PruneOutcome::NoLibrary
+        );
+        assert!(!dir.path().join("args.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_prune_needs_the_python_of_beet() {
+        let (dir, settings) = fake_library(LOG).await;
+        assert_eq!(
+            prune_items(&settings, dir.path()).await,
+            PruneOutcome::Failed(NO_PYTHON.into())
+        );
+        assert!(!dir.path().join("args.txt").exists());
     }
 
     #[tokio::test]

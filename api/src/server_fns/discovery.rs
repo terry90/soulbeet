@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use shared::navidrome::{DiscoveryConfig, DiscoveryTrack};
 
 #[cfg(feature = "server")]
-use dioxus::logger::tracing::{info, warn};
+use dioxus::logger::tracing::{debug, info, warn};
 
 #[cfg(feature = "server")]
 use std::collections::HashMap;
@@ -153,6 +153,7 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
     promote(
         &crate::db::DB,
         &effects,
+        &IMPORT_QUEUE,
         &auth.0.id(),
         &req.track_id,
         replace,
@@ -164,7 +165,7 @@ pub async fn promote_discovery_track(req: TrackActionRequest) -> Result<(), Serv
 
 #[post("/api/discovery/remove", auth: AuthSession)]
 pub async fn remove_discovery_track(req: TrackActionRequest) -> Result<(), ServerFnError> {
-    remove_in(&crate::db::DB, &auth.0.id(), &req.track_id)
+    remove_in(&crate::db::DB, &IMPORT_QUEUE, &auth.0.id(), &req.track_id)
         .await
         .map(|_| ())
         .map_err(|n| failure_error(n.into_failure()))
@@ -1145,7 +1146,9 @@ pub async fn generate_discovery_playlist_internal(
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
         if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-            if scan_imports(&navi, total_downloads).await {
+            let navidrome = crate::core::index::ServerNavidrome;
+            let user = UserId::new(user_id);
+            if scan_imports(&crate::db::DB, &navidrome, &user, &navi, total_downloads).await {
                 // Create/update smart playlists now that tracks are indexed
                 if let Err(e) = reconcile_discovery_playlists(user_id).await {
                     warn!("Playlist reconciliation after generation failed: {}", e);
@@ -1182,15 +1185,28 @@ fn run_outcome(
     }
 }
 
-/// Starts a Navidrome scan of `imported` new tracks and waits up to two
-/// minutes for it to end. Returns whether the scan was started.
+/// Starts a Navidrome scan of `imported` new tracks for `user`, whose client
+/// is `navi`, with scan::start_scan_for and the linked accounts `navidrome`
+/// gives, and waits up to two minutes for it to end. Returns whether the scan
+/// was started.
 ///
 /// The scan runs in a goroutine and startScan answers at once, so "not
 /// scanning" alone can be read before it begins: the wait is for a scan that
-/// ended after the one recorded before it. When that cannot be read the scan
-/// is still started, only not waited for.
+/// ended after the one recorded before it. The scan status is the server's,
+/// so `navi` reads the end of a scan another account started. When that
+/// cannot be read the scan is still started, only not waited for. With no
+/// linked account that may start one, the tracks wait for Navidrome's own
+/// scan.
 #[cfg(feature = "server")]
-async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32) -> bool {
+async fn scan_imports(
+    db: &sqlx::SqlitePool,
+    navidrome: &dyn crate::core::index::NavidromeOf,
+    user: &UserId,
+    navi: &Arc<soulbeet::navidrome::NavidromeClient>,
+    imported: u32,
+) -> bool {
+    use crate::core::scan::{start_scan_for, ScanStart, SCAN_ROLES};
+
     let before = match navi.get_scan_status().await {
         Ok(status) => Some(status.last_scan),
         Err(e) => {
@@ -1198,9 +1214,18 @@ async fn scan_imports(navi: &soulbeet::navidrome::NavidromeClient, imported: u32
             None
         }
     };
-    if let Err(e) = navi.start_scan().await {
-        warn!("Failed to trigger Navidrome scan: {}", e);
-        return false;
+    match start_scan_for(db, navidrome, &SCAN_ROLES, user, navi).await {
+        Ok(ScanStart::Started) => {}
+        Ok(ScanStart::NoAccount) => {
+            debug!(
+                "No Navidrome account linked to Soulbeet may start a scan: {imported} discovery imports appear at Navidrome's next own scan"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!("Failed to trigger Navidrome scan: {}", e);
+            return false;
+        }
     }
     info!(
         "Triggered Navidrome library scan after {} discovery imports",
@@ -2393,15 +2418,53 @@ mod tests {
 
     #[tokio::test]
     async fn a_scan_status_that_cannot_be_read_still_starts_the_scan() {
+        use crate::test_navidrome::{user_body, NavidromeFor, NavidromeStub};
+
         // getLastScanTime's `Internal Error` (server/subsonic/library_scanning.go:16-21); the scan
         // is accepted.
-        let navi = crate::test_navidrome::NavidromeStub::start();
+        let navi = NavidromeStub::start();
         navi.answer(
             "/rest/getScanStatus",
             &[r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"Internal Error"}}}"#],
         );
-        assert!(scan_imports(&navi.client(), 3).await);
-        assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/startScan"]);
+        navi.answer("/rest/getUser", &[&user_body(true)]);
+        let db = crate::db::test_db::migrated().await;
+        let client = navi.client();
+        let navidrome = NavidromeFor(Ok(client.clone()));
+        let user = crate::auth::UserId::new(&format!("alice-{}", uuid::Uuid::new_v4()));
+        assert!(scan_imports(&db, &navidrome, &user, &client, 3).await);
+        assert_eq!(
+            navi.asked(),
+            vec!["/rest/getScanStatus", "/rest/getUser", "/rest/startScan"]
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_linked_account_that_may_scan_none_is_asked_for() {
+        use crate::test_navidrome::{subsonic_ok, user_body, NavidromeFor, NavidromeStub};
+
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getScanStatus",
+            &[&subsonic_ok(
+                r#""scanStatus":{"scanning":false,"count":1342,"folderCount":120,"lastScan":"2026-11-15T10:02:00Z","scanType":"quick","elapsedTime":4000000000}"#,
+            )],
+        );
+        navi.answer("/rest/getUser", &[&user_body(false)]);
+        let db = crate::db::test_db::migrated().await;
+        let client = navi.client();
+        let navidrome = NavidromeFor(Ok(client.clone()));
+        let user = crate::auth::UserId::new(&format!("alice-{}", uuid::Uuid::new_v4()));
+        let logs = crate::test_log::LogCapture::start();
+        assert!(!scan_imports(&db, &navidrome, &user, &client, 3).await);
+        assert_eq!(navi.asked(), vec!["/rest/getScanStatus", "/rest/getUser"]);
+        // A normal state, not a failure: nothing is logged as one.
+        let lines = logs.lines();
+        assert!(
+            lines.contains(&"No Navidrome account linked to Soulbeet may start a scan: 3 discovery imports appear at Navidrome's next own scan".to_string())
+                && !lines.iter().any(|line| line.starts_with("Failed")),
+            "{lines:?}"
+        );
     }
 
     mod reconcile {

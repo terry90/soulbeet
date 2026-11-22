@@ -619,7 +619,8 @@ pub(crate) async fn sync_in(
         .filter(|id| !untold.contains(id))
         .collect();
 
-    let mut tracks = remove_disliked_pending_in(deps.db, &songs, &pending, threshold).await;
+    let mut tracks =
+        remove_disliked_pending_in(deps.db, deps.queue, &songs, &pending, threshold).await;
     let origin = match &permit {
         AutoDeletePermit::Allowed => Some(Origin::Auto),
         AutoDeletePermit::ForApp { grant_id } => Some(Origin::Mcp {
@@ -630,7 +631,14 @@ pub(crate) async fn sync_in(
     let replace = origin.clone().map_or(Replace::Never, Replace::Guarded);
     for song in &songs {
         if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
-            let promoted = promote(deps.db, deps.discovery, &user, &track.id, replace.clone());
+            let promoted = promote(
+                deps.db,
+                deps.discovery,
+                deps.queue,
+                &user,
+                &track.id,
+                replace.clone(),
+            );
             let result = promoted.await.map_err(NotDone::into_failure);
             match &result {
                 Err(e) if is_not_pending(e) => {
@@ -747,6 +755,7 @@ pub(crate) async fn sync(ctx: &UserCtx, permit: AutoDeletePermit) -> Result<Sync
 /// track_not_pending, which sync_in counts as skipped.
 pub(crate) async fn remove_disliked_pending_in(
     db: &SqlitePool,
+    queue: &ImportQueue,
     songs: &[SubsonicSong],
     pending: &HashMap<String, &DiscoveryTrack>,
     promote_threshold: u8,
@@ -758,7 +767,9 @@ pub(crate) async fn remove_disliked_pending_in(
             continue;
         };
         let result = match Folder::get_by_id_in(db, &track.folder_id).await {
-            Ok(Some(folder)) => remove_staged_in(db, track, &folder, StagedOutcome::Removed).await,
+            Ok(Some(folder)) => {
+                remove_staged_in(db, queue, track, &folder, StagedOutcome::Removed).await
+            }
             Ok(None) => Err(folder_not_found()),
             Err(e) => Err(database_failure(Stage::Delete, e)),
         };
@@ -838,7 +849,8 @@ pub(crate) async fn auto_delete_songs(
                 let remove = SyncedTrack::of(song, SyncAction::RemoveFromDiscovery, Some(&track));
                 let result = match Folder::get_by_id_in(guard.db, &track.folder_id).await {
                     Ok(Some(folder)) => {
-                        remove_staged_in(guard.db, &track, &folder, StagedOutcome::Removed).await
+                        remove_staged_in(guard.db, queue, &track, &folder, StagedOutcome::Removed)
+                            .await
                     }
                     Ok(None) => Err(folder_not_found()),
                     Err(e) => Err(database_failure(Stage::Delete, e)),
@@ -920,7 +932,7 @@ mod tests {
     use crate::core::delete_guard::test_support::Library;
     use crate::core::discovery::test_support::TestDiscovery;
     use crate::core::test_ctx;
-    use crate::import_queue::test_support::{RecordingDeps, StubImporter};
+    use crate::import_queue::test_support::stub_queue;
     use crate::models::user_settings::UpdateUserSettings;
     use crate::services::NavidromeLookupError;
     use crate::test_navidrome::{
@@ -1607,8 +1619,9 @@ mod tests {
         assert!(
             matches!(pending_action(&song, &pending, 1), Some(PendingAction::Promote(t)) if t.id == "t1")
         );
+        let (queue, stub) = stub_queue();
         assert_eq!(
-            remove_disliked_pending_in(&lib.db, songs, &pending, 1).await,
+            remove_disliked_pending_in(&lib.db, &queue, songs, &pending, 1).await,
             vec![]
         );
         assert!(staged.exists());
@@ -1617,12 +1630,15 @@ mod tests {
             &lib.alice(),
             songs,
             &pending,
-            &queue(),
+            &queue,
             &Origin::Auto,
         )
         .await;
         assert_eq!(run, vec![]);
-        let removed = remove_disliked_pending_in(&lib.db, songs, &pending, 3).await;
+        let profile =
+            std::fs::canonicalize(lib.root.join("music/alice/Discovery/Explore")).unwrap();
+        let canonical = std::fs::canonicalize(&staged).unwrap();
+        let removed = remove_disliked_pending_in(&lib.db, &queue, songs, &pending, 3).await;
         assert_eq!(
             (acts(&removed), removed[0].discovery_track_id.as_deref()),
             (
@@ -1639,6 +1655,7 @@ mod tests {
             ("Removed".into(), "removed".into())
         );
         assert_eq!(lib.fake.ratings_set(), vec![], "the guard never checked it");
+        assert_eq!(stub.forgets_once(1).await, vec![(profile, canonical)]);
     }
 
     fn deps<'a>(
@@ -1664,7 +1681,7 @@ mod tests {
     }
 
     fn queue() -> ImportQueue {
-        ImportQueue::new(RecordingDeps::new(Arc::new(StubImporter::new())))
+        stub_queue().0
     }
 
     #[tokio::test]
@@ -2241,6 +2258,7 @@ mod tests {
         let later = chrono::Utc::now() + chrono::Duration::days(8);
         let expired = crate::core::discovery::expire_in(
             &lib.db,
+            &queue,
             &folder,
             &HashMap::new(),
             later,
