@@ -1,4 +1,4 @@
-use super::{processing, utils::WantedTrack};
+use super::{processing, utils::WantedTrack, wildcard};
 use crate::{
     error::{MissingSetting, Result, SoulseekError},
     http::{resolve_docker_url, CircuitBreaker},
@@ -20,7 +20,7 @@ use shared::{
     slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -58,12 +58,22 @@ struct SearchContext {
     artist: String,
     album: Option<String>,
     tracks: Vec<WantedTrack>,
-    /// The text slskd was sent.
+    /// The text slskd was sent first.
     query_text: String,
+    /// The texts sent in turn while no peer answers (`wildcard::retry_texts`).
+    retry_texts: Vec<String>,
+    /// How many of `retry_texts` were sent.
+    retried: usize,
+    /// The slskd search running now: the search's own id until a retry text is sent.
+    slskd_id: String,
     keep_below_floor: bool,
+    /// When the first text was sent: the deadline counts from it for every retry.
     start_time: DateTime<Utc>,
     timeout: Duration,
-    /// slskd was told to stop the search at the deadline.
+    /// `stop_search` was called: no retry text is sent any more.
+    stop_requested: bool,
+    /// slskd was told to stop the slskd search running now, by `stop_search` or at the
+    /// deadline.
     cancelled: bool,
 }
 
@@ -77,12 +87,23 @@ pub struct SearchPoll {
 }
 
 /// The part of slskd's search record a poll reads (`GET searches/{id}`,
-/// `SearchesController.cs:140`; `Search/Types/Search.cs:52,55`).
+/// `SearchesController.cs:140`; `Search/Types/Search.cs:52,55,72`).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchStatus {
     is_complete: bool,
     response_count: u32,
+    /// slskd's `SearchStates` flags, written as `JsonStringEnumConverter` writes a flags enum
+    /// (`Program.cs:980`): `Completed, TimedOut`.
+    state: String,
+}
+
+impl SearchStatus {
+    /// Whether the search ended with `flag` among its states: `Errored` when Soulseek.NET threw
+    /// during the search, `Cancelled` when its token was cancelled (`SearchService.cs:331-345`).
+    fn ended_as(&self, flag: &str) -> bool {
+        self.state.split(", ").any(|state| state == flag)
+    }
 }
 
 /// What a poll does after reading a search's status.
@@ -122,6 +143,11 @@ fn poll_step(complete: bool, elapsed: Duration, deadline: Duration, cancelled: b
         PollStep::GiveUp
     }
 }
+
+/// A search the rate limit allows now, with the times of the searches sent in its window. Every
+/// other search waits while it is held, and it counts only once a search is sent in it, so a
+/// retry text found needless after the wait spends no search.
+struct SearchSlot<'a>(MutexGuard<'a, Vec<DateTime<Utc>>>);
 
 #[derive(Debug)]
 pub struct SoulseekClient {
@@ -343,7 +369,8 @@ impl SoulseekClient {
         }
     }
 
-    async fn wait_for_rate_limit(&self) -> Result<()> {
+    /// Waits until the rate limit allows one more search: the slot `post_search` sends it in.
+    async fn wait_for_rate_limit(&self) -> SearchSlot<'_> {
         let mut timestamps = self.search_timestamps.lock().await;
         let now = Utc::now();
         let window_start = now - self.rate_limit_window;
@@ -365,13 +392,14 @@ impl SoulseekClient {
                 }
             }
         }
-        timestamps.push(now);
-        Ok(())
+        SearchSlot(timestamps)
     }
 
-    /// The search for `spec`: `spec.text` trimmed when given, else
-    /// `search_text` of its album and tracks, which a search needs either way
-    /// to score what it finds.
+    /// The search for `spec`: `spec.text` trimmed when given, else the
+    /// `search_parts` of its album and tracks joined by a space, which a search needs either way
+    /// to score what it finds. While no peer answers it, the search is sent
+    /// again under the same id with the texts `wildcard::retry_texts` gives
+    /// for the caller's text, or for the artist and title.
     pub async fn start_search(&self, spec: SearchSpec, timeout: Duration) -> Result<String> {
         let SearchSpec {
             album,
@@ -379,12 +407,11 @@ impl SoulseekClient {
             text,
             keep_below_floor,
         } = spec;
-        let built = search_text(album.as_ref(), &tracks)?;
-        let query = match text.as_deref().map(str::trim) {
-            Some(text) if !text.is_empty() => text.to_string(),
-            _ => built,
+        let parts = search_parts(album.as_ref(), &tracks)?;
+        let (query, retry_texts) = match text.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => (text.to_string(), wildcard::retry_texts(&[text])),
+            _ => (parts.join(" "), wildcard::retry_texts(&parts)),
         };
-        self.wait_for_rate_limit().await?;
 
         let wanted: Vec<WantedTrack> = tracks
             .iter()
@@ -399,24 +426,8 @@ impl SoulseekClient {
             query,
             timeout.num_milliseconds()
         );
-
-        let request_body = SearchRequest::new(&query);
-
-        #[derive(Deserialize)]
-        struct SearchId {
-            id: String,
-        }
-        let search_id_resp: SearchId = self
-            .make_request(Method::POST, "searches", Some(&request_body))
-            .await
-            .map_err(|e| match e {
-                SoulseekError::Api {
-                    status: 400,
-                    message,
-                } => search_refused(message),
-                e => e,
-            })?;
-        let search_id = search_id_resp.id;
+        let slot = self.wait_for_rate_limit().await;
+        let search_id = self.post_search(slot, &query).await?;
 
         self.active_searches.lock().await.insert(
             search_id.clone(),
@@ -428,15 +439,41 @@ impl SoulseekClient {
                     .unwrap_or_else(|| tracks[0].artist.clone()),
                 tracks: wanted,
                 query_text: query,
+                retry_texts,
+                retried: 0,
+                slskd_id: search_id.clone(),
                 keep_below_floor,
                 start_time: Utc::now(),
                 timeout,
+                stop_requested: false,
                 cancelled: false,
             },
         );
 
         info!("Search initiated with ID: {search_id}");
         Ok(search_id)
+    }
+
+    /// Starts one slskd search for `text` in `slot`, which counts it: slskd's id of it.
+    async fn post_search(&self, slot: SearchSlot<'_>, text: &str) -> Result<String> {
+        let SearchSlot(mut timestamps) = slot;
+        timestamps.push(Utc::now());
+        drop(timestamps);
+        #[derive(Deserialize)]
+        struct SearchId {
+            id: String,
+        }
+        let started: SearchId = self
+            .make_request(Method::POST, "searches", Some(&SearchRequest::new(text)))
+            .await
+            .map_err(|e| match e {
+                SoulseekError::Api {
+                    status: 400,
+                    message,
+                } => search_refused(message),
+                e => e,
+            })?;
+        Ok(started.id)
     }
 
     /// One poll of `search_id`, holding for up to 10 seconds while the search
@@ -453,8 +490,10 @@ impl SoulseekClient {
         if matches!(&polled, Ok(poll) if poll.state == SearchState::InProgress) {
             return polled;
         }
-        self.active_searches.lock().await.remove(&search_id);
-        let _ = self.delete_search(&search_id).await;
+        let ended = self.active_searches.lock().await.remove(&search_id);
+        if let Some(ended) = ended {
+            let _ = self.delete_search(&ended.slskd_id).await;
+        }
         match &polled {
             Ok(poll) => info!(
                 "Search {} completed with {} files from slskd",
@@ -470,9 +509,9 @@ impl SoulseekClient {
     async fn poll_turns(&self, search_id: &str, mut context: SearchContext) -> Result<SearchPoll> {
         let poll_start = Utc::now();
         let long_poll_timeout = Duration::seconds(10);
-        let endpoint = format!("searches/{search_id}");
 
         loop {
+            let endpoint = format!("searches/{}", context.slskd_id);
             let status: SearchStatus = self
                 .make_request(Method::GET, &endpoint, None::<()>)
                 .await
@@ -485,9 +524,27 @@ impl SoulseekClient {
                 context.cancelled,
             ) {
                 PollStep::Read => {
-                    return self
-                        .read_responses(search_id, &context, status.response_count)
-                        .await
+                    let mut poll = self.read_responses(&context, status.response_count).await?;
+                    if poll.stats.response_count > 0 {
+                        return Ok(poll);
+                    }
+                    // No peer answered because the search failed, not because none was asked.
+                    if status.ended_as("Errored") {
+                        return Err(SoulseekError::SearchErrored {
+                            search_id: search_id.to_string(),
+                        });
+                    }
+                    if status.ended_as("Cancelled") || self.stopped(search_id).await {
+                        return Ok(poll);
+                    }
+                    // A retry runs under the same id: this poll goes on reading it.
+                    if self.retry_unanswered(search_id, &mut context).await {
+                        continue;
+                    }
+                    if !self.stopped(search_id).await {
+                        poll.stats.unanswered_note = Some(unanswered_note(context.retried > 0));
+                    }
+                    return Ok(poll);
                 }
                 PollStep::Wait => {
                     if (Utc::now() - poll_start) > long_poll_timeout {
@@ -520,14 +577,14 @@ impl SoulseekClient {
         }
     }
 
-    /// The responses of a search slskd completed, counting `response_count`.
+    /// The responses of the slskd search `context` runs, which slskd completed counting
+    /// `response_count`.
     async fn read_responses(
         &self,
-        search_id: &str,
         context: &SearchContext,
         response_count: u32,
     ) -> Result<SearchPoll> {
-        let endpoint = format!("searches/{search_id}/responses");
+        let endpoint = format!("searches/{}/responses", context.slskd_id);
         let mut rereads = 0;
         let responses = loop {
             let responses: Vec<SearchResponse> = self
@@ -572,8 +629,79 @@ impl SoulseekClient {
                 locked_file_count: responses.iter().map(|r| r.locked_file_count).sum(),
                 not_audio,
                 below_floor,
+                retried_texts: context.retry_texts[..context.retried].to_vec(),
+                unanswered_note: None,
             },
         })
+    }
+
+    /// Whether search `search_id` was stopped, by `stop_search` or at its deadline.
+    async fn stopped(&self, search_id: &str) -> bool {
+        (self.active_searches.lock().await)
+            .get(search_id)
+            .is_some_and(|context| context.stop_requested || context.cancelled)
+    }
+
+    /// Sends the next retry text of search `search_id`, whose slskd search `context` names drew
+    /// no response: whether it was sent. None is sent once the texts ran out, once the search
+    /// was stopped, or when less than the inactivity timeout is left before the deadline, too
+    /// little for a search no peer answers to end on its own; a text slskd refuses is logged.
+    /// The new slskd search takes the old one's place in `context` and in the search's entry,
+    /// and the old one is deleted.
+    async fn retry_unanswered(&self, search_id: &str, context: &mut SearchContext) -> bool {
+        let Some(text) = context.retry_texts.get(context.retried).cloned() else {
+            return false;
+        };
+        let time_left = || {
+            context.timeout - (Utc::now() - context.start_time)
+                >= Duration::milliseconds(SEARCH_INACTIVITY_MS.into())
+        };
+        if !time_left() {
+            return false;
+        }
+        // Checked again after the wait for the rate limit, which can outlast the deadline.
+        let slot = self.wait_for_rate_limit().await;
+        if !time_left() || self.stopped(search_id).await {
+            return false;
+        }
+        info!("Search {search_id} drew no response, sending it again as '{text}'");
+        let next = match self.post_search(slot, &text).await {
+            Ok(next) => next,
+            Err(e) => {
+                warn!("Search {search_id} could not be sent again as '{text}': {e}");
+                return false;
+            }
+        };
+        let ended = std::mem::replace(&mut context.slskd_id, next.clone());
+        context.retried += 1;
+        // Recorded before the old search is deleted: a poll dropped meanwhile leaves the entry
+        // naming the search that runs, and its next poll reads that one.
+        let stop_requested = match self.active_searches.lock().await.get_mut(search_id) {
+            Some(entry) => {
+                entry.slskd_id = next.clone();
+                entry.retried = context.retried;
+                entry.stop_requested
+            }
+            None => false,
+        };
+        let _ = self.delete_search(&ended).await;
+        if stop_requested {
+            // `stop_search` asked slskd to stop the search that ended.
+            let endpoint = format!("searches/{next}");
+            match self
+                .make_request::<(), ()>(Method::PUT, &endpoint, None)
+                .await
+            {
+                Ok(()) => {
+                    context.cancelled = true;
+                    if let Some(entry) = self.active_searches.lock().await.get_mut(search_id) {
+                        entry.cancelled = true;
+                    }
+                }
+                Err(e) => warn!("slskd did not stop the retry of stopped search {search_id}: {e}"),
+            }
+        }
+        true
     }
 
     /// Enqueue `req` into `destination`, a folder under slskd's download
@@ -879,10 +1007,20 @@ impl SoulseekClient {
     /// cancels the search's token (`SearchService.cs:414-423`), and the search ends
     /// `Completed, Cancelled` with the responses it had (`SearchService.cs:337-341,359`). 404
     /// (no such search, `:222-225`) is Ok: nothing runs.
-    /// A search this client polls is marked cancelled, so its deadline does not cancel it again
-    /// and its next polls give it the grace a cancelled search has to end.
+    /// slskd is asked to stop the slskd search a search this client polls runs now. The search
+    /// sends no retry text from the call on, marked before slskd is asked so that a retry
+    /// starting meanwhile sees the mark and stops itself. Once slskd took the stop, the search
+    /// is marked cancelled too, so its deadline does not cancel it again and its next polls give
+    /// it the grace a cancelled search has to end.
     pub async fn stop_search(&self, search_id: &str) -> Result<()> {
-        let endpoint = format!("searches/{}", path_segment(search_id)?);
+        let running = match self.active_searches.lock().await.get_mut(search_id) {
+            Some(context) => {
+                context.stop_requested = true;
+                context.slskd_id.clone()
+            }
+            None => search_id.to_string(),
+        };
+        let endpoint = format!("searches/{}", path_segment(&running)?);
         match self
             .make_request::<(), ()>(Method::PUT, &endpoint, None)
             .await
@@ -1422,17 +1560,30 @@ impl crate::DownloadBackend for SoulseekClient {
 /// the last response.
 const SEARCH_INACTIVITY_MS: u32 = 15_000;
 
-/// The query text for a search: one track names itself, an album names the
-/// album, and a search without an album needs exactly one track.
-fn search_text(album: Option<&Album>, tracks: &[Track]) -> Result<String> {
+/// The artist and the title a search names: one track names itself, an album
+/// names the album, and a search without an album needs exactly one track.
+fn search_parts<'a>(album: Option<&'a Album>, tracks: &'a [Track]) -> Result<[&'a str; 2]> {
     match (album, tracks) {
-        (Some(album), [track]) => Ok(format!("{} {}", album.artist.trim(), track.title.trim())),
-        (Some(album), _) => Ok(format!("{} {}", album.artist.trim(), album.title.trim())),
-        (None, [track]) => Ok(format!("{} {}", track.artist.trim(), track.title.trim())),
+        (Some(album), [track]) => Ok([album.artist.trim(), track.title.trim()]),
+        (Some(album), _) => Ok([album.artist.trim(), album.title.trim()]),
+        (None, [track]) => Ok([track.artist.trim(), track.title.trim()]),
         (None, _) => Err(SoulseekError::NoSearchTarget {
             tracks: tracks.len(),
         }),
     }
+}
+
+/// What a search no peer answered says of itself, `retried` when retry texts were sent too.
+fn unanswered_note(retried: bool) -> String {
+    let also = match retried {
+        true => ", also with wildcards in place of some words",
+        false => "",
+    };
+    format!(
+        "No peer answered{also}. The Soulseek server silently drops searches that contain a \
+         phrase on its exclusion list (often a well known artist name or title), so it may be \
+         blocking this one."
+    )
 }
 
 #[derive(Serialize)]
@@ -1618,20 +1769,20 @@ mod tests {
         let silent = track("Marrow Choir", "Silent Night");
         let winter = album("Marrow Choir ", "Winter Songs");
         assert_eq!(
-            search_text(None, std::slice::from_ref(&night)).unwrap(),
-            "Marrow Choir O Holy Night"
+            search_parts(None, std::slice::from_ref(&night)).unwrap(),
+            ["Marrow Choir", "O Holy Night"]
         );
         assert_eq!(
-            search_text(Some(&winter), std::slice::from_ref(&night)).unwrap(),
-            "Marrow Choir O Holy Night"
+            search_parts(Some(&winter), std::slice::from_ref(&night)).unwrap(),
+            ["Marrow Choir", "O Holy Night"]
         );
         assert_eq!(
-            search_text(Some(&winter), &[night, silent]).unwrap(),
-            "Marrow Choir Winter Songs"
+            search_parts(Some(&winter), &[night, silent]).unwrap(),
+            ["Marrow Choir", "Winter Songs"]
         );
         assert_eq!(
-            search_text(Some(&winter), &[]).unwrap(),
-            "Marrow Choir Winter Songs"
+            search_parts(Some(&winter), &[]).unwrap(),
+            ["Marrow Choir", "Winter Songs"]
         );
     }
 
@@ -1642,7 +1793,7 @@ mod tests {
             track("Marrow Choir", "Silent Night"),
         ];
         for tracks in [Vec::new(), two] {
-            let e = search_text(None, &tracks).unwrap_err();
+            let e = search_parts(None, &tracks).unwrap_err();
             assert!(
                 matches!(e, SoulseekError::NoSearchTarget { tracks: n } if n == tracks.len()),
                 "{e:?}"
@@ -2105,13 +2256,23 @@ mod tests {
     /// Soulseek.NET's `Completed | TimedOut`, set when the inactivity timer
     /// fires (`src/SearchInternal.cs:63,145`).
     fn status(complete: bool, responses: u32) -> Reply {
+        let state = if complete {
+            "Completed, TimedOut"
+        } else {
+            "InProgress"
+        };
+        status_in(state, responses)
+    }
+
+    /// slskd's search record in `state`, which `isComplete` follows (`Search.cs:52`).
+    fn status_in(state: &str, responses: u32) -> Reply {
         Reply {
             status: 200,
             body: serde_json::json!({
-                "fileCount": responses, "id": SEARCH_ID, "isComplete": complete, "lockedFileCount": 0,
-                "responseCount": responses, "responses": [], "searchText": "Marrow Choir O Holy Night",
-                "startedAt": "2026-11-15T10:00:00.0000000Z",
-                "state": if complete { "Completed, TimedOut" } else { "InProgress" }, "token": 17 })
+                "fileCount": responses, "id": SEARCH_ID, "isComplete": state.starts_with("Completed"),
+                "lockedFileCount": 0, "responseCount": responses, "responses": [],
+                "searchText": "Marrow Choir O Holy Night", "startedAt": "2026-11-15T10:00:00.0000000Z",
+                "state": state, "token": 17 })
             .to_string(),
         }
     }
@@ -2366,12 +2527,23 @@ mod tests {
         replies: Vec<Reply>,
         deadline: Duration,
     ) -> (SoulseekClient, Arc<StdMutex<Vec<Seen>>>) {
+        searching_limited(replies, deadline, 35, 220).await
+    }
+
+    /// `searching`, with a rate limit of `max_searches` in `window_seconds`.
+    async fn searching_limited(
+        replies: Vec<Reply>,
+        deadline: Duration,
+        max_searches: usize,
+        window_seconds: i64,
+    ) -> (SoulseekClient, Arc<StdMutex<Vec<Seen>>>) {
         let mut all = vec![ok(&format!(r#"{{"id":"{SEARCH_ID}"}}"#))];
         all.extend(replies);
         let (url, seen) = serve(all);
         let client = SoulseekClientBuilder::new()
             .base_url(&url)
             .api_key("k")
+            .rate_limit(max_searches, window_seconds)
             .build()
             .unwrap();
         client
@@ -2413,7 +2585,9 @@ mod tests {
                 file_count: 3,
                 locked_file_count: 2,
                 not_audio: 1,
-                below_floor: 1
+                below_floor: 1,
+                retried_texts: vec![],
+                unanswered_note: None,
             }
         );
         let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
@@ -2438,7 +2612,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();
-        assert_eq!(body["searchText"], search_text(None, &wanted).unwrap());
+        assert_eq!(body["searchText"], "Marrow Choir O Holy Night");
         // Text alone names nothing to score what is found against.
         let untargeted = SearchSpec {
             text: Some("Marrow Choir".into()),
@@ -2487,11 +2661,136 @@ mod tests {
         );
     }
 
+    /// The id slskd gives a search sent again with a retry text.
+    const RETRY_ID: &str = "8d1c0b9a-2e3f-4a5b-8c7d-6e5f4a3b2c1d";
+    /// The id slskd gives the second retry.
+    const LAST_RETRY_ID: &str = "5b4a3c2d-1e0f-4a9b-8c7d-0f1e2d3c4b5a";
+
+    fn started(id: &str) -> Reply {
+        ok(&format!(r#"{{"id":"{id}"}}"#))
+    }
+
+    fn methods_and_targets(seen: &StdMutex<Vec<Seen>>) -> Vec<(String, String)> {
+        (seen.lock().unwrap().iter())
+            .map(|s| (s.method.clone(), s.target.clone()))
+            .collect()
+    }
+
+    fn texts_sent(seen: &StdMutex<Vec<Seen>>) -> Vec<String> {
+        (seen.lock().unwrap().iter())
+            .filter(|s| s.method == "POST")
+            .map(|s| {
+                let body: serde_json::Value = serde_json::from_str(&s.body).unwrap();
+                body["searchText"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// The Soulseek server drops a search holding an excluded phrase: no peer answers it.
     #[tokio::test]
-    async fn a_search_without_responses_is_read_once() {
+    async fn a_search_no_peer_answers_is_sent_again_with_wildcards_under_its_id() {
+        let (client, seen) = searching(
+            vec![
+                status(true, 0),
+                empty(),
+                started(RETRY_ID),
+                no_content(),
+                status(true, 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.state, SearchState::Completed);
+        assert_eq!(poll.albums[0].tracks[0].base.username, "carol_shares");
+        assert_eq!(
+            (
+                poll.stats.query_text.as_str(),
+                poll.stats.retried_texts.clone(),
+                poll.stats.response_count,
+                poll.stats.unanswered_note
+            ),
+            (
+                "Marrow Choir O Holy Night",
+                vec!["*arrow Choir O *oly Night".to_string()],
+                1,
+                None
+            )
+        );
+        assert_eq!(
+            texts_sent(&seen),
+            ["Marrow Choir O Holy Night", "*arrow Choir O *oly Night"]
+        );
+        let (first, retry) = (
+            format!("/api/v0/searches/{SEARCH_ID}"),
+            format!("/api/v0/searches/{RETRY_ID}"),
+        );
+        let t = |method: &str, target: &str| (method.to_string(), target.to_string());
+        assert_eq!(
+            methods_and_targets(&seen),
+            vec![
+                t("POST", "/api/v0/searches"),
+                t("GET", &first),
+                t("GET", &format!("{first}/responses")),
+                t("POST", "/api/v0/searches"),
+                t("DELETE", &first),
+                t("GET", &retry),
+                t("GET", &format!("{retry}/responses")),
+                t("DELETE", &retry),
+            ]
+        );
+        assert!(client.active_searches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_search_nothing_answers_even_with_wildcards_says_the_server_may_block_it() {
+        let (client, seen) = searching(
+            vec![
+                status(true, 0),
+                empty(),
+                started(RETRY_ID),
+                no_content(),
+                status(true, 0),
+                empty(),
+                started(LAST_RETRY_ID),
+                no_content(),
+                status(true, 0),
+                empty(),
+                no_content(),
+            ],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.state, poll.stats.response_count, poll.albums.len()),
+            (SearchState::Completed, 0, 0)
+        );
+        let retried = ["*arrow Choir O *oly Night", "Marrow *hoir O Holy *ight"];
+        assert_eq!(poll.stats.retried_texts, retried);
+        assert_eq!(
+            poll.stats.unanswered_note.as_deref(),
+            Some(unanswered_note(true).as_str())
+        );
+        assert!(unanswered_note(true).contains("may be blocking"));
+        let mut sent = vec!["Marrow Choir O Holy Night"];
+        sent.extend(retried);
+        assert_eq!(texts_sent(&seen), sent);
+        let last = (seen.lock().unwrap().last().cloned()).unwrap();
+        assert_eq!(
+            (last.method.as_str(), last.target),
+            ("DELETE", format!("/api/v0/searches/{LAST_RETRY_ID}"))
+        );
+    }
+
+    /// Less of the search's time is left than a search no peer answers takes to end.
+    #[tokio::test]
+    async fn a_search_without_responses_near_its_deadline_is_read_once() {
         let (client, seen) = searching(
             vec![status(true, 0), empty(), no_content()],
-            Duration::seconds(120),
+            Duration::seconds(10),
         )
         .await;
         let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
@@ -2499,7 +2798,196 @@ mod tests {
             (poll.state, poll.stats.file_count, poll.albums.len()),
             (SearchState::Completed, 0, 0)
         );
+        assert!(poll.stats.retried_texts.is_empty());
+        assert_eq!(
+            poll.stats.unanswered_note.as_deref(),
+            Some(unanswered_note(false).as_str())
+        );
         assert_eq!(seen.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_search_sends_no_retry_text() {
+        let (client, seen) = searching(
+            vec![ok(""), status(true, 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert!(poll.stats.retried_texts.is_empty());
+        assert_eq!(
+            poll.stats.unanswered_note, None,
+            "a stopped search says nothing of it"
+        );
+        assert_eq!(texts_sent(&seen).len(), 1);
+    }
+
+    /// The wait for the rate limit used up the time a retry text needed.
+    #[tokio::test]
+    async fn a_retry_text_the_rate_limit_held_past_its_time_is_not_sent() {
+        let deadline = Duration::milliseconds(i64::from(SEARCH_INACTIVITY_MS) + 1_000);
+        let (client, seen) =
+            searching_limited(vec![status(true, 0), empty(), no_content()], deadline, 1, 2).await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert!(poll.stats.retried_texts.is_empty());
+        assert_eq!(
+            poll.stats.unanswered_note.as_deref(),
+            Some(unanswered_note(false).as_str())
+        );
+        assert_eq!(texts_sent(&seen).len(), 1);
+        // The slot the retry waited for was not spent: the next search does not wait.
+        assert_eq!(client.search_timestamps.lock().await.len(), 1);
+    }
+
+    /// slskd refused the retry text: the search ends as the texts that ran found it.
+    #[tokio::test]
+    async fn a_retry_text_slskd_refuses_ends_the_search_unanswered() {
+        let refused = Reply {
+            status: 500,
+            body: "Search failed".into(),
+        };
+        let (client, seen) = searching(
+            vec![status(true, 0), empty(), refused, no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.state, poll.stats.response_count),
+            (SearchState::Completed, 0)
+        );
+        assert!(poll.stats.retried_texts.is_empty());
+        assert_eq!(
+            poll.stats.unanswered_note.as_deref(),
+            Some(unanswered_note(false).as_str())
+        );
+        let last = (seen.lock().unwrap().last().cloned()).unwrap();
+        assert_eq!(
+            (last.method.as_str(), last.target),
+            ("DELETE", format!("/api/v0/searches/{SEARCH_ID}"))
+        );
+    }
+
+    /// Soulseek.NET threw during the search (`SearchService.cs:331-345`): no peer may have been
+    /// asked, so it is a failure, not a search the server dropped.
+    #[tokio::test]
+    async fn a_search_slskd_ended_errored_without_responses_fails_and_is_not_sent_again() {
+        let (client, seen) = searching(
+            vec![status_in("Completed, Errored", 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let e = client.poll_search(SEARCH_ID.into()).await.unwrap_err();
+        assert!(
+            matches!(&e, SoulseekError::SearchErrored { search_id } if search_id == SEARCH_ID),
+            "{e:?}"
+        );
+        assert_eq!(texts_sent(&seen).len(), 1);
+        assert!(client.active_searches.lock().await.is_empty());
+    }
+
+    /// What an errored search had found is read as any other search's.
+    #[tokio::test]
+    async fn an_errored_search_keeps_the_responses_it_had() {
+        let (client, _) = searching(
+            vec![
+                status_in("Completed, Errored", 1),
+                one_response(),
+                no_content(),
+            ],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(poll.albums[0].tracks[0].base.username, "carol_shares");
+    }
+
+    /// Someone cancelled the search in slskd itself.
+    #[tokio::test]
+    async fn a_search_cancelled_in_slskd_is_not_sent_again() {
+        let (client, seen) = searching(
+            vec![status_in("Completed, Cancelled", 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.stats.retried_texts.len(), poll.stats.unanswered_note),
+            (0, None)
+        );
+        assert_eq!(texts_sent(&seen).len(), 1);
+    }
+
+    /// A stop slskd did not take still ends the retries, and leaves the search to be cancelled at
+    /// its deadline.
+    #[tokio::test]
+    async fn a_stop_slskd_refused_sends_no_retry_text_and_keeps_the_deadline_cancel() {
+        let refused = Reply {
+            status: 500,
+            body: "boom".into(),
+        };
+        let (client, seen) = searching(
+            vec![refused, status(true, 0), empty(), no_content()],
+            Duration::seconds(120),
+        )
+        .await;
+        client.stop_search(SEARCH_ID).await.unwrap_err();
+        {
+            let searches = client.active_searches.lock().await;
+            let context = &searches[SEARCH_ID];
+            assert!(context.stop_requested && !context.cancelled);
+        }
+        let poll = client.poll_search(SEARCH_ID.into()).await.unwrap();
+        assert_eq!(
+            (poll.stats.retried_texts.len(), poll.stats.unanswered_note),
+            (0, None)
+        );
+        assert_eq!(texts_sent(&seen).len(), 1);
+    }
+
+    /// A stop reaches the slskd search a retry text started, not the one that ended.
+    #[tokio::test]
+    async fn a_stop_reaches_the_retry_that_runs() {
+        let (client, seen) = searching(vec![ok("")], Duration::seconds(120)).await;
+        if let Some(context) = client.active_searches.lock().await.get_mut(SEARCH_ID) {
+            context.slskd_id = RETRY_ID.into();
+            context.retried = 1;
+        }
+        client.stop_search(SEARCH_ID).await.unwrap();
+        let stop = seen.lock().unwrap()[1].clone();
+        assert_eq!(
+            (stop.method.as_str(), stop.target),
+            ("PUT", format!("/api/v0/searches/{RETRY_ID}"))
+        );
+        assert!(client.active_searches.lock().await[SEARCH_ID].cancelled);
+    }
+
+    /// Soulseek wildcard terms (`*` for a word's first letter) are sent as the caller wrote them.
+    #[tokio::test]
+    async fn a_callers_wildcards_reach_slskd_as_written() {
+        let (url, seen) = serve(vec![started(SEARCH_ID)]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&url)
+            .api_key("k")
+            .build()
+            .unwrap();
+        let spec = SearchSpec {
+            text: Some(" Ella Fitzgerald *inter Wonderland ".into()),
+            ..SearchSpec::of(None, vec![track("Ella Fitzgerald", "Winter Wonderland")])
+        };
+        client
+            .start_search(spec, Duration::seconds(120))
+            .await
+            .unwrap();
+        assert_eq!(texts_sent(&seen), ["Ella Fitzgerald *inter Wonderland"]);
+        assert_eq!(
+            client.active_searches.lock().await[SEARCH_ID].retry_texts,
+            [
+                "*lla Fitzgerald *inter *onderland",
+                "Ella *itzgerald *inter Wonderland"
+            ]
+        );
     }
 
     /// slskd leaves a record this way when its final update fails

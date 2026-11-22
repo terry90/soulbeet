@@ -5,6 +5,8 @@ pub mod deletion_review;
 pub mod discovery_candidate;
 pub mod discovery_history;
 pub mod discovery_playlist;
+#[cfg(feature = "server")]
+pub mod discovery_search_miss;
 pub mod engine_report;
 pub mod folder;
 #[cfg(feature = "server")]

@@ -486,14 +486,72 @@ async fn stop_waiting(
     }
 }
 
+/// What a discovery run's source search for one candidate track came to.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+enum CandidateSearch {
+    /// The items found, best first.
+    Found(Vec<shared::download::DownloadableItem>),
+    /// Nothing was found, or nothing that scored well enough.
+    Missed(Failure),
+    /// The search failed, which says nothing of the track.
+    Failed(Failure),
+}
+
+/// Searches `searched` for `track` by `artist`, from `album`, for a discovery run of `user_id`,
+/// counting in `db` the runs in a row whose search for it found nothing
+/// (`discovery_search_miss`). Err is the database's text.
+#[cfg(feature = "server")]
+async fn search_candidate(
+    db: &sqlx::SqlitePool,
+    searched: &crate::core::sources::Searched,
+    user_id: &str,
+    artist: &str,
+    track: &str,
+    album: Option<&str>,
+) -> Result<CandidateSearch, String> {
+    use crate::models::discovery_search_miss::{clear_in, record_in};
+    let wanted = [shared::metadata::Track {
+        id: String::new(),
+        title: track.to_string(),
+        artist: artist.to_string(),
+        album_id: None,
+        album_title: album.map(str::to_string),
+        release_date: None,
+        duration: None,
+        mbid: None,
+        release_mbid: None,
+    }];
+    match crate::core::sources::search_ranked(searched, &[], None, &wanted).await {
+        Ok(groups) => {
+            clear_in(db, user_id, artist, track).await?;
+            Ok(CandidateSearch::Found(
+                groups.into_iter().flat_map(|g| g.items).collect(),
+            ))
+        }
+        Err(failure)
+            if matches!(
+                failure.code,
+                FailureCode::SearchNoResults | FailureCode::SearchAllFiltered
+            ) =>
+        {
+            record_in(db, user_id, artist, track).await?;
+            Ok(CandidateSearch::Missed(failure))
+        }
+        Err(failure) => Ok(CandidateSearch::Failed(failure)),
+    }
+}
+
 #[cfg(feature = "server")]
 pub async fn generate_discovery_playlist_internal(
     user_id: &str,
 ) -> Result<shared::navidrome::GenerationResult, Failure> {
+    use crate::core::sources::Searched;
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
     use crate::models::discovery_history::{seen_key, DiscoveryHistoryRow};
-    use crate::services::download_backend;
+    use crate::models::discovery_search_miss;
+    use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
     use shared::navidrome::{GenerationResult, ProfileGenerationStats};
 
     // Acquire per-user lock to prevent concurrent generation
@@ -534,6 +592,7 @@ pub async fn generate_discovery_playlist_internal(
     let backend = download_backend(None)
         .await
         .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
+    let searched: Searched = (DEFAULT_DOWNLOAD_BACKEND.to_string(), backend.clone());
 
     // Create per-profile subdirectories under Discovery/
     for profile in &selected_profiles {
@@ -565,6 +624,16 @@ pub async fn generate_discovery_playlist_internal(
         .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!("Added {} deleted tracks to exclusion set", disliked.len());
     seen.extend(disliked);
+
+    // Tracks whose search kept finding nothing, which the engine would suggest every run
+    let kept_out = discovery_search_miss::kept_out_keys(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+    info!(
+        "Added {} tracks never found on the network to exclusion set",
+        kept_out.len()
+    );
+    seen.extend(kept_out);
 
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
@@ -693,6 +762,15 @@ pub async fn generate_discovery_playlist_internal(
                 let key = seen_key(&candidate.artist, &candidate.track);
                 if seen.contains(&key) {
                     stats.candidates_skipped_seen += 1;
+                    // Used, so the next attempt draws other candidates in its place.
+                    DiscoveryCandidateRow::mark_used(
+                        user_id,
+                        &profile_name,
+                        &candidate.artist,
+                        &candidate.track,
+                    )
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Input, e))?;
                     continue;
                 }
                 stats.candidates_tried += 1;
@@ -705,77 +783,38 @@ pub async fn generate_discovery_playlist_internal(
                 )
                 .await;
 
-                let search_tracks = vec![shared::metadata::Track {
-                    id: String::new(),
-                    title: candidate.track.clone(),
-                    artist: candidate.artist.clone(),
-                    album_id: None,
-                    album_title: candidate.album.clone(),
-                    release_date: None,
-                    duration: None,
-                    mbid: None,
-                    release_mbid: None,
-                }];
-
-                let spec = shared::download::SearchSpec::of(None, search_tracks);
-                let search_id = match backend.start_search(&spec).await {
-                    Ok(id) => id,
-                    Err(e) => {
+                let searched_for = search_candidate(
+                    &crate::db::DB,
+                    &searched,
+                    user_id,
+                    &candidate.artist,
+                    &candidate.track,
+                    candidate.album.as_deref(),
+                )
+                .await
+                .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
+                let mut ranked_items = match searched_for {
+                    CandidateSearch::Found(items) => items,
+                    CandidateSearch::Missed(failure) => {
+                        info!(
+                            "No results for '{}' - {}, skipping: {}",
+                            candidate.artist, candidate.track, failure.message
+                        );
+                        stats.search_misses += 1;
+                        Vec::new()
+                    }
+                    CandidateSearch::Failed(failure) => {
                         warn!(
                             "Search failed for '{}' - {}: {}",
-                            candidate.artist, candidate.track, e
+                            candidate.artist,
+                            candidate.track,
+                            crate::core::logged(&failure)
                         );
                         stats.search_errors += 1;
-                        seen.insert(key.clone());
-                        DiscoveryCandidateRow::mark_used(
-                            user_id,
-                            &profile_name,
-                            &candidate.artist,
-                            &candidate.track,
-                        )
-                        .await
-                        .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
-                        continue;
+                        Vec::new()
                     }
                 };
-
-                // Poll until we get results or the search times out (slskd search has 120s timeout).
-                // Each poll_search call long-polls for up to 10s internally.
-                // Collect up to 3 ranked items so we can fall back if a download fails.
-                let mut ranked_items: Vec<shared::download::DownloadableItem> = Vec::new();
-                for _ in 0..12 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    let search_result = match backend.poll_search(&search_id).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                "Poll failed for '{}' - {}: {}",
-                                candidate.artist, candidate.track, e
-                            );
-                            break;
-                        }
-                    };
-
-                    if !search_result.groups.is_empty() {
-                        for group in &search_result.groups {
-                            for item in &group.items {
-                                ranked_items.push(item.clone());
-                            }
-                        }
-                        break;
-                    }
-
-                    if !search_result.has_more {
-                        break;
-                    }
-                }
-
                 if ranked_items.is_empty() {
-                    info!(
-                        "No results for '{}' - {}, skipping",
-                        candidate.artist, candidate.track
-                    );
-                    stats.search_misses += 1;
                     seen.insert(key.clone());
                     DiscoveryCandidateRow::mark_used(
                         user_id,
@@ -1597,24 +1636,128 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::{
-        discovery_folder_not_found, run_database_failure, run_outcome, scan_imports, settle_poll,
-        stop_waiting, QueuedTrack, FAILED_STATE_CONFIRM,
+        discovery_folder_not_found, run_database_failure, run_outcome, scan_imports,
+        search_candidate, settle_poll, stop_waiting, CandidateSearch, QueuedTrack,
+        FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
     };
+    use crate::core::sources::Searched;
+    use crate::models::discovery_history::seen_key;
+    use crate::models::discovery_search_miss::{
+        kept_out_keys_in, record_in, SEARCH_MISSES_KEPT_OUT,
+    };
+    use crate::security::SEEDED_ADMIN_ID;
     use crate::server_fns::download::enqueue::transfer_key;
     use crate::server_fns::download::failover::SourcePool;
     use crate::server_fns::download::monitor::{CANCEL_SETTLE, RETRY_PENDING_FOR};
     use crate::server_fns::download::test_support::{
-        batch, item, transfer, Cancel, ScriptedOutcome, StubBackend,
+        batch, group, item, search_result, transfer, Cancel, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
-    use shared::download::{DownloadProgress, DownloadState, DownloadableItem};
+    use shared::download::{DownloadProgress, DownloadState, DownloadableItem, SearchState};
     use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserActionCode};
+    use soulbeet::error::SoulseekError;
     use soulbeet::DownloadBackend;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    fn searched(stub: &Arc<StubBackend>) -> Searched {
+        (stub.id().to_string(), stub.clone())
+    }
+
+    async fn kept_out(db: &sqlx::SqlitePool) -> HashSet<String> {
+        kept_out_keys_in(db, SEEDED_ADMIN_ID).await.unwrap()
+    }
+
+    /// The Soulseek server drops every search for MGMT's Kids, wildcards included.
+    #[tokio::test]
+    async fn a_track_whose_search_keeps_finding_nothing_is_kept_out_but_not_for_a_failed_one() {
+        let db = crate::db::test_db::migrated().await;
+        let stub = StubBackend::new(vec![]);
+        stub.script_polls(vec![Err(SoulseekError::SearchGone {
+            body: String::new(),
+        })]);
+        let failed = search_candidate(&db, &searched(&stub), SEEDED_ADMIN_ID, "MGMT", "Kids", None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&failed, CandidateSearch::Failed(f) if f.code == FailureCode::SearchLost),
+            "{failed:?}"
+        );
+        for _ in 1..SEARCH_MISSES_KEPT_OUT {
+            record_in(&db, SEEDED_ADMIN_ID, "MGMT", "Kids")
+                .await
+                .unwrap();
+        }
+        assert!(kept_out(&db).await.is_empty(), "the failed search counted");
+
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![],
+        ))]);
+        let missed = search_candidate(&db, &searched(&stub), SEEDED_ADMIN_ID, "MGMT", "Kids", None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&missed, CandidateSearch::Missed(f) if f.code == FailureCode::SearchNoResults),
+            "{missed:?}"
+        );
+        assert_eq!(
+            kept_out(&db).await,
+            HashSet::from([seen_key("MGMT", "Kids")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_that_finds_the_track_answers_its_items_and_starts_its_count_again() {
+        let db = crate::db::test_db::migrated().await;
+        for _ in 1..SEARCH_MISSES_KEPT_OUT {
+            record_in(&db, SEEDED_ADMIN_ID, "MGMT", "Kids")
+                .await
+                .unwrap();
+        }
+        let stub = StubBackend::new(vec![]);
+        let kids = item(stub.id(), "Kids", "kids-1");
+        stub.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            vec![group(stub.id(), vec![kids.clone()], 0.9)],
+        ))]);
+        let found = search_candidate(
+            &db,
+            &searched(&stub),
+            SEEDED_ADMIN_ID,
+            "MGMT",
+            "Kids",
+            Some("Oracular Spectacular"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&found, CandidateSearch::Found(items) if *items == [kids.clone()]),
+            "{found:?}"
+        );
+        let specs = stub.specs();
+        let wanted = &specs[0].tracks[0];
+        assert_eq!(
+            (
+                wanted.artist.as_str(),
+                wanted.title.as_str(),
+                wanted.album_title.as_deref()
+            ),
+            ("MGMT", "Kids", Some("Oracular Spectacular"))
+        );
+        record_in(&db, SEEDED_ADMIN_ID, "MGMT", "Kids")
+            .await
+            .unwrap();
+        assert!(
+            kept_out(&db).await.is_empty(),
+            "the misses before the find still count"
+        );
+    }
 
     #[test]
     fn discovery_refusals_keep_their_text() {
@@ -2678,8 +2821,7 @@ mod tests {
             navi.answer(&format!("/api/playlist/{ADVENT}"), &[&playlist]);
             let of = NavidromeFor(Ok(navi.client()));
             let running = lock(&discovery_key("alice")).await;
-            let mut second =
-                tokio::spawn(async move { reconcile(&db, &of).await });
+            let mut second = tokio::spawn(async move { reconcile(&db, &of).await });
             let short = std::time::Duration::from_millis(50);
             assert!(
                 tokio::time::timeout(short, &mut second).await.is_err(),

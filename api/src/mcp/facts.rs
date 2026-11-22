@@ -207,9 +207,9 @@ pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) 
 }
 
 /// What a search read and what was dropped (design 10.2), each null when the backend did not
-/// finish the search (`stats` None): files that are not audio (covers, playlists), files scored
-/// below the floor unless the search kept them, flagged, as candidates, and what the filters
-/// dropped.
+/// finish the search (`stats` None): the texts sent again after the first drew no response,
+/// files that are not audio (covers, playlists), files scored below the floor unless the search
+/// kept them, flagged, as candidates, and what the filters dropped.
 pub(crate) fn search_facts(
     stats: Option<&SearchStats>,
     spec: &StoredSpec,
@@ -218,6 +218,7 @@ pub(crate) fn search_facts(
     let Value::Object(facts) = (match stats {
         Some(s) => json!({
             "query_text_sent": cut(&s.query_text),
+            "query_texts_retried": s.retried_texts.iter().map(String::as_str).map(cut).collect::<Vec<_>>(),
             "response_count": s.response_count,
             "file_count": s.file_count,
             "locked_file_count": s.locked_file_count,
@@ -227,6 +228,7 @@ pub(crate) fn search_facts(
         }),
         None => json!({
             "query_text_sent": null,
+            "query_texts_retried": null,
             "response_count": null,
             "file_count": null,
             "locked_file_count": null,
@@ -1751,7 +1753,8 @@ mod tests {
         };
         assert_eq!(
             Value::Object(search_facts(Some(&stats), &kept, &dropped)),
-            json!({"query_text_sent": "Kowloon Wake Up", "response_count": 0, "file_count": 0,
+            json!({"query_text_sent": "Kowloon Wake Up", "query_texts_retried": [],
+                "response_count": 0, "file_count": 0,
                 "locked_file_count": 0, "dropped_not_audio": 3, "dropped_below_floor": 0,
                 "dropped_by_filter": {"format": 2, "bitrate": 0, "not_lossless": 0,
                     "queue_length": 0, "excluded": 0}})

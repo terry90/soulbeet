@@ -47,6 +47,8 @@ pub struct SourceChoices {
     /// Empty while the search is starting, when there is nothing to pick.
     pub search_id: String,
     pub groups: Vec<DownloadableGroup>,
+    /// Why the search may have found nothing, as the backend says it (`SearchStats`).
+    pub unanswered_note: Option<String>,
 }
 
 /// A download query for `album`.
@@ -456,6 +458,7 @@ pub fn Search() -> Element {
         download_options.set(Some(SourceChoices {
             search_id: String::new(),
             groups: vec![],
+            unanswered_note: None,
         }));
 
         let search_id = match auth.call(api::start_download_search(query)).await {
@@ -482,9 +485,13 @@ pub fn Search() -> Element {
             {
                 Ok(response) => {
                     download_options.with_mut(|current| {
-                        if let Some(SourceChoices { groups: list, .. }) =
-                            current.as_mut().filter(|c| c.search_id == search_id)
+                        if let Some(SourceChoices {
+                            groups: list,
+                            unanswered_note,
+                            ..
+                        }) = current.as_mut().filter(|c| c.search_id == search_id)
                         {
+                            *unanswered_note = response.stats.unanswered_note;
                             for new_group in response.groups {
                                 if let Some(pos) = list.iter().position(|x| {
                                     x.source == new_group.source && x.group_id == new_group.group_id
@@ -750,6 +757,7 @@ pub fn Search() -> Element {
         if let Some(choices) = download_options.read().clone() {
           DownloadResults {
             results: choices.groups,
+            unanswered_note: choices.unanswered_note,
             is_searching: loading(),
             is_downloading,
             on_download: move |data| {
