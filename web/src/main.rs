@@ -241,6 +241,7 @@ fn WebNavbar() -> Element {
     rsx! {
         Layout {
             Navbar {
+                home: Route::SearchPage {},
                 Link {
                     class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
                     active_class: "border-beet-accent",
