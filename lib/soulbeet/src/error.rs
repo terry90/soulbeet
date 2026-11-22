@@ -71,6 +71,11 @@ pub enum SoulseekError {
     #[error("Search {search_id} did not end after it was cancelled")]
     SearchNotEnding { search_id: String },
 
+    /// slskd ended a search `Completed, Errored` with no response: Soulseek.NET threw while the
+    /// search ran (`SearchService.cs:331-345`), so no peer may have been asked.
+    #[error("slskd ended search {search_id} with an error")]
+    SearchErrored { search_id: String },
+
     #[error("Unparseable slskd response: {0}")]
     InvalidResponse(String),
 
@@ -125,6 +130,7 @@ impl SoulseekError {
             SoulseekError::UnknownSearch { .. } => false,
             SoulseekError::SearchResponsesLost { .. } => false,
             SoulseekError::SearchNotEnding { .. } => false,
+            SoulseekError::SearchErrored { .. } => false,
             SoulseekError::NoSearchTarget { .. } => false,
             // 400 and 404 are definitive: a rejected request body or a
             // missing record will not heal on retry.
@@ -168,6 +174,8 @@ impl SoulseekError {
             | SoulseekError::UnknownSearch { .. }
             | SoulseekError::SearchResponsesLost { .. } => (SearchLost, SameSourceLater),
             SoulseekError::SearchNotEnding { .. } => (SearchTimeout, SameSourceLater),
+            // slskd's Soulseek client failed during the search: the same search later.
+            SoulseekError::SearchErrored { .. } => (BackendUnreachable, SameSourceLater),
             SoulseekError::Api { status: 429, .. } if stage == Stage::SourceSearch => {
                 (SearchRateLimited, SameSourceLater)
             }
@@ -513,6 +521,14 @@ mod tests {
                 },
                 Stage::SourceSearch,
                 FailureCode::SearchTimeout,
+                RetryAdvice::SameSourceLater,
+            ),
+            (
+                SoulseekError::SearchErrored {
+                    search_id: "3f2b".into(),
+                },
+                Stage::SourceSearch,
+                FailureCode::BackendUnreachable,
                 RetryAdvice::SameSourceLater,
             ),
         ];
