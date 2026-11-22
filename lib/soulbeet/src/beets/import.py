@@ -27,6 +27,9 @@
 # once the task's files are in place, the id and path of each item it
 # imported. "items" holds each file beets imported, as it
 # stored it. stdout carries nothing but beets' own output.
+#
+# Every file beets writes in the run gets only the tags that have a value
+# (KnownTags).
 import json
 import os
 import sys
@@ -71,10 +74,12 @@ import beets.ui
 from beets import config, util
 from beets.autotag.hooks import AlbumMatch
 from beets.autotag.match import Recommendation
+from beets.dbcore import types
 from beets.importer import Action
 from beets.importer.tasks import ImportTask, ImportTaskFactory, SingletonImportTask
 from beets.plugins import BeetsPlugin
 from beets.ui.commands import import_ as import_cmd
+from mediafile import MP4TupleStorageStyle
 
 DUPLICATES = ("as-configured", "report-removals", "skip", "replace")
 
@@ -179,6 +184,66 @@ class Recorder(BeetsPlugin):
 
 
 Recorder()
+
+
+_STORE_PAIR = MP4TupleStorageStyle.store
+
+
+def _store_pair(self, mutagen_file, value):
+    if any(value):
+        _STORE_PAIR(self, mutagen_file, value)
+    elif self.key in mutagen_file:
+        del mutagen_file[self.key]
+
+
+class KnownTags(BeetsPlugin):
+    """Leaves out of each file beets writes the tags it has no value for.
+
+    beets holds a field without a value as its type's null: "" for text, []
+    for lists, 0 for numbers whose type has no separate None (dbcore/types.py).
+    Item.write hands mediafile every media field (library/models.py:915-930
+    in 2.11, :970-985 in 2.8), and mediafile writes a null as a tag: an empty
+    one, or "0000" for a year of 0 (mediafile/fields.py _set_date_tuple). It
+    deletes a tag whose value is None instead, the file's old one included
+    (MediaFile.update), so a value beets stores as it stores the null goes as
+    None. That takes in [""], which a list type stores as "", like [], and
+    the "" a file's empty initial key reads as, though MusicalKey's null is
+    None (dbcore/types.py MusicalKey).
+
+    Item.write sends the write event before it opens the file, for each write
+    in the run, the plugins' own (scrub, embedart, replaygain...) included.
+    It is registered here rather than listed in a config's plugins, so it
+    runs whatever config BEETS_CONFIG names.
+
+    A boolean's null is False, which is a value: comp stays. A NullFloat
+    field such as rg_track_gain is None when unknown, so its 0.0 stays. A
+    month or day of 0 was already left out of the date, and a year of 0 now
+    leaves the whole date out. A field without a type (types.DEFAULT, null
+    None) is written as beets writes it.
+
+    MP4 keeps track and disc numbers as pairs (trkn, disk), and mediafile
+    deletes the total by setting it to 0 (MP4TupleStorageStyle.delete), which
+    stores a pair of zeros when the number is gone too. It reads a 0 there as
+    unset (MP4TupleStorageStyle.get), so such a pair is deleted instead."""
+
+    def __init__(self):
+        super().__init__("soulbeet")
+        self.register_listener("write", self.leave_out_nulls)
+        MP4TupleStorageStyle.store = _store_pair
+
+    def leave_out_nulls(self, item, tags):
+        for key, value in tags.items():
+            kind = item._type(key)
+            if value is None or isinstance(kind.null, bool):
+                continue
+            # A String whose null is None (MusicalKey) still reads "" from a file.
+            if kind.to_sql(value) == kind.to_sql(kind.null) or (
+                isinstance(kind, types.String) and value == ""
+            ):
+                tags[key] = None
+
+
+KnownTags()
 
 
 def penalty_name(key):

@@ -12,3 +12,6 @@
 beets==2.11.0
 numpy==2.2.6
 lap==0.5.13
+# lib/soulbeet/src/beets/import.py replaces MP4TupleStorageStyle.store, so the
+# mediafile it was read against is the one that ships.
+mediafile==0.17.0
