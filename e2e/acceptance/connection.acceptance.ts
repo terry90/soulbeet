@@ -57,7 +57,7 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
     });
     // No linked account is a Navidrome admin: false once Navidrome refused the others, null
     // until then.
-    expect(status.navidrome.can_trigger_scan).not.toBe(true);
+    expect(status.navidrome).not.toMatchObject({ can_trigger_scan: true });
   } finally {
     await mcp.close();
     await context.close();
