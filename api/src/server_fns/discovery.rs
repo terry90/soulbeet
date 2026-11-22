@@ -490,10 +490,12 @@ async fn stop_waiting(
 pub async fn generate_discovery_playlist_internal(
     user_id: &str,
 ) -> Result<shared::navidrome::GenerationResult, Failure> {
+    use crate::core::sources::{search_ranked, Searched};
     use crate::models::deletion_review::DeletionReviewRow;
     use crate::models::discovery_candidate::DiscoveryCandidateRow;
     use crate::models::discovery_history::{seen_key, DiscoveryHistoryRow};
-    use crate::services::download_backend;
+    use crate::models::discovery_search_miss;
+    use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
     use shared::navidrome::{GenerationResult, ProfileGenerationStats};
 
     // Acquire per-user lock to prevent concurrent generation
@@ -534,6 +536,7 @@ pub async fn generate_discovery_playlist_internal(
     let backend = download_backend(None)
         .await
         .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
+    let searched: Searched = (DEFAULT_DOWNLOAD_BACKEND.to_string(), backend.clone());
 
     // Create per-profile subdirectories under Discovery/
     for profile in &selected_profiles {
@@ -565,6 +568,16 @@ pub async fn generate_discovery_playlist_internal(
         .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!("Added {} deleted tracks to exclusion set", disliked.len());
     seen.extend(disliked);
+
+    // Tracks whose search kept finding nothing, which the engine would suggest every run
+    let kept_out = discovery_search_miss::kept_out_keys(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+    info!(
+        "Added {} tracks never found on the network to exclusion set",
+        kept_out.len()
+    );
+    seen.extend(kept_out);
 
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
@@ -693,6 +706,15 @@ pub async fn generate_discovery_playlist_internal(
                 let key = seen_key(&candidate.artist, &candidate.track);
                 if seen.contains(&key) {
                     stats.candidates_skipped_seen += 1;
+                    // Used, so the next attempt draws other candidates in its place.
+                    DiscoveryCandidateRow::mark_used(
+                        user_id,
+                        &profile_name,
+                        &candidate.artist,
+                        &candidate.track,
+                    )
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Input, e))?;
                     continue;
                 }
                 stats.candidates_tried += 1;
@@ -717,76 +739,47 @@ pub async fn generate_discovery_playlist_internal(
                     release_mbid: None,
                 }];
 
-                let spec = shared::download::SearchSpec::of(None, search_tracks);
-                let search_id = match backend.start_search(&spec).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!(
-                            "Search failed for '{}' - {}: {}",
-                            candidate.artist, candidate.track, e
-                        );
-                        stats.search_errors += 1;
-                        seen.insert(key.clone());
-                        DiscoveryCandidateRow::mark_used(
-                            user_id,
-                            &profile_name,
-                            &candidate.artist,
-                            &candidate.track,
-                        )
-                        .await
-                        .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
-                        continue;
-                    }
-                };
-
-                // Poll until we get results or the search times out (slskd search has 120s timeout).
-                // Each poll_search call long-polls for up to 10s internally.
-                // Collect up to 3 ranked items so we can fall back if a download fails.
-                let mut ranked_items: Vec<shared::download::DownloadableItem> = Vec::new();
-                for _ in 0..12 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                    let search_result = match backend.poll_search(&search_id).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                "Poll failed for '{}' - {}: {}",
-                                candidate.artist, candidate.track, e
-                            );
-                            break;
+                let mut ranked_items: Vec<shared::download::DownloadableItem> =
+                    match search_ranked(&searched, &[], None, &search_tracks).await {
+                        Ok(groups) => groups.into_iter().flat_map(|g| g.items).collect(),
+                        Err(failure) => {
+                            if matches!(
+                                failure.code,
+                                FailureCode::SearchNoResults | FailureCode::SearchAllFiltered
+                            ) {
+                                info!(
+                                    "No results for '{}' - {}, skipping: {}",
+                                    candidate.artist, candidate.track, failure.message
+                                );
+                                stats.search_misses += 1;
+                                discovery_search_miss::record(
+                                    user_id,
+                                    &candidate.artist,
+                                    &candidate.track,
+                                )
+                                .await
+                                .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
+                            } else {
+                                warn!(
+                                    "Search failed for '{}' - {}: {}",
+                                    candidate.artist,
+                                    candidate.track,
+                                    crate::core::logged(&failure)
+                                );
+                                stats.search_errors += 1;
+                            }
+                            seen.insert(key.clone());
+                            DiscoveryCandidateRow::mark_used(
+                                user_id,
+                                &profile_name,
+                                &candidate.artist,
+                                &candidate.track,
+                            )
+                            .await
+                            .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
+                            continue;
                         }
                     };
-
-                    if !search_result.groups.is_empty() {
-                        for group in &search_result.groups {
-                            for item in &group.items {
-                                ranked_items.push(item.clone());
-                            }
-                        }
-                        break;
-                    }
-
-                    if !search_result.has_more {
-                        break;
-                    }
-                }
-
-                if ranked_items.is_empty() {
-                    info!(
-                        "No results for '{}' - {}, skipping",
-                        candidate.artist, candidate.track
-                    );
-                    stats.search_misses += 1;
-                    seen.insert(key.clone());
-                    DiscoveryCandidateRow::mark_used(
-                        user_id,
-                        &profile_name,
-                        &candidate.artist,
-                        &candidate.track,
-                    )
-                    .await
-                    .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
-                    continue;
-                }
                 stats.search_hits += 1;
 
                 // Keep the sources this track is allowed to try: the one
@@ -2678,8 +2671,7 @@ mod tests {
             navi.answer(&format!("/api/playlist/{ADVENT}"), &[&playlist]);
             let of = NavidromeFor(Ok(navi.client()));
             let running = lock(&discovery_key("alice")).await;
-            let mut second =
-                tokio::spawn(async move { reconcile(&db, &of).await });
+            let mut second = tokio::spawn(async move { reconcile(&db, &of).await });
             let short = std::time::Duration::from_millis(50);
             assert!(
                 tokio::time::timeout(short, &mut second).await.is_err(),
