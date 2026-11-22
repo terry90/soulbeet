@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 - 2026-11-22
 
 ### Discovery without Last.fm, and single sign-on
 
