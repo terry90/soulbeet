@@ -86,6 +86,18 @@ Available in `:full` but **not** enabled by default (need user config to be usef
 | `edit` | Needs `$EDITOR` and a TTY | Adding it to `plugins:` and running interactively |
 | `lastimport` | Needs your Last.fm username | Adding it to `plugins:` and setting `lastfm.user:` |
 
+## Tags with no value
+
+beets keeps a field it has no value for as an empty text, an empty list or a 0, and writes it into the file as it is: an empty tag, or `0000` as the original date when the match gave none. Soulbeet leaves those tags out of every file beets writes during an import, on every tier and with any `BEETS_CONFIG`, the writes of `scrub`, `embedart`, `lyrics`, `lastgenre`, `replaygain` and `ftintitle` included. An empty or zero tag the file already had for such a field is removed.
+
+- Text and lists: an empty value is left out.
+- Numbers: 0 is left out where beets cannot tell it from no value, which covers track and disc numbers and their totals, `bpm` and the parts of a date. A year of 0 leaves the whole date out. A year without month and day is written as the year alone.
+- A ReplayGain or R128 gain of 0.0 is a value and is kept, and so is a compilation flag of false.
+- On M4A, a track or disc number pair that holds two zeros is left out.
+- A field a plugin adds without a type is written as beets writes it.
+
+This is part of Soulbeet's import driver, not a beets plugin, so it is not in `plugins:` and needs no configuration. A `beet` command you run yourself in the container (`beet write`, `beet modify`, `beet mbsync`) writes tags as beets does, empty ones included. Files imported by earlier versions keep the tags they got then.
+
 ## Adding a plugin that's not in your tier
 
 ### Option 1: Switch to a fatter tier (preferred)

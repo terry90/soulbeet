@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 import yaml
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3
+from mutagen.ogg import OggPage
 
 HERE = Path(__file__).resolve().parent
 CRATE = HERE.parents[1]
@@ -18,6 +20,52 @@ CAPTURE = CRATE / "fixtures" / "beets" / "capture"
 # 77 of them (1152 samples each) last just over two seconds.
 MP3_FRAME = b"\xff\xfb\x90\xc4" + bytes(413)
 TWO_SECONDS = 77
+
+
+def flac_bytes():
+    """The FLAC marker and a STREAMINFO block for two seconds at 44.1 kHz,
+    mono, 16 bits, with no audio frames: mutagen reads the length from it."""
+    rate, samples = 44100, 2 * 44100
+    fields = (rate << 44) | (15 << 36) | samples
+    info = struct.pack(">HH", 4096, 4096) + bytes(6) + fields.to_bytes(8, "big")
+    return b"fLaC" + bytes([0x80, 0, 0, 34]) + info + bytes(16)
+
+
+def _box(kind, body):
+    return struct.pack(">I", 8 + len(body)) + kind + body
+
+
+def m4a_bytes():
+    """An M4A with only a movie header lasting two seconds: mutagen reads the
+    length from mvhd when no track describes the audio."""
+    mvhd = bytes(12) + struct.pack(">II", 1000, 2000) + bytes(80)
+    return (
+        _box(b"ftyp", b"M4A " + bytes(4) + b"M4A mp42isom")
+        + _box(b"moov", _box(b"mvhd", mvhd))
+        + _box(b"mdat", b"")
+    )
+
+
+def opus_bytes():
+    """An Ogg Opus stream: the two header packets and one silent packet on
+    a last page whose granule position makes two seconds."""
+    head = b"OpusHead" + bytes([1, 1]) + struct.pack("<HIhB", 312, 48000, 0, 0)
+    tags = b"OpusTags" + struct.pack("<I", 4) + b"test" + struct.pack("<I", 0)
+    packets = [(head, 0), (tags, 0), (b"\xf8\xff\xfe", 312 + 2 * 48000)]
+    out = b""
+    for seq, (packet, position) in enumerate(packets):
+        page = OggPage()
+        page.serial = 1
+        page.sequence = seq
+        page.position = position
+        page.packets = [packet]
+        page.first = seq == 0
+        page.last = seq == len(packets) - 1
+        out += page.write()
+    return out
+
+
+AUDIO_BYTES = {".flac": flac_bytes, ".m4a": m4a_bytes, ".opus": opus_bytes}
 
 
 def strict_json(raw):
@@ -32,11 +80,21 @@ class Beets:
     """One isolated beets setup, run the way soulbeet runs it."""
 
     @staticmethod
-    def mp3(path, **tags):
-        """A two-second mp3 carrying these ID3 tags (EasyID3 names)."""
+    def audio(path):
+        """A two-second file without tags, in the format its suffix names:
+        mp3, flac, m4a or opus."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(MP3_FRAME * TWO_SECONDS)
-        ID3().save(path)
+        if path.suffix == ".mp3":
+            path.write_bytes(MP3_FRAME * TWO_SECONDS)
+            ID3().save(path)
+        else:
+            path.write_bytes(AUDIO_BYTES[path.suffix]())
+        return path
+
+    @classmethod
+    def mp3(cls, path, **tags):
+        """A two-second mp3 carrying these ID3 tags (EasyID3 names)."""
+        cls.audio(path)
         if tags:
             easy = EasyID3(path)
             easy.update(tags)
