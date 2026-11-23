@@ -46,6 +46,7 @@ pub trait MetadataProvider: Send + Sync {
 
 #[async_trait]
 pub trait DownloadBackend: Send + Sync {
+    /// The id the registry keeps this backend under, and the only one it is looked up by.
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 

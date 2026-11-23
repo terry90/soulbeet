@@ -1464,7 +1464,7 @@ fn parse_batch_enqueue_response(
 #[async_trait::async_trait]
 impl crate::DownloadBackend for SoulseekClient {
     fn id(&self) -> &'static str {
-        "soulseek"
+        shared::slskd::BACKEND_ID
     }
 
     fn name(&self) -> &'static str {
@@ -1654,6 +1654,15 @@ mod tests {
             .api_key("k")
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn the_client_goes_by_the_slskd_backend_id() {
+        use crate::DownloadBackend;
+        assert_eq!(
+            client_at("http://127.0.0.1:1").id(),
+            shared::slskd::BACKEND_ID
+        );
     }
 
     #[tokio::test]

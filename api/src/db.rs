@@ -122,6 +122,7 @@ pub(crate) mod test_db {
     pub const REPORT_REAL_PATH_STATUS: i64 = 20261124000000;
     pub const CHANGELOG_SEEN: i64 = 20261125000000;
     pub const REMOVE_LASTFM: i64 = 20261130000000;
+    pub const BACKEND_ID: i64 = 20261203000000;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -717,6 +718,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seq, 41);
+    }
+
+    #[tokio::test]
+    async fn rows_of_soulseek_transfers_name_the_slskd_backend() {
+        let db = test_db::migrated_before(test_db::BACKEND_ID).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_folder(&db, "u1", "/music/bob").await;
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, \
+             import_mode, state) VALUES ('j1', 'u1', '/music/bob', 7, 7, '{}', 'album', 'done')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let import = |rows: &str| {
+            format!(
+                r#"{{"sources":[],"target":"/music/bob","album":true,"rows":{rows},"keep":"x"}}"#
+            )
+        };
+        let rows = [
+            (
+                "soulseek",
+                r#"{"item":"a","backend":"soulseek","batch_id":"b1"}"#,
+            ),
+            ("no_backend_with_batch", r#"{"item":"b","batch_id":"b1"}"#),
+            ("no_backend_no_batch", r#"{"item":"c"}"#),
+            (
+                "other_backend",
+                r#"{"item":"d","backend":"x","batch_id":"b1"}"#,
+            ),
+        ];
+        for (i, (_, row)) in rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO job_tracks (job_id, slot, state, last_row) VALUES ('j1', ?, 'done', ?)",
+            )
+            .bind(i as i64)
+            .bind(row)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO job_attempts (job_id, slot, n, last_row) VALUES ('j1', ?, 1, ?)",
+            )
+            .bind(i as i64)
+            .bind(row)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let three = format!("[[0,{}],[1,{}],[2,{}]]", rows[0].1, rows[1].1, rows[2].1);
+        for (slot, json) in [(10, import(&three)), (11, import("[]"))] {
+            sqlx::query(
+                "INSERT INTO job_tracks (job_id, slot, state, import_job) VALUES ('j1', ?, 'done', ?)",
+            )
+            .bind(slot)
+            .bind(json)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        test_db::apply(&db, test_db::BACKEND_ID).await;
+        let expected = [
+            r#"{"item":"a","backend":"slskd","batch_id":"b1"}"#,
+            r#"{"item":"b","batch_id":"b1","backend":"slskd"}"#,
+            r#"{"item":"c"}"#,
+            r#"{"item":"d","backend":"x","batch_id":"b1"}"#,
+        ];
+        for table in ["job_tracks", "job_attempts"] {
+            let stored: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT last_row FROM {table} WHERE slot < 4 ORDER BY slot"
+            ))
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            let stored: Vec<serde_json::Value> = stored
+                .iter()
+                .map(|r| serde_json::from_str(r).unwrap())
+                .collect();
+            let expected: Vec<serde_json::Value> = expected
+                .iter()
+                .map(|r| serde_json::from_str(r).unwrap())
+                .collect();
+            assert_eq!(stored, expected, "{table}");
+        }
+        let imports: Vec<String> =
+            sqlx::query_scalar("SELECT import_job FROM job_tracks WHERE slot >= 10 ORDER BY slot")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        let imports: Vec<serde_json::Value> = imports
+            .iter()
+            .map(|r| serde_json::from_str(r).unwrap())
+            .collect();
+        let migrated = format!(
+            "[[0,{}],[1,{}],[2,{}]]",
+            expected[0], expected[1], expected[2]
+        );
+        assert_eq!(
+            imports,
+            vec![
+                serde_json::from_str::<serde_json::Value>(&import(&migrated)).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&import("[]")).unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]

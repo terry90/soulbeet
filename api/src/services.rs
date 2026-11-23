@@ -26,7 +26,7 @@ pub mod providers {
 }
 
 pub mod downloaders {
-    pub const SLSKD: &str = "slskd";
+    pub const SLSKD: &str = shared::slskd::BACKEND_ID;
 }
 
 pub mod importers {
@@ -71,6 +71,8 @@ pub enum BackendLookupError {
     Backend(SoulseekError),
     /// No backend has this id.
     Unknown(String),
+    /// The backend built for `id` goes by `named`, so nothing routed to `id` would reach it.
+    Misnamed { id: String, named: &'static str },
 }
 
 #[cfg(feature = "server")]
@@ -80,6 +82,9 @@ impl std::fmt::Display for BackendLookupError {
             BackendLookupError::Settings(e) => f.write_str(e),
             BackendLookupError::Backend(e) => write!(f, "{e}"),
             BackendLookupError::Unknown(id) => write!(f, "Unknown download backend: {id}"),
+            BackendLookupError::Misnamed { id, named } => {
+                write!(f, "Download backend {id} names itself {named}")
+            }
         }
     }
 }
@@ -98,8 +103,8 @@ impl BackendLookupError {
                 message,
             )
             .with_cause(Service::Database, None, e.clone()),
-            // The caller named a backend that does not exist.
-            BackendLookupError::Unknown(_) => Failure::new(
+            // The caller named a backend that does not exist, or that no backend answers to.
+            BackendLookupError::Unknown(_) | BackendLookupError::Misnamed { .. } => Failure::new(
                 FailureCode::InvalidInput,
                 stage,
                 RetryAdvice::NotRetryable,
@@ -152,12 +157,27 @@ pub async fn download_backend(
         return Ok(backend.clone());
     }
 
-    let backend = init_download_backend(requested).await?;
+    let backend = answering_to(requested, init_download_backend(requested).await?)?;
     DOWNLOAD_BACKENDS
         .write()
         .await
         .insert(requested.to_string(), backend.clone());
     Ok(backend)
+}
+
+/// `backend`, built for `id`, when it goes by `id`: a backend is kept only under its own id.
+#[cfg(feature = "server")]
+fn answering_to(
+    id: &str,
+    backend: Arc<dyn DownloadBackend>,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    match backend.id() {
+        named if named == id => Ok(backend),
+        named => Err(BackendLookupError::Misnamed {
+            id: id.to_string(),
+            named,
+        }),
+    }
 }
 
 #[cfg(feature = "server")]
@@ -459,6 +479,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::security::SEEDED_ADMIN_ID;
+    use crate::server_fns::download::test_support::StubBackend;
 
     #[tokio::test]
     async fn an_unreadable_password_marks_the_user_and_resets_the_banner() {
@@ -770,6 +791,29 @@ mod tests {
                 (FailureCode::InvalidInput, stage, RetryAdvice::NotRetryable)
             );
         }
+    }
+
+    #[test]
+    fn a_backend_is_kept_only_under_its_own_id() {
+        let stub: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let own = stub.id();
+        assert_eq!(answering_to(own, stub.clone()).unwrap().id(), own);
+        let Err(e) = answering_to(downloaders::SLSKD, stub) else {
+            panic!("kept under another backend's id");
+        };
+        assert_eq!(
+            e.to_string(),
+            format!("Download backend slskd names itself {own}")
+        );
+        let f = e.failure(Stage::Enqueue, "m");
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::InvalidInput,
+                Stage::Enqueue,
+                RetryAdvice::NotRetryable
+            )
+        );
     }
 
     #[tokio::test]

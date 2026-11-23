@@ -555,6 +555,9 @@ impl From<SearchState> for crate::download::SearchState {
     }
 }
 
+/// The id slskd goes by as a download backend, in the registry and on every row and search.
+pub const BACKEND_ID: &str = "slskd";
+
 impl From<TrackResult> for crate::download::DownloadableItem {
     fn from(track: TrackResult) -> Self {
         Self {
@@ -682,7 +685,7 @@ impl FileEntry {
             percent: self.percent_complete,
             speed: self.average_speed,
             error: None,
-            backend: Some("slskd".into()),
+            backend: Some(BACKEND_ID.into()),
             batch_id: None,
             batch_label: None,
             local_path: None,
@@ -973,6 +976,12 @@ mod tests {
         }
         let entry: FileEntry = serde_json::from_value(entry).expect("FileEntry should deserialize");
         entry.into_progress(3)
+    }
+
+    #[test]
+    fn a_listed_transfer_names_slskd_as_its_backend() {
+        let row = converted(json!("Queued, Remotely"), None, 0);
+        assert_eq!(row.backend.as_deref(), Some(BACKEND_ID));
     }
 
     #[test]
