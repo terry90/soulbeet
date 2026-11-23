@@ -23,7 +23,6 @@ use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
-use crate::core::database_failure;
 use crate::core::jobs::runner::Acquire;
 use crate::core::jobs::Wanted;
 use crate::core::sources::{
@@ -32,8 +31,10 @@ use crate::core::sources::{
     RECENT_FAILURES_SECS,
 };
 use crate::core::time;
+use crate::core::{backend_unavailable, database_failure};
 use crate::ledger::store::{self, StoredSearch};
 use crate::ledger::StoredSpec;
+use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
 const FIND_SOURCES_ARGS: &[&str] = &[
     "reference",
@@ -182,11 +183,13 @@ async fn start_search(
         }
         return Err(failure_of(f, facts, &spec, &Failed::Elsewhere));
     }
-    let backend = acquire
-        .effects
-        .backend()
+    let backend = (acquire.effects.backends())
+        .get(DEFAULT_DOWNLOAD_BACKEND)
         .await
-        .map_err(|f| failure_of(f, Map::new(), &spec, &Failed::Elsewhere))?;
+        .map_err(|e| {
+            let f = backend_unavailable(Stage::SourceSearch, &e);
+            failure_of(f, Map::new(), &spec, &Failed::Elsewhere)
+        })?;
     let id = uuid::Uuid::new_v4().to_string();
     let run = SearchRun {
         id: id.clone(),
@@ -681,13 +684,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_backend_that_cannot_search_says_who_fixes_it_and_when_to_call_again() {
-        use crate::core::backend_unavailable;
         use crate::services::BackendLookupError;
         use soulbeet::error::{MissingSetting, SoulseekError};
         let (db, acq, effects, token) = app_with_acquire().await;
         let reference = json!({"artist": "Marrow Choir", "title": "O Holy Night"});
         let find = |effects: &TestEffects, e: BackendLookupError| {
-            effects.fail_backend(backend_unavailable(Stage::SourceSearch, &e));
+            effects.fail_backend(e);
             call_tool(
                 app_of(&db, &acq),
                 &token,
@@ -1229,18 +1231,18 @@ mod tests {
         let _running = find("Wake Up");
         reached.notified().await;
         // Four calls all read no search waiting, then enter the line together.
-        effects.hold_backend();
+        effects.stub_backends().hold();
         let mut calls = Vec::from(["Come Over", "Lights Out", "Neon", "Midnight"].map(find));
         let alice = crate::auth::UserId::new("u1");
         tokio::time::timeout(Duration::from_secs(10), async {
-            while effects.backend_calls_held() < 4 {
+            while effects.stub_backends().calls_held() < 4 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("every call passed the first count");
         assert!(acq.searches.waiting_finds(&alice).is_empty());
-        effects.release_backend();
+        effects.stub_backends().release();
         let refused = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(done) = calls.iter().position(|call| call.is_finished()) {

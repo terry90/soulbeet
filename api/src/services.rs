@@ -179,6 +179,25 @@ fn answering_to(
     }
 }
 
+/// Where download backends are looked up by id, so tests answer with stubs.
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+pub trait Backends: Send + Sync {
+    async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError>;
+}
+
+/// The backends the server is configured with.
+#[cfg(feature = "server")]
+pub struct Registry;
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl Backends for Registry {
+    async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        download_backend(Some(id)).await
+    }
+}
+
 #[cfg(feature = "server")]
 fn init_importer(id: &str) -> Result<Arc<dyn MusicImporter>, String> {
     match id {

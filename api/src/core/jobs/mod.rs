@@ -2,7 +2,6 @@
 //! through.
 
 use crate::auth::UserCtx;
-use crate::core::database_failure;
 use crate::core::delete_guard::{PreviewedFile, ReplaceSet};
 use crate::core::deletion::tokens::{peek_in, take_in, DeleteTokenRefusal};
 use crate::core::deletion::{App, REPLACE_CONSENT_SECS};
@@ -10,6 +9,7 @@ use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
 use crate::core::library::{find, MatchKind, Reference};
 use crate::core::sources::{self, Candidate, RECENT_FAILURES_SECS};
+use crate::core::{backend_unavailable, database_failure};
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
 use crate::ledger::{
     Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
@@ -17,7 +17,7 @@ use crate::ledger::{
 };
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
-use crate::services::NavidromeLookupError;
+use crate::services::{NavidromeLookupError, DEFAULT_DOWNLOAD_BACKEND};
 use runner::{spawn_drive, Acquire};
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableItem, IndexState, JobSlot};
@@ -274,7 +274,10 @@ pub(crate) async fn ensure(
     if let Some(failure) = acquire.effects.importer_blocked().await {
         return Err(failure.into());
     }
-    acquire.effects.backend().await?;
+    (acquire.effects.backends())
+        .get(DEFAULT_DOWNLOAD_BACKEND)
+        .await
+        .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
     let previewed = match &replace {
         Some(ReplaceConsent { app, secret }) => {
             let expect = Some(DeletionReason::Replaced);

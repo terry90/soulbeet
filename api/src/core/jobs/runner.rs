@@ -11,7 +11,9 @@ use crate::core::sources::{
     no_candidate_passed, start_stored, view, Candidate, CandidateView, SearchProgress, SearchRun,
     Searches, RECENT_FAILURES_SECS,
 };
-use crate::core::{backend_unavailable, database_failure, logged, metadata};
+use crate::core::{
+    backend_unavailable, backend_unavailable_at, database_failure, logged, metadata,
+};
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
@@ -20,7 +22,7 @@ use crate::ledger::{
     StoredSpec, Transition, Transitioned, LEDGER,
 };
 use crate::server_fns::download::enqueue::nothing_enqueued;
-use crate::services::download_backend;
+use crate::services::{Backends, Registry, DEFAULT_DOWNLOAD_BACKEND};
 use async_trait::async_trait;
 use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
@@ -36,8 +38,8 @@ use tracing::{error, info, warn};
 /// What acquisition does outside the ledger, so tests run it on stubs.
 #[async_trait]
 pub(crate) trait Effects: Send + Sync {
-    /// The default download backend.
-    async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure>;
+    /// Where download backends are looked up.
+    fn backends(&self) -> &dyn Backends;
     /// The failure an import would end with because the importer is broken; None when nothing
     /// blocks imports.
     async fn importer_blocked(&self) -> Option<Failure>;
@@ -160,10 +162,8 @@ struct LiveEffects;
 
 #[async_trait]
 impl Effects for LiveEffects {
-    async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
-        download_backend(None)
-            .await
-            .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))
+    fn backends(&self) -> &dyn Backends {
+        &Registry
     }
 
     async fn importer_blocked(&self) -> Option<Failure> {
@@ -564,7 +564,10 @@ impl Runner<'_> {
                 (query, spec())
             }
         };
-        let backend = self.acquire.effects.backend().await?;
+        let backend = (self.acquire.effects.backends())
+            .get(DEFAULT_DOWNLOAD_BACKEND)
+            .await
+            .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
         let run = SearchRun {
             id: id.to_string(),
             query,
@@ -668,10 +671,10 @@ impl Runner<'_> {
     async fn request(
         &self,
     ) -> Result<Option<(Arc<dyn DownloadBackend>, NewBatch, Acquisition)>, Failure> {
-        let backend = (self.acquire.effects.backend().await).map_err(|f| Failure {
-            stage: Stage::Enqueue,
-            ..f
-        })?;
+        let backend = (self.acquire.effects.backends())
+            .get(DEFAULT_DOWNLOAD_BACKEND)
+            .await
+            .map_err(|e| backend_unavailable_at(Stage::Enqueue, &e))?;
         let target = prepare_target(&self.job.folder).await?;
         let items = store::queued_picks(&self.acquire.db, &self.job.id)
             .await
@@ -730,13 +733,12 @@ mod test_effects {
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
     use crate::importer_health::blocking_failure_of;
     use crate::ledger::JobEvent;
-    use crate::server_fns::download::test_support::StubBackend;
+    use crate::server_fns::download::test_support::{StubBackend, StubBackends};
+    use crate::services::BackendLookupError;
     use shared::download::EnqueueStatus;
     use shared::metadata::{AlbumWithTracks, SearchResult, Track};
     use soulbeet::{MetadataError, MetadataProvider};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use tokio::sync::watch;
 
     impl Acquire {
         /// An `Acquire` on `db` with its own ledger writer, line of searches and import queue
@@ -746,17 +748,16 @@ mod test_effects {
         pub(crate) fn for_test(db: SqlitePool) -> (Arc<Acquire>, Arc<TestEffects>) {
             let ledger = Ledger::start(db.clone());
             let importer = Arc::new(StubImporter::new());
+            let stub = StubBackend::new(vec![]);
             let effects = Arc::new(TestEffects {
                 ledger: ledger.clone(),
-                stub: StubBackend::new(vec![]),
+                backends: StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub.clone()),
+                stub,
                 importer: importer.clone(),
                 downloads: tempfile::tempdir().expect("a test download folder"),
                 library: tempfile::tempdir().expect("a test library folder"),
                 tracks: Mutex::default(),
                 hydrate_error: Mutex::default(),
-                backend_held: watch::Sender::new(false),
-                backend_calls_held: AtomicUsize::new(0),
-                backend_failure: Mutex::default(),
                 enqueued: Mutex::default(),
             });
             let deps = RecordingDeps::into_ledger(importer, ledger.clone());
@@ -781,16 +782,16 @@ mod test_effects {
         }
     }
 
-    /// Answers the `StubBackend` it holds, blocks imports as its `StubImporter`'s health says
-    /// (ready until `importer().set_health`), the importer the queue imports through, and
-    /// hydrates through step 3's `hydrate_in` on a provider whose album has the tracks
-    /// `set_tracks` gave (none until then), or whose
-    /// `get_album` answers the error `fail_hydrate` gave. Keeps every enqueue and answers it
-    /// with each item enqueued, recording only its send (Enqueued), as enqueue_and_watch records
-    /// it before the backend hears of it.
+    /// Looks up the `StubBackend` it holds under the default backend id, blocks imports as its
+    /// `StubImporter`'s health says (ready until `importer().set_health`), the importer the queue
+    /// imports through, and hydrates through `hydrate_in` on a provider whose album has the tracks
+    /// `set_tracks` gave (none until then), or whose `get_album` answers the error `fail_hydrate`
+    /// gave. Keeps every enqueue and answers it with each item enqueued, recording only its send
+    /// (Enqueued), as enqueue_and_watch records it before the backend hears of it.
     pub(crate) struct TestEffects {
         ledger: Ledger,
         stub: Arc<StubBackend>,
+        backends: StubBackends,
         importer: Arc<StubImporter>,
         /// The download folder of the `Acquire` made with it.
         downloads: tempfile::TempDir,
@@ -798,17 +799,16 @@ mod test_effects {
         library: tempfile::TempDir,
         tracks: Mutex<Vec<Track>>,
         hydrate_error: Mutex<Option<MetadataError>>,
-        /// While true, `backend` calls wait for it to turn false.
-        backend_held: watch::Sender<bool>,
-        backend_calls_held: AtomicUsize,
-        /// What every `backend` call answers while set.
-        backend_failure: Mutex<Option<Failure>>,
         enqueued: Mutex<Vec<(NewBatch, Acquisition)>>,
     }
 
     impl TestEffects {
         pub(crate) fn stub(&self) -> &StubBackend {
             &self.stub
+        }
+
+        pub(crate) fn stub_backends(&self) -> &StubBackends {
+            &self.backends
         }
 
         pub(crate) fn importer(&self) -> &StubImporter {
@@ -823,28 +823,14 @@ mod test_effects {
             *self.hydrate_error.lock().unwrap() = Some(e);
         }
 
-        /// Holds every `backend` call from now on until `release_backend`.
-        pub(crate) fn hold_backend(&self) {
-            self.backend_held.send_replace(true);
-        }
-
-        pub(crate) fn release_backend(&self) {
-            self.backend_held.send_replace(false);
-        }
-
         /// Its library folder, on disk while it lives.
         pub(crate) fn library(&self) -> &std::path::Path {
             self.library.path()
         }
 
-        /// Makes every `backend` call answer `failure`.
-        pub(crate) fn fail_backend(&self, failure: Failure) {
-            *self.backend_failure.lock().unwrap() = Some(failure);
-        }
-
-        /// The `backend` calls waiting for `release_backend`.
-        pub(crate) fn backend_calls_held(&self) -> usize {
-            self.backend_calls_held.load(Ordering::SeqCst)
+        /// Makes every lookup of the default backend answer `e`.
+        pub(crate) fn fail_backend(&self, e: BackendLookupError) {
+            self.backends.fail(DEFAULT_DOWNLOAD_BACKEND, e);
         }
 
         /// Every enqueue, in order.
@@ -855,17 +841,8 @@ mod test_effects {
 
     #[async_trait]
     impl Effects for TestEffects {
-        async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
-            let mut held = self.backend_held.subscribe();
-            if *held.borrow_and_update() {
-                self.backend_calls_held.fetch_add(1, Ordering::SeqCst);
-                let _ = held.wait_for(|held| !held).await;
-                self.backend_calls_held.fetch_sub(1, Ordering::SeqCst);
-            }
-            if let Some(failure) = self.backend_failure.lock().unwrap().clone() {
-                return Err(failure);
-            }
-            Ok(self.stub.clone())
+        fn backends(&self) -> &dyn Backends {
+            &self.backends
         }
 
         async fn importer_blocked(&self) -> Option<Failure> {
@@ -958,8 +935,10 @@ mod tests {
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, SourceFilters};
     use crate::server_fns::download::test_support::{group, item, search_result, track};
+    use crate::services::BackendLookupError;
     use shared::download::{FileFacts, SearchResult, SearchState};
     use shared::failure::{FailureCode, RetryAdvice, Service};
+    use soulbeet::error::{MissingSetting, SoulseekError};
     use soulbeet::MetadataError;
     use std::time::Duration;
 
@@ -1319,11 +1298,8 @@ mod tests {
             let done = acq.ledger.transition(&user, &job, change).await.unwrap();
             assert!(matches!(done, Transitioned::Applied { .. }), "{done:?}");
         }
-        effects.fail_backend(Failure::new(
-            FailureCode::BackendNotConfigured,
-            Stage::SourceSearch,
-            RetryAdvice::NeedsUser,
-            "Download backend not available: slskd URL not configured",
+        effects.fail_backend(BackendLookupError::Backend(
+            SoulseekError::NotConfigured(MissingSetting::Url).into(),
         ));
         let (ctx, options) = (alice(), read.options.clone().unwrap());
         let runner = Runner {
@@ -1754,7 +1730,10 @@ mod tests {
             query: DownloadQuery::new(vec![track("Marrow Choir", "O Holy Night")]),
             spec: StoredSpec::default(),
         };
-        let backend = acq.effects.backend().await.unwrap();
+        let backend = (acq.effects.backends())
+            .get(DEFAULT_DOWNLOAD_BACKEND)
+            .await
+            .unwrap();
         let search = start_stored(&acq.searches, &acq.ledger, &alice(), backend, run)
             .await
             .unwrap();

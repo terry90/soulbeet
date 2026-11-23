@@ -14,13 +14,13 @@ use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::metadata::Track;
 use soulbeet::error::{Result as SoulResult, SoulseekError};
 use soulbeet::{BackendError, BackendFault, BackendResult, DownloadBackend, ImportMode, PeerAsk};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
-use crate::services::DEFAULT_DOWNLOAD_BACKEND;
+use crate::services::{BackendLookupError, Backends, DEFAULT_DOWNLOAD_BACKEND};
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner};
 
 pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
@@ -275,6 +275,63 @@ impl StubBackend {
     /// What `get_downloads_for` returns, filtered by peer.
     pub fn set_listing(&self, listing: Vec<DownloadProgress>) {
         *self.listing.lock().unwrap() = listing;
+    }
+}
+
+/// Looks each id up strictly: the stub registered under it, or the lookup
+/// error `fail` set for it, and any other id is unknown. While held, every
+/// lookup waits for `release`.
+#[derive(Default)]
+pub struct StubBackends {
+    stubs: HashMap<String, Arc<StubBackend>>,
+    failures: Mutex<HashMap<String, BackendLookupError>>,
+    held: watch::Sender<bool>,
+    calls_held: AtomicUsize,
+}
+
+impl StubBackends {
+    /// These lookups with `stub` registered under `id`.
+    pub fn with(mut self, id: &str, stub: Arc<StubBackend>) -> Self {
+        self.stubs.insert(id.to_string(), stub);
+        self
+    }
+
+    /// Makes every lookup of `id` answer `e`.
+    pub fn fail(&self, id: &str, e: BackendLookupError) {
+        self.failures.lock().unwrap().insert(id.to_string(), e);
+    }
+
+    /// Holds every lookup from now on until `release`.
+    pub fn hold(&self) {
+        self.held.send_replace(true);
+    }
+
+    pub fn release(&self) {
+        self.held.send_replace(false);
+    }
+
+    /// The lookups waiting for `release`.
+    pub fn calls_held(&self) -> usize {
+        self.calls_held.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Backends for StubBackends {
+    async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        let mut held = self.held.subscribe();
+        if *held.borrow_and_update() {
+            self.calls_held.fetch_add(1, Ordering::SeqCst);
+            let _ = held.wait_for(|held| !held).await;
+            self.calls_held.fetch_sub(1, Ordering::SeqCst);
+        }
+        if let Some(e) = self.failures.lock().unwrap().get(id) {
+            return Err(e.clone());
+        }
+        match self.stubs.get(id) {
+            Some(stub) => Ok(stub.clone()),
+            None => Err(BackendLookupError::Unknown(id.to_string())),
+        }
     }
 }
 

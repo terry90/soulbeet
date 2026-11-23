@@ -33,7 +33,6 @@ use super::server::{common_codes, ToolSpec};
 use super::{wait, McpCaller};
 use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
-use crate::core::database_failure;
 use crate::core::index::library_songs;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::retry::{cancel, dismiss, retry, NewSearchArgs, RetryAnswer};
@@ -43,9 +42,11 @@ use crate::core::jobs::{
     JobSelect, JobView, RetryMode, Untried,
 };
 use crate::core::library::{navidrome_failure, navidrome_for, SongFacts};
+use crate::core::{backend_unavailable_at, database_failure};
 use crate::import_queue::FileLeft;
 use crate::ledger::store::{last_change_of, JobRecord};
 use crate::ledger::{JobState, SlotResult};
+use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
 const GET_JOBS_ARGS: &[&str] = &[
     "job_ids",
@@ -455,15 +456,15 @@ pub(crate) async fn read_now(
         })
         .collect();
     if !running.is_empty() {
-        let answers: Vec<Option<LiveFacts>> = match acquire.effects.backend().await {
+        let backend = (acquire.effects.backends())
+            .get(DEFAULT_DOWNLOAD_BACKEND)
+            .await;
+        let answers: Vec<Option<LiveFacts>> = match backend {
             Ok(backend) => {
                 join_all(running.iter().map(|(_, _, row)| live_facts(&backend, row))).await
             }
-            Err(f) => {
-                let f = Failure {
-                    stage: Stage::Transfer,
-                    ..f
-                };
+            Err(e) => {
+                let f = backend_unavailable_at(Stage::Transfer, &e);
                 running
                     .iter()
                     .map(|(_, _, row)| unanswered(row, &f))

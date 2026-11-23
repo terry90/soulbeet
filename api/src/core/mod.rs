@@ -71,6 +71,15 @@ pub(crate) fn backend_unavailable(stage: Stage, e: &BackendLookupError) -> Failu
     e.failure(stage, format!("Download backend not available: {e}"))
 }
 
+/// `e` with the code `backend_unavailable` gives it at SourceSearch, shown at `stage`: what an
+/// acquisition's lookup failure is wherever it happens.
+pub(crate) fn backend_unavailable_at(stage: Stage, e: &BackendLookupError) -> Failure {
+    Failure {
+        stage,
+        ..backend_unavailable(Stage::SourceSearch, e)
+    }
+}
+
 /// The import target cannot be written: `e` is the filesystem's error.
 pub(crate) fn target_unwritable(e: &std::io::Error, message: impl Into<String>) -> Failure {
     Failure::new(
@@ -184,5 +193,30 @@ mod tests {
                 Some("slskd URL not configured".to_string())
             );
         }
+    }
+
+    #[test]
+    fn a_lookup_shown_at_another_stage_keeps_the_search_code() {
+        let down = BackendLookupError::Backend(
+            SoulseekError::Api {
+                status: 502,
+                message: "Bad Gateway".into(),
+            }
+            .into(),
+        );
+        let f = backend_unavailable_at(Stage::Enqueue, &down);
+        assert_eq!(
+            (f.code, f.stage, f.retry, f.message.as_str()),
+            (
+                FailureCode::BackendUnreachable,
+                Stage::Enqueue,
+                RetryAdvice::SameSourceLater,
+                "Download backend not available: API error: 502 - Bad Gateway"
+            )
+        );
+        assert_eq!(
+            backend_unavailable(Stage::Enqueue, &down).code,
+            FailureCode::EnqueueFailed
+        );
     }
 }
