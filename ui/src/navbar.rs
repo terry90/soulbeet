@@ -1,13 +1,24 @@
 use dioxus::prelude::*;
 
-use crate::Logo;
+use crate::{Logo, SearchReset};
 
+/// `home` is where the logo leads: the app's search page. Clicking it also
+/// clears the search, like the Search link does.
 #[component]
-pub fn Navbar(children: Element) -> Element {
+pub fn Navbar(#[props(into)] home: NavigationTarget, children: Element) -> Element {
+    let search_reset = try_use_context::<SearchReset>();
+
     rsx! {
         header { class: "px-4 sm:px-6 lg:px-8 flex justify-between items-center gap-3 py-6 border-b border-white/5",
-            // Logo area
-            div { class: "flex shrink-0 items-center gap-3 group cursor-default",
+            Link {
+                class: "flex shrink-0 items-center gap-3 group cursor-pointer",
+                to: home,
+                aria_label: "Soulbeet home",
+                onclick: move |_| {
+                    if let Some(SearchReset(mut reset)) = search_reset {
+                        reset += 1;
+                    }
+                },
                 Logo {
                     size: 48,
                     class: "drop-shadow-[0_0_10px_rgba(255,0,255,0.45)] group-hover:-translate-y-1 transition-transform",
