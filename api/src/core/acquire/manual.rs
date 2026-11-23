@@ -8,7 +8,7 @@ use crate::ledger::store::StoredSearch;
 use crate::ledger::{DuplicateRule, JobKind, JobState, Ledger, NewJob, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
-use crate::services::{download_backend, BackendLookupError};
+use crate::services::{download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND};
 use shared::download::{DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
@@ -141,6 +141,7 @@ async fn start_manual(
     let fresh = NewBatch {
         batch_id: uuid::Uuid::new_v4().to_string(),
         label: manual_batch_label(&items),
+        backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
         target,
         import_mode,
         duplicates: DuplicateRule::Guarded,
@@ -349,6 +350,7 @@ mod tests {
             "Come Over".into(),
             dir.path().to_path_buf(),
             ImportMode::Singleton,
+            DEFAULT_DOWNLOAD_BACKEND.to_string(),
         );
         TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
 

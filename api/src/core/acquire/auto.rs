@@ -13,7 +13,7 @@ use crate::ledger::{
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
-use crate::services::download_backend;
+use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
 use dioxus::logger::tracing::info;
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadQuery, DownloadableGroup, EnqueueStatus,
@@ -318,6 +318,7 @@ pub(crate) async fn run_search(
     let fresh = NewBatch {
         batch_id: run.batch_id.clone(),
         label: auto_batch_label(&picked),
+        backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
         target,
         import_mode: run.import_mode,
         duplicates: DuplicateRule::Guarded,

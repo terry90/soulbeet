@@ -30,7 +30,7 @@ use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
-use crate::services::download_backend;
+use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
 use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner, TransferRegistry};
 use async_trait::async_trait;
 use shared::download::{
@@ -190,10 +190,7 @@ pub(crate) async fn resume_downloads(
             if !is_from(&row, next) {
                 if let Some(transfer) = sent(backend, next, request).await {
                     resumed.abandon.push((row.source.clone(), row.id.clone()));
-                    row = transfer
-                        .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                        .with_backend(backend.id())
-                        .with_job(slot.clone());
+                    row = batch.mark(transfer).with_job(slot.clone());
                     resumed.rebound.push(row.clone());
                 }
             }
@@ -249,9 +246,7 @@ pub(crate) async fn resume_downloads(
         if let Ok(path) = find_on_disk(&row.item, base, Some(&destination), &claimed) {
             resumed.on_disk.push(slot);
             resumed.finished.push(ResolvedSlot {
-                row: row
-                    .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                    .with_backend(backend.id()),
+                row: batch.mark(row),
                 path,
                 destination: Some(destination),
             });
@@ -473,6 +468,7 @@ fn batch_of<'a>(
                 label.to_string(),
                 PathBuf::from(&job.folder.path),
                 job.import_mode,
+                DEFAULT_DOWNLOAD_BACKEND.to_string(),
             );
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
@@ -894,19 +890,12 @@ async fn adopt_sent(
             rest.push((slot, record));
             continue;
         };
-        let row = transfer
-            .with_batch(batch_id.clone(), label.clone())
-            .with_backend(backend.id())
-            .with_job(slot.clone());
+        let resumed = batch_of(downloads, &queued.job, &batch_id, &label);
+        let row = resumed.batch.mark(transfer).with_job(slot.clone());
         rows.push(row.clone());
         record.row = Some(row);
         record.state = JobState::Downloading;
-        batch_of(downloads, &queued.job, &batch_id, &label).add(
-            slot,
-            record,
-            &queued.candidates,
-            cap,
-        );
+        resumed.add(slot, record, &queued.candidates, cap);
     }
     if !rows.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -1024,11 +1013,8 @@ async fn resume_batch(
         if failure == already_running() {
             dismissed.push(w.job);
         } else {
-            held.push(
-                DownloadProgress::failed(w.transfer_id, w.source, w.filename, failure)
-                    .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                    .with_job(w.job),
-            );
+            let row = DownloadProgress::failed(w.transfer_id, w.source, w.filename, failure);
+            held.push(batch.mark(row).with_job(w.job));
         }
     }
     if !dismissed.is_empty() {
@@ -1120,6 +1106,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
     let fresh = NewBatch {
         batch_id: uuid::Uuid::new_v4().to_string(),
         label: manual_batch_label(&picked),
+        backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
         duplicates: DuplicateRule::for_job(job.origin, job.options.as_ref()),
@@ -2168,6 +2155,7 @@ mod tests {
                 "Come Over".into(),
                 PathBuf::from(target),
                 ImportMode::Singleton,
+                DEFAULT_DOWNLOAD_BACKEND.to_string(),
             )
         };
         let registry = TransferRegistry::global();
@@ -2196,9 +2184,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(states, vec!["dismissed", "failed", "downloading"]);
+        let held = stored_row(&db, "j1", 1).await;
         assert_eq!(
-            stored_row(&db, "j1", 1).await.failure.map(|f| f.code),
-            Some(FailureCode::AlreadyInFlightOtherUser)
+            (
+                held.failure.map(|f| f.code),
+                held.batch_id.as_deref(),
+                held.backend.as_deref()
+            ),
+            (
+                Some(FailureCode::AlreadyInFlightOtherUser),
+                Some("b1"),
+                Some(DEFAULT_DOWNLOAD_BACKEND)
+            )
         );
     }
 
@@ -2431,6 +2428,7 @@ mod tests {
             "Come Over".into(),
             tmp.path().join("music"),
             ImportMode::Singleton,
+            DEFAULT_DOWNLOAD_BACKEND.to_string(),
         );
         // slskd took both files of b1 and finished 01 while Soulful was down, and its record
         // was cleared; it holds nothing now.
@@ -2526,6 +2524,7 @@ mod tests {
             "Come Over".into(),
             library.to_path_buf(),
             ImportMode::Album,
+            DEFAULT_DOWNLOAD_BACKEND.to_string(),
         )
     }
 
@@ -3195,6 +3194,7 @@ mod tests {
                 "Winter Songs".into(),
                 PathBuf::from(&record.folder.path),
                 ImportMode::Singleton,
+                DEFAULT_DOWNLOAD_BACKEND.to_string(),
             ),
         );
         let started = Started::on(backend);

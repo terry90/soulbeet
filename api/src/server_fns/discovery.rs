@@ -839,6 +839,7 @@ pub async fn generate_discovery_playlist_internal(
                     format!("{} - {}", candidate.artist, candidate.track),
                     std::path::PathBuf::from(folder.discovery_profile_path(&profile_name)),
                     soulbeet::ImportMode::Singleton,
+                    searched.0.clone(),
                 );
                 // Discovery watches its own transfers, so nothing may join it.
                 track_batch.inbox.close();

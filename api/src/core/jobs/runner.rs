@@ -686,6 +686,7 @@ impl Runner<'_> {
         let fresh = NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
             label: manual_batch_label(&picked),
+            backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
             target,
             import_mode: match self.job.kind {
                 JobKind::Track => ImportMode::Singleton,

@@ -33,7 +33,7 @@ use crate::core::database_failure;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
-use crate::services::{download_backend, BackendLookupError};
+use crate::services::{BackendLookupError, Backends};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
 /// Poll interval for checking download status (2 seconds).
@@ -496,14 +496,14 @@ impl DownloadMonitor {
         row: DownloadProgress,
     ) -> DownloadProgress {
         if self.settle(slot, phase, backend) || self.job_cancelled(slot) {
-            self.cancelled_row(slot, backend)
+            self.cancelled_row(slot)
         } else {
             row
         }
     }
 
     /// The row of `slot` its user cancelled.
-    fn cancelled_row(&self, slot: usize, backend: &'static str) -> DownloadProgress {
+    fn cancelled_row(&self, slot: usize) -> DownloadProgress {
         let tracked = &self.tracked_files[slot];
         DownloadProgress::queued(
             tracked.transfer_id.clone(),
@@ -513,7 +513,6 @@ impl DownloadMonitor {
         )
         .with_state(DownloadState::Cancelled)
         .with_failure(cancelled_on_request())
-        .with_backend(backend)
     }
 
     /// The peers this batch is currently waiting on, deduplicated. Follows
@@ -837,8 +836,9 @@ impl DownloadMonitor {
             .push((tracked.source.clone(), tracked.transfer_id.clone()));
     }
 
-    /// Run the monitoring loop until all downloads complete or timeout.
-    pub async fn run(&mut self) {
+    /// Run the monitoring loop until all downloads complete or timeout. Every
+    /// backend call goes to the batch's own backend, looked up in `backends`.
+    pub async fn run(&mut self, backends: &dyn Backends) {
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
         let mut consecutive_empty = 0;
         let mut poll_count = 0;
@@ -860,7 +860,7 @@ impl DownloadMonitor {
 
             poll_count += 1;
 
-            let backend = match download_backend(None).await {
+            let backend = match backends.get(&self.batch.backend).await {
                 Ok(b) => {
                     backend_failures = 0;
                     last_backend = Some(Arc::clone(&b));
@@ -931,7 +931,7 @@ impl DownloadMonitor {
         }
 
         // Joiners must not enqueue into a batch that is only cleaning up.
-        match download_backend(None).await {
+        match backends.get(&self.batch.backend).await {
             Ok(backend) => {
                 self.close_inbox_cancelling(&backend).await;
                 self.remove_batch_transfers(&backend).await;
@@ -1001,7 +1001,7 @@ impl DownloadMonitor {
                 "Cancelling {} from {} on request",
                 tracked.filename, tracked.source
             );
-            let row = self.cancelled_row(slot, backend.id());
+            let row = self.cancelled_row(slot);
             self.abandon(slot, backend).await;
             self.settle(slot, SlotPhase::Settled, backend.id());
             cancelled.push(self.stamp(slot, row));
@@ -1303,11 +1303,11 @@ impl DownloadMonitor {
         let _ = self.tx.send(DownloadEvent::Progress(rows));
     }
 
-    /// `entry` stamped with the batch and with `slot`'s job. Every row the
-    /// monitor sends is built for one slot.
+    /// `entry` marked with the batch and its backend, and with `slot`'s job.
+    /// Every row the monitor sends is built for one slot.
     fn stamp(&self, slot: usize, entry: DownloadProgress) -> DownloadProgress {
-        entry
-            .with_batch(self.batch.owner.batch_id.clone(), self.batch.label.clone())
+        self.batch
+            .mark(entry)
             .with_job(self.tracked_files[slot].job.clone())
     }
 
@@ -2024,7 +2024,8 @@ mod tests {
     use crate::ledger::Recorded;
     use crate::server_fns::download::enqueue::{monitor_stopped, MONITOR_STOPPED};
     use crate::server_fns::download::test_support::{
-        batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend, StubFault,
+        batch, batch_on, item, key, transfer, Cancel, ScriptedOutcome, StubBackend, StubBackends,
+        StubFault,
     };
     use shared::failure::{Service, UserActionCode};
     use soulbeet::error::{MissingSetting, SoulseekError};
@@ -2165,6 +2166,20 @@ mod tests {
             ledger,
         );
         (m, recorded)
+    }
+
+    /// Each recorded `Slots` row's item and backend, in order.
+    fn backends_recorded(recorded: &mut Recorded) -> Vec<(String, Option<String>)> {
+        recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .map(|r| (r.item, r.backend))
+            .collect()
     }
 
     /// A recorded `Slots` event: its state, and each row's item and slot.
@@ -3075,6 +3090,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rows_a_monitor_makes_for_its_slots_carry_the_backend_of_its_batch() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        m.batch.backend = "b".to_string();
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_b".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02".to_string(),
+                alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
+                job: slot_of_j1(1),
+            }])
+            .expect("delivered");
+
+        // The watched slot fails without a listed row, the undrained one is stopped.
+        m.fail_unprocessed_tracks(never_appeared());
+        m.close_inbox();
+
+        let mut sent = Vec::new();
+        while let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() {
+            sent.extend(rows.into_iter().map(|r| (r.item, r.backend)));
+        }
+        let b = Some("b".to_string());
+        let both = vec![
+            ("01.flac".to_string(), b.clone()),
+            ("02.flac".to_string(), b),
+        ];
+        assert_eq!(sent, both);
+        assert_eq!(backends_recorded(&mut recorded), both);
+    }
+
+    // Paused, so the failed state's confirmation window and the poll interval take no real
+    // time.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_is_polled_and_cleaned_up_only_on_its_own_backend() {
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        b.set_listing(vec![failed_transfer("peer_a", "01.flac")]);
+        let backends = StubBackends::default()
+            .with("a", a.clone())
+            .with("b", b.clone());
+        let (tx, _rx) = broadcast::channel(16);
+        let (ledger, _recorded) = Ledger::recording();
+        let mut m = DownloadMonitor::new(
+            vec![watched("peer_a", "01.flac", 0)],
+            PathBuf::from("/music"),
+            tx,
+            batch_on("b", "X"),
+            ledger,
+        );
+
+        m.run(&backends).await;
+
+        let asked = backends.asked();
+        assert!(
+            !asked.is_empty() && asked.iter().all(|id| id == "b"),
+            "{asked:?}"
+        );
+        assert!(a.listings().is_empty() && a.cancelled().is_empty());
+        assert_eq!(
+            b.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("01.flac"))],
+            "the ended record is removed where it is"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unparseable_listing_fails_the_batch_after_its_fuse() {
         let (tx, mut rx) = broadcast::channel(16);
         let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
@@ -3534,6 +3619,39 @@ mod tests {
             }
             other => panic!("expected a row replacement, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_rebound_slots_rows_carry_the_backend_of_its_batch() {
+        let (mut m, mut rx, mut recorded) = failover_monitor();
+        m.batch.backend = "b".to_string();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[failed_transfer("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        match rx.try_recv().expect("an event for the retry") {
+            DownloadEvent::Replaced { entry, .. } => {
+                assert_eq!(
+                    (entry.item.as_str(), entry.backend.as_deref()),
+                    ("dirB/bbb.flac", Some("b"))
+                );
+            }
+            other => panic!("expected a row replacement, got {other:?}"),
+        }
+        let b = Some("b".to_string());
+        assert_eq!(
+            backends_recorded(&mut recorded),
+            vec![
+                ("dirA/aaa.flac".to_string(), b.clone()),
+                ("dirB/bbb.flac".to_string(), b)
+            ]
+        );
     }
 
     #[tokio::test]

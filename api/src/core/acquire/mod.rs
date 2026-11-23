@@ -24,6 +24,7 @@ use crate::server_fns::download::enqueue::{
 };
 use crate::server_fns::download::failover::{align_pool_tracks, item_index, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
+use crate::services::Registry;
 use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner};
 use dioxus::logger::tracing::info;
 use shared::download::{
@@ -64,14 +65,15 @@ pub(super) fn request_stopped(e: &tokio::task::JoinError) -> Failure {
     )
 }
 
-/// The batch a request starts when it joins no running one. It downloads
-/// into `batch_folder(label, batch_id)` and imports into `target` in
-/// `import_mode`, treating what the library has by `duplicates`; the
+/// The batch a request starts when it joins no running one. It downloads on
+/// `backend` into `batch_folder(label, batch_id)` and imports into `target`
+/// in `import_mode`, treating what the library has by `duplicates`; the
 /// request's user owns it.
 #[derive(Clone)]
 pub struct NewBatch {
     pub batch_id: String,
     pub label: String,
+    pub backend: String,
     pub target: PathBuf,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
@@ -105,6 +107,7 @@ impl NewBatch {
             self.label,
             self.target,
             self.import_mode,
+            self.backend,
         );
         batch.with_duplicates(self.duplicates)
     }
@@ -253,11 +256,7 @@ pub(super) async fn queue_and_watch(
     // goes to that user's channel.
     let user = ctx.id();
     let tx = get_or_create_user_channel(&user).await;
-    let row = |p: DownloadProgress, n: u32| {
-        p.with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-            .with_backend(backend.id())
-            .with_job(slot(n))
-    };
+    let row = |p: DownloadProgress, n: u32| batch.mark(p).with_job(slot(n));
 
     let mut failed = Vec::new();
     let mut unanswered = Vec::new();
@@ -381,7 +380,7 @@ pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
     let user = ctx.id();
     tokio::spawn(async move {
         register_user_task(&user).await;
-        monitor.run().await;
+        monitor.run(&Registry).await;
         unregister_user_task(&user).await;
     });
 }
@@ -537,6 +536,7 @@ mod tests {
     use crate::server_fns::download::test_support::{
         batch, group, item, key, ScriptedOutcome, StubBackend,
     };
+    use crate::services::DEFAULT_DOWNLOAD_BACKEND;
     use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadQuery;
     use shared::failure::{Cause, Service};
@@ -547,6 +547,7 @@ mod tests {
         NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
             label: "Come Over".to_string(),
+            backend: running.backend.clone(),
             target,
             import_mode: running.import_mode,
             duplicates: DuplicateRule::Guarded,
@@ -570,6 +571,7 @@ mod tests {
         NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
             label: label.to_string(),
+            backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
             target: PathBuf::from("/music"),
             import_mode: ImportMode::Singleton,
             duplicates: DuplicateRule::Guarded,
@@ -850,7 +852,7 @@ mod tests {
         let results = enqueue_and_watch(
             &Ledger::recording().0,
             &ctx,
-            backend.clone(),
+            backend,
             fresh,
             acquisition(vec![item("peer_a", "One", "01.flac")], Vec::new()),
         )
@@ -862,7 +864,7 @@ mod tests {
         };
         assert_eq!(
             (rows[0].batch_id.as_deref(), rows[0].backend.as_deref()),
-            (Some(batch_id.as_str()), Some(backend.id()))
+            (Some(batch_id.as_str()), Some(DEFAULT_DOWNLOAD_BACKEND))
         );
         assert_eq!(
             rows[0].failure.as_ref().map(|f| f.code),

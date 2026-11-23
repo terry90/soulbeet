@@ -71,10 +71,15 @@ pub fn group(source: &str, items: Vec<DownloadableItem>, score: f64) -> Download
     }
 }
 
-/// A batch of its own user, so tests sharing the process-wide registry never
-/// see each other's claims. Its folder is `<label> [12345678]`, and it
-/// imports into `/music`.
+/// A batch of its own user on the default backend, so tests sharing the
+/// process-wide registry never see each other's claims. Its folder is
+/// `<label> [12345678]`, and it imports into `/music`.
 pub fn batch(label: &str) -> BatchRef {
+    batch_on(DEFAULT_DOWNLOAD_BACKEND, label)
+}
+
+/// `batch(label)` on the backend registered as `backend`.
+pub fn batch_on(backend: &str, label: &str) -> BatchRef {
     let unique = uuid::Uuid::new_v4();
     BatchRef::new(
         TransferOwner {
@@ -84,6 +89,7 @@ pub fn batch(label: &str) -> BatchRef {
         label.to_string(),
         PathBuf::from("/music"),
         ImportMode::Singleton,
+        backend.to_string(),
     )
 }
 
@@ -97,6 +103,7 @@ pub fn same_user_into(running: &BatchRef, target: PathBuf) -> BatchRef {
         "Come Over".to_string(),
         target,
         running.import_mode,
+        running.backend.clone(),
     )
 }
 
@@ -130,8 +137,8 @@ pub enum ScriptedOutcome {
 /// Answers each enqueue from a scripted list, then rejects everything after
 /// the script runs out. Starts every search unless told to fail it, and
 /// answers its polls from a scripted list, then as still running with
-/// nothing found. Records every search spec and stop, destination, request
-/// and cancellation, and lists whatever transfers the test sets. Each stub
+/// nothing found. Records every search spec and stop, destination, request,
+/// listing and cancellation, and lists whatever transfers the test sets. Each stub
 /// has its own backend id, so the registry keys of concurrent tests never
 /// collide.
 pub struct StubBackend {
@@ -143,6 +150,7 @@ pub struct StubBackend {
     destinations: Mutex<Vec<String>>,
     requests: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
+    listed: Mutex<Vec<Vec<String>>>,
     hold: Mutex<Option<Hold>>,
     specs: Mutex<Vec<SearchSpec>>,
     search_hold: Mutex<Option<Hold>>,
@@ -175,6 +183,7 @@ impl StubBackend {
             destinations: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
+            listed: Mutex::new(Vec::new()),
             hold: Mutex::new(None),
             specs: Mutex::new(Vec::new()),
             search_hold: Mutex::new(None),
@@ -276,15 +285,21 @@ impl StubBackend {
     pub fn set_listing(&self, listing: Vec<DownloadProgress>) {
         *self.listing.lock().unwrap() = listing;
     }
+
+    /// The peers of every `get_downloads_for` call, in order.
+    pub fn listings(&self) -> Vec<Vec<String>> {
+        self.listed.lock().unwrap().clone()
+    }
 }
 
 /// Looks each id up strictly: the stub registered under it, or the lookup
-/// error `fail` set for it, and any other id is unknown. While held, every
-/// lookup waits for `release`.
+/// error `fail` set for it, and any other id is unknown. Records every id it
+/// is asked for. While held, every lookup waits for `release`.
 #[derive(Default)]
 pub struct StubBackends {
     stubs: HashMap<String, Arc<StubBackend>>,
     failures: Mutex<HashMap<String, BackendLookupError>>,
+    asked: Mutex<Vec<String>>,
     held: watch::Sender<bool>,
     calls_held: AtomicUsize,
 }
@@ -314,11 +329,17 @@ impl StubBackends {
     pub fn calls_held(&self) -> usize {
         self.calls_held.load(Ordering::SeqCst)
     }
+
+    /// Every id looked up, in order.
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Backends for StubBackends {
     async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        self.asked.lock().unwrap().push(id.to_string());
         let mut held = self.held.subscribe();
         if *held.borrow_and_update() {
             self.calls_held.fetch_add(1, Ordering::SeqCst);
@@ -527,6 +548,7 @@ impl DownloadBackend for StubBackend {
         }
     }
     async fn get_downloads_for(&self, sources: &[String]) -> BackendResult<Vec<DownloadProgress>> {
+        self.listed.lock().unwrap().push(sources.to_vec());
         Ok(self
             .listing
             .lock()

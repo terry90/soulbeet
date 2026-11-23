@@ -489,14 +489,13 @@ pub async fn deliver(
 pub fn stopped_rows(lost: &[AddedSlot], batch: &BatchRef) -> Vec<DownloadProgress> {
     lost.iter()
         .map(|slot| {
-            DownloadProgress::failed(
+            let row = DownloadProgress::failed(
                 slot.transfer_id.clone(),
                 slot.source.clone(),
                 slot.filename.clone(),
                 monitor_stopped(),
-            )
-            .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-            .with_job(slot.job.clone())
+            );
+            batch.mark(row).with_job(slot.job.clone())
         })
         .collect()
 }
@@ -722,6 +721,7 @@ mod tests {
             "Come Over".into(),
             running.target.clone(),
             ImportMode::Singleton,
+            running.backend.clone(),
         );
 
         let enq = enqueue_request(
