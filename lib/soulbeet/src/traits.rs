@@ -54,6 +54,8 @@ pub trait MetadataProvider: Send + Sync {
 /// - Each `QueuedDownload` that `download` returns, and each `DownloadProgress`
 ///   listed, names the sent item's `source` in `source` and its
 ///   `DownloadableItem::id` in `item`.
+/// - Every `DownloadableItem` that `poll_search` returns names `id()` in
+///   `backend`, so its sends come back here.
 /// - A succeeded transfer stays listed until `cancel_download` with `remove`.
 /// - `remove` forgets an ended transfer and never moves or deletes a file.
 /// - An item `download` cannot send gets no answer: the caller fails it.

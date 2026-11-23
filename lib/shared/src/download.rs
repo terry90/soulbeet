@@ -42,6 +42,8 @@ impl From<Track> for DownloadQuery {
 pub struct DownloadableItem {
     /// Unique identifier for this item (backend-specific format)
     pub id: String,
+    /// Id of the download backend that found this item and takes it for download.
+    pub backend: String,
     /// Source identifier (e.g., username for P2P, service for streaming)
     pub source: String,
     /// Display name for the track

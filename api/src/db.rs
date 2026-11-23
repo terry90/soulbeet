@@ -123,6 +123,7 @@ pub(crate) mod test_db {
     pub const CHANGELOG_SEEN: i64 = 20261125000000;
     pub const REMOVE_LASTFM: i64 = 20261130000000;
     pub const BACKEND_ID: i64 = 20261203000000;
+    pub const ITEM_BACKEND: i64 = 20261203000001;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -822,6 +823,104 @@ mod tests {
                 serde_json::from_str::<serde_json::Value>(&import("[]")).unwrap(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn stored_items_name_the_slskd_backend_and_keep_their_order() {
+        let db = test_db::migrated_before(test_db::ITEM_BACKEND).await;
+        insert_user(&db, "u1", "bob").await;
+        insert_folder(&db, "u1", "/music/bob").await;
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, \
+             import_mode, state) VALUES ('j1', 'u1', '/music/bob', 7, 7, '{}', 'album', 'done')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO job_tracks (job_id, slot, state) VALUES ('j1', 0, 'done')")
+            .execute(&db)
+            .await
+            .unwrap();
+        for (n, candidate) in [(1, Some(r#"{"id":"a","source":"p"}"#)), (2, None)] {
+            sqlx::query(
+                "INSERT INTO job_attempts (job_id, slot, n, candidate) VALUES ('j1', 0, ?, ?)",
+            )
+            .bind(n)
+            .bind(candidate)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let item = |id: &str| format!(r#"{{"id":"{id}","source":"p"}}"#);
+        let group = |name: &str, items: &[&str]| {
+            let items: Vec<String> = items.iter().map(|i| item(i)).collect();
+            format!(r#"{{"source":"{name}","items":[{}]}}"#, items.join(","))
+        };
+        let found = format!(
+            "[{},{},{}]",
+            group("g0", &["a", "b"]),
+            group("g1", &["c", "d"]),
+            group("g2", &["e", "f"])
+        );
+        for (id, candidates) in [
+            ("s1", Some(found.as_str())),
+            ("s2", Some("[]")),
+            ("s3", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO searches (id, user_id, expires_at, query, candidates) \
+                 VALUES (?, 'u1', 9, '{}', ?)",
+            )
+            .bind(id)
+            .bind(candidates)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO searches (id, user_id, expires_at, query, candidates) VALUES ('s4', 'u1', 9, '{}', ?)")
+            .bind(r#"[{"source":"g","items":[]}]"#)
+            .execute(&db)
+            .await
+            .unwrap();
+        test_db::apply(&db, test_db::ITEM_BACKEND).await;
+
+        let json = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let stored: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, candidates FROM searches ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        let with_backend = |g: &str, items: &[&str]| {
+            let items: Vec<String> = items
+                .iter()
+                .map(|i| format!(r#"{{"id":"{i}","source":"p","backend":"slskd"}}"#))
+                .collect();
+            format!(r#"{{"source":"{g}","items":[{}]}}"#, items.join(","))
+        };
+        let expected = format!(
+            "[{},{},{}]",
+            with_backend("g0", &["a", "b"]),
+            with_backend("g1", &["c", "d"]),
+            with_backend("g2", &["e", "f"])
+        );
+        assert_eq!(json(stored[0].1.as_deref().unwrap()), json(&expected));
+        assert_eq!(stored[1].1.as_deref(), Some("[]"));
+        assert_eq!(stored[2].1, None);
+        assert_eq!(
+            json(stored[3].1.as_deref().unwrap()),
+            json(r#"[{"source":"g","items":[]}]"#)
+        );
+
+        let attempts: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT candidate FROM job_attempts ORDER BY n")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            json(attempts[0].as_deref().unwrap()),
+            json(r#"{"id":"a","source":"p","backend":"slskd"}"#)
+        );
+        assert_eq!(attempts[1], None);
     }
 
     #[tokio::test]

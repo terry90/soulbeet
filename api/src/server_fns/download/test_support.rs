@@ -20,11 +20,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
+use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 use crate::transfer_registry::{BatchRef, TransferKey, TransferOwner};
 
 pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
     DownloadableItem {
         id: id.to_string(),
+        backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
         source: source.to_string(),
         title: title.to_string(),
         artist: "Kowloon".to_string(),
