@@ -146,7 +146,7 @@ pub enum ScriptedOutcome {
 /// the script runs out. Starts every search unless told to fail it, and
 /// answers its polls from a scripted list, then as still running with
 /// nothing found. Records every search spec and stop, destination, request,
-/// listing and cancellation, and lists whatever transfers the test sets. Each stub
+/// listing, transfer lookup and cancellation, and lists whatever transfers the test sets. Each stub
 /// has its own backend id, so the registry keys of concurrent tests never
 /// collide.
 pub struct StubBackend {
@@ -159,6 +159,7 @@ pub struct StubBackend {
     requests: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
     listed: Mutex<Vec<Vec<String>>>,
+    looked_up: Mutex<Vec<(String, String)>>,
     hold: Mutex<Option<Hold>>,
     specs: Mutex<Vec<SearchSpec>>,
     search_hold: Mutex<Option<Hold>>,
@@ -192,6 +193,7 @@ impl StubBackend {
             requests: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
             listed: Mutex::new(Vec::new()),
+            looked_up: Mutex::new(Vec::new()),
             hold: Mutex::new(None),
             specs: Mutex::new(Vec::new()),
             search_hold: Mutex::new(None),
@@ -297,6 +299,11 @@ impl StubBackend {
     /// The peers of every `get_downloads_for` call, in order.
     pub fn listings(&self) -> Vec<Vec<String>> {
         self.listed.lock().unwrap().clone()
+    }
+
+    /// The (source, transfer id) of every `get_download` call, in order.
+    pub fn download_lookups(&self) -> Vec<(String, String)> {
+        self.looked_up.lock().unwrap().clone()
     }
 }
 
@@ -571,6 +578,7 @@ impl DownloadBackend for StubBackend {
         source: &str,
         id: &str,
     ) -> BackendResult<Option<DownloadProgress>> {
+        (self.looked_up.lock().unwrap()).push((source.to_string(), id.to_string()));
         Ok(self
             .listing
             .lock()

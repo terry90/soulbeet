@@ -198,6 +198,33 @@ impl Backends for Registry {
     }
 }
 
+/// Backends looked up through `backends`, each id once: a later call for the same id gets the
+/// first answer, error included.
+#[cfg(feature = "server")]
+pub struct BackendCache<'a> {
+    backends: &'a dyn Backends,
+    found: HashMap<String, Result<Arc<dyn DownloadBackend>, BackendLookupError>>,
+}
+
+#[cfg(feature = "server")]
+impl<'a> BackendCache<'a> {
+    pub fn new(backends: &'a dyn Backends) -> Self {
+        Self {
+            backends,
+            found: HashMap::new(),
+        }
+    }
+
+    pub async fn get(&mut self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        if let Some(found) = self.found.get(id) {
+            return found.clone();
+        }
+        let found = self.backends.get(id).await;
+        self.found.insert(id.to_string(), found.clone());
+        found
+    }
+}
+
 #[cfg(feature = "server")]
 fn init_importer(id: &str) -> Result<Arc<dyn MusicImporter>, String> {
     match id {
@@ -497,7 +524,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::security::SEEDED_ADMIN_ID;
-    use crate::server_fns::download::test_support::StubBackend;
+    use crate::server_fns::download::test_support::{StubBackend, StubBackends};
 
     #[tokio::test]
     async fn an_unreadable_password_marks_the_user_and_resets_the_banner() {
@@ -832,6 +859,22 @@ mod tests {
                 RetryAdvice::NotRetryable
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_backend_cache_asks_each_id_once() {
+        let stub = StubBackend::new(vec![]);
+        let backends = StubBackends::default().with("a", stub.clone());
+        backends.fail("b", BackendLookupError::Unknown("b".into()));
+        let mut cache = BackendCache::new(&backends);
+        for _ in 0..2 {
+            assert_eq!(cache.get("a").await.unwrap().id(), stub.id());
+            let Err(e) = cache.get("b").await else {
+                panic!("b was found");
+            };
+            assert_eq!(e.to_string(), "Unknown download backend: b");
+        }
+        assert_eq!(backends.asked(), ["a", "b"]);
     }
 
     #[tokio::test]
