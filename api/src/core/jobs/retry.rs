@@ -19,7 +19,7 @@ use super::{
     Untried, Wanted,
 };
 use crate::auth::UserCtx;
-use crate::core::acquire::{numbered, AUTO_SELECT_SCORE_THRESHOLD};
+use crate::core::acquire::{backend_of, numbered, AUTO_SELECT_SCORE_THRESHOLD};
 use crate::core::sources::{
     self, candidate_not_found, owned_search, parse_candidate_id, search_not_found, start_stored,
     view, SearchRun,
@@ -245,7 +245,7 @@ pub(crate) async fn retry(
             let Some((slot, item)) = source_tried(&view) else {
                 return Ok(refusal(&view, &untried, mode));
             };
-            if let Err(refused) = source_ready(acquire, &item.source).await {
+            if let Err(refused) = source_ready(acquire, item).await {
                 return Ok(refused);
             }
             Transition::Queue {
@@ -320,12 +320,13 @@ fn refusal(view: &JobView, untried: &Untried, mode: RetryMode) -> RetryAnswer {
     }
 }
 
-/// Refuses same_source of `source` when the backend says it is offline or blocked, or cannot
-/// say: then the failure says whether the same call can work later (slskd or the Soulseek server
-/// did not answer) in Soulful's words, slskd's text in its cause.
-async fn source_ready(acquire: &Acquire, source: &str) -> Result<(), RetryAnswer> {
+/// Refuses same_source of `tried`'s source when its backend says the source is offline or
+/// blocked, or cannot say: then the failure says whether the same call can work later (slskd or
+/// the Soulseek server did not answer) in Soulful's words, slskd's text in its cause.
+async fn source_ready(acquire: &Acquire, tried: &DownloadableItem) -> Result<(), RetryAnswer> {
+    let source = tried.source.as_str();
     let backend = (acquire.effects.backends())
-        .get(DEFAULT_DOWNLOAD_BACKEND)
+        .get(&tried.backend)
         .await
         .map_err(|e| {
             let f = backend_unavailable_at(Stage::Enqueue, &e);
@@ -631,8 +632,9 @@ async fn dismiss_discarding(
 /// download_source: candidate `candidate_id` of the caller's live search becomes the source of
 /// `target`: the caller's job (an MCP job waiting for a source choice, failed or cancelled, of
 /// the candidate's kind), or a new job in a batch of its own, made after the checks
-/// ensure_in_library makes (importer, backend, folder), its album's tracklist read. Its runner
-/// then enqueues it.
+/// ensure_in_library makes (importer, the candidate's backend, folder), its album's tracklist
+/// read. Its runner then enqueues it. A candidate whose files are not all of one backend is
+/// refused.
 pub(crate) async fn download_source(
     acquire: &Arc<Acquire>,
     ctx: &UserCtx,
@@ -642,6 +644,13 @@ pub(crate) async fn download_source(
     let (search, items) = match candidate(acquire, ctx, candidate_id).await {
         Ok(found) => found,
         Err(refusal) => return Ok(refusal),
+    };
+    let backend = match backend_of(&items) {
+        Ok(id) => id.to_string(),
+        Err(f) => {
+            let facts = Map::from_iter([("candidate_id".to_string(), json!(candidate_id))]);
+            return Ok(RetryAnswer::Refused(f, facts));
+        }
     };
     let kind = kind_of(&search);
     let wrong_kind = |job_kind: JobKind| RetryAnswer::InvalidInput {
@@ -687,10 +696,7 @@ pub(crate) async fn download_source(
     if let Some(f) = acquire.effects.importer_blocked().await {
         return Ok(RetryAnswer::Unavailable(f, Map::new()));
     }
-    let found = (acquire.effects.backends())
-        .get(DEFAULT_DOWNLOAD_BACKEND)
-        .await;
-    if let Err(e) = found {
+    if let Err(e) = acquire.effects.backends().get(&backend).await {
         let f = backend_unavailable(Stage::SourceSearch, &e);
         return Ok(RetryAnswer::Unavailable(f, Map::new()));
     }

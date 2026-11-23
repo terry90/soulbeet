@@ -13,7 +13,7 @@ use crate::ledger::{
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
-use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
+use crate::services::{Backends, Registry};
 use dioxus::logger::tracing::info;
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadQuery, DownloadableGroup, EnqueueStatus,
@@ -23,8 +23,8 @@ use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
 
 use super::{
-    enqueue_and_watch, manual_batch_label, numbered, prepare_target, request_stopped, Acquisition,
-    NewBatch,
+    backend_of, enqueue_and_watch, manual_batch_label, numbered, prepare_target, request_stopped,
+    Acquisition, NewBatch,
 };
 
 /// Name for an auto download's batch: the picked group's title, which a
@@ -160,6 +160,7 @@ pub async fn auto_download(
             folder,
             query,
             backends,
+            &Registry,
             run,
         ));
         Ok::<_, Failure>(())
@@ -172,16 +173,18 @@ pub async fn auto_download(
 /// The spawned part of `auto_download`: searches, stores what it found as
 /// the search's candidates, then waits for a choice from them when no source
 /// scores well enough, else downloads the best one with the rest as
-/// alternates. Given `run.found`, it picks from those instead of searching.
+/// alternates, on the backend its files name, looked up in `backends`. Given
+/// `run.found`, it picks from those instead of searching.
 pub(crate) async fn run_search(
     ledger: Ledger,
     ctx: UserCtx,
     folder: Folder,
     mut query: DownloadQuery,
-    backends: (Searched, Vec<Searched>),
+    searched: (Searched, Vec<Searched>),
+    backends: &dyn Backends,
     mut run: AutoRun,
 ) {
-    let (first, rest) = backends;
+    let (first, rest) = searched;
     let tx = get_or_create_user_channel(&ctx.id()).await;
     let send = |event| {
         let _ = tx.send(DownloadEvent::AutoDownload(event));
@@ -307,7 +310,11 @@ pub(crate) async fn run_search(
         Err(failure) => return fail_job(&ledger, &ctx, &run, failure).await,
     };
 
-    let backend = match download_backend(None).await {
+    let routed = match backend_of(&picked.items) {
+        Ok(id) => id.to_string(),
+        Err(failure) => return fail_job(&ledger, &ctx, &run, failure).await,
+    };
+    let backend = match backends.get(&routed).await {
         Ok(b) => b,
         Err(e) => {
             let failure = backend_unavailable(Stage::Enqueue, &e);
@@ -318,7 +325,7 @@ pub(crate) async fn run_search(
     let fresh = NewBatch {
         batch_id: run.batch_id.clone(),
         label: auto_batch_label(&picked),
-        backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
+        backend: routed,
         target,
         import_mode: run.import_mode,
         duplicates: DuplicateRule::Guarded,
@@ -362,10 +369,13 @@ mod tests {
     use super::*;
     use crate::core::test_ctx;
     use crate::server_fns::download::enqueue::{another_folder, other_user};
-    use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
+    use crate::server_fns::download::test_support::{
+        group, item, item_on, search_result, ScriptedOutcome, StubBackend, StubBackends,
+    };
+    use crate::services::BackendLookupError;
     use shared::download::SearchState;
     use shared::failure::{FailureCode, RetryAdvice};
-    use soulbeet::error::SoulseekError;
+    use soulbeet::error::{MissingSetting, SoulseekError};
     use soulbeet::DownloadBackend;
     use std::sync::Arc;
 
@@ -490,6 +500,7 @@ mod tests {
             folder,
             DownloadQuery::new(vec![]),
             (("a".into(), a), vec![]),
+            &StubBackends::default(),
             run,
         )
         .await;
@@ -543,6 +554,7 @@ mod tests {
             folder,
             DownloadQuery::new(vec![]),
             (("a".into(), a), vec![]),
+            &StubBackends::default(),
             run,
         )
         .await;
@@ -568,6 +580,131 @@ mod tests {
             _ => None,
         });
         assert_eq!(offered, Some(stored));
+    }
+
+    /// `ctx`'s folder at `dir`.
+    fn folder_at(dir: &tempfile::TempDir, ctx: &UserCtx) -> Folder {
+        Folder {
+            id: "f1".into(),
+            user_id: ctx.user_id.clone(),
+            name: "Music".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+            shared: false,
+        }
+    }
+
+    // Paused: search_ranked waits SEARCH_POLL_INTERVAL before each poll.
+    #[tokio::test(start_paused = true)]
+    async fn an_auto_download_sends_the_best_source_to_the_backend_that_found_it() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = test_ctx("auto-routed");
+        let dir = tempfile::tempdir().unwrap();
+        let found = |backend: &str, peer: &str, score| {
+            let items = vec![item_on(backend, peer, "Wake Up", "07.flac")];
+            vec![group(peer, items, score)]
+        };
+        let (a, b) = (
+            StubBackend::new(vec![ScriptedOutcome::Enqueued]),
+            StubBackend::new(vec![ScriptedOutcome::Enqueued]),
+        );
+        a.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            found("a", "peer_a", 0.8),
+        ))]);
+        b.script_polls(vec![Ok(search_result(
+            "search",
+            SearchState::Completed,
+            found("b", "peer_b", 0.9),
+        ))]);
+        let backends = StubBackends::default()
+            .with("a", a.clone())
+            .with("b", b.clone());
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+            found: None,
+        };
+
+        run_search(
+            ledger,
+            ctx.clone(),
+            folder_at(&dir, &ctx),
+            DownloadQuery::new(vec![]),
+            (
+                ("a".into(), a.clone() as Arc<dyn DownloadBackend>),
+                vec![("b".into(), b.clone() as Arc<dyn DownloadBackend>)],
+            ),
+            &backends,
+            run,
+        )
+        .await;
+
+        assert_eq!(backends.asked(), vec!["b".to_string()]);
+        assert_eq!(b.requests().len(), 1);
+        assert!(a.requests().is_empty());
+        let watched: Vec<(Option<String>, Option<String>)> = recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots {
+                    state: JobState::Downloading,
+                    rows,
+                } => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .map(|row| (row.batch_id, row.backend))
+            .collect();
+        assert_eq!(watched, vec![(Some("b1".into()), Some("b".into()))]);
+    }
+
+    #[tokio::test]
+    async fn an_auto_download_whose_backend_cannot_be_looked_up_fails_at_enqueue() {
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = test_ctx("auto-unresolved");
+        let dir = tempfile::tempdir().unwrap();
+        let stored = vec![group(
+            "peer_b",
+            vec![item_on("b", "peer_b", "Wake Up", "b/07.flac")],
+            0.9,
+        )];
+        let a = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backends = StubBackends::default().with("a", a.clone());
+        let unset =
+            BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url).into());
+        backends.fail("b", unset.clone());
+        let run = AutoRun {
+            batch_id: "b1".into(),
+            job: "j1".into(),
+            search_id: "s1".into(),
+            import_mode: ImportMode::Singleton,
+            found: Some(stored),
+        };
+
+        run_search(
+            ledger,
+            ctx.clone(),
+            folder_at(&dir, &ctx),
+            DownloadQuery::new(vec![]),
+            (("a".into(), a.clone() as Arc<dyn DownloadBackend>), vec![]),
+            &backends,
+            run,
+        )
+        .await;
+
+        assert_eq!(
+            recorded.events(),
+            vec![JobEvent::Ended {
+                job: "j1".into(),
+                state: JobState::Failed,
+                failure: Some(backend_unavailable(Stage::Enqueue, &unset)),
+            }]
+        );
+        assert_eq!(backends.asked(), vec!["b".to_string()]);
+        assert!(a.specs().is_empty() && a.requests().is_empty());
     }
 
     #[tokio::test]
@@ -628,6 +765,7 @@ mod tests {
             folder,
             DownloadQuery::new(vec![]).album(album),
             (("a".into(), a), vec![]),
+            &StubBackends::default(),
             run,
         )
         .await;

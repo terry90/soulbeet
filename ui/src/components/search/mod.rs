@@ -532,7 +532,6 @@ pub fn Search() -> Element {
                 .call(api::download(api::DownloadRequest {
                     items,
                     target_folder: folder,
-                    backend: None,
                     search_id,
                 }))
                 .await

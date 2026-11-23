@@ -50,6 +50,21 @@ pub(crate) fn manual_batch_label(items: &[DownloadableItem]) -> String {
     }
 }
 
+/// The one backend `items` name, which their send goes to. Files of more
+/// than one backend, or none, are refused: a send goes to one backend.
+pub(crate) fn backend_of(items: &[DownloadableItem]) -> Result<&str, Failure> {
+    let mut ids = items.iter().map(|item| item.backend.as_str());
+    match ids.next() {
+        Some(first) if ids.all(|id| id == first) => Ok(first),
+        _ => Err(Failure::new(
+            FailureCode::InvalidInput,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            "The files to download must come from one download backend",
+        )),
+    }
+}
+
 /// The backend call that enqueues a request's files failed.
 fn queue_failed(e: &BackendError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))

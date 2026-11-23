@@ -4,8 +4,8 @@
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::acquire::{
-    alternates_from, enqueue_and_watch, manual_batch_label, numbered, prepare_target, Acquisition,
-    NewBatch,
+    alternates_from, backend_of, enqueue_and_watch, manual_batch_label, numbered, prepare_target,
+    Acquisition, NewBatch,
 };
 use crate::core::sources::{
     no_candidate_passed, start_stored, view, Candidate, CandidateView, SearchProgress, SearchRun,
@@ -664,18 +664,13 @@ impl Runner<'_> {
         false
     }
 
-    /// What the job's enqueue asks for: the backend, a batch of its own importing tracks as
-    /// singletons and an album whole (step 5 D1), skipping what the library has, and its slots'
-    /// current picks with the automatic candidates of its search as alternates. None when it has
-    /// no queued slot left.
+    /// What the job's enqueue asks for: the backend its picks name, a batch of its own
+    /// importing tracks as singletons and an album whole, skipping what the library has, and its
+    /// slots' current picks with the automatic candidates of its search as alternates. None when
+    /// it has no queued slot left.
     async fn request(
         &self,
     ) -> Result<Option<(Arc<dyn DownloadBackend>, NewBatch, Acquisition)>, Failure> {
-        let backend = (self.acquire.effects.backends())
-            .get(DEFAULT_DOWNLOAD_BACKEND)
-            .await
-            .map_err(|e| backend_unavailable_at(Stage::Enqueue, &e))?;
-        let target = prepare_target(&self.job.folder).await?;
         let items = store::queued_picks(&self.acquire.db, &self.job.id)
             .await
             .map_err(|e| database_failure(Stage::Enqueue, e))?;
@@ -683,10 +678,16 @@ impl Runner<'_> {
             return Ok(None);
         }
         let picked: Vec<DownloadableItem> = items.iter().map(|(_, item)| item.clone()).collect();
+        let routed = backend_of(&picked)?.to_string();
+        let backend = (self.acquire.effects.backends())
+            .get(&routed)
+            .await
+            .map_err(|e| backend_unavailable_at(Stage::Enqueue, &e))?;
+        let target = prepare_target(&self.job.folder).await?;
         let fresh = NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
             label: manual_batch_label(&picked),
-            backend: DEFAULT_DOWNLOAD_BACKEND.to_string(),
+            backend: routed,
             target,
             import_mode: match self.job.kind {
                 JobKind::Track => ImportMode::Singleton,

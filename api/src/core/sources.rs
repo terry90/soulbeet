@@ -958,7 +958,9 @@ mod tests {
     use crate::auth::UserId;
     use crate::core::test_ctx;
     use crate::ledger::{Ledger, NewSearch};
-    use crate::server_fns::download::test_support::{group, item, search_result, StubBackend};
+    use crate::server_fns::download::test_support::{
+        group, item, item_on, search_result, StubBackend,
+    };
     use shared::download::{DownloadableItem, FileFacts};
     use shared::failure::UserActionCode;
     use soulbeet::error::{MissingSetting, SoulseekError};
@@ -1323,27 +1325,30 @@ mod tests {
     // Paused: every poll waits SEARCH_POLL_INTERVAL first.
     #[tokio::test(start_paused = true)]
     async fn search_ranked_puts_the_best_group_of_every_backend_first() {
-        let found =
-            |peer: &str, score| vec![group(peer, vec![item(peer, "Wake Up", "a.flac")], score)];
+        // Each backend stamps its own id on the files it finds.
+        let found = |backend: &str, peer: &str, score| {
+            let items = vec![item_on(backend, peer, "Wake Up", "a.flac")];
+            vec![group(peer, items, score)]
+        };
         let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
         a.script_polls(vec![Ok(search_result(
             "search",
             SearchState::Completed,
-            found("peer_a", 0.5),
+            found("a", "peer_a", 0.5),
         ))]);
         b.script_polls(vec![Ok(search_result(
             "search",
             SearchState::Completed,
-            found("peer_b", 0.9),
+            found("b", "peer_b", 0.9),
         ))]);
         let first: Searched = ("a".into(), a as Arc<dyn DownloadBackend>);
         let rest: Vec<Searched> = vec![("b".into(), b as Arc<dyn DownloadBackend>)];
         let groups = search_ranked(&first, &rest, None, &[]).await.unwrap();
-        let ranked: Vec<(&str, f64)> = groups
+        let ranked: Vec<(&str, f64, &str)> = groups
             .iter()
-            .map(|g| (g.source.as_str(), g.score))
+            .map(|g| (g.source.as_str(), g.score, g.items[0].backend.as_str()))
             .collect();
-        assert_eq!(ranked, vec![("peer_b", 0.9), ("peer_a", 0.5)]);
+        assert_eq!(ranked, vec![("peer_b", 0.9, "b"), ("peer_a", 0.5, "a")]);
     }
 
     #[tokio::test(start_paused = true)]

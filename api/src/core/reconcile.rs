@@ -30,7 +30,7 @@ use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
-use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
+use crate::services::{download_backend, Registry, DEFAULT_DOWNLOAD_BACKEND};
 use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner, TransferRegistry};
 use async_trait::async_trait;
 use shared::download::{
@@ -350,6 +350,7 @@ impl Resume for Live {
                     folder,
                     query,
                     backends,
+                    &Registry,
                     run,
                 ));
             }

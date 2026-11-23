@@ -42,6 +42,14 @@ pub fn item(source: &str, title: &str, id: &str) -> DownloadableItem {
     }
 }
 
+/// `item(source, title, id)` on the backend registered as `backend`.
+pub fn item_on(backend: &str, source: &str, title: &str, id: &str) -> DownloadableItem {
+    DownloadableItem {
+        backend: backend.to_string(),
+        ..item(source, title, id)
+    }
+}
+
 /// A wanted track with only its artist and title.
 pub fn track(artist: &str, title: &str) -> Track {
     Track {
