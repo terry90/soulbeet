@@ -10,10 +10,9 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 #[cfg(feature = "server")]
 use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
-    error::SoulseekError,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
-    DownloadBackend, MusicImporter, NavidromeClient,
+    BackendError, DownloadBackend, MusicImporter, NavidromeClient,
 };
 #[cfg(feature = "server")]
 use tokio::sync::RwLock;
@@ -63,12 +62,12 @@ pub fn available_importers() -> Vec<(&'static str, &'static str)> {
 /// Why `download_backend` has no backend to give. Its Display is the text
 /// the lookup always showed.
 #[cfg(feature = "server")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BackendLookupError {
     /// The backend's settings could not be read from Soulful's database.
     Settings(String),
     /// The backend refused its settings; its own error says what is wrong.
-    Backend(SoulseekError),
+    Backend(BackendError),
     /// No backend has this id.
     Unknown(String),
     /// The backend built for `id` goes by `named`, so nothing routed to `id` would reach it.
@@ -135,7 +134,7 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
                         })
                         .build()
                 })
-                .map_err(BackendLookupError::Backend)?;
+                .map_err(|e| BackendLookupError::Backend(e.into()))?;
 
             Ok(Arc::new(client))
         }

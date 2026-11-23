@@ -1,5 +1,6 @@
 use super::{processing, utils::WantedTrack, wildcard};
 use crate::{
+    backend_error::BackendResult,
     error::{MissingSetting, Result, SoulseekError},
     http::{resolve_docker_url, CircuitBreaker},
     slskd::models::{
@@ -1471,12 +1472,12 @@ impl crate::DownloadBackend for SoulseekClient {
         "Soulseek"
     }
 
-    async fn start_search(&self, spec: &SearchSpec) -> Result<String> {
+    async fn start_search(&self, spec: &SearchSpec) -> BackendResult<String> {
         let timeout = Duration::seconds(120);
-        self.start_search(spec.clone(), timeout).await
+        Ok(self.start_search(spec.clone(), timeout).await?)
     }
 
-    async fn poll_search(&self, search_id: &str) -> Result<shared::download::SearchResult> {
+    async fn poll_search(&self, search_id: &str) -> BackendResult<shared::download::SearchResult> {
         let poll = self.poll_search(search_id.to_string()).await?;
         Ok(shared::download::SearchResult {
             search_id: search_id.to_string(),
@@ -1496,7 +1497,7 @@ impl crate::DownloadBackend for SoulseekClient {
         items: Vec<shared::download::DownloadableItem>,
         destination: &str,
         request: &str,
-    ) -> Result<Vec<shared::download::QueuedDownload>> {
+    ) -> BackendResult<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()
             .filter_map(|item| item.to_slskd_track())
@@ -1509,7 +1510,7 @@ impl crate::DownloadBackend for SoulseekClient {
     async fn get_downloads_for(
         &self,
         sources: &[String],
-    ) -> Result<Vec<shared::download::DownloadProgress>> {
+    ) -> BackendResult<Vec<shared::download::DownloadProgress>> {
         let limit = self.retry_limit().await?;
         let entries = self.get_downloads_for_users(sources).await?;
         Ok(entries
@@ -1522,7 +1523,7 @@ impl crate::DownloadBackend for SoulseekClient {
         &self,
         source: &str,
         id: &str,
-    ) -> Result<Option<shared::download::DownloadProgress>> {
+    ) -> BackendResult<Option<shared::download::DownloadProgress>> {
         let limit = self.retry_limit().await?;
         Ok(self
             .get_download(source, id)
@@ -1530,20 +1531,25 @@ impl crate::DownloadBackend for SoulseekClient {
             .map(|e| e.into_progress(limit)))
     }
 
-    async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()> {
-        self.cancel_download(username, download_id, remove).await
+    async fn cancel_download(
+        &self,
+        username: &str,
+        download_id: &str,
+        remove: bool,
+    ) -> BackendResult<()> {
+        Ok(self.cancel_download(username, download_id, remove).await?)
     }
 
-    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>> {
-        self.get_place_in_queue(source, id).await
+    async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>> {
+        Ok(self.get_place_in_queue(source, id).await?)
     }
 
-    async fn source_status(&self, source: &str) -> Result<SourcePresence> {
-        self.get_user_presence(source).await
+    async fn source_status(&self, source: &str) -> BackendResult<SourcePresence> {
+        Ok(self.get_user_presence(source).await?)
     }
 
-    async fn stop_search(&self, search_id: &str) -> Result<()> {
-        self.stop_search(search_id).await
+    async fn stop_search(&self, search_id: &str) -> BackendResult<()> {
+        Ok(self.stop_search(search_id).await?)
     }
 
     async fn health_check(&self) -> std::result::Result<(), Failure> {

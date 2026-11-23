@@ -14,7 +14,7 @@ use shared::download::{
 use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
 use shared::metadata::{Album, Track};
 use shared::recommendation::normalize_for_matching;
-use soulbeet::error::PeerAsk;
+use soulbeet::PeerAsk;
 use soulbeet::{DownloadBackend, ImportedItem};
 
 use super::contract::{error_object, NextCall, ToolError};
@@ -321,7 +321,7 @@ pub(crate) fn unanswered(row: &DownloadProgress, failure: &Failure) -> Option<Li
 /// server for a presence.
 async fn answered<T>(
     ask: PeerAsk,
-    read: impl Future<Output = soulbeet::error::Result<T>>,
+    read: impl Future<Output = soulbeet::BackendResult<T>>,
 ) -> Result<T, Failure> {
     match tokio::time::timeout(LIVE_READ_WAIT, read).await {
         Ok(Ok(answer)) => Ok(answer),
@@ -1544,8 +1544,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_backend_that_does_not_answer_within_ten_seconds_is_answered_for_who_was_asked() {
-        use soulbeet::error::PeerAsk;
-        let never = || std::future::pending::<soulbeet::error::Result<Option<u32>>>();
+        use soulbeet::PeerAsk;
+        let never = || std::future::pending::<soulbeet::BackendResult<Option<u32>>>();
         for (ask, code) in [
             (
                 PeerAsk::QueuePosition,

@@ -13,7 +13,7 @@ use shared::download::{
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use shared::metadata::Track;
 use soulbeet::error::{Result as SoulResult, SoulseekError};
-use soulbeet::{DownloadBackend, ImportMode};
+use soulbeet::{BackendError, BackendFault, BackendResult, DownloadBackend, ImportMode, PeerAsk};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -135,8 +135,8 @@ pub enum ScriptedOutcome {
 pub struct StubBackend {
     id: &'static str,
     script: Mutex<Vec<ScriptedOutcome>>,
-    search_start: Mutex<Option<SoulseekError>>,
-    polls: Mutex<VecDeque<SoulResult<SearchResult>>>,
+    search_start: Mutex<Option<BackendError>>,
+    polls: Mutex<VecDeque<BackendResult<SearchResult>>>,
     cancelled: Mutex<Vec<Cancel>>,
     destinations: Mutex<Vec<String>>,
     requests: Mutex<Vec<String>>,
@@ -234,12 +234,15 @@ impl StubBackend {
 
     /// Makes `start_search` fail with `e`.
     pub fn fail_search_start(&self, e: SoulseekError) {
-        *self.search_start.lock().unwrap() = Some(e);
+        *self.search_start.lock().unwrap() = Some(e.into());
     }
 
     /// What `poll_search` answers, in order.
     pub fn script_polls(&self, polls: Vec<SoulResult<SearchResult>>) {
-        *self.polls.lock().unwrap() = polls.into();
+        *self.polls.lock().unwrap() = polls
+            .into_iter()
+            .map(|poll| poll.map_err(BackendError::from))
+            .collect();
     }
 
     /// What `queue_position` answers for every transfer; None until set.
@@ -316,6 +319,48 @@ pub fn search_result(
     }
 }
 
+/// A fault of a backend other than slskd. `unreadable` is what its
+/// `answer_unreadable` says.
+#[derive(Debug)]
+pub struct StubFault {
+    pub unreadable: bool,
+}
+
+impl std::fmt::Display for StubFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.unreadable {
+            "stub answer unreadable"
+        } else {
+            "stub unreachable"
+        })
+    }
+}
+
+impl BackendFault for StubFault {
+    fn failure(&self, stage: Stage, message: String) -> Failure {
+        let (code, retry) = if self.unreadable {
+            (
+                FailureCode::BackendResponseUnreadable,
+                RetryAdvice::NotRetryable,
+            )
+        } else {
+            (
+                FailureCode::BackendUnreachable,
+                RetryAdvice::SameSourceLater,
+            )
+        };
+        Failure::new(code, stage, retry, message)
+    }
+
+    fn ask_failure(&self, ask: PeerAsk, stage: Stage) -> Failure {
+        self.failure(stage, format!("stub could not answer {ask:?}"))
+    }
+
+    fn answer_unreadable(&self) -> bool {
+        self.unreadable
+    }
+}
+
 /// A transfer as the backend lists it.
 pub fn transfer(source: &str, filename: &str, id: &str, state: DownloadState) -> DownloadProgress {
     DownloadProgress::queued(id.to_string(), source.to_string(), filename.to_string(), 0)
@@ -330,7 +375,7 @@ impl DownloadBackend for StubBackend {
     fn name(&self) -> &'static str {
         "Stub"
     }
-    async fn start_search(&self, spec: &SearchSpec) -> SoulResult<String> {
+    async fn start_search(&self, spec: &SearchSpec) -> BackendResult<String> {
         self.specs.lock().unwrap().push(spec.clone());
         let hold = self.search_hold.lock().unwrap().clone();
         if let Some(hold) = hold {
@@ -342,7 +387,7 @@ impl DownloadBackend for StubBackend {
             None => Ok("search".to_string()),
         }
     }
-    async fn poll_search(&self, search_id: &str) -> SoulResult<SearchResult> {
+    async fn poll_search(&self, search_id: &str) -> BackendResult<SearchResult> {
         let next = self.polls.lock().unwrap().pop_front();
         next.unwrap_or_else(|| {
             Ok(search_result(
@@ -360,7 +405,7 @@ impl DownloadBackend for StubBackend {
         items: Vec<DownloadableItem>,
         destination: &str,
         request: &str,
-    ) -> SoulResult<Vec<QueuedDownload>> {
+    ) -> BackendResult<Vec<QueuedDownload>> {
         self.requests.lock().unwrap().push(request.to_string());
         let hold = self.hold.lock().unwrap().clone();
         if let Some(hold) = hold {
@@ -418,10 +463,11 @@ impl DownloadBackend for StubBackend {
             ScriptedOutcome::TransportError => Err(SoulseekError::InvalidResponse(
                 "batch enqueue response: expected value at line 1 column 1 (body 20 bytes)"
                     .to_string(),
-            )),
+            )
+            .into()),
         }
     }
-    async fn get_downloads_for(&self, sources: &[String]) -> SoulResult<Vec<DownloadProgress>> {
+    async fn get_downloads_for(&self, sources: &[String]) -> BackendResult<Vec<DownloadProgress>> {
         Ok(self
             .listing
             .lock()
@@ -431,7 +477,11 @@ impl DownloadBackend for StubBackend {
             .cloned()
             .collect())
     }
-    async fn get_download(&self, source: &str, id: &str) -> SoulResult<Option<DownloadProgress>> {
+    async fn get_download(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> BackendResult<Option<DownloadProgress>> {
         Ok(self
             .listing
             .lock()
@@ -440,7 +490,7 @@ impl DownloadBackend for StubBackend {
             .find(|t| t.source == source && t.id == id)
             .cloned())
     }
-    async fn cancel_download(&self, username: &str, id: &str, remove: bool) -> SoulResult<()> {
+    async fn cancel_download(&self, username: &str, id: &str, remove: bool) -> BackendResult<()> {
         self.cancelled.lock().unwrap().push(Cancel {
             peer: username.to_string(),
             id: id.to_string(),
@@ -448,20 +498,20 @@ impl DownloadBackend for StubBackend {
         });
         Ok(())
     }
-    async fn queue_position(&self, _source: &str, _id: &str) -> SoulResult<Option<u32>> {
+    async fn queue_position(&self, _source: &str, _id: &str) -> BackendResult<Option<u32>> {
         if let Some((status, message)) = self.queue_position_error.lock().unwrap().clone() {
-            return Err(SoulseekError::Api { status, message });
+            return Err(SoulseekError::Api { status, message }.into());
         }
         Ok(*self.queue_position.lock().unwrap())
     }
-    async fn source_status(&self, source: &str) -> SoulResult<SourcePresence> {
+    async fn source_status(&self, source: &str) -> BackendResult<SourcePresence> {
         self.presence_asked.lock().unwrap().push(source.to_string());
         if let Some((status, message)) = self.presence_error.lock().unwrap().clone() {
-            return Err(SoulseekError::Api { status, message });
+            return Err(SoulseekError::Api { status, message }.into());
         }
         Ok(*self.presence.lock().unwrap())
     }
-    async fn stop_search(&self, search_id: &str) -> SoulResult<()> {
+    async fn stop_search(&self, search_id: &str) -> BackendResult<()> {
         self.stopped_searches
             .lock()
             .unwrap()

@@ -1919,7 +1919,8 @@ mod tests {
         backend_unavailable(
             Stage::Transfer,
             &crate::services::BackendLookupError::Backend(
-                soulbeet::error::SoulseekError::NotConfigured(soulbeet::error::MissingSetting::Url),
+                soulbeet::error::SoulseekError::NotConfigured(soulbeet::error::MissingSetting::Url)
+                    .into(),
             ),
         )
     }

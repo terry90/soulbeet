@@ -7,8 +7,7 @@ use shared::download::{
     DownloadProgress, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
 };
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::error::{Result as SoulResult, SoulseekError};
-use soulbeet::DownloadBackend;
+use soulbeet::{BackendError, BackendResult, DownloadBackend};
 use std::sync::Arc;
 
 use super::failover::{alternates_for, item_index};
@@ -176,7 +175,7 @@ pub async fn enqueue_claimed(
     items: Vec<DownloadableItem>,
     batch: &BatchRef,
     request: &str,
-) -> SoulResult<Vec<QueuedDownload>> {
+) -> BackendResult<Vec<QueuedDownload>> {
     let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
     let answered = match backend.download(items, &batch.destination, request).await {
@@ -236,7 +235,7 @@ pub struct RequestEnqueue {
     pub watcher: Watcher,
     /// The backend call itself failed: `results` lacks the files sent in it,
     /// and their keys are released.
-    pub error: Option<SoulseekError>,
+    pub error: Option<BackendError>,
     /// Keys the same user is already downloading into another folder: that
     /// batch shows their rows, and they get no entry in `results`.
     pub elsewhere: Vec<TransferKey>,

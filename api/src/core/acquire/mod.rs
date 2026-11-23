@@ -31,8 +31,7 @@ use shared::download::{
     QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::error::SoulseekError;
-use soulbeet::{DownloadBackend, ImportMode};
+use soulbeet::{BackendError, DownloadBackend, ImportMode};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,7 +50,7 @@ pub(crate) fn manual_batch_label(items: &[DownloadableItem]) -> String {
 }
 
 /// The backend call that enqueues a request's files failed.
-fn queue_failed(e: &SoulseekError) -> Failure {
+fn queue_failed(e: &BackendError) -> Failure {
     e.failure(Stage::Enqueue, format!("Download queue failed: {e}"))
 }
 
@@ -541,6 +540,7 @@ mod tests {
     use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadQuery;
     use shared::failure::{Cause, Service};
+    use soulbeet::error::SoulseekError;
 
     /// A new batch importing into `target` in `running`'s import mode.
     fn new_batch_beside(running: &BatchRef, target: PathBuf) -> NewBatch {

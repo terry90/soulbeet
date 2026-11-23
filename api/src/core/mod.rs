@@ -162,7 +162,8 @@ mod tests {
 
     #[test]
     fn an_unavailable_backend_keeps_its_text_at_either_stage() {
-        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
+        let unset =
+            BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url).into());
         for stage in [Stage::SourceSearch, Stage::Enqueue] {
             let f = backend_unavailable(stage, &unset);
             assert_eq!(

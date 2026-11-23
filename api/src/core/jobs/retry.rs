@@ -8,8 +8,8 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadableItem, SourcePresence};
 use shared::failure::{cut_chars, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
-use soulbeet::error::PeerAsk;
 use soulbeet::ImportMode;
+use soulbeet::PeerAsk;
 
 use super::decide::in_download_folder;
 use super::runner::{fail_job, spawn_drive, Acquire};

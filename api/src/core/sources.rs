@@ -2054,7 +2054,8 @@ mod tests {
 
     #[test]
     fn no_backends_keeps_why_the_default_backend_was_unavailable() {
-        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
+        let unset =
+            BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url).into());
         let f = no_backends(&unset);
         assert_eq!(
             (f.code, f.stage, f.retry, f.message.as_str()),

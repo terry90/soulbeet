@@ -696,7 +696,8 @@ mod tests {
             )
         };
         // No slskd URL saved: a person sets it.
-        let unset = BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url));
+        let unset =
+            BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::Url).into());
         let error = document(&find(&effects, unset).await)["error"].clone();
         assert_eq!(
             (
@@ -712,10 +713,13 @@ mod tests {
         );
         assert_eq!(error["next"], json!([]));
         // slskd does not answer: the same call later.
-        let down = BackendLookupError::Backend(SoulseekError::Api {
-            status: 503,
-            message: "Connection failed: error sending request".into(),
-        });
+        let down = BackendLookupError::Backend(
+            SoulseekError::Api {
+                status: 503,
+                message: "Connection failed: error sending request".into(),
+            }
+            .into(),
+        );
         let error = document(&find(&effects, down).await)["error"].clone();
         assert_eq!(
             (error["code"].as_str(), error["retry"].as_str()),
