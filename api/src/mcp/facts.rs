@@ -30,7 +30,6 @@ use crate::core::sources::{self, Candidate, DroppedByFilter, SearchProgress};
 use crate::core::time;
 use crate::ledger::store::{AttemptRecord, StoredSearch};
 use crate::ledger::{JobKind, JobState, Replacement, ReplacementOutcome, SlotResult, StoredSpec};
-use crate::services::DEFAULT_DOWNLOAD_BACKEND;
 
 /// Peer or provider text as a result shows it: at most TEXT_MAX_CHARS characters as sent in JSON.
 fn cut(text: &str) -> String {
@@ -125,10 +124,10 @@ fn common_parent<'a>(mut ids: impl Iterator<Item = &'a str>) -> String {
 pub(crate) fn candidate_document(candidate: &Candidate, wanted: &DownloadQuery) -> Value {
     let group = &candidate.group;
     let mut doc = Map::new();
-    doc.insert("candidate_id".into(), json!(candidate.id));
-    doc.insert("backend".into(), json!(DEFAULT_DOWNLOAD_BACKEND));
-    doc.insert("source".into(), json!(cut(&group.source)));
     let first = group.items.first();
+    doc.insert("candidate_id".into(), json!(candidate.id));
+    doc.insert("backend".into(), json!(first.map(|i| &i.backend)));
+    doc.insert("source".into(), json!(cut(&group.source)));
     match group.items.as_slice() {
         [item] if wanted.album.is_none() => {
             doc.insert("download_scope".into(), json!("file"));
@@ -679,10 +678,15 @@ fn job_search_read(
 fn attempt_facts(slot: &SlotView, wanted: &DownloadQuery) -> Map<String, Value> {
     let row = shown_row(slot);
     let attempt = current_attempt(slot);
-    let mut facts = file_fields(attempt.and_then(|a| a.candidate.as_ref()), wanted);
+    let candidate = attempt.and_then(|a| a.candidate.as_ref());
+    let mut facts = file_fields(candidate, wanted);
     facts.insert("slot".into(), json!(slot.slot));
     facts.insert("attempt".into(), json!(attempt.map(|a| a.n)));
-    facts.insert("backend".into(), json!(DEFAULT_DOWNLOAD_BACKEND));
+    // An adopted transfer's attempt has no candidate: its row names the backend.
+    let backend = candidate
+        .map(|c| c.backend.as_str())
+        .or(row.and_then(|r| r.backend.as_deref()));
+    facts.insert("backend".into(), json!(backend));
     facts.insert("source".into(), json!(row.map(|r| cut(&r.source))));
     facts.insert("remote_file".into(), json!(row.map(|r| cut(&r.item))));
     facts.insert("bytes_done".into(), json!(row.map(|r| r.transferred)));
@@ -981,7 +985,7 @@ mod tests {
     };
     use crate::core::jobs::{untried, RetryMode};
     use crate::core::test_ctx;
-    use crate::server_fns::download::test_support::{group, item, track};
+    use crate::server_fns::download::test_support::{group, item, item_on, track};
     use shared::download::FileFacts;
 
     #[tokio::test]
@@ -1140,6 +1144,68 @@ mod tests {
             false,
         );
         assert_eq!(doc["slots"][0]["index"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_names_the_backend_of_its_file_else_that_of_its_row() {
+        use crate::core::jobs::test_support::{downloading_track_job_with, file_of};
+        use crate::ledger::JobEvent;
+        use crate::server_fns::download::test_support::batch_on;
+        use crate::services::DEFAULT_DOWNLOAD_BACKEND;
+        use shared::download::{DownloadProgress, JobSlot};
+
+        /// The attempt and backend the failure facts name for alice's track job of `title`,
+        /// whose second attempt (`candidate`, None for a transfer a restart adopted) failed in a
+        /// batch on `on`, its row written as the batch's monitor writes a transfer it gives up on.
+        async fn backend_named(
+            acq: &Acquire,
+            title: &str,
+            candidate: Option<DownloadableItem>,
+            on: &str,
+        ) -> (Value, Value) {
+            let job = downloading_track_job_with(acq, title, auto_options()).await;
+            let slot = JobSlot {
+                job: job.clone(),
+                slot: 0,
+            };
+            acq.ledger.record(JobEvent::Attempt {
+                slot: slot.clone(),
+                request: candidate.as_ref().map(|_| "r1".to_string()),
+                candidate: candidate.map(Box::new),
+            });
+            // Soulseek.NET's text for a peer that is not logged in (src/SoulseekClient.cs:3790).
+            let offline = Failure::new(
+                FailureCode::PeerOffline,
+                Stage::Transfer,
+                RetryAdvice::OtherSource,
+                "User peer_b appears to be offline",
+            );
+            let file = file_of("b", title);
+            let failed = DownloadProgress::failed("t-9".into(), "peer_b".into(), file, offline);
+            let row = batch_on(on, "Come Over").mark(failed).with_job(slot);
+            acq.ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: vec![row],
+            });
+            acq.ledger.settled().await;
+            let view = view_of(acq, &job).await;
+            let (untried, now) = (Untried::default(), ReadNow::default());
+            let doc = job_document(&view, &untried, Detail::Summary, &now, false);
+            assert_eq!(doc["state"], "failed", "{doc}");
+            let facts = &doc["failure"]["facts"];
+            (facts["attempt"].clone(), facts["backend"].clone())
+        }
+
+        let (acq, _) = Acquire::for_alice().await;
+        let adopted = backend_named(&acq, "Silent Night", None, DEFAULT_DOWNLOAD_BACKEND).await;
+        // No attempt is the adopted transfer's: only its row names the backend.
+        assert_eq!(adopted, (Value::Null, json!("slskd")));
+        let title = "The First Noel";
+        let on_b = item_on("b", "peer_b", title, &file_of("b", title));
+        assert_eq!(
+            backend_named(&acq, title, Some(on_b), "b").await,
+            (json!(2), json!("b"))
+        );
     }
 
     #[tokio::test]
@@ -1693,6 +1759,20 @@ mod tests {
         let declared = doc["backend_facts"]["declared_extension"].as_str().unwrap();
         assert!(declared.chars().count() <= TEXT_MAX_CHARS);
         assert!(doc.get("files").is_none() && doc.get("tracks_found").is_none());
+    }
+
+    #[test]
+    fn a_candidate_names_the_backend_its_files_are_on() {
+        let wanted = DownloadQuery::new(vec![track("Kowloon", "Wake Up")]);
+        let candidate = |items| Candidate {
+            id: "s1:0".into(),
+            group: group("peer_b", items, 0.8),
+            recent_failures: 0,
+        };
+        let on_b = candidate(vec![item_on("b", "peer_b", "Wake Up", "b\\01.flac")]);
+        assert_eq!(candidate_document(&on_b, &wanted)["backend"], json!("b"));
+        let empty = candidate(vec![]);
+        assert_eq!(candidate_document(&empty, &wanted)["backend"], Value::Null);
     }
 
     #[test]

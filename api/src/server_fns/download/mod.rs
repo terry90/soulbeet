@@ -282,9 +282,15 @@ pub struct CancelDownloadRequest {
 
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
-    crate::core::acquire::cancel(&auth.0, req.backend.as_deref(), &req.source, &req.id)
-        .await
-        .map_err(failure_error)
+    crate::core::acquire::cancel(
+        &auth.0,
+        &crate::services::Registry,
+        req.backend.as_deref(),
+        &req.source,
+        &req.id,
+    )
+    .await
+    .map_err(failure_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

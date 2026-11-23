@@ -456,10 +456,11 @@ impl BackendFault for StubFault {
     }
 }
 
-/// A transfer as the backend lists it.
+/// A transfer as the default backend lists it.
 pub fn transfer(source: &str, filename: &str, id: &str, state: DownloadState) -> DownloadProgress {
     DownloadProgress::queued(id.to_string(), source.to_string(), filename.to_string(), 0)
         .with_state(state)
+        .with_backend(DEFAULT_DOWNLOAD_BACKEND)
 }
 
 #[async_trait]

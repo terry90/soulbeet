@@ -46,7 +46,7 @@ use crate::core::{backend_unavailable_at, database_failure};
 use crate::import_queue::FileLeft;
 use crate::ledger::store::{last_change_of, JobRecord};
 use crate::ledger::{JobState, SlotResult};
-use crate::services::DEFAULT_DOWNLOAD_BACKEND;
+use crate::services::{BackendCache, Backends};
 
 const GET_JOBS_ARGS: &[&str] = &[
     "job_ids",
@@ -435,9 +435,9 @@ fn unknown_jobs(args: &Args, select: &JobSelect, unknown: Vec<String>) -> ToolEr
     }
 }
 
-/// What the full documents of `views` read now: the backend's answers about each running
-/// transfer, all asked at once, and the songs `ctx`'s Navidrome lists for each import beets found
-/// in the library.
+/// What the full documents of `views` read now: the answers of each running transfer's own
+/// backend about it (`ask_backends`), and the songs `ctx`'s Navidrome lists for each import beets
+/// found in the library.
 pub(crate) async fn read_now(
     acquire: &Acquire,
     navidrome: &dyn NavidromeOf,
@@ -455,26 +455,11 @@ pub(crate) async fn read_now(
                 })
         })
         .collect();
-    if !running.is_empty() {
-        let backend = (acquire.effects.backends())
-            .get(DEFAULT_DOWNLOAD_BACKEND)
-            .await;
-        let answers: Vec<Option<LiveFacts>> = match backend {
-            Ok(backend) => {
-                join_all(running.iter().map(|(_, _, row)| live_facts(&backend, row))).await
-            }
-            Err(e) => {
-                let f = backend_unavailable_at(Stage::Transfer, &e);
-                running
-                    .iter()
-                    .map(|(_, _, row)| unanswered(row, &f))
-                    .collect()
-            }
-        };
-        for ((i, slot, _), facts) in running.iter().zip(answers) {
-            if let Some(facts) = facts {
-                reads[*i].live.insert(*slot, facts);
-            }
+    let rows: Vec<&DownloadProgress> = running.iter().map(|(_, _, row)| *row).collect();
+    let answers = ask_backends(acquire.effects.backends(), &rows).await;
+    for ((i, slot, _), facts) in running.iter().zip(answers) {
+        if let Some(facts) = facts {
+            reads[*i].live.insert(*slot, facts);
         }
     }
     let found: Vec<(usize, u32, &[ImportedItem])> = (views.iter().enumerate())
@@ -509,6 +494,30 @@ pub(crate) async fn read_now(
         reads[*i].library.insert(*slot, songs);
     }
     reads
+}
+
+/// The answers about each of `rows`, all asked at once, each from the backend the row names
+/// (each backend looked up once); nothing for a row that names no backend.
+async fn ask_backends(
+    backends: &dyn Backends,
+    rows: &[&DownloadProgress],
+) -> Vec<Option<LiveFacts>> {
+    let mut cache = BackendCache::new(backends);
+    let mut found = Vec::with_capacity(rows.len());
+    for row in rows {
+        found.push(match row.backend.as_deref() {
+            Some(id) => Some(cache.get(id).await),
+            None => None,
+        });
+    }
+    join_all(rows.iter().zip(found).map(|(row, backend)| async move {
+        match backend {
+            Some(Ok(backend)) => live_facts(&backend, row).await,
+            Some(Err(e)) => unanswered(row, &backend_unavailable_at(Stage::Transfer, &e)),
+            None => None,
+        }
+    }))
+    .await
 }
 
 /// How long the library lookups of one call may take in all: with the backend's own answers
@@ -963,9 +972,11 @@ mod tests {
     use serde_json::{json, Value};
     use shared::download::{
         DownloadProgress, DownloadState, JobSlot, SearchResult, SearchState, SearchStats,
+        SourcePresence,
     };
     use soulbeet::ImportedItem;
 
+    use super::{ask_backends, LiveFacts};
     use crate::connection::test_util::{app_of, call_tool, document, jobs_app};
     use crate::core::folder_of;
     use crate::core::jobs::runner::drive;
@@ -976,7 +987,9 @@ mod tests {
     };
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, JobState};
-    use crate::server_fns::download::test_support::{search_result, transfer};
+    use crate::server_fns::download::test_support::{
+        search_result, transfer, StubBackend, StubBackends,
+    };
     use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
     #[tokio::test]
@@ -1033,6 +1046,54 @@ mod tests {
             json!([{"tool": "get_jobs", "args": {"job_ids": [job], "detail": "full",
                 "wait_seconds": 30, "wait_for": "any_change"}},
                 {"tool": "cancel_job", "args": {"job_id": job}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn each_running_transfer_is_asked_of_the_backend_its_row_names() {
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        a.set_queue_position(Some(4));
+        b.set_presence(SourcePresence::Offline);
+        let backends = StubBackends::default()
+            .with("a", a.clone())
+            .with("b", b.clone());
+        let queued_on_a = DownloadProgress {
+            queued_at_source: true,
+            ..transfer("peer_a", "a/01.flac", "t-1", DownloadState::Queued).with_backend("a")
+        };
+        let on_b =
+            transfer("peer_b", "b/01.flac", "t-2", DownloadState::InProgress).with_backend("b");
+        let also_on_a =
+            transfer("peer_c", "c/01.flac", "t-3", DownloadState::InProgress).with_backend("a");
+        let on_none = DownloadProgress {
+            backend: None,
+            ..transfer("peer_d", "d/01.flac", "t-4", DownloadState::InProgress)
+        };
+
+        let answers = ask_backends(&backends, &[&queued_on_a, &on_b, &also_on_a, &on_none]).await;
+
+        let facts = |queue_position, presence| {
+            Some(LiveFacts {
+                queue_position,
+                presence: Ok(presence),
+            })
+        };
+        assert_eq!(
+            answers,
+            vec![
+                facts(Some(Ok(Some(4))), SourcePresence::Online),
+                facts(None, SourcePresence::Offline),
+                facts(None, SourcePresence::Online),
+                None,
+            ]
+        );
+        assert_eq!(backends.asked(), ["a", "b"], "each backend looked up once");
+        assert_eq!(
+            (a.presence_asked(), b.presence_asked()),
+            (
+                vec!["peer_a".to_string(), "peer_c".to_string()],
+                vec!["peer_b".to_string()]
+            )
         );
     }
 
@@ -1784,7 +1845,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_retry_refused_for_an_offline_source_is_not_offered_again() {
-        use shared::download::SourcePresence;
         let (db, acq, effects, token) = jobs_app().await;
         // slskd's text for a peer whose upload queue is full, which says to retry the same peer
         // later (Application.cs:763-766).

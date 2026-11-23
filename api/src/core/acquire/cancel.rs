@@ -3,13 +3,11 @@
 use crate::auth::UserCtx;
 use crate::core::backend_unavailable;
 use crate::server_fns::download::enqueue::transfer_key;
-use crate::services::download_backend;
+use crate::services::Backends;
 use crate::transfer_registry::{TransferKey, TransferRegistry};
 use dioxus::logger::tracing::info;
 use shared::download::DownloadProgress;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::DownloadBackend;
-use std::sync::Arc;
 
 /// No transfer of the user's has that id on that peer.
 fn download_not_found() -> Failure {
@@ -36,29 +34,19 @@ fn cancel_key(
         .map(|row| transfer_key(backend, &row.source, &row.item))
 }
 
-/// Cancels the transfer the named backend, or the default one, lists under
-/// `transfer_id` from `source`, when one of `ctx`'s batches holds it. Its
-/// watcher stops it on its next poll: a monitor shows it Cancelled, and a
-/// discovery run moves the track on.
+/// Cancels the transfer `backend` lists under `transfer_id` from `source`,
+/// when one of `ctx`'s batches holds it. Its watcher stops it on its next
+/// poll: a monitor shows it Cancelled, and a discovery run moves the track on.
+/// A row that names no backend has no transfer to cancel.
 pub async fn cancel(
     ctx: &UserCtx,
+    backends: &dyn Backends,
     backend: Option<&str>,
     source: &str,
     transfer_id: &str,
 ) -> Result<(), Failure> {
-    let backend = download_backend(backend)
-        .await
-        .map_err(|e| backend_unavailable(Stage::Transfer, &e))?;
-    cancel_on(ctx, &backend, source, transfer_id).await
-}
-
-/// `cancel` on `backend`.
-async fn cancel_on(
-    ctx: &UserCtx,
-    backend: &Arc<dyn DownloadBackend>,
-    source: &str,
-    transfer_id: &str,
-) -> Result<(), Failure> {
+    let id = backend.ok_or_else(download_not_found)?;
+    let backend = (backends.get(id).await).map_err(|e| backend_unavailable(Stage::Transfer, &e))?;
     // The key comes from the transfer the backend lists under that id, never
     // from text the client sends, so a user cannot pair their own file with
     // another user's transfer id on the same peer.
@@ -80,7 +68,11 @@ async fn cancel_on(
 mod tests {
     use super::super::test_support::{ctx_of, own_ctx};
     use super::*;
-    use crate::server_fns::download::test_support::{batch, transfer, StubBackend};
+    use crate::server_fns::download::test_support::{
+        batch, batch_on, transfer, StubBackend, StubBackends,
+    };
+    use crate::services::DEFAULT_DOWNLOAD_BACKEND;
+    use soulbeet::DownloadBackend;
 
     fn listed() -> Vec<DownloadProgress> {
         vec![transfer(
@@ -109,24 +101,67 @@ mod tests {
     async fn another_users_transfer_id_cannot_be_cancelled() {
         let stub = StubBackend::new(vec![]);
         stub.set_listing(listed());
-        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let backends = StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub.clone());
         let theirs = batch("Come Over");
-        let held = transfer_key(backend.id(), "peer_a", "Music\\A\\01.flac");
+        let held = transfer_key(stub.id(), "peer_a", "Music\\A\\01.flac");
         let registry = TransferRegistry::global();
         registry.claim(std::slice::from_ref(&held), &theirs);
+        let on_default = Some(DEFAULT_DOWNLOAD_BACKEND);
 
         assert_eq!(
-            cancel_on(&own_ctx(), &backend, "peer_a", "t-1").await,
+            cancel(&own_ctx(), &backends, on_default, "peer_a", "t-1").await,
             Err(download_not_found())
         );
         assert!(!registry.is_cancelled(&held, &theirs.owner));
 
         assert_eq!(
-            cancel_on(&ctx_of(&theirs), &backend, "peer_a", "t-1").await,
+            cancel(&ctx_of(&theirs), &backends, on_default, "peer_a", "t-1").await,
             Ok(())
         );
         assert!(registry.is_cancelled(&held, &theirs.owner));
         assert!(stub.cancelled().is_empty(), "its watcher stops it");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_goes_to_the_backend_its_row_names() {
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        b.set_listing(listed());
+        let backends = StubBackends::default()
+            .with("a", a.clone())
+            .with("b", b.clone());
+        let theirs = batch_on("b", "Come Over");
+        let held = transfer_key(b.id(), "peer_a", "Music\\A\\01.flac");
+        let registry = TransferRegistry::global();
+        registry.claim(std::slice::from_ref(&held), &theirs);
+
+        assert_eq!(
+            cancel(&ctx_of(&theirs), &backends, Some("b"), "peer_a", "t-1").await,
+            Ok(())
+        );
+        assert!(registry.is_cancelled(&held, &theirs.owner));
+        assert_eq!(
+            (a.listings(), b.listings()),
+            (vec![], vec![vec!["peer_a".to_string()]])
+        );
+        assert_eq!(backends.asked(), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_names_no_backend_is_not_found_and_asks_none() {
+        let stub = StubBackend::new(vec![]);
+        stub.set_listing(listed());
+        let backends = StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub.clone());
+        let theirs = batch("Come Over");
+        let held = transfer_key(stub.id(), "peer_a", "Music\\A\\01.flac");
+        TransferRegistry::global().claim(std::slice::from_ref(&held), &theirs);
+
+        assert_eq!(
+            cancel(&ctx_of(&theirs), &backends, None, "peer_a", "t-1").await,
+            Err(download_not_found())
+        );
+        assert!(backends.asked().is_empty());
+        assert!(stub.listings().is_empty());
+        assert!(!TransferRegistry::global().is_cancelled(&held, &theirs.owner));
     }
 
     #[test]
