@@ -123,6 +123,17 @@ html {
     @apply text-sm md:text-base;
 }
 
+/* Safari on iOS zooms the page into a field under 16px when it takes focus,
+   and below md the root is 14px. Outside any layer, so a text-sm or text-xs
+   class on a field cannot undo it. */
+input:not([type="checkbox"], [type="radio"]),
+select,
+textarea {
+    @variant max-md {
+        font-size: 16px;
+    }
+}
+
 /* Base Styles */
 body {
     @apply bg-beet-dark text-white min-h-screen overflow-hidden font-display;

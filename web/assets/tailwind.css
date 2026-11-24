@@ -16,7 +16,6 @@
     --color-red-900: oklch(39.6% 0.141 25.723);
     --color-orange-300: oklch(83.7% 0.128 66.29);
     --color-orange-500: oklch(70.5% 0.213 47.604);
-    --color-amber-400: oklch(82.8% 0.189 84.429);
     --color-amber-500: oklch(76.9% 0.188 70.08);
     --color-amber-800: oklch(47.3% 0.137 46.201);
     --color-yellow-300: oklch(90.5% 0.182 98.111);
@@ -2260,6 +2259,11 @@ html {
   @media (width >= 48rem) {
     font-size: var(--text-base);
     line-height: var(--tw-leading, var(--text-base--line-height));
+  }
+}
+@media (width < 48rem) {
+  input:not([type="checkbox"], [type="radio"]), select, textarea {
+    font-size: 16px;
   }
 }
 body {
