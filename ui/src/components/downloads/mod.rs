@@ -121,14 +121,20 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
 
     let close_modal = move |_| props.is_open.set(false);
 
-    let (modal_opacity, panel_translate, pointer_events) = if (*props.is_open)() {
-        ("opacity-100", "translate-x-0", "pointer-events-auto")
+    let open = (*props.is_open)();
+    // Closed, it turns hidden once the fade ends, so browsers neither paint
+    // nor composite it, and inert right away, so clicks, keys and screen
+    // readers pass it by while it fades.
+    let (modal_opacity, panel_translate, visibility) = if open {
+        ("opacity-100", "translate-x-0", "visible")
     } else {
-        ("opacity-0", "translate-x-full", "pointer-events-none")
+        ("opacity-0", "translate-x-full", "invisible")
     };
 
     rsx! {
-      div { class: "fixed inset-0 z-50 flex justify-end transition-opacity duration-200 ease-out {modal_opacity} {pointer_events}",
+      div {
+        class: "fixed inset-0 z-50 flex justify-end transition-[opacity,visibility] duration-200 ease-out {modal_opacity} {visibility}",
+        "inert": (!open).then_some(true),
         // Backdrop
         div {
           class: "absolute inset-0 bg-black/60 backdrop-blur-sm cursor-pointer",
@@ -267,6 +273,35 @@ mod tests {
         let p =
             DownloadProgress::queued(item.into(), "peer".into(), item.into(), 1).with_state(state);
         (item.to_string(), p)
+    }
+
+    /// The drawer's outer element as the server renders it.
+    fn drawer(open: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |open: bool| {
+                let is_open = use_signal(|| open);
+                let downloads = use_signal(HashMap::new);
+                rsx! { Downloads { is_open, downloads } }
+            },
+            open,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        html[..html.find('>').unwrap()].to_string()
+    }
+
+    #[test]
+    fn a_closed_drawer_is_hidden_and_inert_once_its_fade_ends() {
+        let closed = drawer(false);
+        assert!(closed.contains(" inert=true"), "{closed}");
+        assert!(closed.contains(" invisible"), "{closed}");
+        assert!(
+            closed.contains("transition-[opacity,visibility]"),
+            "{closed}"
+        );
+        let open = drawer(true);
+        assert!(!open.contains("inert"), "{open}");
+        assert!(!open.contains("invisible"), "{open}");
     }
 
     #[test]
