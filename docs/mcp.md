@@ -302,7 +302,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Music metadata
 
-- `search_music`: searches MusicBrainz for recordings, releases or artists, to check that a recording exists and get its ids.
+- `search_music`: searches MusicBrainz for recordings, releases or artists, to check that a recording exists and get its ids. With kind `release`, an `artist` and no `query` (or `*`), it lists that artist's albums and EPs, studio albums first and each part oldest first, and names in `other_artists` the other artists of that name; pass one's `mbid` as `artist_mbid` to list theirs.
 - `get_release`: a release with its tracks, by MusicBrainz release id.
 - `get_recording_releases`: a recording and the releases it appears on, to tell a studio album from a compilation or a live record.
 
