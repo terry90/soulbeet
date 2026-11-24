@@ -99,6 +99,18 @@
         }
     }
 
+    /* A light that runs along a seam between two rows while something
+       loads. Without motion it rests as a still line across the seam. */
+    .seam-light {
+        background: linear-gradient(90deg, transparent, var(--color-beet-accent), var(--color-beet-leaf), transparent) no-repeat;
+        background-size: 40% 100%;
+        animation: seam-sweep 1.4s ease-in-out infinite;
+        @variant motion-reduce {
+            animation: none;
+            background-size: 100% 100%;
+        }
+    }
+
     .nav-link {
         @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
     }
@@ -132,6 +144,11 @@ textarea {
     @variant max-md {
         font-size: 16px;
     }
+}
+
+@keyframes seam-sweep {
+    from { background-position: -60% 0; }
+    to { background-position: 160% 0; }
 }
 
 /* Base Styles */

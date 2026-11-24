@@ -11,21 +11,10 @@ pub struct FolderChipProps {
     pub active_menu: Signal<Option<String>>,
 }
 
-fn truncate_name(name: &str, max: usize) -> String {
-    // Truncate on a *char* boundary, never a byte boundary: slicing `&name[..max]`
-    // on a byte index that falls inside a multi-byte UTF-8 char (accented or
-    // non-Latin usernames/folders) panics, which in wasm32 lowers to an
-    // `unreachable` that aborts the whole module (see issue #68).
-    if name.chars().count() > max {
-        let truncated: String = name.chars().take(max).collect();
-        format!("{truncated}...")
-    } else {
-        name.to_string()
-    }
-}
-
 const MENU_ID: &str = "__folder_chip__";
 
+/// The folder downloads go to, which opens a menu to pick another. It sits
+/// at the right end of a row, and a long name ends in an ellipsis.
 #[component]
 pub fn FolderChip(props: FolderChipProps) -> Element {
     let folders = &props.folders;
@@ -39,24 +28,26 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
         .as_ref()
         .and_then(|fid| folders.iter().find(|f| f.id == *fid).cloned());
 
-    let (chip_text, needs_attention) = if let Some(ref folder) = selected_folder {
-        (truncate_name(&folder.name, 14), false)
-    } else {
-        ("Select folder".to_string(), true)
+    let (chip_text, needs_attention) = match selected_folder {
+        Some(folder) => (folder.name, false),
+        None => ("Select folder".to_string(), true),
     };
 
-    let chip_class = if is_open {
-        "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono rounded-md transition-all duration-200 cursor-pointer bg-white/10 border border-white/10 text-white mr-2"
+    let pill_class = if is_open {
+        "bg-white/10 border-white/10 text-white"
     } else if needs_attention {
-        "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono rounded-md transition-all duration-200 cursor-pointer bg-white/5 border border-yellow-500/30 text-yellow-400 hover:bg-white/10 hover:text-yellow-300 mr-2"
+        "bg-white/5 border-yellow-500/30 text-yellow-400 group-hover/chip:bg-white/10 group-hover/chip:text-yellow-300"
     } else {
-        "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono rounded-md transition-all duration-200 cursor-pointer bg-white/5 border border-white/5 text-gray-300 hover:bg-white/10 hover:text-white mr-2"
+        "bg-white/5 border-white/5 text-gray-300 group-hover/chip:bg-white/10 group-hover/chip:text-white"
     };
 
     rsx! {
-        div { class: "relative",
+        div { class: "relative ml-auto flex min-w-0",
             button {
-                class: "{chip_class}",
+                class: "group/chip flex items-center min-w-0 max-w-full h-[44px] px-[2px] font-mono text-[12px] cursor-pointer focus-visible:outline-none",
+                r#type: "button",
+                title: "{chip_text}",
+                aria_expanded: is_open,
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
                     if is_open {
@@ -65,19 +56,37 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                         active_menu.set(Some(MENU_ID.to_string()));
                     }
                 },
-                svg {
-                    class: "w-3.5 h-3.5 opacity-70",
-                    fill: "none",
-                    stroke: "currentColor",
-                    stroke_width: "1.5",
-                    view_box: "0 0 24 24",
-                    path {
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                        d: "M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z",
+                span { class: "flex items-center gap-[6px] min-w-0 px-[8px] py-[5px] rounded-md border transition-colors duration-200 group-focus-visible/chip:outline-2 group-focus-visible/chip:outline-offset-1 group-focus-visible/chip:outline-beet-leaf {pill_class}",
+                    svg {
+                        class: "size-[14px] flex-none opacity-70",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "1.5",
+                        view_box: "0 0 24 24",
+                        "aria-hidden": "true",
+                        path {
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            d: "M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z",
+                        }
+                    }
+                    span { class: "sr-only", "Download folder: " }
+                    span { class: "min-w-0 truncate", "{chip_text}" }
+                    // The narrowest phones give its room to the name.
+                    svg {
+                        class: "size-[12px] flex-none opacity-60 max-[399px]:hidden",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        view_box: "0 0 24 24",
+                        "aria-hidden": "true",
+                        path {
+                            stroke_linecap: "round",
+                            stroke_linejoin: "round",
+                            d: "M6 9l6 6 6-6",
+                        }
                     }
                 }
-                "{chip_text}"
             }
 
             if is_open {
@@ -88,7 +97,7 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                         active_menu.set(None);
                         on_folder_change.call(folder);
                     },
-                    align: "left",
+                    align: "right",
                 }
             }
         }
@@ -96,27 +105,50 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::truncate_name;
+pub(super) mod tests {
+    use super::*;
+    use crate::opening_tag;
 
-    #[test]
-    fn does_not_panic_on_multibyte_utf8() {
-        // "Café Música": é/ú are 2-byte chars. Truncating at a byte count that
-        // lands inside a multi-byte char must not panic (issue #68 — the old
-        // `&name[..max]` byte slice did, and in wasm that aborts the module).
-        let name = "Café Música 音楽ライブラリ";
-        // exercise char counts both above and below the limit
-        let short = truncate_name(name, 4);
-        let long = truncate_name(name, 40);
-        assert!(short.ends_with("..."));
-        assert_eq!(long, name);
-        // every output must be valid char-boundary strings
-        assert_eq!(short.trim_end_matches('.').chars().count(), 4);
+    pub(crate) fn folder(id: &str, name: &str) -> Folder {
+        Folder {
+            id: id.to_string(),
+            user_id: "u".to_string(),
+            name: name.to_string(),
+            path: format!("/music/{id}"),
+            shared: false,
+        }
     }
 
     #[test]
-    fn ascii_truncation_unchanged() {
-        assert_eq!(truncate_name("Hello world", 5), "Hello...");
-        assert_eq!(truncate_name("Hello", 5), "Hello");
+    fn a_long_name_is_whole_in_the_page_and_names_the_chip() {
+        let mut dom = VirtualDom::new(|| {
+            let selected_folder_id = use_signal(|| Some("b".to_string()));
+            let active_menu = use_signal(|| None);
+            rsx! {
+                FolderChip {
+                    folders: vec![folder("a", "Vinyl rips"), folder("b", "Lossless archive from the old NAS")],
+                    selected_folder_id,
+                    on_folder_change: |_| {},
+                    active_menu,
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        // Cut short by the layout alone, with an ellipsis.
+        assert!(
+            html.contains(
+                "<span class=\"min-w-0 truncate\">Lossless archive from the old NAS</span>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"sr-only\">Download folder: </span>"),
+            "{html}"
+        );
+        let button = opening_tag(&html, "group/chip");
+        assert!(button.contains("type=\"button\""), "{button}");
+        assert!(button.contains("aria-expanded=false"), "{button}");
+        assert!(button.contains("h-[44px]"), "{button}");
     }
 }

@@ -13,7 +13,9 @@ mod inline_track_panel;
 mod inline_track_row;
 
 mod folder_chip;
-use folder_chip::FolderChip;
+
+mod search_bar;
+use search_bar::SearchBar;
 
 use api::models::folder::Folder;
 use dioxus::logger::tracing::{info, warn};
@@ -29,9 +31,7 @@ use track::TrackResult;
 
 use crate::search::album::AlbumResult;
 use crate::settings_context::use_settings;
-use crate::{
-    use_auth, use_system_health, BackgroundGlows, Button, GlowColor, GlowSpread, SystemStatus,
-};
+use crate::{use_auth, use_system_health, BackgroundGlows, GlowColor, GlowSpread, SystemStatus};
 
 mod download_results;
 use download_results::DownloadResults;
@@ -40,7 +40,7 @@ mod toast;
 use toast::{FallbackToast, FallbackToastData};
 
 mod search_type_toggle;
-use search_type_toggle::{SearchType, SearchTypeToggle};
+use search_type_toggle::SearchType;
 
 /// The sources a search found, to pick files from, and the search a pick
 /// names.
@@ -65,6 +65,7 @@ pub fn Search() -> Element {
     let mut search_results = use_signal::<Option<Vec<SearchResult>>>(|| None);
     let mut search = use_signal(String::new);
     let mut artist = use_signal::<Option<String>>(|| None);
+    let mut artist_open = use_signal(|| false);
     let mut search_type = use_signal(|| settings.last_search_type());
     let mut loading = use_signal(|| false);
     let mut expanded_albums = use_signal::<HashSet<String>>(HashSet::new);
@@ -134,6 +135,7 @@ pub fn Search() -> Element {
                 search_results.set(None);
                 search.set(String::new());
                 artist.set(None);
+                artist_open.set(false);
                 expanded_albums.write().clear();
                 album_cache.write().clear();
                 loading.set(false);
@@ -647,105 +649,22 @@ pub fn Search() -> Element {
           }
         }
 
-        // Search bar
-        div { class: "w-full relative group",
-
-          div { class: "absolute -inset-1 bg-gradient-to-r from-beet-accent to-beet-leaf rounded-t-lg rounded-b-0 md:rounded-b-lg blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200" }
-          div { class: "relative flex items-center bg-beet-dark border border-white/10 rounded-t-lg rounded-b-0 md:rounded-b-lg p-2 shadow-2xl",
-            div { class: "pl-4 pr-2 text-gray-500",
-              svg {
-                class: "w-6 h-6",
-                fill: "none",
-                stroke: "currentColor",
-                view_box: "0 0 24 24",
-                path {
-                  stroke_linecap: "round",
-                  stroke_linejoin: "round",
-                  stroke_width: "2",
-                  d: "M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z",
-                }
-              }
-            }
-            input {
-              "type": "text",
-              value: "{search}",
-              class: "w-2/3 bg-transparent border-none focus:ring-0 text-white text-sm placeholder-gray-600 font-mono h-10 focus:outline-none",
-              placeholder: "Search artist, album or track...",
-              oninput: move |event| search.set(event.value()),
-              onkeydown: move |event| {
-                  if event.key() == Key::Enter {
-                      spawn(perform_search());
-                  }
-              },
-            }
-
-            div { class: "hidden md:flex h-8 w-px bg-white/10 mx-2" }
-            input {
-              "type": "text",
-              value: "{artist.read().clone().unwrap_or_default()}",
-              class: "hidden md:flex w-1/3 bg-transparent border-none focus:ring-0 text-gray-400 text-sm placeholder-gray-700 font-mono h-10 focus:outline-none",
-              placeholder: "Artist (opt)",
-              oninput: move |event| {
-                  let val = event.value();
-                  if val.is_empty() { artist.set(None) } else { artist.set(Some(val)) }
-              },
-              onkeydown: move |event| {
-                  if event.key() == Key::Enter {
-                      spawn(perform_search());
-                  }
-              },
-            }
-            div { class: "hidden md:flex items-center",
-              if folders.read().len() > 1 {
-                FolderChip {
-                  folders: folders.read().clone(),
-                  selected_folder_id,
-                  on_folder_change: handle_folder_change,
-                  active_menu,
-                }
-              }
-              SearchTypeToggle { search_type }
-              Button {
-                class: "rounded ml-2 whitespace-nowrap",
-                disabled: loading() || search.read().is_empty(),
-                onclick: move |_| {
-                    spawn(perform_search());
-                },
-                "SEARCH"
-              }
-            }
-          }
-          // Mobile search bar
-          div { class: "md:hidden relative flex items-center bg-beet-dark border border-t-0 md:border-t border-white/10 rounded-b-lg rounded-t-0 md:rounded-t-lg p-2 shadow-2xl",
-            input {
-              "type": "text",
-              value: "{artist.read().clone().unwrap_or_default()}",
-              class: "w-full pl-4 bg-transparent border-none focus:ring-0 text-gray-400 text-sm placeholder-gray-700 font-mono h-10 focus:outline-none",
-              placeholder: "Artist (opt)",
-              oninput: move |event| {
-                  let val = event.value();
-                  if val.is_empty() { artist.set(None) } else { artist.set(Some(val)) }
-              },
-              onkeydown: move |event| {
-                  if event.key() == Key::Enter {
-                      spawn(perform_search());
-                  }
-              },
-            }
-
-            SearchTypeToggle { search_type }
-
-            Button {
-              class: "rounded ml-2 whitespace-nowrap",
-              disabled: loading() || search.read().is_empty(),
-              onclick: move |_| {
-                  spawn(perform_search());
-              },
-              "SEARCH"
-            }
+        div { class: "w-full",
+          SearchBar {
+            search,
+            artist,
+            artist_open,
+            search_type,
+            loading: loading(),
+            folders: folders.read().clone(),
+            selected_folder_id,
+            on_folder_change: handle_folder_change,
+            active_menu,
+            on_search: move |_| {
+                spawn(perform_search());
+            },
           }
         }
-
 
         SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
 

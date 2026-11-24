@@ -13,6 +13,9 @@ pub enum FieldLook {
     Compact,
     /// The login form's larger field that glows on focus.
     Login,
+    /// A borderless field that fills a row of the search bar. Its text
+    /// colour comes from the added classes.
+    Bar,
 }
 
 impl FieldLook {
@@ -21,6 +24,28 @@ impl FieldLook {
             FieldLook::Form => FIELD_CLASS,
             FieldLook::Compact => "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
             FieldLook::Login => "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
+            FieldLook::Bar => "flex-1 min-w-0 h-[44px] p-0 bg-transparent border-0 rounded-none outline-none appearance-none font-mono text-base placeholder:text-gray-600 [&::-webkit-search-cancel-button]:appearance-none",
+        }
+    }
+}
+
+/// What kind of text a field takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum FieldKind {
+    #[default]
+    Text,
+    /// Hides what is typed.
+    Password,
+    /// Words to search for.
+    Search,
+}
+
+impl FieldKind {
+    fn input_type(self) -> &'static str {
+        match self {
+            FieldKind::Text => "text",
+            FieldKind::Password => "password",
+            FieldKind::Search => "search",
         }
     }
 }
@@ -81,12 +106,16 @@ pub struct TextInputProps {
     /// Names the field for screen readers when no label element does.
     #[props(default, into)]
     pub aria_label: Option<String>,
-    /// Hides what is typed.
     #[props(default)]
-    pub password: bool,
+    pub kind: FieldKind,
+    /// What the Enter key on a phone keyboard says, such as "search".
+    #[props(default)]
+    pub enterkeyhint: Option<&'static str>,
     /// Runs when Enter is pressed in the field.
     #[props(default)]
     pub on_enter: Option<EventHandler>,
+    #[props(default)]
+    pub onmounted: Option<EventHandler<MountedEvent>>,
     #[props(default)]
     pub look: FieldLook,
     /// Classes added to the look's own.
@@ -99,6 +128,7 @@ pub struct TextInputProps {
 pub fn TextInput(props: TextInputProps) -> Element {
     let oninput = props.oninput;
     let on_enter = props.on_enter;
+    let onmounted = props.onmounted;
     let class = match props.class.is_empty() {
         true => props.look.class().to_string(),
         false => format!("{} {}", props.look.class(), props.class),
@@ -108,7 +138,8 @@ pub fn TextInput(props: TextInputProps) -> Element {
             class,
             id: props.id,
             name: props.name,
-            r#type: if props.password { "password" } else { "text" },
+            r#type: props.kind.input_type(),
+            enterkeyhint: props.enterkeyhint,
             autocomplete: props.autofill.map(Autofill::token),
             placeholder: props.placeholder,
             aria_label: props.aria_label,
@@ -123,6 +154,11 @@ pub fn TextInput(props: TextInputProps) -> Element {
                     on_enter.call(());
                 }
             },
+            onmounted: move |evt: MountedEvent| {
+                if let Some(onmounted) = onmounted {
+                    onmounted.call(evt);
+                }
+            },
         }
     }
 }
@@ -131,21 +167,21 @@ pub fn TextInput(props: TextInputProps) -> Element {
 mod tests {
     use super::*;
 
-    fn render(password: bool, aria_label: Option<&'static str>) -> String {
+    fn render(kind: FieldKind, aria_label: Option<&'static str>) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(password, aria_label): (bool, Option<&'static str>)| {
+            |(kind, aria_label): (FieldKind, Option<&'static str>)| {
                 rsx! {
                     TextInput {
                         value: "typed",
                         oninput: |_| {},
                         placeholder: "Username",
                         aria_label: aria_label.map(str::to_string),
-                        password,
+                        kind,
                         class: "text-sm",
                     }
                 }
             },
-            (password, aria_label),
+            (kind, aria_label),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -153,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_field_has_the_shared_look_plus_its_own_classes() {
-        let html = render(false, None);
+        let html = render(FieldKind::Text, None);
         assert!(
             html.contains(&format!("class=\"{FIELD_CLASS} text-sm\"")),
             "{html}"
@@ -165,6 +201,7 @@ mod tests {
         assert!(!html.contains("id="), "{html}");
         assert!(!html.contains("name="), "{html}");
         assert!(!html.contains("autocomplete"), "{html}");
+        assert!(!html.contains("enterkeyhint"), "{html}");
     }
 
     #[test]
@@ -176,7 +213,7 @@ mod tests {
                     name: "secret",
                     autofill: Autofill::CurrentPassword,
                     placeholder: "Password",
-                    password: true,
+                    kind: FieldKind::Password,
                 }
             }
         });
@@ -195,9 +232,26 @@ mod tests {
 
     #[test]
     fn a_password_field_hides_what_is_typed() {
-        let html = render(true, Some("New password"));
+        let html = render(FieldKind::Password, Some("New password"));
         assert!(html.contains("type=\"password\""), "{html}");
         assert!(html.contains("aria-label=\"New password\""), "{html}");
+    }
+
+    #[test]
+    fn a_search_field_asks_phones_for_a_search_key() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                TextInput {
+                    kind: FieldKind::Search,
+                    enterkeyhint: "search",
+                    placeholder: "Search albums",
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("type=\"search\""), "{html}");
+        assert!(html.contains("enterkeyhint=\"search\""), "{html}");
     }
 
     fn render_look(look: FieldLook) -> String {

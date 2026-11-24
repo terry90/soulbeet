@@ -2,34 +2,77 @@ use dioxus::prelude::*;
 
 pub use crate::settings_context::SearchType;
 
+/// The key the search form submits the chosen type under.
+const NAME: &str = "search_type";
+
+/// Album or track, as a radio group.
 #[component]
 pub fn SearchTypeToggle(search_type: Signal<SearchType>) -> Element {
-    let active_class = "text-white bg-white/10 shadow-sm";
-    let inactive_class = "text-gray-500 hover:text-gray-300 hover:bg-white/5";
-
-    let album_class = if search_type() == SearchType::Album {
-        active_class
-    } else {
-        inactive_class
-    };
-    let track_class = if search_type() == SearchType::Track {
-        active_class
-    } else {
-        inactive_class
-    };
-
     rsx! {
-      div { class: "flex items-center bg-black/20 rounded p-1 mr-2",
-        button {
-          class: "px-3 py-1 text-xs font-bold rounded transition-all duration-200 {album_class}",
-          onclick: move |_| search_type.set(SearchType::Album),
-          "ALBUM"
-        }
-        button {
-          class: "px-3 py-1 text-xs font-bold rounded transition-all duration-200 {track_class}",
-          onclick: move |_| search_type.set(SearchType::Track),
-          "TRACK"
+      fieldset { class: "flex flex-none min-w-0 m-0 p-0 border-0",
+        legend { class: "sr-only", "Search for" }
+        for (kind , label) in [(SearchType::Album, "Album"), (SearchType::Track, "Track")] {
+          label { key: "{kind.as_str()}", class: "relative flex items-center h-[44px] px-[2px] cursor-pointer",
+            input {
+              class: "peer absolute inset-0 m-0 opacity-0 cursor-pointer",
+              r#type: "radio",
+              name: NAME,
+              value: kind.as_str(),
+              checked: search_type() == kind,
+              onchange: move |_| search_type.set(kind),
+            }
+            span {
+              class: if search_type() == kind { "text-white bg-white/10" } else { "text-gray-500 peer-hover:text-gray-300" },
+              class: "block px-[10px] max-[399px]:px-[8px] py-[6px] rounded font-mono text-[11px] font-bold tracking-[0.08em] uppercase transition-colors duration-200 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-1 peer-focus-visible:outline-beet-leaf",
+              "{label}"
+            }
+          }
         }
       }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opening_tag;
+
+    #[test]
+    fn album_and_track_are_radios_in_a_named_group() {
+        let mut dom = VirtualDom::new(|| {
+            let search_type = use_signal(|| SearchType::Track);
+            rsx! { SearchTypeToggle { search_type } }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.starts_with("<fieldset"), "{html}");
+        assert!(
+            html.contains("<legend class=\"sr-only\">Search for</legend>"),
+            "{html}"
+        );
+        let album = opening_tag(&html, "value=\"album\"");
+        let track = opening_tag(&html, "value=\"track\"");
+        for radio in [album, track] {
+            assert!(radio.contains("type=\"radio\""), "{radio}");
+            assert!(radio.contains(&format!("name=\"{NAME}\"")), "{radio}");
+        }
+        assert!(track.contains("checked=true"), "{track}");
+        assert!(!album.contains("checked=true"), "{album}");
+    }
+
+    #[test]
+    fn choosing_a_radio_sets_the_search_type() {
+        thread_local! {
+            static CHOSEN: std::cell::Cell<Option<SearchType>> = const { std::cell::Cell::new(None) };
+        }
+        let mut dom = VirtualDom::new(|| {
+            let search_type = use_signal(|| SearchType::Album);
+            use_effect(move || CHOSEN.with(|c| c.set(Some(search_type()))));
+            rsx! { SearchTypeToggle { search_type } }
+        });
+        let changes = crate::listeners(&mut dom, "change");
+        assert_eq!(changes.len(), 2);
+        crate::change(&mut dom, changes[1]);
+        assert_eq!(CHOSEN.with(|c| c.get()), Some(SearchType::Track));
     }
 }
