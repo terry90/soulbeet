@@ -1,4 +1,5 @@
-# dx writes a brotli copy next to each bundled file in release builds, which
-# Dioxus sends to clients that take br instead of the 3 MB original.
+# dx writes a brotli copy next to each bundled file in release builds, and
+# Dioxus sends it to clients that take br, so the bundle is not compressed
+# again on each request.
 [web]
 pre_compress = true
