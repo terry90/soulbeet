@@ -29,10 +29,14 @@ pub(crate) fn compress(router: Router) -> Router {
 /// Dioxus sends a file's brotli copy without `Vary: Accept-Encoding`, and a
 /// shared cache would then hand brotli to a client that never asked for it.
 async fn vary_on_encoding(mut response: Response) -> Response {
-    if response.headers().contains_key(CONTENT_ENCODING) {
-        response
-            .headers_mut()
-            .append(VARY, HeaderValue::from_static("accept-encoding"));
+    let headers = response.headers_mut();
+    let varies = headers.get_all(VARY).iter().any(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.to_ascii_lowercase().contains("accept-encoding"))
+    });
+    if headers.contains_key(CONTENT_ENCODING) && !varies {
+        headers.append(VARY, HeaderValue::from_static("accept-encoding"));
     }
     response
 }
@@ -94,6 +98,15 @@ mod tests {
                 .route(
                     "/assets/copy.br",
                     get(|| async { ([(CONTENT_ENCODING, "br")], Bytes::from(STORED)) }),
+                )
+                .route(
+                    "/assets/varies.br",
+                    get(|| async {
+                        (
+                            [(CONTENT_ENCODING, "br"), (VARY, "Accept-Encoding")],
+                            Bytes::from(STORED),
+                        )
+                    }),
                 )
                 .route("/events", get(|| async { Sse::new(one_event_then_open()) }))
                 .merge(Router::new().serve_api_application(ServeConfig::new(), Page)),
@@ -177,6 +190,14 @@ mod tests {
         assert!(varies_on_encoding(response.headers()));
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], STORED);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_already_varies_on_accept_encoding_says_so_once() {
+        let response = get_with("/assets/varies.br", Some("gzip, br")).await;
+        assert_eq!(encoding(response.headers()), Some("br"));
+        let vary: Vec<_> = response.headers().get_all(VARY).iter().collect();
+        assert_eq!(vary, ["Accept-Encoding"]);
     }
 
     #[tokio::test]
