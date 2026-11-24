@@ -24,7 +24,7 @@ impl FieldLook {
             FieldLook::Form => FIELD_CLASS,
             FieldLook::Compact => "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
             FieldLook::Login => "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
-            FieldLook::Bar => "flex-1 min-w-0 h-[44px] p-0 bg-transparent border-0 rounded-none outline-none appearance-none font-mono text-base placeholder:text-gray-600 [&::-webkit-search-cancel-button]:appearance-none",
+            FieldLook::Bar => "flex-1 min-w-0 h-[44px] p-0 bg-transparent border-0 rounded-none outline-none appearance-none font-mono text-base placeholder:text-gray-600 [&::-webkit-search-cancel-button]:hidden",
         }
     }
 }
