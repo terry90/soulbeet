@@ -31,25 +31,37 @@ const BASE_DELAY_MS: u64 = 500;
 /// Maximum backoff delay cap (milliseconds)
 const MAX_BACKOFF_MS: u64 = 5000;
 
+/// A MusicBrainz client for `host` (host[:port], no scheme), else for
+/// musicbrainz.org. Each request it sends, a 503 sent again included, waits
+/// on `http::mb_limiter` and gets REQUEST_TIMEOUT_SECS to be answered.
+fn new_client(host: Option<&str>) -> MusicBrainzClient {
+    let version = env!("CARGO_PKG_VERSION");
+    let reqwest_client = reqwest::Client::builder()
+        .user_agent(format!(
+            "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
+        ))
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        // As MusicBrainzClient::new sets it (hyperium/hyper#2136).
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("a client with a user agent and timeouts builds");
+    let mut client = MusicBrainzClient::new_with_reqwest_client(reqwest_client);
+    client.rate_limit = Some(crate::http::mb_limiter());
+    if let Some(host) = host {
+        client.musicbrainz_domain = host.to_string();
+    }
+    client
+}
+
 // This ensures the client is initialized only once with a proper user agent.
 fn musicbrainz_client() -> &'static MusicBrainzClient {
     static CLIENT: OnceLock<MusicBrainzClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let version = env!("CARGO_PKG_VERSION");
-        let mut client = MusicBrainzClient::new(&format!(
-            "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
-        ))
-        .expect("Failed to create MusicBrainz client - invalid user agent format");
         // MUSICBRAINZ_HOST points the client at a MusicBrainz mirror
         // (host[:port], no scheme). Mirrors the `musicbrainz.host` option
         // beets exposes for the same purpose.
-        if let Ok(host) = std::env::var("MUSICBRAINZ_HOST") {
-            let host = host.trim();
-            if !host.is_empty() {
-                client.musicbrainz_domain = host.to_string();
-            }
-        }
-        client
+        let host = std::env::var("MUSICBRAINZ_HOST").ok();
+        new_client(host.as_deref().map(str::trim).filter(|h| !h.is_empty()))
     })
 }
 
@@ -116,6 +128,11 @@ impl From<musicbrainz_rs::Error> for MetadataError {
                 status: None,
                 raw: e.to_string(),
             },
+            Error::ReqwestError(e) if e.is_timeout() => MetadataError::Unavailable {
+                service,
+                status: None,
+                raw: format!("no answer within {REQUEST_TIMEOUT_SECS} s"),
+            },
             Error::ReqwestError(e) => MetadataError::Unavailable {
                 service,
                 status: e.status().map(|s| s.as_u16()),
@@ -135,9 +152,10 @@ impl From<musicbrainz_rs::Error> for MetadataError {
     }
 }
 
-/// Retries an async operation with exponential backoff and request timeout.
-/// Only retries transient errors (`MetadataError::is_transient`): no answer
-/// within REQUEST_TIMEOUT_SECS, or an HTTP exchange that failed.
+/// Retries an async operation with exponential backoff. Only retries
+/// transient errors (`MetadataError::is_transient`): no answer within
+/// REQUEST_TIMEOUT_SECS, or an HTTP exchange that failed. The client waits on
+/// the rate limit before each request it sends, so this does not.
 async fn with_retry<T, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, MetadataError>
 where
     F: FnMut() -> Fut,
@@ -145,19 +163,9 @@ where
 {
     let mut attempt = 0;
     loop {
-        // Respect MusicBrainz rate limit (1 req/sec)
-        crate::http::mb_rate_limit().await;
-
-        let result =
-            tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), operation()).await;
-        let e = match result {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(e)) => MetadataError::from(e),
-            Err(_timeout) => MetadataError::Unavailable {
-                service: Service::Musicbrainz,
-                status: None,
-                raw: format!("no answer within {REQUEST_TIMEOUT_SECS} s"),
-            },
+        let e = match operation().await {
+            Ok(value) => return Ok(value),
+            Err(e) => MetadataError::from(e),
         };
         attempt += 1;
         if !e.is_transient() || attempt == MAX_RETRIES {
@@ -761,7 +769,14 @@ pub struct RecordingReleases {
 
 /// Searches MusicBrainz for artists by name or alias.
 pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, MetadataError> {
-    let client = musicbrainz_client();
+    search_artists_with(musicbrainz_client(), query, limit).await
+}
+
+async fn search_artists_with(
+    client: &MusicBrainzClient,
+    query: &str,
+    limit: u8,
+) -> Result<Vec<ArtistMatch>, MetadataError> {
     let found = with_retry("MusicBrainz artist search", || {
         let search_query = artist_search_query(query);
         async move {
@@ -1542,6 +1557,13 @@ mod tests {
         page.entities
     }
 
+    /// The client for the stub server at `base`, which needs no rate limit.
+    fn stub_client(base: &str) -> MusicBrainzClient {
+        let mut client = new_client(Some(base.trim_start_matches("http://")));
+        client.drop_ratelimit();
+        client
+    }
+
     /// A release group search answer of `count` groups in all, holding `ids`.
     fn groups_page(count: i64, ids: std::ops::Range<usize>) -> String {
         let groups: Vec<serde_json::Value> = ids
@@ -1562,8 +1584,7 @@ mod tests {
             reply(groups_page(3, 0..3)),
             reply(groups_page(-1, 0..0)),
         ]);
-        let mut client = MusicBrainzClient::new("tier-test/0 ( local )").unwrap();
-        client.musicbrainz_domain = base.trim_start_matches("http://").to_string();
+        let client = stub_client(&base);
         let mbid = "8456e9f7-debf-4579-a86c-33a325a35d2d";
 
         let (groups, whole) = tier_groups(&client, mbid, Tier::Other, 150).await.unwrap();
@@ -1796,6 +1817,72 @@ mod tests {
             None
         );
         assert_eq!(pick_artist(vec![], None), None);
+    }
+
+    const CHEVELLE: &str = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+
+    /// An artist search answer holding `artists`.
+    fn artists_page(artists: serde_json::Value) -> String {
+        let count = artists.as_array().unwrap().len();
+        serde_json::json!({"created": "2026-11-24T20:53:37.277Z", "count": count, "offset": 0,
+            "artists": artists})
+        .to_string()
+    }
+
+    fn chevelle_found() -> String {
+        artists_page(
+            serde_json::json!([{"id": CHEVELLE, "name": "Chevelle", "sort-name": "Chevelle"}]),
+        )
+    }
+
+    /// Chevelle's release groups of `tier` from the fixture, as one search answer.
+    fn chevelle_tier(tier: Tier) -> String {
+        let mut page: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/release_group_search_chevelle.json"
+        ))
+        .unwrap();
+        let groups: Vec<serde_json::Value> = page["release-groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| {
+                let studio = g["secondary-types"].as_array().is_none_or(|t| t.is_empty());
+                studio == matches!(tier, Tier::Studio)
+            })
+            .cloned()
+            .collect();
+        page["count"] = groups.len().into();
+        page["release-groups"] = groups.into();
+        page.to_string()
+    }
+
+    #[tokio::test]
+    async fn every_request_waits_its_turn_even_one_sent_again_after_a_503() {
+        use crate::test_http::{serve_with_headers, Reply};
+        let reply = |status, body: String| Reply { status, body };
+        let (base, seen) = serve_with_headers(vec![
+            (
+                reply(503, String::new()),
+                vec![("Retry-After", "0".to_string())],
+            ),
+            (reply(200, chevelle_found()), vec![]),
+            (reply(200, chevelle_tier(Tier::Studio)), vec![]),
+        ]);
+        let client = new_client(Some(base.trim_start_matches("http://")));
+        let found = search_artists_with(&client, "Chevelle", FILTER_ARTISTS)
+            .await
+            .unwrap();
+        assert_eq!(found[0].mbid, CHEVELLE);
+        tier_groups(&client, CHEVELLE, Tier::Studio, DISCOGRAPHY_MAX)
+            .await
+            .unwrap();
+        let at: Vec<std::time::Instant> = seen.lock().unwrap().iter().map(|s| s.at).collect();
+        assert_eq!(at.len(), 3);
+        // MB_INTERVAL apart, less what the loopback may shift an arrival by.
+        for pair in at.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap >= Duration::from_millis(1050), "{gap:?}");
+        }
     }
 
     #[test]

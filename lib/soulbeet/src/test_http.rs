@@ -20,6 +20,8 @@ pub(crate) struct Seen {
     pub user_agent: Option<String>,
     pub authorization: Option<String>,
     pub body: String,
+    /// When its request line arrived.
+    pub at: std::time::Instant,
 }
 
 /// Answers the n-th connection with replies[n] (`Connection: close`, JSON
@@ -66,6 +68,7 @@ pub(crate) fn serve_with_headers(
 fn read_request(reader: &mut impl BufRead) -> Seen {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
+    let at = std::time::Instant::now();
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
@@ -105,5 +108,6 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
         user_agent,
         authorization,
         body: String::from_utf8(body).unwrap(),
+        at,
     }
 }
