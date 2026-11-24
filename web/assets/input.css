@@ -35,9 +35,12 @@
         @apply bg-beet-panel/80 backdrop-blur-md border border-white/10 shadow-xl;
     }
     
+    /* Only the hover look fades. WebKit hangs, then crashes, when a button
+       fading its opacity and filter at once, as from disabled to enabled,
+       gets a new opacity before the fade ends. */
     .retro-btn {
-        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf 
-               transition-all duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
+        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf
+               transition-[color,background-color,border-color,box-shadow] duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
     }
 
     /* For a scrolling box: fades its bottom edge so cut-off content reads as more to scroll.

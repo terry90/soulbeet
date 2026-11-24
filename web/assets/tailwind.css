@@ -2357,7 +2357,7 @@
     letter-spacing: var(--tracking-widest);
     color: var(--color-beet-leaf);
     text-transform: uppercase;
-    transition-property: all;
+    transition-property: color,background-color,border-color,box-shadow;
     transition-timing-function: var(--tw-ease, var(--default-transition-timing-function));
     transition-duration: var(--tw-duration, var(--default-transition-duration));
     --tw-duration: 200ms;
