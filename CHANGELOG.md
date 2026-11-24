@@ -2,14 +2,14 @@
 
 ## Unreleased
 
-### A new search bar, and smoother on phones
+### Search by artist, a new search bar, and smoother on phones
 
-The search bar is rebuilt as one layout for every screen, with fixes for lag, zoom and sign-in on phones.
+An artist alone now lists their albums, the search bar is rebuilt as one layout for every screen, and phones get fixes for lag, zoom and sign-in.
 
+- **Search by artist**: Fill in only the artist to list their albums and EPs, studio albums first, with the year and type on each row.
 - **New search bar**: The artist filter opens with a tap on Artist, the download folder can be picked on phones too, and the three service lights are now one status line that opens to the details.
 - **Lighter pages**: The background glows are drawn without a blur filter, which Safari on iOS 26 could stall on for seconds, and the closed downloads drawer is no longer kept on screen.
-- **No zoom when typing**: Fields are 16px on phones, so Safari no longer zooms in when you tap one.
-- **Password managers**: The login and password forms say what each field holds, and a password filled in by a manager is read when you submit.
+- **Typing and sign-in on phones**: Fields no longer make Safari zoom in, and password managers can fill and save the login and password forms.
 - **Faster first load**: The app is sent compressed, at about a third of its size.
 
 ## 0.10.0 - 2026-11-22
