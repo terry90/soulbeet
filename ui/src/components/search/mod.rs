@@ -17,6 +17,9 @@ mod folder_chip;
 mod search_bar;
 use search_bar::SearchBar;
 
+mod discography_heading;
+use discography_heading::DiscographyHeading;
+
 use api::models::folder::Folder;
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
@@ -24,7 +27,9 @@ use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
 };
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{
+    asks_no_title, Album, AlbumWithTracks, ArtistSummary, Discography, SearchResult, Track,
+};
 use std::collections::{HashMap, HashSet};
 
 use track::TrackResult;
@@ -58,11 +63,66 @@ fn album_query(album: &Album) -> DownloadQuery {
     DownloadQuery::new(vec![]).album(album.clone())
 }
 
+/// The artist whose albums a search lists: one given with no title.
+fn discography_artist(artist: Option<String>, query: &str) -> Option<String> {
+    artist.filter(|_| asks_no_title(query))
+}
+
+/// What an artist-only search listed.
+#[derive(Clone, PartialEq, Debug)]
+struct Listed {
+    /// The name searched for.
+    name: String,
+    /// The artist whose albums are listed; None when no artist carries the name.
+    artist: Option<ArtistSummary>,
+    /// The other artists carrying the name.
+    others: Vec<ArtistSummary>,
+    complete: bool,
+    shown: usize,
+}
+
+/// The listing of the search for `name` and its rows, from what it found.
+fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchResult>) {
+    let Some(found) = found else {
+        let listed = Listed {
+            name,
+            artist: None,
+            others: vec![],
+            complete: true,
+            shown: 0,
+        };
+        return (listed, vec![]);
+    };
+    let listed = Listed {
+        name,
+        artist: Some(found.artist),
+        others: found.others,
+        complete: found.complete,
+        shown: found.albums.len(),
+    };
+    let rows = found.albums.into_iter().map(SearchResult::Album).collect();
+    (listed, rows)
+}
+
+/// What a search that found nothing says.
+fn empty_message(listed: Option<&Listed>) -> String {
+    match listed {
+        Some(Listed {
+            artist: Some(artist),
+            ..
+        }) => format!("No albums or EPs by {} on MusicBrainz.", artist.name),
+        Some(Listed { name, .. }) => format!("No artist named “{name}” on MusicBrainz."),
+        None => "No signals found in the ether.".to_string(),
+    }
+}
+
 #[component]
 pub fn Search() -> Element {
     let auth = use_auth();
     let mut settings = use_settings();
     let mut search_results = use_signal::<Option<Vec<SearchResult>>>(|| None);
+    // Set while the results are an artist's albums.
+    let mut listed = use_signal::<Option<Listed>>(|| None);
     let mut search = use_signal(String::new);
     let mut artist = use_signal::<Option<String>>(|| None);
     let mut artist_open = use_signal(|| false);
@@ -133,6 +193,7 @@ pub fn Search() -> Element {
         if let Some(reset) = search_reset {
             if reset.0() > 0 {
                 search_results.set(None);
+                listed.set(None);
                 search.set(String::new());
                 artist.set(None);
                 artist_open.set(false);
@@ -549,10 +610,32 @@ pub fn Search() -> Element {
             is_downloading.set(false);
         };
 
-    let perform_search = move || async move {
+    // Lists the albums of the artist named `name`, or of the one of that name
+    // whose MBID is `chosen`.
+    let list_discography = move |name: String, chosen: Option<String>| async move {
         loading.set(true);
+        let found = auth
+            .call(api::artist_discography(api::DiscographyQuery {
+                artist: name.clone(),
+                mbid: chosen,
+            }))
+            .await;
+        if let Ok(found) = found {
+            let (listing, rows) = listed_from(name, found);
+            listed.set(Some(listing));
+            search_results.set(Some(rows));
+        }
+        loading.set(false);
+    };
+
+    let perform_search = move || async move {
         download_error.set(String::new());
         download_options.set(None);
+        // Album or track alike: an artist's tracks are in its albums' rows.
+        if let Some(name) = discography_artist(artist(), &search()) {
+            return list_discography(name, None).await;
+        }
+        loading.set(true);
 
         let query_data = api::SearchQuery {
             artist: artist(),
@@ -565,6 +648,7 @@ pub fn Search() -> Element {
         };
 
         if let Ok(data) = result {
+            listed.set(None);
             search_results.set(Some(data));
         }
         loading.set(false);
@@ -693,131 +777,148 @@ pub fn Search() -> Element {
             div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-beet-accent" }
           }
         } else {
-          match &*search_results.read() {
-              Some(ref data) if !data.is_empty() => {
+          match (&*search_results.read(), listed()) {
+              (Some(ref data), listing) if !data.is_empty() || listing.as_ref().is_some_and(|l| l.artist.is_some()) => {
                 rsx! {
                   div { class: "w-full bg-beet-panel/50 border border-white/5 p-6 backdrop-blur-sm mt-8 rounded-lg",
-                    h5 { class: "text-xl font-display font-bold mb-4 border-b border-white/10 pb-2 text-white",
-                      "Search Results"
+                    if let Some(Listed { name, artist: Some(found), others, complete, shown }) = listing.clone() {
+                      DiscographyHeading {
+                        name: name.clone(),
+                        artist: found,
+                        others,
+                        complete,
+                        shown,
+                        on_pick: move |mbid: String| {
+                            spawn(list_discography(name.clone(), Some(mbid)));
+                        },
+                      }
+                    } else {
+                      h5 { class: "text-xl font-display font-bold mb-4 border-b border-white/10 pb-2 text-white",
+                        "Search Results"
+                      }
                     }
-                    ul { class: "list-none p-0 space-y-4",
-                      for item in data.iter() {
-                        match item {
-                            SearchResult::Track(ref track) => {
-                                let track_clone = track.clone();
-                                let track_clone_2 = track.clone();
-                                let track_for_dl = track.clone();
-                                let track_for_override = track.clone();
-                                let track_id = track.id.clone();
-                                let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
-                                let has_folders = !folders.read().is_empty();
-                                let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                let current_folders = folders.read().clone();
-                                let current_folder_id = selected_folder_id();
-                                rsx! {
-                                  li { key: "{track.id}",
-                                    TrackResult {
-                                      on_search_sources: move || {
-                                          spawn(download(DownloadQuery::from(track_clone.clone())));
-                                      },
-                                      on_album_click: {
-                                          let album_id_for_expand = track_clone_2.album_id.clone();
-                                          move || {
-                                              if let Some(ref aid) = album_id_for_expand {
-                                                  toggle_expand(aid.clone());
-                                              }
-                                          }
-                                      },
-                                      track: track.clone(),
-                                      download_state: effective_state,
-                                      folders: current_folders,
-                                      selected_folder_id: current_folder_id.clone(),
-                                      active_menu,
-                                      on_download: move |_| {
-                                          handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
-                                      },
-                                      on_override_download: move |folder: Folder| {
-                                          handle_override_download(
-                                              track_for_override.id.clone(),
-                                              DownloadQuery::from(track_for_override.clone()),
-                                              folder,
-                                          );
-                                      },
+                    if data.is_empty() {
+                      p { class: "text-center text-gray-500 py-10 font-mono", "{empty_message(listing.as_ref())}" }
+                    } else {
+                      ul { class: "list-none p-0 space-y-4",
+                        for item in data.iter() {
+                          match item {
+                              SearchResult::Track(ref track) => {
+                                  let track_clone = track.clone();
+                                  let track_clone_2 = track.clone();
+                                  let track_for_dl = track.clone();
+                                  let track_for_override = track.clone();
+                                  let track_id = track.id.clone();
+                                  let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
+                                  let has_folders = !folders.read().is_empty();
+                                  let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                  let current_folders = folders.read().clone();
+                                  let current_folder_id = selected_folder_id();
+                                  rsx! {
+                                    li { key: "{track.id}",
+                                      TrackResult {
+                                        on_search_sources: move || {
+                                            spawn(download(DownloadQuery::from(track_clone.clone())));
+                                        },
+                                        on_album_click: {
+                                            let album_id_for_expand = track_clone_2.album_id.clone();
+                                            move || {
+                                                if let Some(ref aid) = album_id_for_expand {
+                                                    toggle_expand(aid.clone());
+                                                }
+                                            }
+                                        },
+                                        track: track.clone(),
+                                        download_state: effective_state,
+                                        folders: current_folders,
+                                        selected_folder_id: current_folder_id.clone(),
+                                        active_menu,
+                                        on_download: move |_| {
+                                            handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
+                                        },
+                                        on_override_download: move |folder: Folder| {
+                                            handle_override_download(
+                                                track_for_override.id.clone(),
+                                                DownloadQuery::from(track_for_override.clone()),
+                                                folder,
+                                            );
+                                        },
+                                      }
                                     }
                                   }
-                                }
-                            }
-                            SearchResult::Album(ref album) => {
-                                let album_clone = album.clone();
-                                let album_for_dl = album.clone();
-                                let album_for_override = album.clone();
-                                let album_id = album.id.clone();
-                                let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
-                                let has_folders = !folders.read().is_empty();
-                                let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                let current_folders = folders.read().clone();
-                                let current_folder_id = selected_folder_id();
+                              }
+                              SearchResult::Album(ref album) => {
+                                  let album_clone = album.clone();
+                                  let album_for_dl = album.clone();
+                                  let album_for_override = album.clone();
+                                  let album_id = album.id.clone();
+                                  let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
+                                  let has_folders = !folders.read().is_empty();
+                                  let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                  let current_folders = folders.read().clone();
+                                  let current_folder_id = selected_folder_id();
 
-                                let is_expanded = expanded_albums.read().contains(&album_id);
-                                let cached = album_cache.read().get(&album_id).cloned();
-                                let tracks_for_panel: Option<Vec<Track>> = if is_expanded {
-                                    cached.map(|awt| awt.tracks)
-                                } else {
-                                    Some(vec![])
-                                };
+                                  let is_expanded = expanded_albums.read().contains(&album_id);
+                                  let cached = album_cache.read().get(&album_id).cloned();
+                                  let tracks_for_panel: Option<Vec<Track>> = if is_expanded {
+                                      cached.map(|awt| awt.tracks)
+                                  } else {
+                                      Some(vec![])
+                                  };
 
-                                rsx! {
-                                  li { key: "{album.id}",
-                                    AlbumResult {
-                                      is_expanded,
-                                      on_toggle: {
-                                          let id = album_clone.id.clone();
-                                          move || {
-                                              toggle_expand(id.clone());
-                                          }
-                                      },
-                                      on_search_sources: {
-                                          let album_for_search = album.clone();
-                                          move || {
-                                              let query = album_query(&album_for_search);
-                                              spawn(download(query));
-                                          }
-                                      },
-                                      album: album.clone(),
-                                      download_state: effective_state,
-                                      folders: current_folders,
-                                      selected_folder_id: current_folder_id.clone(),
-                                      active_menu,
-                                      on_download: move |_| {
-                                          let query = album_query(&album_for_dl);
-                                          handle_auto_download(album_for_dl.id.clone(), query);
-                                      },
-                                      on_override_download: move |folder: Folder| {
-                                          let query = album_query(&album_for_override);
-                                          handle_override_download(album_for_override.id.clone(), query, folder);
-                                      },
-                                      tracks: tracks_for_panel,
-                                      download_states,
-                                      on_track_download: move |track: Track| {
-                                          handle_track_download(track);
-                                      },
-                                      on_track_override_download: move |(track, folder): (Track, Folder)| {
-                                          handle_track_override_download((track, folder));
-                                      },
+                                  rsx! {
+                                    li { key: "{album.id}",
+                                      AlbumResult {
+                                        is_expanded,
+                                        on_toggle: {
+                                            let id = album_clone.id.clone();
+                                            move || {
+                                                toggle_expand(id.clone());
+                                            }
+                                        },
+                                        on_search_sources: {
+                                            let album_for_search = album.clone();
+                                            move || {
+                                                let query = album_query(&album_for_search);
+                                                spawn(download(query));
+                                            }
+                                        },
+                                        album: album.clone(),
+                                        download_state: effective_state,
+                                        folders: current_folders,
+                                        selected_folder_id: current_folder_id.clone(),
+                                        active_menu,
+                                        on_download: move |_| {
+                                            let query = album_query(&album_for_dl);
+                                            handle_auto_download(album_for_dl.id.clone(), query);
+                                        },
+                                        on_override_download: move |folder: Folder| {
+                                            let query = album_query(&album_for_override);
+                                            handle_override_download(album_for_override.id.clone(), query, folder);
+                                        },
+                                        tracks: tracks_for_panel,
+                                        download_states,
+                                        on_track_download: move |track: Track| {
+                                            handle_track_download(track);
+                                        },
+                                        on_track_override_download: move |(track, folder): (Track, Folder)| {
+                                            handle_track_override_download((track, folder));
+                                        },
+                                      }
                                     }
                                   }
-                                }
-                            }
+                              }
+                          }
                         }
                       }
                     }
                   }
                 }
               },
-              Some(_) => rsx! {
-                div { class: "text-center text-gray-500 py-10 font-mono", "No signals found in the ether." }
+              (Some(_), listing) => rsx! {
+                div { class: "text-center text-gray-500 py-10 font-mono", "{empty_message(listing.as_ref())}" }
               },
-              None => rsx! {},
+              (None, _) => rsx! {},
           }
         }
 
@@ -861,5 +962,75 @@ mod tests {
         let query = album_query(&album);
         assert!(query.tracks.is_empty());
         assert_eq!(query.album, Some(album));
+    }
+
+    #[test]
+    fn a_search_with_an_artist_and_no_title_lists_the_discography() {
+        let chevelle = || Some("Chevelle".to_string());
+        assert_eq!(discography_artist(chevelle(), ""), chevelle());
+        assert_eq!(discography_artist(chevelle(), " * "), chevelle());
+        assert_eq!(discography_artist(chevelle(), "Vena Sera"), None);
+        assert_eq!(discography_artist(None, ""), None);
+
+        let (nobody, rows) = listed_from("Nirvana".into(), None);
+        assert_eq!((nobody.artist.as_ref(), rows.len()), (None, 0));
+        assert_eq!(
+            empty_message(Some(&nobody)),
+            "No artist named “Nirvana” on MusicBrainz."
+        );
+
+        let album = |id: &str, title: &str| Album {
+            id: id.into(),
+            title: title.into(),
+            artist: "Chevelle".into(),
+            release_date: None,
+            mbid: Some(id.into()),
+            cover_url: None,
+            release_types: Some(vec!["Album".into()]),
+            first_release_date: None,
+        };
+        let artist = ArtistSummary {
+            mbid: "8456e9f7-debf-4579-a86c-33a325a35d2d".into(),
+            name: "Chevelle".into(),
+            disambiguation: None,
+        };
+        let (listed, rows) = listed_from(
+            "chevelle".into(),
+            Some(Discography {
+                artist: artist.clone(),
+                others: vec![],
+                albums: vec![
+                    album("c9a3fe11-45a8-4045-9d15-1b80b8333f81", "Point #1"),
+                    album("accde5f7-04da-4c66-bb8e-7bb3d39ad326", "Wonder What’s Next"),
+                ],
+                complete: true,
+            }),
+        );
+        let titles: Vec<&str> = rows
+            .iter()
+            .map(|r| match r {
+                SearchResult::Album(a) => a.title.as_str(),
+                SearchResult::Track(t) => panic!("a track row: {t:?}"),
+            })
+            .collect();
+        assert_eq!(titles, ["Point #1", "Wonder What’s Next"]);
+        assert_eq!(
+            (listed.artist, listed.shown, listed.complete),
+            (Some(artist.clone()), 2, true)
+        );
+        let (none_listed, _) = listed_from(
+            "Chevelle".into(),
+            Some(Discography {
+                artist,
+                others: vec![],
+                albums: vec![],
+                complete: true,
+            }),
+        );
+        assert_eq!(
+            empty_message(Some(&none_listed)),
+            "No albums or EPs by Chevelle on MusicBrainz."
+        );
+        assert_eq!(empty_message(None), "No signals found in the ether.");
     }
 }
