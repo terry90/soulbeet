@@ -167,6 +167,7 @@ fn AuthGuard() -> Element {
 fn WebNavbar() -> Element {
     let mut auth = use_auth();
     let mut downloads_open = use_signal(|| false);
+    let mut downloads_toggle = use_signal(|| None::<std::rc::Rc<MountedData>>);
     let mut search_reset = use_signal(|| 0);
     #[allow(unused_mut)] // mutated in websocket callback (web feature only)
     let mut downloads = use_signal::<HashMap<String, DownloadProgress>>(HashMap::new);
@@ -315,6 +316,7 @@ fn WebNavbar() -> Element {
                 button {
                     class: "relative group p-2 hover:bg-white/5 rounded-lg transition-colors focus:outline-none cursor-pointer",
                     aria_label: "Downloads",
+                    onmounted: move |e| downloads_toggle.set(Some(e.data())),
                     onclick: move |_| downloads_open.set(!downloads_open()),
                     svg {
                         class: "w-5 h-5 text-gray-300 group-hover:text-beet-leaf transition-colors",
@@ -370,7 +372,7 @@ fn WebNavbar() -> Element {
             main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
                 Outlet::<Route> {}
             }
-            Downloads { is_open: downloads_open, downloads }
+            Downloads { is_open: downloads_open, downloads, return_focus_to: downloads_toggle }
         }
     }
 }
