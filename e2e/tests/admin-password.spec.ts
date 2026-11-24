@@ -54,7 +54,7 @@ test('the shipped admin password signs in only to choose a new one', async ({ br
     await page.getByRole('button', { name: 'Change Password' }).click();
 
     await expect(page).toHaveURL(/\/$/);
-    await expect(page.getByPlaceholder('Search artist, album or track...')).toBeVisible();
+    await expect(page.getByRole('searchbox')).toBeVisible();
     shipped = false;
     expect((await page.request.get('/api/users')).ok()).toBeTruthy();
   } finally {

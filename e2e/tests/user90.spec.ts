@@ -6,7 +6,7 @@
 import { expect, test } from '@playwright/test';
 import { copyFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { freshSession, performSearch } from '../helpers/app.js';
+import { freshSession, openServiceStatus, performSearch } from '../helpers/app.js';
 import { e2eRoot, user90BrokenConfig, user90ConfigDirOnHost } from '../helpers/env.js';
 import { maritime } from '../fixtures/dataset.js';
 
@@ -32,6 +32,7 @@ test('a broken config is visible and refuses downloads', async ({ context, page 
   installConfig(user90BrokenConfig);
   const { folder } = await freshSession(context, page, 'user90-broken');
 
+  await openServiceStatus(page);
   await expect(page.getByText('BEETS BROKEN', { exact: true })).toBeVisible({
     timeout: HEALTH_CHANGE_MS,
   });
@@ -63,6 +64,7 @@ test('fixing the config at runtime turns health ready', async ({ context, page }
   installConfig(join(e2eRoot, '.fixtures', 'beets-e2e.yaml'));
   await freshSession(context, page, 'user90-fixed');
 
+  await openServiceStatus(page);
   await expect(page.getByText('BEETS READY', { exact: true })).toBeVisible({
     timeout: HEALTH_CHANGE_MS,
   });

@@ -86,7 +86,7 @@ test('creates an account on first sign-in and keeps it when the username changes
 
   await signInWithSso(page, { username, subject });
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByPlaceholder('Search artist, album or track...')).toBeVisible();
+  await expect(page.getByRole('searchbox')).toBeVisible();
   const first = await currentUser(page);
   expect(first.username).toBe(username);
   // The login state was single use.

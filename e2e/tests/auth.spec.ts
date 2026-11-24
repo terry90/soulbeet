@@ -25,7 +25,7 @@ test('logs a registered user in and out through the UI', async ({ page }) => {
   await registerUser(page.context().request, user);
 
   await loginViaUi(page, user);
-  await expect(page.getByPlaceholder('Search artist, album or track...')).toBeVisible();
+  await expect(page.getByRole('searchbox')).toBeVisible();
 
   await page.getByRole('button', { name: 'Logout' }).click();
   await expect(page).toHaveURL(/\/login$/);

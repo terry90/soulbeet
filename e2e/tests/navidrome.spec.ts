@@ -44,5 +44,5 @@ test('still accepts local accounts when Navidrome rejects them', async ({ page }
   await registerUser(page.context().request, user);
 
   await loginViaUi(page, user);
-  await expect(page.getByPlaceholder('Search artist, album or track...')).toBeVisible();
+  await expect(page.getByRole('searchbox')).toBeVisible();
 });
