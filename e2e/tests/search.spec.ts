@@ -7,10 +7,10 @@ import { glassAtlas, maritime } from '../fixtures/dataset.js';
 
 async function search(page: Page, query: string, type?: 'ALBUM' | 'TRACK') {
   if (type) {
-    await page.getByRole('button', { name: type, exact: true }).filter({ visible: true }).click();
+    await page.getByRole('radio', { name: type }).check();
   }
-  await page.getByPlaceholder('Search artist, album or track...').fill(query);
-  await page.getByRole('button', { name: 'SEARCH' }).filter({ visible: true }).click();
+  await page.getByRole('searchbox').fill(query);
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
 }
 
 // The app spaces MusicBrainz requests out (1 req/s by design), so results
@@ -30,10 +30,8 @@ test('finds a track with artist and album metadata', async ({ context, page }) =
 test('narrows a track search with the artist field', async ({ context, page }) => {
   await freshSession(context, page, 'search-artist');
 
-  await page
-    .getByPlaceholder('Artist (opt)')
-    .filter({ visible: true })
-    .fill(maritime.artist);
+  await page.getByRole('button', { name: 'Add artist filter' }).click();
+  await page.getByPlaceholder('Artist name').fill(maritime.artist);
   await search(page, 'Maritime', 'TRACK');
 
   await expect(page.getByText(maritime.artist).first()).toBeVisible({ timeout: RESULT_TIMEOUT });

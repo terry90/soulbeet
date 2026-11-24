@@ -180,10 +180,18 @@ export async function performSearch(
   query: string,
   type: 'ALBUM' | 'TRACK',
 ): Promise<void> {
-  await page.getByRole('button', { name: type, exact: true }).filter({ visible: true }).click();
-  await page.getByPlaceholder('Search artist, album or track...').fill(query);
-  await page.getByRole('button', { name: 'SEARCH', exact: true }).filter({ visible: true }).click();
+  await page.getByRole('radio', { name: type }).check();
+  await page.getByRole('searchbox').fill(query);
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   await expect(page.getByText('Search Results')).toBeVisible({ timeout: 45_000 });
+}
+
+/** Opens the status line under the search bar, which lists each service. */
+export async function openServiceStatus(page: Page): Promise<void> {
+  await page
+    .locator('summary')
+    .filter({ hasText: /attention|online|Checking/ })
+    .click();
 }
 
 export async function openDownloadsPanel(page: Page): Promise<void> {

@@ -9,7 +9,7 @@ use shared::system::NavidromeStatus;
 use super::panel::{Messages, LABEL_CLASS};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::{submitted_text, Autofill, TextInput};
+use crate::{submitted_text, Autofill, FieldKind, TextInput};
 
 const NOTE_CLASS: &str = "text-xs text-gray-500 font-mono";
 
@@ -104,14 +104,14 @@ pub(super) fn PasswordSection(proof: PasswordProof, on_change: EventHandler<()>)
                 placeholder,
                 aria_label: "Current password",
                 autofill: Autofill::CurrentPassword,
-                password: true,
+                kind: FieldKind::Password,
               }
               TextInput {
                 name: NEW_PASSWORD,
                 placeholder: "New password",
                 aria_label: "New password",
                 autofill: Autofill::NewPassword,
-                password: true,
+                kind: FieldKind::Password,
                 class: "mt-2",
               }
               button { class: "retro-btn mt-2 rounded", "type": "submit", "Change Password" }
@@ -208,7 +208,7 @@ pub(super) fn SingleSignOnSection(
               placeholder,
               aria_label: "Password to link single sign-on",
               autofill: Autofill::CurrentPassword,
-              password: true,
+              kind: FieldKind::Password,
             }
             button {
               class: "retro-btn mt-2 rounded",
@@ -270,7 +270,7 @@ pub(super) fn NavidromeSection(on_change: EventHandler<()>) -> Element {
           oninput: move |v| password.set(v),
           placeholder: "Navidrome password",
           aria_label: "Navidrome password",
-          password: true,
+          kind: FieldKind::Password,
         }
         button {
           class: "retro-btn mt-2 rounded",
