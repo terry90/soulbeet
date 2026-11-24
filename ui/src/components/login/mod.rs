@@ -4,7 +4,8 @@ use std::pin::Pin;
 use dioxus::prelude::*;
 
 use crate::{
-    submitted_text, Autofill, BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput,
+    submitted_text, Autofill, BackgroundGlows, FieldKind, FieldLook, GlowColor, GlowSpread, Logo,
+    TextInput,
 };
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
@@ -101,7 +102,7 @@ pub fn Login(props: Props) -> Element {
                 name: PASSWORD,
                 autofill: Autofill::CurrentPassword,
                 placeholder: "Enter password",
-                password: true,
+                kind: FieldKind::Password,
               }
             }
 

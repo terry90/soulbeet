@@ -4,7 +4,7 @@ use shared::system::NavidromeStatus;
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
 use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
 use crate::friendly_error;
-use crate::{use_auth, use_system_health, TextInput, NOT_LINKED_HINT};
+use crate::{use_auth, use_system_health, FieldKind, TextInput, NOT_LINKED_HINT};
 
 #[component]
 pub fn AppConfigManager() -> Element {
@@ -74,7 +74,7 @@ pub fn AppConfigManager() -> Element {
                                 value: slskd_api_key(),
                                 oninput: move |v| slskd_api_key.set(v),
                                 placeholder: "Enter slskd API key",
-                                password: true,
+                                kind: FieldKind::Password,
                             }
                         }
                     }

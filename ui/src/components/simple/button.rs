@@ -20,12 +20,19 @@ impl ButtonVariant {
 #[derive(Props, Clone, PartialEq)]
 pub struct Props {
     children: Element,
-    #[props(into)]
-    onclick: EventHandler<MouseEvent>,
+    /// Leave out for a submit button, whose form handles the press.
+    #[props(optional)]
+    onclick: Option<EventHandler<MouseEvent>>,
     #[props(optional, default)]
     variant: ButtonVariant,
     #[props(optional, default)]
     disabled: bool,
+    /// Submits the form it is in.
+    #[props(optional, default)]
+    submit: bool,
+    /// The action it started is under way: disabled, but not dimmed.
+    #[props(optional, default)]
+    busy: bool,
     #[props(optional, into)]
     class: String,
 }
@@ -33,22 +40,27 @@ pub struct Props {
 #[component]
 pub fn Button(props: Props) -> Element {
     let variant_classes = props.variant.get_classes();
-    let disabled_classes = if props.disabled {
-        "opacity-30 cursor-not-allowed grayscale pointer-events-none"
+    let disabled = props.disabled || props.busy;
+    let disabled_classes = if props.busy {
+        "opacity-80 pointer-events-none"
+    } else if props.disabled {
+        "opacity-50 cursor-not-allowed grayscale pointer-events-none"
     } else {
         ""
     };
     let additional_classes = props.class;
+    let onclick = props.onclick;
 
     rsx! {
         button {
             class: "{variant_classes} {disabled_classes} {additional_classes} rounded",
+            r#type: if props.submit { "submit" } else { "button" },
             onclick: move |evt| {
-                if !props.disabled {
-                    props.onclick.call(evt)
+                if let (false, Some(onclick)) = (disabled, onclick) {
+                    onclick.call(evt)
                 }
             },
-            disabled: props.disabled,
+            disabled,
             {props.children}
         }
     }

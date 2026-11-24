@@ -12,7 +12,7 @@ use super::panel::{
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::{Autofill, ConfirmModal, FieldLook, TextInput};
+use crate::{Autofill, ConfirmModal, FieldKind, FieldLook, TextInput};
 
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
 const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
@@ -137,7 +137,7 @@ fn OtherAccountPassword(
         oninput,
         placeholder,
         autofill: Autofill::Off,
-        password: true,
+        kind: FieldKind::Password,
       }
     }
 }

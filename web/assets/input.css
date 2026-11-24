@@ -35,9 +35,12 @@
         @apply bg-beet-panel/80 backdrop-blur-md border border-white/10 shadow-xl;
     }
     
+    /* Only the hover look fades. WebKit hangs, then crashes, when a button
+       fading its opacity and filter at once, as from disabled to enabled,
+       gets a new opacity before the fade ends. */
     .retro-btn {
-        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf 
-               transition-all duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
+        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf
+               transition-[color,background-color,border-color,box-shadow] duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
     }
 
     /* For a scrolling box: fades its bottom edge so cut-off content reads as more to scroll.
@@ -99,6 +102,18 @@
         }
     }
 
+    /* A light that runs along a seam between two rows while something
+       loads. Without motion it rests as a still line across the seam. */
+    .seam-light {
+        background: linear-gradient(90deg, transparent, var(--color-beet-accent), var(--color-beet-leaf), transparent) no-repeat;
+        background-size: 40% 100%;
+        animation: seam-sweep 1.4s ease-in-out infinite;
+        @variant motion-reduce {
+            animation: none;
+            background-size: 100% 100%;
+        }
+    }
+
     .nav-link {
         @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
     }
@@ -132,6 +147,11 @@ textarea {
     @variant max-md {
         font-size: 16px;
     }
+}
+
+@keyframes seam-sweep {
+    from { background-position: -60% 0; }
+    to { background-position: 160% 0; }
 }
 
 /* Base Styles */

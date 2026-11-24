@@ -48,6 +48,13 @@ pub(crate) fn click(dom: &mut VirtualDom, target: ElementId) {
     fire(dom, "click", data, target);
 }
 
+/// Fires a change at `target`, as a radio sends when it is chosen, and
+/// runs what that starts.
+pub(crate) fn change(dom: &mut VirtualDom, target: ElementId) {
+    let data = PlatformEventData::new(Box::new(SerializedFormData::new(String::new(), vec![])));
+    fire(dom, "change", data, target);
+}
+
 /// Submits `form` with `fields` as `(name, text)` pairs, runs what that
 /// starts, and tells whether the browser's own submit is still on.
 pub(crate) fn submit_form(dom: &mut VirtualDom, form: ElementId, fields: &[(&str, &str)]) -> bool {

@@ -57,10 +57,11 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
                     let folder_clone = folder.clone();
                     rsx! {
                         button {
+                            r#type: "button",
                             class: if is_active {
-                                "flex items-center gap-2 w-full text-left px-3 py-2.5 text-sm font-mono cursor-pointer bg-beet-leaf/10 text-beet-leaf"
+                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] text-sm font-mono cursor-pointer bg-beet-leaf/10 text-beet-leaf"
                             } else {
-                                "flex items-center gap-2 w-full text-left px-3 py-2.5 hover:bg-white/5 text-sm font-mono cursor-pointer text-gray-300"
+                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] hover:bg-white/5 text-sm font-mono cursor-pointer text-gray-300"
                             },
                             onclick: move |_| on_select_folder.call(folder_clone.clone()),
                             if is_active {
