@@ -12,7 +12,7 @@ use super::panel::{
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::{ConfirmModal, FieldLook, TextInput};
+use crate::{Autofill, ConfirmModal, FieldLook, TextInput};
 
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
 const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
@@ -242,6 +242,7 @@ pub fn UserManager() -> Element {
               value: new_password(),
               oninput: move |v| new_password.set(v),
               placeholder: "Password",
+              autofill: Autofill::NewPassword,
               password: true,
             }
           }
@@ -288,6 +289,7 @@ pub fn UserManager() -> Element {
                                   value: edit_user_password(),
                                   oninput: move |v| edit_user_password.set(v),
                                   placeholder: "New password",
+                                  autofill: Autofill::NewPassword,
                                   password: true,
                                 }
                                 if let Some(note) = reset_note {

@@ -3,9 +3,22 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-use crate::{BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput};
+use crate::{Autofill, BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput};
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
+
+/// The keys the login form submits its fields under.
+const USERNAME: &str = "username";
+const PASSWORD: &str = "password";
+
+/// What the submitted form holds under `name`: the field's text at that
+/// moment, typed or filled in by a password manager without an input event.
+fn submitted(form: &FormData, name: &str) -> String {
+    match form.get_first(name) {
+        Some(FormValue::Text(text)) => text,
+        _ => String::new(),
+    }
+}
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
@@ -20,8 +33,6 @@ pub struct Props {
 
 #[component]
 pub fn Login(props: Props) -> Element {
-    let mut username = use_signal(|| "".to_string());
-    let mut password = use_signal(|| "".to_string());
     let mut error = use_signal(|| "".to_string());
     // A failed password attempt replaces the single sign-on error.
     let shown_error = if error().is_empty() {
@@ -30,9 +41,7 @@ pub fn Login(props: Props) -> Element {
         error()
     };
 
-    let handle_login = move || {
-        let user = username.read().to_string();
-        let pass = password.read().to_string();
+    let handle_login = move |user: String, pass: String| {
         spawn(async move {
             error.set("".to_string());
             match props.login.call((user, pass)).await {
@@ -67,29 +76,35 @@ pub fn Login(props: Props) -> Element {
           // Form
           form {
             class: "space-y-6",
-            onsubmit: move |e| {
+            onsubmit: move |e: Event<FormData>| {
                 e.prevent_default();
-                handle_login();
+                handle_login(submitted(&e, USERNAME), submitted(&e, PASSWORD));
             },
             div {
-              label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              label {
+                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+                r#for: "login-username",
                 "Username"
               }
               TextInput {
                 look: FieldLook::Login,
-                value: username(),
-                oninput: move |v| username.set(v),
+                id: "login-username",
+                name: USERNAME,
+                autofill: Autofill::Username,
                 placeholder: "Enter username",
               }
             }
             div {
-              label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              label {
+                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+                r#for: "login-password",
                 "Password"
               }
               TextInput {
                 look: FieldLook::Login,
-                value: password(),
-                oninput: move |v| password.set(v),
+                id: "login-password",
+                name: PASSWORD,
+                autofill: Autofill::CurrentPassword,
                 placeholder: "Enter password",
                 password: true,
               }
@@ -217,5 +232,85 @@ mod tests {
         assert!(!html.contains("return_to"));
 
         assert!(!render(None, None).contains(api::auth::OIDC_LOGIN_PATH));
+    }
+
+    #[test]
+    fn the_fields_tell_a_password_manager_what_they_hold() {
+        let html = render(None, None);
+        for (id, name, kind, autocomplete) in [
+            ("login-username", USERNAME, "text", "username"),
+            ("login-password", PASSWORD, "password", "current-password"),
+        ] {
+            assert!(html.contains(&format!(" for=\"{id}\">")), "{html}");
+            assert!(
+                html.contains(&format!(
+                    "id=\"{id}\" name=\"{name}\" type=\"{kind}\" autocomplete=\"{autocomplete}\""
+                )),
+                "{html}"
+            );
+        }
+        // No value for a render to write back over what was filled in.
+        assert!(!html.contains("value="), "{html}");
+    }
+
+    thread_local! {
+        static SENT: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn a_sign_in_sends_what_the_form_holds_when_submitted() {
+        use dioxus::core::Mutation;
+        use dioxus::html::{PlatformEventData, SerializedFormData, SerializedFormObject};
+        use futures::FutureExt;
+        use std::{any::Any, rc::Rc};
+
+        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+        let mut dom = VirtualDom::new(|| {
+            let login: LoginCallback = Callback::new(|sent| {
+                SENT.with(|s| s.borrow_mut().push(sent));
+                Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+            });
+            rsx! {
+              Login { login, sso_provider: None, sso_error: None, return_to: None }
+            }
+        });
+        let submits: Vec<_> = dom
+            .rebuild_to_vec()
+            .edits
+            .into_iter()
+            .filter_map(|edit| match edit {
+                Mutation::NewEventListener { name, id } if name == "submit" => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(submits.len(), 1);
+
+        // Filled in by a password manager: no input event reached the fields.
+        let field = |key: &str, text: &str| SerializedFormObject {
+            key: key.into(),
+            text: Some(text.into()),
+            file: None,
+        };
+        let form = SerializedFormData::new(
+            String::new(),
+            vec![field(USERNAME, "ann"), field(PASSWORD, "from the vault")],
+        );
+        let data = PlatformEventData::new(Box::new(form));
+        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
+        dom.runtime()
+            .handle_event("submit", event.clone(), submits[0]);
+        loop {
+            dom.render_immediate(&mut dioxus::core::NoOpMutations);
+            if dom.wait_for_work().now_or_never().is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            SENT.with(|s| s.take()),
+            [("ann".to_string(), "from the vault".to_string())]
+        );
+        // The app signs in, not the browser's own form post.
+        assert!(!event.default_action_enabled());
     }
 }

@@ -9,7 +9,7 @@ use shared::system::NavidromeStatus;
 use super::panel::{Messages, LABEL_CLASS};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::TextInput;
+use crate::{Autofill, TextInput};
 
 const NOTE_CLASS: &str = "text-xs text-gray-500 font-mono";
 
@@ -73,6 +73,7 @@ pub(super) fn PasswordSection(proof: PasswordProof, on_change: EventHandler<()>)
             oninput: move |v| current.set(v),
             placeholder,
             aria_label: "Current password",
+            autofill: Autofill::CurrentPassword,
             password: true,
           }
           TextInput {
@@ -80,6 +81,7 @@ pub(super) fn PasswordSection(proof: PasswordProof, on_change: EventHandler<()>)
             oninput: move |v| password.set(v),
             placeholder: "New password",
             aria_label: "New password",
+            autofill: Autofill::NewPassword,
             password: true,
             class: "mt-2",
           }
@@ -170,6 +172,7 @@ pub(super) fn SingleSignOnSection(
             oninput: move |v| password.set(v),
             placeholder,
             aria_label: "Password to link single sign-on",
+            autofill: Autofill::CurrentPassword,
             password: true,
           }
           button {
@@ -290,7 +293,10 @@ mod tests {
             html.contains("aria-label=\"Password to link single sign-on\""),
             "{html}"
         );
-        assert!(html.contains("placeholder=\"Current password\""), "{html}");
+        assert!(
+            html.contains("autocomplete=\"current-password\" placeholder=\"Current password\""),
+            "{html}"
+        );
         assert!(html.contains("Link single sign-on"), "{html}");
         assert!(!html.contains("Unlink"), "{html}");
 
@@ -393,6 +399,15 @@ mod tests {
         assert!(html.contains("aria-label=\"Current password\""), "{html}");
         assert!(html.contains("placeholder=\"Current password\""), "{html}");
         assert!(html.contains("aria-label=\"New password\""), "{html}");
+        // A password manager fills in the current one and offers to save the new one.
+        assert!(
+            html.contains("autocomplete=\"current-password\" placeholder=\"Current password\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("autocomplete=\"new-password\" placeholder=\"New password\""),
+            "{html}"
+        );
         assert!(html.contains(">Change Password<"), "{html}");
 
         let html = render_password(PasswordProof::NavidromePassword);

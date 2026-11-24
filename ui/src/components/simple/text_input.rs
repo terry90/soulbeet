@@ -25,13 +25,46 @@ impl FieldLook {
     }
 }
 
+/// What a field holds, so a password manager knows what to fill in or save.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Autofill {
+    /// The username of the account signing in.
+    Username,
+    /// The password the account signs in with now.
+    CurrentPassword,
+    /// A password being chosen.
+    NewPassword,
+}
+
+impl Autofill {
+    fn token(self) -> &'static str {
+        match self {
+            Autofill::Username => "username",
+            Autofill::CurrentPassword => "current-password",
+            Autofill::NewPassword => "new-password",
+        }
+    }
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct TextInputProps {
-    #[props(into)]
-    pub value: String,
-    pub oninput: EventHandler<String>,
+    /// The field's text, which `oninput` keeps up to date. Leave both out
+    /// for a field its form reads when submitted: the field then keeps
+    /// whatever is typed or filled in, and no render writes over it.
+    #[props(default, into)]
+    pub value: Option<String>,
+    #[props(default)]
+    pub oninput: Option<EventHandler<String>>,
     #[props(into)]
     pub placeholder: String,
+    /// The id a `label` names in its `for`.
+    #[props(default, into)]
+    pub id: Option<String>,
+    /// The key its form submits the text under.
+    #[props(default, into)]
+    pub name: Option<String>,
+    #[props(default)]
+    pub autofill: Option<Autofill>,
     /// Names the field for screen readers when no label element does.
     #[props(default, into)]
     pub aria_label: Option<String>,
@@ -60,11 +93,18 @@ pub fn TextInput(props: TextInputProps) -> Element {
     rsx! {
         input {
             class,
+            id: props.id,
+            name: props.name,
             r#type: if props.password { "password" } else { "text" },
+            autocomplete: props.autofill.map(Autofill::token),
             placeholder: props.placeholder,
             aria_label: props.aria_label,
             value: props.value,
-            oninput: move |evt: Event<FormData>| oninput.call(evt.value()),
+            oninput: move |evt: Event<FormData>| {
+                if let Some(oninput) = oninput {
+                    oninput.call(evt.value());
+                }
+            },
             onkeydown: move |evt: Event<KeyboardData>| {
                 if let (Key::Enter, Some(on_enter)) = (evt.key(), on_enter) {
                     on_enter.call(());
@@ -109,6 +149,55 @@ mod tests {
         assert!(html.contains("placeholder=\"Username\""), "{html}");
         assert!(html.contains("value=\"typed\""), "{html}");
         assert!(!html.contains("aria-label"), "{html}");
+        assert!(!html.contains("id="), "{html}");
+        assert!(!html.contains("name="), "{html}");
+        assert!(!html.contains("autocomplete"), "{html}");
+    }
+
+    fn render_unbound(autofill: Autofill) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |autofill: Autofill| {
+                rsx! {
+                    TextInput {
+                        id: "field",
+                        name: "secret",
+                        autofill,
+                        placeholder: "Password",
+                        password: true,
+                    }
+                }
+            },
+            autofill,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_field_its_form_reads_has_no_value_to_write_back() {
+        let html = render_unbound(Autofill::CurrentPassword);
+        assert!(
+            html.contains(
+                "id=\"field\" name=\"secret\" type=\"password\" autocomplete=\"current-password\""
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("value"), "{html}");
+    }
+
+    #[test]
+    fn each_autofill_tells_the_password_manager_what_the_field_holds() {
+        for (autofill, token) in [
+            (Autofill::Username, "username"),
+            (Autofill::CurrentPassword, "current-password"),
+            (Autofill::NewPassword, "new-password"),
+        ] {
+            let html = render_unbound(autofill);
+            assert!(
+                html.contains(&format!("autocomplete=\"{token}\"")),
+                "{html}"
+            );
+        }
     }
 
     #[test]
