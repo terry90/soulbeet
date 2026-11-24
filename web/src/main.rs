@@ -22,6 +22,8 @@ use views::{
 };
 
 mod auth;
+#[cfg(feature = "server")]
+mod compression;
 mod views;
 #[cfg(feature = "web")]
 mod websocket;
@@ -90,16 +92,18 @@ fn main() {
 
             // Only the app's pages get the framing header: the consent
             // page sets its own policy.
-            Ok(dioxus::server::router(App)
-                .layer(axum::middleware::map_response(
-                    api::connection::deny_framing,
-                ))
-                .merge(api::connection::router(
-                    api::connection::ConnectionState::live(),
-                ))
-                .merge(api::oidc::router())
-                .merge(api::healthz::router())
-                .layer(CookieManagerLayer::new()))
+            Ok(compression::compress(
+                dioxus::server::router(App)
+                    .layer(axum::middleware::map_response(
+                        api::connection::deny_framing,
+                    ))
+                    .merge(api::connection::router(
+                        api::connection::ConnectionState::live(),
+                    ))
+                    .merge(api::oidc::router())
+                    .merge(api::healthz::router())
+                    .layer(CookieManagerLayer::new()),
+            ))
         });
     }
 
