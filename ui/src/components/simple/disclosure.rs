@@ -88,50 +88,23 @@ pub(crate) struct ToggleDriver {
 impl ToggleDriver {
     /// Renders `dom`, whose only click listener must be the toggle.
     pub(crate) fn new(mut dom: VirtualDom) -> Self {
-        use dioxus::core::Mutation;
-        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
-        let clicks: Vec<dioxus::core::ElementId> = dom
-            .rebuild_to_vec()
-            .edits
-            .into_iter()
-            .filter_map(|edit| match edit {
-                Mutation::NewEventListener { name, id } if name == "click" => Some(id),
-                _ => None,
-            })
-            .collect();
+        let clicks = super::testing::listeners(&mut dom, "click");
         assert_eq!(
             clicks.len(),
             1,
             "expected only the toggle to listen for clicks"
         );
-        let mut driver = Self {
+        // What the first render started (a resource, an effect) ends before any click.
+        super::testing::settle(&mut dom);
+        Self {
             dom,
             toggle: clicks[0],
-        };
-        // What the first render started (a resource, an effect) ends before any click.
-        driver.settle();
-        driver
-    }
-
-    /// Runs what is pending until nothing is left to do.
-    fn settle(&mut self) {
-        use futures::FutureExt;
-        loop {
-            self.dom.render_immediate(&mut dioxus::core::NoOpMutations);
-            if self.dom.wait_for_work().now_or_never().is_none() {
-                break;
-            }
         }
     }
 
     /// Clicks the toggle and runs what that starts until nothing is left to do.
     pub(crate) fn click(&mut self) {
-        use dioxus::html::{PlatformEventData, SerializedMouseData};
-        use std::{any::Any, rc::Rc};
-        let data = PlatformEventData::new(Box::<SerializedMouseData>::default());
-        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
-        self.dom.runtime().handle_event("click", event, self.toggle);
-        self.settle();
+        super::testing::click(&mut self.dom, self.toggle);
     }
 
     pub(crate) fn html(&self) -> String {

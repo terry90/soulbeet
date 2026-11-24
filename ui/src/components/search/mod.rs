@@ -29,7 +29,9 @@ use track::TrackResult;
 
 use crate::search::album::AlbumResult;
 use crate::settings_context::use_settings;
-use crate::{use_auth, use_system_health, Button, SystemStatus};
+use crate::{
+    use_auth, use_system_health, BackgroundGlows, Button, GlowColor, GlowSpread, SystemStatus,
+};
 
 mod download_results;
 use download_results::DownloadResults;
@@ -623,8 +625,7 @@ pub fn Search() -> Element {
 
     rsx! {
       // bg decorations
-      div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[150px] pointer-events-none" }
-      div { class: "fixed bottom-1/4 -right-10 w-64 h-64 bg-beet-leaf/10 rounded-full blur-[150px] pointer-events-none" }
+      BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Wide }
 
       div {
         class: "w-full max-w-3xl space-y-8 z-10 mx-auto flex flex-col items-center mt-20",

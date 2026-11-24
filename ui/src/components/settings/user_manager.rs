@@ -12,7 +12,7 @@ use super::panel::{
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
-use crate::{ConfirmModal, FieldLook, TextInput};
+use crate::{Autofill, ConfirmModal, FieldLook, TextInput};
 
 const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
 const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
@@ -116,6 +116,28 @@ pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
           },
           None => rsx! {},
         }
+      }
+    }
+}
+
+/// A password the admin sets for another account. Autofill is off: the
+/// browser must neither fill in the admin's own password nor save this one
+/// as theirs.
+#[component]
+fn OtherAccountPassword(
+    value: String,
+    oninput: EventHandler<String>,
+    placeholder: &'static str,
+    #[props(default)] look: FieldLook,
+) -> Element {
+    rsx! {
+      TextInput {
+        look,
+        value,
+        oninput,
+        placeholder,
+        autofill: Autofill::Off,
+        password: true,
       }
     }
 }
@@ -238,11 +260,10 @@ pub fn UserManager() -> Element {
           }
           div {
             label { class: LABEL_CLASS, "New Password" }
-            TextInput {
+            OtherAccountPassword {
               value: new_password(),
               oninput: move |v| new_password.set(v),
               placeholder: "Password",
-              password: true,
             }
           }
         }
@@ -283,12 +304,11 @@ pub fn UserManager() -> Element {
                             if editing_user_id() == Some(user.id.clone()) {
                               div { class: "flex flex-col gap-2",
                                 div { class: "font-bold text-white font-display", "{user.username}" }
-                                TextInput {
+                                OtherAccountPassword {
                                   look: FieldLook::Compact,
                                   value: edit_user_password(),
                                   oninput: move |v| edit_user_password.set(v),
                                   placeholder: "New password",
-                                  password: true,
                                 }
                                 if let Some(note) = reset_note {
                                   p { class: "text-xs text-gray-500 font-mono", "{note}" }
@@ -380,6 +400,24 @@ mod tests {
             role: Role::User,
             has_password,
             sso_name: sso_name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_password_for_another_account_is_not_the_admins_to_fill_or_save() {
+        for look in [FieldLook::Form, FieldLook::Compact] {
+            let mut dom = VirtualDom::new_with_props(
+                |look: FieldLook| {
+                    rsx! {
+                        OtherAccountPassword { look, value: "", oninput: |_| {}, placeholder: "Password" }
+                    }
+                },
+                look,
+            );
+            dom.rebuild_in_place();
+            let field = dioxus_ssr::render(&dom);
+            assert!(field.contains("autocomplete=\"off\""), "{field}");
+            assert!(field.contains("type=\"password\""), "{field}");
         }
     }
 

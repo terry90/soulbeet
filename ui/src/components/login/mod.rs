@@ -3,9 +3,15 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-use crate::{FieldLook, Logo, TextInput};
+use crate::{
+    submitted_text, Autofill, BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput,
+};
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
+
+/// The keys the login form submits its fields under.
+const USERNAME: &str = "username";
+const PASSWORD: &str = "password";
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
@@ -20,8 +26,6 @@ pub struct Props {
 
 #[component]
 pub fn Login(props: Props) -> Element {
-    let mut username = use_signal(|| "".to_string());
-    let mut password = use_signal(|| "".to_string());
     let mut error = use_signal(|| "".to_string());
     // A failed password attempt replaces the single sign-on error.
     let shown_error = if error().is_empty() {
@@ -30,9 +34,7 @@ pub fn Login(props: Props) -> Element {
         error()
     };
 
-    let handle_login = move || {
-        let user = username.read().to_string();
-        let pass = password.read().to_string();
+    let handle_login = move |user: String, pass: String| {
         spawn(async move {
             error.set("".to_string());
             match props.login.call((user, pass)).await {
@@ -47,8 +49,7 @@ pub fn Login(props: Props) -> Element {
     rsx! {
       div { class: "flex flex-col items-center justify-center min-h-screen text-white font-display",
         // bg decorations
-        div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[150px] pointer-events-none" }
-        div { class: "fixed bottom-1/4 -right-10 w-64 h-64 bg-beet-leaf/10 rounded-full blur-[150px] pointer-events-none" }
+        BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Wide }
 
         div { class: "p-8 bg-beet-panel border border-white/10 rounded-lg shadow-2xl w-full max-w-md relative z-10",
           // Header
@@ -65,32 +66,40 @@ pub fn Login(props: Props) -> Element {
             }
           }
 
-          // Form
+          // A post, so a submit the app fails to catch never puts the
+          // password in the address.
           form {
             class: "space-y-6",
-            onsubmit: move |e| {
+            method: "post",
+            onsubmit: move |e: Event<FormData>| {
                 e.prevent_default();
-                handle_login();
+                handle_login(submitted_text(&e, USERNAME), submitted_text(&e, PASSWORD));
             },
             div {
-              label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              label {
+                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+                r#for: "login-username",
                 "Username"
               }
               TextInput {
                 look: FieldLook::Login,
-                value: username(),
-                oninput: move |v| username.set(v),
+                id: "login-username",
+                name: USERNAME,
+                autofill: Autofill::Username,
                 placeholder: "Enter username",
               }
             }
             div {
-              label { class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+              label {
+                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
+                r#for: "login-password",
                 "Password"
               }
               TextInput {
                 look: FieldLook::Login,
-                value: password(),
-                oninput: move |v| password.set(v),
+                id: "login-password",
+                name: PASSWORD,
+                autofill: Autofill::CurrentPassword,
                 placeholder: "Enter password",
                 password: true,
               }
@@ -163,6 +172,7 @@ pub fn Login(props: Props) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opening_tag as tag;
 
     fn render(sso_provider: Option<&str>, return_to: Option<&str>) -> String {
         #[derive(Props, PartialEq, Clone)]
@@ -218,5 +228,64 @@ mod tests {
         assert!(!html.contains("return_to"));
 
         assert!(!render(None, None).contains(api::auth::OIDC_LOGIN_PATH));
+    }
+
+    #[test]
+    fn the_fields_tell_a_password_manager_what_they_hold() {
+        let html = render(None, None);
+        // A post, so the browser's own submit never puts them in the address.
+        assert!(
+            tag(&html, "class=\"space-y-6\"").contains("method=\"post\""),
+            "{html}"
+        );
+        for (id, name, kind, autocomplete) in [
+            ("login-username", USERNAME, "text", "username"),
+            ("login-password", PASSWORD, "password", "current-password"),
+        ] {
+            assert!(html.contains(&format!(" for=\"{id}\">")), "{html}");
+            let field = tag(&html, &format!("id=\"{id}\""));
+            for attribute in [
+                format!("name=\"{name}\""),
+                format!("type=\"{kind}\""),
+                format!("autocomplete=\"{autocomplete}\""),
+            ] {
+                assert!(field.contains(&attribute), "{attribute} in {field}");
+            }
+        }
+        // No value for a render to write back over what was filled in.
+        assert!(!html.contains("value="), "{html}");
+    }
+
+    thread_local! {
+        static SENT: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn a_sign_in_sends_what_the_form_holds_when_submitted() {
+        let mut dom = VirtualDom::new(|| {
+            let login: LoginCallback = Callback::new(|sent| {
+                SENT.with(|s| s.borrow_mut().push(sent));
+                Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+            });
+            rsx! {
+              Login { login, sso_provider: None, sso_error: None, return_to: None }
+            }
+        });
+        let submits = crate::listeners(&mut dom, "submit");
+        assert_eq!(submits.len(), 1);
+
+        // Filled in by a password manager: no input event reached the fields.
+        let browser_submits = crate::submit_form(
+            &mut dom,
+            submits[0],
+            &[(USERNAME, "ann"), (PASSWORD, "from the vault")],
+        );
+
+        assert_eq!(
+            SENT.with(|s| s.take()),
+            [("ann".to_string(), "from the vault".to_string())]
+        );
+        // The app signs in, not the browser's own form post.
+        assert!(!browser_submits);
     }
 }

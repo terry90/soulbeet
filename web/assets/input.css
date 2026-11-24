@@ -46,6 +46,59 @@
         mask-image: linear-gradient(to bottom, black calc(100% - 2.5rem), transparent);
     }
 
+    /* The two soft discs of colour behind a page: what a 16rem disc of a
+       colour at 10% looks like under a Gaussian blur, painted as a gradient
+       with no filter. Safari on iOS 26 stalls for seconds on a large
+       filter: blur() over fixed elements (WebKit bug 319187).
+       --glow-spread is the blur's radius, --glow-peak the opacity left at
+       the centre, 10% * (1 - exp(-R^2 / (2 * spread^2))) for the disc's
+       radius R, and the stops follow the blurred disc's falloff out to
+       three radii of the blur. */
+    .glow {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: radial-gradient(
+            circle calc(8rem + 3 * var(--glow-spread)) at var(--glow-at),
+            color-mix(in srgb, var(--glow-color) var(--glow-peak), transparent) 0%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.941), transparent) 10%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.783), transparent) 20%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.576), transparent) 30%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.374), transparent) 40%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.214), transparent) 50%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.108), transparent) 60%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.048), transparent) 70%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.019), transparent) 80%,
+            color-mix(in srgb, var(--glow-color) calc(var(--glow-peak) * 0.006), transparent) 90%,
+            transparent 100%
+        );
+    }
+
+    .glow-top-left {
+        --glow-at: 5.5rem calc(25% + 8rem);
+    }
+
+    .glow-bottom-right {
+        --glow-at: calc(100% - 5.5rem) calc(75% - 8rem);
+    }
+
+    /* The disc is 16rem, and a rem is 14px below md and 16px from it. */
+    .glow-wide {
+        --glow-spread: 150px;
+        --glow-peak: 2.43%;
+        @variant md {
+            --glow-peak: 3.05%;
+        }
+    }
+
+    .glow-tight {
+        --glow-spread: 100px;
+        --glow-peak: 4.66%;
+        @variant md {
+            --glow-peak: 5.59%;
+        }
+    }
+
     .nav-link {
         @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
     }
@@ -68,6 +121,17 @@
 
 html {
     @apply text-sm md:text-base;
+}
+
+/* Safari on iOS zooms the page into a field under 16px when it takes focus,
+   and below md the root is 14px. Outside any layer, so a text-sm or text-xs
+   class on a field cannot undo it. */
+input:not([type="checkbox"], [type="radio"]),
+select,
+textarea {
+    @variant max-md {
+        font-size: 16px;
+    }
 }
 
 /* Base Styles */

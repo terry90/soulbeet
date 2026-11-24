@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 
 use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
@@ -19,6 +20,10 @@ use crate::friendly_error;
 pub struct DownloadsProps {
     pub is_open: Signal<bool>,
     pub downloads: Signal<HashMap<String, DownloadProgress>>,
+    /// Where focus goes back to once the drawer closes: the toggle that
+    /// opened it.
+    #[props(into)]
+    pub return_focus_to: ReadSignal<Option<Rc<MountedData>>>,
 }
 
 #[component]
@@ -119,16 +124,39 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         },
     );
 
-    let close_modal = move |_| props.is_open.set(false);
+    // Keys and screen readers start in the drawer once it opens, and go
+    // back to the toggle when it closes: focus left inside an inert drawer
+    // falls to the top of the page.
+    let mut close_button = use_signal(|| None::<Rc<MountedData>>);
+    use_effect(move || {
+        if (props.is_open)() {
+            focus(close_button.peek().clone());
+        }
+    });
+    let close_modal = move |_| {
+        props.is_open.set(false);
+        focus(props.return_focus_to.peek().clone());
+    };
 
-    let (modal_opacity, panel_translate, pointer_events) = if (*props.is_open)() {
-        ("opacity-100", "translate-x-0", "pointer-events-auto")
+    let open = (*props.is_open)();
+    // Closed, it turns hidden once the fade ends, so browsers neither paint
+    // nor composite it, and inert right away, so clicks, keys and screen
+    // readers pass it by while it fades. Opening shows it at once, so its
+    // close button can take focus.
+    let (modal_opacity, panel_translate, visibility) = if open {
+        ("opacity-100", "translate-x-0", "visible transition-opacity")
     } else {
-        ("opacity-0", "translate-x-full", "pointer-events-none")
+        (
+            "opacity-0",
+            "translate-x-full",
+            "invisible transition-[opacity,visibility]",
+        )
     };
 
     rsx! {
-      div { class: "fixed inset-0 z-50 flex justify-end transition-opacity duration-200 ease-out {modal_opacity} {pointer_events}",
+      div {
+        class: "fixed inset-0 z-50 flex justify-end duration-200 ease-out {modal_opacity} {visibility}",
+        "inert": (!open).then_some(true),
         // Backdrop
         div {
           class: "absolute inset-0 bg-black/60 backdrop-blur-sm cursor-pointer",
@@ -150,6 +178,7 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
             button {
               class: "text-gray-400 hover:text-white transition-colors cursor-pointer",
               aria_label: "Close downloads",
+              onmounted: move |e| close_button.set(Some(e.data())),
               onclick: close_modal,
               svg {
                 class: "w-6 h-6",
@@ -204,6 +233,15 @@ enum Failure {
     OnRow,
     /// In the picker that sent it, which stays.
     InPicker(String),
+}
+
+/// Moves keyboard focus to `element`, once it is mounted.
+fn focus(element: Option<Rc<MountedData>>) {
+    if let Some(element) = element {
+        spawn(async move {
+            let _ = element.set_focus(true).await;
+        });
+    }
 }
 
 /// Picks and match loads come from the picker; Retry and as-is from the row.
@@ -267,6 +305,81 @@ mod tests {
         let p =
             DownloadProgress::queued(item.into(), "peer".into(), item.into(), 1).with_state(state);
         (item.to_string(), p)
+    }
+
+    /// The drawer's outer element as the server renders it.
+    fn drawer(open: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |open: bool| {
+                let is_open = use_signal(|| open);
+                let downloads = use_signal(HashMap::new);
+                let return_focus_to = use_signal(|| None);
+                rsx! { Downloads { is_open, downloads, return_focus_to } }
+            },
+            open,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        html[..html.find('>').unwrap()].to_string()
+    }
+
+    #[test]
+    fn a_closed_drawer_is_hidden_and_inert_once_its_fade_ends() {
+        let closed = drawer(false);
+        assert!(closed.contains(" inert=true"), "{closed}");
+        assert!(closed.contains(" invisible"), "{closed}");
+        assert!(
+            closed.contains("transition-[opacity,visibility]"),
+            "{closed}"
+        );
+        let open = drawer(true);
+        assert!(!open.contains("inert"), "{open}");
+        assert!(!open.contains("invisible"), "{open}");
+        // Shown at once, so its close button can take focus.
+        assert!(open.contains(" transition-opacity"), "{open}");
+        assert!(!open.contains("visibility"), "{open}");
+    }
+
+    thread_local! {
+        static TOGGLE_FOCUSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The navbar toggle, counting the times it is asked to take focus.
+    struct Toggle;
+
+    impl RenderedElementBacking for Toggle {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn set_focus(
+            &self,
+            focus: bool,
+        ) -> Pin<Box<dyn Future<Output = dioxus::html::MountedResult<()>>>> {
+            if focus {
+                TOGGLE_FOCUSED.with(|f| f.set(f.get() + 1));
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn closing_from_inside_gives_focus_back_to_the_toggle() {
+        let mut dom = VirtualDom::new(|| {
+            let is_open = use_signal(|| true);
+            let downloads = use_signal(HashMap::new);
+            let return_focus_to = use_signal(|| Some(Rc::new(MountedData::new(Toggle))));
+            rsx! { Downloads { is_open, downloads, return_focus_to } }
+        });
+        // The backdrop, the close button, then the footer's clear button.
+        let clicks = crate::listeners(&mut dom, "click");
+        assert_eq!(clicks.len(), 3);
+        for (closer, focused) in [(clicks[1], 1), (clicks[0], 2)] {
+            crate::click(&mut dom, closer);
+            assert_eq!(TOGGLE_FOCUSED.with(|f| f.get()), focused);
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains(" inert=true"), "{html}");
+        }
     }
 
     #[test]
