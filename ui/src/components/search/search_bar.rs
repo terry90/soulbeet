@@ -222,10 +222,11 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             }
           }
         }
-        p { class: "sr-only", role: "status",
-          if loading {
-            "Searching"
-          }
+      }
+      // Outside the busy form, whose changes a screen reader may hold back.
+      p { class: "sr-only", role: "status",
+        if loading {
+          "Searching"
         }
       }
     }
@@ -403,7 +404,7 @@ mod tests {
         assert!(opening_tag(&idle, "role=\"search\"").contains("aria-busy=false"));
         assert!(!idle.contains("seam-light"), "{idle}");
         assert!(
-            idle.contains("<p class=\"sr-only\" role=\"status\"></p>"),
+            idle.contains("</form><p class=\"sr-only\" role=\"status\"></p>"),
             "{idle}"
         );
 
@@ -413,8 +414,9 @@ mod tests {
         });
         assert!(opening_tag(&html, "role=\"search\"").contains("aria-busy=true"));
         assert!(html.contains("seam-light"), "{html}");
+        // After the form, so its aria-busy does not hold the news back.
         assert!(
-            html.contains("<p class=\"sr-only\" role=\"status\">Searching</p>"),
+            html.contains("</form><p class=\"sr-only\" role=\"status\">Searching</p>"),
             "{html}"
         );
         let button = opening_tag(&html, "retro-btn");
