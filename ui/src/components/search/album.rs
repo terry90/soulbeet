@@ -7,6 +7,17 @@ use super::download_icon::{DownloadIcon, DownloadRowState};
 use super::inline_track_panel::InlineTrackPanel;
 use crate::CoverArt;
 
+/// The year the album first came out and its release types, as
+/// "2003 · Album · Live"; None when it has neither.
+fn album_facts(album: &Album) -> Option<String> {
+    let year = (album.first_release_date.as_deref()).map(|d| d.chars().take(4).collect());
+    let facts: Vec<String> = year
+        .into_iter()
+        .chain(album.release_types.iter().flatten().cloned())
+        .collect();
+    (!facts.is_empty()).then(|| facts.join(" · "))
+}
+
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     pub album: Album,
@@ -53,8 +64,8 @@ pub fn AlbumResult(props: Props) -> Element {
                         "{album.title}"
                     }
                     p { class: "text-xs text-gray-400 font-mono truncate", "{album.artist}" }
-                    if let Some(release_date) = &album.release_date {
-                        p { class: "text-xs text-gray-500 font-mono", "{release_date}" }
+                    if let Some(facts) = album_facts(album) {
+                        p { class: "text-xs text-gray-500 font-mono", "{facts}" }
                     }
                 }
 
@@ -128,5 +139,43 @@ pub fn AlbumResult(props: Props) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn album(first_release_date: Option<&str>, release_types: &[&str]) -> Album {
+        Album {
+            id: "accde5f7-04da-4c66-bb8e-7bb3d39ad326".into(),
+            title: "Wonder What’s Next".into(),
+            artist: "Chevelle".into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: (!release_types.is_empty())
+                .then(|| release_types.iter().map(|t| t.to_string()).collect()),
+            first_release_date: first_release_date.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_album_row_shows_its_year_and_types() {
+        let facts = |date, types| album_facts(&album(date, types));
+        assert_eq!(
+            facts(Some("2002-08-27"), &["Album"]).as_deref(),
+            Some("2002 · Album")
+        );
+        assert_eq!(
+            facts(Some("2003"), &["Album", "Live"]).as_deref(),
+            Some("2003 · Album · Live")
+        );
+        assert_eq!(
+            facts(None, &["Album", "Live"]).as_deref(),
+            Some("Album · Live")
+        );
+        assert_eq!(facts(Some("1999"), &[]).as_deref(), Some("1999"));
+        assert_eq!(facts(None, &[]), None);
     }
 }
