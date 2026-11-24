@@ -3,7 +3,9 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, json_chars, TEXT_MAX_CHARS};
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{
+    asks_no_title, Album, AlbumWithTracks, ArtistSummary, Discography, SearchResult, Track,
+};
 use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
 
 use super::args::Args;
@@ -102,10 +104,12 @@ fn recording_entry(t: &Track) -> Value {
     whole_ids(entry, &["id", "recording_mbid"])
 }
 
-/// A found release; `release_types` is null when the provider gave none (D15).
+/// A found release; `release_types` is null when the provider gave none (D15),
+/// and `first_release_date` is when its release group first came out.
 fn release_entry(a: &Album) -> Value {
     let entry = json!({"id": a.id, "release_mbid": a.mbid, "title": cut(a.title.clone()),
         "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
+        "first_release_date": cut_opt(a.first_release_date.clone()),
         "release_types": a.release_types});
     whole_ids(entry, &["id", "release_mbid"])
 }
@@ -126,14 +130,42 @@ pub(crate) fn artist_fields(query: &str, found: &[ArtistMatch]) -> Map<String, V
     search_fields("artist", query, entries)
 }
 
-/// `({"release": {"id", "mbid", "title", "artist", "date", "release_types"}},
-/// the tracks)`; `release_types` is null for None (D15). A track's
+/// An artist-only release search: the artist found, the others carrying the
+/// name, and the artist's releases in discography order. With no artist
+/// found, `artist` is null and the empty list is complete.
+pub(crate) fn discography_fields(query: &str, found: Option<&Discography>) -> Map<String, Value> {
+    let summary = |a: &ArtistSummary| {
+        let entry = json!({"mbid": a.mbid, "name": cut(a.name.clone()),
+            "disambiguation": cut_opt(a.disambiguation.clone())});
+        whole_ids(entry, &["mbid"])
+    };
+    let (artist, others, complete, entries) = match found {
+        Some(d) => (
+            summary(&d.artist),
+            d.others.iter().map(summary).collect::<Vec<_>>(),
+            d.complete,
+            d.albums.iter().map(release_entry).collect(),
+        ),
+        None => (Value::Null, vec![], true, vec![]),
+    };
+    // Fitted with `complete` at its longest, false, which it may still become.
+    let fields = object(json!({"kind": "release", "query": query, "artist": artist,
+        "other_artists": others, "complete": false}));
+    let mut fields = fit_whole(fields, "releases", entries, "left_out");
+    let whole = fields["left_out"] == json!(0);
+    fields.insert("complete".into(), json!(complete && whole));
+    fields
+}
+
+/// `({"release": {"id", "mbid", "title", "artist", "date",
+/// "first_release_date", "release_types"}}, the tracks)`; `release_types` is null for None (D15). A track's
 /// `position` is its 1-based place in the release's running order across
 /// media.
 pub(crate) fn release_fields(release: &AlbumWithTracks) -> (Map<String, Value>, Vec<Value>) {
     let a = &release.album;
     let album = json!({"id": a.id, "mbid": a.mbid, "title": cut(a.title.clone()),
         "artist": cut(a.artist.clone()), "date": cut_opt(a.release_date.clone()),
+        "first_release_date": cut_opt(a.first_release_date.clone()),
         "release_types": a.release_types});
     let fields = object(json!({"release": whole_ids(album, &["id", "mbid"])}));
     let tracks = release
@@ -185,20 +217,43 @@ pub(crate) async fn search_music(
     _caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new(SEARCH, args, &["kind", "query", "artist", "limit"]);
+    let args = Args::new(
+        SEARCH,
+        args,
+        &["kind", "query", "artist", "artist_mbid", "limit"],
+    );
     answer(
         async {
             let kind = args.opt_choice("kind", KINDS)?.ok_or_else(|| {
                 invalid_value(SEARCH, "kind", &format!("one of {}", KINDS.join(", ")))
             })?;
-            let query = args.string("query")?;
+            let query = args.opt_string("query")?.unwrap_or_default();
             let artist = args.opt_string("artist")?;
+            let artist_mbid = args.opt_mbid("artist_mbid")?;
             let limit = args.opt_u32("limit", 1, 25)?.unwrap_or(10);
             if kind == "artist" && artist.is_some() {
                 return Err(invalid_value(
                     SEARCH,
                     "artist",
                     "absent for kind artist: put the name in query",
+                ));
+            }
+            // The artist whose releases to list: a release search with an artist and no title.
+            let listing = artist
+                .as_deref()
+                .filter(|_| kind == "release" && asks_no_title(&query));
+            if asks_no_title(&query) && listing.is_none() {
+                return Err(invalid_value(
+                    SEARCH,
+                    "query",
+                    "text to search for; only kind release with an artist takes none, to list that artist's releases",
+                ));
+            }
+            if artist_mbid.is_some() && listing.is_none() {
+                return Err(invalid_value(
+                    SEARCH,
+                    "artist_mbid",
+                    "absent unless kind is release with an artist and no query",
                 ));
             }
             args.finish()?;
@@ -208,13 +263,18 @@ pub(crate) async fn search_music(
                 "artist" => None,
                 other => unreachable!("opt_choice answers one of KINDS, not {other}"),
             };
-            let found = match search_kind {
-                Some(search_kind) => {
+            let found = match (listing, search_kind) {
+                (Some(name), _) => {
+                    metadata::discography(name, artist_mbid.as_deref(), limit as usize)
+                        .await
+                        .map(|found| discography_fields(&query, found.as_ref()))
+                }
+                (None, Some(search_kind)) => {
                     metadata::search(search_kind, artist.as_deref(), &query, limit as usize)
                         .await
                         .map(|results| music_fields(kind, &query, &results))
                 }
-                None => {
+                (None, None) => {
                     let limit = u8::try_from(limit).expect("limit is at most 25");
                     metadata::artists(&query, limit)
                         .await
@@ -222,7 +282,8 @@ pub(crate) async fn search_music(
                 }
             };
             found.map_err(|f| {
-                let facts = object(json!({"kind": kind, "query": query, "artist": artist}));
+                let facts = object(json!({"kind": kind, "query": query, "artist": artist,
+                    "artist_mbid": artist_mbid}));
                 upstream_error(f, facts, args.same_call())
             })
         }
@@ -338,13 +399,101 @@ mod tests {
             mbid: Some("317d1e85-3f9e-463e-939b-bebf47aa2178".into()),
             cover_url: None,
             release_types: Some(vec!["Album".into(), "Compilation".into()]),
-            first_release_date: None,
+            first_release_date: Some("1945".into()),
         };
         let doc = music_fields("release", "Merry Christmas", &[SearchResult::Album(album)]);
         assert_eq!(
-            doc["releases"][0]["release_types"],
-            json!(["Album", "Compilation"])
+            (
+                &doc["releases"][0]["release_types"],
+                &doc["releases"][0]["first_release_date"]
+            ),
+            (&json!(["Album", "Compilation"]), &json!("1945"))
         );
+    }
+
+    fn nirvana(mbid: &str, disambiguation: &str) -> ArtistSummary {
+        ArtistSummary {
+            mbid: mbid.into(),
+            name: "Nirvana".into(),
+            disambiguation: Some(disambiguation.into()),
+        }
+    }
+
+    #[test]
+    fn a_release_listing_names_the_artist_and_the_others() {
+        let bleach = Album {
+            id: "f1afec0b-26dd-3db5-9aa1-c91229a74a24".into(),
+            title: "Bleach".into(),
+            artist: "Nirvana".into(),
+            release_date: None,
+            mbid: Some("f1afec0b-26dd-3db5-9aa1-c91229a74a24".into()),
+            cover_url: None,
+            release_types: Some(vec!["Album".into()]),
+            first_release_date: Some("1989-06".into()),
+        };
+        let found = Discography {
+            artist: nirvana(
+                "5b11f4ce-a62d-471e-81fc-a69a8278c7da",
+                "1980s–1990s US grunge band",
+            ),
+            others: vec![nirvana(
+                "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6",
+                "60s band from the UK",
+            )],
+            albums: vec![bleach.clone()],
+            complete: true,
+        };
+        assert_eq!(
+            Value::Object(discography_fields("", Some(&found))),
+            json!({"kind": "release", "query": "",
+                "artist": {"mbid": "5b11f4ce-a62d-471e-81fc-a69a8278c7da", "name": "Nirvana",
+                    "disambiguation": "1980s–1990s US grunge band"},
+                "other_artists": [{"mbid": "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6", "name": "Nirvana",
+                    "disambiguation": "60s band from the UK"}],
+                "complete": true,
+                "releases": [release_entry(&bleach)],
+                "left_out": 0})
+        );
+        let more = Discography {
+            complete: false,
+            ..found
+        };
+        assert_eq!(discography_fields("", Some(&more))["complete"], false);
+        assert_eq!(
+            Value::Object(discography_fields("*", None)),
+            json!({"kind": "release", "query": "*", "artist": null, "other_artists": [],
+                "complete": true, "releases": [], "left_out": 0})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_can_be_left_out_only_for_releases_by_an_artist() {
+        let (_, app, token) = mcp_app().await;
+        let no_query = "search_music: query must be text to search for; only kind release with an artist takes none, to list that artist's releases";
+        for (args, message) in [
+            (json!({"kind": "recording", "artist": "Chevelle"}), no_query),
+            (json!({"kind": "recording", "query": "*", "artist": "Chevelle"}), no_query),
+            (json!({"kind": "release"}), no_query),
+            (json!({"kind": "release", "query": " "}), no_query),
+            (json!({"kind": "artist", "query": "*"}), no_query),
+            (
+                json!({"kind": "recording", "query": "Vena Sera", "artist": "Chevelle",
+                    "artist_mbid": "8456e9f7-debf-4579-a86c-33a325a35d2d"}),
+                "search_music: artist_mbid must be absent unless kind is release with an artist and no query",
+            ),
+            (
+                json!({"kind": "release", "query": "Vena Sera", "artist": "Chevelle",
+                    "artist_mbid": "8456e9f7-debf-4579-a86c-33a325a35d2d"}),
+                "search_music: artist_mbid must be absent unless kind is release with an artist and no query",
+            ),
+        ] {
+            let e = &document(&call_tool(app.clone(), &token, SEARCH, args.clone()).await)["error"];
+            assert_eq!(
+                (e["code"].as_str(), e["message"].as_str()),
+                (Some("invalid_input"), Some(message)),
+                "{args}"
+            );
+        }
     }
 
     #[test]
@@ -405,10 +554,13 @@ mod tests {
             .unwrap();
         let schema: Value = serde_json::from_str(spec.input_schema).unwrap();
         assert_eq!(schema["properties"].get("provider"), None);
+        // An artist's releases are listed with no query, and another artist of the name by MBID.
+        assert_eq!(schema["required"], json!(["kind"]));
+        assert_eq!(schema["properties"]["artist_mbid"]["type"], "string");
         let (_, app, token) = mcp_app().await;
         for (name, args, message) in [
             (SEARCH, json!({"kind": "recording", "query": "Silent Night", "provider": "musicbrainz"}),
-             "search_music takes no argument named 'provider': it takes only kind, query, artist, limit"),
+             "search_music takes no argument named 'provider': it takes only kind, query, artist, artist_mbid, limit"),
             (RELEASE, json!({"release_id": "lastfm:album:bing crosby:white christmas"}),
              "get_release: release_id must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
         ] {
