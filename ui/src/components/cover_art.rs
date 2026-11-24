@@ -24,6 +24,9 @@ pub fn CoverArt(album: Album) -> Element {
             src: "{url}",
             alt: "{alt}",
             class: "w-full h-full object-cover",
+            // An artist's albums can list hundreds of rows.
+            loading: "lazy",
+            decoding: "async",
             onerror: move |_| has_error.set(true),
           }
         } else {
