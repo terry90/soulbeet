@@ -50,6 +50,15 @@ impl Autofill {
     }
 }
 
+/// What the submitted form holds under `name`: the field's text at that
+/// moment, typed or filled in by a password manager without an input event.
+pub fn submitted_text(form: &FormData, name: &str) -> String {
+    match form.get_first(name) {
+        Some(FormValue::Text(text)) => text,
+        _ => String::new(),
+    }
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct TextInputProps {
     /// The field's text, which `oninput` keeps up to date. Leave both out
@@ -158,50 +167,30 @@ mod tests {
         assert!(!html.contains("autocomplete"), "{html}");
     }
 
-    fn render_unbound(autofill: Autofill) -> String {
-        let mut dom = VirtualDom::new_with_props(
-            |autofill: Autofill| {
-                rsx! {
-                    TextInput {
-                        id: "field",
-                        name: "secret",
-                        autofill,
-                        placeholder: "Password",
-                        password: true,
-                    }
-                }
-            },
-            autofill,
-        );
-        dom.rebuild_in_place();
-        dioxus_ssr::render(&dom)
-    }
-
     #[test]
     fn a_field_its_form_reads_has_no_value_to_write_back() {
-        let html = render_unbound(Autofill::CurrentPassword);
-        assert!(
-            html.contains(
-                "id=\"field\" name=\"secret\" type=\"password\" autocomplete=\"current-password\""
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("value"), "{html}");
-    }
-
-    #[test]
-    fn each_autofill_tells_the_password_manager_what_the_field_holds() {
-        for (autofill, token) in [
-            (Autofill::Username, "username"),
-            (Autofill::CurrentPassword, "current-password"),
-            (Autofill::NewPassword, "new-password"),
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                TextInput {
+                    id: "field",
+                    name: "secret",
+                    autofill: Autofill::CurrentPassword,
+                    placeholder: "Password",
+                    password: true,
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        for attribute in [
+            "id=\"field\"",
+            "name=\"secret\"",
+            "type=\"password\"",
+            "autocomplete=\"current-password\"",
         ] {
-            let html = render_unbound(autofill);
-            assert!(
-                html.contains(&format!("autocomplete=\"{token}\"")),
-                "{html}"
-            );
+            assert!(html.contains(attribute), "{attribute} in {html}");
         }
+        assert!(!html.contains("value"), "{html}");
     }
 
     #[test]

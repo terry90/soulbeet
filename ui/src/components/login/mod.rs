@@ -3,22 +3,15 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-use crate::{Autofill, BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput};
+use crate::{
+    submitted_text, Autofill, BackgroundGlows, FieldLook, GlowColor, GlowSpread, Logo, TextInput,
+};
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
 
 /// The keys the login form submits its fields under.
 const USERNAME: &str = "username";
 const PASSWORD: &str = "password";
-
-/// What the submitted form holds under `name`: the field's text at that
-/// moment, typed or filled in by a password manager without an input event.
-fn submitted(form: &FormData, name: &str) -> String {
-    match form.get_first(name) {
-        Some(FormValue::Text(text)) => text,
-        _ => String::new(),
-    }
-}
 
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
@@ -73,12 +66,14 @@ pub fn Login(props: Props) -> Element {
             }
           }
 
-          // Form
+          // A post, so a submit the app fails to catch never puts the
+          // password in the address.
           form {
             class: "space-y-6",
+            method: "post",
             onsubmit: move |e: Event<FormData>| {
                 e.prevent_default();
-                handle_login(submitted(&e, USERNAME), submitted(&e, PASSWORD));
+                handle_login(submitted_text(&e, USERNAME), submitted_text(&e, PASSWORD));
             },
             div {
               label {
@@ -177,6 +172,7 @@ pub fn Login(props: Props) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opening_tag as tag;
 
     fn render(sso_provider: Option<&str>, return_to: Option<&str>) -> String {
         #[derive(Props, PartialEq, Clone)]
@@ -237,17 +233,24 @@ mod tests {
     #[test]
     fn the_fields_tell_a_password_manager_what_they_hold() {
         let html = render(None, None);
+        // A post, so the browser's own submit never puts them in the address.
+        assert!(
+            tag(&html, "class=\"space-y-6\"").contains("method=\"post\""),
+            "{html}"
+        );
         for (id, name, kind, autocomplete) in [
             ("login-username", USERNAME, "text", "username"),
             ("login-password", PASSWORD, "password", "current-password"),
         ] {
             assert!(html.contains(&format!(" for=\"{id}\">")), "{html}");
-            assert!(
-                html.contains(&format!(
-                    "id=\"{id}\" name=\"{name}\" type=\"{kind}\" autocomplete=\"{autocomplete}\""
-                )),
-                "{html}"
-            );
+            let field = tag(&html, &format!("id=\"{id}\""));
+            for attribute in [
+                format!("name=\"{name}\""),
+                format!("type=\"{kind}\""),
+                format!("autocomplete=\"{autocomplete}\""),
+            ] {
+                assert!(field.contains(&attribute), "{attribute} in {field}");
+            }
         }
         // No value for a render to write back over what was filled in.
         assert!(!html.contains("value="), "{html}");
@@ -259,12 +262,6 @@ mod tests {
 
     #[test]
     fn a_sign_in_sends_what_the_form_holds_when_submitted() {
-        use dioxus::core::Mutation;
-        use dioxus::html::{PlatformEventData, SerializedFormData, SerializedFormObject};
-        use futures::FutureExt;
-        use std::{any::Any, rc::Rc};
-
-        dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
         let mut dom = VirtualDom::new(|| {
             let login: LoginCallback = Callback::new(|sent| {
                 SENT.with(|s| s.borrow_mut().push(sent));
@@ -274,43 +271,21 @@ mod tests {
               Login { login, sso_provider: None, sso_error: None, return_to: None }
             }
         });
-        let submits: Vec<_> = dom
-            .rebuild_to_vec()
-            .edits
-            .into_iter()
-            .filter_map(|edit| match edit {
-                Mutation::NewEventListener { name, id } if name == "submit" => Some(id),
-                _ => None,
-            })
-            .collect();
+        let submits = crate::listeners(&mut dom, "submit");
         assert_eq!(submits.len(), 1);
 
         // Filled in by a password manager: no input event reached the fields.
-        let field = |key: &str, text: &str| SerializedFormObject {
-            key: key.into(),
-            text: Some(text.into()),
-            file: None,
-        };
-        let form = SerializedFormData::new(
-            String::new(),
-            vec![field(USERNAME, "ann"), field(PASSWORD, "from the vault")],
+        let browser_submits = crate::submit_form(
+            &mut dom,
+            submits[0],
+            &[(USERNAME, "ann"), (PASSWORD, "from the vault")],
         );
-        let data = PlatformEventData::new(Box::new(form));
-        let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
-        dom.runtime()
-            .handle_event("submit", event.clone(), submits[0]);
-        loop {
-            dom.render_immediate(&mut dioxus::core::NoOpMutations);
-            if dom.wait_for_work().now_or_never().is_none() {
-                break;
-            }
-        }
 
         assert_eq!(
             SENT.with(|s| s.take()),
             [("ann".to_string(), "from the vault".to_string())]
         );
         // The app signs in, not the browser's own form post.
-        assert!(!event.default_action_enabled());
+        assert!(!browser_submits);
     }
 }
