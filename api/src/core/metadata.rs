@@ -2,8 +2,10 @@
 
 use shared::download::DownloadQuery;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::metadata::{Album, AlbumWithTracks, Discography, SearchResult};
-use soulbeet::musicbrainz::{self, ArtistMatch, MusicBrainzProvider, RecordingReleases};
+use shared::metadata::{Album, AlbumWithTracks, SearchResult};
+use soulbeet::musicbrainz::{
+    self, ArtistAlbums, ArtistMatch, MusicBrainzProvider, RecordingReleases,
+};
 use soulbeet::{MetadataError, MetadataProvider};
 
 /// Which provider search runs: search_albums or search_tracks.
@@ -67,13 +69,14 @@ pub async fn artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, Failure
 /// Albums the web UI's artist-only search shows.
 pub(crate) const DISCOGRAPHY_LIMIT: usize = musicbrainz::DISCOGRAPHY_MAX;
 
-/// The albums and EPs of the artist named `name`, or of the one of that name
-/// whose MBID is `chosen`; None when MusicBrainz has no such artist.
+/// The first `limit` albums and EPs of the artist named `name`, or of the one
+/// of that name whose MBID is `chosen`; `ArtistAlbums` says when MusicBrainz
+/// has no artist of that name, or none of them is `chosen`.
 pub async fn discography(
     name: &str,
     chosen: Option<&str>,
     limit: usize,
-) -> Result<Option<Discography>, Failure> {
+) -> Result<ArtistAlbums, Failure> {
     musicbrainz::discography(name, chosen, limit)
         .await
         .map_err(|e| provider_failure(&e))

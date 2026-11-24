@@ -98,6 +98,11 @@ impl Page {
         let limit = args
             .opt_u32("limit", 1, MAX_LIMIT)?
             .unwrap_or(DEFAULT_LIMIT);
+        Page::with_limit(args, list, limit)
+    }
+
+    /// `read` for a tool that read `limit` itself, within its own bounds.
+    pub(crate) fn with_limit(args: &Args, list: Value, limit: u32) -> Result<Page, ToolError> {
         let listing = Listing::new(args.tool(), &list);
         let offset = listing.read(args)?;
         Ok(Page {

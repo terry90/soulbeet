@@ -11,6 +11,10 @@ use crate::core::metadata::{self, SearchKind};
 use crate::core::sources;
 #[cfg(feature = "server")]
 use crate::{server_fns::failure_error, AuthSession};
+#[cfg(feature = "server")]
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+#[cfg(feature = "server")]
+use soulbeet::musicbrainz::ArtistAlbums;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchQuery {
@@ -60,6 +64,23 @@ pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, Serve
     .map_err(failure_error)
 }
 
+/// The page's answer to an artist-only search: None when no artist carries
+/// the name. A picked artist MusicBrainz no longer finds under the name is
+/// refused, so the page says so instead of listing another.
+#[cfg(feature = "server")]
+fn discography_answer(found: ArtistAlbums) -> Result<Option<Discography>, Failure> {
+    match found {
+        ArtistAlbums::NoArtist => Ok(None),
+        ArtistAlbums::Found(discography) => Ok(Some(discography)),
+        ArtistAlbums::NotAmong(_) => Err(Failure::new(
+            FailureCode::InvalidInput,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            "MusicBrainz no longer finds the artist picked under this name. Search again to pick one.",
+        )),
+    }
+}
+
 #[post("/api/metadata/discography", _: AuthSession)]
 pub async fn artist_discography(
     input: DiscographyQuery,
@@ -70,6 +91,7 @@ pub async fn artist_discography(
         metadata::DISCOGRAPHY_LIMIT,
     )
     .await
+    .and_then(discography_answer)
     .map_err(failure_error)
 }
 
@@ -117,6 +139,36 @@ mod tests {
             AlbumQuery {
                 id: "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f".into()
             }
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_picked_artist_no_longer_found_is_refused() {
+        use shared::metadata::ArtistSummary;
+        assert_eq!(discography_answer(ArtistAlbums::NoArtist), Ok(None));
+        let nirvana = ArtistSummary {
+            mbid: "5b11f4ce-a62d-471e-81fc-a69a8278c7da".into(),
+            name: "Nirvana".into(),
+            disambiguation: None,
+        };
+        let found = Discography {
+            artist: nirvana.clone(),
+            others: vec![],
+            albums: vec![],
+            complete: true,
+        };
+        assert_eq!(
+            discography_answer(ArtistAlbums::Found(found.clone())),
+            Ok(Some(found))
+        );
+        let refused = discography_answer(ArtistAlbums::NotAmong(vec![nirvana])).unwrap_err();
+        assert_eq!(
+            (refused.code, refused.message.as_str()),
+            (
+                FailureCode::InvalidInput,
+                "MusicBrainz no longer finds the artist picked under this name. Search again to pick one."
+            )
         );
     }
 }

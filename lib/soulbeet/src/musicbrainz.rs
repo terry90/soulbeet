@@ -561,19 +561,22 @@ fn discography_albums(groups: Vec<ReleaseGroup>) -> Vec<Album> {
 }
 
 /// The artist of `found` whose MBID is `chosen`, else the first, and the
-/// others; None when there is no such artist.
+/// others; `found` itself when there is no such artist.
 fn pick_artist(
     mut found: Vec<ArtistMatch>,
     chosen: Option<&str>,
-) -> Option<(ArtistMatch, Vec<ArtistMatch>)> {
+) -> Result<(ArtistMatch, Vec<ArtistMatch>), Vec<ArtistMatch>> {
     let at = match chosen {
-        Some(mbid) => found.iter().position(|a| a.mbid == mbid)?,
-        None => 0,
+        Some(mbid) => found.iter().position(|a| a.mbid == mbid),
+        None => (!found.is_empty()).then_some(0),
     };
-    (at < found.len()).then(|| {
-        let artist = found.remove(at);
-        (artist, found)
-    })
+    match at {
+        Some(at) => {
+            let artist = found.remove(at);
+            Ok((artist, found))
+        }
+        None => Err(found),
+    }
 }
 
 fn artist_summary(a: ArtistMatch) -> ArtistSummary {
@@ -608,20 +611,46 @@ fn discography_from(
     }
 }
 
-/// The albums and EPs of the artist named `name`, at most `limit` of them:
-/// of the artist whose MBID is `chosen` when given, else of the first that
-/// carries the name. None when no artist carries it, or none of them is
-/// `chosen`.
+/// What an artist-only search found for a name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArtistAlbums {
+    /// No artist carries the name.
+    NoArtist,
+    /// The artists that carry the name, none of them the one chosen.
+    NotAmong(Vec<ArtistSummary>),
+    Found(Discography),
+}
+
+/// The first `limit` albums and EPs of the artist named `name`: of the
+/// artist whose MBID is `chosen` when given, else of the first that carries
+/// the name.
 pub async fn discography(
     name: &str,
     chosen: Option<&str>,
     limit: usize,
-) -> Result<Option<Discography>, MetadataError> {
-    let found = named_artists(name, search_artists(name, FILTER_ARTISTS).await?);
-    let Some((artist, others)) = pick_artist(found, chosen) else {
-        return Ok(None);
+) -> Result<ArtistAlbums, MetadataError> {
+    discography_with(musicbrainz_client(), name, chosen, limit).await
+}
+
+async fn discography_with(
+    client: &MusicBrainzClient,
+    name: &str,
+    chosen: Option<&str>,
+    limit: usize,
+) -> Result<ArtistAlbums, MetadataError> {
+    let found = named_artists(
+        name,
+        search_artists_with(client, name, FILTER_ARTISTS).await?,
+    );
+    let (artist, others) = match pick_artist(found, chosen) {
+        Ok(picked) => picked,
+        Err(found) if found.is_empty() => return Ok(ArtistAlbums::NoArtist),
+        Err(found) => {
+            return Ok(ArtistAlbums::NotAmong(
+                found.into_iter().map(artist_summary).collect(),
+            ))
+        }
     };
-    let client = musicbrainz_client();
     let (studio, studio_whole) =
         tier_groups(client, &artist.mbid, Tier::Studio, DISCOGRAPHY_MAX).await?;
     let other = if studio.len() < limit.min(DISCOGRAPHY_MAX) {
@@ -630,7 +659,7 @@ pub async fn discography(
     } else {
         None
     };
-    Ok(Some(discography_from(
+    Ok(ArtistAlbums::Found(discography_from(
         artist,
         others,
         studio,
@@ -1649,14 +1678,14 @@ mod tests {
                 "The Blue Album",
             ]
         );
-        // No single, and neither the Sci‐Fi Crimes EP nor The Basement Tapes, which have no
+        // No single, and neither the Sci‐Fi Crimes EP nor Basement Tapes, which have no
         // official release.
-        assert!(albums
-            .iter()
-            .all(|a| a.release_types.as_ref().unwrap()[0] != "Single"));
-        assert!(!albums
-            .iter()
-            .any(|a| a.title.contains("Basement") || a.release_types == Some(vec!["EP".into()])));
+        let unofficial: Vec<ReleaseGroup> = chevelle_groups()
+            .into_iter()
+            .filter(|g| g.id.starts_with("77493e52") || g.id.starts_with("41622d70"))
+            .collect();
+        assert_eq!(unofficial.len(), 2);
+        assert_eq!(discography_albums(unofficial), []);
         // The official release titled as the group, here with its ’, not the first official one,
         // which writes "Wonder What's Next"; and for Point #1 the first official one, after a
         // release with no status.
@@ -1814,9 +1843,9 @@ mod tests {
         assert_eq!(others[0].mbid, NIRVANA_US);
         assert_eq!(
             pick_artist(nirvanas(), Some("00000000-0000-4000-8000-000000000000")),
-            None
+            Err(nirvanas())
         );
-        assert_eq!(pick_artist(vec![], None), None);
+        assert_eq!(pick_artist(vec![], None), Err(vec![]));
     }
 
     const CHEVELLE: &str = "8456e9f7-debf-4579-a86c-33a325a35d2d";
@@ -1854,6 +1883,69 @@ mod tests {
         page["count"] = groups.len().into();
         page["release-groups"] = groups.into();
         page.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_discography_reads_only_the_tiers_its_limit_needs() {
+        use crate::test_http::{serve, Reply};
+        let reply = |body: String| Reply { status: 200, body };
+        let (base, seen) = serve(vec![
+            reply(chevelle_found()),
+            reply(chevelle_tier(Tier::Studio)),
+            reply(chevelle_found()),
+            reply(chevelle_tier(Tier::Studio)),
+            reply(chevelle_tier(Tier::Other)),
+            reply(artists_page(serde_json::json!([]))),
+            reply(include_str!("fixtures/musicbrainz/artist_search_nirvana.json").into()),
+        ]);
+        let client = stub_client(&base);
+        let sent = || seen.lock().unwrap().len();
+
+        // Five rows are all studio albums: the other tier is not asked for.
+        let ArtistAlbums::Found(five) = discography_with(&client, "Chevelle", None, 5)
+            .await
+            .unwrap()
+        else {
+            panic!("Chevelle is found");
+        };
+        assert_eq!(sent(), 2);
+        assert_eq!((five.albums.len(), five.complete), (5, false));
+        assert_eq!(five.albums[1].title, "Wonder What’s Next");
+
+        let ArtistAlbums::Found(all) = discography_with(&client, "Chevelle", None, DISCOGRAPHY_MAX)
+            .await
+            .unwrap()
+        else {
+            panic!("Chevelle is found");
+        };
+        assert_eq!(sent(), 5);
+        assert_eq!((all.albums.len(), all.complete), (18, true));
+        let targets: Vec<String> = (seen.lock().unwrap().iter())
+            .map(|s| s.target.clone())
+            .collect();
+        assert!(targets[3].contains(&discography_query(CHEVELLE, Tier::Studio)));
+        assert!(targets[4].contains(&discography_query(CHEVELLE, Tier::Other)));
+
+        assert_eq!(
+            discography_with(&client, "Zqxvb Plorbnik Quintet", None, DISCOGRAPHY_MAX)
+                .await
+                .unwrap(),
+            ArtistAlbums::NoArtist
+        );
+        assert_eq!(sent(), 6);
+
+        // A chosen artist not among those of the name gets them back, with no release search.
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        let ArtistAlbums::NotAmong(named) =
+            discography_with(&client, "Nirvana", Some(unknown), DISCOGRAPHY_MAX)
+                .await
+                .unwrap()
+        else {
+            panic!("the chosen artist is not among those named Nirvana");
+        };
+        assert_eq!(sent(), 7);
+        assert_eq!(named.len(), 7);
+        assert_eq!(named[0].mbid, NIRVANA_US);
     }
 
     #[tokio::test]

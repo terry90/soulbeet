@@ -3,13 +3,11 @@
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
 use shared::failure::{cut_json, json_chars, TEXT_MAX_CHARS};
-use shared::metadata::{
-    asks_no_title, Album, AlbumWithTracks, ArtistSummary, Discography, SearchResult, Track,
-};
-use soulbeet::musicbrainz::{ArtistMatch, RecordingReleases};
+use shared::metadata::{asks_no_title, Album, AlbumWithTracks, ArtistSummary, SearchResult, Track};
+use soulbeet::musicbrainz::{ArtistAlbums, ArtistMatch, RecordingReleases};
 
 use super::args::Args;
-use super::contract::{answer, invalid_value, upstream_error};
+use super::contract::{answer, invalid_value, upstream_error, ToolError};
 use super::paging::{fit, fit_whole, Listing, Page};
 use super::McpCaller;
 use crate::connection::ConnectionState;
@@ -19,6 +17,7 @@ const SEARCH: &str = "search_music";
 const RELEASE: &str = "get_release";
 const RECORDING: &str = "get_recording_releases";
 const RECORDING_ARGS: &[&str] = &["recording_mbid", "limit", "cursor"];
+const SEARCH_ARGS: &[&str] = &["kind", "query", "artist", "artist_mbid", "limit", "cursor"];
 
 /// The kinds `search_music` takes; each names its items key with an "s".
 const KINDS: &[&str] = &["recording", "release", "artist"];
@@ -130,31 +129,53 @@ pub(crate) fn artist_fields(query: &str, found: &[ArtistMatch]) -> Map<String, V
     search_fields("artist", query, entries)
 }
 
+fn artist_summary_entry(a: &ArtistSummary) -> Value {
+    let entry = json!({"mbid": a.mbid, "name": cut(a.name.clone()),
+        "disambiguation": cut_opt(a.disambiguation.clone())});
+    whole_ids(entry, &["mbid"])
+}
+
 /// An artist-only release search: the artist found, the others carrying the
-/// name, and the artist's releases in discography order. With no artist
-/// found, `artist` is null and the empty list is complete.
-pub(crate) fn discography_fields(query: &str, found: Option<&Discography>) -> Map<String, Value> {
-    let summary = |a: &ArtistSummary| {
-        let entry = json!({"mbid": a.mbid, "name": cut(a.name.clone()),
-            "disambiguation": cut_opt(a.disambiguation.clone())});
-        whole_ids(entry, &["mbid"])
-    };
-    let (artist, others, complete, entries) = match found {
-        Some(d) => (
-            summary(&d.artist),
-            d.others.iter().map(summary).collect::<Vec<_>>(),
+/// name, and the page of the artist's releases in discography order from
+/// `page.offset`, with a cursor while more follow. `complete` is true on the
+/// last page of a listing that held every album and EP MusicBrainz has for
+/// the artist. With no artist found, `artist` is null and the empty listing
+/// is complete. A chosen artist not among those of the name is refused, and
+/// the refusal lists those.
+fn artist_albums_fields(
+    query: &str,
+    found: ArtistAlbums,
+    page: &Page,
+) -> Result<Map<String, Value>, ToolError> {
+    let (artist, others, complete, albums) = match found {
+        ArtistAlbums::NoArtist => (Value::Null, vec![], true, vec![]),
+        ArtistAlbums::NotAmong(named) => {
+            let mut e = invalid_value(
+                SEARCH,
+                "artist_mbid",
+                "the mbid of one of the artists of that name, which artists lists",
+            );
+            let named: Vec<Value> = named.iter().map(artist_summary_entry).collect();
+            e.facts.insert("artists".into(), json!(named));
+            return Err(e);
+        }
+        ArtistAlbums::Found(d) => (
+            artist_summary_entry(&d.artist),
+            d.others.iter().map(artist_summary_entry).collect(),
             d.complete,
-            d.albums.iter().map(release_entry).collect(),
+            d.albums,
         ),
-        None => (Value::Null, vec![], true, vec![]),
     };
+    let entries = (albums.get(page.offset..).unwrap_or_default().iter())
+        .map(release_entry)
+        .collect();
     // Fitted with `complete` at its longest, false, which it may still become.
     let fields = object(json!({"kind": "release", "query": query, "artist": artist,
         "other_artists": others, "complete": false}));
-    let mut fields = fit_whole(fields, "releases", entries, "left_out");
-    let whole = fields["left_out"] == json!(0);
-    fields.insert("complete".into(), json!(complete && whole));
-    fields
+    let mut fields = fit(fields, "releases", entries, page, !complete);
+    let last = fields["cursor"].is_null();
+    fields.insert("complete".into(), json!(complete && last));
+    Ok(fields)
 }
 
 /// `({"release": {"id", "mbid", "title", "artist", "date",
@@ -217,11 +238,7 @@ pub(crate) async fn search_music(
     _caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new(
-        SEARCH,
-        args,
-        &["kind", "query", "artist", "artist_mbid", "limit"],
-    );
+    let args = Args::new(SEARCH, args, SEARCH_ARGS);
     answer(
         async {
             let kind = args.opt_choice("kind", KINDS)?.ok_or_else(|| {
@@ -249,43 +266,52 @@ pub(crate) async fn search_music(
                     "text to search for; only kind release with an artist takes none, to list that artist's releases",
                 ));
             }
-            if artist_mbid.is_some() && listing.is_none() {
-                return Err(invalid_value(
-                    SEARCH,
-                    "artist_mbid",
-                    "absent unless kind is release with an artist and no query",
-                ));
+            if listing.is_none() {
+                for name in ["artist_mbid", "cursor"] {
+                    args.absent(
+                        name,
+                        "absent unless kind is release with an artist and no query",
+                    )?;
+                }
             }
+            let listing = match listing {
+                Some(name) => {
+                    let list = json!({"artist": name, "artist_mbid": artist_mbid});
+                    Some((name, Page::with_limit(&args, list, limit)?))
+                }
+                None => None,
+            };
             args.finish()?;
+            let facts = object(json!({"kind": kind, "query": query, "artist": artist,
+                "artist_mbid": artist_mbid}));
+            if let Some((name, page)) = listing {
+                // The rows before the page are read too, to sort the page among them.
+                let rows = page.offset.saturating_add(page.limit);
+                let found = metadata::discography(name, artist_mbid.as_deref(), rows)
+                    .await
+                    .map_err(|f| upstream_error(f, facts, args.same_call()))?;
+                return artist_albums_fields(&query, found, &page);
+            }
             let search_kind = match kind {
                 "recording" => Some(SearchKind::Tracks),
                 "release" => Some(SearchKind::Albums),
                 "artist" => None,
                 other => unreachable!("opt_choice answers one of KINDS, not {other}"),
             };
-            let found = match (listing, search_kind) {
-                (Some(name), _) => {
-                    metadata::discography(name, artist_mbid.as_deref(), limit as usize)
-                        .await
-                        .map(|found| discography_fields(&query, found.as_ref()))
-                }
-                (None, Some(search_kind)) => {
+            let found = match search_kind {
+                Some(search_kind) => {
                     metadata::search(search_kind, artist.as_deref(), &query, limit as usize)
                         .await
                         .map(|results| music_fields(kind, &query, &results))
                 }
-                (None, None) => {
+                None => {
                     let limit = u8::try_from(limit).expect("limit is at most 25");
                     metadata::artists(&query, limit)
                         .await
                         .map(|found| artist_fields(&query, &found))
                 }
             };
-            found.map_err(|f| {
-                let facts = object(json!({"kind": kind, "query": query, "artist": artist,
-                    "artist_mbid": artist_mbid}));
-                upstream_error(f, facts, args.same_call())
-            })
+            found.map_err(|f| upstream_error(f, facts, args.same_call()))
         }
         .await,
     )
@@ -349,7 +375,7 @@ pub(crate) async fn get_recording_releases(
 mod tests {
     use serde_json::{json, Map, Value};
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
-    use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+    use shared::metadata::{Album, AlbumWithTracks, Discography, SearchResult, Track};
     use soulbeet::musicbrainz::{RecordingInfo, RecordingRelease, ReleaseGroupInfo};
     use soulbeet::MetadataError;
 
@@ -419,50 +445,116 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_release_listing_names_the_artist_and_the_others() {
-        let bleach = Album {
-            id: "f1afec0b-26dd-3db5-9aa1-c91229a74a24".into(),
-            title: "Bleach".into(),
+    fn album(id: &str, title: &str, date: &str) -> Album {
+        Album {
+            id: id.into(),
+            title: title.into(),
             artist: "Nirvana".into(),
             release_date: None,
-            mbid: Some("f1afec0b-26dd-3db5-9aa1-c91229a74a24".into()),
+            mbid: Some(id.into()),
             cover_url: None,
             release_types: Some(vec!["Album".into()]),
-            first_release_date: Some("1989-06".into()),
+            first_release_date: Some(date.into()),
+        }
+    }
+
+    /// The page of Nirvana's listing that `cursor` starts, `limit` releases long.
+    fn listing_page(cursor: Option<&Value>, limit: u32) -> Page {
+        let mut args = json!({"kind": "release", "artist": "Nirvana"});
+        if let Some(cursor) = cursor {
+            args["cursor"] = cursor.clone();
+        }
+        let args = Args::new(SEARCH, args.as_object().cloned(), SEARCH_ARGS);
+        let list = json!({"artist": "Nirvana", "artist_mbid": null});
+        Page::with_limit(&args, list, limit).unwrap()
+    }
+
+    #[test]
+    fn a_release_listing_names_the_artist_and_the_others() {
+        let bleach = album("f1afec0b-26dd-3db5-9aa1-c91229a74a24", "Bleach", "1989-06");
+        let nevermind = album(
+            "b52a8f31-b5ab-34e9-92f4-f5b7110220f0",
+            "Nevermind",
+            "1991-09-24",
+        );
+        let found = |albums: Vec<Album>, complete| {
+            ArtistAlbums::Found(Discography {
+                artist: nirvana(
+                    "5b11f4ce-a62d-471e-81fc-a69a8278c7da",
+                    "1980s–1990s US grunge band",
+                ),
+                others: vec![nirvana(
+                    "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6",
+                    "60s band from the UK",
+                )],
+                albums,
+                complete,
+            })
         };
-        let found = Discography {
-            artist: nirvana(
-                "5b11f4ce-a62d-471e-81fc-a69a8278c7da",
-                "1980s–1990s US grunge band",
-            ),
-            others: vec![nirvana(
-                "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6",
-                "60s band from the UK",
-            )],
-            albums: vec![bleach.clone()],
-            complete: true,
-        };
+        let first = listing_page(None, 1);
+        let doc = artist_albums_fields("", found(vec![bleach.clone()], false), &first).unwrap();
+        let cursor = doc["cursor"].clone();
+        assert!(cursor.is_string(), "{doc:?}");
         assert_eq!(
-            Value::Object(discography_fields("", Some(&found))),
+            Value::Object(doc),
             json!({"kind": "release", "query": "",
                 "artist": {"mbid": "5b11f4ce-a62d-471e-81fc-a69a8278c7da", "name": "Nirvana",
                     "disambiguation": "1980s–1990s US grunge band"},
                 "other_artists": [{"mbid": "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6", "name": "Nirvana",
                     "disambiguation": "60s band from the UK"}],
-                "complete": true,
+                "complete": false,
                 "releases": [release_entry(&bleach)],
-                "left_out": 0})
+                "cursor": cursor})
         );
-        let more = Discography {
-            complete: false,
-            ..found
-        };
-        assert_eq!(discography_fields("", Some(&more))["complete"], false);
+        // The next page reads the rows before it again and lists the rest.
+        let next = listing_page(Some(&cursor), 1);
+        assert_eq!(next.offset, 1);
+        let doc =
+            artist_albums_fields("", found(vec![bleach, nevermind.clone()], true), &next).unwrap();
         assert_eq!(
-            Value::Object(discography_fields("*", None)),
+            (&doc["releases"], &doc["cursor"], &doc["complete"]),
+            (
+                &json!([release_entry(&nevermind)]),
+                &Value::Null,
+                &json!(true)
+            )
+        );
+        // A last page of a listing MusicBrainz has more for is not complete.
+        let doc = artist_albums_fields("", found(vec![], false), &listing_page(None, 10)).unwrap();
+        assert_eq!(doc["complete"], false);
+
+        assert_eq!(
+            Value::Object(
+                artist_albums_fields("*", ArtistAlbums::NoArtist, &listing_page(None, 10)).unwrap()
+            ),
             json!({"kind": "release", "query": "*", "artist": null, "other_artists": [],
-                "complete": true, "releases": [], "left_out": 0})
+                "complete": true, "releases": [], "cursor": null})
+        );
+    }
+
+    #[test]
+    fn a_chosen_artist_not_of_the_name_is_refused_with_those_of_it() {
+        let uk = nirvana(
+            "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6",
+            "60s band from the UK",
+        );
+        let e = artist_albums_fields(
+            "",
+            ArtistAlbums::NotAmong(vec![uk]),
+            &listing_page(None, 10),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (e.failure.code, e.failure.message.as_str()),
+            (
+                FailureCode::InvalidInput,
+                "search_music: artist_mbid must be the mbid of one of the artists of that name, which artists lists"
+            )
+        );
+        assert_eq!(
+            e.facts["artists"],
+            json!([{"mbid": "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6", "name": "Nirvana",
+                "disambiguation": "60s band from the UK"}])
         );
     }
 
@@ -485,6 +577,14 @@ mod tests {
                 json!({"kind": "release", "query": "Vena Sera", "artist": "Chevelle",
                     "artist_mbid": "8456e9f7-debf-4579-a86c-33a325a35d2d"}),
                 "search_music: artist_mbid must be absent unless kind is release with an artist and no query",
+            ),
+            (
+                json!({"kind": "release", "query": "Vena Sera", "cursor": "eyJ0IjoiIn0"}),
+                "search_music: cursor must be absent unless kind is release with an artist and no query",
+            ),
+            (
+                json!({"kind": "release", "artist": "Chevelle", "cursor": "eyJ0IjoiIn0"}),
+                "search_music: cursor must be a cursor search_music returned for the same arguments",
             ),
         ] {
             let e = &document(&call_tool(app.clone(), &token, SEARCH, args.clone()).await)["error"];
@@ -560,7 +660,7 @@ mod tests {
         let (_, app, token) = mcp_app().await;
         for (name, args, message) in [
             (SEARCH, json!({"kind": "recording", "query": "Silent Night", "provider": "musicbrainz"}),
-             "search_music takes no argument named 'provider': it takes only kind, query, artist, artist_mbid, limit"),
+             "search_music takes no argument named 'provider': it takes only kind, query, artist, artist_mbid, limit, cursor"),
             (RELEASE, json!({"release_id": "lastfm:album:bing crosby:white christmas"}),
              "get_release: release_id must be a MusicBrainz id: 36 characters, 8-4-4-4-12 hexadecimal digits"),
         ] {
