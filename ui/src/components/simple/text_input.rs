@@ -34,6 +34,9 @@ pub enum Autofill {
     CurrentPassword,
     /// A password being chosen.
     NewPassword,
+    /// Someone else's secret, such as a password an admin sets for another
+    /// account: the browser must not fill in or save the signed-in user's own.
+    Off,
 }
 
 impl Autofill {
@@ -42,6 +45,7 @@ impl Autofill {
             Autofill::Username => "username",
             Autofill::CurrentPassword => "current-password",
             Autofill::NewPassword => "new-password",
+            Autofill::Off => "off",
         }
     }
 }
