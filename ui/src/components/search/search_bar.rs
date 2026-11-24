@@ -91,7 +91,8 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             evt.prevent_default();
             search.set(submitted_text(&evt, QUERY));
             let typed = submitted_text(&evt, ARTIST);
-            artist.set((!typed.trim().is_empty()).then_some(typed));
+            let typed = typed.trim();
+            artist.set((!typed.is_empty()).then(|| typed.to_string()));
             on_search.call(());
         },
 
@@ -370,8 +371,8 @@ mod tests {
 
         let mut dom = bar(chevelle());
         let submits = crate::listeners(&mut dom, "submit");
-        crate::submit_form(&mut dom, submits[0], &[(QUERY, ""), (ARTIST, "Chevelle")]);
-        // A blank artist is no artist.
+        crate::submit_form(&mut dom, submits[0], &[(QUERY, ""), (ARTIST, " Chevelle ")]);
+        // The artist is kept trimmed, and a blank one is no artist.
         crate::submit_form(
             &mut dom,
             submits[0],

@@ -133,6 +133,8 @@ pub fn Search() -> Element {
     let mut download_options = use_signal::<Option<SourceChoices>>(|| None);
     let mut is_downloading = use_signal(|| false);
     let mut download_error = use_signal(String::new);
+    // Why the last search failed.
+    let mut search_error = use_signal(String::new);
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
 
@@ -194,6 +196,7 @@ pub fn Search() -> Element {
             if reset.0() > 0 {
                 search_results.set(None);
                 listed.set(None);
+                search_error.set(String::new());
                 search.set(String::new());
                 artist.set(None);
                 artist_open.set(false);
@@ -610,32 +613,41 @@ pub fn Search() -> Element {
             is_downloading.set(false);
         };
 
+    // Clears what the last search and its downloads left on screen.
+    let mut start_search = move || {
+        download_error.set(String::new());
+        download_options.set(None);
+        search_error.set(String::new());
+        loading.set(true);
+    };
+
     // Lists the albums of the artist named `name`, or of the one of that name
     // whose MBID is `chosen`.
     let list_discography = move |name: String, chosen: Option<String>| async move {
-        loading.set(true);
+        start_search();
         let found = auth
             .call(api::artist_discography(api::DiscographyQuery {
                 artist: name.clone(),
                 mbid: chosen,
             }))
             .await;
-        if let Ok(found) = found {
-            let (listing, rows) = listed_from(name, found);
-            listed.set(Some(listing));
-            search_results.set(Some(rows));
+        match found {
+            Ok(found) => {
+                let (listing, rows) = listed_from(name, found);
+                listed.set(Some(listing));
+                search_results.set(Some(rows));
+            }
+            Err(e) => search_error.set(crate::friendly_error(&e)),
         }
         loading.set(false);
     };
 
     let perform_search = move || async move {
-        download_error.set(String::new());
-        download_options.set(None);
         // Album or track alike: an artist's tracks are in its albums' rows.
         if let Some(name) = discography_artist(artist(), &search()) {
             return list_discography(name, None).await;
         }
-        loading.set(true);
+        start_search();
 
         let query_data = api::SearchQuery {
             artist: artist(),
@@ -647,9 +659,12 @@ pub fn Search() -> Element {
             SearchType::Track => auth.call(api::search_track(query_data)).await,
         };
 
-        if let Ok(data) = result {
-            listed.set(None);
-            search_results.set(Some(data));
+        match result {
+            Ok(data) => {
+                listed.set(None);
+                search_results.set(Some(data));
+            }
+            Err(e) => search_error.set(crate::friendly_error(&e)),
         }
         loading.set(false);
     };
@@ -752,6 +767,9 @@ pub fn Search() -> Element {
           SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
         }
 
+        if !search_error().is_empty() {
+          p { class: "text-sm font-mono text-red-400 mt-4", "{search_error}" }
+        }
         if !download_error().is_empty() {
           p { class: "text-sm font-mono text-red-400 mt-4", "{download_error}" }
         }

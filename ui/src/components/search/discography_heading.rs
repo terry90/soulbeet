@@ -17,7 +17,7 @@ pub struct DiscographyHeadingProps {
     pub name: String,
     /// The artist whose albums are listed.
     pub artist: ArtistSummary,
-    /// The other artists carrying the name.
+    /// The other artists carrying the name, as their name or an alias.
     pub others: Vec<ArtistSummary>,
     /// Every album and EP of the artist is listed.
     pub complete: bool,
@@ -57,7 +57,7 @@ pub fn DiscographyHeading(props: DiscographyHeadingProps) -> Element {
         }
         if !picks.is_empty() {
           div { class: "flex flex-wrap items-center gap-2 text-xs font-mono text-gray-400",
-            span { "Other artists named {name}:" }
+            span { "Other artists known as {name}:" }
             for (mbid, label, aria) in picks {
               button {
                 key: "{mbid}",
@@ -140,7 +140,7 @@ mod tests {
         let html = render(uk(), true);
         assert!(html.contains("Albums by Nirvana"), "{html}");
         assert!(html.contains("1980s–1990s US grunge band"), "{html}");
-        assert!(html.contains("Other artists named Nirvana:"), "{html}");
+        assert!(html.contains("Other artists known as Nirvana:"), "{html}");
         let button = opening_tag(
             &html,
             "aria-label=\"Show albums by Nirvana, 60s band from the UK\"",
