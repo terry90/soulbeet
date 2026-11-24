@@ -4,6 +4,7 @@ use ui::settings::{
     AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
     FolderAdminPanel, FolderManager, RemoteAccessPanel, SecurityStatusPanel, UserManager,
 };
+use ui::{BackgroundGlows, GlowColor, GlowSpread};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub(crate) enum SettingsTab {
@@ -55,8 +56,7 @@ pub fn SettingsPage() -> Element {
     });
 
     rsx! {
-        div { class: "fixed top-1/4 -left-10 w-64 h-64 bg-beet-accent/10 rounded-full blur-[100px] pointer-events-none" }
-        div { class: "fixed bottom-1/4 -right-10 w-64 h-64 bg-beet-leaf/10 rounded-full blur-[100px] pointer-events-none" }
+        BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Tight }
 
         div { class: "space-y-6 text-white w-full max-w-3xl z-10 mx-auto",
             div { class: "text-center mb-6",
