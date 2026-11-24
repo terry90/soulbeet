@@ -237,9 +237,10 @@ impl SourcePool {
     }
 }
 
-/// The item of each group of `rest` offering `track` (same normalized title),
-/// in `rest`'s order. `rest` must be sorted by descending score, so the best
-/// group comes first. Matching is by title, never by filename: the same track
+/// The item of each group of `rest` offering `track` (same normalized title)
+/// on `track`'s backend, in `rest`'s order: a slot's sources are all on the
+/// backend its batch watches. `rest` must be sorted by descending score, so
+/// the best group comes first. Matching is by title, never by filename: the same track
 /// has a completely different remote path on each peer. A group offers a title
 /// twice only when its album has it twice, one file per track, as two discs
 /// can: then the file closest to the track's length is that track's own.
@@ -262,7 +263,9 @@ pub fn alternates_for(
                 .items
                 .iter()
                 .filter(|candidate| {
-                    shared::recommendation::normalize_for_matching(&candidate.title) == wanted
+                    candidate.backend == track.backend
+                        && shared::recommendation::normalize_for_matching(&candidate.title)
+                            == wanted
                 })
                 .min_by_key(|&candidate| distance(candidate))
         })
@@ -310,7 +313,7 @@ mod tests {
     use super::*;
     use crate::server_fns::download::enqueue::{ALREADY_MINE, ANOTHER_FOLDER, NOTHING_ENQUEUED};
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, same_user_into, ScriptedOutcome, StubBackend,
+        batch, group, item, item_on, key, same_user_into, ScriptedOutcome, StubBackend,
     };
     use crate::transfer_registry::TransferRegistry;
     use shared::download::DownloadableItem;
@@ -564,6 +567,28 @@ mod tests {
 
         let mut pool = SourcePool::from_tracks(&tracks, &rest, MAX_SOURCES_PER_TRACK);
         assert!(pool.take_next(0).is_none());
+    }
+
+    #[test]
+    fn only_groups_on_the_picks_backend_offer_alternates() {
+        let track = item_on("a", "peer_a", "Wake Up", "a.flac");
+        let rest = vec![
+            group(
+                "peer_b",
+                vec![item_on("b", "peer_b", "Wake Up", "b.flac")],
+                0.9,
+            ),
+            group(
+                "peer_c",
+                vec![item_on("a", "peer_c", "Wake Up", "c.flac")],
+                0.8,
+            ),
+        ];
+        let offered: Vec<(String, String)> = alternates_for(&track, &rest)
+            .into_iter()
+            .map(|i| (i.backend, i.source))
+            .collect();
+        assert_eq!(offered, vec![("a".to_string(), "peer_c".to_string())]);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::backend_error::{BackendFault, PeerAsk};
 use shared::failure::{
     Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
 };
@@ -235,35 +236,16 @@ impl SoulseekError {
     }
 }
 
-/// A question Soulful asks slskd about a peer outside the calls of a transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerAsk {
-    /// `GET transfers/downloads/{username}/{id}/position`: slskd asks the peer, now, for the
-    /// transfer's place in its queue.
-    QueuePosition,
-    /// `GET users/{username}/status`: slskd asks the Soulseek server whether the peer is online.
-    Presence,
-}
-
-impl PeerAsk {
-    /// Soulful's own words for the ask that failed: slskd's text, which names peers and remote
-    /// files, stays in the failure's cause.
-    pub fn message(self) -> &'static str {
-        match self {
-            PeerAsk::QueuePosition => {
-                "slskd could not ask the source for this transfer's place in its queue"
-            }
-            PeerAsk::Presence => "slskd could not say whether the source is online",
+/// Soulful's own words for the ask that failed: slskd's text, which names peers and remote files,
+/// stays in the failure's cause. slskd asks the peer for a place in its queue
+/// (`GET transfers/downloads/{username}/{id}/position`) and the Soulseek server for a presence
+/// (`GET users/{username}/status`).
+fn ask_message(ask: PeerAsk) -> &'static str {
+    match ask {
+        PeerAsk::QueuePosition => {
+            "slskd could not ask the source for this transfer's place in its queue"
         }
-    }
-
-    /// Who did not answer when the ask gets no answer in time: the peer for a place in its
-    /// queue, the Soulseek server for a presence.
-    pub fn unanswered(self) -> FailureCode {
-        match self {
-            PeerAsk::QueuePosition => FailureCode::TransferConnectionFailed,
-            PeerAsk::Presence => FailureCode::BackendUnreachable,
-        }
+        PeerAsk::Presence => "slskd could not say whether the source is online",
     }
 }
 
@@ -282,7 +264,7 @@ impl SoulseekError {
                 ask.unanswered(),
                 stage,
                 RetryAdvice::SameSourceLater,
-                ask.message(),
+                ask_message(ask),
             )
             .with_cause(Service::Slskd, Some(500), message.clone()),
             // Not the downloads list, whose own code transfer_list_unreadable is.
@@ -290,11 +272,11 @@ impl SoulseekError {
                 FailureCode::BackendResponseUnreadable,
                 stage,
                 RetryAdvice::NotRetryable,
-                ask.message(),
+                ask_message(ask),
             )
             .with_cause(Service::Slskd, None, self.to_string())
             .with_user_action(update_soulful_or_slskd()),
-            other => other.failure(stage, ask.message()),
+            other => other.failure(stage, ask_message(ask)),
         }
     }
 }
@@ -321,6 +303,20 @@ fn update_soulful_or_slskd() -> UserAction {
         "Update Soulbeet or slskd so that Soulbeet can read slskd's answers again",
         "Soulbeet and slskd",
     )
+}
+
+impl BackendFault for SoulseekError {
+    fn failure(&self, stage: Stage, message: String) -> Failure {
+        SoulseekError::failure(self, stage, message)
+    }
+
+    fn ask_failure(&self, ask: PeerAsk, stage: Stage) -> Failure {
+        SoulseekError::ask_failure(self, ask, stage)
+    }
+
+    fn answer_unreadable(&self) -> bool {
+        matches!(self, SoulseekError::InvalidResponse(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SoulseekError>;
@@ -628,7 +624,7 @@ mod tests {
         for (e, ask, code, retry) in cases {
             let f = e.ask_failure(ask, Stage::Transfer);
             assert_eq!((f.code, f.retry), (code, retry), "{e:?}");
-            assert_eq!(f.message, ask.message());
+            assert_eq!(f.message, ask_message(ask));
             let raw = match &e {
                 SoulseekError::Api { message, .. } => message.clone(),
                 SoulseekError::UserOffline { body, .. } => body.clone(),

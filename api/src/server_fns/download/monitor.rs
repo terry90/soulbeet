@@ -12,8 +12,7 @@ use shared::download::{
     DownloadEvent, DownloadProgress, DownloadState, DownloadableItem, JobSlot, QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::error::SoulseekError;
-use soulbeet::{DownloadBackend, ImportMode};
+use soulbeet::{BackendError, DownloadBackend, ImportMode};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +33,7 @@ use crate::core::database_failure;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
-use crate::services::{download_backend, BackendLookupError};
+use crate::services::{BackendLookupError, Backends};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
 
 /// Poll interval for checking download status (2 seconds).
@@ -65,7 +64,7 @@ const ABSENT_TRACK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_BACKEND_FAILURES: u32 = 5;
 
 /// Consecutive unparseable download listings tolerated before failing the
-/// batch. Scoped to schema drift (`SoulseekError::InvalidResponse`): slskd
+/// batch. Scoped to schema drift (`BackendError::answer_unreadable`): slskd
 /// answered but its response no longer parses, which will not fix itself,
 /// so the batch must fail with that error instead of "Download never
 /// appeared in slskd". Transport errors are excluded: slskd being briefly
@@ -193,7 +192,7 @@ pub(crate) fn cancelled_on_request() -> Failure {
 /// slskd's transfer list stayed unreadable for `BACKEND_STALL_TIMEOUT`, the
 /// last read failing with `e`. Its code, advice and cause are `e`'s: a
 /// refused API key needs a person, an unreachable slskd needs time.
-fn stalled(e: &SoulseekError) -> Failure {
+fn stalled(e: &BackendError) -> Failure {
     e.failure(
         Stage::Transfer,
         format!(
@@ -210,7 +209,7 @@ fn backend_unavailable(e: &BackendLookupError) -> Failure {
 }
 
 /// slskd's downloads list kept failing to parse.
-fn list_unreadable(e: &SoulseekError) -> Failure {
+fn list_unreadable(e: &BackendError) -> Failure {
     e.failure(
         Stage::Transfer,
         format!("Could not read slskd downloads list: {e}"),
@@ -497,14 +496,14 @@ impl DownloadMonitor {
         row: DownloadProgress,
     ) -> DownloadProgress {
         if self.settle(slot, phase, backend) || self.job_cancelled(slot) {
-            self.cancelled_row(slot, backend)
+            self.cancelled_row(slot)
         } else {
             row
         }
     }
 
     /// The row of `slot` its user cancelled.
-    fn cancelled_row(&self, slot: usize, backend: &'static str) -> DownloadProgress {
+    fn cancelled_row(&self, slot: usize) -> DownloadProgress {
         let tracked = &self.tracked_files[slot];
         DownloadProgress::queued(
             tracked.transfer_id.clone(),
@@ -514,7 +513,6 @@ impl DownloadMonitor {
         )
         .with_state(DownloadState::Cancelled)
         .with_failure(cancelled_on_request())
-        .with_backend(backend)
     }
 
     /// The peers this batch is currently waiting on, deduplicated. Follows
@@ -636,8 +634,8 @@ impl DownloadMonitor {
     /// while no list can be read no per-track deadline is ever evaluated and
     /// the monitor would poll for the life of the process (#78). The batch
     /// fails with the error that ended it.
-    fn poll_failed(&self, e: SoulseekError, invalid_responses: &mut u32) -> Option<Failure> {
-        if let SoulseekError::InvalidResponse(_) = e {
+    fn poll_failed(&self, e: BackendError, invalid_responses: &mut u32) -> Option<Failure> {
+        if e.answer_unreadable() {
             // Schema drift: slskd answered but its downloads list no
             // longer parses. That will not fix itself, so fail the
             // batch with the real error instead of polling forever
@@ -838,8 +836,9 @@ impl DownloadMonitor {
             .push((tracked.source.clone(), tracked.transfer_id.clone()));
     }
 
-    /// Run the monitoring loop until all downloads complete or timeout.
-    pub async fn run(&mut self) {
+    /// Run the monitoring loop until all downloads complete or timeout. Every
+    /// backend call goes to the batch's own backend, looked up in `backends`.
+    pub async fn run(&mut self, backends: &dyn Backends) {
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
         let mut consecutive_empty = 0;
         let mut poll_count = 0;
@@ -861,7 +860,7 @@ impl DownloadMonitor {
 
             poll_count += 1;
 
-            let backend = match download_backend(None).await {
+            let backend = match backends.get(&self.batch.backend).await {
                 Ok(b) => {
                     backend_failures = 0;
                     last_backend = Some(Arc::clone(&b));
@@ -932,7 +931,7 @@ impl DownloadMonitor {
         }
 
         // Joiners must not enqueue into a batch that is only cleaning up.
-        match download_backend(None).await {
+        match backends.get(&self.batch.backend).await {
             Ok(backend) => {
                 self.close_inbox_cancelling(&backend).await;
                 self.remove_batch_transfers(&backend).await;
@@ -1002,7 +1001,7 @@ impl DownloadMonitor {
                 "Cancelling {} from {} on request",
                 tracked.filename, tracked.source
             );
-            let row = self.cancelled_row(slot, backend.id());
+            let row = self.cancelled_row(slot);
             self.abandon(slot, backend).await;
             self.settle(slot, SlotPhase::Settled, backend.id());
             cancelled.push(self.stamp(slot, row));
@@ -1304,11 +1303,11 @@ impl DownloadMonitor {
         let _ = self.tx.send(DownloadEvent::Progress(rows));
     }
 
-    /// `entry` stamped with the batch and with `slot`'s job. Every row the
-    /// monitor sends is built for one slot.
+    /// `entry` marked with the batch and its backend, and with `slot`'s job.
+    /// Every row the monitor sends is built for one slot.
     fn stamp(&self, slot: usize, entry: DownloadProgress) -> DownloadProgress {
-        entry
-            .with_batch(self.batch.owner.batch_id.clone(), self.batch.label.clone())
+        self.batch
+            .mark(entry)
             .with_job(self.tracked_files[slot].job.clone())
     }
 
@@ -2025,10 +2024,11 @@ mod tests {
     use crate::ledger::Recorded;
     use crate::server_fns::download::enqueue::{monitor_stopped, MONITOR_STOPPED};
     use crate::server_fns::download::test_support::{
-        batch, item, key, transfer, Cancel, ScriptedOutcome, StubBackend,
+        batch, batch_on, item, key, transfer, Cancel, ScriptedOutcome, StubBackend, StubBackends,
+        StubFault,
     };
     use shared::failure::{Service, UserActionCode};
-    use soulbeet::error::MissingSetting;
+    use soulbeet::error::{MissingSetting, SoulseekError};
     use std::path::Path;
     use tokio::sync::broadcast;
 
@@ -2166,6 +2166,20 @@ mod tests {
             ledger,
         );
         (m, recorded)
+    }
+
+    /// Each recorded `Slots` row's item and backend, in order.
+    fn backends_recorded(recorded: &mut Recorded) -> Vec<(String, Option<String>)> {
+        recorded
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                JobEvent::Slots { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .map(|r| (r.item, r.backend))
+            .collect()
     }
 
     /// A recorded `Slots` event: its state, and each row's item and slot.
@@ -2968,13 +2982,13 @@ mod tests {
         };
 
         assert!(
-            m.poll_failed(circuit_open(), &mut invalid).is_none(),
+            m.poll_failed(circuit_open().into(), &mut invalid).is_none(),
             "gave up while slskd was fine"
         );
 
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
         let failure = m
-            .poll_failed(circuit_open(), &mut invalid)
+            .poll_failed(circuit_open().into(), &mut invalid)
             .expect("polled a dead backend forever");
         m.stop_early(failure, Some(&backend)).await;
 
@@ -3016,7 +3030,9 @@ mod tests {
             status: 401,
             message: String::new(),
         };
-        let failure = m.poll_failed(refused, &mut 0).expect("the batch stops");
+        let failure = m
+            .poll_failed(refused.into(), &mut 0)
+            .expect("the batch stops");
         m.stop_early(failure, Some(&backend)).await;
 
         let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
@@ -3037,6 +3053,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn any_backend_answer_that_cannot_be_read_fails_the_batch_after_its_fuse() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (mut m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let unreadable = || BackendError::from(StubFault { unreadable: true });
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let mut invalid = 0;
+        for _ in 1..MAX_INVALID_RESPONSES {
+            assert!(m.poll_failed(unreadable(), &mut invalid).is_none());
+        }
+        let failure = m
+            .poll_failed(unreadable(), &mut invalid)
+            .expect("the fuse burns");
+        m.stop_early(failure, Some(&backend)).await;
+
+        let Ok(DownloadEvent::Progress(entries)) = rx.try_recv() else {
+            panic!("the UI was never told the batch died");
+        };
+        assert_failed(
+            &entries[0],
+            FailureCode::BackendResponseUnreadable,
+            "Could not read slskd downloads list: stub answer unreadable",
+        );
+    }
+
+    #[test]
+    fn a_backend_fault_with_a_readable_answer_is_not_fused_by_count() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
+        let unreachable = || BackendError::from(StubFault { unreadable: false });
+        let mut invalid = 0;
+        for _ in 0..MAX_INVALID_RESPONSES {
+            assert!(m.poll_failed(unreachable(), &mut invalid).is_none());
+        }
+        assert_eq!(invalid, 0);
+    }
+
+    #[tokio::test]
+    async fn rows_a_monitor_makes_for_its_slots_carry_the_backend_of_its_batch() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["01.flac"]);
+        m.batch.backend = "b".to_string();
+        m.batch
+            .inbox
+            .reserve()
+            .expect("open inbox")
+            .deliver(vec![AddedSlot {
+                source: "peer_b".to_string(),
+                filename: "02.flac".to_string(),
+                transfer_id: "t-02".to_string(),
+                alternates: vec![],
+                max_sources: MAX_SOURCES_PER_TRACK,
+                job: slot_of_j1(1),
+            }])
+            .expect("delivered");
+
+        // The watched slot fails without a listed row, the undrained one is stopped.
+        m.fail_unprocessed_tracks(never_appeared());
+        m.close_inbox();
+
+        let mut sent = Vec::new();
+        while let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() {
+            sent.extend(rows.into_iter().map(|r| (r.item, r.backend)));
+        }
+        let b = Some("b".to_string());
+        let both = vec![
+            ("01.flac".to_string(), b.clone()),
+            ("02.flac".to_string(), b),
+        ];
+        assert_eq!(sent, both);
+        assert_eq!(backends_recorded(&mut recorded), both);
+    }
+
+    // Paused, so the failed state's confirmation window and the poll interval take no real
+    // time.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_is_polled_and_cleaned_up_only_on_its_own_backend() {
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        b.set_listing(vec![failed_transfer("peer_a", "01.flac")]);
+        let backends = StubBackends::default()
+            .with("a", a.clone())
+            .with("b", b.clone());
+        let (tx, _rx) = broadcast::channel(16);
+        let (ledger, _recorded) = Ledger::recording();
+        let mut m = DownloadMonitor::new(
+            vec![watched("peer_a", "01.flac", 0)],
+            PathBuf::from("/music"),
+            tx,
+            batch_on("b", "X"),
+            ledger,
+        );
+
+        m.run(&backends).await;
+
+        let asked = backends.asked();
+        assert!(
+            !asked.is_empty() && asked.iter().all(|id| id == "b"),
+            "{asked:?}"
+        );
+        assert!(a.listings().is_empty() && a.cancelled().is_empty());
+        assert_eq!(
+            b.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("01.flac"))],
+            "the ended record is removed where it is"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unparseable_listing_fails_the_batch_after_its_fuse() {
         let (tx, mut rx) = broadcast::channel(16);
         let (mut m, mut recorded) = monitor_on(tx, vec!["peer_a"], vec!["a.flac"]);
@@ -3045,10 +3168,10 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let mut invalid = 0;
         for _ in 1..MAX_INVALID_RESPONSES {
-            assert!(m.poll_failed(drift(), &mut invalid).is_none());
+            assert!(m.poll_failed(drift().into(), &mut invalid).is_none());
         }
         let failure = m
-            .poll_failed(drift(), &mut invalid)
+            .poll_failed(drift().into(), &mut invalid)
             .expect("the fuse burns");
         m.stop_early(failure, Some(&backend)).await;
 
@@ -3499,6 +3622,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rebound_slots_rows_carry_the_backend_of_its_batch() {
+        let (mut m, mut rx, mut recorded) = failover_monitor();
+        m.batch.backend = "b".to_string();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        m.track_states[0].failing_since = Some(ago(FAILED_STATE_CONFIRM + Duration::from_secs(1)));
+
+        poll_tracks(
+            &mut m,
+            &[failed_transfer("peer_a", "dirA/aaa.flac")],
+            &backend,
+        )
+        .await;
+
+        match rx.try_recv().expect("an event for the retry") {
+            DownloadEvent::Replaced { entry, .. } => {
+                assert_eq!(
+                    (entry.item.as_str(), entry.backend.as_deref()),
+                    ("dirB/bbb.flac", Some("b"))
+                );
+            }
+            other => panic!("expected a row replacement, got {other:?}"),
+        }
+        let b = Some("b".to_string());
+        assert_eq!(
+            backends_recorded(&mut recorded),
+            vec![
+                ("dirA/aaa.flac".to_string(), b.clone()),
+                ("dirB/bbb.flac".to_string(), b)
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn a_single_track_batch_that_never_appears_fails_over() {
         // A lone track has no sibling to keep the batch non-empty, so
         // process_tracks and handle_absent_tracks never see it: the empty
@@ -3578,7 +3734,7 @@ mod tests {
     #[test]
     fn monitor_failures_keep_their_text() {
         use RetryAdvice::*;
-        let e = SoulseekError::InvalidResponse("bad json".into());
+        let e: BackendError = SoulseekError::InvalidResponse("bad json".into()).into();
         let unreadable = format!("Could not read slskd downloads list: {e}");
         for (f, code, retry, message) in [
             (
@@ -3644,7 +3800,7 @@ mod tests {
     }
 
     fn unset_key() -> BackendLookupError {
-        BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::ApiKey))
+        BackendLookupError::Backend(SoulseekError::NotConfigured(MissingSetting::ApiKey).into())
     }
 
     /// The lookup error is the cause, and the backend says what to set.
@@ -4284,7 +4440,7 @@ mod tests {
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
 
         let failure = m
-            .poll_failed(slskd_unavailable(), &mut 0)
+            .poll_failed(slskd_unavailable().into(), &mut 0)
             .expect("the batch stops");
         m.stop_early(failure, Some(&backend)).await;
 
@@ -4330,7 +4486,7 @@ mod tests {
         // slskd then stays unreachable for 10 minutes.
         m.last_readable_poll = ago(BACKEND_STALL_TIMEOUT + Duration::from_secs(1));
         let failure = m
-            .poll_failed(slskd_unavailable(), &mut 0)
+            .poll_failed(slskd_unavailable().into(), &mut 0)
             .expect("the batch stops");
         m.stop_early(failure, Some(&backend)).await;
 

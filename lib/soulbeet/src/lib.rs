@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod backend_error;
 pub mod beets;
 pub mod deezer;
 pub mod engine;
@@ -16,6 +17,7 @@ pub mod slskd;
 pub(crate) mod test_http;
 pub mod traits;
 
+pub use backend_error::{BackendError, BackendFault, BackendResult, PeerAsk};
 pub use beets::{duplicate_note, DuplicateNote};
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};

@@ -555,10 +555,14 @@ impl From<SearchState> for crate::download::SearchState {
     }
 }
 
+/// The id slskd goes by as a download backend, in the registry and on every row and search.
+pub const BACKEND_ID: &str = "slskd";
+
 impl From<TrackResult> for crate::download::DownloadableItem {
     fn from(track: TrackResult) -> Self {
         Self {
             id: track.base.filename.clone(),
+            backend: BACKEND_ID.into(),
             source: track.base.username.clone(),
             title: track.title,
             artist: track.artist,
@@ -682,7 +686,7 @@ impl FileEntry {
             percent: self.percent_complete,
             speed: self.average_speed,
             error: None,
-            backend: Some("slskd".into()),
+            backend: Some(BACKEND_ID.into()),
             batch_id: None,
             batch_label: None,
             local_path: None,
@@ -976,6 +980,12 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_transfer_names_slskd_as_its_backend() {
+        let row = converted(json!("Queued, Remotely"), None, 0);
+        assert_eq!(row.backend.as_deref(), Some(BACKEND_ID));
+    }
+
+    #[test]
     fn a_row_names_the_request_whose_batch_its_transfer_came_in() {
         let request = request_batch_id("890f943c-02e1-4d45-af76-d55e3d855684", 0);
         assert_eq!(request, "890f943c-02e1-4d45-af76-d55e00000000");
@@ -1138,7 +1148,7 @@ mod tests {
     fn an_item_stored_before_file_facts_still_converts() {
         let base = r#"{"username":"p","filename":"a.flac","size":1,"bitrate":null,"duration":null,"hasFreeUploadSlot":false,"uploadSpeed":0,"queueLength":0}"#;
         let item: crate::download::DownloadableItem = serde_json::from_value(json!({
-            "id": "a.flac", "source": "p", "title": "A", "artist": "B", "album": "C",
+            "id": "a.flac", "backend": "slskd", "source": "p", "title": "A", "artist": "B", "album": "C",
             "size": 1, "duration": null, "quality": "flac", "quality_score": 0.9,
             "backend_data": base}))
         .unwrap();
@@ -1152,6 +1162,17 @@ mod tests {
             (track.base.declared_extension, track.base.folder_audio_files),
             (None, 0)
         );
+    }
+
+    #[test]
+    fn a_converted_search_file_names_slskd_as_its_backend() {
+        let track: TrackResult = serde_json::from_value(json!({
+            "username": "p", "filename": "a.flac", "size": 1, "bitrate": null,
+            "duration": null, "hasFreeUploadSlot": false, "uploadSpeed": 0,
+            "queueLength": 0, "artist": "B", "title": "A", "album": "C", "match_score": 0.9}))
+        .unwrap();
+        let item: crate::download::DownloadableItem = track.into();
+        assert_eq!(item.backend, BACKEND_ID);
     }
 
     #[test]

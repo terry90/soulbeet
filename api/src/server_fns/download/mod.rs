@@ -282,17 +282,21 @@ pub struct CancelDownloadRequest {
 
 #[post("/api/downloads/cancel", auth: AuthSession)]
 pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnError> {
-    crate::core::acquire::cancel(&auth.0, req.backend.as_deref(), &req.source, &req.id)
-        .await
-        .map_err(failure_error)
+    crate::core::acquire::cancel(
+        &auth.0,
+        &crate::services::Registry,
+        req.backend.as_deref(),
+        &req.source,
+        &req.id,
+    )
+    .await
+    .map_err(failure_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub items: Vec<DownloadableItem>,
     pub target_folder: String,
-    #[serde(default)]
-    pub backend: Option<String>,
     /// The search the items were picked from.
     pub search_id: String,
 }
@@ -302,15 +306,9 @@ pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, Serve
     let folder = crate::core::folders::owned_at(&auth.0, &req.target_folder)
         .await
         .map_err(failure_error)?;
-    crate::core::acquire::download(
-        &auth.0,
-        &folder,
-        req.items,
-        req.backend.as_deref(),
-        &req.search_id,
-    )
-    .await
-    .map_err(failure_error)
+    crate::core::acquire::download(&auth.0, &folder, req.items, &req.search_id)
+        .await
+        .map_err(failure_error)
 }
 
 /// Imports a failed or skipped row again, from the job kept for it, the way

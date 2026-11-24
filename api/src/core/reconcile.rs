@@ -8,8 +8,8 @@
 use crate::auth::{UserCtx, UserId};
 use crate::config::CONFIG;
 use crate::core::acquire::{
-    alternates_from, enqueue_and_watch, fail_job, manual_batch_label, run_search, spawn_monitor,
-    Acquisition, AutoRun, NewBatch, RequestBatch,
+    alternates_from, backend_of, enqueue_and_watch, fail_job, manual_batch_label, run_search,
+    spawn_monitor, Acquisition, AutoRun, NewBatch, RequestBatch,
 };
 use crate::core::jobs::runner::{spawn_drive, ACQUIRE};
 use crate::core::sources::{server_restarted_search, view, RECENT_FAILURES_SECS};
@@ -30,7 +30,7 @@ use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
-use crate::services::download_backend;
+use crate::services::{BackendCache, Backends, Registry};
 use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner, TransferRegistry};
 use async_trait::async_trait;
 use shared::download::{
@@ -190,10 +190,7 @@ pub(crate) async fn resume_downloads(
             if !is_from(&row, next) {
                 if let Some(transfer) = sent(backend, next, request).await {
                     resumed.abandon.push((row.source.clone(), row.id.clone()));
-                    row = transfer
-                        .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                        .with_backend(backend.id())
-                        .with_job(slot.clone());
+                    row = batch.mark(transfer).with_job(slot.clone());
                     resumed.rebound.push(row.clone());
                 }
             }
@@ -249,9 +246,7 @@ pub(crate) async fn resume_downloads(
         if let Ok(path) = find_on_disk(&row.item, base, Some(&destination), &claimed) {
             resumed.on_disk.push(slot);
             resumed.finished.push(ResolvedSlot {
-                row: row
-                    .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                    .with_backend(backend.id()),
+                row: batch.mark(row),
                 path,
                 destination: Some(destination),
             });
@@ -277,8 +272,8 @@ async fn look_on_disk(
 /// What reconciliation starts.
 #[async_trait]
 pub(crate) trait Resume: Send + Sync {
-    /// The backend the downloads of the unfinished jobs ran on.
-    async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure>;
+    /// Where the backends the unfinished jobs ran on are looked up.
+    fn backends(&self) -> &dyn Backends;
     /// Watches `transfers` for `batch`, failing slots over from `pool`, and
     /// the files requests deliver to its inbox; an album batch imports
     /// `found`, its files already finished, with them once every slot has
@@ -307,15 +302,13 @@ pub(crate) trait Resume: Send + Sync {
     fn cancel_job(&self, job: &str);
 }
 
-/// The server's: the default backend, real monitors, enqueues and searches.
+/// The server's: its configured backends, real monitors, enqueues and searches.
 struct Live;
 
 #[async_trait]
 impl Resume for Live {
-    async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
-        download_backend(None)
-            .await
-            .map_err(|e| backend_unavailable(Stage::Transfer, &e))
+    fn backends(&self) -> &dyn Backends {
+        &Registry
     }
 
     async fn watch(
@@ -355,6 +348,7 @@ impl Resume for Live {
                     folder,
                     query,
                     backends,
+                    &Registry,
                     run,
                 ));
             }
@@ -374,6 +368,20 @@ impl Resume for Live {
 /// Shows `rows` (each with its slot) to `user` and records them Failed.
 async fn fail_rows(ledger: &Ledger, user: &UserId, rows: Vec<DownloadProgress>) {
     end_rows(ledger, user, JobState::Failed, rows).await;
+}
+
+/// Fails the row each of `slots` shows with `failure`.
+async fn fail_slots(
+    ledger: &Ledger,
+    user: &UserId,
+    slots: &[(JobSlot, SlotRecord)],
+    failure: &Failure,
+) {
+    let rows = (slots.iter())
+        .filter_map(|(slot, record)| shown_row(slot, record))
+        .map(|row| row.failed_with(failure.clone()))
+        .collect();
+    fail_rows(ledger, user, rows).await;
 }
 
 /// Shows `rows` (each with its slot) to `user` and records them in `state`.
@@ -449,20 +457,22 @@ impl Downloads {
     }
 }
 
-/// The monitor batch `batch_id` of `job`'s user among `downloads`, added
-/// with `label` when it is not there yet: an MCP job's skips what the library
-/// has.
+/// The monitor batch `batch_id` of `job`'s user on `backend` among
+/// `downloads`, added with `label` when it is not there yet: an MCP job's
+/// skips what the library has.
 fn batch_of<'a>(
     downloads: &'a mut Vec<Downloads>,
     job: &UnfinishedJob,
     batch_id: &str,
     label: &str,
+    backend: &str,
 ) -> &'a mut Downloads {
     let user = job.ctx.id();
-    let at = match downloads
-        .iter()
-        .position(|d| d.batch.owner.user_id == user && d.batch.owner.batch_id == batch_id)
-    {
+    let at = match downloads.iter().position(|d| {
+        d.batch.owner.user_id == user
+            && d.batch.owner.batch_id == batch_id
+            && d.batch.backend == backend
+    }) {
         Some(at) => at,
         None => {
             let batch = BatchRef::new(
@@ -473,6 +483,7 @@ fn batch_of<'a>(
                 label.to_string(),
                 PathBuf::from(&job.folder.path),
                 job.import_mode,
+                backend.to_string(),
             );
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
@@ -491,6 +502,8 @@ fn batch_of<'a>(
 /// The queued slots of one job, by their first source.
 struct Queued {
     job: UnfinishedJob,
+    /// The backend its slots' current picks are on.
+    backend: String,
     slots: Vec<(JobSlot, SlotRecord)>,
     candidates: Vec<DownloadableGroup>,
 }
@@ -762,13 +775,14 @@ pub(crate) async fn resume_unfinished(
                         .monitor_batch_id
                         .clone()
                         .map(|id| (id, job.batch_label.clone().unwrap_or_default()));
-                    let Some((batch_id, label)) = named.or(recorded) else {
-                        let rows = shown_row(&slot, &record).into_iter();
-                        let rows = rows.map(|row| row.failed_with(transfer_lost())).collect();
-                        fail_rows(ledger, &user, rows).await;
+                    // Every send of a pick goes to the pick's backend.
+                    let backend = current_pick(&record).map(|pick| pick.backend.clone());
+                    let (Some((batch_id, label)), Some(backend)) = (named.or(recorded), backend)
+                    else {
+                        fail_slots(ledger, &user, &[(slot, record)], &transfer_lost()).await;
                         continue;
                     };
-                    batch_of(&mut downloads, &job, &batch_id, &label).add(
+                    batch_of(&mut downloads, &job, &batch_id, &label, &backend).add(
                         slot,
                         record,
                         &candidates,
@@ -779,12 +793,20 @@ pub(crate) async fn resume_unfinished(
                 _ => {}
             }
         }
-        if !waiting.is_empty() {
-            queued.push(Queued {
+        if waiting.is_empty() {
+            continue;
+        }
+        let picks: Vec<DownloadableItem> = (waiting.iter())
+            .filter_map(|(_, record)| current_pick(record).cloned())
+            .collect();
+        match backend_of(&picks) {
+            Ok(backend) => queued.push(Queued {
+                backend: backend.to_string(),
                 job,
                 slots: waiting,
                 candidates,
-            });
+            }),
+            Err(failure) => fail_slots(ledger, &user, &waiting, &failure).await,
         }
     }
 
@@ -813,29 +835,18 @@ pub(crate) async fn resume_unfinished(
         }
     }
 
-    if downloads.is_empty() && queued.is_empty() {
-        return;
-    }
-    let backend = match resume.backend().await {
-        Ok(backend) => backend,
-        Err(failure) => {
-            let stopped = downloads
-                .into_iter()
-                .map(|d| (d.ctx, d.slots))
-                .chain(queued.into_iter().map(|q| (q.job.ctx, q.slots)));
-            for (ctx, slots) in stopped {
-                let rows = slots
-                    .iter()
-                    .filter_map(|(slot, record)| shown_row(slot, record))
-                    .map(|row| row.failed_with(failure.clone()))
-                    .collect();
-                fail_rows(ledger, &ctx.id(), rows).await;
-            }
-            return;
-        }
-    };
+    // A backend that cannot be had fails only the slots of its own batches and jobs.
+    let mut backends = BackendCache::new(resume.backends());
     let mut fresh = Vec::new();
     for job in queued {
+        let backend = match backends.get(&job.backend).await {
+            Ok(backend) => backend,
+            Err(e) => {
+                let failure = backend_unavailable(Stage::Transfer, &e);
+                fail_slots(ledger, &job.job.ctx.id(), &job.slots, &failure).await;
+                continue;
+            }
+        };
         let Some(job) = adopt_sent(ledger, &backend, &mut downloads, job).await else {
             continue;
         };
@@ -847,20 +858,30 @@ pub(crate) async fn resume_unfinished(
                 failure: None,
             });
         } else {
-            fresh.push(job);
+            fresh.push((backend, job));
+        }
+    }
+    // adopt_sent joins a job only to a batch on its own backend, so a batch
+    // failed here holds no queued job.
+    let mut batches = Vec::new();
+    for batch in downloads {
+        match backends.get(&batch.batch.backend).await {
+            Ok(backend) => batches.push((backend, batch)),
+            Err(e) => {
+                let failure = backend_unavailable(Stage::Transfer, &e);
+                fail_slots(ledger, &batch.ctx.id(), &batch.slots, &failure).await;
+            }
         }
     }
     // One batch whose files are slow to find on disk holds up no other.
-    futures::future::join_all(
-        downloads
-            .into_iter()
-            .map(|batch| resume_batch(ledger, queue, resume, &backend, download_base, batch)),
-    )
+    futures::future::join_all(batches.into_iter().map(|(backend, batch)| {
+        resume_batch(ledger, queue, resume, backend, download_base, batch)
+    }))
     .await;
     futures::future::join_all(
         fresh
             .into_iter()
-            .map(|job| enqueue_anew(resume, &backend, job)),
+            .map(|(backend, job)| enqueue_anew(resume, backend, job)),
     )
     .await;
 }
@@ -894,19 +915,12 @@ async fn adopt_sent(
             rest.push((slot, record));
             continue;
         };
-        let row = transfer
-            .with_batch(batch_id.clone(), label.clone())
-            .with_backend(backend.id())
-            .with_job(slot.clone());
+        let resumed = batch_of(downloads, &queued.job, &batch_id, &label, &queued.backend);
+        let row = resumed.batch.mark(transfer).with_job(slot.clone());
         rows.push(row.clone());
         record.row = Some(row);
         record.state = JobState::Downloading;
-        batch_of(downloads, &queued.job, &batch_id, &label).add(
-            slot,
-            record,
-            &queued.candidates,
-            cap,
-        );
+        resumed.add(slot, record, &queued.candidates, cap);
     }
     if !rows.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -929,7 +943,7 @@ async fn adopt_sent(
         return None;
     }
     queued.slots = rest;
-    batch_of(downloads, &queued.job, &batch_id, &label)
+    batch_of(downloads, &queued.job, &batch_id, &label, &queued.backend)
         .queued
         .push(queued);
     None
@@ -951,7 +965,7 @@ async fn resume_batch(
     ledger: &Ledger,
     queue: &ImportQueue,
     resume: &dyn Resume,
-    backend: &Arc<dyn DownloadBackend>,
+    backend: Arc<dyn DownloadBackend>,
     download_base: &Path,
     downloads: Downloads,
 ) {
@@ -974,7 +988,7 @@ async fn resume_batch(
         rebound,
         abandon,
         on_disk,
-    } = resume_downloads(backend, download_base, &batch, slots, waiting).await;
+    } = resume_downloads(&backend, download_base, &batch, slots, waiting).await;
     fail_rows(ledger, &user, lost).await;
     if !rebound.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -1024,11 +1038,8 @@ async fn resume_batch(
         if failure == already_running() {
             dismissed.push(w.job);
         } else {
-            held.push(
-                DownloadProgress::failed(w.transfer_id, w.source, w.filename, failure)
-                    .with_batch(batch.owner.batch_id.clone(), batch.label.clone())
-                    .with_job(w.job),
-            );
+            let row = DownloadProgress::failed(w.transfer_id, w.source, w.filename, failure);
+            held.push(batch.mark(row).with_job(w.job));
         }
     }
     if !dismissed.is_empty() {
@@ -1075,11 +1086,8 @@ async fn resume_batch(
     futures::future::join_all(joining.into_iter().map(|(q, reservation)| {
         let (job, acquisition) = q.acquisition();
         let into = RequestBatch::Running(batch.clone(), reservation);
-        async move {
-            resume
-                .enqueue(&job.ctx, backend.clone(), into, acquisition)
-                .await
-        }
+        let backend = backend.clone();
+        async move { resume.enqueue(&job.ctx, backend, into, acquisition).await }
     }))
     .await;
 }
@@ -1092,6 +1100,7 @@ impl Queued {
             job,
             slots,
             candidates,
+            ..
         } = self;
         let items: Vec<(u32, DownloadableItem)> = slots
             .iter()
@@ -1109,8 +1118,9 @@ impl Queued {
 }
 
 /// Enqueues the queued slots of a job that never had a batch into a new one
-/// importing in the job's mode.
-async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, queued: Queued) {
+/// on `backend`, its picks' own, importing in the job's mode.
+async fn enqueue_anew(resume: &dyn Resume, backend: Arc<dyn DownloadBackend>, queued: Queued) {
+    let id = queued.backend.clone();
     let (job, acquisition) = queued.acquisition();
     let picked: Vec<DownloadableItem> = acquisition
         .items
@@ -1120,12 +1130,13 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
     let fresh = NewBatch {
         batch_id: uuid::Uuid::new_v4().to_string(),
         label: manual_batch_label(&picked),
+        backend: id,
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
         duplicates: DuplicateRule::for_job(job.origin, job.options.as_ref()),
     };
     resume
-        .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
+        .enqueue(&job.ctx, backend, fresh.into(), acquisition)
         .await;
 }
 
@@ -1164,7 +1175,10 @@ mod tests {
         StoredSpec, Transition, SEARCH_KEPT_SECS,
     };
     use crate::server_fns::download::enqueue::file_taken_by_another_download;
-    use crate::server_fns::download::test_support::{batch, group, item, transfer, StubBackend};
+    use crate::server_fns::download::test_support::{
+        batch, group, item, item_on, transfer, StubBackend, StubBackends,
+    };
+    use crate::services::{BackendLookupError, DEFAULT_DOWNLOAD_BACKEND};
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
     use shared::failure::{FailureCode, RetryAdvice, Stage};
     use soulbeet::{DriverChoice, DuplicateRun, ImportedItem};
@@ -1409,10 +1423,14 @@ mod tests {
     /// job, (slot, item id), the running batch joined (None: a new one)
     type Sent = (String, Vec<(u32, String)>, Option<String>);
 
-    /// Records what reconciliation started; its backend is `backend`.
+    /// Records what reconciliation started, looking backends up in `backends`.
     struct Started {
-        backend: Arc<dyn DownloadBackend>,
+        backends: StubBackends,
         watched: Mutex<Vec<WatchStart>>,
+        /// Each watched batch's id and backend.
+        watched_on: Mutex<Vec<(String, String)>>,
+        /// Each enqueue's job, its batch's backend and the id of the backend it was handed.
+        enqueued_on: Mutex<Vec<(String, String, &'static str)>>,
         /// The path and slot of each file a watched batch was handed found.
         found: Mutex<Vec<(PathBuf, Option<JobSlot>)>>,
         enqueued: Mutex<Vec<EnqueueStart>>,
@@ -1430,10 +1448,13 @@ mod tests {
     }
 
     impl Started {
-        fn on(backend: Arc<dyn DownloadBackend>) -> Started {
+        /// Started with `stub` registered under the default id.
+        fn on(stub: Arc<StubBackend>) -> Started {
             Started {
-                backend,
+                backends: StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub),
                 watched: Mutex::default(),
+                watched_on: Mutex::default(),
+                enqueued_on: Mutex::default(),
                 found: Mutex::default(),
                 enqueued: Mutex::default(),
                 searched: Mutex::default(),
@@ -1441,6 +1462,14 @@ mod tests {
                 standing_by: Mutex::default(),
                 driven: Mutex::default(),
                 steps: Mutex::default(),
+            }
+        }
+
+        /// It with `stub` registered under `id` too.
+        fn with(self, id: &str, stub: Arc<StubBackend>) -> Started {
+            Started {
+                backends: self.backends.with(id, stub),
+                ..self
             }
         }
 
@@ -1464,8 +1493,8 @@ mod tests {
 
     #[async_trait]
     impl Resume for Started {
-        async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
-            Ok(self.backend.clone())
+        fn backends(&self) -> &dyn Backends {
+            &self.backends
         }
         async fn watch(
             &self,
@@ -1491,6 +1520,8 @@ mod tests {
             ));
             (self.steps.lock().unwrap())
                 .extend(transfers.iter().map(|t| format!("watch {}", t.job.job)));
+            (self.watched_on.lock().unwrap())
+                .push((batch.owner.batch_id.clone(), batch.backend.clone()));
             self.watched.lock().unwrap().push((
                 batch.owner.batch_id,
                 batch.label,
@@ -1503,14 +1534,17 @@ mod tests {
         async fn enqueue(
             &self,
             _: &UserCtx,
-            _: Arc<dyn DownloadBackend>,
+            backend: Arc<dyn DownloadBackend>,
             batch: RequestBatch,
             a: Acquisition,
         ) {
-            let (mode, running) = match batch {
-                RequestBatch::New(fresh) => (fresh.import_mode, None),
-                RequestBatch::Running(batch, _) => (batch.import_mode, Some(batch.owner.batch_id)),
+            let (mode, on, running) = match batch {
+                RequestBatch::New(fresh) => (fresh.import_mode, fresh.backend, None),
+                RequestBatch::Running(batch, _) => {
+                    (batch.import_mode, batch.backend, Some(batch.owner.batch_id))
+                }
             };
+            (self.enqueued_on.lock().unwrap()).push((a.job.clone(), on, backend.id()));
             self.enqueued.lock().unwrap().push((
                 a.job,
                 a.items.into_iter().map(|(s, i)| (s, i.id)).collect(),
@@ -1915,19 +1949,29 @@ mod tests {
     /// slskd's URL is not set, so no backend is available; nothing may start.
     struct Unavailable;
 
-    fn unset() -> Failure {
-        backend_unavailable(
-            Stage::Transfer,
-            &crate::services::BackendLookupError::Backend(
-                soulbeet::error::SoulseekError::NotConfigured(soulbeet::error::MissingSetting::Url),
-            ),
+    /// The lookup error every id of Unavailable answers.
+    fn not_configured() -> BackendLookupError {
+        BackendLookupError::Backend(
+            soulbeet::error::SoulseekError::NotConfigured(soulbeet::error::MissingSetting::Url)
+                .into(),
         )
+    }
+
+    fn unset() -> Failure {
+        backend_unavailable(Stage::Transfer, &not_configured())
+    }
+
+    #[async_trait]
+    impl Backends for Unavailable {
+        async fn get(&self, _: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+            Err(not_configured())
+        }
     }
 
     #[async_trait]
     impl Resume for Unavailable {
-        async fn backend(&self) -> Result<Arc<dyn DownloadBackend>, Failure> {
-            Err(unset())
+        fn backends(&self) -> &dyn Backends {
+            self
         }
         async fn watch(
             &self,
@@ -2167,6 +2211,7 @@ mod tests {
                 "Come Over".into(),
                 PathBuf::from(target),
                 ImportMode::Singleton,
+                DEFAULT_DOWNLOAD_BACKEND.to_string(),
             )
         };
         let registry = TransferRegistry::global();
@@ -2178,7 +2223,7 @@ mod tests {
             &[transfer_key(backend.id(), "peer_a", "a/02.flac")],
             &holder("bob", "/music/bob"),
         );
-        let started = Started::on(backend);
+        let started = Started::on(stub);
 
         reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
         ledger.settled().await;
@@ -2195,9 +2240,18 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(states, vec!["dismissed", "failed", "downloading"]);
+        let held = stored_row(&db, "j1", 1).await;
         assert_eq!(
-            stored_row(&db, "j1", 1).await.failure.map(|f| f.code),
-            Some(FailureCode::AlreadyInFlightOtherUser)
+            (
+                held.failure.map(|f| f.code),
+                held.batch_id.as_deref(),
+                held.backend.as_deref()
+            ),
+            (
+                Some(FailureCode::AlreadyInFlightOtherUser),
+                Some("b1"),
+                Some(DEFAULT_DOWNLOAD_BACKEND)
+            )
         );
     }
 
@@ -2430,6 +2484,7 @@ mod tests {
             "Come Over".into(),
             tmp.path().join("music"),
             ImportMode::Singleton,
+            DEFAULT_DOWNLOAD_BACKEND.to_string(),
         );
         // slskd took both files of b1 and finished 01 while Soulful was down, and its record
         // was cleared; it holds nothing now.
@@ -2525,6 +2580,7 @@ mod tests {
             "Come Over".into(),
             library.to_path_buf(),
             ImportMode::Album,
+            DEFAULT_DOWNLOAD_BACKEND.to_string(),
         )
     }
 
@@ -2767,6 +2823,140 @@ mod tests {
             .map(|(batch, label, _)| (batch.clone(), label.clone()))
             .collect();
         assert_eq!(watched, vec![("b1".to_string(), "Come Over".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_be_had_fails_only_the_slots_whose_picks_are_on_it() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let on_b = StubBackend::new(vec![]);
+        on_b.set_listing(vec![transfer(
+            "peer_b",
+            "b/01.flac",
+            "t-b01",
+            DownloadState::InProgress,
+        )]);
+        let started = Started::on(StubBackend::new(vec![])).with("b", on_b.clone());
+        let unknown = BackendLookupError::Unknown("a".into());
+        started.backends.fail("a", unknown.clone());
+        let slot = |job: &str, slot| JobSlot {
+            job: job.into(),
+            slot,
+        };
+        // j-a's picks are on a: one file downloads in bx, the other is still queued.
+        job_of(
+            &ledger,
+            &db,
+            "j-a",
+            JobState::Queued,
+            None,
+            vec![
+                (0, item_on("a", "peer_a", "One", "a/01.flac")),
+                (1, item_on("a", "peer_a", "Two", "a/02.flac")),
+            ],
+        )
+        .await;
+        enqueued_in_b1(&ledger, "j-a");
+        // j-b's are on b: its downloading file's row names bx too, and the job's later send
+        // went to b2, which b does not hold.
+        job_of(
+            &ledger,
+            &db,
+            "j-b",
+            JobState::Queued,
+            None,
+            vec![
+                (0, item_on("b", "peer_b", "One", "b/01.flac")),
+                (1, item_on("b", "peer_b", "Two", "b/02.flac")),
+            ],
+        )
+        .await;
+        ledger.record(JobEvent::Enqueued {
+            job: "j-b".into(),
+            monitor_batch_id: "b2".into(),
+            batch_label: "Other".into(),
+            request: "r-b2".into(),
+        });
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![
+                transfer("peer_a", "a/01.flac", "t-a01", DownloadState::InProgress)
+                    .with_batch("bx".into(), "Come Over".into())
+                    .with_job(slot("j-a", 0)),
+                transfer("peer_b", "b/01.flac", "t-b01", DownloadState::InProgress)
+                    .with_batch("bx".into(), "Come Over".into())
+                    .with_job(slot("j-b", 0)),
+            ],
+        });
+        ledger.settled().await;
+
+        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        let failure = backend_unavailable(Stage::Transfer, &unknown);
+        for n in 0..2 {
+            let row = stored_row(&db, "j-a", n).await;
+            assert_eq!(row.failure, Some(failure.clone()), "slot {n}");
+        }
+        assert_eq!(store::job_state(&db, "j-a").await, Some(JobState::Failed));
+        let states: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM job_tracks WHERE job_id = 'j-b' ORDER BY slot")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(states, vec!["downloading", "queued"]);
+        let mut asked = started.backends.asked();
+        asked.sort();
+        assert_eq!(asked, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            on_b.download_lookups(),
+            vec![("peer_b".to_string(), "t-b01".to_string())]
+        );
+        let mut watched_on = started.watched_on.lock().unwrap().clone();
+        watched_on.sort();
+        assert_eq!(
+            watched_on,
+            vec![
+                ("b2".to_string(), "b".to_string()),
+                ("bx".to_string(), "b".to_string())
+            ]
+        );
+        let watched: Vec<WatchStart> = started.watched.lock().unwrap().clone();
+        assert!(watched.contains(&(
+            "bx".into(),
+            "Come Over".into(),
+            vec![("t-b01".into(), slot("j-b", 0))]
+        )));
+        assert_eq!(
+            *started.enqueued_on.lock().unwrap(),
+            vec![("j-b".to_string(), "b".to_string(), on_b.id())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_job_whose_files_are_on_two_backends_fails_and_asks_neither() {
+        let (ledger, db) = ledger().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Started::on(StubBackend::new(vec![]));
+        let picks = vec![
+            (0, item_on("a", "peer_a", "One", "a/01.flac")),
+            (1, item_on("b", "peer_b", "Two", "b/02.flac")),
+        ];
+        let items: Vec<DownloadableItem> = picks.iter().map(|(_, item)| item.clone()).collect();
+        let mixed = backend_of(&items).unwrap_err();
+        job_of(&ledger, &db, "j1", JobState::Queued, None, picks).await;
+        ledger.settled().await;
+
+        reconcile_in(&db, &ledger, &queue(), &started, tmp.path()).await;
+        ledger.settled().await;
+
+        for n in 0..2 {
+            let row = stored_row(&db, "j1", n).await;
+            assert_eq!(row.failure, Some(mixed.clone()), "slot {n}");
+        }
+        assert_eq!(store::job_state(&db, "j1").await, Some(JobState::Failed));
+        assert!(started.nothing());
+        assert!(started.backends.asked().is_empty());
     }
 
     #[tokio::test]
@@ -3194,9 +3384,10 @@ mod tests {
                 "Winter Songs".into(),
                 PathBuf::from(&record.folder.path),
                 ImportMode::Singleton,
+                DEFAULT_DOWNLOAD_BACKEND.to_string(),
             ),
         );
-        let started = Started::on(backend);
+        let started = Started::on(stub);
 
         reconcile_in(db, ledger, &queue(), &started, tmp.path()).await;
         ledger.settled().await;

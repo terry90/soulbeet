@@ -12,7 +12,7 @@
 
 use crate::auth::UserId;
 use crate::ledger::DuplicateRule;
-use shared::download::{batch_folder, DownloadableItem, JobSlot};
+use shared::download::{batch_folder, DownloadProgress, DownloadableItem, JobSlot};
 use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -30,13 +30,16 @@ pub struct TransferOwner {
     pub batch_id: String,
 }
 
-/// A running batch: who owns it, its name, the folder its transfers are
-/// enqueued into, the library folder they are imported into, how its imports
-/// treat what the library has and the inbox that takes more of them.
+/// A running batch: who owns it, its name, the backend its transfers are on,
+/// the folder they are enqueued into, the library folder they are imported
+/// into, how its imports treat what the library has and the inbox that takes
+/// more of them.
 #[derive(Clone, Debug)]
 pub struct BatchRef {
     pub owner: TransferOwner,
     pub label: String,
+    /// The id of the backend every call for this batch goes to.
+    pub backend: String,
     pub destination: String,
     pub target: PathBuf,
     pub inbox: Arc<BatchInbox>,
@@ -45,24 +48,32 @@ pub struct BatchRef {
 }
 
 impl BatchRef {
-    /// A new batch downloading into `batch_folder(label, batch_id)` and
-    /// importing into `target` in `import_mode`, its duplicates guarded.
+    /// A new batch downloading on `backend` into `batch_folder(label, batch_id)`
+    /// and importing into `target` in `import_mode`, its duplicates guarded.
     pub fn new(
         owner: TransferOwner,
         label: String,
         target: PathBuf,
         import_mode: ImportMode,
+        backend: String,
     ) -> Self {
         let destination = batch_folder(&label, &owner.batch_id);
         Self {
             owner,
             label,
+            backend,
             destination,
             target,
             inbox: BatchInbox::new(),
             import_mode,
             duplicates: DuplicateRule::Guarded,
         }
+    }
+
+    /// `row` as a row of this batch: its batch and its backend set together.
+    pub fn mark(&self, row: DownloadProgress) -> DownloadProgress {
+        row.with_batch(self.owner.batch_id.clone(), self.label.clone())
+            .with_backend(&self.backend)
     }
 
     /// The batch with imports that treat what the library already has by `rule`.
@@ -456,6 +467,7 @@ mod tests {
             "Come Over".to_string(),
             PathBuf::from("/music"),
             import_mode,
+            "slskd".to_string(),
         )
     }
 
@@ -480,6 +492,7 @@ mod tests {
             "Come Over".into(),
             running.target.clone(),
             ImportMode::Singleton,
+            running.backend.clone(),
         )
         .with_duplicates(DuplicateRule::Skip);
         let claim = registry.claim_for_request(&[key("01.flac"), key("02.flac")], &fresh);

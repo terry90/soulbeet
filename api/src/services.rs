@@ -10,10 +10,9 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 #[cfg(feature = "server")]
 use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
-    error::SoulseekError,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
-    DownloadBackend, MusicImporter, NavidromeClient,
+    BackendError, DownloadBackend, MusicImporter, NavidromeClient,
 };
 #[cfg(feature = "server")]
 use tokio::sync::RwLock;
@@ -26,7 +25,7 @@ pub mod providers {
 }
 
 pub mod downloaders {
-    pub const SLSKD: &str = "slskd";
+    pub const SLSKD: &str = shared::slskd::BACKEND_ID;
 }
 
 pub mod importers {
@@ -63,14 +62,16 @@ pub fn available_importers() -> Vec<(&'static str, &'static str)> {
 /// Why `download_backend` has no backend to give. Its Display is the text
 /// the lookup always showed.
 #[cfg(feature = "server")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BackendLookupError {
     /// The backend's settings could not be read from Soulful's database.
     Settings(String),
     /// The backend refused its settings; its own error says what is wrong.
-    Backend(SoulseekError),
+    Backend(BackendError),
     /// No backend has this id.
     Unknown(String),
+    /// The backend built for `id` goes by `named`, so nothing routed to `id` would reach it.
+    Misnamed { id: String, named: &'static str },
 }
 
 #[cfg(feature = "server")]
@@ -80,6 +81,9 @@ impl std::fmt::Display for BackendLookupError {
             BackendLookupError::Settings(e) => f.write_str(e),
             BackendLookupError::Backend(e) => write!(f, "{e}"),
             BackendLookupError::Unknown(id) => write!(f, "Unknown download backend: {id}"),
+            BackendLookupError::Misnamed { id, named } => {
+                write!(f, "Download backend {id} names itself {named}")
+            }
         }
     }
 }
@@ -98,8 +102,8 @@ impl BackendLookupError {
                 message,
             )
             .with_cause(Service::Database, None, e.clone()),
-            // The caller named a backend that does not exist.
-            BackendLookupError::Unknown(_) => Failure::new(
+            // The caller named a backend that does not exist, or that no backend answers to.
+            BackendLookupError::Unknown(_) | BackendLookupError::Misnamed { .. } => Failure::new(
                 FailureCode::InvalidInput,
                 stage,
                 RetryAdvice::NotRetryable,
@@ -130,7 +134,7 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
                         })
                         .build()
                 })
-                .map_err(BackendLookupError::Backend)?;
+                .map_err(|e| BackendLookupError::Backend(e.into()))?;
 
             Ok(Arc::new(client))
         }
@@ -152,12 +156,73 @@ pub async fn download_backend(
         return Ok(backend.clone());
     }
 
-    let backend = init_download_backend(requested).await?;
+    let backend = answering_to(requested, init_download_backend(requested).await?)?;
     DOWNLOAD_BACKENDS
         .write()
         .await
         .insert(requested.to_string(), backend.clone());
     Ok(backend)
+}
+
+/// `backend`, built for `id`, when it goes by `id`: a backend is kept only under its own id.
+#[cfg(feature = "server")]
+fn answering_to(
+    id: &str,
+    backend: Arc<dyn DownloadBackend>,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    match backend.id() {
+        named if named == id => Ok(backend),
+        named => Err(BackendLookupError::Misnamed {
+            id: id.to_string(),
+            named,
+        }),
+    }
+}
+
+/// Where download backends are looked up by id, so tests answer with stubs.
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+pub trait Backends: Send + Sync {
+    async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError>;
+}
+
+/// The backends the server is configured with.
+#[cfg(feature = "server")]
+pub struct Registry;
+
+#[cfg(feature = "server")]
+#[async_trait::async_trait]
+impl Backends for Registry {
+    async fn get(&self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        download_backend(Some(id)).await
+    }
+}
+
+/// Backends looked up through `backends`, each id once: a later call for the same id gets the
+/// first answer, error included.
+#[cfg(feature = "server")]
+pub struct BackendCache<'a> {
+    backends: &'a dyn Backends,
+    found: HashMap<String, Result<Arc<dyn DownloadBackend>, BackendLookupError>>,
+}
+
+#[cfg(feature = "server")]
+impl<'a> BackendCache<'a> {
+    pub fn new(backends: &'a dyn Backends) -> Self {
+        Self {
+            backends,
+            found: HashMap::new(),
+        }
+    }
+
+    pub async fn get(&mut self, id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+        if let Some(found) = self.found.get(id) {
+            return found.clone();
+        }
+        let found = self.backends.get(id).await;
+        self.found.insert(id.to_string(), found.clone());
+        found
+    }
 }
 
 #[cfg(feature = "server")]
@@ -459,6 +524,7 @@ mod tests {
     use super::*;
     use crate::db::test_db;
     use crate::security::SEEDED_ADMIN_ID;
+    use crate::server_fns::download::test_support::{StubBackend, StubBackends};
 
     #[tokio::test]
     async fn an_unreadable_password_marks_the_user_and_resets_the_banner() {
@@ -770,6 +836,45 @@ mod tests {
                 (FailureCode::InvalidInput, stage, RetryAdvice::NotRetryable)
             );
         }
+    }
+
+    #[test]
+    fn a_backend_is_kept_only_under_its_own_id() {
+        let stub: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let own = stub.id();
+        assert_eq!(answering_to(own, stub.clone()).unwrap().id(), own);
+        let Err(e) = answering_to(downloaders::SLSKD, stub) else {
+            panic!("kept under another backend's id");
+        };
+        assert_eq!(
+            e.to_string(),
+            format!("Download backend slskd names itself {own}")
+        );
+        let f = e.failure(Stage::Enqueue, "m");
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::InvalidInput,
+                Stage::Enqueue,
+                RetryAdvice::NotRetryable
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_cache_asks_each_id_once() {
+        let stub = StubBackend::new(vec![]);
+        let backends = StubBackends::default().with("a", stub.clone());
+        backends.fail("b", BackendLookupError::Unknown("b".into()));
+        let mut cache = BackendCache::new(&backends);
+        for _ in 0..2 {
+            assert_eq!(cache.get("a").await.unwrap().id(), stub.id());
+            let Err(e) = cache.get("b").await else {
+                panic!("b was found");
+            };
+            assert_eq!(e.to_string(), "Unknown download backend: b");
+        }
+        assert_eq!(backends.asked(), ["a", "b"]);
     }
 
     #[tokio::test]

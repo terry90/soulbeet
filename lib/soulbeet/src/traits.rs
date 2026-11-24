@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::error::Result;
+use crate::backend_error::BackendResult;
 use crate::history::HistoryError;
 use crate::knowledge::{CacheError, KnowledgeError};
 use crate::musicbrainz::ArtistMatch;
@@ -44,13 +44,29 @@ pub trait MetadataProvider: Send + Sync {
     async fn get_album(&self, id: &str) -> std::result::Result<AlbumWithTracks, MetadataError>;
 }
 
+/// A source of files. Files of a `download` call land at
+/// `<DOWNLOAD_PATH>/<destination>/<name>`, under the naming slskd uses, which
+/// `resolve_in_destination` reads.
+///
+/// What the callers rely on:
+/// - `QueuedDownload::id` is stable, and is the id `get_downloads_for` and
+///   `get_download` list the transfer under.
+/// - Each `QueuedDownload` that `download` returns, and each `DownloadProgress`
+///   listed, names the sent item's `source` in `source` and its
+///   `DownloadableItem::id` in `item`.
+/// - Every `DownloadableItem` that `poll_search` returns names `id()` in
+///   `backend`, so its sends come back here.
+/// - A succeeded transfer stays listed until `cancel_download` with `remove`.
+/// - `remove` forgets an ended transfer and never moves or deletes a file.
+/// - An item `download` cannot send gets no answer: the caller fails it.
 #[async_trait]
 pub trait DownloadBackend: Send + Sync {
+    /// The id the registry keeps this backend under, and the only one it is looked up by.
     fn id(&self) -> &'static str;
     fn name(&self) -> &'static str;
 
-    async fn start_search(&self, spec: &SearchSpec) -> Result<String>;
-    async fn poll_search(&self, search_id: &str) -> Result<SearchResult>;
+    async fn start_search(&self, spec: &SearchSpec) -> BackendResult<String>;
+    async fn poll_search(&self, search_id: &str) -> BackendResult<SearchResult>;
     /// A fresh id for one `download` call, drawn before the call so the caller can store it
     /// first. Opaque to the caller.
     fn new_request(&self) -> String;
@@ -63,21 +79,27 @@ pub trait DownloadBackend: Send + Sync {
         items: Vec<DownloadableItem>,
         destination: &str,
         request: &str,
-    ) -> Result<Vec<QueuedDownload>>;
+    ) -> BackendResult<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller
     /// here is waiting on a specific batch (#78). This is the polling path.
-    async fn get_downloads_for(&self, sources: &[String]) -> Result<Vec<DownloadProgress>>;
+    async fn get_downloads_for(&self, sources: &[String]) -> BackendResult<Vec<DownloadProgress>>;
     /// The transfer `source` holds under `id`, as `get_downloads_for` reads it; None when the backend no longer has it.
-    async fn get_download(&self, source: &str, id: &str) -> Result<Option<DownloadProgress>>;
-    async fn cancel_download(&self, username: &str, download_id: &str, remove: bool) -> Result<()>;
+    async fn get_download(&self, source: &str, id: &str)
+        -> BackendResult<Option<DownloadProgress>>;
+    async fn cancel_download(
+        &self,
+        username: &str,
+        download_id: &str,
+        remove: bool,
+    ) -> BackendResult<()>;
     /// The transfer's place in the source's queue, asked of the source now; None when the
     /// backend no longer has the transfer.
-    async fn queue_position(&self, source: &str, id: &str) -> Result<Option<u32>>;
+    async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>>;
     /// Whether the source is online now.
-    async fn source_status(&self, source: &str) -> Result<SourcePresence>;
+    async fn source_status(&self, source: &str) -> BackendResult<SourcePresence>;
     /// Ends a running search early; its next poll reads what it found so far.
-    async fn stop_search(&self, search_id: &str) -> Result<()>;
+    async fn stop_search(&self, search_id: &str) -> BackendResult<()>;
     /// Ok when the backend can take work now; else why not, as a failure
     /// with the backend's own answer as its cause.
     async fn health_check(&self) -> std::result::Result<(), Failure>;
