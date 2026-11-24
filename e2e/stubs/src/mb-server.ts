@@ -1,6 +1,7 @@
 // MusicBrainz /ws/2 double. Both consumers speak the JSON web service:
 // - soulbeet (musicbrainz_rs): recording / release-group search with the
-//   entities inlined, plus release lookup for tracklists
+//   entities inlined, an artist's release groups read a page at a time,
+//   plus release lookup for tracklists
 // - beets 2.x (musicbrainz plugin): recording search for candidate ids,
 //   then per-id recording lookups
 // Everything is served from the shared fixture dataset. A control API sets
@@ -80,15 +81,23 @@ function weakHit(hit: RecordingHit): RecordingHit {
  * whose `"` and `\` are escaped (Soulful) and `field:(escaped terms)`
  * groups (beets), joined with AND or whitespace. Soulful's artist filter is
  * `(name:"phrase" OR arid:"mbid" ...)`; every `arid` is kept in `arids`.
+ * Soulful's discography search is `arid:"mbid" AND (primarytype:album OR
+ * primarytype:ep) AND [NOT ]secondarytype:* AND status:official`: every
+ * `primarytype` is kept in `primaryTypes`, and `secondarytype:*` sets
+ * `hasSecondaryType`, false after NOT.
  */
 function parseLucene(query: string): {
   fields: Map<string, string>;
   arids: string[];
+  primaryTypes: string[];
+  hasSecondaryType: boolean | undefined;
   freeText: string[];
 } {
   const fields = new Map<string, string>();
   const arids: string[] = [];
-  const fieldPattern = /([a-z]+):(?:"((?:[^"\\]|\\.)*)"|\(([^)]*)\)|(\S+))/gi;
+  const primaryTypes: string[] = [];
+  let hasSecondaryType: boolean | undefined;
+  const fieldPattern = /([a-z]+):(?:"((?:[^"\\]|\\.)*)"|\(([^)]*)\)|([^\s()]+))/gi;
   let match: RegExpExecArray | null;
   const consumed: string[] = [];
   while ((match = fieldPattern.exec(query)) !== null) {
@@ -99,6 +108,10 @@ function parseLucene(query: string): {
     const text = value.replace(/\\(.)/g, '$1').toLowerCase().trim();
     if (key === 'arid') {
       arids.push(text);
+    } else if (key === 'primarytype') {
+      primaryTypes.push(text);
+    } else if (key === 'secondarytype' && text === '*') {
+      hasSecondaryType = !/\bNOT\s+$/.test(query.slice(0, match.index));
     } else {
       fields.set(key, text);
     }
@@ -113,12 +126,19 @@ function parseLucene(query: string): {
     .toLowerCase()
     .split(/\s+/)
     .filter((t) => t.length > 0);
-  return { fields, arids, freeText };
+  return { fields, arids, primaryTypes, hasSecondaryType, freeText };
 }
 
-/** Whether the release's artist is the one a query's artist filter names. */
+/**
+ * Whether the release's artist is the one a query's artist filter names.
+ * With no name, the `arid` clauses alone filter, when there are any.
+ */
 function artistMatches(release: FixtureRelease, name: string | undefined, arids: string[]): boolean {
-  return matchesText(release.artist, name) || arids.includes(release.artistMbid.toLowerCase());
+  const byMbid = arids.includes(release.artistMbid.toLowerCase());
+  if (name === undefined && arids.length > 0) {
+    return byMbid;
+  }
+  return matchesText(release.artist, name) || byMbid;
 }
 
 function matchesText(haystack: string, needle: string | undefined): boolean {
@@ -176,13 +196,29 @@ function searchRecordings(query: string): RecordingHit[] {
   return hits;
 }
 
+function secondaryTypes(release: FixtureRelease): string[] {
+  return release.secondaryTypes ?? [];
+}
+
+type ReleaseStatus = NonNullable<FixtureRelease['status']>;
+
+function releaseStatus(release: FixtureRelease): ReleaseStatus {
+  return release.status ?? 'Official';
+}
+
+/**
+ * A release group matches `status:` when one of its releases has that
+ * status; each fixture group holds one release.
+ */
 function searchReleaseGroups(query: string): FixtureRelease[] {
-  const { fields, arids, freeText } = parseLucene(query);
+  const { fields, arids, primaryTypes, hasSecondaryType, freeText } = parseLucene(query);
   const title =
     fields.get('releasegroup') ?? fields.get('releasegroupaccent') ?? fields.get('release');
   const artist = fields.get('artist') ?? fields.get('artistname');
+  const status = fields.get('status');
   const free = freeText.join(' ');
-  const hasCriteria = title !== undefined || artist !== undefined || free.length > 0;
+  const hasCriteria =
+    title !== undefined || artist !== undefined || arids.length > 0 || free.length > 0;
 
   return releases.filter((release) => {
     const titleOk = matchesText(release.title, title);
@@ -191,11 +227,22 @@ function searchReleaseGroups(query: string): FixtureRelease[] {
       title === undefined && artist === undefined
         ? matchesText(`${release.artist} ${release.title}`, free)
         : true;
-    return hasCriteria && titleOk && artistOk && freeOk;
+    const typeOk =
+      primaryTypes.length === 0 || primaryTypes.includes(release.primaryType.toLowerCase());
+    const secondaryOk =
+      hasSecondaryType === undefined || hasSecondaryType === secondaryTypes(release).length > 0;
+    const statusOk = status === undefined || releaseStatus(release).toLowerCase() === status;
+    return hasCriteria && titleOk && artistOk && freeOk && typeOk && secondaryOk && statusOk;
   });
 }
 
 // ---- JSON entity builders ----------------------------------------------------
+
+/** MusicBrainz's release status ids. */
+const STATUS_IDS: Record<ReleaseStatus, string> = {
+  Official: '4e304316-386d-3409-af2e-78857eec5cfe',
+  Bootleg: '1156806e-d06a-38bd-83f0-cf2284a808b9',
+};
 
 function artistCreditJson(release: FixtureRelease): Array<Record<string, unknown>> {
   return [
@@ -217,14 +264,14 @@ function releaseJson(release: FixtureRelease): Record<string, unknown> {
   return {
     id: release.releaseMbid,
     title: release.title,
-    status: 'Official',
+    status: releaseStatus(release),
     date: release.date,
     country: 'XW',
     disambiguation: '',
     quality: 'normal',
     barcode: null,
     packaging: null,
-    'status-id': '4e304316-386d-3409-af2e-78857eec5cfe',
+    'status-id': STATUS_IDS[releaseStatus(release)],
     'release-events': [{ date: release.date, area: null }],
     'text-representation': { language: 'eng', script: 'Latn' },
     'artist-credit': artistCreditJson(release),
@@ -233,7 +280,7 @@ function releaseJson(release: FixtureRelease): Record<string, unknown> {
       title: release.title,
       'primary-type': release.primaryType,
       'first-release-date': release.date,
-      'secondary-types': [],
+      'secondary-types': secondaryTypes(release),
       disambiguation: '',
     },
   };
@@ -262,7 +309,7 @@ function releaseGroupJson(release: FixtureRelease): Record<string, unknown> {
     id: release.releaseGroupMbid,
     title: release.title,
     'primary-type': release.primaryType,
-    'secondary-types': [],
+    'secondary-types': secondaryTypes(release),
     'first-release-date': release.date,
     disambiguation: '',
     'artist-credit': artistCreditJson(release),
@@ -310,6 +357,16 @@ function releaseWithRecordingsJson(release: FixtureRelease): Record<string, unkn
 
 // ---- server -----------------------------------------------------------------
 
+/** The page a search or browse asks for: `limit` (25 when not given) and `offset`. */
+function requestedPage(url: URL): { limit: number; offset: number } {
+  const limitParam = Number(url.searchParams.get('limit') ?? '25');
+  const offsetParam = Number(url.searchParams.get('offset') ?? '0');
+  return {
+    limit: Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25,
+    offset: Number.isFinite(offsetParam) && offsetParam > 0 ? offsetParam : 0,
+  };
+}
+
 /**
  * Applies the control to beets requests: logs them, waits the latency, then
  * answers 503 when unavailable. The handler gets whether to weaken what it
@@ -346,8 +403,7 @@ export function createMusicBrainzServer(control: MbControl): Server {
         pattern: '/ws/2/recording',
         handler: served(control, ({ res, url }, weak) => {
           const query = url.searchParams.get('query') ?? '';
-          const limitParam = Number(url.searchParams.get('limit') ?? '25');
-          const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
+          const { limit } = requestedPage(url);
           const hits = searchRecordings(query)
             .sort((a, b) => b.release.rating - a.release.rating)
             .slice(0, limit)
@@ -379,13 +435,14 @@ export function createMusicBrainzServer(control: MbControl): Server {
         pattern: '/ws/2/release-group',
         handler: served(control, ({ res, url }) => {
           const query = url.searchParams.get('query') ?? '';
+          const { limit, offset } = requestedPage(url);
           const found = searchReleaseGroups(query).sort((a, b) => b.rating - a.rating);
           console.log(`[mb] release-group search "${query}" -> ${found.length}`);
           sendJson(res, 200, {
             created: new Date().toISOString(),
             count: found.length,
-            offset: 0,
-            'release-groups': found.map((r) => releaseGroupJson(r)),
+            offset,
+            'release-groups': found.slice(offset, offset + limit).map((r) => releaseGroupJson(r)),
           });
         }),
       },
@@ -395,8 +452,7 @@ export function createMusicBrainzServer(control: MbControl): Server {
         handler: served(control, ({ res, url }) => {
           // An artist search answer (GET /ws/2/artist?query=...): {created, count, offset, artists}.
           const query = url.searchParams.get('query') ?? '';
-          const limitParam = Number(url.searchParams.get('limit') ?? '25');
-          const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
+          const { limit } = requestedPage(url);
           const found = searchArtists(query);
           console.log(`[mb] artist search "${query}" -> ${found.length}`);
           sendJson(res, 200, {
@@ -430,10 +486,7 @@ export function createMusicBrainzServer(control: MbControl): Server {
           // A release browse by recording (GET /ws/2/release?recording=...&inc=release-groups):
           // {release-count, release-offset, releases}, each release with its release group.
           const recording = url.searchParams.get('recording') ?? '';
-          const limitParam = Number(url.searchParams.get('limit') ?? '25');
-          const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
-          const offsetParam = Number(url.searchParams.get('offset') ?? '0');
-          const offset = Number.isFinite(offsetParam) && offsetParam > 0 ? offsetParam : 0;
+          const { limit, offset } = requestedPage(url);
           const found = releasesOfRecording(recording);
           console.log(`[mb] releases of recording ${recording} -> ${found.length}`);
           sendJson(res, 200, {

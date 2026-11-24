@@ -19,7 +19,11 @@ export interface FixtureRelease {
   artistMbid: string;
   /** YYYY-MM-DD */
   date: string;
-  primaryType: 'Album' | 'Single';
+  primaryType: 'Album' | 'Single' | 'EP';
+  /** The release group's secondary types; none when left out */
+  secondaryTypes?: ('Compilation' | 'Live')[];
+  /** Official when left out */
+  status?: 'Official' | 'Bootleg';
   /** 0-100, drives result ordering in the app (sorted by rating) */
   rating: number;
   tracks: FixtureTrack[];
@@ -452,6 +456,183 @@ export const bellwether: FixtureRelease = {
   ],
 };
 
+// The release groups of the artist search.spec.ts lists by name alone: two
+// studio albums and an EP, a live album and a compilation, plus a single and
+// a bootleg the listing leaves out. The stub answers them by rating, which
+// orders them unlike the app's listing. No peer shares them.
+const orchidTelegraphMbid = 'ca04fdcb-6061-4416-a79f-2cda532c6132';
+
+export const semaphoreGardens: FixtureRelease = {
+  releaseMbid: '8d879ec8-3c08-4459-9750-1da6245f45f4',
+  releaseGroupMbid: '8e5809d7-eedb-444b-9213-64c5c57c7ca2',
+  title: 'Semaphore Gardens',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2017-03-10',
+  primaryType: 'Album',
+  rating: 56,
+  tracks: [
+    {
+      mbid: '472b4b60-ed0a-4c26-9ee5-fa5aa6c738bc',
+      title: 'Flag Hill',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: 'a0f4f6dd-3d80-4cd3-9b87-e929034424e8',
+      title: 'Morning Code',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const morseBloom: FixtureRelease = {
+  releaseMbid: '2ea22535-13c3-4e72-9b72-8794e9d1148f',
+  releaseGroupMbid: '7814c4d5-fec1-47af-9699-622f06e12b9d',
+  title: 'Morse Bloom',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2015-06-12',
+  primaryType: 'EP',
+  rating: 55,
+  tracks: [
+    {
+      mbid: '6c55ff50-028d-46ef-be16-8aa4ff059e00',
+      title: 'Dot Dash',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '27765ce2-2280-4a11-a573-10d3a4266764',
+      title: 'Bloom Key',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const wirelessOrchards: FixtureRelease = {
+  releaseMbid: 'c4bec95a-22b8-4003-8c66-51c92e87a25a',
+  releaseGroupMbid: '62bb1537-aefe-4777-9867-e4cfd359ef3b',
+  title: 'Wireless Orchards',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2014-09-05',
+  primaryType: 'Album',
+  rating: 54,
+  tracks: [
+    {
+      mbid: '2a3a93a8-3888-4ed1-a811-11744c77c471',
+      title: 'Antenna Rows',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '548df86b-d89b-44a8-b50b-9beb391c2a24',
+      title: 'Crystal Set',
+      position: 2,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '12d67ac9-6739-4df3-999e-03860d2e5367',
+      title: 'Long Wave Lullaby',
+      position: 3,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const liveAtTheExchange: FixtureRelease = {
+  releaseMbid: 'b28f4715-555a-4c36-a986-3a51aad853ca',
+  releaseGroupMbid: '1a42ad1f-85d5-40e9-8946-9a2634f82476',
+  title: 'Live at the Exchange',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2018-11-23',
+  primaryType: 'Album',
+  secondaryTypes: ['Live'],
+  rating: 58,
+  tracks: [
+    {
+      mbid: '36462e1e-3c9d-4def-80c1-be41038f7a63',
+      title: 'Switchboard Overture',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const collectedDispatches: FixtureRelease = {
+  releaseMbid: 'f6fe03e0-2658-4f6b-8e60-dd2def177d50',
+  releaseGroupMbid: '19546376-97e2-4cea-bb82-2abb32965c44',
+  title: 'Collected Dispatches',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2020-04-03',
+  primaryType: 'Album',
+  secondaryTypes: ['Compilation'],
+  rating: 57,
+  tracks: [
+    {
+      mbid: '635c037d-9411-4ade-97dd-08be9c8badb8',
+      title: 'Telegram Waltz',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const pylonSong: FixtureRelease = {
+  releaseMbid: 'ebf65879-d94d-40cb-ac62-4b6628d26050',
+  releaseGroupMbid: '06df7bf4-26fb-4a76-8a4e-7434b231c80b',
+  title: 'Pylon Song',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2019-02-01',
+  primaryType: 'Single',
+  rating: 53,
+  tracks: [
+    {
+      mbid: '60aa7d54-f7ad-4307-aa92-f7b62ba4eeea',
+      title: 'Pylon Song',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+export const liveAtTheAnnex: FixtureRelease = {
+  releaseMbid: 'f56f430c-b617-43b8-9599-64a78b0a53f0',
+  releaseGroupMbid: '58020d53-7bd9-492e-8f61-1414320305c6',
+  title: 'Live at the Annex',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2016-08-19',
+  primaryType: 'Album',
+  secondaryTypes: ['Live'],
+  status: 'Bootleg',
+  rating: 52,
+  tracks: [
+    {
+      mbid: '6890a298-c06f-4e02-87b3-a4fb3aeed0af',
+      title: 'Annex Hum',
+      position: 1,
+      lengthMs: 30000,
+    },
+  ],
+};
+
+const orchidTelegraphReleases: FixtureRelease[] = [
+  semaphoreGardens,
+  morseBloom,
+  wirelessOrchards,
+  liveAtTheExchange,
+  collectedDispatches,
+  pylonSong,
+  liveAtTheAnnex,
+];
+
 // Releases the MCP acceptance suite downloads: no other spec touches them.
 
 export const fenwickCarols: FixtureRelease = {
@@ -540,6 +721,7 @@ export const releases: FixtureRelease[] = [
   ...importReleases,
   cinderPsalmChoir,
   bellwether,
+  ...orchidTelegraphReleases,
   fenwickCarols,
 ];
 
