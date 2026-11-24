@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::{DownloadQuery, SearchResult as DownloadSearchResult},
-    metadata::{AlbumWithTracks, SearchResult},
+    metadata::{AlbumWithTracks, Discography, SearchResult},
 };
 
 #[cfg(feature = "server")]
@@ -16,6 +16,14 @@ use crate::{server_fns::failure_error, AuthSession};
 pub struct SearchQuery {
     pub artist: Option<String>,
     pub query: String,
+}
+
+/// An artist-only search: the artist's name, and the MBID of the one of that
+/// name to list when it is not the first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiscographyQuery {
+    pub artist: String,
+    pub mbid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +55,19 @@ pub async fn search_track(input: SearchQuery) -> Result<Vec<SearchResult>, Serve
         input.artist.as_deref(),
         &input.query,
         metadata::SEARCH_LIMIT,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[post("/api/metadata/discography", _: AuthSession)]
+pub async fn artist_discography(
+    input: DiscographyQuery,
+) -> Result<Option<Discography>, ServerFnError> {
+    metadata::discography(
+        &input.artist,
+        input.mbid.as_deref(),
+        metadata::DISCOGRAPHY_LIMIT,
     )
     .await
     .map_err(failure_error)

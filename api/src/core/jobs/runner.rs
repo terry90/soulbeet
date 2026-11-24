@@ -920,6 +920,7 @@ mod test_effects {
                     mbid: Some(id.to_string()),
                     cover_url: None,
                     release_types: None,
+                    first_release_date: None,
                 },
                 tracks,
             })

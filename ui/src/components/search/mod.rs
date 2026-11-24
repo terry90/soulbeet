@@ -856,6 +856,7 @@ mod tests {
             mbid: None,
             cover_url: None,
             release_types: None,
+            first_release_date: None,
         };
         let query = album_query(&album);
         assert!(query.tracks.is_empty());

@@ -82,6 +82,7 @@ impl Wanted {
                 mbid: Some(a.release_mbid.clone()),
                 cover_url: None,
                 release_types: None,
+                first_release_date: None,
             }),
         }
     }

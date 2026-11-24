@@ -338,6 +338,7 @@ mod tests {
             mbid: Some("317d1e85-3f9e-463e-939b-bebf47aa2178".into()),
             cover_url: None,
             release_types: Some(vec!["Album".into(), "Compilation".into()]),
+            first_release_date: None,
         };
         let doc = music_fields("release", "Merry Christmas", &[SearchResult::Album(album)]);
         assert_eq!(
@@ -357,6 +358,7 @@ mod tests {
                 mbid: Some("317d1e85-3f9e-463e-939b-bebf47aa2178".into()),
                 cover_url: None,
                 release_types: Some(vec!["Album".into(), "Compilation".into()]),
+                first_release_date: None,
             },
             tracks: vec![silent_night()],
         };
@@ -687,6 +689,7 @@ mod tests {
             mbid: None,
             cover_url: None,
             release_types: None,
+            first_release_date: None,
         };
         let release = &music_fields(
             "release",
@@ -785,6 +788,7 @@ mod tests {
                 mbid: None,
                 cover_url: None,
                 release_types: None,
+                first_release_date: None,
             },
             tracks: vec![track],
         };

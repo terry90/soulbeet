@@ -1682,6 +1682,7 @@ mod tests {
             mbid: None,
             cover_url: None,
             release_types: None,
+            first_release_date: None,
         };
         let cases: [(&str, &str, DownloadQuery, bool); 8] = [
             (

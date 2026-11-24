@@ -76,6 +76,36 @@ pub struct Album {
     /// the release group has no type set (D15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_types: Option<Vec<String>>,
+    /// The release group's first release date (YYYY, YYYY-MM or YYYY-MM-DD):
+    /// when any edition first came out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_release_date: Option<String>,
+}
+
+/// An artist a discography is for, or one that shares its name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtistSummary {
+    pub mbid: String,
+    pub name: String,
+    pub disambiguation: Option<String>,
+}
+
+/// An artist's albums and EPs, as an artist-only search lists them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Discography {
+    pub artist: ArtistSummary,
+    /// The other artists carrying the name, to pick instead.
+    pub others: Vec<ArtistSummary>,
+    /// In discography order.
+    pub albums: Vec<Album>,
+    /// Every album and EP MusicBrainz lists for the artist is in `albums`.
+    pub complete: bool,
+}
+
+/// Whether a search's title text asks for no title: empty, or "*", which
+/// once matched any title.
+pub fn asks_no_title(query: &str) -> bool {
+    matches!(query.trim(), "" | "*")
 }
 
 /// An album with its full track listing.
@@ -116,5 +146,15 @@ mod tests {
         assert_eq!(with(Some("71582789:00")).duration_secs(), None);
         assert_eq!(with(Some("")).duration_secs(), None);
         assert_eq!(with(None).duration_secs(), None);
+    }
+
+    #[test]
+    fn a_title_of_nothing_or_a_star_asks_for_no_title() {
+        for query in ["", "  ", "*", " * "] {
+            assert!(asks_no_title(query), "{query:?}");
+        }
+        for query in ["Vena Sera", "**", "*Road"] {
+            assert!(!asks_no_title(query), "{query:?}");
+        }
     }
 }

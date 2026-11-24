@@ -2254,6 +2254,7 @@ mod tests {
             mbid: Some("5D7C1E2A-4B6C-4E8A-9B3F-0A2F7E4B6C1D".into()),
             cover_url: None,
             release_types: None,
+            first_release_date: None,
         };
         let keys = recording_keys(&DownloadQuery::new(vec![]).album(album), JobKind::Album);
         assert_eq!(
