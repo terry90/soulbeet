@@ -2,6 +2,7 @@ use api::models::folder::Folder;
 use dioxus::prelude::*;
 
 use super::download_options_menu::FolderDropdown;
+use crate::Chevron;
 
 #[derive(Props, PartialEq, Clone)]
 pub struct FolderChipProps {
@@ -73,19 +74,7 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                     span { class: "sr-only", "Download folder: " }
                     span { class: "min-w-0 truncate", "{chip_text}" }
                     // The narrowest phones give its room to the name.
-                    svg {
-                        class: "size-[12px] flex-none opacity-60 max-[399px]:hidden",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        view_box: "0 0 24 24",
-                        "aria-hidden": "true",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            d: "M6 9l6 6 6-6",
-                        }
-                    }
+                    Chevron { class: "opacity-60 max-[399px]:hidden" }
                 }
             }
 

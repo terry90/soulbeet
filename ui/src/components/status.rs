@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 use shared::system::{HealthLevel, NavidromeStatus, SystemHealth};
 
+use crate::{Chevron, FOCUS_RING};
+
 /// The status dot class and chip text for an importer health level.
 pub fn importer_chip(level: HealthLevel) -> (&'static str, &'static str) {
     let dot = match level {
@@ -204,22 +206,10 @@ pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> 
 
     rsx! {
       details { class: "group/status mt-[10px] w-full font-mono text-[11px] text-gray-500",
-        summary { class: "inline-flex items-center gap-2 min-h-[44px] max-w-full rounded cursor-pointer list-none hover:text-gray-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-beet-leaf [&::-webkit-details-marker]:hidden",
+        summary { class: "inline-flex items-center gap-2 min-h-[44px] max-w-full rounded cursor-pointer list-none hover:text-gray-300 {FOCUS_RING} [&::-webkit-details-marker]:hidden",
           span { class: "size-[6px] flex-none rounded-full {worst.dot()}", aria_hidden: "true" }
           span { class: "min-w-0", "{line}" }
-          svg {
-            class: "size-[12px] flex-none transition-transform duration-200 group-open/status:rotate-180",
-            fill: "none",
-            stroke: "currentColor",
-            stroke_width: "2",
-            view_box: "0 0 24 24",
-            "aria-hidden": "true",
-            path {
-              stroke_linecap: "round",
-              stroke_linejoin: "round",
-              d: "M6 9l6 6 6-6",
-            }
-          }
+          Chevron { class: "transition-transform duration-200 group-open/status:rotate-180" }
         }
         ul { class: "grid gap-2 mb-1 px-3 py-[10px] leading-normal list-none bg-beet-panel/60 border border-white/6 rounded-md",
           for service in services {

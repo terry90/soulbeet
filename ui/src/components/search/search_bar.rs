@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 
 use super::folder_chip::FolderChip;
 use super::search_type_toggle::{SearchType, SearchTypeToggle};
-use crate::{submitted_text, Button, FieldKind, FieldLook, TextInput};
+use crate::{submitted_text, Button, FieldKind, FieldLook, TextInput, FOCUS_RING};
 
 /// The keys the search form submits its fields under.
 const QUERY: &str = "query";
@@ -18,10 +18,6 @@ const ROW_CLASS: &str =
 
 /// The icon or word before a row's field, which turns magenta with it.
 const LEAD_CLASS: &str = "flex-none w-[48px] self-stretch flex items-center justify-center text-gray-500 cursor-text group-focus-within/row:text-beet-accent";
-
-/// What a small control in the bar looks like when it has keyboard focus.
-const FOCUS_RING: &str =
-    "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-beet-leaf";
 
 #[derive(Props, Clone, PartialEq)]
 pub struct SearchBarProps {
