@@ -431,6 +431,9 @@
   .mt-20 {
     margin-top: calc(var(--spacing) * 20);
   }
+  .mt-\[10px\] {
+    margin-top: 10px;
+  }
   .mt-auto {
     margin-top: auto;
   }
@@ -508,6 +511,10 @@
   }
   .table {
     display: table;
+  }
+  .size-\[6px\] {
+    width: 6px;
+    height: 6px;
   }
   .size-\[12px\] {
     width: 12px;
@@ -752,6 +759,10 @@
     --tw-translate-y: calc(calc(1 / 2 * 100%) * -1);
     translate: var(--tw-translate-x) var(--tw-translate-y);
   }
+  .-translate-y-px {
+    --tw-translate-y: -1px;
+    translate: var(--tw-translate-x) var(--tw-translate-y);
+  }
   .rotate-90 {
     rotate: 90deg;
   }
@@ -865,14 +876,14 @@
   .gap-4 {
     gap: calc(var(--spacing) * 4);
   }
-  .gap-6 {
-    gap: calc(var(--spacing) * 6);
-  }
   .gap-\[2px\] {
     gap: 2px;
   }
   .gap-\[6px\] {
     gap: 6px;
+  }
+  .gap-\[10px\] {
+    gap: 10px;
   }
   :where(.space-y-0 > :not(:last-child)) {
     --tw-space-y-reverse: 0;
@@ -1215,6 +1226,12 @@
       background-color: color-mix(in oklab, var(--color-beet-panel) 50%, transparent);
     }
   }
+  .bg-beet-panel\/60 {
+    background-color: color-mix(in srgb, #1a0b2e 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-panel) 60%, transparent);
+    }
+  }
   .bg-black\/20 {
     background-color: color-mix(in srgb, #000 20%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1505,6 +1522,9 @@
   .py-\[6px\] {
     padding-block: 6px;
   }
+  .py-\[10px\] {
+    padding-block: 10px;
+  }
   .pt-4 {
     padding-top: calc(var(--spacing) * 4);
   }
@@ -1604,6 +1624,10 @@
   }
   .text-\[13px\] {
     font-size: 13px;
+  }
+  .leading-normal {
+    --tw-leading: var(--leading-normal);
+    line-height: var(--leading-normal);
   }
   .leading-relaxed {
     --tw-leading: var(--leading-relaxed);
@@ -1928,6 +1952,9 @@
   }
   .\[--glow-color\:var\(--color-blue-500\)\] {
     --glow-color: var(--color-blue-500);
+  }
+  :is(:where(.group\/status):is([open], :popover-open, :open) .group-open\/status\:rotate-180) {
+    rotate: 180deg;
   }
   :is(:where(.group):focus-within .group-focus-within\:opacity-50) {
     opacity: 50%;
@@ -2289,6 +2316,9 @@
     .lg\:px-8 {
       padding-inline: calc(var(--spacing) * 8);
     }
+  }
+  .\[\&\:\:-webkit-details-marker\]\:hidden::-webkit-details-marker {
+    display: none;
   }
   .\[\&\:\:-webkit-search-cancel-button\]\:appearance-none::-webkit-search-cancel-button {
     appearance: none;
