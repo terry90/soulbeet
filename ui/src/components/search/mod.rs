@@ -664,9 +664,9 @@ pub fn Search() -> Element {
                 spawn(perform_search());
             },
           }
-        }
 
-        SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
+          SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
+        }
 
         if !download_error().is_empty() {
           p { class: "text-sm font-mono text-red-400 mt-4", "{download_error}" }
