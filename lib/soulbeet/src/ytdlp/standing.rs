@@ -52,10 +52,22 @@ impl Standing {
         self.paused_now.notified().await;
     }
 
-    /// Records what a call to YouTube came to: Ok, or the fault it failed with. A rate limit or
-    /// a bot check pauses every call; three refused downloads within an hour count as a bot
-    /// check. Returns the pause this answer started, if it started one.
-    pub(crate) fn heard(&self, outcome: Result<(), &Fault>) -> Option<Pause> {
+    /// Records what a download or a probe came to: Ok, or the fault it failed with. A rate limit
+    /// or a bot check pauses every call; three refused downloads within an hour, with no
+    /// download answered in between, count as a bot check. Returns the pause this answer
+    /// started, if it started one.
+    pub(crate) fn heard_download(&self, outcome: Result<(), &Fault>) -> Option<Pause> {
+        self.heard(outcome, true)
+    }
+
+    /// Records what a search came to. YouTube Music's API answers searches while its media
+    /// servers refuse this server's downloads, so a search leaves the run of refused downloads
+    /// as it is.
+    pub(crate) fn heard_search(&self, outcome: Result<(), &Fault>) -> Option<Pause> {
+        self.heard(outcome, false)
+    }
+
+    fn heard(&self, outcome: Result<(), &Fault>, download: bool) -> Option<Pause> {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         // A track YouTube does not have, or has in no format asked for, is YouTube answering.
@@ -66,6 +78,7 @@ impl Standing {
         let hold = match fault.map(|f| f.kind) {
             Some(Kind::RateLimited) => Some((Hold::RateLimited, RATE_LIMIT_PAUSE)),
             Some(Kind::BotCheck) => Some((Hold::BotCheck, BOT_CHECK_PAUSE)),
+            _ if !download => None,
             Some(Kind::Forbidden) => {
                 state.forbidden.push_back(now);
                 while state
@@ -126,7 +139,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_rate_limit_pauses_for_an_hour() {
         let standing = Standing::default();
-        let pause = standing.heard(Err(&fault(Kind::RateLimited))).unwrap();
+        let pause = standing.heard_download(Err(&fault(Kind::RateLimited))).unwrap();
         assert_eq!(pause.why, Hold::RateLimited);
         assert_eq!(standing.paused(), Some(pause));
         tokio::time::advance(RATE_LIMIT_PAUSE - Duration::from_secs(1)).await;
@@ -138,29 +151,44 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn three_refusals_within_an_hour_are_a_bot_check() {
         let standing = Standing::default();
-        assert!(standing.heard(Err(&fault(Kind::Forbidden))).is_none());
+        assert!(standing.heard_download(Err(&fault(Kind::Forbidden))).is_none());
         tokio::time::advance(Duration::from_secs(61 * 60)).await;
         // The first is over an hour old.
-        assert!(standing.heard(Err(&fault(Kind::Forbidden))).is_none());
-        assert!(standing.heard(Err(&fault(Kind::Forbidden))).is_none());
-        let pause = standing.heard(Err(&fault(Kind::Forbidden))).unwrap();
+        assert!(standing.heard_download(Err(&fault(Kind::Forbidden))).is_none());
+        assert!(standing.heard_download(Err(&fault(Kind::Forbidden))).is_none());
+        let pause = standing.heard_download(Err(&fault(Kind::Forbidden))).unwrap();
         assert_eq!(pause.why, Hold::BotCheck);
 
-        // An answer in between breaks the run.
+        // A download answered in between breaks the run.
         let standing = Standing::default();
-        standing.heard(Err(&fault(Kind::Forbidden)));
-        standing.heard(Err(&fault(Kind::Forbidden)));
-        standing.heard(Ok(()));
-        assert!(standing.heard(Err(&fault(Kind::Forbidden))).is_none());
+        standing.heard_download(Err(&fault(Kind::Forbidden)));
+        standing.heard_download(Err(&fault(Kind::Forbidden)));
+        standing.heard_download(Ok(()));
+        assert!(standing.heard_download(Err(&fault(Kind::Forbidden))).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_answered_between_refused_downloads_leaves_the_run() {
+        let standing = Standing::default();
+        standing.heard_download(Err(&fault(Kind::Forbidden)));
+        assert!(standing.heard_search(Ok(())).is_none());
+        standing.heard_download(Err(&fault(Kind::Forbidden)));
+        assert!(standing.heard_search(Err(&fault(Kind::Forbidden))).is_none());
+        let pause = standing.heard_download(Err(&fault(Kind::Forbidden))).unwrap();
+        assert_eq!(pause.why, Hold::BotCheck);
+        // A search still pauses everything on a rate limit.
+        let standing = Standing::default();
+        let pause = standing.heard_search(Err(&fault(Kind::RateLimited))).unwrap();
+        assert_eq!(pause.why, Hold::RateLimited);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_passed_probe_lifts_a_bot_check_and_not_a_rate_limit() {
         let standing = Standing::default();
-        standing.heard(Err(&fault(Kind::BotCheck)));
+        standing.heard_download(Err(&fault(Kind::BotCheck)));
         standing.passed_probe();
         assert_eq!(standing.paused(), None);
-        standing.heard(Err(&fault(Kind::RateLimited)));
+        standing.heard_download(Err(&fault(Kind::RateLimited)));
         standing.passed_probe();
         assert!(standing.paused().is_some());
     }
@@ -168,9 +196,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_missing_track_is_youtube_answering() {
         let standing = Standing::default();
-        standing.heard(Err(&fault(Kind::Unavailable)));
+        standing.heard_download(Err(&fault(Kind::Unavailable)));
         assert_eq!(standing.heard_within(Duration::from_secs(60)), Some(Ok(())));
-        standing.heard(Err(&fault(Kind::Network)));
+        standing.heard_download(Err(&fault(Kind::Network)));
         assert_eq!(
             standing.heard_within(Duration::from_secs(60)),
             Some(Err(fault(Kind::Network)))

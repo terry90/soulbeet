@@ -619,7 +619,7 @@ impl Queue {
                 }
                 Err(fault) => Err(fault),
             };
-            if let Some(pause) = self.standing.heard(outcome.as_ref().map(|_| ())) {
+            if let Some(pause) = self.standing.heard_download(outcome.as_ref().map(|_| ())) {
                 self.fail_queued(&ended::paused(pause));
             }
             match outcome {

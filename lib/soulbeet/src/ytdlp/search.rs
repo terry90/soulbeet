@@ -116,7 +116,7 @@ impl Asker {
             .helper
             .call(&request, Limits::SEARCH, &mut |_| {})
             .await;
-        self.standing.heard(answer.as_ref().map(|_| ()));
+        self.standing.heard_search(answer.as_ref().map(|_| ()));
         answer
     }
 }

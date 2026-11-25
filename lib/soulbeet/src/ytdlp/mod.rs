@@ -276,7 +276,7 @@ impl Engine {
         if let Err(fault) = &probed {
             warn!("YouTube Music health probe failed: {}", fault.message);
         }
-        self.standing.heard(probed.as_ref().map(|_| ()));
+        self.standing.heard_download(probed.as_ref().map(|_| ()));
         probed
     }
 }
