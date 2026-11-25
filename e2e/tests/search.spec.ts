@@ -10,6 +10,7 @@ import {
   liveAtTheExchange,
   maritime,
   morseBloom,
+  pylonSong,
   semaphoreGardens,
   wirelessOrchards,
 } from '../fixtures/dataset.js';
@@ -32,10 +33,10 @@ async function searchByArtist(page: Page, artist: string, query: string, type: '
 // can queue up behind other workers' searches.
 const RESULT_TIMEOUT = 45_000;
 
-// Orchid Telegraph's albums and EPs as the app lists them: studio albums,
-// then studio EPs, then compilations before live albums before demos, each
-// oldest first. The demo's release has no status; its single and its bootleg
-// are left out.
+// Orchid Telegraph's releases as the app lists them: studio albums, then
+// studio EPs, then compilations before live albums before demos, then
+// singles, each oldest first. The demo's release has no status; its bootleg
+// is left out.
 const discography = [
   { album: wirelessOrchards, facts: '2014 · Album' },
   { album: semaphoreGardens, facts: '2017 · Album' },
@@ -43,6 +44,7 @@ const discography = [
   { album: collectedDispatches, facts: '2020 · Album · Compilation' },
   { album: liveAtTheExchange, facts: '2018 · Album · Live' },
   { album: atticSignals, facts: '2012 · Album · Demo' },
+  { album: pylonSong, facts: '2019 · Single' },
 ];
 
 /** The rows under "Albums by Orchid Telegraph": `discography`, in order. */
@@ -102,7 +104,7 @@ test('shows the empty state when nothing matches', async ({ context, page }) => 
   });
 });
 
-test('lists the albums of an artist given alone, studio albums first, oldest first', async ({
+test('lists the releases of an artist given alone, studio albums first, singles last', async ({
   context,
   page,
 }) => {

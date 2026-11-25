@@ -11,6 +11,23 @@ fn artist_label(artist: &ArtistSummary, between: &str, after: &str) -> String {
     }
 }
 
+/// What the heading says of the rows left out, and where to find them: a
+/// titled search finds albums and EPs only, and a single's songs are found
+/// as tracks. None when nothing was left out.
+fn left_out_note(shown: usize, albums_complete: bool, singles_complete: bool) -> Option<String> {
+    if albums_complete && singles_complete {
+        return None;
+    }
+    let mut note = format!("Showing {shown} releases.");
+    if !albums_complete {
+        note.push_str(" Add a title to search the albums and EPs left out.");
+    }
+    if !singles_complete {
+        note.push_str(" For the singles left out, search their songs as tracks.");
+    }
+    Some(note)
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct DiscographyHeadingProps {
     /// The name the search was for.
@@ -20,7 +37,9 @@ pub struct DiscographyHeadingProps {
     /// The other artists carrying the name, as their name or an alias.
     pub others: Vec<ArtistSummary>,
     /// Every album and EP of the artist is listed.
-    pub complete: bool,
+    pub albums_complete: bool,
+    /// Every single of the artist is listed.
+    pub singles_complete: bool,
     /// How many are listed.
     pub shown: usize,
     /// Runs with the MBID of the other artist picked.
@@ -35,7 +54,8 @@ pub fn DiscographyHeading(props: DiscographyHeadingProps) -> Element {
         name,
         artist,
         others,
-        complete,
+        albums_complete,
+        singles_complete,
         shown,
         on_pick,
     } = props;
@@ -70,10 +90,8 @@ pub fn DiscographyHeading(props: DiscographyHeadingProps) -> Element {
             }
           }
         }
-        if !complete {
-          p { class: "text-xs font-mono text-gray-500",
-            "Showing {shown} albums and EPs, studio ones first. Add a title to search the rest."
-          }
+        if let Some(note) = left_out_note(shown, albums_complete, singles_complete) {
+          p { class: "text-xs font-mono text-gray-500", "{note}" }
         }
       }
     }
@@ -99,10 +117,15 @@ mod tests {
     #[derive(Props, Clone, PartialEq)]
     struct Setup {
         others: Vec<ArtistSummary>,
-        complete: bool,
+        albums_complete: bool,
+        singles_complete: bool,
     }
 
-    fn heading(others: Vec<ArtistSummary>, complete: bool) -> VirtualDom {
+    fn heading(
+        others: Vec<ArtistSummary>,
+        albums_complete: bool,
+        singles_complete: bool,
+    ) -> VirtualDom {
         VirtualDom::new_with_props(
             |setup: Setup| {
                 rsx! {
@@ -113,18 +136,23 @@ mod tests {
                         "1980s–1990s US grunge band",
                     ),
                     others: setup.others,
-                    complete: setup.complete,
+                    albums_complete: setup.albums_complete,
+                    singles_complete: setup.singles_complete,
                     shown: 300,
                     on_pick: |mbid| PICKED.with(|p| p.borrow_mut().push(mbid)),
                   }
                 }
             },
-            Setup { others, complete },
+            Setup {
+                others,
+                albums_complete,
+                singles_complete,
+            },
         )
     }
 
-    fn render(others: Vec<ArtistSummary>, complete: bool) -> String {
-        let mut dom = heading(others, complete);
+    fn render(others: Vec<ArtistSummary>, albums_complete: bool, singles_complete: bool) -> String {
+        let mut dom = heading(others, albums_complete, singles_complete);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
@@ -137,7 +165,7 @@ mod tests {
                 "60s band from the UK",
             )]
         };
-        let html = render(uk(), true);
+        let html = render(uk(), true, true);
         assert!(html.contains("Albums by Nirvana"), "{html}");
         assert!(html.contains("1980s–1990s US grunge band"), "{html}");
         assert!(html.contains("Other artists known as Nirvana:"), "{html}");
@@ -152,7 +180,7 @@ mod tests {
         );
         assert!(!html.contains("Showing"), "{html}");
 
-        let mut dom = heading(uk(), true);
+        let mut dom = heading(uk(), true, true);
         let clicks = crate::listeners(&mut dom, "click");
         assert_eq!(clicks.len(), 1);
         crate::click(&mut dom, clicks[0]);
@@ -164,13 +192,28 @@ mod tests {
 
     #[test]
     fn the_heading_says_when_albums_were_left_out() {
-        let html = render(vec![], false);
+        let html = render(vec![], false, true);
         assert!(
             html.contains(
-                "Showing 300 albums and EPs, studio ones first. Add a title to search the rest."
+                "Showing 300 releases. Add a title to search the albums and EPs left out.<"
             ),
             "{html}"
         );
         assert!(!html.contains("Other artists"), "{html}");
+    }
+
+    #[test]
+    fn the_heading_says_where_to_find_the_singles_left_out() {
+        let html = render(vec![], true, false);
+        assert!(
+            html.contains(
+                "Showing 300 releases. For the singles left out, search their songs as tracks.<"
+            ),
+            "{html}"
+        );
+        assert_eq!(
+            left_out_note(300, false, false).as_deref(),
+            Some("Showing 300 releases. Add a title to search the albums and EPs left out. For the singles left out, search their songs as tracks.")
+        );
     }
 }

@@ -6,7 +6,7 @@
 
 An artist alone now lists their albums, the search bar is rebuilt as one layout for every screen, and phones get fixes for lag, zoom and sign-in.
 
-- **Search by artist**: Fill in only the artist to list their albums and EPs, studio albums first, with the year and type on each row.
+- **Search by artist**: Fill in only the artist to list their albums, EPs and singles, studio albums first, with the year and type on each row.
 - **New search bar**: The artist filter opens with a tap on Artist, the download folder can be picked on phones too, and the three service lights are now one status line that opens to the details.
 - **Lighter pages**: The background glows are drawn without a blur filter, which Safari on iOS 26 could stall on for seconds, and the closed downloads drawer is no longer kept on screen.
 - **Typing and sign-in on phones**: Fields no longer make Safari zoom in, and password managers can fill and save the login and password forms.

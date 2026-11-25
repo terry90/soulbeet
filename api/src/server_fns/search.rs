@@ -156,7 +156,8 @@ mod tests {
             artist: nirvana.clone(),
             others: vec![],
             albums: vec![],
-            complete: true,
+            albums_complete: true,
+            singles_complete: true,
         };
         assert_eq!(
             discography_answer(ArtistAlbums::Found(found.clone())),

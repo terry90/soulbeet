@@ -457,10 +457,10 @@ export const bellwether: FixtureRelease = {
 };
 
 // The release groups of the artist search.spec.ts lists by name alone: two
-// studio albums and an EP, a live album, a compilation and a demo whose
-// release has no status, plus a single and a bootleg the listing leaves out.
-// The stub answers them by rating, which orders them unlike the app's
-// listing. No peer shares them.
+// studio albums and an EP, a live album, a compilation, a demo whose release
+// has no status and a single, plus a bootleg the listing leaves out. The stub
+// answers them by rating, which orders them unlike the app's listing. No peer
+// shares them.
 const orchidTelegraphMbid = 'ca04fdcb-6061-4416-a79f-2cda532c6132';
 
 export const semaphoreGardens: FixtureRelease = {

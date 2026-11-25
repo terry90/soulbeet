@@ -77,7 +77,8 @@ struct Listed {
     artist: Option<ArtistSummary>,
     /// The other artists carrying the name.
     others: Vec<ArtistSummary>,
-    complete: bool,
+    albums_complete: bool,
+    singles_complete: bool,
     shown: usize,
 }
 
@@ -88,7 +89,8 @@ fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchR
             name,
             artist: None,
             others: vec![],
-            complete: true,
+            albums_complete: true,
+            singles_complete: true,
             shown: 0,
         };
         return (listed, vec![]);
@@ -97,7 +99,8 @@ fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchR
         name,
         artist: Some(found.artist),
         others: found.others,
-        complete: found.complete,
+        albums_complete: found.albums_complete,
+        singles_complete: found.singles_complete,
         shown: found.albums.len(),
     };
     let rows = found.albums.into_iter().map(SearchResult::Album).collect();
@@ -110,7 +113,10 @@ fn empty_message(listed: Option<&Listed>) -> String {
         Some(Listed {
             artist: Some(artist),
             ..
-        }) => format!("No albums or EPs by {} on MusicBrainz.", artist.name),
+        }) => format!(
+            "No albums, EPs or singles by {} on MusicBrainz.",
+            artist.name
+        ),
         Some(Listed { name, .. }) => format!("No artist named “{name}” on MusicBrainz."),
         None => "No signals found in the ether.".to_string(),
     }
@@ -799,12 +805,13 @@ pub fn Search() -> Element {
               (Some(ref data), listing) if !data.is_empty() || listing.as_ref().is_some_and(|l| l.artist.is_some()) => {
                 rsx! {
                   div { class: "w-full bg-beet-panel/50 border border-white/5 p-6 backdrop-blur-sm mt-8 rounded-lg",
-                    if let Some(Listed { name, artist: Some(found), others, complete, shown }) = listing.clone() {
+                    if let Some(Listed { name, artist: Some(found), others, albums_complete, singles_complete, shown }) = listing.clone() {
                       DiscographyHeading {
                         name: name.clone(),
                         artist: found,
                         others,
-                        complete,
+                        albums_complete,
+                        singles_complete,
                         shown,
                         on_pick: move |mbid: String| {
                             spawn(list_discography(name.clone(), Some(mbid)));
@@ -1021,7 +1028,8 @@ mod tests {
                     album("c9a3fe11-45a8-4045-9d15-1b80b8333f81", "Point #1"),
                     album("accde5f7-04da-4c66-bb8e-7bb3d39ad326", "Wonder What’s Next"),
                 ],
-                complete: true,
+                albums_complete: true,
+                singles_complete: false,
             }),
         );
         let titles: Vec<&str> = rows
@@ -1033,8 +1041,13 @@ mod tests {
             .collect();
         assert_eq!(titles, ["Point #1", "Wonder What’s Next"]);
         assert_eq!(
-            (listed.artist, listed.shown, listed.complete),
-            (Some(artist.clone()), 2, true)
+            (
+                listed.artist,
+                listed.shown,
+                listed.albums_complete,
+                listed.singles_complete
+            ),
+            (Some(artist.clone()), 2, true, false)
         );
         let (none_listed, _) = listed_from(
             "Chevelle".into(),
@@ -1042,12 +1055,13 @@ mod tests {
                 artist,
                 others: vec![],
                 albums: vec![],
-                complete: true,
+                albums_complete: true,
+                singles_complete: true,
             }),
         );
         assert_eq!(
             empty_message(Some(&none_listed)),
-            "No albums or EPs by Chevelle on MusicBrainz."
+            "No albums, EPs or singles by Chevelle on MusicBrainz."
         );
         assert_eq!(empty_message(None), "No signals found in the ether.");
     }

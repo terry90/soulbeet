@@ -88,10 +88,10 @@ const RELEASE_TO_SHOW = 'NOT (status:* AND NOT status:official)';
  * groups (beets), joined with AND or whitespace. Soulful's artist filter is
  * `(name:"phrase" OR arid:"mbid" ...)`; every `arid` is kept in `arids`.
  * Soulful's discography search is `arid:"mbid" AND (primarytype:album OR
- * primarytype:ep) AND [NOT ]secondarytype:* AND RELEASE_TO_SHOW`: every
- * `primarytype` is kept in `primaryTypes`, `secondarytype:*` sets
- * `hasSecondaryType`, false after NOT, and RELEASE_TO_SHOW sets
- * `releaseToShow`.
+ * primarytype:ep) AND [NOT ]secondarytype:*` or `arid:"mbid" AND
+ * primarytype:single`, then `AND RELEASE_TO_SHOW`: every `primarytype` is
+ * kept in `primaryTypes`, `secondarytype:*` sets `hasSecondaryType`, false
+ * after NOT, and RELEASE_TO_SHOW sets `releaseToShow`.
  */
 function parseLucene(query: string): {
   fields: Map<string, string>;

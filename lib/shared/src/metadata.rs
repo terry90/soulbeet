@@ -90,16 +90,26 @@ pub struct ArtistSummary {
     pub disambiguation: Option<String>,
 }
 
-/// An artist's albums and EPs, as an artist-only search lists them.
+/// An artist's albums, EPs and singles, as an artist-only search lists them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Discography {
     pub artist: ArtistSummary,
     /// The other artists carrying the name, to pick instead.
     pub others: Vec<ArtistSummary>,
-    /// In discography order.
+    /// In discography order: the albums and EPs, then the singles.
     pub albums: Vec<Album>,
     /// Every album and EP MusicBrainz lists for the artist is in `albums`.
-    pub complete: bool,
+    pub albums_complete: bool,
+    /// Every single MusicBrainz lists for the artist is in `albums`.
+    pub singles_complete: bool,
+}
+
+impl Discography {
+    /// Every album, EP and single MusicBrainz lists for the artist is in
+    /// `albums`.
+    pub fn complete(&self) -> bool {
+        self.albums_complete && self.singles_complete
+    }
 }
 
 /// Whether a search's title text asks for no title: empty, or "*", which
