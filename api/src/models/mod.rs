@@ -1,5 +1,7 @@
 pub mod app_config;
 #[cfg(feature = "server")]
+pub mod archival_upgrade;
+#[cfg(feature = "server")]
 pub mod contextual;
 #[cfg(feature = "server")]
 pub mod deletion_block;

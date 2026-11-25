@@ -263,6 +263,17 @@ pub fn start_channel_cleanup_task() {
             tokio::time::sleep(delay).await;
             repeat_spaced(RECOMMENDATION_INTERVAL, run_recommendations).await;
         });
+
+        tokio::spawn(async {
+            // Wait 45s after startup before running low-priority archival FLAC upgrades.
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            repeat_spaced(
+                crate::core::archival::ARCHIVAL_WORKER_INTERVAL,
+                crate::core::archival::run_archival_worker_tick,
+            )
+            .await;
+        });
+        info!("Started low-priority archival FLAC upgrade worker");
     });
 }
 

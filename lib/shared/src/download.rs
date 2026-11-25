@@ -702,9 +702,210 @@ pub enum DownloadEvent {
     },
     /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
     AutoDownload(AutoDownloadEvent),
+    /// 1-tap Acquire & Play lifecycle events (`Acquiring -> Importing -> Indexing -> Ready`)
+    /// used by clients to animate the `seam-light` sweep and start playback the instant
+    /// Navidrome indexes the track.
+    AcquireAndPlay(AcquireAndPlayEvent),
     /// The server's build id, the first frame on a socket whose client asked
     /// for it. A bundle from another build may misread every event after it.
     Build(String),
+}
+
+/// Request payload for `POST /api/acquire-and-play`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayRequest {
+    pub artist: String,
+    pub title: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub recording_mbid: Option<String>,
+    #[serde(default)]
+    pub release_mbid: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<u32>,
+    /// Target folder id; when omitted, uses the user's default download folder (or first owned folder).
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    /// Prefer fast secondary backends before falling back to archival P2P (Soulseek).
+    #[serde(default = "default_prefer_fast")]
+    pub prefer_fast: bool,
+}
+
+fn default_prefer_fast() -> bool {
+    true
+}
+
+/// Initial response from `POST /api/acquire-and-play`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayResponse {
+    pub request_id: String,
+    pub status: AcquireAndPlayInitialStatus,
+}
+
+/// Whether the requested track was already playable in Navidrome or entered acquisition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AcquireAndPlayInitialStatus {
+    /// Already present in the caller's Navidrome library — play immediately without downloading.
+    AlreadyOwned {
+        navidrome_song_id: String,
+        codec: Option<String>,
+        is_lossy: bool,
+    },
+    /// Acquisition pipeline started; progress arrives over `/api/downloads/updates` as
+    /// `DownloadEvent::AcquireAndPlay`.
+    Started {
+        batch_id: String,
+        job_id: String,
+        backend_ids: Vec<String>,
+    },
+}
+
+/// Real-time stage progression for an in-flight Acquire & Play request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum AcquireAndPlayStage {
+    /// Searching or transferring the file from a download backend.
+    Acquiring {
+        backend_id: String,
+        backend_name: String,
+        source: Option<String>,
+        quality: Option<String>,
+    },
+    /// Tagging and moving into the library via beets.
+    Importing,
+    /// Waiting for Navidrome to scan and expose the playable song ID.
+    Indexing,
+    /// Track is indexed and ready to stream from Navidrome.
+    Ready {
+        navidrome_song_id: Option<String>,
+        codec: Option<String>,
+        is_lossy: bool,
+        already_owned: bool,
+        backend_id: Option<String>,
+    },
+    /// Best candidate scored below the automatic threshold; prompt the user to pick a source.
+    NeedsManualChoice {
+        search_id: String,
+        results: Vec<DownloadableGroup>,
+        best_score: f64,
+        threshold: f64,
+    },
+    /// Pipeline terminated with an error.
+    Failed { failure: Failure },
+}
+
+/// WebSocket event pushed on the user's download channel during Acquire & Play.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayEvent {
+    pub request_id: String,
+    pub artist: String,
+    pub title: String,
+    #[serde(default)]
+    pub recording_mbid: Option<String>,
+    pub stage: AcquireAndPlayStage,
+}
+
+/// Lifecycle state of an On-Keep background archival FLAC upgrade job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivalUpgradeStatus {
+    Queued,
+    Searching,
+    Downloading,
+    Completed,
+    SkippedAlreadyLossless,
+    Failed,
+}
+
+impl ArchivalUpgradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchivalUpgradeStatus::Queued => "queued",
+            ArchivalUpgradeStatus::Searching => "searching",
+            ArchivalUpgradeStatus::Downloading => "downloading",
+            ArchivalUpgradeStatus::Completed => "completed",
+            ArchivalUpgradeStatus::SkippedAlreadyLossless => "skipped_already_lossless",
+            ArchivalUpgradeStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "searching" => ArchivalUpgradeStatus::Searching,
+            "downloading" => ArchivalUpgradeStatus::Downloading,
+            "completed" => ArchivalUpgradeStatus::Completed,
+            "skipped_already_lossless" => ArchivalUpgradeStatus::SkippedAlreadyLossless,
+            "failed" => ArchivalUpgradeStatus::Failed,
+            _ => ArchivalUpgradeStatus::Queued,
+        }
+    }
+}
+
+/// An On-Keep-only background archival FLAC upgrade job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivalUpgradeJob {
+    pub id: String,
+    pub user_id: String,
+    pub folder_id: String,
+    pub navidrome_song_id: Option<String>,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub recording_mbid: Option<String>,
+    pub original_codec: String,
+    pub original_backend: String,
+    pub trigger_reason: String,
+    pub status: ArchivalUpgradeStatus,
+    pub job_id: Option<String>,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Request to trigger an archival FLAC upgrade when a user explicitly keeps/stars a track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerArchivalUpgradeRequest {
+    pub navidrome_song_id: Option<String>,
+    pub discovery_track_id: Option<String>,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub recording_mbid: Option<String>,
+    pub folder_id: Option<String>,
+    /// Reported codec of the kept track (e.g., "opus", "mp3", "flac"), when known.
+    pub codec: Option<String>,
+    /// Reason that gated this upgrade (`"keep"`, `"star"`, `"promote"`, `"manual"`).
+    pub trigger_reason: String,
+}
+
+/// Outcome of evaluating an On-Keep archival FLAC upgrade hook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ArchivalUpgradeOutcome {
+    Enqueued { job: Box<ArchivalUpgradeJob> },
+    AlreadyScheduled { upgrade_id: String },
+    AlreadyLossless { codec: String },
+    NotFastAcquired,
+}
+
+/// Returns `true` when an audio format/codec label represents a lossy format
+/// (and `false` for lossless formats such as FLAC, WAV, ALAC, AIFF, APE, WavPack, DSD).
+pub fn is_lossy_format(codec_or_quality: &str) -> bool {
+    let lower = codec_or_quality.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let lossless_tokens = [
+        "flac", "wav", "alac", "aiff", "aif", "ape", "wv", "wavpack", "dsf", "dff", "dsd", "pcm",
+        "lossless",
+    ];
+    if lossless_tokens.iter().any(|tok| lower.contains(tok)) {
+        return false;
+    }
+    true
 }
 
 /// Events from the auto-download pipeline, sent over WebSocket

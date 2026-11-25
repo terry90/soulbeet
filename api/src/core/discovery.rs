@@ -608,6 +608,21 @@ async fn promote_claimed(
         .await
         .map_err(|e| database_failure(Stage::Import, e))?;
 
+    if let Err(f) = crate::core::archival::maybe_enqueue_for_promoted_discovery_in(
+        db,
+        &source_folder.user_id,
+        &target_folder.id,
+        &track,
+    )
+    .await
+    {
+        warn!(
+            "Failed to evaluate archival FLAC upgrade for promoted track '{}': {}",
+            track.title,
+            crate::core::logged(&f)
+        );
+    }
+
     if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
         db,
         &source_folder.user_id,

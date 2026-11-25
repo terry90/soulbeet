@@ -221,6 +221,10 @@ fn WebNavbar() -> Element {
                 DownloadEvent::AutoDownload(auto_event) => {
                     auto_download_signal.set(Some(auto_event));
                 }
+                DownloadEvent::AcquireAndPlay(_acquire_event) => {
+                    // Consumed by the Studio Player UI in Phase 3 (PR 3A/3B) to animate `seam-light`
+                    // and start playback automatically when Navidrome indexes the track.
+                }
                 DownloadEvent::Build(server_build) => {
                     if !api::build_id::is_current(&server_build) {
                         outdated.set(true);
