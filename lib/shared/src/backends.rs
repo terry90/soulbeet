@@ -54,8 +54,27 @@ pub const SLSKD: BackendMeta = BackendMeta {
     blocked: Some("slskd's blacklist holds this source"),
 };
 
+pub const ARCHIVE: BackendMeta = BackendMeta {
+    id: crate::archive::BACKEND_ID,
+    name: "Internet Archive",
+    service: "archive.org",
+    delivery: Delivery::AsFound,
+    switch: Switch::AdminToggle,
+    about: &[
+        "Off until an admin turns it on. Auto-download then searches archive.org next to Soulseek.",
+        "Offers only the files their uploaders gave, never archive.org's own conversions, and checks each one against the checksum archive.org lists before it is imported.",
+        "Each item's rights are set by its uploader.",
+    ],
+    link: Some((
+        "Rights on archive.org",
+        "https://help.archive.org/help/rights/",
+    )),
+    attribution: None,
+    blocked: None,
+};
+
 /// Every backend this build has, the default one first.
-pub const ALL: &[BackendMeta] = &[SLSKD];
+pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE];
 
 /// The backend a search or a send uses when none is named.
 pub const DEFAULT_ID: &str = SLSKD.id;
@@ -98,7 +117,21 @@ mod tests {
         assert_eq!(ALL[0].id, DEFAULT_ID);
         assert_eq!(ALL[0].switch, Switch::AlwaysOn);
         assert_eq!(meta("slskd"), Some(&SLSKD));
+        assert_eq!(meta("archive"), Some(&ARCHIVE));
         assert_eq!(meta("nicotine"), None);
+    }
+
+    #[test]
+    fn the_archive_is_off_until_an_admin_turns_it_on_and_links_its_rights_page() {
+        assert_eq!(ARCHIVE.switch, Switch::AdminToggle);
+        assert_eq!(ARCHIVE.delivery, Delivery::AsFound);
+        assert!(ARCHIVE
+            .link
+            .is_some_and(|(_, url)| url.starts_with("https://")));
+        assert_eq!(
+            blocked("archive"),
+            "archive.org will not give files from this source"
+        );
     }
 
     #[test]
