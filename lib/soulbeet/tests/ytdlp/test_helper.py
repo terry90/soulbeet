@@ -3,6 +3,7 @@ YouTube Music answered on 2026-11-25. The Rust tests read the same answers as th
 them, from src/ytdlp/fixtures: each fixture must be what the helper prints."""
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -189,3 +190,33 @@ def test_nothing_but_answers_reaches_stdout(helper, tmp_path):
         {"command": "fetch", "video_id": "MdzF0rFOC9Y", "staging_dir": str(staging), "min_abr": 96}
     ):
         assert set(line) <= {"progress", "done"}
+
+
+def gone(pid):
+    """Whether `pid` is gone, or a zombie, within 5 s."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().split(" ")[2]
+        except FileNotFoundError:
+            return True
+        if state == "Z":
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_a_helper_whose_stdin_closes_kills_its_group(spawn, home):
+    # A search that never returns, as ytmusicapi's can, whose server is then gone.
+    process = spawn({"command": "search_songs", "query": "stall", "limit": 5})
+    pids = home / "stall-pids"
+    deadline = time.monotonic() + 10
+    while not pids.exists() or len(pids.read_text().split()) != 2:
+        assert time.monotonic() < deadline, "the search never started"
+        time.sleep(0.02)
+    helper, child = (int(p) for p in pids.read_text().split())
+    process.stdin.close()
+    assert process.wait(timeout=10) == -9
+    assert process.stdout.read() == ""
+    assert gone(child)
+    assert helper == process.pid

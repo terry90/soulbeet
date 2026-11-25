@@ -34,32 +34,63 @@ def tools(tmp_path):
 
 
 @pytest.fixture
-def helper(tmp_path, tools):
-    """Runs the helper as Soulbeet does, on the fakes: its request on stdin, its environment
-    only its own folder. Returns the lines it printed."""
+def home(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    cache = tmp_path / "cache"
+    return home
 
-    def run(request, site_packages=FAKES, **overrides):
+
+@pytest.fixture
+def spawn(tmp_path, tools, home):
+    """Starts the helper as Soulbeet does, on the fakes: the leader of its own process group,
+    its environment only its own folder, its request on stdin, which stays open."""
+    started = []
+
+    def start(request, site_packages=FAKES, **overrides):
         envelope = {
             "site_packages": str(site_packages),
-            "cache_dir": str(cache),
+            "cache_dir": str(tmp_path / "cache"),
             **tools,
             **overrides,
             **request,
         }
-        done = subprocess.run(
-            [sys.executable, "-I", "-X", "utf8", "-c", HELPER],
-            input=json.dumps(envelope) + "\n",
-            capture_output=True,
-            text=True,
-            env={"HOME": str(home), "TMPDIR": str(home), "LANG": "C.UTF-8"},
-            cwd=home,
-            timeout=60,
-        )
-        assert done.returncode == 0, done.stderr
-        return [json.loads(line) for line in done.stdout.splitlines()]
+        said = tmp_path / f"stderr-{len(started)}"
+        with said.open("w") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-X", "utf8", "-c", HELPER],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+                env={"HOME": str(home), "TMPDIR": str(home), "LANG": "C.UTF-8"},
+                cwd=home,
+                process_group=0,
+            )
+        process.said = said
+        started.append(process)
+        process.stdin.write(json.dumps(envelope) + "\n")
+        process.stdin.flush()
+        return process
+
+    yield start
+    for process in started:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+@pytest.fixture
+def helper(spawn, tmp_path):
+    """Runs the helper as Soulbeet does, and closes its stdin once it ended. Returns the lines
+    it printed."""
+
+    def run(request, **overrides):
+        process = spawn(request, **overrides)
+        out = process.stdout.read()
+        ended = process.wait(timeout=60)
+        process.stdin.close()
+        assert ended == 0, process.said.read_text()
+        return [json.loads(line) for line in out.splitlines()]
 
     return run
 

@@ -1,8 +1,13 @@
 """Stands in for ytmusicapi: answers the searches and albums the tests ask with the answers
-YouTube Music gave on 2026-11-25, saved in ../../answers. Any other request finds nothing, and a
-query of "fail: <text>" fails as ytmusicapi does when YouTube Music answers with an error."""
+YouTube Music gave on 2026-11-25, saved in ../../answers. Any other request finds nothing, a
+query of "fail: <text>" fails as ytmusicapi does when YouTube Music answers with an error, and
+"stall" never ends, as a request with no timeout can: it starts a child, writes its own pid and
+the child's to $HOME/stall-pids, and sleeps."""
 
 import json
+import os
+import subprocess
+import time
 from pathlib import Path
 
 ANSWERS = Path(__file__).resolve().parents[2] / "answers"
@@ -26,6 +31,11 @@ def saved(name):
 
 class YTMusic:
     def search(self, query, filter=None, limit=20):
+        if query == "stall":
+            child = subprocess.Popen(["sleep", "60"])
+            pids = Path(os.environ["HOME"]) / "stall-pids"
+            pids.write_text(f"{os.getpid()} {child.pid}")
+            time.sleep(60)
         if query.startswith("fail: "):
             raise YTMusicServerError(query[len("fail: "):])
         name = SEARCHES.get((query, filter))

@@ -58,7 +58,7 @@ yt-dlp breaks when YouTube changes, every few weeks, until a newer yt-dlp is rel
 ## What YouTube sees, and what runs on your server
 
 - YouTube sees your server's address. Requests carry yt-dlp's and ytmusicapi's own client headers, and no account, cookie or anything about your users.
-- yt-dlp and ytmusicapi run in a Python helper Soulbeet starts for each search or download, with a fixed command line, no shell, and an environment holding only its own folders: it sees no key and no password. Each run is in a process group of its own, killed as a whole when it ends, is cancelled, times out (2 minutes without output, 10 minutes in all for a download), or the source is turned off.
+- yt-dlp and ytmusicapi run in a Python helper Soulbeet starts for each search or download, with a fixed command line, no shell, and an environment holding only its own folders: it sees no key and no password. Each run is in a process group of its own, killed as a whole when it ends, is cancelled, times out (2 minutes without output, 10 minutes in all for a download), or the source is turned off. When Soulbeet itself is killed, each helper kills its group as its stdin closes.
 - YouTube's player code, which yt-dlp must run, runs in deno with no permissions: no files, no network, no programs.
 - What the helper prints is never logged whole. Messages keep no URL, since YouTube's media URLs carry your server's address.
 

@@ -1,7 +1,9 @@
 //! How the backend talks to its helper, a Python script run once per call: one request as JSON
 //! on stdin, then one JSON object per line on stdout. The helper runs with a fixed argument
 //! list, no shell, an environment of its own folders only, and in a process group of its own
-//! that is killed when the call ends, times out or is dropped.
+//! that is killed when the call ends, times out or is dropped. Stdin stays open until then: the
+//! helper kills its own group when it closes, so a server killed without running its drops
+//! leaves no helper running.
 
 use super::error::{clean, Fault, Kind};
 use crate::process::ProcessGroup;
@@ -298,7 +300,6 @@ impl Helper {
                     format!("The helper took no request: {e}"),
                 )));
             }
-            drop(stdin);
             let mut lines = Lines::new(stdout);
             loop {
                 let idle = Instant::now() + limits.idle;
@@ -511,6 +512,24 @@ print(json.dumps({"version": {"python": "3.11", "yt_dlp": request["site_packages
         assert!(v.yt_dlp.unwrap().ends_with("site-packages"));
         assert_eq!(seen.len(), 1);
         assert_eq!((seen[0].downloaded, seen[0].total), (5, Some(10)));
+    }
+
+    #[tokio::test]
+    async fn stdin_stays_open_until_the_call_ends() {
+        let (answer, _) = ask(
+            r#"
+import json, select, sys
+sys.stdin.readline()
+ended, _, _ = select.select([sys.stdin], [], [], 1.0)
+print(json.dumps({"version": {"python": "closed" if ended else "open"}}))
+"#,
+            SHORT,
+        )
+        .await;
+        let Answer::Version(v) = answer.unwrap() else {
+            panic!("not a version");
+        };
+        assert_eq!(v.python.as_deref(), Some("open"));
     }
 
     #[tokio::test]

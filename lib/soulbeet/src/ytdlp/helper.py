@@ -1,9 +1,13 @@
 """Soulbeet's YouTube Music helper.
 
 Soulbeet runs it as `python -I -X utf8 -c <this file>`, with no shell and an environment that
-holds only its own folders, and writes one request as JSON on stdin. The helper answers with one
-JSON object per line on stdout: progress lines while it downloads, then one answer or one error.
-Nothing else reaches stdout: yt-dlp's own output, and every program it runs, write to stderr.
+holds only its own folders, as the leader of a process group of its own, and writes one request
+as JSON on stdin. The helper answers with one JSON object per line on stdout: progress lines
+while it downloads, then one answer or one error. Nothing else reaches stdout: yt-dlp's own
+output, and every program it runs, write to stderr.
+
+Soulbeet keeps stdin open until the call ends. When it closes, because the call ended or the
+server is gone, the helper kills its process group: nothing it started outlives the server.
 """
 
 import importlib
@@ -12,8 +16,10 @@ import json
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 URL = re.compile(r"https?://\S+")
@@ -327,6 +333,21 @@ COMMANDS = {
 }
 
 
+def end_with_stdin():
+    """Kills the helper's process group once stdin ends. Programs it runs read /dev/null."""
+    pipe = os.dup(sys.stdin.fileno())
+    nothing = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nothing, sys.stdin.fileno())
+    os.close(nothing)
+
+    def watch():
+        while os.read(pipe, 4096):
+            pass
+        os.killpg(os.getpid(), signal.SIGKILL)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main():
     answers = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
     # From here on fd 1, sys.stdout and every program run write to stderr.
@@ -338,7 +359,9 @@ def main():
         answers.flush()
 
     try:
-        request = json.loads(sys.stdin.readline())
+        line = sys.stdin.readline()
+        end_with_stdin()
+        request = json.loads(line)
         sys.path.insert(0, request["site_packages"])
         command = COMMANDS.get(request.get("command"))
         if command is None:
