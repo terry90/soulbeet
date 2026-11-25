@@ -7,6 +7,7 @@ members = [
   # "mobile",
   "api",
   "lib/soulbeet",
+  "lib/client-core",
 ]
 
 [workspace.dependencies]
@@ -17,6 +18,7 @@ ui = { path = "ui" }
 api = { path = "api" }
 shared = { path = "lib/shared" }
 soulbeet = { path = "lib/soulbeet" }
+client-core = { path = "lib/client-core" }
 
 [profile]
 
