@@ -13,6 +13,7 @@ use shared::failure::{
 };
 #[cfg(feature = "server")]
 use soulbeet::{
+    archive::{ArchiveBackend, EngineCell, EngineSettings},
     beets::{BeetsImporter, BeetsSettings},
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
@@ -30,6 +31,7 @@ pub mod providers {
 
 pub mod downloaders {
     pub const SLSKD: &str = shared::slskd::BACKEND_ID;
+    pub const ARCHIVE: &str = shared::archive::BACKEND_ID;
 }
 
 pub mod importers {
@@ -200,8 +202,35 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
 
             Ok(Arc::new(client))
         }
+        downloaders::ARCHIVE => {
+            archive_backend(&soulbeet::archive::ENGINE, archive_settings().await?).await
+        }
         _ => Err(BackendLookupError::Unknown(id.to_string())),
     }
+}
+
+/// What the Internet Archive engine runs on: this install's downloads folder, its id, the
+/// transfer book, and where archive.org is.
+#[cfg(feature = "server")]
+async fn archive_settings() -> Result<EngineSettings, BackendLookupError> {
+    Ok(EngineSettings {
+        download_path: crate::config::CONFIG.download_path().clone(),
+        instance: instance_id().await.map_err(BackendLookupError::Settings)?,
+        book: transfer_book(),
+        base_url: soulbeet::archive::base_url_from_env(),
+    })
+}
+
+/// A handle on the engine of `cell`, started on the first build: a rebuilt handle shares the
+/// transfers the engine runs.
+#[cfg(feature = "server")]
+async fn archive_backend(
+    cell: &EngineCell,
+    settings: EngineSettings,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    let engine =
+        (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
+    Ok(Arc::new(ArchiveBackend::new(engine)))
 }
 
 /// The backend `download_backend(None)` gives.
@@ -291,9 +320,25 @@ pub async fn reload_download_backend(id: &str) {
 /// lookup gets it; a handle taken earlier must then be refused `download` and `start_search`
 /// until the backend is built again. Each backend that can be turned off adds its arm.
 #[cfg(feature = "server")]
-#[allow(clippy::match_single_binding)]
+// A match each switchable backend adds its arm to; one arm until the next backend lands.
+#[allow(clippy::single_match)]
 pub(crate) async fn stop_backend(id: &str) {
     match id {
+        downloaders::ARCHIVE => {
+            let engine = &soulbeet::archive::ENGINE;
+            if engine.stop().await {
+                return;
+            }
+            let forgotten = match archive_settings().await {
+                Ok(settings) => {
+                    (engine.forget_unfinished(settings).await).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = forgotten {
+                tracing::warn!("Could not forget the unfinished Internet Archive transfers: {e}");
+            }
+        }
         _ => {}
     }
 }
@@ -687,6 +732,7 @@ mod tests {
     use crate::db::test_db;
     use crate::security::SEEDED_ADMIN_ID;
     use crate::server_fns::download::test_support::{StubBackend, StubBackends};
+    use std::collections::HashSet;
 
     #[tokio::test]
     async fn an_unreadable_password_marks_the_user_and_resets_the_banner() {
@@ -1039,15 +1085,9 @@ mod tests {
         assert_eq!(backends.asked(), ["a", "b"]);
     }
 
-    /// A backend an admin turns on, as a backend branch adds one.
-    const SWITCHED: BackendMeta = BackendMeta {
-        id: "archive",
-        name: "Internet Archive",
-        service: "archive.org",
-        switch: Switch::AdminToggle,
-        ..shared::backends::SLSKD
-    };
-    static METAS: &[BackendMeta] = &[shared::backends::SLSKD, SWITCHED];
+    /// The backend an admin turns on.
+    const SWITCHED: BackendMeta = shared::backends::ARCHIVE;
+    static METAS: &[BackendMeta] = shared::backends::ALL;
 
     #[tokio::test]
     async fn a_backend_turned_off_is_disabled_and_says_where_to_turn_it_on() {
@@ -1225,5 +1265,271 @@ mod tests {
             importers.push(caller.await.unwrap().unwrap());
         }
         assert!(importers.iter().all(|i| Arc::ptr_eq(i, &importers[0])));
+    }
+    /// archive.org as a test answers it: each connection gets `200` and the next of `bodies`,
+    /// and once they are all sent a connection is held open with no answer.
+    fn archive_double(bodies: Vec<Vec<u8>>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut bodies = bodies.into_iter();
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 2 {
+                    line.clear();
+                }
+                match bodies.next() {
+                    Some(body) => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(head.as_bytes()).unwrap();
+                        stream.write_all(&body).unwrap();
+                    }
+                    None => held.push(stream),
+                }
+            }
+        });
+        base
+    }
+
+    /// The search item of the file `name` of `identifier`, whose bytes are `bytes`.
+    fn archive_item(
+        identifier: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> shared::download::DownloadableItem {
+        let file = shared::archive::ArchiveFile {
+            identifier: identifier.into(),
+            name: name.into(),
+            size: bytes.len() as u64,
+            md5: format!("{:x}", md5::compute(bytes)),
+        };
+        shared::download::DownloadableItem {
+            id: format!("{identifier}/{name}"),
+            backend: downloaders::ARCHIVE.into(),
+            source: identifier.into(),
+            title: "Moon Age".into(),
+            artist: "Duster".into(),
+            album: "Stratosphere".into(),
+            size: Some(bytes.len() as u64),
+            duration: None,
+            quality: "mp3".into(),
+            quality_score: 0.75,
+            backend_data: Some(serde_json::to_string(&file).unwrap()),
+            match_score: 1.0,
+            below_floor: false,
+            facts: Default::default(),
+        }
+    }
+
+    /// A downloads folder and a transfer book on a test database, archive.org at `base`.
+    async fn archive_settings_at(
+        base: &str,
+    ) -> (tempfile::TempDir, sqlx::SqlitePool, EngineSettings) {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db::migrated().await;
+        let settings = EngineSettings {
+            download_path: root.path().to_path_buf(),
+            instance: instance_id_in(&db).await.unwrap(),
+            book: Arc::new(crate::ledger::transfer_book::SqliteTransferBook::new(
+                db.clone(),
+            )),
+            base_url: base.to_string(),
+        };
+        (root, db, settings)
+    }
+
+    fn partial_files(settings: &EngineSettings) -> Vec<PathBuf> {
+        let dir = settings
+            .download_path
+            .join(soulbeet::partial::PARTIAL_FOLDER)
+            .join(&settings.instance)
+            .join(downloaders::ARCHIVE);
+        std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn sent_to(
+        backend: &Arc<dyn DownloadBackend>,
+        item: shared::download::DownloadableItem,
+        destination: &str,
+    ) -> shared::download::QueuedDownload {
+        let mut queued = backend
+            .download(vec![item], destination, "r1", "u1")
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].status, shared::download::EnqueueStatus::Enqueued);
+        queued.remove(0)
+    }
+
+    async fn ended(
+        backend: &Arc<dyn DownloadBackend>,
+        queued: &shared::download::QueuedDownload,
+    ) -> shared::download::DownloadProgress {
+        use shared::download::DownloadState::*;
+        for _ in 0..500 {
+            let row = backend
+                .get_download(&queued.source, &queued.id)
+                .await
+                .unwrap();
+            if let Some(row) = row.filter(|r| matches!(r.state, Completed | Failed(_))) {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("transfer {} never ended", queued.id);
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_archive_handle_still_lists_the_transfer_the_old_one_sent() {
+        let base = archive_double(vec![]);
+        let (_root, db, settings) = archive_settings_at(&base).await;
+        let cell = EngineCell::new();
+        let first = archive_backend(&cell, settings.clone()).await.unwrap();
+        let bytes = vec![7u8; 4096];
+        let queued = sent_to(
+            &first,
+            archive_item("duster", "01 Moon Age.mp3", &bytes),
+            "Stratosphere [aaaa1111]",
+        )
+        .await;
+
+        // The registry drops the handle (a turn-on, a settings save, a failed lookup) and
+        // builds it again around the same engine.
+        let rebuilt = archive_backend(&cell, settings.clone()).await.unwrap();
+        let row = rebuilt
+            .get_download("duster", &queued.id)
+            .await
+            .unwrap()
+            .expect("the rebuilt handle lists the running transfer");
+        assert_eq!(row.request.as_deref(), Some("r1"));
+        let book = crate::ledger::transfer_book::SqliteTransferBook::new(db);
+        let entries = soulbeet::TransferBook::all(&book, downloaders::ARCHIVE)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].transfer_id.as_deref(), Some(queued.id.as_str()));
+        cell.stop().await;
+    }
+
+    #[tokio::test]
+    async fn turning_the_archive_off_leaves_no_part_file_and_no_unfinished_entry() {
+        let done = vec![3u8; 2048];
+        let base = archive_double(vec![done.clone()]);
+        let (root, db, settings) = archive_settings_at(&base).await;
+        let cell = EngineCell::new();
+        let backend = archive_backend(&cell, settings.clone()).await.unwrap();
+        let finished = sent_to(
+            &backend,
+            archive_item("duster", "01 Moon Age.mp3", &done),
+            "Stratosphere [aaaa1111]",
+        )
+        .await;
+        ended(&backend, &finished).await;
+        let running = sent_to(
+            &backend,
+            archive_item("duster", "02 Heading for the Door.mp3", &[5u8; 4096]),
+            "Stratosphere [aaaa1111]",
+        )
+        .await;
+        for _ in 0..500 {
+            if !partial_files(&settings).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(partial_files(&settings).len(), 1);
+
+        assert!(cell.stop().await);
+
+        assert!(partial_files(&settings).is_empty());
+        let book = crate::ledger::transfer_book::SqliteTransferBook::new(db);
+        let entries = soulbeet::TransferBook::all(&book, downloaders::ARCHIVE)
+            .await
+            .unwrap();
+        let kept: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(kept, [finished.id.as_str()]);
+        assert!(backend
+            .get_download("duster", &running.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            std::fs::read(root.path().join("Stratosphere [aaaa1111]/01 Moon Age.mp3")).unwrap(),
+            done
+        );
+        // The handle taken before the stop is refused until the backend is built again.
+        let refused = backend
+            .download(
+                vec![archive_item("duster", "03.mp3", &done)],
+                "Stratosphere [aaaa1111]",
+                "r2",
+                "u1",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.failure(Stage::Enqueue, refused.to_string()).code,
+            FailureCode::BackendNotConfigured
+        );
+        let spec = shared::download::SearchSpec::of(None, vec![]);
+        assert!(backend.start_search(&spec).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_archive_file_lands_where_the_monitor_looks_for_it_under_any_of_its_names() {
+        use crate::server_fns::download::utils::{file_id, resolve_in_destination};
+        let bodies = vec![vec![1u8; 1500], vec![2u8; 1700], vec![3u8; 1900]];
+        let base = archive_double(bodies.clone());
+        let (root, _db, settings) = archive_settings_at(&base).await;
+        let cell = EngineCell::new();
+        let backend = archive_backend(&cell, settings).await.unwrap();
+        let destination = "Stratosphere [aaaa1111]";
+        let mut rows = Vec::new();
+        for (identifier, bytes) in [
+            "duster-stratosphere_202403",
+            "a0165062421_10",
+            "1998-duster-stratosphere",
+        ]
+        .into_iter()
+        .zip(&bodies)
+        {
+            let queued = sent_to(
+                &backend,
+                archive_item(
+                    identifier,
+                    "[1998] Stratosphere/01 Moon Age: Live?.mp3",
+                    bytes,
+                ),
+                destination,
+            )
+            .await;
+            rows.push(ended(&backend, &queued).await);
+        }
+        let mut claimed = HashSet::new();
+        let mut found = Vec::new();
+        for (row, bytes) in rows.iter().zip(&bodies) {
+            let path =
+                resolve_in_destination(&row.item, root.path(), destination, &claimed).unwrap();
+            assert_eq!(&std::fs::read(&path).unwrap(), bytes);
+            claimed.insert(file_id(&path).unwrap());
+            found.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+        assert_eq!(found[0], "01 Moon Age_ Live_.mp3");
+        assert_eq!(found[1], "01 Moon Age: Live?.mp3");
+        assert!(
+            shared::download::is_ticks_copy(&found[2], "01 Moon Age_ Live_.mp3"),
+            "{}",
+            found[2]
+        );
+        cell.stop().await;
     }
 }

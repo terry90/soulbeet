@@ -138,6 +138,9 @@ pub(crate) enum FileAnswer {
     Cut(usize),
     /// As `Whole`, then nothing after this many bytes of the body, the connection held open.
     Stall(usize),
+    /// The whole file with 200 whatever `Range` asks, as a server that ignores it, the
+    /// connection closed after this many bytes of the body.
+    NoRange(usize),
     /// This status with an empty body.
     Status(u16),
 }
@@ -200,7 +203,7 @@ fn file_response(file: &ServedFile, request: &Seen, answer: FileAnswer) -> Vec<u
     let range = request
         .range
         .as_deref()
-        .filter(|_| same_file)
+        .filter(|_| same_file && !matches!(answer, FileAnswer::NoRange(_)))
         .and_then(|r| r.strip_prefix("bytes="))
         .and_then(|r| r.split_once('-'))
         .and_then(|(start, end)| {
@@ -228,7 +231,9 @@ fn file_response(file: &ServedFile, request: &Seen, answer: FileAnswer) -> Vec<u
     )
     .into_bytes();
     let sent = match answer {
-        FileAnswer::Cut(n) | FileAnswer::Stall(n) => &body[..n.min(body.len())],
+        FileAnswer::Cut(n) | FileAnswer::Stall(n) | FileAnswer::NoRange(n) => {
+            &body[..n.min(body.len())]
+        }
         _ => body,
     };
     out.extend_from_slice(sent);

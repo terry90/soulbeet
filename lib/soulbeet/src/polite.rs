@@ -1,6 +1,7 @@
-//! One paced HTTP client for ListenBrainz, ListenBrainz Labs and Deezer. It
-//! spaces requests per host, waits out rate limits, retries a bot challenge
-//! page like an outage and never hands one to a caller as data.
+//! One paced HTTP client for ListenBrainz, ListenBrainz Labs, Deezer and archive.org. It
+//! spaces requests per host, waits out rate limits (a 429 or 503 holds every request to the
+//! host, `HostGate`), retries a bot challenge page like an outage and never hands one to a
+//! caller as data.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -44,6 +45,15 @@ impl Pace {
         backoff: Duration::from_millis(5000),
         retries: 3,
         timeout: Duration::from_secs(15),
+    };
+
+    /// archive.org publishes no limit and blocks heavy automated traffic, so one request a
+    /// second, shared by every user's searches.
+    pub const ARCHIVE: Pace = Pace {
+        min_interval: Duration::from_millis(1000),
+        backoff: Duration::from_millis(5000),
+        retries: 3,
+        timeout: Duration::from_secs(30),
     };
 
     #[cfg(test)]
@@ -93,18 +103,64 @@ impl RemoteError {
     }
 }
 
-type Gate = Arc<tokio::sync::Mutex<Instant>>;
+/// The pace every client of one host keeps: requests take their turn one at a time, spaced by
+/// their pace, and a hold (an exhausted rate limit, a 429 or 503) holds every request to the
+/// host until it is over.
+pub struct HostGate {
+    /// Taken in the order requests come, while each waits for its turn.
+    turn: tokio::sync::Mutex<()>,
+    /// No request goes out before this.
+    next: std::sync::Mutex<Instant>,
+}
 
 /// One gate per host:port so every client of a host shares its pacing.
-static GATES: LazyLock<std::sync::Mutex<HashMap<String, Gate>>> = LazyLock::new(Default::default);
+static GATES: LazyLock<std::sync::Mutex<HashMap<String, Arc<HostGate>>>> =
+    LazyLock::new(Default::default);
 
-fn gate_for(key: &str) -> Gate {
-    GATES
-        .lock()
-        .unwrap()
-        .entry(key.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(Instant::now())))
-        .clone()
+impl HostGate {
+    /// The gate of the host `base_url` names, shared by every client of it in the process.
+    pub fn of(base_url: &str) -> Result<Arc<HostGate>, String> {
+        let parsed = url::Url::parse(base_url).map_err(|e| e.to_string())?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| format!("no host in {base_url}"))?;
+        let key = match parsed.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let mut gates = GATES.lock().unwrap();
+        let gate = gates.entry(key).or_insert_with(|| {
+            Arc::new(HostGate {
+                turn: tokio::sync::Mutex::new(()),
+                next: std::sync::Mutex::new(Instant::now()),
+            })
+        });
+        Ok(gate.clone())
+    }
+
+    /// Waits until a request may go out, then spaces the next one `interval` after it. A hold
+    /// that grows meanwhile is waited out too.
+    pub async fn wait_for_turn(&self, interval: Duration) {
+        let _turn = self.turn.lock().await;
+        loop {
+            let until = {
+                let mut next = self.next.lock().unwrap();
+                let now = Instant::now();
+                if *next <= now {
+                    *next = now + interval;
+                    return;
+                }
+                *next
+            };
+            tokio::time::sleep_until(until.into()).await;
+        }
+    }
+
+    /// Holds every request to the host for `wait` from now, unless a longer hold is on.
+    pub fn hold(&self, wait: Duration) {
+        let mut next = self.next.lock().unwrap();
+        *next = (*next).max(Instant::now() + wait);
+    }
 }
 
 /// A whole-seconds header value, if present and numeric.
@@ -133,7 +189,7 @@ pub struct PoliteClient {
     base: String,
     service: &'static str,
     pace: Pace,
-    gate: Gate,
+    gate: Arc<HostGate>,
     token: Option<String>,
     is_quota: Option<fn(&[u8]) -> bool>,
     failed: std::sync::Mutex<Streak>,
@@ -147,14 +203,7 @@ impl PoliteClient {
     ) -> Result<PoliteClient, RemoteError> {
         let unavailable = |detail: String| RemoteError::Unavailable { service, detail };
         let base = base_url.trim_end_matches('/').to_string();
-        let parsed = url::Url::parse(&base).map_err(|e| unavailable(e.to_string()))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| unavailable(format!("no host in {base}")))?;
-        let key = match parsed.port_or_known_default() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
+        let gate = HostGate::of(&base).map_err(unavailable)?;
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(pace.timeout)
@@ -166,7 +215,7 @@ impl PoliteClient {
             base,
             service,
             pace,
-            gate: gate_for(&key),
+            gate,
             token: None,
             is_quota: None,
             failed: Default::default(),
@@ -204,21 +253,11 @@ impl PoliteClient {
         self.send(Method::POST, path, Some(body)).await
     }
 
-    async fn wait_for_turn(&self) {
-        let mut next = self.gate.lock().await;
-        let now = Instant::now();
-        if *next > now {
-            tokio::time::sleep(*next - now).await;
-        }
-        *next = Instant::now() + self.pace.min_interval;
-    }
-
     /// An exhausted limit holds every request to the host until it resets.
-    async fn hold_gate(&self, headers: &HeaderMap) {
+    fn hold_gate(&self, headers: &HeaderMap) {
         if header_secs(headers, "X-RateLimit-Remaining") == Some(0) {
             if let Some(secs) = header_secs(headers, "X-RateLimit-Reset-In") {
-                let mut next = self.gate.lock().await;
-                *next = (*next).max(Instant::now() + Duration::from_secs(secs));
+                self.gate.hold(Duration::from_secs(secs));
             }
         }
     }
@@ -273,7 +312,7 @@ impl PoliteClient {
         };
         for attempt in 0..=self.pace.retries {
             let mut wait = self.backoff(attempt);
-            self.wait_for_turn().await;
+            self.gate.wait_for_turn(self.pace.min_interval).await;
             let mut request = self.http.request(method.clone(), &url);
             if let Some(token) = &self.token {
                 request = request.header("Authorization", format!("Token {token}"));
@@ -294,7 +333,7 @@ impl PoliteClient {
             };
             let status = response.status();
             let headers = response.headers().clone();
-            self.hold_gate(&headers).await;
+            self.hold_gate(&headers);
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -311,9 +350,14 @@ impl PoliteClient {
                 if let Some(secs) = header_secs(&headers, "X-RateLimit-Reset-In") {
                     wait = Duration::from_secs(secs);
                 }
+                // The host asked every client to slow down, not only this call.
+                self.gate.hold(wait);
                 last = RemoteError::RateLimited { service };
                 self.pause(attempt, wait).await;
                 continue;
+            }
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                self.gate.hold(wait);
             }
             if status.is_server_error() {
                 last = RemoteError::Unavailable {
@@ -445,6 +489,55 @@ mod tests {
         assert_eq!(c.get::<Vec<u8>>("/a").await.unwrap(), Some(vec![2]));
         assert!(start.elapsed() >= Duration::from_secs(1));
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_429_holds_every_client_of_the_host() {
+        let (base, seen) = serve(vec![
+            Reply {
+                status: 429,
+                body: String::new(),
+            },
+            ok("[1]"),
+            ok("[2]"),
+        ]);
+        let pace = Pace {
+            backoff: Duration::from_millis(300),
+            retries: 1,
+            ..Pace::immediate()
+        };
+        let (a, b) = (
+            PoliteClient::new(&base, "Deezer", pace).unwrap(),
+            PoliteClient::new(&base, "Deezer", pace).unwrap(),
+        );
+        let (first, second) = tokio::join!(a.get::<Vec<u8>>("/a"), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            b.get::<Vec<u8>>("/b").await
+        });
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        let seen = seen.lock().unwrap();
+        for later in &seen[1..] {
+            assert!(
+                later.at.duration_since(seen[0].at) >= Duration::from_millis(300),
+                "{} waited for the hold",
+                later.target
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hold_that_grows_while_a_request_waits_is_waited_out() {
+        let gate = HostGate::of("http://hold.invalid:1").unwrap();
+        let start = Instant::now();
+        gate.hold(Duration::from_millis(100));
+        let waiting = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.wait_for_turn(Duration::ZERO).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.hold(Duration::from_millis(250));
+        waiting.await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(300));
     }
 
     #[tokio::test]
@@ -605,6 +698,20 @@ mod tests {
         assert_eq!(
             (Pace::DEEZER.min_interval, Pace::DEEZER.backoff),
             (Duration::from_millis(250), Duration::from_millis(5000))
+        );
+        assert_eq!(
+            (
+                Pace::ARCHIVE.min_interval,
+                Pace::ARCHIVE.backoff,
+                Pace::ARCHIVE.retries,
+                Pace::ARCHIVE.timeout
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                3,
+                Duration::from_secs(30)
+            )
         );
     }
 }

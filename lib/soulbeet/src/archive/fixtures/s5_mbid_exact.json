@@ -1,0 +1,57 @@
+{
+ "responseHeader": {
+  "status": 0,
+  "QTime": 174,
+  "params": {
+   "query": "external-identifier:&quot;urn:mb_release_id:c7ba938a-d3b3-4eee-9fc9-8c51eec86f0a&quot;",
+   "qin": "external-identifier:&quot;urn:mb_release_id:c7ba938a-d3b3-4eee-9fc9-8c51eec86f0a&quot;",
+   "fields": "identifier,title,creator,date,collection,format,item_size,downloads,external-identifier,access-restricted-item,licenseurl,mediatype",
+   "wt": "json",
+   "rows": 5,
+   "start": 0
+  }
+ },
+ "response": {
+  "numFound": 1,
+  "start": 0,
+  "docs": [
+   {
+    "collection": [
+     "opensource_audio"
+    ],
+    "creator": "Ephemeris",
+    "date": "2009-03-12T00:00:00Z",
+    "downloads": 165,
+    "external-identifier": [
+     "urn:discogs:release:25276960",
+     "urn:discogs:release:6225840",
+     "urn:discogs:master:749911",
+     "urn:discogs:artist:130498",
+     "urn:mb_release_id:c7ba938a-d3b3-4eee-9fc9-8c51eec86f0a",
+     "urn:mb_releasegroup_id:8801d510-9618-3dcf-bcd1-f33cb843b4e1",
+     "urn:mb_recording_id:7081a8af-30fe-4328-8b10-d9adefb14d4b",
+     "urn:mb_artist_id:2e9a2ac1-fd8e-4111-aab8-97fbdacfb274",
+     "urn:spotify:track:4ny2iuBqP2HyMkcCJWui34",
+     "urn:spotify:album:2WtaJdVfkdH9n0mSZZlwyo"
+    ],
+    "format": [
+     "7z",
+     "AIFF",
+     "Archive BitTorrent",
+     "Flac",
+     "Item Tile",
+     "JPEG",
+     "Metadata",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "ephemeris-h.u.v.a.-network-dissolving-time",
+    "item_size": 230514384,
+    "mediatype": "audio",
+    "title": "Ephemeris: H.U.V.A. NETWORK ft. Dissolving Time"
+   }
+  ]
+ }
+}

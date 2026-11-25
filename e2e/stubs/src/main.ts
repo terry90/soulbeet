@@ -1,8 +1,9 @@
-// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer and OpenID
-// Connect doubles.
+// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer, archive.org and
+// OpenID Connect doubles.
 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createArchiveServer } from './archive-server.js';
 import { createDeezerServer } from './deezer-server.js';
 import { createLabsServer, createListenBrainzServer } from './listenbrainz-server.js';
 import { MbControl, createMusicBrainzServer } from './mb-server.js';
@@ -18,6 +19,7 @@ const mbPort = Number(process.env.MB_PORT ?? 5050);
 const lbPort = Number(process.env.LB_PORT ?? 5060);
 const labsPort = Number(process.env.LABS_PORT ?? 5061);
 const deezerPort = Number(process.env.DEEZER_PORT ?? 5062);
+const archivePort = Number(process.env.ARCHIVE_PORT ?? 5064);
 const apiKey = process.env.SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 const audioDir = resolve(process.env.AUDIO_DIR ?? join(e2eRoot, '.fixtures', 'audio'));
 const downloadsDir = resolve(process.env.DOWNLOADS_DIR ?? join(e2eRoot, '.runtime', 'downloads'));
@@ -68,6 +70,11 @@ deezer.listen(deezerPort, '0.0.0.0', () => {
   console.log(`[deezer] listening on :${deezerPort}`);
 });
 
+const archive = createArchiveServer(audioDir);
+archive.listen(archivePort, '0.0.0.0', () => {
+  console.log(`[archive] listening on :${archivePort}`);
+});
+
 const oidc = createOidcServer({
   issuer: oidcIssuer,
   browserUrl: oidcBrowserUrl,
@@ -87,6 +94,7 @@ process.on('SIGTERM', () => {
   lb.close();
   labs.close();
   deezer.close();
+  archive.close();
   oidc.close();
   process.exit(0);
 });
