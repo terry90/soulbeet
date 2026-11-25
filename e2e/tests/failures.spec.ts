@@ -3,7 +3,13 @@
 // restores stub state between tests.
 
 import { expect, test } from '@playwright/test';
-import { freshSession, openDownloadsPanel, performSearch, transferRow } from '../helpers/app.js';
+import {
+  freshSession,
+  openDownloadsPanel,
+  openServiceStatus,
+  performSearch,
+  transferRow,
+} from '../helpers/app.js';
 import { resetStubs, setOutage, setPeerBehavior } from '../helpers/control.js';
 import { expectFileAppears, importedTrackPath } from '../helpers/files.js';
 import { driftwoodCodes, glassAtlas } from '../fixtures/dataset.js';
@@ -203,7 +209,15 @@ test('surfaces a per-file enqueue rejection with its real reason', async ({ cont
 
 test('reports a failed search when slskd is unreachable', async ({ context, page }) => {
   await freshSession(context, page, 'fail-outage');
+  // The status line names the download backend, online before the outage.
+  await openServiceStatus(page);
+  await expect(page.getByText('SOULSEEK ONLINE', { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
   await setOutage(true);
+  await expect(page.getByText('SOULSEEK OFFLINE', { exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
 
   await performSearch(page, 'Undertow', 'TRACK');
   const row = page.locator('li').filter({ hasText: 'Undertow' }).first();

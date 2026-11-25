@@ -30,3 +30,11 @@ Usernames are unique without regard to letter case, so `Bob` and `bob` are the s
 ## Settings in the web UI
 
 slskd URL and API key are configured through the web UI (Settings > Config) and stored in the database. The ListenBrainz username, the optional token and the Deezer switch are configured per-user in Settings > Library.
+
+## Download sources
+
+Soulseek, through slskd, is always on. Every other download source is off until an admin turns it on in Settings > Config > Connections, under the slskd settings; turning one on asks first. A source that is on is searched by auto-download next to Soulseek, and the status line under the search bar has a row for it.
+
+Turning a source off stops its searches and its unfinished downloads and deletes their partial files. Downloads still waiting on it fail with "{name} is turned off in Settings > Config > Connections". Files it finished stay where they are.
+
+How a download source plugs in is in [download-backends.md](download-backends.md).
