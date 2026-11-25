@@ -54,6 +54,7 @@ dotenvy = "0.15.7"
 
 [dev-dependencies]
 async-trait = "0.1"
+md5 = "0.7"
 rmcp = { version = "=3.10.0", default-features = false, features = [
   "client",
   "auth",
