@@ -26,11 +26,13 @@ export async function holdTransfers(page: Page): Promise<(artist: string, album:
   });
   return (artist, album, titles) => {
     const rows = STEPS.slice(0, titles.length).map((step, i) => {
+      // The slice keeps i within titles.
+      const title = titles[i] as string;
       const size = (24 + ((i * 7) % 15)) * 1_000_000;
       return {
         id: `shot-${i}`,
         source: 'peer',
-        item: `${artist}\\${album}\\${String(i + 1).padStart(2, '0')} ${titles[i].replace(/[\\/]/g, ' ')}.flac`,
+        item: `${artist}\\${album}\\${String(i + 1).padStart(2, '0')} ${title.replace(/[\\/]/g, ' ')}.flac`,
         size,
         transferred: Math.round((size * step.percent) / 100),
         state: step.state,

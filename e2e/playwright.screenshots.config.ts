@@ -1,9 +1,9 @@
 import { defineConfig, devices } from '@playwright/test';
 import { baseUrl } from './helpers/env.js';
 
-// Retakes the pictures in ../screenshots on a running Soulbeet, yours or the
-// e2e stack: E2E_BASE_URL, SHOTS_USER, SHOTS_PASSWORD and SHOTS_QUERY (an
-// album title to search for), then `npm run screenshots`.
+// Retakes the pictures in ../screenshots on the stub stack (scripts/dev-stack.sh
+// up), then `npm run screenshots`. The suite's setup points the app at the
+// slskd stub first, so the downloader reads online for real.
 export default defineConfig({
   testDir: '.',
   fullyParallel: false,
@@ -15,12 +15,19 @@ export default defineConfig({
   use: { baseURL: baseUrl },
   projects: [
     {
+      name: 'setup',
+      testMatch: /tests\/setup\.app\.ts/,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
       name: 'desktop',
+      dependencies: ['setup'],
       testMatch: /screenshots\/desktop\.shots\.ts/,
       use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 },
     },
     {
       name: 'mobile',
+      dependencies: ['setup'],
       testMatch: /screenshots\/mobile\.shots\.ts/,
       use: { ...devices['Pixel 7'] },
     },
