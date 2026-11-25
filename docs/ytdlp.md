@@ -18,7 +18,7 @@ Soulbeet asks YouTube Music for the album, then reads the tracklists of the best
 
 Between a clean and an explicit version that match as well, the explicit one is taken.
 
-A YouTube file always scores as an Opus file at about 130 kbps, so a complete, exact album scores about 0.72, just over what auto-download picks on its own.
+A YouTube file always scores 0.5 for its quality, just under an MP3 of 128 kbps. A complete, exact album then scores about 0.8, and one that lacks a track of twelve, or whose titles match a little less well, still reaches the 0.7 auto-download picks at.
 
 ## When it is searched and picked
 

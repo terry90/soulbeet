@@ -44,9 +44,13 @@ pub(crate) const ESTIMATED_KBPS: u32 = 130;
 /// The longest part of an item name before its video id, in bytes.
 const NAME_MAX_BYTES: usize = 180;
 
+/// What Opus adds to its score: the shared table knows no Opus and scores it as an unknown
+/// format. With it, Opus at about 130 kbps scores 0.5, just under an MP3 of 128 kbps.
+const OPUS_TERM: f64 = 0.2;
+
 /// The one quality score every YouTube file has: an Opus file at about 130 kbps.
 pub(crate) fn quality_score() -> f64 {
-    format_score("opus", Some(ESTIMATED_KBPS)).min(1.0)
+    (format_score("opus", Some(ESTIMATED_KBPS)) + OPUS_TERM).min(1.0)
 }
 
 /// What a search is for.
@@ -645,7 +649,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn spiderland_is_found_whole_and_scores_between_seven_and_eight_tenths() {
+    fn spiderland_is_found_whole_and_scores_about_eight_tenths() {
         let wanted = spiderland();
         let hits = albums("slint-albums");
         let shortlisted = shortlist(&hits, &wanted);
@@ -662,7 +666,7 @@ pub(crate) mod tests {
         let group = group.unwrap();
         assert_eq!(group.items.len(), 6);
         assert_eq!(group.source, "ytm:MPREb_ur8iGYISD11");
-        assert!((0.7..=0.8).contains(&group.score), "{}", group.score);
+        assert!((0.78..=0.81).contains(&group.score), "{}", group.score);
         assert_eq!(
             counts,
             Counts {
@@ -689,8 +693,9 @@ pub(crate) mod tests {
         assert_eq!(data.wanted.track_total, Some(6));
         assert_eq!(data.wanted.release_mbid.as_deref(), Some("rel-spiderland"));
         assert_eq!((data.title_score, data.album_score), (1.0, 1.0));
-        // Every file is Opus at about 130 kbps, under every lossless and good MP3 file.
-        assert!(group.items.iter().all(|i| i.quality_score == 0.3));
+        // Every file is Opus at about 130 kbps, under every lossless file and MP3 of 128 kbps.
+        assert!(group.items.iter().all(|i| i.quality_score == 0.5));
+        assert!(quality_score() < format_score("mp3", Some(128)));
     }
 
     #[test]
