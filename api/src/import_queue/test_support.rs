@@ -11,8 +11,9 @@ use shared::download::{
 };
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
-    DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    ImportedItem, MusicImporter, PruneOutcome, Relocation, SkipReason, TaskCount,
+    BeetsTrackInfo, DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome,
+    ImportResult, ImportedItem, MusicImporter, PruneOutcome, RegisterOutcome, Relocation,
+    SkipReason, TagEdits, TaskCount,
 };
 use sqlx::SqlitePool;
 use std::collections::VecDeque;
@@ -143,6 +144,13 @@ pub struct StubImporter {
     prunes: Mutex<Vec<PathBuf>>,
     relocations: Mutex<Vec<(PathBuf, Vec<u64>)>>,
     relocate_answer: Mutex<Relocation>,
+    registers: Mutex<Vec<(PathBuf, PathBuf)>>,
+    register_answer: Mutex<RegisterOutcome>,
+    inspect_answer: Mutex<Result<Option<BeetsTrackInfo>, String>>,
+    tag_edits: Mutex<Vec<(PathBuf, PathBuf, TagEdits)>>,
+    tag_edit_answer: Mutex<Option<Result<BeetsTrackInfo, shared::failure::Failure>>>,
+    rematches: Mutex<Vec<(PathBuf, Vec<PathBuf>, bool)>>,
+    relocate_files: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl StubImporter {
@@ -172,6 +180,13 @@ impl StubImporter {
                 now: vec![],
                 failure: None,
             }),
+            registers: Mutex::new(vec![]),
+            register_answer: Mutex::new(RegisterOutcome::Registered),
+            inspect_answer: Mutex::new(Ok(None)),
+            tag_edits: Mutex::new(vec![]),
+            tag_edit_answer: Mutex::new(None),
+            rematches: Mutex::new(vec![]),
+            relocate_files: Mutex::new(vec![]),
         }
     }
 
@@ -216,6 +231,36 @@ impl StubImporter {
 
     pub fn script_relocate(&self, answer: Relocation) {
         *self.relocate_answer.lock().unwrap() = answer;
+    }
+
+    #[allow(dead_code)]
+    pub fn script_register(&self, answer: RegisterOutcome) {
+        *self.register_answer.lock().unwrap() = answer;
+    }
+
+    pub fn script_inspect(&self, answer: Result<Option<BeetsTrackInfo>, String>) {
+        *self.inspect_answer.lock().unwrap() = answer;
+    }
+
+    #[allow(dead_code)]
+    pub fn script_modify_tags(&self, answer: Result<BeetsTrackInfo, shared::failure::Failure>) {
+        *self.tag_edit_answer.lock().unwrap() = Some(answer);
+    }
+
+    pub fn registers(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.registers.lock().unwrap().clone()
+    }
+
+    pub fn tag_edits(&self) -> Vec<(PathBuf, PathBuf, TagEdits)> {
+        self.tag_edits.lock().unwrap().clone()
+    }
+
+    pub fn rematches(&self) -> Vec<(PathBuf, Vec<PathBuf>, bool)> {
+        self.rematches.lock().unwrap().clone()
+    }
+
+    pub fn relocate_files(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.relocate_files.lock().unwrap().clone()
     }
 
     pub fn panic_next(&self) {
@@ -349,6 +394,14 @@ impl MusicImporter for StubImporter {
         self.relocate_answer.lock().unwrap().clone()
     }
 
+    async fn relocate_file(&self, library: &Path, file: &Path) -> Relocation {
+        self.relocate_files
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), file.to_path_buf()));
+        self.relocate_answer.lock().unwrap().clone()
+    }
+
     fn refused(&self, issue: String) -> ImportResult {
         ImportResult::refused(issue)
     }
@@ -359,6 +412,75 @@ impl MusicImporter for StubImporter {
             .unwrap()
             .push((library.to_path_buf(), file.to_path_buf()));
         self.forget_answer.lock().unwrap().clone()
+    }
+
+    async fn register_in_place(&self, library: &Path, file: &Path) -> RegisterOutcome {
+        self.registers
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), file.to_path_buf()));
+        self.register_answer.lock().unwrap().clone()
+    }
+
+    async fn inspect_file(
+        &self,
+        _library: &Path,
+        _file: &Path,
+    ) -> Result<Option<BeetsTrackInfo>, String> {
+        self.inspect_answer.lock().unwrap().clone()
+    }
+
+    async fn modify_tags(
+        &self,
+        library: &Path,
+        file: &Path,
+        edits: &TagEdits,
+    ) -> Result<BeetsTrackInfo, shared::failure::Failure> {
+        self.tag_edits
+            .lock()
+            .unwrap()
+            .push((library.to_path_buf(), file.to_path_buf(), edits.clone()));
+        if let Some(answer) = self.tag_edit_answer.lock().unwrap().clone() {
+            return answer;
+        }
+        Ok(BeetsTrackInfo {
+            beets_id: 1,
+            path: file.to_path_buf(),
+            title: edits.title.clone().unwrap_or_else(|| "O Holy Night".into()),
+            artist: edits.artist.clone().unwrap_or_else(|| "Marrow Choir".into()),
+            album: edits.album.clone().unwrap_or_else(|| "Winter Songs".into()),
+            album_artist: edits
+                .album_artist
+                .clone()
+                .unwrap_or_else(|| "Marrow Choir".into()),
+            year: edits.year.or(Some(2019)),
+            track: edits.track.or(Some(3)),
+            disc: edits.disc.or(Some(1)),
+            genre: edits.genre.clone().unwrap_or_default(),
+            comments: edits.comment.clone().unwrap_or_default(),
+            recording_mbid: None,
+            release_mbid: None,
+        })
+    }
+
+    async fn rematch_in_place(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        _mode: ImportMode,
+        _choice: &DriverChoice,
+        pretend: bool,
+    ) -> ImportResult {
+        self.rematches.lock().unwrap().push((
+            library.to_path_buf(),
+            sources.iter().map(|s| s.to_path_buf()).collect(),
+            pretend,
+        ));
+        self.results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(imported)
     }
 
     async fn prune(&self, library: &Path) -> PruneOutcome {

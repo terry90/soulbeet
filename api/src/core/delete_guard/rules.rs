@@ -19,7 +19,7 @@ use tracing::info;
 /// them owns the file (D7). Another user's folder that does not resolve, and whose stored path
 /// does not show `path` outside it, may hold the file, so it is kept; the refusal names neither
 /// that folder nor its owner, the log does.
-pub(super) fn owning_folders<'a>(
+pub(crate) fn owning_folders<'a>(
     path: &Path,
     folders: &'a [PolicyFolder],
     actor: &UserId,
@@ -61,7 +61,7 @@ pub(super) fn owning_folders<'a>(
 /// The ids of every registered folder, of any user, that holds the canonical file `path`
 /// strictly, or does not resolve and whose stored path does not show `path` outside it: the
 /// folders a job importing into could write `path` in.
-pub(super) fn holding_folders<'a>(path: &Path, folders: &'a [PolicyFolder]) -> Vec<&'a str> {
+pub(crate) fn holding_folders<'a>(path: &Path, folders: &'a [PolicyFolder]) -> Vec<&'a str> {
     folders
         .iter()
         .filter(|f| match &f.path {
@@ -81,7 +81,7 @@ fn lexically_outside(file: &Path, stored: &Path) -> bool {
 }
 
 /// Rule 2: the canonical `path`, a regular file (local_file_in), has an audio extension.
-pub(super) fn audio_file(path: &Path) -> Result<(), Failure> {
+pub(crate) fn audio_file(path: &Path) -> Result<(), Failure> {
     if !soulbeet::audio::is_audio_path(path) {
         return Err(not_a_track("The file is not an audio file"));
     }
@@ -91,7 +91,7 @@ pub(super) fn audio_file(path: &Path) -> Result<(), Failure> {
 /// Rule 5: no job in one of `folder_ids` whose state is not terminal wants `song` (D16). Jobs
 /// in `exempt` do not count. A state JobState::parse does not know, or a `wanted` that does
 /// not parse, counts as wanting it.
-pub(super) async fn not_in_use_in(
+pub(crate) async fn not_in_use_in(
     db: &SqlitePool,
     folder_ids: &[&str],
     song: &NativeSong,

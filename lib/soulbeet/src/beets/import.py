@@ -81,11 +81,11 @@ from beets.plugins import BeetsPlugin
 from beets.ui.commands import import_ as import_cmd
 from mediafile import MP4TupleStorageStyle
 
-DUPLICATES = ("as-configured", "report-removals", "skip", "replace")
+DUPLICATES = ("as-configured", "report-removals", "skip", "replace", "keep-no-remove")
 
 USAGE = (
     f"usage: import.py REPORT ({' | '.join(DUPLICATES)})"
-    " (auto | asis | pick SOURCE ID) -- BEET_ARGS"
+    " (auto | asis | register | pick SOURCE ID) -- BEET_ARGS"
 )
 
 report = {
@@ -154,6 +154,7 @@ KEEPS_LIBRARY = {
     "report-removals": "reports removals",
     "skip": "skips duplicates",
     "replace": "reports removals",
+    "keep-no-remove": "keeps existing files without removing duplicates",
 }
 
 
@@ -315,6 +316,8 @@ class Reporting(Session):
         if self.duplicates == "skip":
             # beets reads it for each task (importer/stages.py _resolve_duplicates).
             config["import"]["duplicate_action"] = "skip"
+        elif self.duplicates == "keep-no-remove":
+            config["import"]["duplicate_action"] = "keep"
         elif self.duplicates == "replace":
             config["import"]["duplicate_action"] = "keep"
             self.kept_for_removal = True
@@ -515,6 +518,13 @@ class AsIsSession(Reporting):
         super().run()
 
 
+class RegisterSession(Reporting):
+    """Registers files already in a library folder into its beets DB without
+    moving, copying, writing tags, or refusing files with partial tags."""
+
+    pass
+
+
 def parse(argv):
     """(report path, session class, beet args) from the command line."""
     if "--" not in argv[2:]:
@@ -529,6 +539,8 @@ def parse(argv):
         return report_path, AutoSession, beet_args
     if choice == ["asis"]:
         return report_path, AsIsSession, [*beet_args, "-A"]
+    if choice == ["register"]:
+        return report_path, RegisterSession, [*beet_args, "-A", "-C", "-M", "-W"]
     if len(choice) == 3 and choice[0] == "pick":
         PickSession.source, PickSession.wanted = choice[1], choice[2]
         return report_path, PickSession, [*beet_args, "-S", choice[2]]

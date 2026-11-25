@@ -151,10 +151,30 @@ pub async fn get(
     ctx: &UserCtx,
     id: &str,
 ) -> Result<(PlaylistFacts, Vec<PlaylistEntry>), Failure> {
+    get_with_folders(navi, ctx, id, None).await
+}
+
+/// Like `get`, enriching each entry's `SongFacts.folder` using `folders` when provided.
+pub(crate) async fn get_with_folders(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    folders: Option<&crate::core::library::FolderResolver>,
+) -> Result<(PlaylistFacts, Vec<PlaylistEntry>), Failure> {
     let (playlist, tracks) = read(navi, ctx, id).await?;
     Ok((
         facts(&playlist, &ctx.username),
-        tracks.iter().map(entry).collect(),
+        tracks
+            .iter()
+            .map(|t| PlaylistEntry {
+                position: position_of(t),
+                missing: t.song.missing,
+                song: match folders {
+                    Some(resolver) => resolver.facts(&t.song),
+                    None => SongFacts::from(&t.song),
+                },
+            })
+            .collect(),
     ))
 }
 
@@ -180,15 +200,6 @@ async fn read(
         .map_err(failure)?
         .ok_or_else(|| playlist_not_found(id))?;
     Ok((playlist, tracks))
-}
-
-/// A native track row as an entry.
-fn entry(track: &PlaylistTrack) -> PlaylistEntry {
-    PlaylistEntry {
-        position: position_of(track),
-        missing: track.song.missing,
-        song: SongFacts::from(&track.song),
-    }
 }
 
 /// A native track row's 0-based position: its 1-based place less one.

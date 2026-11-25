@@ -22,14 +22,14 @@ use super::sync::cut;
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
-use crate::core::delete_guard::quota::permission_not_granted;
+use crate::core::delete_guard::quota::permission_not_granted_at;
 use crate::core::delete_guard::Guard;
 use crate::core::deletion::tokens::{DeleteTokenRefusal, TokenRefusalKind};
 use crate::core::deletion::{
     self, App, ConfirmOutcome, Confirmed, Preview, PreviewEntry, PreviewOutcome, SONGS_PER_TOKEN,
     TOKEN_SECS,
 };
-use crate::core::library::{self, SongFacts, SongGroup};
+use crate::core::library::{self, FolderResolver, SongFacts, SongGroup};
 use crate::core::time;
 use crate::models::deletion_review::DeletionReviewRow;
 use crate::oauth::now_unix;
@@ -50,7 +50,7 @@ pub(crate) const FIND_DUPLICATES: ToolSpec = ToolSpec {
     title: "Duplicate songs",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Finds songs the user's Navidrome library holds more than once: groups of present songs with the same artist and title (compared without case, accents or punctuation), each song with its id, album, format, bitrate, size, duration, path, recording MBID and this user's rating, and per group same_recording: true when every song has the same recording MBID, false when they have different ones, null when one has none. A group lists at most {SONGS_PER_TOKEN} songs and songs_omitted counts the rest. Reads the whole library, so it can take seconds to a minute on a large one; it fails when Navidrome's pages held fewer songs than it counts, and a song removed while it reads can let another pass unseen, so search again after deleting. The song ids work in preview_delete_tracks. Failure codes: {common}, {NAVIDROME_CODES}.")
+        format!("Finds songs the user's Navidrome library holds more than once: groups of present songs with the same artist and title (compared without case, accents or punctuation), each song with its id, album, format, bitrate, size, duration, path, Soulbeet folder when known, recording MBID and this user's rating, and per group same_recording: true when every song has the same recording MBID, false when they have different ones, null when one has none. A group lists at most {SONGS_PER_TOKEN} songs and songs_omitted counts the rest. Reads the whole library, so it can take seconds to a minute on a large one; it fails when Navidrome's pages held fewer songs than it counts, and a song removed while it reads can let another pass unseen, so search again after deleting. The song ids work in preview_delete_tracks and move_tracks. Failure codes: {common}, {NAVIDROME_CODES}.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "properties": {"#,
@@ -70,7 +70,7 @@ pub(crate) const PREVIEW_DELETE_TRACKS: ToolSpec = ToolSpec {
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
         let minutes = TOKEN_SECS / 60;
-        format!("Checks up to {SONGS_PER_TOKEN} songs (Navidrome song ids from find_in_library, search_library, get_playlist or find_duplicates) for deletion from this user's library and says for each whether it may be deleted and, if not, why: not in one of this user's folders, not an audio file, wanted by a download or import that is not finished, rated, starred or kept in a playlist by another listener, another listener's ratings unreadable, or the file not where Navidrome says. reason is disliked (discovery stops suggesting the track), replaced or cleanup. Returns each song's title, artist, album, file, size, format, this user's rating and playlists, and a confirmation_token for exactly the songs that may be deleted, valid {minutes} minutes and once. Nothing is deleted by this call. Deletion is permanent: show the user this preview, the songs and files, and ask for an explicit yes before calling delete_tracks with the token; the delete_tracks entry in next says requires_user_confirmation. A pending discovery track is not deleted here; remove_discovery_track removes it. Needs deletion switched on for this app in Soulbeet (Settings > Users > Connected apps). At most {DAILY_APP_DELETIONS} tracks a day per user through connected apps. Failure codes: {common}, {NAVIDROME_CODES}, permission_not_granted, delete_daily_limit, partial, and per song unknown_handle, delete_path_unresolved, delete_outside_library, delete_not_a_track, delete_in_use, delete_blocked_by_other_user, delete_veto_unknown.")
+        format!("Checks up to {SONGS_PER_TOKEN} songs (Navidrome song ids from find_in_library, search_library, get_playlist or find_duplicates) for deletion from this user's library and says for each whether it may be deleted and, if not, why: not in one of this user's folders, not an audio file, wanted by a download or import that is not finished, rated, starred or kept in a playlist by another listener, another listener's ratings unreadable, or the file not where Navidrome says. reason is disliked (discovery stops suggesting the track), replaced or cleanup. Returns each song's title, artist, album, file, size, format, this user's rating and playlists, and a confirmation_token for exactly the songs that may be deleted, valid {minutes} minutes and once. Nothing is deleted by this call. Deletion is permanent: show the user this preview, the songs and files, and ask for an explicit yes before calling delete_tracks with the token; the delete_tracks entry in next says requires_user_confirmation. A pending discovery track is not deleted here; remove_discovery_track removes it. Needs 'Allow managing library files (delete, move, re-tag)' switched on for this app in Soulbeet (Settings > Users > Connected apps). At most {DAILY_APP_DELETIONS} tracks a day per user through connected apps. Failure codes: {common}, {NAVIDROME_CODES}, permission_not_granted, delete_daily_limit, partial, and per song unknown_handle, delete_path_unresolved, delete_outside_library, delete_not_a_track, delete_in_use, delete_blocked_by_other_user, delete_veto_unknown.")
     },
     input_schema: r#"{"type": "object", "additionalProperties": false, "required": ["song_ids", "reason"], "properties": {"song_ids": {"type": "array", "minItems": 1, "maxItems": 25, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "reason": {"enum": ["disliked", "replaced", "cleanup"]}}}"#,
     read_only: false,
@@ -136,10 +136,15 @@ fn guard_of(state: &ConnectionState) -> Guard<'_> {
     )
 }
 
-/// An app without the deletion switch, refused before any argument value is used.
+/// An app without the file-management switch, refused before any argument value is used.
 pub(crate) fn deletion_off() -> ToolError {
+    deletion_off_at(Stage::Delete)
+}
+
+/// Like `deletion_off`, tagging the refusal with `stage`.
+pub(crate) fn deletion_off_at(stage: Stage) -> ToolError {
     ToolError {
-        failure: permission_not_granted(),
+        failure: permission_not_granted_at(stage),
         facts: Map::new(),
         tried: vec![],
         next: vec![],
@@ -158,7 +163,13 @@ async fn find_duplicates(
             let page = Page::read(&args, json!({}))?;
             args.finish()?;
             let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
-            let groups = library::duplicates(&navi)
+            let resolver = FolderResolver::load_in(
+                &state.db,
+                &caller.ctx.user_id,
+                state.navidrome_music_path.as_deref(),
+            )
+            .await;
+            let groups = library::duplicates_with_folders(&navi, Some(&resolver))
                 .await
                 .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
             // One more than the page holds tells fit whether more follow.
@@ -621,7 +632,7 @@ mod tests {
     use crate::connection::test_util::{
         access_token, app_on_library, call_tool, document, mcp_app, mcp_app_with, RESOURCE,
     };
-    use crate::core::delete_guard::quota::{daily_limit, enable_deletion};
+    use crate::core::delete_guard::quota::{daily_limit, enable_deletion, permission_not_granted};
     use crate::core::delete_guard::test_support::Library;
     use crate::core::deletion::tokens::{token_expired, token_not_found, token_used};
     use crate::core::deletion::ConfirmEntry;
@@ -656,7 +667,7 @@ mod tests {
                 (error["code"].as_str(), error["message"].as_str()),
                 (
                     Some("permission_not_granted"),
-                    Some("Deleting music is turned off for this app")
+                    Some("Managing library files (delete, move, re-tag) is turned off for this app")
                 ),
                 "{tool}"
             );

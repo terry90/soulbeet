@@ -3,7 +3,7 @@
 use super::classify::LOCKED;
 use super::runner::{run_beet, RunEnd, RunLimits, RunSpec, Stream};
 use super::{BeetsSettings, NO_PYTHON};
-use crate::traits::{ForgetOutcome, PruneOutcome, Relocation};
+use crate::traits::{BeetsTrackInfo, ForgetOutcome, PruneOutcome, Relocation, TagEdits};
 use serde::Deserialize;
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
 use std::ffi::OsString;
@@ -137,8 +137,231 @@ async fn remove_present(path: &Path) -> std::io::Result<()> {
 }
 
 /// Whether the music folder `root` has a library db.
-async fn has_library(s: &BeetsSettings, root: &Path) -> Result<bool, String> {
+pub(crate) async fn has_library(s: &BeetsSettings, root: &Path) -> Result<bool, String> {
     exists(&library_db(s, root).await?).await
+}
+
+/// Looks up item ids at `file` inside `root`'s library; empty when none or no library exists.
+pub(crate) async fn item_ids_at(
+    s: &BeetsSettings,
+    root: &Path,
+    file: &Path,
+) -> Result<Vec<u64>, String> {
+    if !has_library(s, root).await? {
+        return Ok(vec![]);
+    }
+    let mut query = OsString::from("path:");
+    query.push(file);
+    let ls = vec!["ls".into(), "-f".into(), ID_FORMAT.into(), query];
+    let rows = run_library(s, root, Program::Beet(None), ls)
+        .await
+        .map_err(String::from)?;
+    rows.into_iter()
+        .map(|row| {
+            row.parse::<u64>()
+                .map_err(|_| format!("beet ls gave an item id that is not a number: {row}"))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct ExportedTrack {
+    id: String,
+    path: PathBuf,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    album: String,
+    #[serde(default)]
+    albumartist: String,
+    #[serde(default)]
+    year: String,
+    #[serde(default)]
+    track: String,
+    #[serde(default)]
+    disc: String,
+    #[serde(default)]
+    genre: String,
+    #[serde(default)]
+    comments: String,
+    #[serde(default)]
+    mb_trackid: String,
+    #[serde(default)]
+    mb_albumid: String,
+}
+
+fn opt_u32(text: &str) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|n| *n > 0)
+}
+
+fn opt_str(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Reads beets' stored metadata for the item at `file` inside `root`, or `Ok(None)` when absent.
+pub(crate) async fn inspect_file(
+    s: &BeetsSettings,
+    root: &Path,
+    file: &Path,
+) -> Result<Option<BeetsTrackInfo>, String> {
+    if !has_library(s, root).await? {
+        return Ok(None);
+    }
+    let mut query = OsString::from("path:");
+    query.push(file);
+    let command: Vec<OsString> = vec![
+        "export".into(),
+        "-l".into(),
+        "-f".into(),
+        "jsonlines".into(),
+        "-i".into(),
+        "id,path,title,artist,album,albumartist,year,track,disc,genre,comments,mb_trackid,mb_albumid".into(),
+        query,
+    ];
+    let rows = run_library(s, root, Program::Beet(Some("export")), command)
+        .await
+        .map_err(String::from)?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let item: ExportedTrack = serde_json::from_str(row)
+        .map_err(|e| format!("beet export gave unreadable track JSON ({e}): {row}"))?;
+    let beets_id = item
+        .id
+        .parse::<u64>()
+        .map_err(|_| format!("beet export gave an item id that is not a number: {row}"))?;
+    Ok(Some(BeetsTrackInfo {
+        beets_id,
+        path: item.path,
+        title: item.title,
+        artist: item.artist,
+        album: item.album,
+        album_artist: item.albumartist,
+        year: opt_u32(&item.year),
+        track: opt_u32(&item.track),
+        disc: opt_u32(&item.disc),
+        genre: item.genre,
+        comments: item.comments,
+        recording_mbid: opt_str(item.mb_trackid),
+        release_mbid: opt_str(item.mb_albumid),
+    }))
+}
+
+/// Applies direct tag modifications to `file` inside `root` using `beet modify -y -M -w`,
+/// keeping the file at its exact path on disk.
+pub(crate) async fn modify_tags_by_id(
+    s: &BeetsSettings,
+    root: &Path,
+    id: u64,
+    file: &Path,
+    edits: &TagEdits,
+) -> Result<BeetsTrackInfo, Failure> {
+    let mut command: Vec<OsString> = vec![
+        "modify".into(),
+        "-y".into(),
+        "-M".into(),
+        "-w".into(),
+        format!("id:{id}").into(),
+    ];
+    if let Some(v) = &edits.title {
+        command.push(format!("title={v}").into());
+    }
+    if let Some(v) = &edits.artist {
+        command.push(format!("artist={v}").into());
+    }
+    if let Some(v) = &edits.album {
+        command.push(format!("album={v}").into());
+    }
+    if let Some(v) = &edits.album_artist {
+        command.push(format!("albumartist={v}").into());
+    }
+    if let Some(v) = edits.year {
+        command.push(format!("year={v}").into());
+    }
+    if let Some(v) = edits.track {
+        command.push(format!("track={v}").into());
+    }
+    if let Some(v) = edits.disc {
+        command.push(format!("disc={v}").into());
+    }
+    if let Some(v) = &edits.genre {
+        command.push(format!("genre={v}").into());
+    }
+    if let Some(v) = &edits.comment {
+        command.push(format!("comments={v}").into());
+    }
+    run_library(s, root, Program::Beet(None), command)
+        .await
+        .map_err(|e| {
+            let mut f = Failure::new(
+                FailureCode::RetagFailed,
+                Stage::Retag,
+                RetryAdvice::SameSourceLater,
+                format!("Could not modify tags: {}", e.text),
+            );
+            f.cause = e.cause();
+            f
+        })?;
+    inspect_file(s, root, file)
+        .await
+        .map_err(|e| {
+            Failure::new(
+                FailureCode::RetagFailed,
+                Stage::Retag,
+                RetryAdvice::SameSourceLater,
+                format!("Tags were written, but Soulbeet could not read the updated beets item: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            Failure::new(
+                FailureCode::RetagFailed,
+                Stage::Retag,
+                RetryAdvice::SameSourceLater,
+                "Tags were written, but the track was not found in the beets library afterwards",
+            )
+        })
+}
+
+/// Relocates the single item at `file` inside `root` according to beets' path template.
+pub(crate) async fn relocate_file(s: &BeetsSettings, root: &Path, file: &Path) -> Relocation {
+    let ids = match item_ids_at(s, root, file).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            return Relocation {
+                now: vec![],
+                failure: move_failure(vec![Problem {
+                    retry: RetryAdvice::SameSourceLater,
+                    message: format!("Could not find the track in beets before relocating: {e}"),
+                    cause: None,
+                }]),
+            };
+        }
+    };
+    match ids.as_slice() {
+        [id] => move_items(s, root, &[*id]).await,
+        [] => Relocation {
+            now: vec![],
+            failure: move_failure(vec![Problem {
+                retry: RetryAdvice::NotRetryable,
+                message: "Could not relocate the track: it is not in the folder's beets library".into(),
+                cause: None,
+            }]),
+        },
+        several => Relocation {
+            now: vec![],
+            failure: move_failure(vec![Problem {
+                retry: RetryAdvice::NotRetryable,
+                message: format!(
+                    "Could not relocate the track: {} beets items match its path",
+                    several.len()
+                ),
+                cause: None,
+            }]),
+        },
+    }
 }
 
 /// Drops the item at exactly `file` from the library under `root`, leaving

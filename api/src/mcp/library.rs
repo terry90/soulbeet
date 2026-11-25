@@ -17,7 +17,7 @@ use super::paging::{fit, Listing, Page, RESULT_MAX_CHARS};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::index::navidrome_keeps;
-use crate::core::library::{self, navidrome_for, Found, Reference, LOOKUPS_AT_ONCE};
+use crate::core::library::{self, navidrome_for, FolderResolver, Found, Reference, LOOKUPS_AT_ONCE};
 
 /// The caller's Navidrome client, or why there is none. The same call is
 /// offered again when the lookup can answer later, as its database branch
@@ -107,6 +107,12 @@ async fn find_items(
 ) -> Result<CallToolResult, ToolError> {
     let (elements, refs, listing, start) = read_references(args)?;
     let navi = navidrome_of(state, caller, Stage::LibraryCheck, args).await?;
+    let resolver = FolderResolver::load_in(
+        &state.db,
+        &caller.ctx.user_id,
+        state.navidrome_music_path.as_deref(),
+    )
+    .await;
     let mut it = Items {
         stage: Stage::LibraryCheck,
         noun: "references",
@@ -119,7 +125,7 @@ async fn find_items(
     // By index: a closure taking each `&Reference` from the stream must
     // hold for any lifetime, which the boxed handler cannot show.
     let mut lookups = futures::stream::iter(start..refs.len())
-        .map(|i| library::find(&navi, &refs[i]))
+        .map(|i| library::find_with_folders(&navi, &refs[i], Some(&resolver)))
         .buffered(LOOKUPS_AT_ONCE);
     while let Some(found) = lookups.next().await {
         let i = start + it.results.len();
@@ -618,6 +624,60 @@ mod tests {
                         "match": {"kind": "exact", "score": null, "differs": [], "duration_delta_s": 0,
                             "unchecked": []}}]}],
                 "cursor": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn find_in_library_includes_soulbeet_folder_when_resolved() {
+        let lib = crate::core::delete_guard::test_support::Library::new().await;
+        let music_root = lib.root.join("music").to_string_lossy().into_owned();
+        let navi = NavidromeStub::start();
+        let song = serde_json::json!({
+            "id": "e1",
+            "path": "alice/A/x.flac",
+            "title": "O Holy Night",
+            "artist": "Marrow Choir",
+            "album": "Winter Songs",
+            "albumArtist": "Marrow Choir",
+            "albumId": "al1",
+            "size": 5,
+            "libraryId": 1,
+            "libraryPath": music_root,
+            "missing": false,
+            "updatedAt": "2026-11-15T10:00:00Z",
+            "suffix": "flac",
+            "bitRate": 912,
+            "trackNumber": 3,
+            "year": 2019,
+            "duration": 263.4,
+            "rating": 4,
+            "starred": true,
+            "playCount": 3
+        });
+        navi.answer("/api/song", &[&format!("[{song}]")]);
+        let state = crate::connection::ConnectionState {
+            navidrome: Arc::new(NavidromeFor(Ok(navi.client()))),
+            ..crate::connection::ConnectionState::for_test(lib.db.clone())
+        };
+        let token = crate::connection::test_util::access_token(
+            &lib.db,
+            "alice",
+            crate::connection::test_util::RESOURCE,
+        )
+        .await;
+        let app = crate::connection::router(state);
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "find_in_library",
+                json!({"references": [{"artist": "Marrow Choir", "title": "O Holy Night"}]}),
+            )
+            .await,
+        );
+        assert_eq!(
+            doc["results"][0]["matches"][0]["folder"],
+            json!({"folder_id": "alice-music", "name": "alice-music", "shared": false})
         );
     }
 

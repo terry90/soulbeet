@@ -90,12 +90,12 @@ fn needs_confirmation(was_allowed: bool) -> bool {
     !was_allowed
 }
 
-/// What turning deletion on for `app_host` lets it do, asked before it is turned on: everything
-/// the switch opens, including the two deletions that need no preview, and the limit shared by
-/// every app of the user.
+/// What turning file management on for `app_host` lets it do, asked before it is turned on:
+/// everything the switch opens, including moving and re-tagging tracks, the two deletions that
+/// need no preview, and the daily deletion limit shared by every app of the user.
 fn enable_deletion_message(app_host: &str) -> String {
     format!(
-        "Let {app_host} delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most {DAILY_APP_DELETIONS} tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
+        "Let {app_host} manage library files (delete, move between folders, and re-tag)? Before deleting, moving or re-tagging tracks it has to ask you first. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. Deletions are limited to at most {DAILY_APP_DELETIONS} tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
     )
 }
 
@@ -167,7 +167,7 @@ fn AppList(
                                                 }
                                             },
                                         }
-                                        "Allow deleting music"
+                                        "Allow managing library files (delete, move, re-tag)"
                                     }
                                 }
                             }
@@ -190,7 +190,7 @@ fn AppList(
         if let Some(asked) = pending_enable() {
             ConfirmModal {
                 message: enable_deletion_message(&asked.app_host),
-                confirm_label: "Allow deleting",
+                confirm_label: "Allow managing files",
                 danger: true,
                 on_confirm: move |_| {
                     pending_enable.set(None);
@@ -268,7 +268,7 @@ mod tests {
     fn turning_deletion_on_asks_with_the_apps_name() {
         assert_eq!(
             enable_deletion_message("claude.ai"),
-            "Let claude.ai delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
+            "Let claude.ai manage library files (delete, move between folders, and re-tag)? Before deleting, moving or re-tagging tracks it has to ask you first. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. Deletions are limited to at most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored."
         );
     }
 
@@ -285,7 +285,7 @@ mod tests {
             "claude.ai",
             "It calls itself &#34;Claude&#34;.",
             "Last used 2027-01-15",
-            "Allow deleting music",
+            "Allow managing library files (delete, move, re-tag)",
             "checked",
             "Disconnect",
         ] {
@@ -311,7 +311,7 @@ mod tests {
         assert!(
             html.contains("(bob)") && html.contains("Never used") && html.contains("Disconnect")
         );
-        assert!(!html.contains("Allow deleting music"));
+        assert!(!html.contains("Allow managing library files (delete, move, re-tag)"));
     }
 
     #[test]

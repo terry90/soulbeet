@@ -23,6 +23,7 @@ pub(crate) mod scan;
 pub mod settings;
 pub mod sources;
 pub(crate) mod time;
+pub mod tracks;
 
 /// Soulful's own database failed.
 pub(crate) fn database_failure(stage: Stage, e: impl std::fmt::Display) -> Failure {

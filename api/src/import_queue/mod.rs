@@ -28,8 +28,9 @@ use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, 
 use shared::failure::Failure;
 use soulbeet::audio::{count_audio_files, is_audio_path};
 use soulbeet::{
-    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter, PruneOutcome, SkipReason, SourceFile, TaskCount,
+    BeetsTrackInfo, DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome,
+    ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile,
+    TagEdits, TaskCount,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -320,6 +321,35 @@ enum Work {
         file: PathBuf,
         done: oneshot::Sender<ForgetOutcome>,
     },
+    /// Registers an existing `file` inside the target's library without writing or moving it.
+    RegisterInPlace {
+        file: PathBuf,
+        done: oneshot::Sender<RegisterOutcome>,
+    },
+    /// Reads beets metadata for `file` inside the target's library.
+    InspectFile {
+        file: PathBuf,
+        done: oneshot::Sender<Result<Option<BeetsTrackInfo>, String>>,
+    },
+    /// Applies direct tag edits to `file` inside the target's library (`--nomove --write`).
+    ModifyTags {
+        file: PathBuf,
+        edits: TagEdits,
+        done: oneshot::Sender<Result<BeetsTrackInfo, Failure>>,
+    },
+    /// Re-matches `sources` in place (`--nocopy --nomove`) inside the target's library.
+    RematchInPlace {
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+        choice: DriverChoice,
+        pretend: bool,
+        done: oneshot::Sender<ImportResult>,
+    },
+    /// Relocates `file` inside the target's library according to beets' path template.
+    RelocateFile {
+        file: PathBuf,
+        done: oneshot::Sender<Relocation>,
+    },
     /// Drops the items whose file is gone from the target's library.
     Prune {
         done: oneshot::Sender<PruneOutcome>,
@@ -331,7 +361,13 @@ impl Work {
     fn owner(&self) -> Option<&JobOwner> {
         match self {
             Work::Import(waiting) => waiting.job.owner.as_ref(),
-            Work::Forget { .. } | Work::Prune { .. } => None,
+            Work::Forget { .. }
+            | Work::RegisterInPlace { .. }
+            | Work::InspectFile { .. }
+            | Work::ModifyTags { .. }
+            | Work::RematchInPlace { .. }
+            | Work::RelocateFile { .. }
+            | Work::Prune { .. } => None,
         }
     }
 }
@@ -458,6 +494,144 @@ impl ImportQueue {
             .unwrap_or_else(|_| PruneOutcome::Failed(WORKER_STOPPED.into()))
     }
 
+    /// Registers an existing `file` inside `library`'s beets database without copying, moving,
+    /// writing tags, or removing duplicates.
+    pub async fn register_in_place(&self, library: &Path, file: &Path) -> RegisterOutcome {
+        let key = match existing_key(library).await {
+            Ok(key) => key,
+            Err(e) => return RegisterOutcome::Failed(e),
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::RegisterInPlace {
+                file: file.to_path_buf(),
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| RegisterOutcome::Failed(WORKER_STOPPED.into()))
+    }
+
+    /// Reads beets' stored metadata for `file` inside `library`.
+    pub async fn inspect_file(
+        &self,
+        library: &Path,
+        file: &Path,
+    ) -> Result<Option<BeetsTrackInfo>, String> {
+        let key = existing_key(library).await?;
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::InspectFile {
+                file: file.to_path_buf(),
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| Err(WORKER_STOPPED.into()))
+    }
+
+    /// Applies direct tag modifications to `file` inside `library` in place (`--nomove --write`).
+    pub async fn modify_tags(
+        &self,
+        library: &Path,
+        file: &Path,
+        edits: TagEdits,
+    ) -> Result<BeetsTrackInfo, Failure> {
+        let key = existing_key(library).await.map_err(|e| {
+            Failure::new(
+                shared::failure::FailureCode::RetagFailed,
+                shared::failure::Stage::Retag,
+                shared::failure::RetryAdvice::NotRetryable,
+                e,
+            )
+        })?;
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::ModifyTags {
+                file: file.to_path_buf(),
+                edits,
+                done,
+            },
+        );
+        outcome.await.unwrap_or_else(|_| {
+            Err(Failure::new(
+                shared::failure::FailureCode::RetagFailed,
+                shared::failure::Stage::Retag,
+                shared::failure::RetryAdvice::SameSourceLater,
+                WORKER_STOPPED,
+            ))
+        })
+    }
+
+    /// Re-matches `sources` in place inside `library` (`--nocopy --nomove`), optionally pretending.
+    pub async fn rematch_in_place(
+        &self,
+        library: &Path,
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+        choice: DriverChoice,
+        pretend: bool,
+    ) -> ImportResult {
+        let key = match existing_key(library).await {
+            Ok(key) => key,
+            Err(e) => return ImportResult::failed(FailKind::TargetUnwritable, e),
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::RematchInPlace {
+                sources,
+                mode,
+                choice,
+                pretend,
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+    }
+
+    /// Relocates `file` inside `library` according to beets' path template (`beet move`).
+    pub async fn relocate_file(&self, library: &Path, file: &Path) -> Relocation {
+        let key = match existing_key(library).await {
+            Ok(key) => key,
+            Err(e) => {
+                return Relocation {
+                    now: vec![],
+                    failure: Some(Failure::new(
+                        shared::failure::FailureCode::ImportBeetsFailed,
+                        shared::failure::Stage::Retag,
+                        shared::failure::RetryAdvice::NotRetryable,
+                        e,
+                    )),
+                }
+            }
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::RelocateFile {
+                file: file.to_path_buf(),
+                done,
+            },
+        );
+        outcome.await.unwrap_or_else(|_| Relocation {
+            now: vec![],
+            failure: Some(Failure::new(
+                shared::failure::FailureCode::ImportBeetsFailed,
+                shared::failure::Stage::Retag,
+                shared::failure::RetryAdvice::SameSourceLater,
+                WORKER_STOPPED,
+            )),
+        })
+    }
+
     /// Queues `item` on `key`, starting the target's worker if none runs. An
     /// import's state is set to its position.
     fn enqueue(&self, key: PathBuf, item: Work) {
@@ -561,6 +735,85 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                     });
                 let _ = done.send(outcome);
             }
+            Work::RegisterInPlace { file, done } => {
+                let outcome = AssertUnwindSafe(shared.register_in_place(&key, &file))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Registering {} in {} panicked",
+                            file.display(),
+                            key.display()
+                        );
+                        RegisterOutcome::Failed(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
+            Work::InspectFile { file, done } => {
+                let outcome = AssertUnwindSafe(shared.inspect_file(&key, &file))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Inspecting {} in {} panicked", file.display(), key.display());
+                        Err(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
+            Work::ModifyTags { file, edits, done } => {
+                let outcome = AssertUnwindSafe(shared.modify_tags(&key, &file, &edits))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "Modifying tags of {} in {} panicked",
+                            file.display(),
+                            key.display()
+                        );
+                        Err(Failure::new(
+                            shared::failure::FailureCode::RetagFailed,
+                            shared::failure::Stage::Retag,
+                            shared::failure::RetryAdvice::SameSourceLater,
+                            WORKER_STOPPED,
+                        ))
+                    });
+                let _ = done.send(outcome);
+            }
+            Work::RematchInPlace {
+                sources,
+                mode,
+                choice,
+                pretend,
+                done,
+            } => {
+                let outcome = AssertUnwindSafe(
+                    shared.rematch_in_place(&key, &sources, mode, &choice, pretend),
+                )
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    warn!("Re-matching in {} panicked", key.display());
+                    ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
+                });
+                let _ = done.send(outcome);
+            }
+            Work::RelocateFile { file, done } => {
+                let outcome = AssertUnwindSafe(shared.relocate_file(&key, &file))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Relocating {} in {} panicked", file.display(), key.display());
+                        Relocation {
+                            now: vec![],
+                            failure: Some(Failure::new(
+                                shared::failure::FailureCode::ImportBeetsFailed,
+                                shared::failure::Stage::Retag,
+                                shared::failure::RetryAdvice::SameSourceLater,
+                                WORKER_STOPPED,
+                            )),
+                        }
+                    });
+                let _ = done.send(outcome);
+            }
             Work::Prune { done } => {
                 let outcome = AssertUnwindSafe(shared.prune(&key))
                     .catch_unwind()
@@ -618,6 +871,75 @@ impl Shared {
         match self.deps.importer().await {
             Ok(importer) => importer.forget(library, file).await,
             Err(e) => ForgetOutcome::Failed(e),
+        }
+    }
+
+    async fn register_in_place(&self, library: &Path, file: &Path) -> RegisterOutcome {
+        match self.deps.importer().await {
+            Ok(importer) => importer.register_in_place(library, file).await,
+            Err(e) => RegisterOutcome::Failed(e),
+        }
+    }
+
+    async fn inspect_file(
+        &self,
+        library: &Path,
+        file: &Path,
+    ) -> Result<Option<BeetsTrackInfo>, String> {
+        match self.deps.importer().await {
+            Ok(importer) => importer.inspect_file(library, file).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn modify_tags(
+        &self,
+        library: &Path,
+        file: &Path,
+        edits: &TagEdits,
+    ) -> Result<BeetsTrackInfo, Failure> {
+        match self.deps.importer().await {
+            Ok(importer) => importer.modify_tags(library, file, edits).await,
+            Err(e) => Err(Failure::new(
+                shared::failure::FailureCode::RetagFailed,
+                shared::failure::Stage::Retag,
+                shared::failure::RetryAdvice::SameSourceLater,
+                e,
+            )),
+        }
+    }
+
+    async fn rematch_in_place(
+        &self,
+        library: &Path,
+        sources: &[PathBuf],
+        mode: ImportMode,
+        choice: &DriverChoice,
+        pretend: bool,
+    ) -> ImportResult {
+        match self.deps.importer().await {
+            Ok(importer) => {
+                let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+                importer
+                    .rematch_in_place(&refs, library, mode, choice, pretend)
+                    .await
+            }
+            Err(e) => ImportResult::failed(FailKind::Setup, e),
+        }
+    }
+
+    async fn relocate_file(&self, library: &Path, file: &Path) -> Relocation {
+        match self.deps.importer().await {
+            Ok(importer) => importer.relocate_file(library, file).await,
+            Err(e) => Relocation {
+                now: vec![],
+                failure: Some(Failure::new(
+                    shared::failure::FailureCode::ImportBeetsFailed,
+                    shared::failure::Stage::Retag,
+                    shared::failure::RetryAdvice::SameSourceLater,
+                    e,
+                )),
+            },
         }
     }
 

@@ -51,7 +51,7 @@ pub(super) async fn local_file_in(
 /// resolve may hold for the song (learn_from_folders) and looks again. With no proof the first
 /// answer stands, with a candidate that could not be read as its cause when one was skipped.
 /// A root that is here keeps the first answer: the file is gone, not the library.
-pub(super) async fn local_file_learning(
+pub(crate) async fn local_file_learning(
     db: &SqlitePool,
     song: &NativeSong,
     music_path: Option<&Path>,
@@ -290,7 +290,7 @@ async fn rootless(
 }
 
 /// `song`'s library root on this machine, as local_file_in finds it.
-async fn root_in(
+pub(crate) async fn root_in(
     db: &SqlitePool,
     song: &NativeSong,
     music_path: Option<&Path>,

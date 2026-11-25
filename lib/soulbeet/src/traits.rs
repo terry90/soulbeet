@@ -460,6 +460,61 @@ pub enum PruneOutcome {
     Failed(String),
 }
 
+/// What became of a request to register an existing file in a folder's beets library
+/// without moving, copying, writing tags, or deleting any file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    Registered,
+    AlreadyInLibrary,
+    Failed(String),
+}
+
+/// Metadata beets stores for a single tracked library file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeetsTrackInfo {
+    pub beets_id: u64,
+    pub path: PathBuf,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub album_artist: String,
+    pub year: Option<u32>,
+    pub track: Option<u32>,
+    pub disc: Option<u32>,
+    pub genre: String,
+    pub comments: String,
+    pub recording_mbid: Option<String>,
+    pub release_mbid: Option<String>,
+}
+
+/// Direct tag modifications to apply to an audio file via `beet modify -y -M -w`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagEdits {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub year: Option<u32>,
+    pub track: Option<u32>,
+    pub disc: Option<u32>,
+    pub genre: Option<String>,
+    pub comment: Option<String>,
+}
+
+impl TagEdits {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.artist.is_none()
+            && self.album.is_none()
+            && self.album_artist.is_none()
+            && self.year.is_none()
+            && self.track.is_none()
+            && self.disc.is_none()
+            && self.genre.is_none()
+            && self.comment.is_none()
+    }
+}
+
 #[async_trait]
 pub trait MusicImporter: Send + Sync {
     async fn import(
@@ -475,6 +530,10 @@ pub trait MusicImporter: Send + Sync {
     /// gives them, then reads where each item's file is, also when the move failed.
     async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation;
 
+    /// Moves the item at `file` of the library of `library` to the path beets' path template
+    /// gives it (`beet move`), then reads its new path.
+    async fn relocate_file(&self, library: &Path, file: &Path) -> Relocation;
+
     /// The result of a job not run because of `issue`, the title of one of
     /// this importer's blocking health issues.
     fn refused(&self, issue: String) -> ImportResult;
@@ -482,6 +541,38 @@ pub trait MusicImporter: Send + Sync {
     /// Removes the item at exactly `file` from the library of `library`,
     /// leaving the file alone.
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome;
+
+    /// Registers an existing `file` inside `library`'s beets database without copying,
+    /// moving, writing tags, or removing duplicates.
+    async fn register_in_place(&self, library: &Path, file: &Path) -> RegisterOutcome;
+
+    /// Reads beets' stored metadata for the item at `file` inside `library`, or `Ok(None)`
+    /// when not tracked in that library.
+    async fn inspect_file(
+        &self,
+        library: &Path,
+        file: &Path,
+    ) -> std::result::Result<Option<BeetsTrackInfo>, String>;
+
+    /// Applies direct tag edits to `file` inside `library` in place (`--nomove --write`),
+    /// registering the file first if needed.
+    async fn modify_tags(
+        &self,
+        library: &Path,
+        file: &Path,
+        edits: &TagEdits,
+    ) -> std::result::Result<BeetsTrackInfo, Failure>;
+
+    /// Re-matches `sources` in place (`--nocopy --nomove`) inside `library` against metadata
+    /// sources. When `pretend` is true, no tags or database rows are written (`-p -W`).
+    async fn rematch_in_place(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        pretend: bool,
+    ) -> ImportResult;
 
     /// Removes from the library of `library` every item whose file is gone, leaving every file
     /// alone; none while no item of the library has its file there.

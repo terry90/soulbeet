@@ -69,8 +69,8 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
     }
     body.push_str(
         "<p>Once allowed, it can see your library, downloads and settings, search for music, \
-         download into your folders, and manage your playlists and ratings. It cannot delete \
-         music unless you turn that on for it in Settings &gt; Users &gt; Connected apps.</p>\n",
+         download into your folders, and manage your playlists and ratings. It cannot delete, \
+         move or re-tag library files unless you turn that on for it in Settings &gt; Users &gt; Connected apps.</p>\n",
     );
     body.push_str(&format!(
         "<p>When you answer, Soulbeet sends you back to {redirect}.</p>\n"
