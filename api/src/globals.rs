@@ -225,6 +225,9 @@ pub fn start_channel_cleanup_task() {
                 interval.tick().await;
                 cleanup_stale_channels().await;
                 cleanup_stale_progress().await;
+                crate::core::connect::CONNECT_HUB
+                    .prune_stale(CHANNEL_STALE_THRESHOLD_SECS as i64)
+                    .await;
             }
         });
         info!(

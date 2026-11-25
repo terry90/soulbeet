@@ -2,6 +2,8 @@ use dioxus::prelude::*;
 
 pub mod auth;
 pub mod changelog;
+pub mod client;
+pub mod connect;
 pub mod connections;
 pub mod discovery;
 pub mod download;
@@ -16,6 +18,8 @@ pub mod user;
 
 pub use auth::*;
 pub use changelog::*;
+pub use client::*;
+pub use connect::*;
 pub use connections::*;
 pub use discovery::*;
 pub use download::*;

@@ -1,4 +1,5 @@
 pub mod changelog;
+pub mod client;
 pub mod download;
 pub mod failure;
 pub mod metadata;

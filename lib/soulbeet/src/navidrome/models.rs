@@ -558,6 +558,65 @@ pub struct NativeArtist {
     pub mbz_artist_id: Option<String>,
 }
 
+/// OpenSubsonic `getLyricsBySongId` body (`responses.LyricsList`,
+/// `server/subsonic/responses/responses.go:523-540`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricsListBody {
+    pub lyrics_list: Option<LyricsList>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricsList {
+    #[serde(default)]
+    pub structured_lyrics: Vec<StructuredLyrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuredLyrics {
+    #[serde(default)]
+    pub display_artist: Option<String>,
+    #[serde(default)]
+    pub display_title: Option<String>,
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub line: Vec<LyricLine>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub synced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricLine {
+    /// Line start timestamp in milliseconds when `synced` is true.
+    #[serde(default)]
+    pub start: Option<i64>,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// Legacy Subsonic `getLyrics` body (`responses.Lyrics`,
+/// `server/subsonic/responses/responses.go:494-498`).
+#[derive(Debug, Deserialize)]
+pub struct LegacyLyricsBody {
+    pub lyrics: Option<LegacyLyrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LegacyLyrics {
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
