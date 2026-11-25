@@ -172,6 +172,10 @@ mod tests {
             Some("2003 · Album · Live")
         );
         assert_eq!(
+            facts(Some("2011-10-14"), &["Single"]).as_deref(),
+            Some("2011 · Single")
+        );
+        assert_eq!(
             facts(None, &["Album", "Live"]).as_deref(),
             Some("Album · Live")
         );

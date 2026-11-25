@@ -4,11 +4,13 @@ import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import { freshSession } from '../helpers/app.js';
 import {
+  atticSignals,
   collectedDispatches,
   glassAtlas,
   liveAtTheExchange,
   maritime,
   morseBloom,
+  pylonSong,
   semaphoreGardens,
   wirelessOrchards,
 } from '../fixtures/dataset.js';
@@ -31,15 +33,18 @@ async function searchByArtist(page: Page, artist: string, query: string, type: '
 // can queue up behind other workers' searches.
 const RESULT_TIMEOUT = 45_000;
 
-// Orchid Telegraph's albums and EPs as the app lists them: studio albums,
-// then studio EPs, then compilations before live albums, each oldest first.
-// Its single and its bootleg are left out.
+// Orchid Telegraph's releases as the app lists them: studio albums, then
+// studio EPs, then compilations before live albums before demos, then
+// singles, each oldest first. The demo's release has no status; its bootleg
+// is left out.
 const discography = [
   { album: wirelessOrchards, facts: '2014 · Album' },
   { album: semaphoreGardens, facts: '2017 · Album' },
   { album: morseBloom, facts: '2015 · EP' },
   { album: collectedDispatches, facts: '2020 · Album · Compilation' },
   { album: liveAtTheExchange, facts: '2018 · Album · Live' },
+  { album: atticSignals, facts: '2012 · Album · Demo' },
+  { album: pylonSong, facts: '2019 · Single' },
 ];
 
 /** The rows under "Albums by Orchid Telegraph": `discography`, in order. */
@@ -99,7 +104,7 @@ test('shows the empty state when nothing matches', async ({ context, page }) => 
   });
 });
 
-test('lists the albums of an artist given alone, studio albums first, oldest first', async ({
+test('lists the releases of an artist given alone, studio albums first, singles last', async ({
   context,
   page,
 }) => {
@@ -131,16 +136,21 @@ test('says when no artist carries the name', async ({ context, page }) => {
   });
 });
 
-test('expands the tracklist of a listed album', async ({ context, page }) => {
+test('expands the tracklist of a listed album, one whose release has no status too', async ({
+  context,
+  page,
+}) => {
   await freshSession(context, page, 'search-discography-album');
 
   await searchByArtist(page, wirelessOrchards.artist, '', 'ALBUM');
 
-  const albumCard = page.getByText(wirelessOrchards.title).first();
-  await expect(albumCard).toBeVisible({ timeout: RESULT_TIMEOUT });
-  await albumCard.click();
+  for (const album of [wirelessOrchards, atticSignals]) {
+    const albumCard = page.getByText(album.title).first();
+    await expect(albumCard).toBeVisible({ timeout: RESULT_TIMEOUT });
+    await albumCard.click();
 
-  for (const track of wirelessOrchards.tracks) {
-    await expect(page.getByText(track.title).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
+    for (const track of album.tracks) {
+      await expect(page.getByText(track.title).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
+    }
   }
 });

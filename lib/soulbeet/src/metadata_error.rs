@@ -12,7 +12,9 @@ pub enum MetadataError {
         status: Option<u16>,
         raw: String,
     },
-    #[error("{} is rate limiting Soulbeet: {raw}", name(*.service))]
+    /// Shown as the app's own words: `raw` holds what the provider or its
+    /// client said, which reads as a fault of Soulbeet's setup.
+    #[error("{} is busy. Try again shortly.", name(*.service))]
     RateLimited {
         service: Service,
         status: Option<u16>,

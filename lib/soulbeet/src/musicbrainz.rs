@@ -396,7 +396,7 @@ pub async fn search(
 }
 
 /// The album an album search shows for `group`: None unless the group is an
-/// album or an EP with an official release.
+/// album or an EP that `album_release` finds a release of.
 fn album_result(group: &ReleaseGroup) -> Option<Album> {
     if !matches!(
         group.primary_type,
@@ -404,6 +404,12 @@ fn album_result(group: &ReleaseGroup) -> Option<Album> {
     ) {
         return None;
     }
+    group_album(group)
+}
+
+/// The row of `group`, whatever its type: None when `album_release` finds
+/// no release of it.
+fn group_album(group: &ReleaseGroup) -> Option<Album> {
     let release = album_release(group)?;
     Some(Album {
         id: release.id.clone(),
@@ -417,28 +423,49 @@ fn album_result(group: &ReleaseGroup) -> Option<Album> {
     })
 }
 
-/// The release an album search shows for `group`: an official one titled as
-/// the group, else the first official one. A release titled otherwise is often
+/// The release an album search shows for `group`: the one titled as the
+/// group, else the first, among its official releases, or among its releases
+/// with no status when it has no official one. A release with no status is
+/// one no editor gave a status, such as the only release of Chevelle's
+/// "Basement Tapes"; a group whose releases are all bootlegs, promotions or
+/// of another status has none to show. A release titled otherwise is often
 /// another edition of the album, such as its extended mixes alone. A release
 /// group search sends each release's id, title and status but no date or
 /// tracklist, so the order MusicBrainz lists them in decides among the rest.
 fn album_release(group: &ReleaseGroup) -> Option<&Release> {
-    let official: Vec<&Release> = (group.releases.iter().flatten())
-        .filter(|r| r.status == Some(ReleaseStatus::Official))
-        .collect();
+    let with_status = |status: Option<ReleaseStatus>| -> Vec<&Release> {
+        (group.releases.iter().flatten())
+            .filter(|r| r.status == status)
+            .collect()
+    };
+    let official = with_status(Some(ReleaseStatus::Official));
+    let candidates = if official.is_empty() {
+        with_status(None)
+    } else {
+        official
+    };
     let group_title = group.title.to_lowercase();
-    (official.iter())
+    (candidates.iter())
         .find(|r| r.title.to_lowercase() == group_title)
-        .or(official.first())
+        .or(candidates.first())
         .copied()
 }
 
 /// Release groups a discography page asks for: the most MusicBrainz answers.
 const DISCOGRAPHY_PAGE: u8 = 100;
 
-/// Release groups a discography reads at most. Bob Dylan's 210 official
+/// Albums and EPs a discography reads at most. Bob Dylan's 210 official
 /// albums and EPs fit.
-pub const DISCOGRAPHY_MAX: usize = 300;
+const ALBUMS_MAX: usize = 300;
+
+/// Singles a discography reads at most, apart from its albums and EPs, so
+/// an artist's singles never take an album's place. Armin van Buuren's 329
+/// fit (searched 2026-11-25); of an artist with more, the listing holds
+/// those the search answered first, which are in no date order.
+const SINGLES_MAX: usize = 400;
+
+/// Rows a discography lists at most: its albums and EPs, then its singles.
+pub const DISCOGRAPHY_MAX: usize = ALBUMS_MAX + SINGLES_MAX;
 
 /// The order albums and EPs with secondary types list in, by those types.
 const SECONDARY_ORDER: [ReleaseGroupSecondaryType; 11] = [
@@ -455,25 +482,36 @@ const SECONDARY_ORDER: [ReleaseGroupSecondaryType; 11] = [
     ReleaseGroupSecondaryType::AudioDrama,
 ];
 
-/// The part of a discography one search reads: the release groups with no
-/// secondary type, or those with one. A search with only an artist clause
-/// scores every group alike and answers them in index order, so the studio
-/// albums are read whole before anything else.
+/// The part of a discography one search reads: the albums and EPs with no
+/// secondary type, those with one, or the singles. A search with only an
+/// artist clause scores every group alike and answers them in index order,
+/// so the studio albums are read whole before anything else.
 #[derive(Debug, Clone, Copy)]
 enum Tier {
     Studio,
     Other,
+    Single,
 }
 
-/// The search for artist `mbid`'s release groups of `tier` that are albums
-/// or EPs with an official release.
+/// The search for artist `mbid`'s release groups of `tier` that have an
+/// official release or releases with no status at all, as `album_release`
+/// takes them. The index holds no status for a release that has none, so
+/// `NOT (status:* AND NOT status:official)` leaves out exactly the groups
+/// that have a status and no official release: of Chevelle's 44 groups it
+/// kept the 27 with an official release and "Basement Tapes", whose one
+/// release has no status, and left out every bootleg-only and
+/// promotion-only one (searched 2026-11-25). `status:official OR (*:* NOT
+/// status:*)` found no group without a status there. A group mixing
+/// bootlegs with releases of no status is left out too: the index cannot
+/// tell it from a bootleg-only one.
 fn discography_query(mbid: &str, tier: Tier) -> String {
-    let secondary = match tier {
-        Tier::Studio => "NOT secondarytype:*",
-        Tier::Other => "secondarytype:*",
+    let types = match tier {
+        Tier::Studio => "(primarytype:album OR primarytype:ep) AND NOT secondarytype:*",
+        Tier::Other => "(primarytype:album OR primarytype:ep) AND secondarytype:*",
+        Tier::Single => "primarytype:single",
     };
     query_param(&format!(
-        "{} AND (primarytype:album OR primarytype:ep) AND {secondary} AND status:official",
+        "{} AND {types} AND NOT (status:* AND NOT status:official)",
         phrase("arid", mbid)
     ))
 }
@@ -490,7 +528,7 @@ async fn tier_groups(
     while groups.len() < budget {
         let limit = u8::try_from((budget - groups.len()).min(DISCOGRAPHY_PAGE.into()))
             .expect("a page is at most DISCOGRAPHY_PAGE");
-        let offset = u16::try_from(groups.len()).expect("DISCOGRAPHY_MAX fits an offset");
+        let offset = u16::try_from(groups.len()).expect("a tier's budget fits an offset");
         let page = with_retry("MusicBrainz discography", || {
             let search_query = discography_query(mbid, tier);
             async move {
@@ -521,26 +559,32 @@ async fn tier_groups(
 }
 
 /// Where `group` lists in a discography: albums with no secondary type,
-/// then such EPs, then those with secondary types in SECONDARY_ORDER; each
-/// oldest first, an undated one last, then by title and id.
-fn discography_key(group: &ReleaseGroup) -> (bool, u8, Vec<usize>, bool, String, String, String) {
-    let primary = match group.primary_type {
-        Some(ReleaseGroupPrimaryType::Album) => 0,
-        _ => 1,
+/// then such EPs, then those with secondary types in SECONDARY_ORDER, then
+/// singles whatever their secondary types; each oldest first, an undated
+/// one last, then by title and id.
+fn discography_key(group: &ReleaseGroup) -> (u8, u8, Vec<usize>, bool, String, String, String) {
+    let (part, primary) = match group.primary_type {
+        Some(ReleaseGroupPrimaryType::Single) => (2, 0),
+        Some(ReleaseGroupPrimaryType::Album) => (u8::from(!group.secondary_types.is_empty()), 0),
+        _ => (u8::from(!group.secondary_types.is_empty()), 1),
     };
-    let mut secondary: Vec<usize> = (group.secondary_types.iter())
-        .map(|t| {
-            (SECONDARY_ORDER.iter())
-                .position(|o| o == t)
-                .unwrap_or(SECONDARY_ORDER.len())
-        })
-        .collect();
+    let mut secondary: Vec<usize> = if part == 2 {
+        Vec::new()
+    } else {
+        (group.secondary_types.iter())
+            .map(|t| {
+                (SECONDARY_ORDER.iter())
+                    .position(|o| o == t)
+                    .unwrap_or(SECONDARY_ORDER.len())
+            })
+            .collect()
+    };
     secondary.sort_unstable();
     let date = (group.first_release_date.as_ref())
         .map(|d| d.0.clone())
         .unwrap_or_default();
     (
-        !group.secondary_types.is_empty(),
+        part,
         primary,
         secondary,
         date.is_empty(),
@@ -550,14 +594,16 @@ fn discography_key(group: &ReleaseGroup) -> (bool, u8, Vec<usize>, bool, String,
     )
 }
 
-/// The albums of `groups` in discography order, each group once.
+/// The rows of `groups` in discography order, each group once. The groups
+/// are those the tiers' searches found, so each is an album, an EP or a
+/// single.
 fn discography_albums(groups: Vec<ReleaseGroup>) -> Vec<Album> {
     let mut seen = HashSet::new();
     let mut groups: Vec<ReleaseGroup> = (groups.into_iter())
         .filter(|g| seen.insert(g.id.clone()))
         .collect();
     groups.sort_by_cached_key(discography_key);
-    groups.iter().filter_map(album_result).collect()
+    groups.iter().filter_map(group_album).collect()
 }
 
 /// The artist of `found` whose MBID is `chosen`, else the first, and the
@@ -587,27 +633,40 @@ fn artist_summary(a: ArtistMatch) -> ArtistSummary {
     }
 }
 
+/// The groups a tier's search gave, and whether that is every group of the
+/// tier; None when the tier was not read.
+type TierRead = Option<(Vec<ReleaseGroup>, bool)>;
+
+/// Whether `tier` was read whole.
+fn read_whole(tier: &TierRead) -> bool {
+    tier.as_ref().is_some_and(|(_, whole)| *whole)
+}
+
 /// The discography of `artist` from the groups its tiers gave, cut to
-/// `limit` albums. `other` is None when that tier was not read.
+/// `limit` rows.
 fn discography_from(
     artist: ArtistMatch,
     others: Vec<ArtistMatch>,
-    studio: Vec<ReleaseGroup>,
-    studio_whole: bool,
-    other: Option<(Vec<ReleaseGroup>, bool)>,
+    studio: (Vec<ReleaseGroup>, bool),
+    other: TierRead,
+    singles: TierRead,
     limit: usize,
 ) -> Discography {
-    let other_whole = other.as_ref().is_some_and(|(_, whole)| *whole);
-    let mut groups = studio;
+    let (other_whole, singles_whole) = (read_whole(&other), read_whole(&singles));
+    let (mut groups, studio_whole) = studio;
     groups.extend(other.into_iter().flat_map(|(groups, _)| groups));
     let mut albums = discography_albums(groups);
-    let complete = studio_whole && other_whole && albums.len() <= limit;
+    let singles = discography_albums(singles.map(|(groups, _)| groups).unwrap_or_default());
+    let albums_complete = studio_whole && other_whole && albums.len() <= limit;
+    let singles_complete = singles_whole && albums.len() + singles.len() <= limit;
+    albums.extend(singles);
     albums.truncate(limit);
     Discography {
         artist: artist_summary(artist),
         others: others.into_iter().map(artist_summary).collect(),
         albums,
-        complete,
+        albums_complete,
+        singles_complete,
     }
 }
 
@@ -621,9 +680,9 @@ pub enum ArtistAlbums {
     Found(Discography),
 }
 
-/// The first `limit` albums and EPs of the artist named `name`: of the
-/// artist whose MBID is `chosen` when given, else of the first that carries
-/// the name.
+/// The first `limit` rows of the artist named `name`, its albums and EPs
+/// then its singles: of the artist whose MBID is `chosen` when given, else
+/// of the first that carries the name.
 pub async fn discography(
     name: &str,
     chosen: Option<&str>,
@@ -651,21 +710,23 @@ async fn discography_with(
             ))
         }
     };
-    let (studio, studio_whole) =
-        tier_groups(client, &artist.mbid, Tier::Studio, DISCOGRAPHY_MAX).await?;
-    let other = if studio.len() < limit.min(DISCOGRAPHY_MAX) {
-        let budget = DISCOGRAPHY_MAX - studio.len();
+    // Each tier read is read up to its whole budget, as the search answers in
+    // no date order: a part read only in part could miss its oldest rows.
+    let studio = tier_groups(client, &artist.mbid, Tier::Studio, ALBUMS_MAX).await?;
+    let other = if studio.0.len() < limit.min(ALBUMS_MAX) {
+        let budget = ALBUMS_MAX - studio.0.len();
         Some(tier_groups(client, &artist.mbid, Tier::Other, budget).await?)
     } else {
         None
     };
+    let albums_read = studio.0.len() + other.as_ref().map_or(0, |(groups, _)| groups.len());
+    let singles = if albums_read < limit {
+        Some(tier_groups(client, &artist.mbid, Tier::Single, SINGLES_MAX).await?)
+    } else {
+        None
+    };
     Ok(ArtistAlbums::Found(discography_from(
-        artist,
-        others,
-        studio,
-        studio_whole,
-        other,
-        limit,
+        artist, others, studio, other, singles, limit,
     )))
 }
 
@@ -1237,6 +1298,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn musicbrainz_busy_past_the_clients_retries_is_said_in_soulbeets_words() {
+        let e = MetadataError::from(musicbrainz_rs::Error::MaxRetriesExceeded);
+        assert_eq!(e.to_string(), "MusicBrainz is busy. Try again shortly.");
+        // The client's own text stays the cause.
+        let f = e.failure(shared::failure::Stage::Metadata, e.to_string());
+        assert_eq!(
+            f.cause.map(|c| c.raw),
+            Some(musicbrainz_rs::Error::MaxRetriesExceeded.to_string())
+        );
+    }
+
     /// GET https://musicbrainz.org/ws/2/recording/4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8?inc=artists&fmt=json
     const RECORDING: &str = r#"{"title":"Silent Night","length":149000,"video":false,"first-release-date":"1995","id":"4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8","disambiguation":"","artist-credit":[{"artist":{"disambiguation":"","country":"US","sort-name":"Crosby, Bing","type-id":"b6e035f4-3ce9-331c-97df-83397230b0df","name":"Bing Crosby","id":"2437980f-513a-44fc-80f1-b90d9d7fcf8f","type":"Person"},"name":"Bing Crosby","joinphrase":""}]}"#;
     /// GET https://musicbrainz.org/ws/2/release?recording=4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8&inc=release-groups&limit=2&offset=0&fmt=json
@@ -1552,25 +1625,94 @@ mod tests {
             Some("032e6446-2867-4ebe-b2d2-0a96ee460cd8")
         );
 
-        // Only the release that has no status.
-        let mut unofficial: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
-        let first = unofficial["releases"][0].clone();
-        unofficial["releases"] = serde_json::json!([first]);
-        let unofficial: ReleaseGroup = serde_json::from_value(unofficial).unwrap();
-        assert!(album_release(&unofficial).is_none());
+        // With no official release, one with no status stands for the group; a bootleg never does.
+        let only = |statuses: &[Option<&str>]| {
+            let mut group: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+            let releases: Vec<serde_json::Value> = (statuses.iter().enumerate())
+                .map(|(i, status)| {
+                    let mut release = serde_json::json!({"id": format!("r{i}"), "title": "Bigger Than All of Us"});
+                    if let Some(status) = status {
+                        release["status"] = (*status).into();
+                    }
+                    release
+                })
+                .collect();
+            group["releases"] = releases.into();
+            let group: ReleaseGroup = serde_json::from_value(group).unwrap();
+            album_release(&group).map(|r| r.id.clone())
+        };
+        assert_eq!(only(&[None]).as_deref(), Some("r0"));
+        assert_eq!(only(&[Some("Bootleg"), None]).as_deref(), Some("r1"));
+        assert_eq!(only(&[None, Some("Official")]).as_deref(), Some("r1"));
+        assert_eq!(only(&[Some("Bootleg"), Some("Promotion")]), None);
     }
 
     #[test]
-    fn a_discography_asks_for_one_tier_of_official_albums_and_eps() {
+    fn a_discography_asks_for_one_tier_of_albums_eps_or_singles_with_a_release_to_show() {
         let chevelle = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+        let status = "NOT (status:* AND NOT status:official)";
         assert_eq!(
             lucene(&discography_query(chevelle, Tier::Studio)),
-            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND NOT secondarytype:* AND status:official"#
+            format!(
+                r#"arid:"{chevelle}" AND (primarytype:album OR primarytype:ep) AND NOT secondarytype:* AND {status}"#
+            )
         );
         assert_eq!(
             lucene(&discography_query(chevelle, Tier::Other)),
-            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND secondarytype:* AND status:official"#
+            format!(
+                r#"arid:"{chevelle}" AND (primarytype:album OR primarytype:ep) AND secondarytype:* AND {status}"#
+            )
         );
+        assert_eq!(
+            lucene(&discography_query(chevelle, Tier::Single)),
+            format!(r#"arid:"{chevelle}" AND primarytype:single AND {status}"#)
+        );
+    }
+
+    /// The release groups GET https://musicbrainz.org/ws/2/release-group?query=arid:"8456e9f7-debf-4579-a86c-33a325a35d2d"
+    /// AND NOT (status:* AND NOT status:official)&limit=100&fmt=json answered, fetched 2026-11-25: 28 of the 44.
+    const CHEVELLE_WITH_A_RELEASE_TO_SHOW: [&str; 28] = [
+        "0988939c-a318-4d97-87db-504ddd344ae5",
+        "0c1dd7ec-f44f-4814-94b5-fe377d58b2bb",
+        "13adbf35-1c95-4c14-a156-0839cf8c239c",
+        "1d8e751e-2e24-4acd-999f-f2937119989d",
+        "24f654ae-1316-3bcf-9805-14507646f86b",
+        "3361c06e-d206-4516-866c-38a71172a737",
+        "383fc228-fe32-4033-a9b4-6342dad33766",
+        "41622d70-d319-4bbb-8b42-ea6d4f165f4a",
+        "4ae1d590-4135-4fd4-8d98-922cdb9b53bd",
+        "605778cf-c222-46cc-ad65-392ba8ba028d",
+        "6d80fd4d-4de0-3b81-af98-c8b1584725ef",
+        "76995141-f5d4-4148-a91f-5ad72384dfe3",
+        "7d58e1cf-9490-4348-9535-2c1fcd4cefcf",
+        "87b380eb-3101-3618-819b-38ddec289cf8",
+        "92e1287f-c4bf-49b2-94cc-b18a28f3cd15",
+        "97d1e844-c82a-3fab-a7a6-b4a6ffc9cde3",
+        "99ac2205-efd7-4e00-9717-b17672142d1a",
+        "ac57206e-2884-39a4-8969-eaf9a4c14232",
+        "b5978973-537a-4f47-860e-ca7b6df79035",
+        "c41b6870-01fe-42fe-a560-0e3d179fe972",
+        "c64094f0-8f7d-4595-89f2-588aaa8b1120",
+        "cae2397e-65d3-4ada-883f-e6a8ff4af610",
+        "d132db5b-d7b4-4c06-b3ed-ea0d6e4b39ca",
+        "d52f8bb2-5752-4edf-9e40-f3aed288b0fb",
+        "dabb19c6-f5ac-354a-b49b-4823e954ee54",
+        "eb397436-c727-4aa4-9cdd-57e98ebc4d62",
+        "f031b0f9-501e-4506-ba79-c13f59604427",
+        "fedf2ea7-6951-445e-bb3f-fcd4002fd963",
+    ];
+
+    #[test]
+    fn the_status_clause_keeps_the_groups_album_release_has_a_release_of() {
+        for g in chevelle_groups() {
+            assert_eq!(
+                album_release(&g).is_some(),
+                CHEVELLE_WITH_A_RELEASE_TO_SHOW.contains(&g.id.as_str()),
+                "{} {}",
+                g.id,
+                g.title
+            );
+        }
     }
 
     /// GET https://musicbrainz.org/ws/2/release-group?query=arid:"8456e9f7-debf-4579-a86c-33a325a35d2d"&limit=100&fmt=json,
@@ -1636,13 +1778,13 @@ mod tests {
             targets[1]
         );
 
-        let (groups, whole) = tier_groups(&client, mbid, Tier::Studio, DISCOGRAPHY_MAX)
+        let (groups, whole) = tier_groups(&client, mbid, Tier::Studio, ALBUMS_MAX)
             .await
             .unwrap();
         assert_eq!((groups.len(), whole), (3, true));
         assert_eq!(seen.lock().unwrap().len(), 3);
 
-        let e = tier_groups(&client, mbid, Tier::Studio, DISCOGRAPHY_MAX)
+        let e = tier_groups(&client, mbid, Tier::Studio, ALBUMS_MAX)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1651,10 +1793,22 @@ mod tests {
         );
     }
 
+    /// Chevelle's discography from every tier, each read whole, cut to `limit` rows.
+    fn chevelle_discography(limit: usize) -> Discography {
+        discography_from(
+            found(CHEVELLE, "Chevelle", &[]),
+            vec![],
+            (chevelle_tier_groups(Tier::Studio), true),
+            Some((chevelle_tier_groups(Tier::Other), true)),
+            Some((chevelle_tier_groups(Tier::Single), true)),
+            limit,
+        )
+    }
+
     #[test]
-    fn a_discography_lists_studio_albums_first_oldest_first() {
-        let albums = discography_albums(chevelle_groups());
-        let titles: Vec<&str> = albums.iter().map(|a| a.title.as_str()).collect();
+    fn a_discography_lists_studio_albums_first_and_singles_last_each_oldest_first() {
+        let d = chevelle_discography(DISCOGRAPHY_MAX);
+        let titles: Vec<&str> = d.albums.iter().map(|a| a.title.as_str()).collect();
         assert_eq!(
             titles,
             [
@@ -1676,34 +1830,59 @@ mod tests {
                 "Music as a Weapon II",
                 "Any Last Words",
                 "The Blue Album",
+                "Basement Tapes",
+                "The Red",
+                "Jars",
+                "Face to the Floor",
+                "Hats Off to the Bull",
+                "Take Out the Gunman",
+                "Joyride (Omen)",
+                "Self Destructor",
+                "Rabbit Hole (Cowards, Pt. 1)",
+                "Jim Jones (Cowards, Pt. 2)",
             ]
         );
-        // No single, and neither the Sci‐Fi Crimes EP nor Basement Tapes, which have no
-        // official release.
-        let unofficial: Vec<ReleaseGroup> = chevelle_groups()
-            .into_iter()
-            .filter(|g| g.id.starts_with("77493e52") || g.id.starts_with("41622d70"))
-            .collect();
-        assert_eq!(unofficial.len(), 2);
-        assert_eq!(discography_albums(unofficial), []);
+        assert!(d.complete());
         // The official release titled as the group, here with its ’, not the first official one,
         // which writes "Wonder What's Next"; and for Point #1 the first official one, after a
         // release with no status.
-        assert_eq!(albums[1].id, "accde5f7-04da-4c66-bb8e-7bb3d39ad326");
-        assert_eq!(albums[0].id, "c9a3fe11-45a8-4045-9d15-1b80b8333f81");
-        let next = &albums[1];
+        assert_eq!(d.albums[1].id, "accde5f7-04da-4c66-bb8e-7bb3d39ad326");
+        assert_eq!(d.albums[0].id, "c9a3fe11-45a8-4045-9d15-1b80b8333f81");
+        let facts = |a: &Album| {
+            (
+                a.id.clone(),
+                a.first_release_date.clone(),
+                a.release_types.clone(),
+            )
+        };
+        let types = |t: &[&str]| Some(t.iter().map(|t| t.to_string()).collect::<Vec<_>>());
         assert_eq!(
+            facts(&d.albums[1]),
             (
-                next.title.as_str(),
-                next.first_release_date.as_deref(),
-                next.release_types.clone()
-            ),
-            (
-                "Wonder What’s Next",
-                Some("2002-08-27"),
-                Some(vec!["Album".to_string()])
+                "accde5f7-04da-4c66-bb8e-7bb3d39ad326".into(),
+                Some("2002-08-27".into()),
+                types(&["Album"])
             )
         );
+        // Basement Tapes, whose one release has no status, is listed by that release.
+        assert_eq!(
+            facts(&d.albums[18]),
+            (
+                "37272390-9c78-485d-879e-95d4225e8ec5".into(),
+                Some("1998".into()),
+                types(&["Album", "Demo"])
+            )
+        );
+        // The single titled as an album is listed as well as the album.
+        assert_eq!(
+            facts(&d.albums[22]),
+            (
+                "d625e30e-1668-4091-bac7-bf0c38b2d22e".into(),
+                Some("2012-02-16".into()),
+                types(&["Single"])
+            )
+        );
+        assert_eq!(d.albums[5].release_types, types(&["Album"]));
     }
 
     /// A release group of `primary` and `secondary` types, first out on `date`, with one
@@ -1739,6 +1918,10 @@ mod tests {
             group("09", "A", "Album", &[], "2004"),
             group("10", "Later", "Album", &[], "2004-02-23"),
             group("11", "First", "Album", &[], "1999"),
+            group("12", "Undated Single", "Single", &[], ""),
+            group("13", "Single", "Single", &[], "1990"),
+            group("14", "First", "Single", &[], "1999"),
+            group("15", "Remix Single", "Single", &["Remix"], "1985"),
         ];
         let titles: Vec<String> = discography_albums(groups)
             .into_iter()
@@ -1758,34 +1941,60 @@ mod tests {
                 "Soundtrack",
                 "Live",
                 "Live EP",
+                "Remix Single",
+                "Single",
+                "First",
+                "Undated Single",
             ]
         );
     }
 
     #[test]
     fn a_discography_is_complete_only_when_every_tier_was_read_whole_and_fits() {
-        let artist = found("8456e9f7-debf-4579-a86c-33a325a35d2d", "Chevelle", &[]);
-        let (studio, other): (Vec<_>, Vec<_>) = chevelle_groups()
-            .into_iter()
-            .partition(|g| g.secondary_types.is_empty());
-        let complete = |studio_whole, other_whole: Option<bool>, limit| {
-            let other = other_whole.map(|whole| (other.clone(), whole));
-            discography_from(
-                artist.clone(),
+        let (studio, other, singles) = (
+            chevelle_tier_groups(Tier::Studio),
+            chevelle_tier_groups(Tier::Other),
+            chevelle_tier_groups(Tier::Single),
+        );
+        let read = |studio_whole, other_whole: Option<bool>, singles_whole: Option<bool>, limit| {
+            let d = discography_from(
+                found(CHEVELLE, "Chevelle", &[]),
                 vec![],
-                studio.clone(),
-                studio_whole,
-                other,
+                (studio.clone(), studio_whole),
+                other_whole.map(|whole| (other.clone(), whole)),
+                singles_whole.map(|whole| (singles.clone(), whole)),
                 limit,
-            )
+            );
+            (d.albums_complete, d.singles_complete, d.albums.len())
         };
-        assert!(complete(true, Some(true), DISCOGRAPHY_MAX).complete);
-        assert!(complete(true, Some(true), 18).complete);
-        assert!(!complete(false, Some(true), DISCOGRAPHY_MAX).complete);
-        assert!(!complete(true, None, DISCOGRAPHY_MAX).complete);
-        assert!(!complete(true, Some(false), DISCOGRAPHY_MAX).complete);
-        let cut = complete(true, Some(true), 12);
-        assert!(!cut.complete);
+        assert_eq!(
+            read(true, Some(true), Some(true), DISCOGRAPHY_MAX),
+            (true, true, 28)
+        );
+        assert_eq!(read(true, Some(true), Some(true), 28), (true, true, 28));
+        assert_eq!(
+            read(false, Some(true), Some(true), DISCOGRAPHY_MAX),
+            (false, true, 28)
+        );
+        assert_eq!(
+            read(true, Some(false), Some(true), DISCOGRAPHY_MAX),
+            (false, true, 28)
+        );
+        assert_eq!(
+            read(true, Some(true), Some(false), DISCOGRAPHY_MAX),
+            (true, false, 28)
+        );
+        // A tier not read was not read whole.
+        assert_eq!(read(true, None, None, DISCOGRAPHY_MAX), (false, false, 10));
+        assert_eq!(
+            read(true, Some(true), None, DISCOGRAPHY_MAX),
+            (true, false, 19)
+        );
+        // Cut among the singles, every album and EP is listed.
+        assert_eq!(read(true, Some(true), Some(true), 20), (true, false, 20));
+        // Cut among the albums, no single is.
+        let cut = chevelle_discography(12);
+        assert_eq!((cut.albums_complete, cut.singles_complete), (false, false));
         assert_eq!(cut.albums.len(), 12);
         assert!(cut.albums[..10]
             .iter()
@@ -1798,6 +2007,50 @@ mod tests {
                 disambiguation: None
             }
         );
+    }
+
+    #[test]
+    fn a_release_with_no_status_is_looked_up_with_its_tracks() {
+        // GET https://musicbrainz.org/ws/2/release/37272390-9c78-485d-879e-95d4225e8ec5?inc=recordings+artist-credits+release-groups&fmt=json,
+        // fetched 2026-11-25 and trimmed to the fields read: "status" and "status-id" are null.
+        let release: Release = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/release_basement_tapes.json"
+        ))
+        .unwrap();
+        assert_eq!(release.status, None);
+        let r = album_from_release(release);
+        assert_eq!(
+            (
+                r.album.id.as_str(),
+                r.album.title.as_str(),
+                r.album.artist.as_str(),
+                r.album.release_types.clone()
+            ),
+            (
+                "37272390-9c78-485d-879e-95d4225e8ec5",
+                "Basement Tapes",
+                "Chevelle",
+                Some(vec!["Album".to_string(), "Demo".to_string()])
+            )
+        );
+        let tracks: Vec<(&str, Option<&str>)> = (r.tracks.iter())
+            .map(|t| (t.title.as_str(), t.duration.as_deref()))
+            .collect();
+        assert_eq!(
+            tracks,
+            [
+                ("Open", Some("06:53")),
+                ("Build", Some("04:14")),
+                ("Commuter", Some("04:32")),
+                ("Credit to You", Some("03:32")),
+                ("Humidity", Some("04:32")),
+                ("Untitled (Dos)", Some("06:04")),
+            ]
+        );
+        assert!(r
+            .tracks
+            .iter()
+            .all(|t| t.release_mbid.as_deref() == Some("37272390-9c78-485d-879e-95d4225e8ec5")));
     }
 
     /// GET https://musicbrainz.org/ws/2/artist?query=artist:"Nirvana" OR alias:"Nirvana"&limit=25&fmt=json,
@@ -1864,7 +2117,8 @@ mod tests {
         )
     }
 
-    /// Chevelle's release groups of `tier` from the fixture, as one search answer.
+    /// Chevelle's release groups of `tier` from the fixture that the tier's search finds, as one
+    /// search answer: of the right types, and among those the status clause kept.
     fn chevelle_tier(tier: Tier) -> String {
         let mut page: serde_json::Value = serde_json::from_str(include_str!(
             "fixtures/musicbrainz/release_group_search_chevelle.json"
@@ -1875,14 +2129,28 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|g| {
-                let studio = g["secondary-types"].as_array().is_none_or(|t| t.is_empty());
-                studio == matches!(tier, Tier::Studio)
+                let secondary = g["secondary-types"]
+                    .as_array()
+                    .is_some_and(|t| !t.is_empty());
+                let types = match (g["primary-type"].as_str(), tier) {
+                    (Some("Album" | "EP"), Tier::Studio) => !secondary,
+                    (Some("Album" | "EP"), Tier::Other) => secondary,
+                    (Some("Single"), Tier::Single) => true,
+                    _ => false,
+                };
+                types && CHEVELLE_WITH_A_RELEASE_TO_SHOW.contains(&g["id"].as_str().unwrap())
             })
             .cloned()
             .collect();
         page["count"] = groups.len().into();
         page["release-groups"] = groups.into();
         page.to_string()
+    }
+
+    fn chevelle_tier_groups(tier: Tier) -> Vec<ReleaseGroup> {
+        let page: musicbrainz_rs::entity::search::SearchResult<ReleaseGroup> =
+            serde_json::from_str(&chevelle_tier(tier)).unwrap();
+        page.entities
     }
 
     #[tokio::test]
@@ -1895,36 +2163,59 @@ mod tests {
             reply(chevelle_found()),
             reply(chevelle_tier(Tier::Studio)),
             reply(chevelle_tier(Tier::Other)),
+            reply(chevelle_found()),
+            reply(chevelle_tier(Tier::Studio)),
+            reply(chevelle_tier(Tier::Other)),
+            reply(chevelle_tier(Tier::Single)),
             reply(artists_page(serde_json::json!([]))),
             reply(include_str!("fixtures/musicbrainz/artist_search_nirvana.json").into()),
         ]);
         let client = stub_client(&base);
         let sent = || seen.lock().unwrap().len();
-
-        // Five rows are all studio albums: the other tier is not asked for.
-        let ArtistAlbums::Found(five) = discography_with(&client, "Chevelle", None, 5)
-            .await
-            .unwrap()
-        else {
-            panic!("Chevelle is found");
+        let listed = |found: ArtistAlbums| match found {
+            ArtistAlbums::Found(d) => d,
+            other => panic!("Chevelle is found: {other:?}"),
         };
+
+        // Five rows are all studio albums: the other tiers are not asked for.
+        let five = listed(
+            discography_with(&client, "Chevelle", None, 5)
+                .await
+                .unwrap(),
+        );
         assert_eq!(sent(), 2);
-        assert_eq!((five.albums.len(), five.complete), (5, false));
+        assert_eq!((five.albums.len(), five.complete()), (5, false));
         assert_eq!(five.albums[1].title, "Wonder What’s Next");
 
-        let ArtistAlbums::Found(all) = discography_with(&client, "Chevelle", None, DISCOGRAPHY_MAX)
-            .await
-            .unwrap()
-        else {
-            panic!("Chevelle is found");
-        };
+        // Fifteen rows are albums: the singles are not asked for.
+        let fifteen = listed(
+            discography_with(&client, "Chevelle", None, 15)
+                .await
+                .unwrap(),
+        );
         assert_eq!(sent(), 5);
-        assert_eq!((all.albums.len(), all.complete), (18, true));
+        assert_eq!(
+            (
+                fifteen.albums.len(),
+                fifteen.albums_complete,
+                fifteen.singles_complete
+            ),
+            (15, false, false)
+        );
+
+        let all = listed(
+            discography_with(&client, "Chevelle", None, DISCOGRAPHY_MAX)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sent(), 9);
+        assert_eq!((all.albums.len(), all.complete()), (28, true));
         let targets: Vec<String> = (seen.lock().unwrap().iter())
             .map(|s| s.target.clone())
             .collect();
-        assert!(targets[3].contains(&discography_query(CHEVELLE, Tier::Studio)));
-        assert!(targets[4].contains(&discography_query(CHEVELLE, Tier::Other)));
+        assert!(targets[6].contains(&discography_query(CHEVELLE, Tier::Studio)));
+        assert!(targets[7].contains(&discography_query(CHEVELLE, Tier::Other)));
+        assert!(targets[8].contains(&discography_query(CHEVELLE, Tier::Single)));
 
         assert_eq!(
             discography_with(&client, "Zqxvb Plorbnik Quintet", None, DISCOGRAPHY_MAX)
@@ -1932,7 +2223,7 @@ mod tests {
                 .unwrap(),
             ArtistAlbums::NoArtist
         );
-        assert_eq!(sent(), 6);
+        assert_eq!(sent(), 10);
 
         // A chosen artist not among those of the name gets them back, with no release search.
         let unknown = "00000000-0000-4000-8000-000000000000";
@@ -1943,7 +2234,7 @@ mod tests {
         else {
             panic!("the chosen artist is not among those named Nirvana");
         };
-        assert_eq!(sent(), 7);
+        assert_eq!(sent(), 11);
         assert_eq!(named.len(), 7);
         assert_eq!(named[0].mbid, NIRVANA_US);
     }
@@ -1965,7 +2256,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(found[0].mbid, CHEVELLE);
-        tier_groups(&client, CHEVELLE, Tier::Studio, DISCOGRAPHY_MAX)
+        tier_groups(&client, CHEVELLE, Tier::Studio, ALBUMS_MAX)
             .await
             .unwrap();
         let at: Vec<std::time::Instant> = seen.lock().unwrap().iter().map(|s| s.at).collect();

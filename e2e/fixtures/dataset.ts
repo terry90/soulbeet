@@ -21,9 +21,9 @@ export interface FixtureRelease {
   date: string;
   primaryType: 'Album' | 'Single' | 'EP';
   /** The release group's secondary types; none when left out */
-  secondaryTypes?: ('Compilation' | 'Live')[];
-  /** Official when left out */
-  status?: 'Official' | 'Bootleg';
+  secondaryTypes?: ('Compilation' | 'Live' | 'Demo')[];
+  /** Official when left out; null for a release no editor gave a status */
+  status?: 'Official' | 'Bootleg' | null;
   /** 0-100, drives result ordering in the app (sorted by rating) */
   rating: number;
   tracks: FixtureTrack[];
@@ -457,9 +457,10 @@ export const bellwether: FixtureRelease = {
 };
 
 // The release groups of the artist search.spec.ts lists by name alone: two
-// studio albums and an EP, a live album and a compilation, plus a single and
-// a bootleg the listing leaves out. The stub answers them by rating, which
-// orders them unlike the app's listing. No peer shares them.
+// studio albums and an EP, a live album, a compilation, a demo whose release
+// has no status and a single, plus a bootleg the listing leaves out. The stub
+// answers them by rating, which orders them unlike the app's listing. No peer
+// shares them.
 const orchidTelegraphMbid = 'ca04fdcb-6061-4416-a79f-2cda532c6132';
 
 export const semaphoreGardens: FixtureRelease = {
@@ -623,6 +624,33 @@ export const liveAtTheAnnex: FixtureRelease = {
   ],
 };
 
+export const atticSignals: FixtureRelease = {
+  releaseMbid: '2f5e348f-b2c0-428a-8f79-0f75135140ff',
+  releaseGroupMbid: '4563dfb9-ee37-439e-948a-0c7173f3c8f2',
+  title: 'Attic Signals',
+  artist: 'Orchid Telegraph',
+  artistMbid: orchidTelegraphMbid,
+  date: '2012-05-04',
+  primaryType: 'Album',
+  secondaryTypes: ['Demo'],
+  status: null,
+  rating: 51,
+  tracks: [
+    {
+      mbid: 'c1a4a951-6451-49ab-a25c-9123eb17ca61',
+      title: 'Loft Static',
+      position: 1,
+      lengthMs: 30000,
+    },
+    {
+      mbid: '7163fd88-4e32-42ff-b0d2-041de655c184',
+      title: 'Rafter Tone',
+      position: 2,
+      lengthMs: 30000,
+    },
+  ],
+};
+
 const orchidTelegraphReleases: FixtureRelease[] = [
   semaphoreGardens,
   morseBloom,
@@ -631,6 +659,7 @@ const orchidTelegraphReleases: FixtureRelease[] = [
   collectedDispatches,
   pylonSong,
   liveAtTheAnnex,
+  atticSignals,
 ];
 
 // Releases the MCP acceptance suite downloads: no other spec touches them.

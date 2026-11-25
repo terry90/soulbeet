@@ -138,8 +138,8 @@ fn artist_summary_entry(a: &ArtistSummary) -> Value {
 /// An artist-only release search: the artist found, the others carrying the
 /// name, and the page of the artist's releases in discography order from
 /// `page.offset`, with a cursor while more follow. `complete` is true on the
-/// last page of a listing that held every album and EP MusicBrainz has for
-/// the artist. With no artist found, `artist` is null and the empty listing
+/// last page of a listing that held every album, EP and single MusicBrainz
+/// has for the artist. With no artist found, `artist` is null and the empty listing
 /// is complete. A chosen artist not among those of the name is refused, and
 /// the refusal lists those.
 fn artist_albums_fields(
@@ -162,7 +162,7 @@ fn artist_albums_fields(
         ArtistAlbums::Found(d) => (
             artist_summary_entry(&d.artist),
             d.others.iter().map(artist_summary_entry).collect(),
-            d.complete,
+            d.complete(),
             d.albums,
         ),
     };
@@ -488,7 +488,8 @@ mod tests {
                     "60s band from the UK",
                 )],
                 albums,
-                complete,
+                albums_complete: complete,
+                singles_complete: true,
             })
         };
         let first = listing_page(None, 1);
@@ -521,6 +522,13 @@ mod tests {
         );
         // A last page of a listing MusicBrainz has more for is not complete.
         let doc = artist_albums_fields("", found(vec![], false), &listing_page(None, 10)).unwrap();
+        assert_eq!(doc["complete"], false);
+        // Nor is one that holds every album and EP but not every single.
+        let mut singles_left_out = found(vec![], true);
+        if let ArtistAlbums::Found(d) = &mut singles_left_out {
+            d.singles_complete = false;
+        }
+        let doc = artist_albums_fields("", singles_left_out, &listing_page(None, 10)).unwrap();
         assert_eq!(doc["complete"], false);
 
         assert_eq!(

@@ -66,10 +66,11 @@ pub async fn artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, Failure
         .map_err(|e| provider_failure(&e))
 }
 
-/// Albums the web UI's artist-only search shows.
+/// Rows the web UI's artist-only search shows.
 pub(crate) const DISCOGRAPHY_LIMIT: usize = musicbrainz::DISCOGRAPHY_MAX;
 
-/// The first `limit` albums and EPs of the artist named `name`, or of the one
+/// The first `limit` rows of the artist named `name`, its albums and EPs
+/// then its singles, or of the one
 /// of that name whose MBID is `chosen`; `ArtistAlbums` says when MusicBrainz
 /// has no artist of that name, or none of them is `chosen`.
 pub async fn discography(
