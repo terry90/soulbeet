@@ -252,7 +252,7 @@ pub(crate) async fn start_seed_radio_in(
     let mut owned_tracks: Vec<SeedRadioTrack> = Vec::new();
     let mut owned_keys: HashSet<String> = HashSet::new();
 
-    if let Some(ref song_id) = req.seed_song_id.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(song_id) = req.seed_song_id.as_deref().filter(|s| !s.trim().is_empty()) {
         if let Some(song) = navi
             .get_song(song_id)
             .await
@@ -425,24 +425,24 @@ mod tests {
         assert_eq!(updated.preferred_languages, vec!["fr", "en"]);
         assert!((updated.local_culture_ratio - 0.50).abs() < 0.001);
 
-        // Steer Noël to MoreLocal -> 0.50 + 0.25 = 0.75
+        // Steer Holiday pack to MoreLocal -> 0.50 + 0.25 = 0.75
         let steered =
-            steer_seasonal_pack_in(&db, "alice", "noel", CultureSteering::MoreLocal)
+            steer_seasonal_pack_in(&db, "alice", "holiday", CultureSteering::MoreLocal)
                 .await
                 .unwrap();
-        assert_eq!(steered.title, "Noël à la Française");
+        assert_eq!(steered.title, "Holiday Classics & Gems");
         assert_eq!(steered.steering, CultureSteering::MoreLocal);
         assert!((steered.local_ratio - 0.75).abs() < 0.001);
         assert!(steered.exclude_from_core_taste);
 
-        // Active mixes in December surface Noël à la Française with persisted MoreLocal steering
+        // Active mixes in December surface Holiday Classics & Gems with persisted MoreLocal steering
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
         let mixes = list_active_contextual_mixes_in(&db, &test_ctx("alice"), dec)
             .await
             .unwrap();
         assert_eq!(mixes[0].kind, ContextualMixKind::Seasonal);
-        assert_eq!(mixes[0].slug, "noel");
-        assert_eq!(mixes[0].title, "Noël à la Française");
+        assert_eq!(mixes[0].slug, "holiday");
+        assert_eq!(mixes[0].title, "Holiday Classics & Gems");
         assert_eq!(mixes[0].steering, Some(CultureSteering::MoreLocal));
         assert!(mixes[0].exclude_from_core_taste);
         assert!(mixes.iter().any(|m| m.slug == "drive"));
@@ -457,9 +457,9 @@ mod tests {
             "INSERT INTO discovery_tracks \
                 (id, song_id, title, artist, album, path, folder_id, profile, status, \
                  exclude_from_core_taste, reason_label, culture_bucket, pack_slug) \
-             VALUES ('dt-noel', 's-noel', 'Petit Papa Noël', 'Tino Rossi', 'Noël', \
-                     '/music/alice/Discovery/Seasonal/noel/01.flac', ?, 'Balanced', 'Pending', \
-                     1, 'FRENCH NOËL PICK', 'local', 'noel')",
+             VALUES ('dt-holiday', 's-holiday', 'Winter Song', 'Regional Artist', 'Holiday', \
+                     '/music/alice/Discovery/Seasonal/holiday/01.flac', ?, 'Balanced', 'Pending', \
+                     1, 'FR HOLIDAY PICK', 'local', 'holiday')",
         )
         .bind(&folder_id)
         .execute(&db)
@@ -469,8 +469,8 @@ mod tests {
         let queue = list_triage_queue_in(&db, "alice").await.unwrap();
         assert_eq!(queue.len(), 1);
         assert!(queue[0].exclude_from_core_taste);
-        assert_eq!(queue[0].reason_label.as_deref(), Some("FRENCH NOËL PICK"));
+        assert_eq!(queue[0].reason_label.as_deref(), Some("FR HOLIDAY PICK"));
         assert_eq!(queue[0].culture_bucket.as_deref(), Some("local"));
-        assert_eq!(queue[0].pack_slug.as_deref(), Some("noel"));
+        assert_eq!(queue[0].pack_slug.as_deref(), Some("holiday"));
     }
 }

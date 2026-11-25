@@ -775,7 +775,8 @@ impl CultureSteering {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeasonalKind {
-    Noel,
+    #[serde(alias = "noel")]
+    Holiday,
     NewYearsEve,
     Summer,
     Halloween,
@@ -785,7 +786,7 @@ pub enum SeasonalKind {
 
 impl SeasonalKind {
     pub const ALL: [SeasonalKind; 6] = [
-        SeasonalKind::Noel,
+        SeasonalKind::Holiday,
         SeasonalKind::NewYearsEve,
         SeasonalKind::Summer,
         SeasonalKind::Halloween,
@@ -795,7 +796,7 @@ impl SeasonalKind {
 
     pub const fn slug(self) -> &'static str {
         match self {
-            SeasonalKind::Noel => "noel",
+            SeasonalKind::Holiday => "holiday",
             SeasonalKind::NewYearsEve => "nye",
             SeasonalKind::Summer => "summer",
             SeasonalKind::Halloween => "halloween",
@@ -806,13 +807,16 @@ impl SeasonalKind {
 
     pub fn from_slug(slug: &str) -> Option<Self> {
         let normalized = slug.trim().to_ascii_lowercase();
+        if normalized == "noel" {
+            return Some(SeasonalKind::Holiday);
+        }
         Self::ALL.into_iter().find(|k| k.slug() == normalized)
     }
 
     /// Returns the seasonal pack active for a `(month, day)` calendar date (1-based).
     pub fn active_for(month: u32, day: u32) -> Option<Self> {
         match (month, day) {
-            (11, 20..=30) | (12, 1..=27) => Some(SeasonalKind::Noel),
+            (11, 20..=30) | (12, 1..=27) => Some(SeasonalKind::Holiday),
             (12, 28..=31) | (1, 1..=2) => Some(SeasonalKind::NewYearsEve),
             (3, 20..=31) | (4, 1..=30) | (5, 1..=31) => Some(SeasonalKind::Spring),
             (6, 1..=30) | (7, 1..=31) | (8, 1..=31) => Some(SeasonalKind::Summer),
@@ -822,53 +826,46 @@ impl SeasonalKind {
         }
     }
 
-    pub fn localized_title(self, country: Option<&str>) -> String {
-        let is_fr = country.is_some_and(|c| c.eq_ignore_ascii_case("FR"));
+    /// Universal default title for this seasonal pack. Clients/i18n may localize
+    /// display labels using `kind` and the user's cultural profile.
+    pub const fn title(self) -> &'static str {
         match self {
-            SeasonalKind::Noel if is_fr => "Noël à la Française".to_string(),
-            SeasonalKind::Noel => "Holiday Classics & Gems".to_string(),
-            SeasonalKind::NewYearsEve if is_fr => "Réveillon Bangers".to_string(),
-            SeasonalKind::NewYearsEve => "New Year's Eve Party".to_string(),
-            SeasonalKind::Summer if is_fr => "Soleil & Été".to_string(),
-            SeasonalKind::Summer => "Summer Anthems".to_string(),
-            SeasonalKind::Halloween => "Halloween Dark Mode".to_string(),
-            SeasonalKind::Autumn if is_fr => "Automne Cosy".to_string(),
-            SeasonalKind::Autumn => "Autumn Cozy".to_string(),
-            SeasonalKind::Spring if is_fr => "Printemps — Fresh Cuts".to_string(),
-            SeasonalKind::Spring => "Spring Fresh Cuts".to_string(),
+            SeasonalKind::Holiday => "Holiday Classics & Gems",
+            SeasonalKind::NewYearsEve => "New Year's Eve Party",
+            SeasonalKind::Summer => "Summer Anthems",
+            SeasonalKind::Halloween => "Halloween Dark Mode",
+            SeasonalKind::Autumn => "Autumn Cozy",
+            SeasonalKind::Spring => "Spring Fresh Cuts",
         }
     }
 
-    pub fn subtitle(self, country: Option<&str>) -> String {
-        let is_fr = country.is_some_and(|c| c.eq_ignore_ascii_case("FR"));
+    /// Universal default subtitle for this seasonal pack.
+    pub const fn subtitle(self) -> &'static str {
         match self {
-            SeasonalKind::Noel if is_fr => {
-                "French holiday staples blended with international winter classics".to_string()
-            }
-            SeasonalKind::Noel => {
-                "Festive local favorites and international holiday classics".to_string()
+            SeasonalKind::Holiday => {
+                "Festive local favorites blended with international holiday classics"
             }
             SeasonalKind::NewYearsEve => {
-                "High-energy dance, pop, and party anthems for midnight".to_string()
+                "High-energy dance, pop, and party anthems for midnight"
             }
             SeasonalKind::Summer => {
-                "Sun-soaked local hits, festival anthems, and warm grooves".to_string()
+                "Sun-soaked local hits, festival anthems, and warm grooves"
             }
             SeasonalKind::Halloween => {
-                "Darksynth, post-punk, and spooky classics tuned to your taste".to_string()
+                "Darksynth, post-punk, and spooky classics tuned to your taste"
             }
             SeasonalKind::Autumn => {
-                "Warm acoustic, indie, and mellow folk for crisp evenings".to_string()
+                "Warm acoustic, indie, and mellow folk for crisp evenings"
             }
             SeasonalKind::Spring => {
-                "Fresh releases and upbeat indie cuts across your orbit".to_string()
+                "Fresh releases and upbeat indie cuts across your orbit"
             }
         }
     }
 
     pub fn active_window_label(self) -> &'static str {
         match self {
-            SeasonalKind::Noel => "Nov 20 – Dec 27",
+            SeasonalKind::Holiday => "Nov 20 – Dec 27",
             SeasonalKind::NewYearsEve => "Dec 28 – Jan 2",
             SeasonalKind::Summer => "Jun 1 – Aug 31",
             SeasonalKind::Halloween => "Oct 15 – Nov 1",
@@ -879,7 +876,7 @@ impl SeasonalKind {
 
     pub fn expires_label(self) -> &'static str {
         match self {
-            SeasonalKind::Noel => "Auto-cleans Jan 5 unless kept",
+            SeasonalKind::Holiday => "Auto-cleans Jan 5 unless kept",
             SeasonalKind::NewYearsEve => "Auto-cleans Jan 8 unless kept",
             SeasonalKind::Summer => "Auto-cleans Sep 7 unless kept",
             SeasonalKind::Halloween => "Auto-cleans Nov 8 unless kept",
@@ -890,13 +887,19 @@ impl SeasonalKind {
 
     /// Primary ListenBrainz / MusicBrainz theme tag for this seasonal pack.
     pub fn primary_tag(self) -> &'static str {
+        self.theme_tags()[0]
+    }
+
+    /// Diverse set of theme tags for this seasonal pack so candidate generation
+    /// spans multiple musical moods and styles rather than one narrow genre.
+    pub const fn theme_tags(self) -> &'static [&'static str] {
         match self {
-            SeasonalKind::Noel => "christmas",
-            SeasonalKind::NewYearsEve => "dance",
-            SeasonalKind::Summer => "summer",
-            SeasonalKind::Halloween => "gothic rock",
-            SeasonalKind::Autumn => "acoustic",
-            SeasonalKind::Spring => "indie pop",
+            SeasonalKind::Holiday => &["christmas", "holiday", "winter"],
+            SeasonalKind::NewYearsEve => &["dance", "party", "disco", "funk", "electronic"],
+            SeasonalKind::Summer => &["summer", "tropical", "reggae", "indie", "pop"],
+            SeasonalKind::Halloween => &["halloween", "darkwave", "post-punk", "synthwave"],
+            SeasonalKind::Autumn => &["autumn", "acoustic", "folk", "jazz", "chill"],
+            SeasonalKind::Spring => &["spring", "indie pop", "dream pop", "soul", "bossa nova"],
         }
     }
 }
@@ -921,12 +924,11 @@ impl SeasonalPackSpec {
         culture: &UserCultureProfile,
         steering: CultureSteering,
     ) -> Self {
-        let country = culture.effective_country();
         Self {
             slug: kind.slug().to_string(),
             kind,
-            title: kind.localized_title(country),
-            subtitle: kind.subtitle(country),
+            title: kind.title().to_string(),
+            subtitle: kind.subtitle().to_string(),
             steering,
             local_ratio: steering.effective_ratio(culture.local_culture_ratio),
             exclude_from_core_taste: true,

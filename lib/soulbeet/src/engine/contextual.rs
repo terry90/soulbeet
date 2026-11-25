@@ -2,11 +2,12 @@
 //!
 //! Plugs into `CandidateGenerator` using only MusicBrainz/ListenBrainz (`MusicKnowledge`) and
 //! Deezer's unauthenticated public API (`DeezerClient`). Enforces:
-//! - Zero-config `UserCultureProfile` inference from listening history + artist areas + tags
-//! - Culturally blended Seasonal Packs (local + international + taste-matched wildcards)
+//! - Zero-config `UserCultureProfile` inference from listening history + artist areas + global tags
+//! - Culturally blended Seasonal Packs (local + international + multi-genre taste wildcards)
 //! - Live `CultureSteering` ratio shifts (`MoreLocal` / `Balanced` / `MoreInternational`)
 //! - Strict `exclude_from_core_taste` isolation for seasonal tracks
-//! - Moment Mixes (`Drive`, `Morning`, `Focus`, `LateNight`)
+//! - Artist diversity capping so no single artist dominates a contextual drop
+//! - Moment Mixes (`Drive`, `Morning`, `Focus`, `LateNight`) spanning the user's top genres
 //! - Explainable `reason_label` and `culture_bucket` on every `Candidate`
 
 use std::collections::{HashMap, HashSet};
@@ -14,8 +15,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use shared::recommendation::{
-    Candidate, CandidateSet, CultureBucket, CultureSteering, MomentKind, ProfileConfig,
-    SeasonalKind, SeasonalPackSpec, SourceErrors, TrackRef, UserCultureProfile, UserMusicProfile,
+    discovery_name, Candidate, CandidateSet, CultureBucket, CultureSteering, MomentKind,
+    ProfileConfig, SeasonalKind, SeasonalPackSpec, SourceErrors, TrackRef, UserCultureProfile,
+    UserMusicProfile,
 };
 
 use crate::deezer::{DeezerClient, DeezerTrack};
@@ -23,6 +25,9 @@ use crate::knowledge::KnowledgeError;
 use crate::traits::{CandidateGenerator, GeneratorOutput, MusicKnowledge, TagOp};
 
 use super::merge_signals;
+
+/// Maximum tracks by any single artist allowed in one seasonal or moment drop.
+const MAX_TRACKS_PER_ARTIST: usize = 2;
 
 /// Public regional/seasonal track pool source (backed by `DeezerClient` in production,
 /// stubbed in deterministic fixture tests).
@@ -96,50 +101,188 @@ pub enum ContextSpec {
     },
 }
 
-/// Maps an ISO country code to ListenBrainz folksonomy adjective tag and regional Deezer queries.
-pub fn country_local_tag(country: &str) -> &'static str {
-    match country.trim().to_ascii_uppercase().as_str() {
+/// Maps an ISO-3166 alpha-2 country code to its primary ListenBrainz/MusicBrainz
+/// regional adjective tag. Returns `None` for unrecognized codes so callers fall back
+/// to the user's actual local tags/genres instead of forcing a narrow default.
+pub fn country_local_tag(country: &str) -> Option<&'static str> {
+    Some(match country.trim().to_ascii_uppercase().as_str() {
+        // Europe
         "FR" => "french",
+        "BE" => "belgian",
+        "CH" => "swiss",
         "DE" => "german",
-        "JP" => "japanese",
+        "AT" => "austrian",
+        "GB" | "UK" => "british",
+        "IE" => "irish",
         "ES" => "spanish",
+        "PT" => "portuguese",
         "IT" => "italian",
-        "BR" => "brazilian",
-        "KR" => "korean",
+        "NL" => "dutch",
         "SE" => "swedish",
         "NO" => "norwegian",
-        "GB" => "british",
+        "DK" => "danish",
+        "FI" => "finnish",
+        "IS" => "icelandic",
+        "PL" => "polish",
+        "CZ" => "czech",
+        "HU" => "hungarian",
+        "RO" => "romanian",
+        "GR" => "greek",
+        "TR" => "turkish",
+        "UA" => "ukrainian",
+        "RU" => "russian",
+        "RS" | "HR" | "BA" => "balkan",
+        // Americas
+        "US" => "american",
         "CA" => "canadian",
-        "BE" => "belgian",
-        "PT" => "portuguese",
-        "NL" => "dutch",
-        _ => "indie",
+        "MX" => "mexican",
+        "BR" => "brazilian",
+        "AR" => "argentine",
+        "CO" => "colombian",
+        "CL" => "chilean",
+        "PE" => "peruvian",
+        "CU" => "cuban",
+        "PR" => "puerto rican",
+        "JM" => "jamaican",
+        // Asia & Oceania
+        "JP" => "japanese",
+        "KR" => "korean",
+        "CN" => "chinese",
+        "TW" => "taiwanese",
+        "HK" => "cantopop",
+        "IN" => "indian",
+        "ID" => "indonesian",
+        "TH" => "thai",
+        "VN" => "vietnamese",
+        "PH" => "filipino",
+        "AU" => "australian",
+        "NZ" => "new zealand",
+        // Africa & Middle East
+        "NG" => "nigerian",
+        "GH" => "ghanaian",
+        "ZA" => "south african",
+        "SN" => "senegalese",
+        "ML" => "malian",
+        "ET" => "ethiopian",
+        "EG" => "egyptian",
+        "MA" => "moroccan",
+        "DZ" => "algerian",
+        "TN" => "tunisian",
+        "LB" => "lebanese",
+        "IL" => "israeli",
+        "IR" => "persian",
+        _ => return None,
+    })
+}
+
+/// Regional musical genre/scene keywords associated with an ISO country code, used to
+/// recognize local tags in a user's library without hardcoding a single culture.
+fn country_scene_keywords(country: &str) -> &'static [&'static str] {
+    match country.trim().to_ascii_uppercase().as_str() {
+        "FR" => &["french", "chanson", "french touch"],
+        "JP" => &["japanese", "j-pop", "j-rock", "city pop", "shibuya-kei"],
+        "KR" => &["korean", "k-pop", "k-indie", "k-hip-hop"],
+        "BR" => &["brazilian", "bossa nova", "mpb", "samba", "funk carioca"],
+        "NG" | "GH" => &["afrobeat", "afrobeats", "afropop", "highlife", "nigerian", "ghanaian"],
+        "ZA" => &["amapiano", "gqom", "kwaito", "south african"],
+        "JM" => &["reggae", "dub", "dancehall", "ska", "jamaican"],
+        "ES" => &["spanish", "flamenco", "latin"],
+        "MX" | "CO" | "AR" | "CL" | "PE" | "CU" | "PR" => {
+            &["latin", "cumbia", "salsa", "reggaeton", "corridos", "tango", "bolero"]
+        }
+        "PT" => &["portuguese", "fado"],
+        "IN" => &["indian", "bollywood", "hindustani", "carnatic", "bhangra"],
+        "DE" => &["german", "krautrock", "neue deutsche welle"],
+        "SE" | "NO" | "DK" | "FI" | "IS" => &["nordic", "scandinavian", "swedish", "norwegian", "icelandic"],
+        "DZ" | "MA" | "TN" | "EG" | "LB" => &["arabic", "rai", "raï", "maghreb", "habibi funk"],
+        "CN" | "TW" | "HK" => &["mandopop", "cantopop", "c-pop", "chinese"],
+        _ => &[],
     }
 }
 
-/// Regional Deezer playlist search queries for a seasonal pack + ISO country.
-pub fn seasonal_local_queries(kind: SeasonalKind, country: Option<&str>) -> Vec<&'static str> {
-    let code = country.unwrap_or("").to_ascii_uppercase();
-    match (kind, code.as_str()) {
-        (SeasonalKind::Noel, "FR") => vec!["Chansons de Noël", "Noël Français"],
-        (SeasonalKind::NewYearsEve, "FR") => vec!["Soirée Réveillon", "Hits Français Soirée"],
-        (SeasonalKind::Summer, "FR") => vec!["Été Français", "Soleil French Pop"],
-        (SeasonalKind::Halloween, "FR") => vec!["Halloween France", "Darksynth"],
-        (SeasonalKind::Autumn, "FR") => vec!["Automne Chanson Française", "French Indie Chill"],
-        (SeasonalKind::Spring, "FR") => vec!["Nouveautés Françaises", "French Indie Pop"],
-        (SeasonalKind::Noel, _) => vec!["Christmas Classics", "Holiday Hits"],
-        (SeasonalKind::NewYearsEve, _) => vec!["New Years Eve Party", "Dance Anthems"],
-        (SeasonalKind::Summer, _) => vec!["Summer Hits", "Indie Summer"],
-        (SeasonalKind::Halloween, _) => vec!["Halloween Party", "Spooky Classics"],
-        (SeasonalKind::Autumn, _) => vec!["Autumn Acoustic", "Cozy Indie"],
-        (SeasonalKind::Spring, _) => vec!["Spring Indie", "Fresh Pop"],
+/// Default preferred language list inferred from an ISO-3166 country code when the user
+/// has not explicitly configured languages.
+fn country_default_languages(country: &str) -> Vec<String> {
+    let primary = match country.trim().to_ascii_uppercase().as_str() {
+        "FR" | "BE" | "CH" | "SN" | "ML" => Some("fr"),
+        "DE" | "AT" => Some("de"),
+        "ES" | "MX" | "AR" | "CO" | "CL" | "PE" | "CU" | "PR" => Some("es"),
+        "IT" => Some("it"),
+        "PT" | "BR" => Some("pt"),
+        "NL" => Some("nl"),
+        "SE" => Some("sv"),
+        "NO" => Some("no"),
+        "DK" => Some("da"),
+        "FI" => Some("fi"),
+        "IS" => Some("is"),
+        "PL" => Some("pl"),
+        "TR" => Some("tr"),
+        "GR" => Some("el"),
+        "UA" => Some("uk"),
+        "RU" => Some("ru"),
+        "JP" => Some("ja"),
+        "KR" => Some("ko"),
+        "CN" | "TW" | "HK" => Some("zh"),
+        "IN" => Some("hi"),
+        "ID" => Some("id"),
+        "TH" => Some("th"),
+        "VN" => Some("vi"),
+        "EG" | "MA" | "DZ" | "TN" | "LB" => Some("ar"),
+        "IR" => Some("fa"),
+        _ => None,
+    };
+    match primary {
+        Some(lang) => vec![lang.to_string(), "en".to_string()],
+        None => vec!["en".to_string()],
     }
+}
+
+/// Dynamically builds diverse regional Deezer playlist search queries from the user's
+/// country adjective and inferred local tags combined with the seasonal theme.
+pub fn seasonal_local_queries(
+    kind: SeasonalKind,
+    country: Option<&str>,
+    local_tags: &[String],
+) -> Vec<String> {
+    let theme = match kind {
+        SeasonalKind::Holiday => "christmas",
+        SeasonalKind::NewYearsEve => "party",
+        SeasonalKind::Summer => "summer",
+        SeasonalKind::Halloween => "halloween",
+        SeasonalKind::Autumn => "autumn",
+        SeasonalKind::Spring => "spring",
+    };
+
+    let mut queries = Vec::new();
+    let mut push_unique = |candidate: String| {
+        if !candidate.trim().is_empty()
+            && !queries.iter().any(|q: &String| q.eq_ignore_ascii_case(&candidate))
+        {
+            queries.push(candidate);
+        }
+    };
+
+    if let Some(code) = country.filter(|c| !c.trim().is_empty()) {
+        if let Some(adj) = country_local_tag(code) {
+            push_unique(format!("{adj} {theme}"));
+        }
+    }
+    for tag in local_tags.iter().take(2) {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            push_unique(format!("{trimmed} {theme}"));
+        }
+    }
+    if queries.is_empty() {
+        queries.push(seasonal_international_query(kind).to_string());
+    }
+    queries
 }
 
 /// Global Deezer playlist search query for international classics in a seasonal pack.
 pub fn seasonal_international_query(kind: SeasonalKind) -> &'static str {
     match kind {
-        SeasonalKind::Noel => "Christmas Hits",
+        SeasonalKind::Holiday => "Christmas Hits",
         SeasonalKind::NewYearsEve => "Party Hits",
         SeasonalKind::Summer => "Summer Anthems",
         SeasonalKind::Halloween => "Halloween Classics",
@@ -149,7 +292,7 @@ pub fn seasonal_international_query(kind: SeasonalKind) -> &'static str {
 }
 
 /// Infers a zero-config `UserCultureProfile` from the user's listening profile + MusicBrainz
-/// artist areas (`MusicKnowledge::artist_areas`) + artist tags.
+/// artist areas (`MusicKnowledge::artist_areas`) + artist folksonomy tags.
 pub async fn infer_culture_profile(
     profile: &UserMusicProfile,
     knowledge: &dyn MusicKnowledge,
@@ -183,25 +326,54 @@ pub async fn infer_culture_profile(
         }
     }
 
-    // Also inspect folksonomy genre tags for regional hints when areas are sparse.
-    let mut tag_country_hints: Vec<(&str, &str)> = vec![
+    // Broad global folksonomy hints when artist MBID areas are sparse.
+    const TAG_COUNTRY_HINTS: &[(&str, &str)] = &[
         ("french", "FR"),
         ("chanson", "FR"),
         ("japanese", "JP"),
         ("j-pop", "JP"),
+        ("city pop", "JP"),
+        ("korean", "KR"),
+        ("k-pop", "KR"),
         ("german", "DE"),
+        ("krautrock", "DE"),
         ("spanish", "ES"),
+        ("flamenco", "ES"),
         ("italian", "IT"),
         ("brazilian", "BR"),
-        ("k-pop", "KR"),
-        ("korean", "KR"),
+        ("bossa nova", "BR"),
+        ("mpb", "BR"),
+        ("portuguese", "PT"),
+        ("fado", "PT"),
         ("swedish", "SE"),
+        ("norwegian", "NO"),
+        ("icelandic", "IS"),
+        ("dutch", "NL"),
+        ("polish", "PL"),
+        ("turkish", "TR"),
+        ("greek", "GR"),
+        ("afrobeat", "NG"),
+        ("afrobeats", "NG"),
+        ("amapiano", "ZA"),
+        ("reggae", "JM"),
+        ("dub", "JM"),
+        ("bollywood", "IN"),
+        ("mandopop", "TW"),
+        ("cantopop", "HK"),
+        ("cumbia", "CO"),
+        ("tango", "AR"),
+        ("mariachi", "MX"),
+        ("raï", "DZ"),
+        ("balkan", "RS"),
+        ("australian", "AU"),
+        ("canadian", "CA"),
+        ("british", "GB"),
+        ("irish", "IE"),
     ];
-    tag_country_hints.shrink_to_fit();
 
     for wt in &profile.genre_distribution {
         let lower = wt.name.to_ascii_lowercase();
-        for (needle, code) in &tag_country_hints {
+        for (needle, code) in TAG_COUNTRY_HINTS {
             if lower.contains(needle) {
                 *country_scores.entry((*code).to_string()).or_default() += wt.weight * 10.0;
             }
@@ -231,15 +403,15 @@ pub async fn infer_culture_profile(
         .or_else(|| inferred_area_weights.first().map(|(c, _)| c.clone()));
 
     let inferred_local_tags = if let Some(ref country) = effective_country {
-        let needle = country_local_tag(country);
+        let adj = country_local_tag(country);
+        let scene = country_scene_keywords(country);
         let mut tags: Vec<String> = profile
             .genre_distribution
             .iter()
             .filter(|t| {
                 let lower = t.name.to_ascii_lowercase();
-                lower.contains(needle)
-                    || (country == "FR" && lower.contains("chanson"))
-                    || (country == "JP" && (lower.contains("j-pop") || lower.contains("city pop")))
+                adj.is_some_and(|needle| lower.contains(needle))
+                    || scene.iter().any(|kw| lower.contains(kw))
             })
             .map(|t| t.name.clone())
             .collect();
@@ -252,17 +424,7 @@ pub async fn infer_culture_profile(
     let preferred_languages = if !explicit_languages.is_empty() {
         explicit_languages
     } else if let Some(ref country) = effective_country {
-        let lang = match country.as_str() {
-            "FR" | "BE" | "CH" => vec!["fr".to_string(), "en".to_string()],
-            "DE" | "AT" => vec!["de".to_string(), "en".to_string()],
-            "ES" | "MX" | "AR" => vec!["es".to_string(), "en".to_string()],
-            "IT" => vec!["it".to_string(), "en".to_string()],
-            "JP" => vec!["ja".to_string(), "en".to_string()],
-            "BR" | "PT" => vec!["pt".to_string(), "en".to_string()],
-            "KR" => vec!["ko".to_string(), "en".to_string()],
-            _ => vec!["en".to_string()],
-        };
-        lang
+        country_default_languages(country)
     } else {
         vec!["en".to_string()]
     };
@@ -297,13 +459,55 @@ pub fn seasonal_bucket_quotas(
         return (0, 0, 0);
     }
     let effective_local = steering.effective_ratio(base_local_ratio);
-    let wildcard = ((target_count as f32) * 0.15).round() as usize;
+    let wildcard = ((target_count as f32) * 0.20).round() as usize;
     let wildcard = wildcard.min(target_count.saturating_sub(1));
     let remaining_after_wildcard = target_count.saturating_sub(wildcard);
     let local = (((target_count as f32) * effective_local).round() as usize)
         .min(remaining_after_wildcard);
     let international = target_count.saturating_sub(local + wildcard);
     (local, international, wildcard)
+}
+
+/// Selects up to `quota` candidates from `pool` while enforcing a per-artist cap across
+/// `artist_counts` so no single artist monopolizes a drop.
+fn take_diverse(
+    pool: Vec<Candidate>,
+    quota: usize,
+    artist_counts: &mut HashMap<String, usize>,
+) -> Vec<Candidate> {
+    let mut picked = Vec::with_capacity(quota);
+    for c in pool {
+        if picked.len() >= quota {
+            break;
+        }
+        let artist_key = discovery_name(&c.artist);
+        let count = artist_counts.entry(artist_key).or_insert(0);
+        if *count >= MAX_TRACKS_PER_ARTIST {
+            continue;
+        }
+        *count += 1;
+        picked.push(c);
+    }
+    picked
+}
+
+/// Interleaves multiple candidate lists round-robin so diverse sources/genres appear evenly.
+fn interleave<T>(lists: Vec<Vec<T>>) -> Vec<T> {
+    let mut iters: Vec<std::vec::IntoIter<T>> = lists.into_iter().map(IntoIterator::into_iter).collect();
+    let mut out = Vec::new();
+    loop {
+        let mut progressed = false;
+        for it in &mut iters {
+            if let Some(item) = it.next() {
+                out.push(item);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
 }
 
 /// Contextual candidate generator supporting Seasonal Packs (culturally blended) and Moment Mixes.
@@ -330,7 +534,13 @@ impl ContextualCandidateGenerator {
         }
     }
 
-    fn is_excluded(&self, profile: &UserMusicProfile, artist: &str, track: &str, mbid: Option<&str>) -> bool {
+    fn is_excluded(
+        &self,
+        profile: &UserMusicProfile,
+        artist: &str,
+        track: &str,
+        mbid: Option<&str>,
+    ) -> bool {
         let key = CandidateSet::key(artist, track);
         if self.rejected_keys.contains(&key) {
             return true;
@@ -346,6 +556,7 @@ impl ContextualCandidateGenerator {
         profile.known.knows_track(&tr)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_candidate(
         artist: String,
         track: String,
@@ -374,6 +585,23 @@ impl ContextualCandidateGenerator {
         }
     }
 
+    fn user_top_genres(profile: &UserMusicProfile, limit: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for g in profile
+            .tag_comfort_zone
+            .iter()
+            .chain(profile.genre_distribution.iter().map(|t| &t.name))
+        {
+            if !out.iter().any(|existing| existing.eq_ignore_ascii_case(g)) {
+                out.push(g.clone());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     async fn generate_seasonal(
         &self,
         profile: &UserMusicProfile,
@@ -383,29 +611,28 @@ impl ContextualCandidateGenerator {
     ) -> GeneratorOutput {
         let mut errors = SourceErrors::default();
         let country = culture.effective_country();
-        let local_tag = country.map(country_local_tag).unwrap_or("indie");
-        let holiday_tag = pack.kind.primary_tag();
+        let theme_tags = pack.kind.theme_tags();
+        let primary_tag = pack.kind.primary_tag();
         let (local_quota, intl_quota, wildcard_quota) =
             seasonal_bucket_quotas(target_count, pack.steering, culture.local_culture_ratio);
 
-        let local_label = match (pack.kind, country) {
-            (SeasonalKind::Noel, Some("FR")) => "FRENCH NOËL PICK".to_string(),
-            (SeasonalKind::Noel, Some(c)) => format!("{c} HOLIDAY PICK"),
-            (_, Some(c)) => format!("{c} {} PICK", pack.kind.slug().to_ascii_uppercase()),
-            (_, None) => format!("{} LOCAL PICK", pack.kind.slug().to_ascii_uppercase()),
+        let slug_upper = pack.kind.slug().to_ascii_uppercase();
+        let local_label = match country {
+            Some(c) => format!("{c} {slug_upper} PICK"),
+            None => format!("{slug_upper} LOCAL PICK"),
         };
-        let intl_label = match pack.kind {
-            SeasonalKind::Noel => "INTERNATIONAL NOËL CLASSIC".to_string(),
-            _ => format!("INTERNATIONAL {} CLASSIC", pack.kind.slug().to_ascii_uppercase()),
-        };
+        let intl_label = format!("INTERNATIONAL {slug_upper} CLASSIC");
 
-        // 1. Local pool: Deezer regional playlists + ListenBrainz multi-tag (holiday AND local_tag)
-        let mut local_pool: Vec<Candidate> = Vec::new();
         let mut seen_keys: HashSet<String> = HashSet::new();
 
+        // 1. Local pool: dynamic regional Deezer playlists + ListenBrainz multi-tag across
+        //    the user's country adjective & inferred local tags.
+        let mut local_streams: Vec<Vec<Candidate>> = Vec::new();
+
         if let Some(ref pools) = self.pools {
-            for query in seasonal_local_queries(pack.kind, country) {
-                match pools.search_playlist_tracks(query, 2, 25).await {
+            for query in seasonal_local_queries(pack.kind, country, &culture.inferred_local_tags) {
+                let mut stream = Vec::new();
+                match pools.search_playlist_tracks(&query, 2, 25).await {
                     Ok(tracks) => {
                         for (idx, t) in tracks.into_iter().enumerate() {
                             if self.is_excluded(profile, &t.artist, &t.title, None) {
@@ -414,7 +641,7 @@ impl ContextualCandidateGenerator {
                             let key = CandidateSet::key(&t.artist, &t.title);
                             if seen_keys.insert(key) {
                                 let score = 1.0 / (1.0 + idx as f64 * 0.08);
-                                local_pool.push(Self::make_candidate(
+                                stream.push(Self::make_candidate(
                                     t.artist,
                                     t.title,
                                     None,
@@ -430,77 +657,100 @@ impl ContextualCandidateGenerator {
                     }
                     Err(e) => errors.record(e.service(), e),
                 }
+                if !stream.is_empty() {
+                    local_streams.push(stream);
+                }
             }
         }
 
-        match self
-            .knowledge
-            .multi_tag_tracks(&[holiday_tag, local_tag], TagOp::And, None, local_quota.max(15))
-            .await
-        {
-            Ok(tracks) => {
-                for (idx, tr) in tracks.into_iter().enumerate() {
-                    if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref()) {
-                        continue;
-                    }
-                    let key = CandidateSet::key(&tr.artist.name, &tr.title);
-                    if seen_keys.insert(key) {
-                        let score = 0.95 / (1.0 + idx as f64 * 0.08);
-                        local_pool.push(Self::make_candidate(
-                            tr.artist.name,
-                            tr.title,
-                            tr.mbid,
-                            tr.artist.mbid,
-                            score,
-                            "seasonal_local_lb",
-                            "contextual",
-                            local_label.clone(),
-                            CultureBucket::Local,
-                        ));
-                    }
-                }
-            }
-            Err(e) => errors.record(e.service(), e),
+        let mut regional_tags: Vec<String> = Vec::new();
+        if let Some(adj) = country.and_then(country_local_tag) {
+            regional_tags.push(adj.to_string());
         }
-
-        // 2. International classics pool: ListenBrainz popular holiday + Deezer global playlist/chart
-        let mut intl_pool: Vec<Candidate> = Vec::new();
-        match self
-            .knowledge
-            .multi_tag_tracks(
-                &[holiday_tag],
-                TagOp::And,
-                Some((65, 100)),
-                intl_quota.max(15),
-            )
-            .await
-        {
-            Ok(tracks) => {
-                for (idx, tr) in tracks.into_iter().enumerate() {
-                    if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref()) {
-                        continue;
-                    }
-                    let key = CandidateSet::key(&tr.artist.name, &tr.title);
-                    if seen_keys.insert(key) {
-                        let score = 1.0 / (1.0 + idx as f64 * 0.08);
-                        intl_pool.push(Self::make_candidate(
-                            tr.artist.name,
-                            tr.title,
-                            tr.mbid,
-                            tr.artist.mbid,
-                            score,
-                            "seasonal_intl_lb",
-                            "contextual",
-                            intl_label.clone(),
-                            CultureBucket::International,
-                        ));
+        for lt in culture.inferred_local_tags.iter().take(2) {
+            if !regional_tags.iter().any(|t| t.eq_ignore_ascii_case(lt)) {
+                regional_tags.push(lt.clone());
+            }
+        }
+        for regional in &regional_tags {
+            let mut stream = Vec::new();
+            match self
+                .knowledge
+                .multi_tag_tracks(&[primary_tag, regional.as_str()], TagOp::And, None, local_quota.max(15))
+                .await
+            {
+                Ok(tracks) => {
+                    for (idx, tr) in tracks.into_iter().enumerate() {
+                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref())
+                        {
+                            continue;
+                        }
+                        let key = CandidateSet::key(&tr.artist.name, &tr.title);
+                        if seen_keys.insert(key) {
+                            let score = 0.95 / (1.0 + idx as f64 * 0.08);
+                            stream.push(Self::make_candidate(
+                                tr.artist.name,
+                                tr.title,
+                                tr.mbid,
+                                tr.artist.mbid,
+                                score,
+                                "seasonal_local_lb",
+                                "contextual",
+                                local_label.clone(),
+                                CultureBucket::Local,
+                            ));
+                        }
                     }
                 }
+                Err(e) => errors.record(e.service(), e),
             }
-            Err(e) => errors.record(e.service(), e),
+            if !stream.is_empty() {
+                local_streams.push(stream);
+            }
+        }
+        let local_pool = interleave(local_streams);
+
+        // 2. International classics pool: blend across multiple seasonal theme tags + global playlists
+        let mut intl_streams: Vec<Vec<Candidate>> = Vec::new();
+        for theme_tag in theme_tags.iter().take(2) {
+            let mut stream = Vec::new();
+            match self
+                .knowledge
+                .multi_tag_tracks(&[theme_tag], TagOp::And, Some((60, 100)), intl_quota.max(15))
+                .await
+            {
+                Ok(tracks) => {
+                    for (idx, tr) in tracks.into_iter().enumerate() {
+                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref())
+                        {
+                            continue;
+                        }
+                        let key = CandidateSet::key(&tr.artist.name, &tr.title);
+                        if seen_keys.insert(key) {
+                            let score = 1.0 / (1.0 + idx as f64 * 0.08);
+                            stream.push(Self::make_candidate(
+                                tr.artist.name,
+                                tr.title,
+                                tr.mbid,
+                                tr.artist.mbid,
+                                score,
+                                "seasonal_intl_lb",
+                                "contextual",
+                                intl_label.clone(),
+                                CultureBucket::International,
+                            ));
+                        }
+                    }
+                }
+                Err(e) => errors.record(e.service(), e),
+            }
+            if !stream.is_empty() {
+                intl_streams.push(stream);
+            }
         }
 
         if let Some(ref pools) = self.pools {
+            let mut stream = Vec::new();
             match pools
                 .search_playlist_tracks(seasonal_international_query(pack.kind), 2, 25)
                 .await
@@ -513,7 +763,7 @@ impl ContextualCandidateGenerator {
                         let key = CandidateSet::key(&t.artist, &t.title);
                         if seen_keys.insert(key) {
                             let score = 0.9 / (1.0 + idx as f64 * 0.08);
-                            intl_pool.push(Self::make_candidate(
+                            stream.push(Self::make_candidate(
                                 t.artist,
                                 t.title,
                                 None,
@@ -529,36 +779,48 @@ impl ContextualCandidateGenerator {
                 }
                 Err(e) => errors.record(e.service(), e),
             }
+            if !stream.is_empty() {
+                intl_streams.push(stream);
+            }
         }
+        let intl_pool = interleave(intl_streams);
 
-        // 3. Taste-matched seasonal wildcards (holiday AND user's top comfort genre)
-        let mut wildcard_pool: Vec<Candidate> = Vec::new();
-        let top_genre = profile
-            .tag_comfort_zone
-            .first()
-            .or_else(|| profile.genre_distribution.first().map(|t| &t.name))
-            .map(String::as_str);
-
-        if let Some(genre) = top_genre {
-            let reason = format!(
-                "{} × {}",
-                pack.kind.slug().to_ascii_uppercase(),
-                genre.to_ascii_uppercase()
-            );
+        // 3. Taste-matched seasonal wildcards across up to 3 of the user's top genres,
+        //    prioritizing genres not already queried in `regional_tags` so wildcards add
+        //    genuinely fresh musical facets instead of duplicating the local pool.
+        let mut top_genres = Self::user_top_genres(profile, 6);
+        top_genres.sort_by_key(|g| {
+            usize::from(
+                regional_tags
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(g)),
+            )
+        });
+        top_genres.truncate(3);
+        let mut wildcard_streams: Vec<Vec<Candidate>> = Vec::new();
+        for genre in &top_genres {
+            let reason = format!("{slug_upper} × {}", genre.to_ascii_uppercase());
+            let mut stream = Vec::new();
             match self
                 .knowledge
-                .multi_tag_tracks(&[holiday_tag, genre], TagOp::And, None, wildcard_quota.max(10))
+                .multi_tag_tracks(
+                    &[primary_tag, genre.as_str()],
+                    TagOp::And,
+                    None,
+                    wildcard_quota.max(8),
+                )
                 .await
             {
                 Ok(tracks) => {
                     for (idx, tr) in tracks.into_iter().enumerate() {
-                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref()) {
+                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref())
+                        {
                             continue;
                         }
                         let key = CandidateSet::key(&tr.artist.name, &tr.title);
                         if seen_keys.insert(key) {
                             let score = 0.92 / (1.0 + idx as f64 * 0.1);
-                            wildcard_pool.push(Self::make_candidate(
+                            stream.push(Self::make_candidate(
                                 tr.artist.name,
                                 tr.title,
                                 tr.mbid,
@@ -574,20 +836,25 @@ impl ContextualCandidateGenerator {
                 }
                 Err(e) => errors.record(e.service(), e),
             }
+            if !stream.is_empty() {
+                wildcard_streams.push(stream);
+            }
         }
+        let wildcard_pool = interleave(wildcard_streams);
 
-        // Assemble final quota-enforced sets.
+        // Assemble final quota-enforced sets with per-artist diversity capping.
+        let mut artist_counts: HashMap<String, usize> = HashMap::new();
         let mut local_set = CandidateSet::new();
         let mut intl_set = CandidateSet::new();
         let mut wildcard_set = CandidateSet::new();
 
-        for c in local_pool.into_iter().take(local_quota) {
+        for c in take_diverse(local_pool, local_quota, &mut artist_counts) {
             local_set.insert(c);
         }
-        for c in intl_pool.into_iter().take(intl_quota) {
+        for c in take_diverse(intl_pool, intl_quota, &mut artist_counts) {
             intl_set.insert(c);
         }
-        for c in wildcard_pool.into_iter().take(wildcard_quota) {
+        for c in take_diverse(wildcard_pool, wildcard_quota, &mut artist_counts) {
             wildcard_set.insert(c);
         }
 
@@ -611,41 +878,57 @@ impl ContextualCandidateGenerator {
         target_count: usize,
     ) -> GeneratorOutput {
         let mut errors = SourceErrors::default();
-        let mut set = CandidateSet::new();
         let reason = format!("{} PICK", kind.title().to_ascii_uppercase());
-        let top_genre = profile.tag_comfort_zone.first().map(String::as_str);
+        let top_genres = Self::user_top_genres(profile, 3);
+        let mut streams: Vec<Vec<Candidate>> = Vec::new();
+        let mut seen_keys: HashSet<String> = HashSet::new();
 
-        for mood_tag in kind.mood_tags() {
-            let query_tags: Vec<&str> = match top_genre {
+        for (i, mood_tag) in kind.mood_tags().iter().enumerate() {
+            let paired_genre = top_genres.get(i % top_genres.len().max(1)).map(String::as_str);
+            let query_tags: Vec<&str> = match paired_genre {
                 Some(g) if !g.eq_ignore_ascii_case(mood_tag) => vec![mood_tag, g],
                 _ => vec![mood_tag],
             };
+            let mut stream = Vec::new();
             match self
                 .knowledge
-                .multi_tag_tracks(&query_tags, TagOp::Or, None, target_count.max(10))
+                .multi_tag_tracks(&query_tags, TagOp::And, None, target_count.max(10))
                 .await
             {
                 Ok(tracks) => {
                     for (idx, tr) in tracks.into_iter().enumerate() {
-                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref()) {
+                        if self.is_excluded(profile, &tr.artist.name, &tr.title, tr.mbid.as_deref())
+                        {
                             continue;
                         }
-                        let score = 1.0 / (1.0 + idx as f64 * 0.08);
-                        set.insert(Self::make_candidate(
-                            tr.artist.name,
-                            tr.title,
-                            tr.mbid,
-                            tr.artist.mbid,
-                            score,
-                            "moment_mood_tags",
-                            "contextual",
-                            reason.clone(),
-                            CultureBucket::TasteWildcard,
-                        ));
+                        let key = CandidateSet::key(&tr.artist.name, &tr.title);
+                        if seen_keys.insert(key) {
+                            let score = 1.0 / (1.0 + idx as f64 * 0.08);
+                            stream.push(Self::make_candidate(
+                                tr.artist.name,
+                                tr.title,
+                                tr.mbid,
+                                tr.artist.mbid,
+                                score,
+                                "moment_mood_tags",
+                                "contextual",
+                                reason.clone(),
+                                CultureBucket::TasteWildcard,
+                            ));
+                        }
                     }
                 }
                 Err(e) => errors.record(e.service(), e),
             }
+            if !stream.is_empty() {
+                streams.push(stream);
+            }
+        }
+
+        let mut artist_counts: HashMap<String, usize> = HashMap::new();
+        let mut set = CandidateSet::new();
+        for c in take_diverse(interleave(streams), target_count.max(1), &mut artist_counts) {
+            set.insert(c);
         }
 
         let (candidates, signals) = merge_signals(vec![("moment_mood", set)]);
@@ -727,57 +1010,82 @@ mod tests {
         }
     }
 
-    fn french_profile() -> UserMusicProfile {
+    fn eclectic_profile() -> UserMusicProfile {
         UserMusicProfile {
             genre_distribution: vec![
-                tag("french electro", 0.5),
-                tag("chanson", 0.3),
-                tag("indie rock", 0.2),
+                tag("city pop", 0.35),
+                tag("bossa nova", 0.25),
+                tag("indie rock", 0.20),
+                tag("jazz", 0.20),
             ],
-            tag_comfort_zone: vec!["french electro".into(), "indie rock".into()],
+            tag_comfort_zone: vec![
+                "city pop".into(),
+                "bossa nova".into(),
+                "indie rock".into(),
+                "jazz".into(),
+            ],
             seed_artists: vec![
-                played("Daft Punk", Some("mb-daft"), 80),
-                played("Air", Some("mb-air"), 60),
+                played("Tatsuro Yamashita", Some("mb-tatsuro"), 80),
+                played("Mariya Takeuchi", Some("mb-mariya"), 60),
                 played("Radiohead", Some("mb-radiohead"), 40),
             ],
             ..Default::default()
         }
     }
 
-    fn build_noel_fixtures() -> (Arc<FakeKnowledge>, Arc<FakePoolSource>) {
+    fn build_holiday_fixtures() -> (Arc<FakeKnowledge>, Arc<FakePoolSource>) {
         let mut kb = FakeKnowledge::default();
-        kb.areas.insert("mb-daft", Some("FR".into()));
-        kb.areas.insert("mb-air", Some("FR".into()));
+        kb.areas.insert("mb-tatsuro", Some("JP".into()));
+        kb.areas.insert("mb-mariya", Some("JP".into()));
         kb.areas.insert("mb-radiohead", Some("GB".into()));
 
-        // Local LB tracks (christmas AND french)
-        let local_lb: Vec<TrackRef> = (1..=12)
-            .map(|i| track(&format!("Artiste FR {i}"), None, &format!("Noël FR {i}"), None))
+        // Local LB tracks (christmas AND japanese)
+        let local_lb: Vec<TrackRef> = (1..=14)
+            .map(|i| track(&format!("JP Artist {i}"), None, &format!("Winter JP {i}"), None))
             .collect();
         kb.multi_tag_tracks
-            .insert("AND:christmas+french".into(), local_lb);
+            .insert("AND:christmas+japanese".into(), local_lb);
 
-        // International LB classics (christmas)
-        let intl_lb: Vec<TrackRef> = (1..=15)
-            .map(|i| track(&format!("Global Artist {i}"), None, &format!("Xmas Classic {i}"), None))
+        // International LB classics (christmas + holiday)
+        let intl_lb: Vec<TrackRef> = (1..=16)
+            .map(|i| track(&format!("Global Artist {i}"), None, &format!("Holiday Classic {i}"), None))
             .collect();
         kb.multi_tag_tracks
             .insert("AND:christmas".into(), intl_lb);
 
-        // Taste-matched wildcards (christmas AND french electro)
-        let wildcards: Vec<TrackRef> = (1..=6)
-            .map(|i| track(&format!("Electro Xmas {i}"), None, &format!("Synth Snow {i}"), None))
-            .collect();
-        kb.multi_tag_tracks
-            .insert("AND:christmas+french electro".into(), wildcards);
+        // Taste-matched wildcards across multiple user genres
+        kb.multi_tag_tracks.insert(
+            "AND:christmas+city pop".into(),
+            (1..=4)
+                .map(|i| track(&format!("CityPop Winter {i}"), None, &format!("Neon Snow {i}"), None))
+                .collect(),
+        );
+        kb.multi_tag_tracks.insert(
+            "AND:christmas+bossa nova".into(),
+            (1..=4)
+                .map(|i| track(&format!("Bossa Winter {i}"), None, &format!("Rio Snow {i}"), None))
+                .collect(),
+        );
+        kb.multi_tag_tracks.insert(
+            "AND:christmas+indie rock".into(),
+            (1..=4)
+                .map(|i| track(&format!("Indie Winter {i}"), None, &format!("Fuzzy Snow {i}"), None))
+                .collect(),
+        );
+        kb.multi_tag_tracks.insert(
+            "AND:christmas+jazz".into(),
+            (1..=4)
+                .map(|i| track(&format!("Jazz Winter {i}"), None, &format!("Velvet Snow {i}"), None))
+                .collect(),
+        );
 
         let mut playlists = HashMap::new();
         playlists.insert(
-            "Chansons de Noël".into(),
+            "japanese christmas".into(),
             (1..=6)
                 .map(|i| DeezerTrack {
-                    artist: format!("Chanteur {i}"),
-                    title: format!("Petit Papa {i}"),
+                    artist: format!("Tokyo Singer {i}"),
+                    title: format!("Snow Lights {i}"),
                 })
                 .collect(),
         );
@@ -786,31 +1094,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn infers_french_culture_profile_from_artist_areas_and_tags() {
-        let (kb, _) = build_noel_fixtures();
-        let profile = french_profile();
+    async fn infers_global_culture_profile_from_artist_areas_and_tags() {
+        let (kb, _) = build_holiday_fixtures();
+        let profile = eclectic_profile();
         let culture = infer_culture_profile(&profile, kb.as_ref(), None, vec![], 0.45).await;
 
-        assert_eq!(culture.effective_country(), Some("FR"));
-        assert!(culture.inferred_area_weights[0].0 == "FR");
-        assert!(culture.inferred_area_weights[0].1 > 0.65);
-        assert!(culture.preferred_languages.contains(&"fr".to_string()));
+        assert_eq!(culture.effective_country(), Some("JP"));
+        assert_eq!(culture.inferred_area_weights[0].0, "JP");
+        assert!(culture.preferred_languages.contains(&"ja".to_string()));
         assert!(culture
             .inferred_local_tags
             .iter()
-            .any(|t| t == "french electro"));
+            .any(|t| t == "city pop"));
+
+        // Global coverage across continents (Africa, Latin America, Europe, Asia)
+        assert_eq!(country_local_tag("NG"), Some("nigerian"));
+        assert_eq!(country_local_tag("BR"), Some("brazilian"));
+        assert_eq!(country_local_tag("FR"), Some("french"));
+        assert_eq!(country_local_tag("IS"), Some("icelandic"));
+        assert_eq!(country_local_tag("ZZ"), None);
     }
 
     #[tokio::test]
-    async fn noel_pack_enforces_bucket_quotas_and_steering_shifts() {
-        let (kb, pools) = build_noel_fixtures();
-        let profile = french_profile();
+    async fn holiday_pack_enforces_quotas_steering_and_multi_genre_wildcard_diversity() {
+        let (kb, pools) = build_holiday_fixtures();
+        let profile = eclectic_profile();
         let culture = UserCultureProfile {
-            home_country: Some("FR".into()),
-            preferred_languages: vec!["fr".into(), "en".into()],
+            home_country: Some("JP".into()),
+            preferred_languages: vec!["ja".into(), "en".into()],
             local_culture_ratio: 0.45,
-            inferred_area_weights: vec![("FR".into(), 0.78), ("GB".into(), 0.22)],
-            inferred_local_tags: vec!["french electro".into()],
+            inferred_area_weights: vec![("JP".into(), 0.78), ("GB".into(), 0.22)],
+            inferred_local_tags: vec!["city pop".into()],
         };
 
         let run_with = |steering: CultureSteering| {
@@ -819,9 +1133,9 @@ mod tests {
             let profile = profile.clone();
             let culture = culture.clone();
             async move {
-                let pack = SeasonalPackSpec::for_kind(SeasonalKind::Noel, &culture, steering);
+                let pack = SeasonalPackSpec::for_kind(SeasonalKind::Holiday, &culture, steering);
                 assert!(pack.exclude_from_core_taste);
-                assert_eq!(pack.title, "Noël à la Française");
+                assert_eq!(pack.title, "Holiday Classics & Gems");
                 let gen = ContextualCandidateGenerator::new(
                     ContextSpec::Seasonal {
                         pack,
@@ -842,41 +1156,53 @@ mod tests {
                     .iter()
                     .filter(|c| c.culture_bucket == Some(CultureBucket::International))
                     .count();
+                let wildcard_reasons: HashSet<String> = items
+                    .iter()
+                    .filter(|c| c.culture_bucket == Some(CultureBucket::TasteWildcard))
+                    .filter_map(|c| c.reason_label.clone())
+                    .collect();
                 let wildcard = items
                     .iter()
                     .filter(|c| c.culture_bucket == Some(CultureBucket::TasteWildcard))
                     .count();
                 assert!(items.iter().all(|c| c.reason_label.is_some()));
-                (local, intl, wildcard)
+                (local, intl, wildcard, wildcard_reasons)
             }
         };
 
-        // Balanced (0.45 * 20 = 9 local, 0.15 * 20 = 3 wildcard, 8 intl)
-        let (bal_local, bal_intl, bal_wild) = run_with(CultureSteering::Balanced).await;
-        assert_eq!((bal_local, bal_intl, bal_wild), (9, 8, 3));
+        // Balanced (0.45 * 20 = 9 local, 0.20 * 20 = 4 wildcard, 7 intl)
+        let (bal_local, bal_intl, bal_wild, wild_reasons) =
+            run_with(CultureSteering::Balanced).await;
+        assert_eq!((bal_local, bal_intl, bal_wild), (9, 7, 4));
+        // Wildcards span all 3 of the user's top genres (city pop, bossa nova, indie rock)
+        assert_eq!(
+            wild_reasons.len(),
+            3,
+            "expected wildcards across 3 genres, got {wild_reasons:?}"
+        );
 
-        // MoreLocal (0.70 * 20 = 14 local, 3 wildcard, 3 intl)
-        let (more_local, more_local_intl, _) = run_with(CultureSteering::MoreLocal).await;
-        assert_eq!((more_local, more_local_intl), (14, 3));
+        // MoreLocal (0.70 * 20 = 14 local, 4 wildcard, 2 intl)
+        let (more_local, more_local_intl, _, _) = run_with(CultureSteering::MoreLocal).await;
+        assert_eq!((more_local, more_local_intl), (14, 2));
         assert!(more_local > bal_local);
 
-        // MoreInternational (0.20 * 20 = 4 local, 3 wildcard, 13 intl)
-        let (less_local, more_intl, _) = run_with(CultureSteering::MoreInternational).await;
-        assert_eq!((less_local, more_intl), (4, 13));
+        // MoreInternational (0.20 * 20 = 4 local, 4 wildcard, 12 intl)
+        let (less_local, more_intl, _, _) = run_with(CultureSteering::MoreInternational).await;
+        assert_eq!((less_local, more_intl), (4, 12));
         assert!(more_intl > bal_intl);
     }
 
     #[tokio::test]
-    async fn rejected_tracks_are_never_recommended_again_and_core_taste_isolates_seasonal() {
-        let (kb, pools) = build_noel_fixtures();
-        let profile = french_profile();
+    async fn rejected_tracks_and_artist_cap_are_enforced_and_core_taste_isolates_seasonal() {
+        let (kb, pools) = build_holiday_fixtures();
+        let profile = eclectic_profile();
         let culture = UserCultureProfile {
-            home_country: Some("FR".into()),
+            home_country: Some("JP".into()),
             ..Default::default()
         };
-        let rejected = HashSet::from([CandidateSet::key("Chanteur 1", "Petit Papa 1")]);
+        let rejected = HashSet::from([CandidateSet::key("Tokyo Singer 1", "Snow Lights 1")]);
         let pack = SeasonalPackSpec::for_kind(
-            SeasonalKind::Noel,
+            SeasonalKind::Holiday,
             &culture,
             CultureSteering::Balanced,
         );
@@ -894,8 +1220,28 @@ mod tests {
         assert!(
             !out.candidates
                 .candidates
-                .contains_key(&CandidateSet::key("Chanteur 1", "Petit Papa 1"))
+                .contains_key(&CandidateSet::key("Tokyo Singer 1", "Snow Lights 1"))
         );
+
+        // Per-artist cap check
+        let mut counts = HashMap::new();
+        let same_artist: Vec<Candidate> = (1..=5)
+            .map(|i| {
+                ContextualCandidateGenerator::make_candidate(
+                    "Same Artist".into(),
+                    format!("Track {i}"),
+                    None,
+                    None,
+                    1.0,
+                    "test",
+                    "contextual",
+                    "TEST".into(),
+                    CultureBucket::Local,
+                )
+            })
+            .collect();
+        let capped = take_diverse(same_artist, 5, &mut counts);
+        assert_eq!(capped.len(), MAX_TRACKS_PER_ARTIST);
 
         // Anti-pollution core taste isolation check
         let tracks = vec![("Winter Song", true), ("Regular Track", false)];
