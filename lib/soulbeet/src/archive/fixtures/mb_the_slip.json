@@ -1,0 +1,57 @@
+{
+ "id": "12b57d46-a192-499e-a91f-7da66790a1c1",
+ "title": "The Slip",
+ "artist": "Nine Inch Nails",
+ "tracks": [
+  {
+   "position": 1,
+   "title": "999,999",
+   "length": 85586
+  },
+  {
+   "position": 2,
+   "title": "1,000,000",
+   "length": 236133
+  },
+  {
+   "position": 3,
+   "title": "Letting You",
+   "length": 229560
+  },
+  {
+   "position": 4,
+   "title": "Discipline",
+   "length": 259200
+  },
+  {
+   "position": 5,
+   "title": "Echoplex",
+   "length": 285106
+  },
+  {
+   "position": 6,
+   "title": "Head Down",
+   "length": 295000
+  },
+  {
+   "position": 7,
+   "title": "Lights in the Sky",
+   "length": 209680
+  },
+  {
+   "position": 8,
+   "title": "Corona Radiata",
+   "length": 453520
+  },
+  {
+   "position": 9,
+   "title": "The Four of Us Are Dying",
+   "length": 277813
+  },
+  {
+   "position": 10,
+   "title": "Demon Seed",
+   "length": 298000
+  }
+ ]
+}
