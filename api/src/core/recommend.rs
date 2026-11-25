@@ -81,9 +81,14 @@ pub(crate) struct DiscoveryServices {
 impl DiscoveryServices {
     /// The server's services: the real hosts, unless the environment overrides them.
     pub(crate) fn live() -> DiscoveryServices {
+        Self::for_db((*DB).clone())
+    }
+
+    /// The server's services backed by `db` for the shared knowledge cache.
+    pub(crate) fn for_db(db: SqlitePool) -> DiscoveryServices {
         DiscoveryServices {
             hosts: KnowledgeHosts::from_env(),
-            cache: Arc::new(SqliteKnowledgeCache::new((*DB).clone())),
+            cache: Arc::new(SqliteKnowledgeCache::new(db)),
             musicbrainz: Arc::new(MusicBrainzProvider::new()),
             metabrainz_pace: Pace::METABRAINZ,
             deezer_pace: Pace::DEEZER,
@@ -166,16 +171,16 @@ pub(crate) async fn generate_in(
 
 /// What a run reads: the user's histories, the generators their settings turn on, and the
 /// knowledge about music. With what setting them up found wrong but did not stop the run.
-struct RunSources {
-    histories: Vec<Arc<dyn ListeningHistory>>,
-    generators: Vec<Arc<dyn CandidateGenerator>>,
-    knowledge: Arc<MetaBrainzKnowledge>,
-    errors: SourceErrors,
+pub(crate) struct RunSources {
+    pub(crate) histories: Vec<Arc<dyn ListeningHistory>>,
+    pub(crate) generators: Vec<Arc<dyn CandidateGenerator>>,
+    pub(crate) knowledge: Arc<MetaBrainzKnowledge>,
+    pub(crate) errors: SourceErrors,
 }
 
 /// Reads the Navidrome library and sets up the remote clients `plan` turns on. Fails with
 /// the name of the source that could not be read or set up.
-async fn sources_of(
+pub(crate) async fn sources_of(
     navidrome: &dyn NavidromeOf,
     services: &DiscoveryServices,
     user: &UserId,
@@ -239,7 +244,7 @@ async fn sources_of(
 /// The run's ListenBrainz client. A saved token is checked once: one ListenBrainz does not know
 /// is left out of the whole run, since it would refuse every request that sends it, and the
 /// errors say so. A check that fails keeps the token, and the run's own calls report the failure.
-async fn listenbrainz_for(
+pub(crate) async fn listenbrainz_for(
     services: &DiscoveryServices,
     token: Option<String>,
 ) -> Result<(Arc<ListenBrainzClient>, SourceErrors), RemoteError> {
@@ -291,7 +296,7 @@ async fn store_failure_in(
 /// The profile has no seeds. A history that `failed` may hold the user's listening, so the
 /// run is retried later and the failure names it; with every history answered, there is no
 /// listening data.
-fn no_seeds(failed: Vec<SourceError>) -> Failure {
+pub(crate) fn no_seeds(failed: Vec<SourceError>) -> Failure {
     if failed.is_empty() {
         return no_listening_data();
     }

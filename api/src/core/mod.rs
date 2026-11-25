@@ -6,12 +6,14 @@ use crate::services::BackendLookupError;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
 pub mod acquire;
+pub mod browse;
 pub mod delete_guard;
 pub mod deletion;
 pub mod discovery;
 pub mod folders;
 pub mod health;
 pub mod index;
+pub mod insights;
 pub mod jobs;
 pub mod library;
 pub mod metadata;

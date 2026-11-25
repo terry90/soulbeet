@@ -33,6 +33,7 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
       'delete_tracks',
       'dismiss_job',
       'ensure_in_library',
+      'fetch_artwork_and_lyrics',
       'move_tracks',
       'promote_discovery_track',
       'remove_discovery_track',

@@ -1,6 +1,8 @@
 //! Track management core operations: inspect, move across folders/libraries, and re-tag/re-match.
 //! Both the MCP tools and any future UI server functions call into this module.
 
+pub mod audit;
+pub mod extras;
 pub mod inspect;
 pub mod move_tracks;
 pub mod retag;
