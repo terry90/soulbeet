@@ -248,8 +248,7 @@ fn WebNavbar() -> Element {
             Navbar {
                 home: Route::SearchPage {},
                 Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
-                    active_class: "border-beet-accent",
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
                     to: Route::SearchPage {},
                     onclick: move |_| search_reset += 1,
                     span { class: "hidden md:block", "Search" }
@@ -267,8 +266,7 @@ fn WebNavbar() -> Element {
                     }
                 }
                 Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
-                    active_class: "border-beet-accent",
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
                     to: Route::DashboardPage {},
                     span { class: "hidden md:block", "Dashboard" }
                     svg {
@@ -285,8 +283,7 @@ fn WebNavbar() -> Element {
                     }
                 }
                 Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent pb-0.5",
-                    active_class: "border-beet-accent",
+                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
                     to: Route::SettingsPage {},
                     span { class: "hidden md:block", "Settings" }
                     svg {
