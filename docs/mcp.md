@@ -615,7 +615,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 
 ## Failure causes
 
-A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `filesystem`, `database` (Soulbeet's own settings database), `internet_archive` (archive.org, for the Internet Archive download backend), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
+A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `filesystem`, `database` (Soulbeet's own settings database), `internet_archive` (archive.org, for the Internet Archive download backend), `youtube` (YouTube, for the YouTube Music download backend), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
 
 ## Known limits
 

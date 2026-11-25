@@ -73,8 +73,24 @@ pub const ARCHIVE: BackendMeta = BackendMeta {
     blocked: None,
 };
 
+pub const YTDLP: BackendMeta = BackendMeta {
+    id: crate::ytdlp::BACKEND_ID,
+    name: "YouTube Music",
+    service: "YouTube",
+    delivery: Delivery::LossyOnly,
+    switch: Switch::AdminToggle,
+    about: &[
+        "Off until an admin turns it on. Auto-download then searches YouTube Music only when no other source has a match it would take, and picks from it on its own only for users who chose that in their settings.",
+        "Its files are Opus at about 130 kbps, never lossless, and never replace a copy already in the library.",
+        "Needs the :full image. YouTube's terms forbid downloading from it: turning this on is your choice.",
+    ],
+    link: Some(("YouTube's Terms of Service", "https://www.youtube.com/t/terms")),
+    attribution: None,
+    blocked: None,
+};
+
 /// Every backend this build has, the default one first.
-pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE];
+pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE, YTDLP];
 
 /// The backend a search or a send uses when none is named.
 pub const DEFAULT_ID: &str = SLSKD.id;
@@ -82,6 +98,12 @@ pub const DEFAULT_ID: &str = SLSKD.id;
 /// The backend with registry id `id`.
 pub fn meta(id: &str) -> Option<&'static BackendMeta> {
     ALL.iter().find(|m| m.id == id)
+}
+
+/// What the backend `id` delivers: its meta's, else as found, as for a backend this build has no
+/// meta for.
+pub fn delivery(id: &str) -> Delivery {
+    meta(id).map_or(Delivery::AsFound, |m| m.delivery)
 }
 
 /// The service texts name for the backend `id`: its meta's, else `id` itself, as for a backend
@@ -118,6 +140,7 @@ mod tests {
         assert_eq!(ALL[0].switch, Switch::AlwaysOn);
         assert_eq!(meta("slskd"), Some(&SLSKD));
         assert_eq!(meta("archive"), Some(&ARCHIVE));
+        assert_eq!(meta("ytdlp"), Some(&YTDLP));
         assert_eq!(meta("nicotine"), None);
     }
 
@@ -131,6 +154,21 @@ mod tests {
         assert_eq!(
             blocked("archive"),
             "archive.org will not give files from this source"
+        );
+    }
+
+    #[test]
+    fn youtube_music_is_off_until_an_admin_turns_it_on_and_delivers_lossy_files_only() {
+        assert_eq!(YTDLP.switch, Switch::AdminToggle);
+        assert_eq!(delivery("ytdlp"), Delivery::LossyOnly);
+        assert_eq!(delivery("slskd"), Delivery::AsFound);
+        assert_eq!(delivery("stub-3"), Delivery::AsFound);
+        assert!(YTDLP
+            .link
+            .is_some_and(|(_, url)| url.starts_with("https://")));
+        assert_eq!(
+            blocked("ytdlp"),
+            "YouTube will not give files from this source"
         );
     }
 
