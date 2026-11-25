@@ -1,6 +1,6 @@
 use std::ops::RangeInclusive;
 
-use api::models::user_settings::{LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS};
+use api::models::user_settings::{LossyFallback, LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS};
 use api::{create_user_folder, delete_folder, get_user_folders, update_folder, UserSettings};
 use dioxus::prelude::*;
 use serde_json::Value;
@@ -53,6 +53,25 @@ fn number_text(value: &Value) -> Option<String> {
     value.as_i64().map(|n| n.to_string())
 }
 
+/// The names of the backends among `enabled` whose files are lossy only, as one text; None when
+/// there is none.
+fn lossy_names<'a>(enabled: impl Iterator<Item = &'a str>) -> Option<String> {
+    let names: Vec<&str> = enabled
+        .filter_map(shared::backends::meta)
+        .filter(|m| m.delivery == shared::backends::Delivery::LossyOnly)
+        .map(|m| m.name)
+        .collect();
+    (!names.is_empty()).then(|| names.join(" or "))
+}
+
+fn lossy_label(choice: LossyFallback) -> &'static str {
+    match choice {
+        LossyFallback::Never => "Never use it",
+        LossyFallback::Ask => "Ask me",
+        LossyFallback::Auto => "Download automatically (lossy)",
+    }
+}
+
 #[component]
 pub fn FolderManager() -> Element {
     let mut folder_name = use_signal(|| "".to_string());
@@ -73,7 +92,16 @@ pub fn FolderManager() -> Element {
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
     let mut deezer_recommendations = use_signal(|| false);
+    let mut lossy_fallback = use_signal(LossyFallback::default);
     let library_error = use_signal(String::new);
+    // The backends an admin turned on whose files are lossy only; the choice shows while one is.
+    let lossy_backends = use_resource(|| async {
+        let backends = api::get_backends()
+            .await
+            .map(|b| b.download)
+            .unwrap_or_default();
+        lossy_names(backends.iter().map(|b| b.id.as_str()))
+    });
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
@@ -111,11 +139,13 @@ pub fn FolderManager() -> Element {
     };
     let mut show_profiles =
         move |s: &UserSettings| discovery_profiles.set(s.discovery_profiles.clone());
+    let mut show_lossy = move |s: &UserSettings| lossy_fallback.set(s.lossy_fallback);
 
     use_effect(move || {
         if let Some(Ok(s)) = &*settings_resource.read() {
             auto_delete_enabled.set(s.auto_delete_enabled);
             deezer_recommendations.set(s.deezer_recommendations);
+            show_lossy(s);
             discovery_enabled.set(s.discovery_enabled);
             show_threshold(s);
             show_lb_username(s);
@@ -575,6 +605,35 @@ pub fn FolderManager() -> Element {
                         }
                     }
 
+                    if let Some(Some(names)) = lossy_backends.read().as_ref() {
+                        div { class: "p-3 bg-beet-dark rounded border border-white/10",
+                            p { class: "text-sm text-white font-medium", "When only {names} has it" }
+                            p { class: "text-xs text-gray-500 font-mono mb-2",
+                                "Its files are lossy. Auto-download looks there only when no other source has a match it would take, and never replaces a copy already in your library."
+                            }
+                            select {
+                                class: "w-full p-2 rounded bg-beet-panel border border-white/10 text-white font-mono text-sm",
+                                name: "lossy_fallback",
+                                onchange: move |e| {
+                                    let change = LossyFallback::parse(&e.value())
+                                        .map(|choice| api::UpdateUserSettings {
+                                            lossy_fallback: Some(choice),
+                                            ..Default::default()
+                                        })
+                                        .ok_or_else(|| "Choose one of the three".to_string());
+                                    saver.save(change, show_lossy)
+                                },
+                                for choice in LossyFallback::ALL {
+                                    option {
+                                        value: choice.as_str(),
+                                        selected: lossy_fallback() == choice,
+                                        {lossy_label(choice)}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Auto-delete toggle
                     div { class: "flex items-center justify-between p-3 bg-beet-dark rounded border border-white/10",
                         div {
@@ -635,6 +694,19 @@ pub fn FolderManager() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lossy_choice_names_only_backends_whose_files_are_lossy() {
+        assert_eq!(lossy_names(["slskd", "archive"].into_iter()), None);
+        assert_eq!(
+            lossy_names(["slskd", "ytdlp"].into_iter()).as_deref(),
+            Some("YouTube Music")
+        );
+        assert_eq!(
+            LossyFallback::ALL.map(lossy_label),
+            ["Never use it", "Ask me", "Download automatically (lossy)"]
+        );
+    }
 
     #[test]
     fn per_profile_numbers_are_sent_only_when_each_one_reads() {

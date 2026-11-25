@@ -12,6 +12,44 @@ pub const LIFETIME_DAYS: RangeInclusive<i64> = 1..=90;
 /// The rating at which the rating sync promotes a pending discovery track.
 pub const PROMOTE_THRESHOLDS: RangeInclusive<u8> = 1..=5;
 
+/// What auto-download does with a backend whose files are lossy only, when no other backend has a
+/// match it would take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(sqlx::Type))]
+#[cfg_attr(feature = "server", sqlx(rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+pub enum LossyFallback {
+    /// Not searched, and never offered.
+    Never,
+    /// Searched, and offered to pick from; never picked on its own.
+    #[default]
+    Ask,
+    /// Searched, and picked on its own when it scores well enough.
+    Auto,
+}
+
+impl LossyFallback {
+    pub const ALL: [LossyFallback; 3] = [
+        LossyFallback::Never,
+        LossyFallback::Ask,
+        LossyFallback::Auto,
+    ];
+
+    /// The stored text of this choice.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LossyFallback::Never => "never",
+            LossyFallback::Ask => "ask",
+            LossyFallback::Auto => "auto",
+        }
+    }
+
+    /// The choice stored as `text`.
+    pub fn parse(text: &str) -> Option<LossyFallback> {
+        Self::ALL.into_iter().find(|c| c.as_str() == text)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "server", derive(sqlx::FromRow))]
 pub struct UserSettings {
@@ -32,6 +70,7 @@ pub struct UserSettings {
     pub discovery_last_generated_at: Option<String>,
     pub default_download_folder_id: Option<String>,
     pub deezer_recommendations: bool,
+    pub lossy_fallback: LossyFallback,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -64,6 +103,8 @@ pub struct UpdateUserSettings {
     pub default_download_folder_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deezer_recommendations: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossy_fallback: Option<LossyFallback>,
 }
 
 #[cfg(feature = "server")]
@@ -112,6 +153,7 @@ impl UserSettings {
             discovery_last_generated_at: None,
             default_download_folder_id: None,
             deezer_recommendations: false,
+            lossy_fallback: LossyFallback::Ask,
         }
     }
 
@@ -164,7 +206,8 @@ impl UserSettings {
             discovery_profiles,
             discovery_playlist_name,
             default_download_folder_id,
-            deezer_recommendations
+            deezer_recommendations,
+            lossy_fallback
         );
         if given.is_empty() {
             insert.push(" ON CONFLICT(user_id) DO NOTHING");
@@ -428,5 +471,44 @@ mod tests {
         .await
         .unwrap();
         assert!(s.deezer_recommendations);
+    }
+
+    #[tokio::test]
+    async fn a_user_is_asked_before_lossy_files_until_they_choose_otherwise() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        let s = UserSettings::get_in(&db, "alice").await.unwrap();
+        assert_eq!(s.lossy_fallback, LossyFallback::Ask);
+        for choice in LossyFallback::ALL {
+            let s = UserSettings::upsert_in(
+                &db,
+                "alice",
+                UpdateUserSettings {
+                    lossy_fallback: Some(choice),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(s.lossy_fallback, choice);
+            assert_eq!(LossyFallback::parse(choice.as_str()), Some(choice));
+        }
+        // The database holds the choice as its text, and nothing else.
+        let stored: String =
+            sqlx::query_scalar("SELECT lossy_fallback FROM user_settings WHERE user_id = 'alice'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "auto");
+        assert!(
+            sqlx::query("UPDATE user_settings SET lossy_fallback = 'sometimes'")
+                .execute(&db)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(LossyFallback::Never).unwrap(),
+            serde_json::json!("never")
+        );
     }
 }

@@ -125,6 +125,7 @@ pub(crate) mod test_db {
     pub const BACKEND_ID: i64 = 20261203000000;
     pub const ITEM_BACKEND: i64 = 20261203000001;
     pub const BACKEND_TRANSFERS: i64 = 20261204000001;
+    pub const LOSSY_FALLBACK: i64 = 20261205000000;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -965,7 +966,9 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        test_db::apply(&db, test_db::REMOVE_LASTFM).await;
+        // With every later migration, as the upgrade from 0.9.0 runs them: the settings read
+        // every column.
+        test_db::apply_from(&db, test_db::REMOVE_LASTFM).await;
         let columns: Vec<String> =
             sqlx::query_scalar("SELECT name FROM pragma_table_info('user_settings')")
                 .fetch_all(&db)
@@ -1032,6 +1035,34 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(kept, "http://slskd:5030");
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_install_asks_each_user_before_lossy_files() {
+        let db = test_db::migrated_before(test_db::LOSSY_FALLBACK).await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'bob', 'h')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO user_settings (user_id, auto_delete_enabled, deezer_recommendations, \
+             discovery_track_count, discovery_lifetime_days) VALUES ('u1', 1, 1, ?, ?)",
+        )
+        .bind(r#"{"Conservative":10,"Balanced":10,"Adventurous":10}"#)
+        .bind(r#"{"Conservative":7,"Balanced":7,"Adventurous":7}"#)
+        .execute(&db)
+        .await
+        .unwrap();
+        test_db::apply_from(&db, test_db::LOSSY_FALLBACK).await;
+
+        let s = crate::models::user_settings::UserSettings::get_in(&db, "u1")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.lossy_fallback,
+            crate::models::user_settings::LossyFallback::Ask
+        );
+        assert!(s.auto_delete_enabled && s.deezer_recommendations);
     }
 
     #[tokio::test]
