@@ -9,6 +9,7 @@ use crate::core::library::SongFacts;
 use crate::import_queue::KeptRun;
 use crate::transfer_registry::TransferRegistry;
 use serde::{Deserialize, Serialize};
+use shared::backends::Delivery;
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadableGroup, DownloadableItem, JobSlot, MatchChoices,
     SearchStats,
@@ -178,6 +179,15 @@ impl DuplicateRule {
             (_, Some(set)) => DuplicateRule::Replace(set),
             (BatchOrigin::Ui, None) => DuplicateRule::Guarded,
             (BatchOrigin::Mcp, None) => DuplicateRule::Skip,
+        }
+    }
+
+    /// This rule for a batch on a backend that delivers `delivery`: a lossy-only backend's batch
+    /// skips what the library has, whatever its origin, so a lossy file never replaces a copy.
+    pub fn for_delivery(self, delivery: Delivery) -> DuplicateRule {
+        match delivery {
+            Delivery::AsFound => self,
+            Delivery::LossyOnly => DuplicateRule::Skip,
         }
     }
 }
@@ -2679,6 +2689,27 @@ mod tests {
             DuplicateRule::for_job(BatchOrigin::Mcp, None),
             DuplicateRule::Skip
         );
+    }
+
+    #[test]
+    fn a_lossy_only_batch_skips_what_the_library_has_from_every_origin() {
+        let set = ReplaceSet {
+            grant_id: "g1".into(),
+            files: vec![],
+            expires_at: 1,
+        };
+        for rule in [
+            DuplicateRule::Guarded,
+            DuplicateRule::Skip,
+            DuplicateRule::Replace(set.clone()),
+        ] {
+            assert_eq!(
+                rule.clone().for_delivery(Delivery::LossyOnly),
+                DuplicateRule::Skip,
+                "{rule:?}"
+            );
+            assert_eq!(rule.clone().for_delivery(Delivery::AsFound), rule);
+        }
     }
 
     #[tokio::test]
