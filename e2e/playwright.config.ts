@@ -40,6 +40,7 @@ export default defineConfig({
         /user90\.spec\.ts/,
         /navidrome\.spec\.ts/,
         /admin-password\.spec\.ts/,
+        /archive-backend\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -89,6 +90,15 @@ export default defineConfig({
       name: 'imports',
       dependencies: ['failures'],
       testMatch: /imports\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Turns the Internet Archive backend on for the whole instance, which every search then
+      // asks too, so it runs alone, last.
+      name: 'archive',
+      dependencies: ['imports'],
+      testMatch: /archive-backend\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },
     },

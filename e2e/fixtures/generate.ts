@@ -1,5 +1,5 @@
 // Generates everything the stack needs that does not belong in git:
-// tagged audio files for every peer share (ffmpeg sine tones), the beets
+// tagged audio files for every peer share and archive file (ffmpeg sine tones), the beets
 // config for the e2e stack (the shipped beets_config.yaml with MusicBrainz
 // pointed at the stub), the broken config the user90 instance starts with
 // and the runtime directories the services share. Run it before the stack
@@ -10,6 +10,7 @@ import { copyFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
+import { archiveAudioFiles } from './archive-dataset.js';
 import { allAudioFiles, audioFileName, taggedRecording } from './dataset.js';
 import { user90BrokenConfig } from '../helpers/env.js';
 
@@ -24,7 +25,7 @@ const mbHost = process.env.E2E_MB_HOST ?? '127.0.0.1:5050';
 function generateAudio(): void {
   mkdirSync(audioDir, { recursive: true });
 
-  for (const share of allAudioFiles()) {
+  for (const share of [...allAudioFiles(), ...archiveAudioFiles()]) {
     const target = join(audioDir, audioFileName(share));
     if (existsSync(target)) {
       continue;

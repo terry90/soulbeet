@@ -1,5 +1,5 @@
 # E2E stack: the production soulbeet image wired to a fake slskd, a fake
-# MusicBrainz and a real Navidrome. Downloads and the music library are
+# MusicBrainz, a fake archive.org and a real Navidrome. Downloads and the music library are
 # bind-mounted so the specs can assert on delivered and imported files.
 #
 # Build the app image first (from the repo root):
@@ -23,6 +23,7 @@ services:
       - LISTENBRAINZ_HOST=stubs:5060
       - LISTENBRAINZ_LABS_HOST=stubs:5061
       - DEEZER_HOST=stubs:5062
+      - ARCHIVE_HOST=stubs:5064
       - NAVIDROME_URL=http://navidrome:4533
       - OIDC_ISSUER_URL=http://stubs:5070
       - OIDC_CLIENT_ID=soulbeet-e2e
@@ -55,6 +56,7 @@ services:
       - LISTENBRAINZ_HOST=stubs:5060
       - LISTENBRAINZ_LABS_HOST=stubs:5061
       - DEEZER_HOST=stubs:5062
+      - ARCHIVE_HOST=stubs:5064
     volumes:
       - ./.runtime/downloads:/downloads
       - ./.runtime/music-user90:/music
