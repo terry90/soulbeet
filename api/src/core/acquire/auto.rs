@@ -20,7 +20,7 @@ use dioxus::logger::tracing::info;
 use shared::backends::{delivery, Delivery};
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadQuery, DownloadableGroup, EnqueueStatus,
-    QueuedDownload,
+    ManualReason, QueuedDownload,
 };
 use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
@@ -177,9 +177,16 @@ pub async fn auto_download(
     Ok(batch_id)
 }
 
+/// The lossy-only backend whose files `group` holds; None for any other group.
+fn lossy_backend(group: &DownloadableGroup) -> Option<&str> {
+    (group.items.first())
+        .map(|item| item.backend.as_str())
+        .filter(|backend| delivery(backend) == Delivery::LossyOnly)
+}
+
 /// Whether `group` holds a lossy-only backend's files.
 fn lossy(group: &DownloadableGroup) -> bool {
-    (group.items.first()).is_some_and(|item| delivery(&item.backend) == Delivery::LossyOnly)
+    lossy_backend(group).is_some()
 }
 
 /// Whether the pipeline picks from `groups`, best first, without the user: one of a backend that
@@ -190,14 +197,26 @@ fn picks_primary(groups: &[DownloadableGroup]) -> bool {
 
 /// The group the pipeline picks from `groups` without the user: the first of a backend that
 /// delivers files as found that scores well enough, else, only when the user takes lossy files
-/// automatically, the first lossy-only one that does.
-fn pick(groups: &[DownloadableGroup], lossy_fallback: LossyFallback) -> Option<usize> {
+/// automatically, the first lossy-only one that does. Else why the user picks: lossy-only when
+/// such a group scores well enough and the user is asked before lossy files.
+fn pick(
+    groups: &[DownloadableGroup],
+    lossy_fallback: LossyFallback,
+) -> Result<usize, ManualReason> {
     let passes = |g: &DownloadableGroup| g.score >= AUTO_SELECT_SCORE_THRESHOLD;
-    (groups.iter().position(|g| !lossy(g) && passes(g))).or_else(|| {
-        (lossy_fallback == LossyFallback::Auto)
-            .then(|| groups.iter().position(|g| lossy(g) && passes(g)))
-            .flatten()
-    })
+    if let Some(i) = groups.iter().position(|g| !lossy(g) && passes(g)) {
+        return Ok(i);
+    }
+    let confident_lossy = (groups.iter().enumerate())
+        .filter(|(_, g)| passes(g))
+        .find_map(|(i, g)| Some((i, lossy_backend(g)?)));
+    match (confident_lossy, lossy_fallback) {
+        (Some((i, _)), LossyFallback::Auto) => Ok(i),
+        (Some((_, backend)), LossyFallback::Ask) => Err(ManualReason::LossyOnly {
+            backend: backend.to_string(),
+        }),
+        _ => Err(ManualReason::NoConfidentMatch),
+    }
 }
 
 /// The spawned part of `auto_download`: searches, stores what it found as
@@ -320,23 +339,27 @@ pub(crate) async fn run_search(
     );
 
     // Decide: auto-pick or fallback (per D-04)
-    let Some(picked) = pick(&all_groups, usable.lossy) else {
-        // Before the toast, so a pick from it finds the job waiting.
-        ledger.record(JobEvent::NeedsSourceChoice {
-            job: run.job.clone(),
-        });
-        send(AutoDownloadEvent::FallbackToManual {
-            batch_id: run.batch_id.clone(),
-            search_id: run.search_id.clone(),
-            results: all_groups,
-            best_score,
-            threshold: AUTO_SELECT_SCORE_THRESHOLD,
-        });
-        info!(
-            "Auto-download: no source to pick at threshold {:.1}, falling back to manual for '{}'",
-            AUTO_SELECT_SCORE_THRESHOLD, query_desc
-        );
-        return;
+    let picked = match pick(&all_groups, usable.lossy) {
+        Ok(picked) => picked,
+        Err(reason) => {
+            info!(
+                "Auto-download: no source to pick at threshold {:.1} ({:?}), falling back to manual for '{}'",
+                AUTO_SELECT_SCORE_THRESHOLD, reason, query_desc
+            );
+            // Before the toast, so a pick from it finds the job waiting.
+            ledger.record(JobEvent::NeedsSourceChoice {
+                job: run.job.clone(),
+            });
+            send(AutoDownloadEvent::FallbackToManual {
+                batch_id: run.batch_id.clone(),
+                search_id: run.search_id.clone(),
+                results: all_groups,
+                best_score,
+                threshold: AUTO_SELECT_SCORE_THRESHOLD,
+                reason,
+            });
+            return;
+        }
     };
     let picked = all_groups.remove(picked);
 
@@ -571,11 +594,16 @@ mod tests {
             .contains(&JobEvent::NeedsSourceChoice { job: "j1".into() }));
         let fallback = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
             DownloadEvent::AutoDownload(AutoDownloadEvent::FallbackToManual {
-                search_id, ..
-            }) => Some(search_id),
+                search_id,
+                reason,
+                ..
+            }) => Some((search_id, reason)),
             _ => None,
         });
-        assert_eq!(fallback, Some("s1".to_string()));
+        assert_eq!(
+            fallback,
+            Some(("s1".to_string(), ManualReason::NoConfidentMatch))
+        );
     }
 
     #[tokio::test]
@@ -869,14 +897,52 @@ mod tests {
         ))]);
     }
 
-    /// The results of the run's FallbackToManual event, by source; None when there was none.
-    fn offered(rx: &mut tokio::sync::broadcast::Receiver<DownloadEvent>) -> Option<Vec<String>> {
+    /// The results of the run's FallbackToManual event, by source, and its reason; None when
+    /// there was none.
+    fn offered(
+        rx: &mut tokio::sync::broadcast::Receiver<DownloadEvent>,
+    ) -> Option<(Vec<String>, ManualReason)> {
         std::iter::from_fn(|| rx.try_recv().ok()).find_map(|e| match e {
             DownloadEvent::AutoDownload(AutoDownloadEvent::FallbackToManual {
-                results, ..
-            }) => Some(results.into_iter().map(|g| g.source).collect()),
+                results,
+                reason,
+                ..
+            }) => Some((results.into_iter().map(|g| g.source).collect(), reason)),
             _ => None,
         })
+    }
+
+    /// What `pick` says of one slskd group scoring `primary` and one YouTube Music group scoring
+    /// `lossy`, for a user who takes lossy files as `fallback`.
+    fn picked(primary: f64, lossy: f64, fallback: LossyFallback) -> Result<usize, ManualReason> {
+        let groups = vec![
+            group(
+                "peer_a",
+                vec![item_on("slskd", "peer_a", "Wake Up", "07.flac")],
+                primary,
+            ),
+            group(
+                "ytm:album",
+                vec![item_on("ytdlp", "ytm:album", "Wake Up", "07.opus")],
+                lossy,
+            ),
+        ];
+        pick(&groups, fallback)
+    }
+
+    #[test]
+    fn the_pick_says_lossy_only_when_only_a_lossy_group_is_confident_and_the_user_is_asked() {
+        let lossy_only = Err(ManualReason::LossyOnly {
+            backend: "ytdlp".into(),
+        });
+        assert_eq!(picked(0.5, 0.9, LossyFallback::Ask), lossy_only);
+        assert_eq!(picked(0.5, 0.7, LossyFallback::Ask), lossy_only);
+        assert_eq!(picked(0.5, 0.9, LossyFallback::Auto), Ok(1));
+        assert_eq!(picked(0.8, 0.9, LossyFallback::Ask), Ok(0));
+        let none = Err(ManualReason::NoConfidentMatch);
+        assert_eq!(picked(0.5, 0.69, LossyFallback::Ask), none);
+        assert_eq!(picked(0.5, 0.6, LossyFallback::Auto), none);
+        assert_eq!(picked(0.5, 0.9, LossyFallback::Never), none);
     }
 
     fn auto_run(found: Option<Vec<DownloadableGroup>>) -> AutoRun {
@@ -968,7 +1034,12 @@ mod tests {
         assert_eq!(youtube.specs().len(), 1);
         assert_eq!(
             offered(&mut rx),
-            Some(vec!["peer_a".to_string(), "ytm:album".to_string()])
+            Some((
+                vec!["peer_a".to_string(), "ytm:album".to_string()],
+                ManualReason::LossyOnly {
+                    backend: "ytdlp".into()
+                }
+            ))
         );
         assert!(slskd.requests().is_empty() && youtube.requests().is_empty());
     }
@@ -1060,8 +1131,54 @@ mod tests {
         )
         .await;
 
-        assert_eq!(offered(&mut rx), Some(vec!["ytm:album".to_string()]));
+        assert_eq!(
+            offered(&mut rx),
+            Some((
+                vec!["ytm:album".to_string()],
+                ManualReason::LossyOnly {
+                    backend: "ytdlp".into()
+                }
+            ))
+        );
         assert!(youtube.requests().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_user_who_is_asked_gets_no_confident_match_when_the_lossy_group_scores_under_the_floor(
+    ) {
+        let (ledger, _recorded) = Ledger::recording();
+        let ctx = test_ctx("tier-ask-weak");
+        let mut rx = crate::globals::get_or_create_user_channel(&ctx.id())
+            .await
+            .subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let slskd = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let youtube = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        finds(&slskd, "slskd", "peer_a", 0.5);
+        finds(&youtube, "ytdlp", "ytm:album", 0.6);
+        let (usable, backends) = tiers(&slskd, &youtube, LossyFallback::Ask);
+
+        let folder = folder_at(&dir, &ctx);
+        let query = DownloadQuery::new(vec![]);
+        run_search(
+            ledger,
+            ctx,
+            folder,
+            query,
+            usable,
+            &backends,
+            auto_run(None),
+        )
+        .await;
+
+        assert_eq!(youtube.specs().len(), 1);
+        assert_eq!(
+            offered(&mut rx),
+            Some((
+                vec!["peer_a".to_string(), "ytm:album".to_string()],
+                ManualReason::NoConfidentMatch
+            ))
+        );
     }
 
     #[tokio::test]
@@ -1097,7 +1214,10 @@ mod tests {
         let run = auto_run(Some(stored));
         run_search(ledger, ctx, folder, query, usable, &backends, run).await;
 
-        assert_eq!(offered(&mut rx), Some(vec!["peer_a".to_string()]));
+        assert_eq!(
+            offered(&mut rx),
+            Some((vec!["peer_a".to_string()], ManualReason::NoConfidentMatch))
+        );
         assert!(youtube.requests().is_empty());
     }
 }

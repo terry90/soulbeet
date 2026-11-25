@@ -106,6 +106,12 @@ pub fn delivery(id: &str) -> Delivery {
     meta(id).map_or(Delivery::AsFound, |m| m.delivery)
 }
 
+/// The name the UI shows for the backend `id`: its meta's, else `id` itself, as for a backend
+/// this build has no meta for.
+pub fn name(id: &str) -> &str {
+    meta(id).map_or(id, |m| m.name)
+}
+
 /// The service texts name for the backend `id`: its meta's, else `id` itself, as for a backend
 /// this build has no meta for.
 pub fn service(id: &str) -> &str {
@@ -170,6 +176,12 @@ mod tests {
             blocked("ytdlp"),
             "YouTube will not give files from this source"
         );
+    }
+
+    #[test]
+    fn the_ui_names_a_backend_by_its_meta_else_by_its_id() {
+        assert_eq!(name("ytdlp"), YTDLP.name);
+        assert_eq!(name("stub-3"), "stub-3");
     }
 
     #[test]

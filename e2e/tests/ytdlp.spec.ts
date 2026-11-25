@@ -88,10 +88,10 @@ test('an album only YouTube Music has is offered as lossy, and the pick imports'
   await autoDownload(page, morseBloom.title);
 
   // Never picked on its own for a user who is asked first, which every user is until they
-  // choose otherwise.
-  await expect(page.getByText(`No confident match for ${morseBloom.title}.`)).toBeVisible({
-    timeout: 90_000,
-  });
+  // choose otherwise. The match is confident, so the toast says why it was not picked.
+  await expect(
+    page.getByText(`Only ${YOUTUBE} has ${morseBloom.title}, and its files are lossy.`),
+  ).toBeVisible({ timeout: 90_000 });
   await page.getByText('Pick a source manually').click();
   await expect(page.getByText('Download Options')).toBeVisible();
   await expect(page.getByText(`Lossy, from ${YOUTUBE}`, { exact: true })).toBeVisible();

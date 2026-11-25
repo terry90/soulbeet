@@ -23,7 +23,7 @@ A YouTube file always scores 0.5 for its quality, just under an MP3 of 128 kbps.
 ## When it is searched and picked
 
 - Auto-download searches YouTube Music last: only when no other source found something it would pick on its own. Its results come after every other source's, under "Lossy, from YouTube Music", each with a "LOSSY · YOUTUBE MUSIC" label. The label stays on the download row through the import.
-- Each user chooses, in Settings > Library, "When only YouTube Music has it": **Never use it** (it is not searched for them at all), **Ask me** (the default: its results are offered to pick from, never picked on their own) or **Download automatically (lossy)**.
+- Each user chooses, in Settings > Library, "When only YouTube Music has it": **Never use it** (it is not searched for them at all), **Ask me** (the default: its results are offered to pick from, never picked on their own; when one of them scores what auto-download picks at, the message reads "Only YouTube Music has {album}, and its files are lossy." instead of "No confident match for {album}.") or **Download automatically (lossy)**.
 - A file from YouTube Music never replaces a copy already in the library: its imports skip what the library has, whatever started them.
 - The manual "Search sources" view and the MCP tools search Soulseek only.
 
