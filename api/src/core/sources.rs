@@ -10,10 +10,12 @@ use crate::ledger::{
     Ledger, NewSearch, SearchOutcome, SourceFilters, StoredSpec, LEDGER, SEARCH_KEPT_SECS,
 };
 use crate::services::{
-    available_download_backends, download_backend, BackendLookupError, DEFAULT_DOWNLOAD_BACKEND,
+    download_backend, enabled_download_backends, BackendLookupError, Backends, Registry,
+    DEFAULT_DOWNLOAD_BACKEND,
 };
-use dioxus::logger::tracing::warn;
+use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
+use shared::backends::BackendMeta;
 use shared::download::{
     DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchResult, SearchSpec,
     SearchState, SearchStats,
@@ -277,17 +279,26 @@ fn no_backends(e: &BackendLookupError) -> Failure {
 /// The backends to search, the default one first when it is available, or
 /// the default one's lookup error as `no_backends` when none is.
 pub async fn usable_backends() -> Result<(Searched, Vec<Searched>), Failure> {
+    usable_from(&Registry, &enabled_download_backends().await).await
+}
+
+/// `usable_backends` of the backends `enabled` lists, looked up in `backends`. One turned off
+/// since the list was read is left out quietly: being off is no fault.
+pub(crate) async fn usable_from(
+    backends: &dyn Backends,
+    enabled: &[&BackendMeta],
+) -> Result<(Searched, Vec<Searched>), Failure> {
     let mut others = Vec::new();
-    for (id, _) in available_download_backends() {
-        if id == DEFAULT_DOWNLOAD_BACKEND {
-            continue;
-        }
-        match download_backend(Some(id)).await {
-            Ok(b) => others.push((id.to_string(), b)),
-            Err(e) => warn!("Backend {} unavailable for auto-download: {}", id, e),
+    for meta in enabled.iter().filter(|m| m.id != DEFAULT_DOWNLOAD_BACKEND) {
+        match backends.get(meta.id).await {
+            Ok(b) => others.push((meta.id.to_string(), b)),
+            Err(e @ BackendLookupError::Disabled(_)) => {
+                debug!("Backend {} skipped: {}", meta.id, e)
+            }
+            Err(e) => warn!("Backend {} unavailable for auto-download: {}", meta.id, e),
         }
     }
-    match download_backend(None).await {
+    match backends.get(DEFAULT_DOWNLOAD_BACKEND).await {
         Ok(b) => Ok(((DEFAULT_DOWNLOAD_BACKEND.to_string(), b), others)),
         Err(e) => {
             warn!(
@@ -2055,6 +2066,53 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!searches.runs("f4"));
+    }
+
+    #[tokio::test]
+    async fn a_backend_turned_off_is_skipped_without_a_warning() {
+        use crate::server_fns::download::test_support::StubBackends;
+        use shared::backends::{Switch, SLSKD};
+        const ARCHIVE: BackendMeta = BackendMeta {
+            id: "archive",
+            name: "Internet Archive",
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        const BROKEN: BackendMeta = BackendMeta {
+            id: "broken",
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        let slskd = StubBackend::new(vec![]);
+        let backends = StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, slskd.clone());
+        backends.fail(
+            "archive",
+            BackendLookupError::Disabled("Internet Archive".into()),
+        );
+        backends.fail(
+            "broken",
+            BackendLookupError::Settings("database is locked".into()),
+        );
+        let log = crate::test_log::LogCapture::start();
+
+        let (first, others) = usable_from(&backends, &[&SLSKD, &ARCHIVE, &BROKEN])
+            .await
+            .unwrap();
+
+        assert_eq!(first.0, DEFAULT_DOWNLOAD_BACKEND);
+        assert_eq!(first.1.id(), slskd.id());
+        assert!(others.is_empty());
+        let lines = log.lines();
+        assert!(
+            !lines.iter().any(|l| l.contains("archive unavailable")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Backend broken unavailable for auto-download: database is locked"),
+            "{lines:?}"
+        );
     }
 
     #[test]

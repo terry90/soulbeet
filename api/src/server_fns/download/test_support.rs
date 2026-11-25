@@ -157,6 +157,7 @@ pub struct StubBackend {
     cancelled: Mutex<Vec<Cancel>>,
     destinations: Mutex<Vec<String>>,
     requests: Mutex<Vec<String>>,
+    owners: Mutex<Vec<String>>,
     listing: Mutex<Vec<DownloadProgress>>,
     listed: Mutex<Vec<Vec<String>>>,
     looked_up: Mutex<Vec<(String, String)>>,
@@ -170,6 +171,7 @@ pub struct StubBackend {
     queue_position_error: Mutex<Option<(u16, String)>>,
     presence_error: Mutex<Option<(u16, String)>>,
     presence_asked: Mutex<Vec<String>>,
+    health_hangs: Mutex<bool>,
 }
 
 /// Holds every `download` (or `start_search`) call until released, after announcing it.
@@ -191,6 +193,7 @@ impl StubBackend {
             cancelled: Mutex::new(Vec::new()),
             destinations: Mutex::new(Vec::new()),
             requests: Mutex::new(Vec::new()),
+            owners: Mutex::new(Vec::new()),
             listing: Mutex::new(Vec::new()),
             listed: Mutex::new(Vec::new()),
             looked_up: Mutex::new(Vec::new()),
@@ -203,6 +206,7 @@ impl StubBackend {
             queue_position_error: Mutex::new(None),
             presence_error: Mutex::new(None),
             presence_asked: Mutex::new(Vec::new()),
+            health_hangs: Mutex::new(false),
         })
     }
 
@@ -219,6 +223,16 @@ impl StubBackend {
     /// The request of every `download` call, in order, from when it arrives.
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// The owner of every `download` call, in order.
+    pub fn owners(&self) -> Vec<String> {
+        self.owners.lock().unwrap().clone()
+    }
+
+    /// Makes every `health_check` wait forever.
+    pub fn hang_health_check(&self) {
+        *self.health_hangs.lock().unwrap() = true;
     }
 
     /// Makes each `download` call wait: the first notifier fires when a call
@@ -501,8 +515,10 @@ impl DownloadBackend for StubBackend {
         items: Vec<DownloadableItem>,
         destination: &str,
         request: &str,
+        owner: &str,
     ) -> BackendResult<Vec<QueuedDownload>> {
         self.requests.lock().unwrap().push(request.to_string());
+        self.owners.lock().unwrap().push(owner.to_string());
         let hold = self.hold.lock().unwrap().clone();
         if let Some(hold) = hold {
             hold.reached.notify_one();
@@ -588,9 +604,9 @@ impl DownloadBackend for StubBackend {
             .find(|t| t.source == source && t.id == id)
             .cloned())
     }
-    async fn cancel_download(&self, username: &str, id: &str, remove: bool) -> BackendResult<()> {
+    async fn cancel_download(&self, source: &str, id: &str, remove: bool) -> BackendResult<()> {
         self.cancelled.lock().unwrap().push(Cancel {
-            peer: username.to_string(),
+            peer: source.to_string(),
             id: id.to_string(),
             remove,
         });
@@ -620,6 +636,10 @@ impl DownloadBackend for StubBackend {
         Ok(())
     }
     async fn health_check(&self) -> Result<(), Failure> {
+        let hangs = *self.health_hangs.lock().unwrap();
+        if hangs {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 }

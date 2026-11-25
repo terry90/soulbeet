@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 pub mod store;
+pub mod transfer_book;
 mod writer;
 
 use writer::{Inbox, Reply, Write};

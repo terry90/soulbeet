@@ -8,14 +8,18 @@ pub mod history;
 pub mod http;
 pub mod knowledge;
 pub mod listenbrainz;
+pub mod matching;
 pub mod metadata_error;
 pub mod musicbrainz;
 pub mod navidrome;
+pub mod partial;
 pub mod polite;
 pub mod slskd;
+pub mod tags;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod traits;
+pub mod transfer_book;
 
 pub use backend_error::{BackendError, BackendFault, BackendResult, PeerAsk};
 pub use beets::{duplicate_note, DuplicateNote};
@@ -28,3 +32,4 @@ pub use traits::{
     PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile, TagEdits, TaskCount,
     TimeoutKind, WantedRemoval,
 };
+pub use transfer_book::{BookEntry, BookError, TransferBook};

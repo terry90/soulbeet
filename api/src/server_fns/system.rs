@@ -8,7 +8,7 @@ use shared::system::BackendInfo;
 use crate::config::CONFIG;
 #[cfg(feature = "server")]
 use crate::services::{
-    available_download_backends, available_importers, available_metadata_providers,
+    available_importers, available_metadata_providers, enabled_download_backends,
 };
 #[cfg(feature = "server")]
 use crate::{AdminSession, AuthSession};
@@ -30,11 +30,12 @@ pub async fn get_backends() -> Result<AvailableBackends, ServerFnError> {
                     name: name.to_string(),
                 })
                 .collect(),
-            download: available_download_backends()
+            download: enabled_download_backends()
+                .await
                 .into_iter()
-                .map(|(id, name)| BackendInfo {
-                    id: id.to_string(),
-                    name: name.to_string(),
+                .map(|meta| BackendInfo {
+                    id: meta.id.to_string(),
+                    name: meta.name.to_string(),
                 })
                 .collect(),
             importer: available_importers()

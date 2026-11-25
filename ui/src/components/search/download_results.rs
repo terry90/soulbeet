@@ -1,13 +1,14 @@
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
+use shared::backends::{BackendMeta, Delivery, DEFAULT_ID};
 use shared::download::{DownloadableGroup, DownloadableItem};
 use std::collections::HashSet;
 
-use crate::{use_auth, Checkbox, FIELD_CLASS};
+use crate::{use_auth, Checkbox, LossyChip, FIELD_CLASS};
 
 /// Format a sample rate in Hz as kHz, trimming a trailing .0 (44100 -> "44.1", 48000 -> "48").
-fn format_khz(hz: i32) -> String {
-    let khz = hz as f64 / 1000.0;
+fn format_khz(hz: u32) -> String {
+    let khz = f64::from(hz) / 1000.0;
     if khz.fract() == 0.0 {
         format!("{}", khz as i64)
     } else {
@@ -15,52 +16,88 @@ fn format_khz(hz: i32) -> String {
     }
 }
 
-fn quality_badge(item: &DownloadableItem) -> Element {
-    let quality = item.quality.as_str();
+/// The bitrate a backend estimates, when it only has an estimate (`backend_facts.estimated_kbps`).
+fn estimated_kbps(item: &DownloadableItem) -> Option<u64> {
+    item.facts
+        .backend_facts
+        .get("estimated_kbps")
+        .and_then(|v| v.as_u64())
+}
 
-    let search_result = item
-        .backend_data
-        .as_ref()
-        .and_then(|data| serde_json::from_str::<shared::slskd::SearchResult>(data).ok());
-
-    let label = if quality == "mp3" {
-        let bitrate = search_result.as_ref().and_then(|sr| sr.bitrate);
-        match bitrate {
-            Some(br) if br >= 320 => "320k".to_string(),
-            Some(br) if br >= 256 => "256k".to_string(),
-            Some(br) if br >= 192 => "192k".to_string(),
-            Some(br) if br > 0 => format!("{}k", br),
-            _ => "MP3".to_string(),
+/// The badge text and colour of a file, from the facts its backend reported.
+fn quality_label(item: &DownloadableItem) -> (String, &'static str) {
+    let format = item
+        .facts
+        .extension
+        .clone()
+        .unwrap_or_else(|| item.quality.to_lowercase());
+    let known_bitrate = item.facts.bitrate_kbps.filter(|&br| br > 0);
+    let estimate = || estimated_kbps(item).filter(|_| known_bitrate.is_none());
+    let label = if format == "mp3" {
+        match (known_bitrate, estimate()) {
+            (Some(br), _) if br >= 320 => "320k".to_string(),
+            (Some(br), _) if br >= 256 => "256k".to_string(),
+            (Some(br), _) if br >= 192 => "192k".to_string(),
+            (Some(br), _) => format!("{br}k"),
+            (None, Some(est)) => format!("~{est}k"),
+            (None, None) => "MP3".to_string(),
         }
-    } else if matches!(quality, "flac" | "wav") {
+    } else if matches!(format.as_str(), "flac" | "wav") {
         // Lossless: show bit depth / sample rate like slskd does (e.g. FLAC 16/44.1)
-        let (depth, rate) = search_result
-            .as_ref()
-            .map(|sr| (sr.bit_depth, sr.sample_rate))
-            .unwrap_or((None, None));
-        match (depth, rate) {
+        match (item.facts.bit_depth, item.facts.sample_rate_hz) {
             (Some(d), Some(r)) => {
-                format!("{} {}/{}", quality.to_uppercase(), d, format_khz(r))
+                format!("{} {}/{}", format.to_uppercase(), d, format_khz(r))
             }
-            (None, Some(r)) => format!("{} {}", quality.to_uppercase(), format_khz(r)),
-            _ => quality.to_uppercase(),
+            (None, Some(r)) => format!("{} {}", format.to_uppercase(), format_khz(r)),
+            _ => format.to_uppercase(),
         }
     } else {
-        quality.to_uppercase()
+        match estimate() {
+            Some(est) => format!("{} ~{est}k", format.to_uppercase()),
+            None => format.to_uppercase(),
+        }
     };
 
-    let color = match quality {
+    let color = match format.as_str() {
         "flac" | "wav" => "bg-blue-600/30 text-blue-300 border-blue-500/40",
         "m4a" | "aac" | "ogg" => "bg-green-600/30 text-green-300 border-green-500/40",
         _ => "bg-gray-600/30 text-gray-300 border-gray-500/40",
     };
+    (label, color)
+}
 
+fn quality_badge(item: &DownloadableItem) -> Element {
+    let (label, color) = quality_label(item);
     rsx! {
         span {
             class: "text-[10px] font-mono px-1.5 py-0.5 rounded border {color} uppercase shrink-0",
             "{label}"
         }
     }
+}
+
+/// The backend a group's files came from, when this build knows it.
+fn backend_of(group: &DownloadableGroup) -> Option<&'static BackendMeta> {
+    group
+        .items
+        .first()
+        .and_then(|i| shared::backends::meta(&i.backend))
+}
+
+/// The page of the group's source at its backend, when the backend gave an https one.
+fn item_url(group: &DownloadableGroup) -> Option<String> {
+    let url = group
+        .items
+        .first()?
+        .facts
+        .backend_facts
+        .get("item_url")?
+        .as_str()?;
+    url.starts_with("https://").then(|| url.to_string())
+}
+
+fn is_lossy(meta: Option<&BackendMeta>) -> bool {
+    meta.is_some_and(|m| m.delivery == Delivery::LossyOnly)
 }
 
 #[derive(Props, PartialEq, Clone)]
@@ -79,6 +116,8 @@ pub struct Props {
 #[derive(Props, Clone, PartialEq)]
 struct AlbumResultItemProps {
     album: DownloadableGroup,
+    /// The backend the group's files came from.
+    backend: Option<&'static BackendMeta>,
     selected_tracks: Signal<HashSet<String>>,
     on_album_select_all: EventHandler<DownloadableGroup>,
     on_track_toggle: EventHandler<String>,
@@ -121,6 +160,7 @@ fn TrackItem(props: TrackItemProps) -> Element {
 #[component]
 fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     let album = props.album.clone();
+    let source_page = item_url(&album);
     let mut is_expanded = use_signal(|| props.starts_expanded);
 
     rsx! {
@@ -140,12 +180,31 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                             "Best match"
                         }
                     }
+                    if let Some(meta) = props.backend {
+                        LossyChip { meta }
+                    }
                     h4 { class: "text-base leading-snug font-bold text-beet-leaf break-words", "{album.title}" }
                     if let Some(artist) = album.artist.as_ref().filter(|a| !a.is_empty()) {
                         p { class: "mt-1 text-sm text-gray-300 font-mono break-words", "{artist}" }
                     }
                     p { class: "mt-1 text-xs text-gray-400 font-mono uppercase tracking-wide",
                         "{album.quality} · Score {album.score:.2}"
+                    }
+                    if let Some(meta) = props.backend.filter(|m| m.id != DEFAULT_ID) {
+                        p { class: "mt-1 text-xs text-gray-300 font-mono", "{meta.name}" }
+                    }
+                    if let Some(attribution) = props.backend.and_then(|m| m.attribution) {
+                        p { class: "mt-1 text-xs text-gray-400 font-mono break-words", "{attribution}" }
+                    }
+                    if let Some(url) = source_page {
+                        a {
+                            class: "mt-1 inline-block text-xs font-mono text-gray-300 hover:text-white underline decoration-dotted",
+                            href: "{url}",
+                            target: "_blank",
+                            rel: "noopener noreferrer",
+                            onclick: move |e| e.stop_propagation(),
+                            "Source page"
+                        }
                     }
                 }
 
@@ -181,6 +240,35 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The groups, best first, each with the backend it came from (`backends`, one per group), and
+/// "Lossy, from {name}" before the first group of a backend that delivers lossy files only.
+#[component]
+fn GroupList(
+    groups: Vec<DownloadableGroup>,
+    backends: Vec<Option<&'static BackendMeta>>,
+    selected_tracks: Signal<HashSet<String>>,
+    on_album_select_all: EventHandler<DownloadableGroup>,
+    on_track_toggle: EventHandler<String>,
+) -> Element {
+    let first_lossy = backends.iter().position(|b| is_lossy(*b));
+    rsx! {
+        for (idx, (album, backend)) in groups.into_iter().zip(backends).enumerate() {
+            if let Some(meta) = backend.filter(|_| Some(idx) == first_lossy) {
+                h4 { class: "pt-2 text-sm font-mono text-amber-300", "Lossy, from {meta.name}" }
+            }
+            AlbumResultItem {
+                backend,
+                album,
+                selected_tracks,
+                on_album_select_all,
+                on_track_toggle,
+                is_best: idx == 0,
+                starts_expanded: idx == 0,
             }
         }
     }
@@ -323,15 +411,12 @@ pub fn DownloadResults(props: Props) -> Element {
                         }
                     }
                 }
-                for (idx, album) in results.iter().enumerate() {
-                    AlbumResultItem {
-                        album: album.clone(),
-                        selected_tracks,
-                        on_album_select_all: handle_album_select_all,
-                        on_track_toggle: handle_track_toggle,
-                        is_best: idx == 0,
-                        starts_expanded: idx == 0,
-                    }
+                GroupList {
+                    backends: results.iter().map(backend_of).collect::<Vec<_>>(),
+                    groups: results.clone(),
+                    selected_tracks,
+                    on_album_select_all: handle_album_select_all,
+                    on_track_toggle: handle_track_toggle,
                 }
             }
             div { class: "fixed bottom-8 right-8",
@@ -360,5 +445,208 @@ pub fn DownloadResults(props: Props) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::backends::{Switch, SLSKD};
+    use shared::download::FileFacts;
+
+    static GD: BackendMeta = BackendMeta {
+        id: "gdstudio",
+        name: "NetEase (GD Studio)",
+        service: "GD Studio",
+        switch: Switch::AdminToggle,
+        attribution: Some("NetEase via GD音乐台 (music.gdstudio.xyz)"),
+        ..SLSKD
+    };
+    static YOUTUBE: BackendMeta = BackendMeta {
+        id: "ytdlp",
+        name: "YouTube Music",
+        service: "YouTube",
+        delivery: Delivery::LossyOnly,
+        switch: Switch::AdminToggle,
+        ..SLSKD
+    };
+
+    fn item(backend: &str, facts: FileFacts) -> DownloadableItem {
+        DownloadableItem {
+            id: "07 - Wake Up.flac".into(),
+            backend: backend.into(),
+            source: "peer".into(),
+            title: "Wake Up".into(),
+            artist: "Kowloon".into(),
+            album: "Come Over".into(),
+            size: None,
+            duration: None,
+            quality: facts.extension.clone().unwrap_or_default(),
+            quality_score: 1.0,
+            backend_data: None,
+            match_score: 0.9,
+            below_floor: false,
+            facts,
+        }
+    }
+
+    fn facts(ext: &str) -> FileFacts {
+        FileFacts {
+            extension: Some(ext.into()),
+            ..FileFacts::default()
+        }
+    }
+
+    fn estimated(ext: &str, kbps: u64) -> FileFacts {
+        let mut facts = facts(ext);
+        facts
+            .backend_facts
+            .insert("estimated_kbps".into(), kbps.into());
+        facts
+    }
+
+    #[test]
+    fn the_badge_reads_the_files_facts() {
+        let label = |facts| quality_label(&item("slskd", facts)).0;
+        for (facts, wanted) in [
+            (
+                FileFacts {
+                    bitrate_kbps: Some(320),
+                    ..facts("mp3")
+                },
+                "320k",
+            ),
+            (
+                FileFacts {
+                    bitrate_kbps: Some(224),
+                    ..facts("mp3")
+                },
+                "192k",
+            ),
+            (
+                FileFacts {
+                    bitrate_kbps: Some(128),
+                    ..facts("mp3")
+                },
+                "128k",
+            ),
+            (facts("mp3"), "MP3"),
+            (
+                FileFacts {
+                    bit_depth: Some(16),
+                    sample_rate_hz: Some(44_100),
+                    ..facts("flac")
+                },
+                "FLAC 16/44.1",
+            ),
+            (
+                FileFacts {
+                    sample_rate_hz: Some(48_000),
+                    ..facts("wav")
+                },
+                "WAV 48",
+            ),
+            (facts("flac"), "FLAC"),
+            (facts("m4a"), "M4A"),
+            (estimated("mp3", 160), "~160k"),
+            (estimated("opus", 130), "OPUS ~130k"),
+            (
+                FileFacts {
+                    bitrate_kbps: Some(256),
+                    ..estimated("mp3", 160)
+                },
+                "256k",
+            ),
+        ] {
+            assert_eq!(label(facts.clone()), wanted, "{facts:?}");
+        }
+    }
+
+    fn group(backend: &str, url: Option<&str>) -> DownloadableGroup {
+        let mut facts = facts("flac");
+        if let Some(url) = url {
+            facts.backend_facts.insert("item_url".into(), url.into());
+        }
+        DownloadableGroup {
+            source: format!("{backend}-source"),
+            group_id: format!("{backend}/group"),
+            title: format!("Come Over from {backend}"),
+            artist: Some("Kowloon".into()),
+            item_count: 1,
+            total_size: 1,
+            items: vec![item(backend, facts)],
+            quality: "flac".into(),
+            score: 0.9,
+        }
+    }
+
+    fn render(
+        groups: Vec<DownloadableGroup>,
+        backends: Vec<Option<&'static BackendMeta>>,
+    ) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(groups, backends): (Vec<DownloadableGroup>, Vec<Option<&'static BackendMeta>>)| {
+                let selected_tracks = use_signal(HashSet::new);
+                rsx! {
+                    GroupList {
+                        groups,
+                        backends,
+                        selected_tracks,
+                        on_album_select_all: |_| {},
+                        on_track_toggle: |_| {},
+                    }
+                }
+            },
+            (groups, backends),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_group_of_another_backend_names_it_and_its_source_page() {
+        let html = render(
+            vec![
+                group("slskd", None),
+                group("gdstudio", Some("https://music.163.com/song?id=1")),
+                group("other", Some("http://example.invalid/item")),
+            ],
+            vec![Some(&SLSKD), Some(&GD), None],
+        );
+        let slskd = &html[..html.find("Come Over from gdstudio").unwrap()];
+        assert!(!slskd.contains("Soulseek"), "{slskd}");
+        assert!(html.contains(">NetEase (GD Studio)</p>"), "{html}");
+        assert!(
+            html.contains(">NetEase via GD音乐台 (music.gdstudio.xyz)</p>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"https://music.163.com/song?id=1\""),
+            "{html}"
+        );
+        assert!(!html.contains("example.invalid"), "{html}");
+        assert_eq!(html.matches("Source page").count(), 1, "{html}");
+        assert!(!html.contains("Lossy"), "{html}");
+    }
+
+    #[test]
+    fn lossy_groups_carry_the_chip_after_one_heading() {
+        let html = render(
+            vec![
+                group("slskd", None),
+                group("ytdlp", None),
+                group("ytdlp", None),
+            ],
+            vec![Some(&SLSKD), Some(&YOUTUBE), Some(&YOUTUBE)],
+        );
+        assert_eq!(
+            html.matches("Lossy, from YouTube Music").count(),
+            1,
+            "{html}"
+        );
+        assert_eq!(html.matches("LOSSY · YOUTUBE MUSIC").count(), 2, "{html}");
+        let heading = html.find("Lossy, from YouTube Music").unwrap();
+        assert!(html.find("Come Over from slskd").unwrap() < heading);
+        assert!(heading < html.find("Come Over from ytdlp").unwrap());
     }
 }

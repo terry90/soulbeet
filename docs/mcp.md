@@ -289,7 +289,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Status, settings and folders
 
-- `get_status`: what Soulbeet can do for this user now: whether slskd and beets work, the Navidrome link and scan status, whether Soulbeet can start a Navidrome scan after the user's imports (`can_trigger_scan`, with `scan_note` saying how, see [Navidrome scans](#navidrome-scans)), the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
+- `get_status`: what Soulbeet can do for this user now: whether each enabled download backend and beets work (`download_backends`, one `{id, name, online, failure}` per backend, the default first; `download_backend` describes the default one, slskd), the Navidrome link and scan status, whether Soulbeet can start a Navidrome scan after the user's imports (`can_trigger_scan`, with `scan_note` saying how, see [Navidrome scans](#navidrome-scans)), the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
 - `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings, with `discovery.deezer_recommendations` (whether the names of artists the user plays go to Deezer).
 - `list_folders`: the user's library folders with ids, paths, free space, whether shared, `in_navidrome`, and which is the default.
 
@@ -512,7 +512,7 @@ The ones you are most likely to see:
 | `navidrome_not_linked` | `library_check`, `index`, `playlist`, `delete` | The account is not linked to Navidrome or its stored password cannot be read (user action `relink_navidrome`), or `NAVIDROME_URL` is not set (user action `configure_navidrome`). | Enter your Navidrome password under Connect Navidrome, in Soulbeet's Settings > Users, or set `NAVIDROME_URL`. |
 | `navidrome_circuit_open` | `library_check`, `index`, `playlist`, `delete` | Navidrome failed 5 times in a row, so Soulbeet sends it nothing for 60 seconds. | Wait a minute; check Navidrome. |
 | `navidrome_refused` | `library_check`, `index`, `playlist`, `delete` | Navidrome answered with an error other than a refused login, for example an account that may not do what was asked. | Read `cause`; trying again gives the same answer. |
-| `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key. User action `configure_backend`. | An admin sets the slskd URL and API key in Settings > Config. |
+| `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key; or the download backend is turned off. User action `configure_backend`. | An admin sets the slskd URL and API key in Settings > Config, or turns the backend on in Settings > Config > Connections. |
 | `backend_unreachable` | `source_search`, `enqueue`, `transfer` | slskd did not answer, is not connected to the Soulseek network, or is not logged in (then user action `configure_backend`: check slskd's Soulseek user name and password). At `source_search` also: slskd ended the search with an error before any peer answered. | Check slskd; try again later. |
 | `settings_unreadable` | any | Soulbeet could not read its own database. | Check the server's disk and log; try again later. |
 | `backend_response_unreadable` | `source_search`, `enqueue`, `transfer`, `metadata` | slskd, or MusicBrainz, answered something Soulbeet cannot read. For slskd, user action `update_soulful_or_backend`. | Update Soulbeet or slskd so that their versions match. |
@@ -531,6 +531,7 @@ The ones you are most likely to see:
 | `slskd_too_old` | `enqueue` | slskd is older than 0.26. User action `upgrade_backend`. | Upgrade slskd to 0.26 or newer. |
 | `transfer_connection_failed` | `transfer` | The connection to the source failed or dropped, or slskd restarted during the transfer. | Another source; after a slskd restart, the same one later. |
 | `transfer_size_mismatch` | `transfer` | The source's file has another size than it announced. | Another source. |
+| `transfer_checksum_mismatch` | `transfer` | The downloaded bytes do not match the checksum the source gave for the file. | Another source. |
 | `transfer_rejected_not_shared` | `transfer` | The source says the file is not shared. | Another source. |
 | `transfer_rejected_peer_busy` | `transfer` | The source's queue is full, or it hit a daily or weekly quota. | The same source later for a full queue, another source for a quota. |
 | `transfer_rejected_failure_limit` | `transfer` | The source refuses after too many failed transfers today or this week. | Another source. |
@@ -543,6 +544,7 @@ The ones you are most likely to see:
 | `transfer_stuck_in_remote_queue` | `transfer` | The transfer waited 15 minutes in the source's queue. | Another source. |
 | `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read. | Check slskd; update Soulbeet or slskd if their versions do not match. |
 | `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
+| `download_disk_full` | `transfer` | The disk the download backend writes to is full. User action `free_disk_space`. | Free disk space, then retry. |
 | `import_no_match` | `import` | beets found no close enough match. | The assistant reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
 | `import_already_in_library` | `import`, `index` | The library already holds this recording; the facts give its song ids. | Nothing. To replace it, preview with reason `replaced` and pass `replace_existing`. |
 | `import_nothing_to_import` | `import` | beets found nothing to import in the downloaded files. | Another source. |
@@ -595,7 +597,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 
 | Code | What | Where |
 |---|---|---|
-| `configure_backend` | "Set the slskd URL and API key", or "Check the Soulseek username and password slskd signs in with" | "Settings > Config", or "slskd" |
+| `configure_backend` | "Set the slskd URL and API key", "Check the Soulseek username and password slskd signs in with", or "Turn on {backend}" | "Settings > Config", "slskd", or "Settings > Config > Connections" |
 | `upgrade_backend` | "Upgrade slskd to 0.26 or newer" | "slskd" |
 | `update_soulful_or_backend` | "Update Soulbeet or slskd so that Soulbeet can read slskd's answers again" | "Soulbeet and slskd" |
 | `fix_importer` | "Fix the beets setup: {problem}" | "Settings > Config" |

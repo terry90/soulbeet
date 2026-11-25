@@ -693,6 +693,12 @@ pub(crate) fn sample_facts() -> StatusFacts {
         health: SystemHealth {
             downloader_online: true,
             downloader_failure: None,
+            downloaders: vec![shared::system::DownloaderHealth {
+                id: "slskd".into(),
+                name: "Soulseek".into(),
+                online: true,
+                failure: None,
+            }],
             // Soulful's own beets probe issue, lib/soulbeet/src/beets/probe.rs:121-125
             importer: ImporterHealth {
                 level: HealthLevel::Degraded,

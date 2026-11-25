@@ -55,6 +55,7 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
       mcp_url: mcpUrl,
       user: { username: user.username, role: 'user' },
       download_backend: { backend: 'slskd', online: true },
+      download_backends: [{ id: 'slskd', name: 'Soulseek', online: true }],
       navidrome: { connected: true, admin: false },
       deletion_enabled: false,
     });

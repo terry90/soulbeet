@@ -124,6 +124,7 @@ pub(crate) mod test_db {
     pub const REMOVE_LASTFM: i64 = 20261130000000;
     pub const BACKEND_ID: i64 = 20261203000000;
     pub const ITEM_BACKEND: i64 = 20261203000001;
+    pub const BACKEND_TRANSFERS: i64 = 20261204000001;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -995,6 +996,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(search.query.tracks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upgraded_install_gets_an_empty_transfer_book_that_keeps_data_as_json() {
+        let db = test_db::migrated_before(test_db::BACKEND_TRANSFERS).await;
+        sqlx::query(
+            "INSERT INTO app_config (key, value) VALUES ('slskd_url', 'http://slskd:5030')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        test_db::apply_from(&db, test_db::BACKEND_TRANSFERS).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backend_transfers")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query(
+            "INSERT INTO backend_transfers (backend, key, source, item, request, target, created_at) \
+             VALUES ('archive', 'k1', 'the_slip', '01.flac', 'r1', 'F', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let data: String = sqlx::query_scalar("SELECT data FROM backend_transfers")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(data, "{}");
+        let kept: String =
+            sqlx::query_scalar("SELECT value FROM app_config WHERE key = 'slskd_url'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(kept, "http://slskd:5030");
     }
 
     #[tokio::test]

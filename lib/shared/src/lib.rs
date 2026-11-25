@@ -1,3 +1,4 @@
+pub mod backends;
 pub mod changelog;
 pub mod download;
 pub mod failure;

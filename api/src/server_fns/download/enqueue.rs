@@ -178,7 +178,15 @@ pub async fn enqueue_claimed(
 ) -> BackendResult<Vec<QueuedDownload>> {
     let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
-    let answered = match backend.download(items, &batch.destination, request).await {
+    let answered = match backend
+        .download(
+            items,
+            &batch.destination,
+            request,
+            batch.owner.user_id.as_str(),
+        )
+        .await
+    {
         Ok(queued) => queued,
         Err(e) => {
             for key in &keys {
@@ -1111,6 +1119,15 @@ mod tests {
         assert!(TransferRegistry::global()
             .may_adopt(&key(&backend, "peer_a", "01.flac"), &batch("Other").owner));
         assert_eq!(stub.cancelled(), vec![Cancel::only("peer_a", "t-01.flac")]);
+    }
+
+    #[tokio::test]
+    async fn the_backend_hears_whose_batch_it_downloads_for() {
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        enqueue_claimed_for(&backend, &running).await;
+        assert_eq!(stub.owners(), vec![running.owner.user_id.to_string()]);
     }
 
     /// Claims and enqueues `01.flac` into `running`.

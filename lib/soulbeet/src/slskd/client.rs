@@ -1,4 +1,5 @@
-use super::{processing, utils::WantedTrack, wildcard};
+use super::{processing, wildcard};
+use crate::matching::path::WantedTrack;
 use crate::{
     backend_error::BackendResult,
     error::{MissingSetting, Result, SoulseekError},
@@ -1465,11 +1466,11 @@ fn parse_batch_enqueue_response(
 #[async_trait::async_trait]
 impl crate::DownloadBackend for SoulseekClient {
     fn id(&self) -> &'static str {
-        shared::slskd::BACKEND_ID
+        shared::backends::SLSKD.id
     }
 
     fn name(&self) -> &'static str {
-        "Soulseek"
+        shared::backends::SLSKD.name
     }
 
     async fn start_search(&self, spec: &SearchSpec) -> BackendResult<String> {
@@ -1497,6 +1498,7 @@ impl crate::DownloadBackend for SoulseekClient {
         items: Vec<shared::download::DownloadableItem>,
         destination: &str,
         request: &str,
+        _owner: &str,
     ) -> BackendResult<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()
@@ -1533,11 +1535,11 @@ impl crate::DownloadBackend for SoulseekClient {
 
     async fn cancel_download(
         &self,
-        username: &str,
+        source: &str,
         download_id: &str,
         remove: bool,
     ) -> BackendResult<()> {
-        Ok(self.cancel_download(username, download_id, remove).await?)
+        Ok(self.cancel_download(source, download_id, remove).await?)
     }
 
     async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>> {
@@ -1664,12 +1666,12 @@ mod tests {
     }
 
     #[test]
-    fn the_client_goes_by_the_slskd_backend_id() {
+    fn the_client_goes_by_its_backend_meta() {
         use crate::DownloadBackend;
-        assert_eq!(
-            client_at("http://127.0.0.1:1").id(),
-            shared::slskd::BACKEND_ID
-        );
+        let client = client_at("http://127.0.0.1:1");
+        let meta = shared::backends::meta("slskd").unwrap();
+        assert_eq!((client.id(), client.name()), (meta.id, meta.name));
+        assert_eq!(client.id(), shared::slskd::BACKEND_ID);
     }
 
     #[tokio::test]

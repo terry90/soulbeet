@@ -17,7 +17,7 @@ pub(crate) use disclosure::ToggleDriver;
 pub use disclosure::{use_open_handler, Disclosure};
 pub use row_action::RowAction;
 #[cfg(test)]
-pub(crate) use testing::{change, click, listeners, opening_tag, submit_form};
+pub(crate) use testing::{change, click, click_and_find, listeners, opening_tag, submit_form};
 pub use text_input::{submitted_text, Autofill, FieldKind, FieldLook, TextInput, FIELD_CLASS};
 
 /// What a small control looks like when it has keyboard focus.

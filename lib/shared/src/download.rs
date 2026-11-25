@@ -303,7 +303,7 @@ pub enum SourcePresence {
     Online,
     Away,
     Offline,
-    /// slskd's blacklist holds this user, so nothing can be downloaded from it.
+    /// The backend will not give this source's files.
     Blocked,
 }
 
@@ -546,6 +546,115 @@ pub fn batch_folder(label: &str, batch_id: &str) -> String {
         .take(8)
         .collect();
     format!("{label} [{short}]")
+}
+
+/// How good a file's format is, on the one scale every backend scores on: the format's weight
+/// plus its bitrate's term, uncapped. A backend's `quality_score` is this plus its own terms,
+/// capped at 1.0.
+pub fn format_score(extension: &str, bitrate_kbps: Option<u32>) -> f64 {
+    let mut score = match extension {
+        "flac" => 1.0,
+        "wav" => 0.85,
+        "m4a" | "aac" => 0.65,
+        "ogg" => 0.6,
+        "mp3" => 0.55,
+        "wma" => 0.4,
+        _ => 0.3,
+    };
+    if let Some(br) = bitrate_kbps {
+        if br >= 320 {
+            score += 0.2;
+        } else if br >= 256 {
+            score += 0.1;
+        } else if br < 128 {
+            score -= 0.3;
+        }
+    }
+    score
+}
+
+/// Replace characters that are invalid in filenames with `_`.
+/// Mirrors slskd's `ReplaceInvalidFileNameCharacters` on Windows hosts and,
+/// since slskd sanitizes idempotently, produces names slskd will not alter
+/// again on either OS. Used both to pre-sanitize the batch enqueue
+/// `destination` and to predict where a backend placed a downloaded file.
+pub fn sanitize_filename(name: &str) -> String {
+    let invalid = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        if invalid.contains(&c) || c == '\0' {
+            result.push('_');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Sanitize like slskd running on a Unix host: only `/` and NUL are invalid.
+/// slskd 0.26 sanitizes basenames with the host OS's invalid set, so a Linux
+/// slskd keeps characters like `:` that [`sanitize_filename`] would replace;
+/// path resolution has to try both candidates.
+fn sanitize_filename_unix(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c == '/' || c == '\0' {
+            result.push('_');
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// The names a file whose remote basename is `remote_basename` may land under in its batch
+/// folder: sanitized with the Windows-invalid set (slskd on Windows, and what Soulful's own
+/// destinations use) or with the Unix set (slskd on Linux keeps characters like `:`), the first
+/// one first. One name when they agree. A taken name lands as a `ticks_copy` of one of them.
+pub fn landing_names(remote_basename: &str) -> Vec<String> {
+    let windows = sanitize_filename(remote_basename);
+    let unix = sanitize_filename_unix(remote_basename);
+    if unix == windows {
+        vec![windows]
+    } else {
+        vec![windows, unix]
+    }
+}
+
+/// The copy slskd writes when `name` is taken: `<stem>_<ticks, 18 digits><ext>`.
+pub fn ticks_copy(name: &str, ticks: u64) -> String {
+    let (stem, ext) = stem_and_ext(name);
+    format!("{stem}_{ticks:018}{ext}")
+}
+
+/// Whether `name` is a `ticks_copy` of `original`.
+pub fn is_ticks_copy(name: &str, original: &str) -> bool {
+    let (stem, ext) = stem_and_ext(original);
+    !stem.is_empty()
+        && name
+            .strip_prefix(stem)
+            .and_then(|rest| rest.strip_prefix('_'))
+            .and_then(|rest| rest.strip_suffix(ext))
+            .is_some_and(|ticks| ticks.len() == 18 && ticks.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A file name's stem and its extension with the dot, as `Path::file_stem` and
+/// `Path::extension` split it: a leading dot starts the stem, not an extension.
+fn stem_and_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(at) if at > 0 => name.split_at(at),
+        _ => (name, ""),
+    }
+}
+
+/// .NET ticks (100 ns since 0001-01-01) at `at`, as slskd stamps a copy.
+pub fn dotnet_ticks(at: std::time::SystemTime) -> u64 {
+    const AT_UNIX_EPOCH: u64 = 621_355_968_000_000_000;
+    let ticks = |d: std::time::Duration| (d.as_nanos() / 100) as u64;
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => AT_UNIX_EPOCH + ticks(after),
+        Err(before) => AT_UNIX_EPOCH.saturating_sub(ticks(before.duration())),
+    }
 }
 
 /// What the backend did with one file of an enqueue request.
@@ -888,6 +997,61 @@ mod tests {
         assert!(DownloadState::Completed < DownloadState::ImportQueued(1));
         assert!(DownloadState::ImportQueued(1) < DownloadState::ImportQueued(3));
         assert!(DownloadState::ImportQueued(9) < DownloadState::Importing);
+    }
+
+    #[test]
+    fn a_format_scores_its_weight_and_bitrate_uncapped() {
+        for (ext, bitrate, score) in [
+            ("flac", None, 1.0),
+            ("flac", Some(1411), 1.2),
+            ("wav", None, 0.85),
+            ("m4a", Some(256), 0.75),
+            ("aac", None, 0.65),
+            ("ogg", Some(160), 0.6),
+            ("mp3", Some(320), 0.75),
+            ("mp3", Some(96), 0.55 - 0.3),
+            ("wma", None, 0.4),
+            ("opus", None, 0.3),
+        ] {
+            assert!(
+                (format_score(ext, bitrate) - score).abs() < 1e-12,
+                "{ext} {bitrate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn landing_names_are_the_windows_and_the_unix_sanitized_name() {
+        assert_eq!(landing_names("01 - Intro.flac"), vec!["01 - Intro.flac"]);
+        assert_eq!(
+            landing_names("AC: DC?.mp3"),
+            vec!["AC_ DC_.mp3", "AC: DC?.mp3"]
+        );
+        assert_eq!(sanitize_filename("a/b\\c\0"), "a_b_c_");
+        assert_eq!(sanitize_filename_unix("a/b\\c\0"), "a_b\\c_");
+    }
+
+    #[test]
+    fn a_ticks_copy_is_read_back_as_a_copy_of_its_name_only() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let ticks = dotnet_ticks(at);
+        assert_eq!(ticks, 621_355_968_000_000_000 + 17_900_000_000_000_000);
+        for name in ["01.flac", "Track", "a.tar.gz", ".hidden"] {
+            let copy = ticks_copy(name, ticks);
+            assert!(is_ticks_copy(&copy, name), "{copy}");
+            assert!(!is_ticks_copy(&copy, "02.flac"), "{copy}");
+        }
+        assert_eq!(ticks_copy("01.flac", ticks), "01_639255968000000000.flac");
+        assert_eq!(ticks_copy("01.flac", 7), "01_000000000000000007.flac");
+        for other in [
+            "01_123.flac",
+            "01_x.flac",
+            "01_6392559680000000000.flac",
+            "01.flac",
+        ] {
+            assert!(!is_ticks_copy(other, "01.flac"), "{other}");
+        }
+        assert_eq!(dotnet_ticks(std::time::UNIX_EPOCH), 621_355_968_000_000_000);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
+use super::backends::BackendSwitches;
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
 use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
 use crate::friendly_error;
@@ -87,6 +88,8 @@ pub fn AppConfigManager() -> Element {
                 onclick: handle_save,
                 if saving() { "Saving..." } else { "Save Configuration" }
             }
+
+            BackendSwitches {}
         }
     }
 }

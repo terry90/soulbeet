@@ -1,6 +1,6 @@
 use crate::use_auth;
 use dioxus::prelude::*;
-use shared::system::{ImporterHealth, SystemHealth};
+use shared::system::{DownloaderHealth, ImporterHealth, SystemHealth};
 
 /// Health context that provides live backend availability throughout the app.
 /// Polled in one place so components can react to it without running their own loops.
@@ -21,6 +21,13 @@ impl Health {
 
     pub fn importer(&self) -> ImporterHealth {
         self.state.read().importer.clone()
+    }
+
+    /// The last health of the download backend `id`; None while it is off or not checked yet.
+    pub fn downloader(&self, id: &str) -> Option<DownloaderHealth> {
+        (self.state.read().downloaders.iter())
+            .find(|d| d.id == id)
+            .cloned()
     }
 }
 

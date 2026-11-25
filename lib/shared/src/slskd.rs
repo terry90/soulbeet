@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use std::fmt;
@@ -331,40 +330,6 @@ impl<'de> Deserialize<'de> for FlattenedFiles {
     }
 }
 
-/// Replace characters that are invalid in filenames with `_`.
-/// Mirrors slskd's `ReplaceInvalidFileNameCharacters` on Windows hosts and,
-/// since slskd sanitizes idempotently, produces names slskd will not alter
-/// again on either OS. Used both to pre-sanitize the batch enqueue
-/// `destination` and to predict where slskd placed a downloaded file.
-pub fn sanitize_filename(name: &str) -> String {
-    let invalid = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    let mut result = String::with_capacity(name.len());
-    for c in name.chars() {
-        if invalid.contains(&c) || c == '\0' {
-            result.push('_');
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Sanitize like slskd running on a Unix host: only `/` and NUL are invalid.
-/// slskd 0.26 sanitizes basenames with the host OS's invalid set, so a Linux
-/// slskd keeps characters like `:` that [`sanitize_filename`] would replace;
-/// path resolution has to try both candidates.
-pub fn sanitize_filename_unix(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c == '/' || c == '\0' {
-            result.push('_');
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchResult {
     pub guessed_artist: String,
@@ -457,43 +422,21 @@ impl SearchResult {
             .to_lowercase()
     }
 
+    /// `format_score` of the file plus the peer's terms: a free slot, its speed, its queue.
+    /// A negative bitrate a peer reports scores as 0, under 128.
     pub fn quality_score(&self) -> f64 {
-        let quality_weights: HashMap<&str, f64> = [
-            ("flac", 1.0),
-            ("wav", 0.85),
-            ("m4a", 0.65),
-            ("aac", 0.65),
-            ("mp3", 0.55),
-            ("ogg", 0.6),
-            ("wma", 0.4),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let mut base_score = *quality_weights.get(self.quality().as_str()).unwrap_or(&0.3);
-
-        if let Some(br) = self.bitrate {
-            if br >= 320 {
-                base_score += 0.2;
-            } else if br >= 256 {
-                base_score += 0.1;
-            } else if br < 128 {
-                base_score -= 0.3;
-            }
-        }
-
+        let bitrate = self.bitrate.map(|br| u32::try_from(br).unwrap_or(0));
+        let mut score = crate::download::format_score(&self.quality(), bitrate);
         if self.has_free_upload_slot {
-            base_score += 0.1;
+            score += 0.1;
         }
         if self.upload_speed > 100 {
-            base_score += 0.05;
+            score += 0.05;
         }
         if self.queue_length > 10 {
-            base_score -= 0.1;
+            score -= 0.1;
         }
-
-        base_score.min(1.0)
+        score.min(1.0)
     }
 }
 
@@ -1131,6 +1074,82 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+
+    /// The score as it was computed before `format_score` held the format part.
+    fn score_before_format_score(r: &SearchResult) -> f64 {
+        let weights: std::collections::HashMap<&str, f64> = [
+            ("flac", 1.0),
+            ("wav", 0.85),
+            ("m4a", 0.65),
+            ("aac", 0.65),
+            ("mp3", 0.55),
+            ("ogg", 0.6),
+            ("wma", 0.4),
+        ]
+        .into_iter()
+        .collect();
+        let mut base = *weights.get(r.quality().as_str()).unwrap_or(&0.3);
+        if let Some(br) = r.bitrate {
+            if br >= 320 {
+                base += 0.2;
+            } else if br >= 256 {
+                base += 0.1;
+            } else if br < 128 {
+                base -= 0.3;
+            }
+        }
+        if r.has_free_upload_slot {
+            base += 0.1;
+        }
+        if r.upload_speed > 100 {
+            base += 0.05;
+        }
+        if r.queue_length > 10 {
+            base -= 0.1;
+        }
+        base.min(1.0)
+    }
+
+    #[test]
+    fn a_files_score_is_its_format_score_plus_the_peers_terms_as_before() {
+        let names = [
+            "a.flac", "a.FLAC", "a.wav", "a.m4a", "a.aac", "a.ogg", "a.mp3", "a.wma", "a.opus", "a",
+        ];
+        for name in names {
+            for bitrate in [
+                None,
+                Some(-1),
+                Some(0),
+                Some(96),
+                Some(128),
+                Some(256),
+                Some(320),
+            ] {
+                for (slot, speed, queue) in [(false, 0, 0), (true, 101, 0), (true, 500, 11)] {
+                    let r = SearchResult {
+                        username: "p".into(),
+                        filename: format!("Music\\{name}"),
+                        size: 1,
+                        bitrate,
+                        duration: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        has_free_upload_slot: slot,
+                        upload_speed: speed,
+                        queue_length: queue,
+                        variable_bit_rate: None,
+                        declared_extension: None,
+                        folder_audio_files: 1,
+                    };
+                    assert_eq!(
+                        r.quality_score(),
+                        score_before_format_score(&r),
+                        "{name} {bitrate:?} {slot} {speed} {queue}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

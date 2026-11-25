@@ -45,8 +45,9 @@ pub trait MetadataProvider: Send + Sync {
 }
 
 /// A source of files. Files of a `download` call land at
-/// `<DOWNLOAD_PATH>/<destination>/<name>`, under the naming slskd uses, which
-/// `resolve_in_destination` reads.
+/// `<DOWNLOAD_PATH>/<destination>/<name>`, `name` being one of
+/// `shared::download::landing_names(last segment of DownloadableItem::id)` or a `ticks_copy` of
+/// it, as `resolve_in_destination` reads.
 ///
 /// What the callers rely on:
 /// - `QueuedDownload::id` is stable, and is the id `get_downloads_for` and
@@ -57,7 +58,11 @@ pub trait MetadataProvider: Send + Sync {
 /// - Every `DownloadableItem` that `poll_search` returns names `id()` in
 ///   `backend`, so its sends come back here.
 /// - A succeeded transfer stays listed until `cancel_download` with `remove`.
-/// - `remove` forgets an ended transfer and never moves or deletes a file.
+/// - A backend that keeps transfers in memory loses them on restart; `get_download` then answers
+///   None, which reconcile treats as a lost transfer. An ended record may be forgotten 7 days
+///   after it ended.
+/// - `remove` forgets an ended transfer and never moves or deletes a file in the destination; a
+///   backend's own partial files are its own.
 /// - An item `download` cannot send gets no answer: the caller fails it.
 #[async_trait]
 pub trait DownloadBackend: Send + Sync {
@@ -73,12 +78,15 @@ pub trait DownloadBackend: Send + Sync {
     /// Enqueue `items` into `destination`, a folder under the backend's
     /// download directory shared by every item of the call. `request` is
     /// one `new_request` gave, for this call only: every transfer the call
-    /// makes is listed with it as `DownloadProgress::request`.
+    /// makes is listed with it as `DownloadProgress::request`. `owner` is the
+    /// id of the user the batch is for, opaque, only for sharing the backend
+    /// fairly between users: never logged and never sent out.
     async fn download(
         &self,
         items: Vec<DownloadableItem>,
         destination: &str,
         request: &str,
+        owner: &str,
     ) -> BackendResult<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller
@@ -89,19 +97,24 @@ pub trait DownloadBackend: Send + Sync {
         -> BackendResult<Option<DownloadProgress>>;
     async fn cancel_download(
         &self,
-        username: &str,
+        source: &str,
         download_id: &str,
         remove: bool,
     ) -> BackendResult<()>;
-    /// The transfer's place in the source's queue, asked of the source now; None when the
-    /// backend no longer has the transfer.
+    /// The transfer's place in the line it waits in before it starts: the source's queue for a
+    /// peer backend (asked now, or the last place the source gave when it cannot be asked), the
+    /// backend's own queue otherwise; Some(0) once it is not waiting; None when the backend no
+    /// longer has the transfer.
     async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>>;
-    /// Whether the source is online now.
+    /// Whether this backend can fetch from the source now.
     async fn source_status(&self, source: &str) -> BackendResult<SourcePresence>;
     /// Ends a running search early; its next poll reads what it found so far.
     async fn stop_search(&self, search_id: &str) -> BackendResult<()>;
     /// Ok when the backend can take work now; else why not, as a failure
-    /// with the backend's own answer as its cause.
+    /// with the backend's own answer as its cause. Called every 10 s per open tab. A backend
+    /// that calls a third-party service costs it at most one request per minute, caching inside
+    /// the backend; slskd, the user's own server, is checked live. Its failure is shown to every
+    /// user and logged, so it never holds a key, a password or a URL with credentials in it.
     async fn health_check(&self) -> std::result::Result<(), Failure>;
 }
 

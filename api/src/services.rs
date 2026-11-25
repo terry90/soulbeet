@@ -6,7 +6,11 @@ use std::{
 };
 
 #[cfg(feature = "server")]
-use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use shared::backends::{BackendMeta, Switch};
+#[cfg(feature = "server")]
+use shared::failure::{
+    Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
+};
 #[cfg(feature = "server")]
 use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
@@ -33,8 +37,7 @@ pub mod importers {
 }
 
 #[cfg(feature = "server")]
-static DOWNLOAD_BACKENDS: LazyLock<RwLock<HashMap<String, Arc<dyn DownloadBackend>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static DOWNLOAD_BACKENDS: LazyLock<Built> = LazyLock::new(Built::default);
 
 #[cfg(feature = "server")]
 static MUSIC_IMPORTERS: LazyLock<RwLock<HashMap<String, Arc<dyn MusicImporter>>>> =
@@ -49,9 +52,48 @@ pub fn available_metadata_providers() -> Vec<(&'static str, &'static str)> {
     vec![(providers::MUSICBRAINZ, "MusicBrainz")]
 }
 
+/// The backends that may be used now: the ones always on, and the ones an admin turned on. A
+/// switch that cannot be read leaves its backend out; the database failure shows elsewhere.
 #[cfg(feature = "server")]
-pub fn available_download_backends() -> Vec<(&'static str, &'static str)> {
-    vec![(downloaders::SLSKD, "Soulseek")]
+pub async fn enabled_download_backends() -> Vec<&'static BackendMeta> {
+    enabled_in(&crate::db::DB, shared::backends::ALL).await
+}
+
+#[cfg(feature = "server")]
+pub(crate) async fn enabled_in(
+    db: &sqlx::SqlitePool,
+    all: &'static [BackendMeta],
+) -> Vec<&'static BackendMeta> {
+    let mut enabled = Vec::new();
+    for meta in all {
+        if switched_on(db, meta).await.is_ok() {
+            enabled.push(meta);
+        }
+    }
+    enabled
+}
+
+/// Ok when `meta`'s backend may be used: always on, or turned on by an admin.
+#[cfg(feature = "server")]
+pub(crate) async fn switched_on(
+    db: &sqlx::SqlitePool,
+    meta: &BackendMeta,
+) -> Result<(), BackendLookupError> {
+    if meta.switch == Switch::AlwaysOn {
+        return Ok(());
+    }
+    match turned_on(db, meta.id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BackendLookupError::Disabled(meta.name.to_string())),
+        Err(e) => Err(BackendLookupError::Settings(e)),
+    }
+}
+
+/// Whether an admin turned on the backend `id`: its switch key reads "true".
+#[cfg(feature = "server")]
+pub(crate) async fn turned_on(db: &sqlx::SqlitePool, id: &str) -> Result<bool, String> {
+    let on = AppConfig::get_in(db, &keys::backend_enabled(id)).await?;
+    Ok(on.as_deref() == Some("true"))
 }
 
 #[cfg(feature = "server")]
@@ -72,6 +114,8 @@ pub enum BackendLookupError {
     Unknown(String),
     /// The backend built for `id` goes by `named`, so nothing routed to `id` would reach it.
     Misnamed { id: String, named: &'static str },
+    /// An admin has not turned on the backend with this name.
+    Disabled(String),
 }
 
 #[cfg(feature = "server")]
@@ -83,6 +127,9 @@ impl std::fmt::Display for BackendLookupError {
             BackendLookupError::Unknown(id) => write!(f, "Unknown download backend: {id}"),
             BackendLookupError::Misnamed { id, named } => {
                 write!(f, "Download backend {id} names itself {named}")
+            }
+            BackendLookupError::Disabled(name) => {
+                write!(f, "{name} is turned off in {SWITCHES_AT}")
             }
         }
     }
@@ -109,9 +156,24 @@ impl BackendLookupError {
                 RetryAdvice::NotRetryable,
                 message,
             ),
+            BackendLookupError::Disabled(name) => Failure::new(
+                FailureCode::BackendNotConfigured,
+                stage,
+                RetryAdvice::NeedsUser,
+                message,
+            )
+            .with_user_action(UserAction::new(
+                UserActionCode::ConfigureBackend,
+                format!("Turn on {name}"),
+                SWITCHES_AT,
+            )),
         }
     }
 }
+
+/// Where an admin turns download backends on and off.
+#[cfg(feature = "server")]
+pub const SWITCHES_AT: &str = "Settings > Config > Connections";
 
 #[cfg(feature = "server")]
 async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
@@ -144,24 +206,123 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
 
 /// The backend `download_backend(None)` gives.
 #[cfg(feature = "server")]
-pub const DEFAULT_DOWNLOAD_BACKEND: &str = downloaders::SLSKD;
+pub const DEFAULT_DOWNLOAD_BACKEND: &str = shared::backends::DEFAULT_ID;
 
 #[cfg(feature = "server")]
 pub async fn download_backend(
     id: Option<&str>,
 ) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
     let requested = id.unwrap_or(DEFAULT_DOWNLOAD_BACKEND);
+    DOWNLOAD_BACKENDS
+        .get_or_build(requested, || async {
+            if let Some(meta) = shared::backends::meta(requested) {
+                switched_on(&crate::db::DB, meta).await?;
+            }
+            answering_to(requested, init_download_backend(requested).await?)
+        })
+        .await
+}
 
-    if let Some(backend) = DOWNLOAD_BACKENDS.read().await.get(requested) {
-        return Ok(backend.clone());
+/// The backends built so far, each id in a slot of its own.
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct Built(RwLock<HashMap<String, Slot>>);
+
+/// One id's backend, once built. Built while the slot is locked, so concurrent first lookups
+/// share one backend and a `forget` waits for a build in flight.
+#[cfg(feature = "server")]
+type Slot = Arc<tokio::sync::Mutex<Option<Arc<dyn DownloadBackend>>>>;
+
+#[cfg(feature = "server")]
+impl Built {
+    async fn slot(&self, id: &str) -> Slot {
+        if let Some(slot) = self.0.read().await.get(id) {
+            return slot.clone();
+        }
+        self.0
+            .write()
+            .await
+            .entry(id.to_string())
+            .or_default()
+            .clone()
     }
 
-    let backend = answering_to(requested, init_download_backend(requested).await?)?;
-    DOWNLOAD_BACKENDS
-        .write()
+    /// The backend kept under `id`, else the one `build` gives, kept. A slow build holds up
+    /// only lookups of its own id, and a `forget` that returns before a lookup starts is never
+    /// undone by it.
+    async fn get_or_build<F, Fut>(
+        &self,
+        id: &str,
+        build: F,
+    ) -> Result<Arc<dyn DownloadBackend>, BackendLookupError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<dyn DownloadBackend>, BackendLookupError>>,
+    {
+        let slot = self.slot(id).await;
+        let mut kept = slot.lock().await;
+        if let Some(backend) = &*kept {
+            return Ok(backend.clone());
+        }
+        let backend = build().await?;
+        *kept = Some(backend.clone());
+        Ok(backend)
+    }
+
+    /// Drops the backend kept under `id`, once any build of it in flight has finished.
+    async fn forget(&self, id: &str) {
+        let slot = self.0.read().await.get(id).cloned();
+        if let Some(slot) = slot {
+            *slot.lock().await = None;
+        }
+    }
+}
+
+/// Drops the backend kept under `id`, so the next lookup builds it again from its settings and
+/// its switch. The other backends stay.
+#[cfg(feature = "server")]
+pub async fn reload_download_backend(id: &str) {
+    DOWNLOAD_BACKENDS.forget(id).await;
+}
+
+/// Stops everything the backend `id` runs in this process: its searches, and its unfinished
+/// transfers, whose partial files it deletes and whose transfer book entries it forgets. Entries
+/// of finished transfers stay. Runs after the backend was dropped from the registry, so no new
+/// lookup gets it; a handle taken earlier must then be refused `download` and `start_search`
+/// until the backend is built again. Each backend that can be turned off adds its arm.
+#[cfg(feature = "server")]
+#[allow(clippy::match_single_binding)]
+pub(crate) async fn stop_backend(id: &str) {
+    match id {
+        _ => {}
+    }
+}
+
+/// This install's id, made and stored on first use.
+#[cfg(feature = "server")]
+pub async fn instance_id() -> Result<String, String> {
+    instance_id_in(&crate::db::DB).await
+}
+
+#[cfg(feature = "server")]
+pub(crate) async fn instance_id_in(db: &sqlx::SqlitePool) -> Result<String, String> {
+    sqlx::query("INSERT INTO app_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING")
+        .bind(keys::INSTANCE_ID)
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(db)
         .await
-        .insert(requested.to_string(), backend.clone());
-    Ok(backend)
+        .map_err(|e| e.to_string())?;
+    AppConfig::get_in(db, keys::INSTANCE_ID)
+        .await?
+        .ok_or_else(|| "the instance id was not stored".to_string())
+}
+
+/// The transfer records a backend keeps across restarts, in Soulful's database.
+#[cfg(feature = "server")]
+pub fn transfer_book() -> Arc<dyn soulbeet::TransferBook> {
+    Arc::new(crate::ledger::transfer_book::SqliteTransferBook::new(
+        (*crate::db::DB).clone(),
+    ))
 }
 
 /// `backend`, built for `id`, when it goes by `id`: a backend is kept only under its own id.
@@ -506,7 +667,8 @@ pub async fn evict_navidrome_client(user_id: &str) {
 
 #[cfg(feature = "server")]
 pub async fn reload_providers() {
-    DOWNLOAD_BACKENDS.write().await.clear();
+    // The form saved changes only slskd's settings: the other backends keep running.
+    DOWNLOAD_BACKENDS.forget(downloaders::SLSKD).await;
     // MUSIC_IMPORTERS stays: importers are built from the environment only,
     // and dropping one would drop its cached health.
     NAVIDROME_CLIENTS.write().await.clear();
@@ -875,6 +1037,174 @@ mod tests {
             assert_eq!(e.to_string(), "Unknown download backend: b");
         }
         assert_eq!(backends.asked(), ["a", "b"]);
+    }
+
+    /// A backend an admin turns on, as a backend branch adds one.
+    const SWITCHED: BackendMeta = BackendMeta {
+        id: "archive",
+        name: "Internet Archive",
+        service: "archive.org",
+        switch: Switch::AdminToggle,
+        ..shared::backends::SLSKD
+    };
+    static METAS: &[BackendMeta] = &[shared::backends::SLSKD, SWITCHED];
+
+    #[tokio::test]
+    async fn a_backend_turned_off_is_disabled_and_says_where_to_turn_it_on() {
+        use shared::failure::UserActionCode;
+        let db = test_db::migrated().await;
+        let Err(e) = switched_on(&db, &SWITCHED).await else {
+            panic!("a backend never turned on is on");
+        };
+        assert_eq!(
+            e.to_string(),
+            "Internet Archive is turned off in Settings > Config > Connections"
+        );
+        let f = e.failure(Stage::Enqueue, e.to_string());
+        assert_eq!(
+            (f.code, f.stage, f.retry),
+            (
+                FailureCode::BackendNotConfigured,
+                Stage::Enqueue,
+                RetryAdvice::NeedsUser
+            )
+        );
+        let action = f.user_action.unwrap();
+        assert_eq!(
+            (action.code, action.what.as_str(), action.where_.as_str()),
+            (
+                UserActionCode::ConfigureBackend,
+                "Turn on Internet Archive",
+                "Settings > Config > Connections"
+            )
+        );
+        AppConfig::set_in(&db, "archive_enabled", "true")
+            .await
+            .unwrap();
+        assert!(switched_on(&db, &SWITCHED).await.is_ok());
+        AppConfig::set_in(&db, "archive_enabled", "false")
+            .await
+            .unwrap();
+        assert!(switched_on(&db, &SWITCHED).await.is_err());
+        assert!(switched_on(&db, &shared::backends::SLSKD).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_enabled_backends_are_the_ones_always_on_and_the_ones_turned_on() {
+        let db = test_db::migrated().await;
+        let ids = |metas: Vec<&BackendMeta>| metas.iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd"]);
+        AppConfig::set_in(&db, &keys::backend_enabled("archive"), "true")
+            .await
+            .unwrap();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd", "archive"]);
+        AppConfig::delete_in(&db, "archive_enabled").await.unwrap();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd"]);
+
+        // A switch that cannot be read leaves its backend out.
+        AppConfig::set_in(&db, &keys::backend_enabled("archive"), "true")
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE app_config")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd"]);
+        assert!(matches!(
+            switched_on(&db, &SWITCHED).await,
+            Err(BackendLookupError::Settings(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reloading_one_backend_keeps_the_others_built() {
+        let built = Built::default();
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = |stub: Arc<StubBackend>| {
+            builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(stub as Arc<dyn DownloadBackend>) }
+        };
+        built.get_or_build("a", || build(a.clone())).await.unwrap();
+        built.get_or_build("b", || build(b.clone())).await.unwrap();
+
+        built.forget("a").await;
+
+        let kept = built
+            .get_or_build("b", || async {
+                Err(BackendLookupError::Unknown("b was built again".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.id(), b.id());
+        let again = built.get_or_build("a", || build(a.clone())).await.unwrap();
+        assert_eq!(again.id(), a.id());
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // A lookup that fails keeps nothing.
+        let refused = built
+            .get_or_build("c", || async {
+                Err(BackendLookupError::Disabled("Internet Archive".into()))
+            })
+            .await;
+        assert!(refused.is_err());
+        let c = StubBackend::new(vec![]);
+        built.get_or_build("c", || build(c.clone())).await.unwrap();
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_build_in_flight_holds_up_only_its_own_id_and_a_forget_waits_for_it() {
+        let built = Arc::new(Built::default());
+        let (a, b) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let (started, building) = tokio::sync::oneshot::channel::<()>();
+        let slow = tokio::spawn({
+            let (built, a) = (built.clone(), a.clone());
+            async move {
+                built
+                    .get_or_build("a", || async move {
+                        started.send(()).unwrap();
+                        hold.await.unwrap();
+                        Ok(a as Arc<dyn DownloadBackend>)
+                    })
+                    .await
+            }
+        });
+        building.await.unwrap();
+
+        // Another id builds while "a" is still building.
+        let other = built
+            .get_or_build("b", || async { Ok(b.clone() as Arc<dyn DownloadBackend>) })
+            .await
+            .unwrap();
+        assert_eq!(other.id(), b.id());
+
+        // The turn-off that drops "a" waits for the build, then removes what it kept.
+        let forget = tokio::spawn({
+            let built = built.clone();
+            async move { built.forget("a").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!forget.is_finished());
+        release.send(()).unwrap();
+        slow.await.unwrap().unwrap();
+        forget.await.unwrap();
+        let again = built
+            .get_or_build("a", || async {
+                Err(BackendLookupError::Disabled("Internet Archive".into()))
+            })
+            .await;
+        assert!(again.is_err(), "the forget kept the build in flight");
+    }
+
+    #[tokio::test]
+    async fn an_install_keeps_one_instance_id_of_its_own() {
+        let (one, other) = (test_db::migrated().await, test_db::migrated().await);
+        let id = instance_id_in(&one).await.unwrap();
+        assert_eq!(instance_id_in(&one).await.unwrap(), id);
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+        assert_ne!(instance_id_in(&other).await.unwrap(), id);
     }
 
     #[tokio::test]

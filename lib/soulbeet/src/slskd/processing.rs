@@ -1,5 +1,7 @@
-use super::utils::{self, WantedTrack};
 use crate::audio::is_audio_path;
+use crate::matching::assign::assign_tracks;
+use crate::matching::path::{rank_match, release_folder, remote_folder, Ranked, WantedTrack};
+use crate::matching::score::{group_score, MIN_SCORE_THRESHOLD};
 use crate::slskd::models::SearchResponse;
 use itertools::Itertools;
 use shared::slskd::{declared_extension, AlbumResult, MatchResult, SearchResult, TrackResult};
@@ -21,25 +23,6 @@ fn kept_as_audio(filename: &str) -> bool {
     path.extension().is_none() || is_audio_path(path)
 }
 
-/// The remote folder of a file a peer names with `\` or `/` between its folders.
-fn remote_folder(filename: &str) -> &str {
-    filename
-        .rsplit_once(['\\', '/'])
-        .map_or("", |(folder, _)| folder)
-}
-
-/// The remote folder of the release a file is in: its own folder, or the one
-/// above it when its folder is one disc of the release.
-fn release_folder(filename: &str) -> &str {
-    let folder = remote_folder(filename);
-    let (above, name) = folder.rsplit_once(['\\', '/']).unwrap_or(("", folder));
-    if utils::is_disc_folder(name) {
-        above
-    } else {
-        folder
-    }
-}
-
 /// A file as one of the expected tracks it may be.
 struct Candidate {
     /// The track's index in the expected tracks.
@@ -58,14 +41,13 @@ pub fn process_search_responses(
     expected_tracks: &[WantedTrack],
     keep_below_floor: bool,
 ) -> Processed {
-    const MIN_SCORE_THRESHOLD: f64 = 0.6;
     let mut not_audio = 0;
     let mut below_floor = 0;
     let mut scored_files: Vec<(Vec<Candidate>, SearchResult)> = Vec::new();
     // A file that shares no word with any wanted title is none of them,
     // whatever its folder and length say. Every ranking of a file has the
     // same title score.
-    let under = |r: &utils::Ranked| {
+    let under = |r: &Ranked| {
         r.result.total_score < MIN_SCORE_THRESHOLD
             || (r.track.is_some() && r.result.track_score == 0.0)
     };
@@ -82,7 +64,7 @@ pub fn process_search_responses(
                 continue;
             }
 
-            let ranked = utils::rank_match(
+            let ranked = rank_match(
                 &file.filename,
                 Some(searched_artist),
                 searched_album,
@@ -138,6 +120,11 @@ pub fn process_search_responses(
     }
 }
 
+/// The candidate a file is as the expected track `track`.
+fn candidate(file: &(Vec<Candidate>, SearchResult), track: usize) -> Option<&Candidate> {
+    file.0.iter().find(|c| c.track == track)
+}
+
 fn find_best_albums(
     scored_files: &[(Vec<Candidate>, SearchResult)],
     expected_tracks: &[WantedTrack],
@@ -158,32 +145,24 @@ fn find_best_albums(
     album_groups
         .into_iter()
         .filter_map(|((username, _), files_in_group)| {
-            // Every file as every track it may be, best first.
-            let mut pairs: Vec<(&Candidate, &SearchResult)> = files_in_group
-                .iter()
-                .flat_map(|(candidates, search)| candidates.iter().map(move |c| (c, search)))
+            // A file a peer lists twice is one file.
+            let mut seen: HashSet<&str> = HashSet::new();
+            let files: Vec<&(Vec<Candidate>, SearchResult)> = files_in_group
+                .into_iter()
+                .filter(|(_, search)| seen.insert(search.filename.as_str()))
                 .collect();
-            pairs.sort_by(|(c1, s1), (c2, s2)| {
-                c2.result
-                    .total_score
-                    .partial_cmp(&c1.result.total_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        s2.quality_score()
-                            .partial_cmp(&s1.quality_score())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            });
-            // Each track takes the best file no other track took, so a title
-            // the album repeats gets a file per track, never one file twice.
-            let mut taken: Vec<Option<(&Candidate, &SearchResult)>> =
-                vec![None; expected_tracks.len()];
-            let mut used: HashSet<&str> = HashSet::new();
-            for (candidate, search) in pairs {
-                if taken[candidate.track].is_none() && used.insert(search.filename.as_str()) {
-                    taken[candidate.track] = Some((candidate, search));
-                }
-            }
+            let taken: Vec<Option<(&Candidate, &SearchResult)>> = assign_tracks(
+                expected_tracks,
+                &files,
+                |file, track, _| candidate(file, track).map(|c| c.result.total_score),
+                |(_, search)| search.quality_score(),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(track, took)| {
+                took.and_then(|(f, _)| Some((candidate(files[f], track)?, &files[f].1)))
+            })
+            .collect();
 
             let final_tracks: Vec<_> = taken
                 .into_iter()
@@ -221,8 +200,7 @@ fn find_best_albums(
                 .sum::<f64>()
                 / final_tracks.len() as f64;
 
-            let album_quality_score =
-                (avg_score * 0.3) + (completeness * 0.3) + (avg_format_score * 0.4);
+            let album_quality_score = group_score(avg_score, completeness, avg_format_score);
 
             // Every file of a release folder guesses the same album.
             let album_title = final_tracks[0].album.clone();
