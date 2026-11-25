@@ -2160,6 +2160,10 @@ mod tests {
             "broken",
             BackendLookupError::Settings("database is locked".into()),
         );
+        backends.fail(
+            "ytdlp",
+            BackendLookupError::Disabled("YouTube Music".into()),
+        );
         let log = crate::test_log::LogCapture::start();
 
         let usable = usable_from(
@@ -2176,7 +2180,9 @@ mod tests {
         assert!(usable.last_resort.is_empty());
         let lines = log.lines();
         assert!(
-            !lines.iter().any(|l| l.contains("archive unavailable")),
+            !lines
+                .iter()
+                .any(|l| l.contains("archive unavailable") || l.contains("ytdlp unavailable")),
             "{lines:?}"
         );
         assert!(
