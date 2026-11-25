@@ -5,12 +5,15 @@
 //! compressed again on every request. Everything else is gzipped here as it
 //! is sent: pages, server function answers, and the bundled files for
 //! clients that do not take br, which browsers often leave out on plain http.
+//! Images and fonts go as stored: they are compressed already (woff2 is
+//! brotli inside), and gzip only costs time on them.
 
 use axum::http::header::{CONTENT_ENCODING, VARY};
 use axum::http::HeaderValue;
 use axum::middleware::map_response;
 use axum::response::Response;
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 
 /// `router` with its answers gzipped for clients that take gzip.
@@ -21,9 +24,12 @@ use tower_http::compression::CompressionLayer;
 /// Pages render in full before they are sent (Dioxus streaming is off), so
 /// gzip holds none of them back either.
 pub(crate) fn compress(router: Router) -> Router {
-    router
-        .layer(map_response(vary_on_encoding))
-        .layer(CompressionLayer::new().no_br())
+    let worth_compressing = DefaultPredicate::new().and(NotForContentType::const_new("font/woff2"));
+    router.layer(map_response(vary_on_encoding)).layer(
+        CompressionLayer::new()
+            .no_br()
+            .compress_when(worth_compressing),
+    )
 }
 
 /// Dioxus sends a file's brotli copy without `Vary: Accept-Encoding`, and a
@@ -62,11 +68,16 @@ mod tests {
     use super::*;
 
     const CSS: &str = "/assets/tailwind.css";
+    const FONT: &str = "/assets/CommitMono-Variable.woff2";
     /// Long enough to be worth compressing, were it not already.
     const STORED: &[u8] = &[0x1b; 256];
 
     fn css_on_disk() -> Vec<u8> {
         std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/tailwind.css")).unwrap()
+    }
+
+    fn font_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/CommitMono-Variable.woff2")
     }
 
     #[component]
@@ -87,14 +98,15 @@ mod tests {
             .chain(futures::stream::pending())
     }
 
-    /// A page rendered by Dioxus, the stylesheet served the way Dioxus serves
-    /// each bundled file (dioxus-server `serve_dir_cached`), an answer that
-    /// is already brotli, and an event stream.
+    /// A page rendered by Dioxus, the stylesheet and a font served the way
+    /// Dioxus serves each bundled file (dioxus-server `serve_dir_cached`), an
+    /// answer that is already brotli, and an event stream.
     fn app() -> Router {
         let css = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/tailwind.css");
         compress(
             Router::new()
                 .route_service(CSS, ServeFile::new(css).precompressed_br())
+                .route_service(FONT, ServeFile::new(font_path()).precompressed_br())
                 .route(
                     "/assets/copy.br",
                     get(|| async { ([(CONTENT_ENCODING, "br")], Bytes::from(STORED)) }),
@@ -161,6 +173,16 @@ mod tests {
         assert!(varies_on_encoding(response.headers()));
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, css_on_disk());
+    }
+
+    #[tokio::test]
+    async fn a_font_is_sent_as_stored_to_a_client_that_takes_gzip() {
+        let response = get_with(FONT, Some("gzip, deflate")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "font/woff2");
+        assert_eq!(encoding(response.headers()), None);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, std::fs::read(font_path()).unwrap());
     }
 
     #[tokio::test]

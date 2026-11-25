@@ -1,5 +1,4 @@
 /*! tailwindcss v4.3.5 | MIT License | https://tailwindcss.com */
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&display=swap');
 @layer properties;
 @layer theme, base, components, utilities;
 @layer theme {
@@ -7,7 +6,7 @@
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
       "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
       "Segoe UI Symbol", "Noto Color Emoji";
-    --font-mono: "JetBrains Mono", monospace;
+    --font-mono: "Commit Mono", monospace;
     --color-red-300: oklch(80.8% 0.114 19.571);
     --color-red-400: oklch(70.4% 0.191 22.216);
     --color-red-500: oklch(63.7% 0.237 25.331);
@@ -97,11 +96,14 @@
     --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
     --default-font-family: var(--font-sans);
     --default-mono-font-family: var(--font-mono);
+    --default-mono-font-feature-settings: var(--font-mono--font-feature-settings);
     --color-beet-dark: #0f0518;
     --color-beet-panel: #1a0b2e;
     --color-beet-accent: #ff00ff;
     --color-beet-leaf: #00ff9d;
+    --font-mono--font-feature-settings: "ss03", "ss04", "ss05";
     --font-display: "Space Grotesk", sans-serif;
+    --font-display--font-feature-settings: normal;
   }
 }
 @layer base {
@@ -1579,9 +1581,11 @@
   }
   .font-display {
     font-family: var(--font-display);
+    font-feature-settings: var(--font-display--font-feature-settings);
   }
   .font-mono {
     font-family: var(--font-mono);
+    font-feature-settings: var(--font-mono--font-feature-settings);
   }
   .text-2xl {
     font-size: var(--text-2xl);
@@ -2370,6 +2374,7 @@
     padding-inline: calc(var(--spacing) * 6);
     padding-block: calc(var(--spacing) * 3);
     font-family: var(--font-mono);
+    font-feature-settings: var(--font-mono--font-feature-settings);
     font-size: var(--text-xs);
     line-height: var(--tw-leading, var(--text-xs--line-height));
     --tw-tracking: var(--tracking-widest);
@@ -2441,6 +2446,7 @@
   }
   .nav-link {
     font-family: var(--font-display);
+    font-feature-settings: var(--font-display--font-feature-settings);
     font-size: var(--text-sm);
     line-height: var(--tw-leading, var(--text-sm--line-height));
     color: var(--color-gray-400);
@@ -2502,6 +2508,7 @@ body {
   overflow: hidden;
   background-color: var(--color-beet-dark);
   font-family: var(--font-display);
+  font-feature-settings: var(--font-display--font-feature-settings);
   color: var(--color-white);
   background-image: linear-gradient(rgba(26, 11, 46, 0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(26, 11, 46, 0.5) 1px, transparent 1px);
   background-size: 40px 40px;

@@ -1,5 +1,6 @@
 # dx writes a brotli copy next to each bundled file in release builds, and
 # Dioxus sends it to clients that take br, so the bundle is not compressed
-# again on each request.
+# again on each request. The fonts get one too, a few bytes larger than the
+# woff2 itself, which is brotli already: dx cannot leave a file out.
 [web]
 pre_compress = true
