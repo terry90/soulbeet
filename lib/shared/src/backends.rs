@@ -37,8 +37,9 @@ pub struct BackendMeta {
     pub link: Option<(&'static str, &'static str)>,
     /// Shown on each source row of this backend.
     pub attribution: Option<&'static str>,
-    /// Why a same-source retry is refused when the backend will not give a source's files.
-    pub blocked: &'static str,
+    /// Why a same-source retry is refused when the backend will not give a source's files, when
+    /// the backend words it its own way; else `blocked` gives the common text.
+    pub blocked: Option<&'static str>,
 }
 
 pub const SLSKD: BackendMeta = BackendMeta {
@@ -50,7 +51,7 @@ pub const SLSKD: BackendMeta = BackendMeta {
     about: &[],
     link: None,
     attribution: None,
-    blocked: "slskd's blacklist holds this source",
+    blocked: Some("slskd's blacklist holds this source"),
 };
 
 /// Every backend this build has, the default one first.
@@ -68,6 +69,15 @@ pub fn meta(id: &str) -> Option<&'static BackendMeta> {
 /// this build has no meta for.
 pub fn service(id: &str) -> &str {
     meta(id).map_or(id, |m| m.service)
+}
+
+/// Why a same-source retry on the backend `id` is refused when it will not give a source's
+/// files.
+pub fn blocked(id: &str) -> String {
+    match meta(id).and_then(|m| m.blocked) {
+        Some(text) => text.to_string(),
+        None => format!("{} will not give files from this source", service(id)),
+    }
 }
 
 /// Whether an admin turned a backend on.
@@ -95,6 +105,11 @@ mod tests {
     fn texts_name_the_backends_service() {
         assert_eq!(service("slskd"), "slskd");
         assert_eq!(service("stub-3"), "stub-3");
+        assert_eq!(blocked("slskd"), "slskd's blacklist holds this source");
+        assert_eq!(
+            blocked("stub-3"),
+            "stub-3 will not give files from this source"
+        );
     }
 
     #[test]

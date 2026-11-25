@@ -145,15 +145,11 @@ pub(crate) fn source_offline() -> Failure {
 
 /// same_source of a source the backend `backend` will not give files from.
 pub(crate) fn source_blocked(backend: &str) -> Failure {
-    let message = match shared::backends::meta(backend) {
-        Some(meta) => meta.blocked.to_string(),
-        None => format!("{backend} will not give files from this source"),
-    };
     Failure::new(
         FailureCode::EnqueueFailed,
         Stage::Enqueue,
         RetryAdvice::OtherSource,
-        message,
+        shared::backends::blocked(backend),
     )
 }
 

@@ -595,7 +595,7 @@ pub fn sanitize_filename(name: &str) -> String {
 /// slskd 0.26 sanitizes basenames with the host OS's invalid set, so a Linux
 /// slskd keeps characters like `:` that [`sanitize_filename`] would replace;
 /// path resolution has to try both candidates.
-pub fn sanitize_filename_unix(name: &str) -> String {
+fn sanitize_filename_unix(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     for c in name.chars() {
         if c == '/' || c == '\0' {
