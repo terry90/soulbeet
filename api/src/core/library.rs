@@ -23,6 +23,14 @@ use crate::core::index::{NavidromeOf, LOOKUP_PAGE};
 use crate::core::time;
 use crate::models::navidrome_library::NavidromeLibraryRow;
 
+/// The Soulbeet library folder holding a song, when known.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderRef {
+    pub folder_id: String,
+    pub name: String,
+    pub shared: bool,
+}
+
 /// A song as the tools report it, from a native record or a Subsonic child
 /// (D7). The rating, star and play count are the caller's own; Navidrome
 /// sends 0 for "none" (model/annotation.go:6-12), and so does this.
@@ -48,6 +56,8 @@ pub struct SongFacts {
     pub starred: bool,
     pub starred_at: Option<String>,
     pub play_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<FolderRef>,
 }
 
 /// A text taken from Navidrome, cut to TEXT_MAX_CHARS of JSON (`cut_json`).
@@ -95,6 +105,7 @@ impl From<&NativeSong> for SongFacts {
             starred: song.starred,
             starred_at: song.starred_at.map(time::at),
             play_count: song.play_count,
+            folder: None,
         }
     }
 }
@@ -119,6 +130,111 @@ impl From<&SubsonicSong> for SongFacts {
             starred: song.starred.is_some(),
             starred_at: when(song.starred.as_deref()),
             play_count: song.play_count.map_or(0, u64::from),
+            folder: None,
+        }
+    }
+}
+
+/// Resolves a `NativeSong` to the caller's deepest matching Soulbeet folder without extra
+/// database queries per song.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FolderResolver {
+    /// Caller's folders with their resolved (or stored) path, deepest first.
+    folders: Vec<(PathBuf, FolderRef)>,
+    /// `NAVIDROME_MUSIC_PATH` for the default library, when set.
+    music_path: Option<PathBuf>,
+    /// Learned Navidrome library roots: `(library_id, navidrome_path, local_path)`.
+    learned: Vec<(i64, String, PathBuf)>,
+}
+
+impl FolderResolver {
+    pub(crate) async fn load_in(
+        db: &SqlitePool,
+        user_id: &str,
+        music_path: Option<&Path>,
+    ) -> Self {
+        let folders = crate::models::folder::Folder::get_all_by_user_in(db, user_id)
+            .await
+            .unwrap_or_default();
+        let learned = NavidromeLibraryRow::all_in(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.library_id, r.navidrome_path, PathBuf::from(r.local_path)))
+            .collect();
+        let mut entries: Vec<(PathBuf, FolderRef)> = folders
+            .into_iter()
+            .map(|f| {
+                let path = crate::folder_policy::canonical_folder_path(Path::new(&f.path))
+                    .unwrap_or_else(|_| PathBuf::from(&f.path));
+                (
+                    path,
+                    FolderRef {
+                        folder_id: f.id,
+                        name: f.name,
+                        shared: f.shared,
+                    },
+                )
+            })
+            .collect();
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0.components().count()));
+        FolderResolver {
+            folders: entries,
+            music_path: music_path.map(Path::to_path_buf),
+            learned,
+        }
+    }
+
+    /// Maps `song` (using its library root + library-relative `path`) to the caller's deepest
+    /// folder holding it, or `None` when none does.
+    pub(crate) fn resolve_native(&self, song: &NativeSong) -> Option<FolderRef> {
+        if self.folders.is_empty() || song.path.is_empty() {
+            return None;
+        }
+        let rel = Path::new(&song.path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        {
+            return None;
+        }
+        let root = self.root_for(song);
+        let root_canonical =
+            crate::folder_policy::canonical_folder_path(&root).unwrap_or(root);
+        let full = root_canonical.join(rel);
+        self.resolve_local(&full)
+    }
+
+    /// Maps an absolute local file path to the caller's deepest folder holding it.
+    pub(crate) fn resolve_local(&self, local: &Path) -> Option<FolderRef> {
+        self.folders
+            .iter()
+            .find(|(folder, _)| local != folder && local.starts_with(folder))
+            .map(|(_, info)| info.clone())
+    }
+
+    fn root_for(&self, song: &NativeSong) -> PathBuf {
+        if let Some(root) = &self.music_path {
+            if song.library_id == DEFAULT_LIBRARY_ID {
+                return root.clone();
+            }
+        }
+        if let Some((_, _, local)) = self
+            .learned
+            .iter()
+            .find(|(id, nd, _)| *id == song.library_id && nd == &song.library_path)
+        {
+            return local.clone();
+        }
+        PathBuf::from(&song.library_path)
+    }
+
+    /// Builds `SongFacts` from `song` with `folder` populated when known.
+    pub(crate) fn facts(&self, song: &NativeSong) -> SongFacts {
+        SongFacts {
+            folder: self.resolve_native(song),
+            ..SongFacts::from(song)
         }
     }
 }
@@ -382,8 +498,20 @@ fn word_dice(a: &str, b: &str) -> f64 {
 /// fuzzily, with `duration` in `unchecked`, not in `differs`; an album the
 /// song does not name is `unchecked` too, and the album, given or not,
 /// never changes the kind (`MatchHow::unchecked`).
+#[cfg(test)]
 pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
-    let facts = SongFacts::from(song);
+    classify_with(r, song, None)
+}
+
+pub(crate) fn classify_with(
+    r: &Reference,
+    song: &NativeSong,
+    folders: Option<&FolderResolver>,
+) -> Option<Match> {
+    let facts = match folders {
+        Some(resolver) => resolver.facts(song),
+        None => SongFacts::from(song),
+    };
     let duration_delta_s = r
         .duration_s
         .zip(facts.duration_s)
@@ -457,13 +585,22 @@ pub(crate) fn classify(r: &Reference, song: &NativeSong) -> Option<Match> {
 /// mbid first, then exact, then fuzzy by score, ties by song id, cut to
 /// MATCHES_KEPT. Failures are LibraryCheck failures.
 pub async fn find(navi: &NavidromeClient, r: &Reference) -> Result<Found, Failure> {
+    find_with_folders(navi, r, None).await
+}
+
+/// Like `find`, enriching each match's `SongFacts.folder` using `folders` when provided.
+pub(crate) async fn find_with_folders(
+    navi: &NavidromeClient,
+    r: &Reference,
+    folders: Option<&FolderResolver>,
+) -> Result<Found, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut seen = HashSet::new();
     let mut matches = Vec::new();
     let mut take = |songs: Vec<NativeSong>, matches: &mut Vec<Match>| {
         for song in songs {
             if seen.insert(song.id.clone()) {
-                matches.extend(classify(r, &song));
+                matches.extend(classify_with(r, &song, folders));
             }
         }
     };
@@ -757,14 +894,26 @@ pub struct SongGroup {
 /// a page repeat one song and pass another), since a part would miss copies. A song removed while
 /// the pages are read can still let one pass unseen.
 pub async fn duplicates(navi: &NavidromeClient) -> Result<Vec<SongGroup>, Failure> {
+    duplicates_with_folders(navi, None).await
+}
+
+/// Like `duplicates`, enriching each song's `folder` using `folders` when provided.
+pub(crate) async fn duplicates_with_folders(
+    navi: &NavidromeClient,
+    folders: Option<&FolderResolver>,
+) -> Result<Vec<SongGroup>, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let mut by_key: BTreeMap<(String, String), Vec<SongFacts>> = BTreeMap::new();
     let page = navi.all_songs().await.map_err(failure)?;
     for song in &page.songs {
+        let facts = match folders {
+            Some(resolver) => resolver.facts(song),
+            None => SongFacts::from(song),
+        };
         by_key
             .entry((match_key(&song.artist), match_key(&song.title)))
             .or_default()
-            .push(SongFacts::from(song));
+            .push(facts);
     }
     if (page.songs.len() as u64) < page.total {
         return Err(songs_missed(page.songs.len(), page.total));
@@ -829,7 +978,8 @@ mod tests {
                 rating: 4,
                 starred: true,
                 starred_at: Some("2026-11-02T18:04:51Z".into()),
-                play_count: 3
+                play_count: 3,
+                folder: None,
             }
         );
     }

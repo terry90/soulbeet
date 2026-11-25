@@ -12,23 +12,29 @@ use sqlx::SqliteConnection;
 /// The window the daily room counts, in seconds.
 pub(crate) const DAY_SECS: i64 = 86_400;
 
-/// Design 11.5: how a person lets this app delete music (step 7 D7: the checkbox "Allow deleting
-/// music").
+/// Design 11.5: how a person lets this app manage library files (delete, move, re-tag): the
+/// checkbox "Allow managing library files (delete, move, re-tag)".
 pub(crate) fn enable_deletion() -> UserAction {
     UserAction::new(
         UserActionCode::EnableDeletion,
-        "Allow deleting music for this app",
+        "Allow managing library files for this app",
         "Settings > Users > Connected apps",
     )
 }
 
-/// The app may not delete: its switch is off, or its grant is gone or not the caller's.
+/// The app may not manage library files: its switch is off, or its grant is gone or not the
+/// caller's.
 pub(crate) fn permission_not_granted() -> Failure {
+    permission_not_granted_at(Stage::Delete)
+}
+
+/// Like `permission_not_granted`, reporting `stage` (`Delete`, `Move`, or `Retag`).
+pub(crate) fn permission_not_granted_at(stage: Stage) -> Failure {
     Failure::new(
         FailureCode::PermissionNotGranted,
-        Stage::Delete,
+        stage,
         RetryAdvice::NeedsUser,
-        "Deleting music is turned off for this app",
+        "Managing library files (delete, move, re-tag) is turned off for this app",
     )
     .with_user_action(enable_deletion())
 }

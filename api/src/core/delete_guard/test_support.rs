@@ -350,12 +350,41 @@ impl Listeners for FakeNavidrome {
                 return Ok(None);
             }
             let pair = (user.clone(), id.to_string());
+            let songs: Vec<SubsonicSong> = s
+                .records
+                .iter()
+                .filter(|(song_id, (_, album))| {
+                    album == id && s.sees.contains(&(user.clone(), (*song_id).clone()))
+                })
+                .map(|(song_id, (song, album_id))| SubsonicSong {
+                    id: song.id.clone(),
+                    title: song.title.clone(),
+                    artist: Some(song.artist.clone()),
+                    album: Some(song.album.clone()),
+                    album_id: Some(album_id.clone()),
+                    genre: None,
+                    duration: Some(song.duration as u32),
+                    user_rating: (s.rating(&user, song_id) > 0)
+                        .then(|| s.rating(&user, song_id)),
+                    play_count: Some(song.play_count as u32),
+                    starred: s
+                        .stars
+                        .contains(&(user.clone(), song_id.clone()))
+                        .then(|| "2026-11-14T20:11:05Z".to_string()),
+                    music_brainz_id: song.mbz_recording_id.clone(),
+                    suffix: Some(song.suffix.clone()),
+                    bit_rate: Some(song.bit_rate),
+                    size: Some(song.size),
+                    year: Some(song.year),
+                    track: Some(song.track_number),
+                })
+                .collect();
             Ok(Some(SubsonicAlbum {
                 id: id.to_string(),
                 name: Some("Winter Songs".into()),
                 title: None,
                 artist: Some("Marrow Choir".into()),
-                song_count: None,
+                song_count: Some(songs.len() as u32),
                 duration: None,
                 genre: None,
                 user_rating: (!s.legacy.contains(&user))
@@ -366,7 +395,7 @@ impl Listeners for FakeNavidrome {
                     .then(|| "2026-11-14T20:11:05Z".to_string()),
                 year: None,
                 play_count: None,
-                song: Vec::new(),
+                song: songs,
             }))
         })
     }

@@ -466,15 +466,42 @@ pub(crate) async fn promote(
     track_id: &str,
     replace: Replace,
 ) -> Result<DiscoveryTrack, NotDone> {
-    let (db, effects, queue, user, track_id) = (
+    promote_to(db, effects, queue, user, track_id, None, replace)
+        .await
+        .map(|(track, _)| track)
+}
+
+/// Like `promote`, optionally targeting another folder `target_folder_id` owned by `user`
+/// instead of the track's discovery folder (for example promoting directly to a shared folder).
+/// Returns the promoted track and the folder it was imported into.
+pub(crate) async fn promote_to(
+    db: &SqlitePool,
+    effects: &Arc<dyn DiscoveryEffects>,
+    queue: &ImportQueue,
+    user: &UserId,
+    track_id: &str,
+    target_folder_id: Option<&str>,
+    replace: Replace,
+) -> Result<(DiscoveryTrack, Folder), NotDone> {
+    let (db, effects, queue, user, track_id, target_folder_id) = (
         db.clone(),
         effects.clone(),
         queue.clone(),
         user.clone(),
         track_id.to_string(),
+        target_folder_id.map(str::to_string),
     );
     tokio::spawn(async move {
-        promote_detached(&db, &*effects, &queue, &user, &track_id, replace).await
+        promote_detached(
+            &db,
+            &*effects,
+            &queue,
+            &user,
+            &track_id,
+            target_folder_id.as_deref(),
+            replace,
+        )
+        .await
     })
     .await
     .unwrap_or_else(|e| Err(NotDone::Claimed(promote_stopped(&e))))
@@ -486,25 +513,52 @@ async fn promote_detached(
     queue: &ImportQueue,
     user: &UserId,
     track_id: &str,
+    target_folder_id: Option<&str>,
     replace: Replace,
-) -> Result<DiscoveryTrack, NotDone> {
-    let (track, folder) = (claim_for_promote_in(db, track_id, &user.to_string()).await)
+) -> Result<(DiscoveryTrack, Folder), NotDone> {
+    // Validate an explicit target folder before claiming the track, so an invalid folder leaves
+    // the track untouched.
+    let explicit_target = match target_folder_id {
+        Some(id) => {
+            let folder = Folder::get_by_id_in(db, id)
+                .await
+                .map_err(|e| NotDone::Unclaimed(database_failure(Stage::Import, e)))?
+                .filter(|f| f.user_id == user.to_string())
+                .ok_or_else(|| NotDone::Unclaimed(folder_not_found()))?;
+            Some(folder)
+        }
+        None => None,
+    };
+    let (track, source_folder) = (claim_for_promote_in(db, track_id, &user.to_string()).await)
         .map_err(NotDone::Unclaimed)?;
-    promote_claimed(db, effects, queue, user, track, folder, replace)
-        .await
-        .map_err(NotDone::Claimed)
+    let target_folder = explicit_target.unwrap_or_else(|| source_folder.clone());
+    promote_claimed(
+        db,
+        effects,
+        queue,
+        user,
+        track,
+        source_folder,
+        target_folder.clone(),
+        replace,
+    )
+    .await
+    .map(|track| (track, target_folder))
+    .map_err(NotDone::Claimed)
 }
 
 /// The promote of `track`, which claim_for_promote_in claimed. Once the import moved the staged
 /// file out of its profile folder, the file's item is dropped from that folder's library
 /// (forget_detached); a file the import left there, as beets' copy does, keeps its item.
+#[allow(clippy::too_many_arguments)]
 async fn promote_claimed(
     db: &SqlitePool,
     effects: &dyn DiscoveryEffects,
     queue: &ImportQueue,
     user: &UserId,
     track: DiscoveryTrack,
-    folder: Folder,
+    source_folder: Folder,
+    target_folder: Folder,
     replace: Replace,
 ) -> Result<DiscoveryTrack, Failure> {
     let track_id = track.id.as_str();
@@ -525,13 +579,13 @@ async fn promote_claimed(
         return Err(promote_file_gone());
     };
 
-    let target = PathBuf::from(&folder.path);
+    let target = PathBuf::from(&target_folder.path);
     if let Err(failure) = effects.import(&src, &target, user, replace).await {
         back_to_pending().await;
         return Err(failure);
     }
 
-    let profile_root = PathBuf::from(folder.discovery_profile_path(&track.profile));
+    let profile_root = PathBuf::from(source_folder.discovery_profile_path(&track.profile));
     if let Some(parent) = src.parent() {
         let _ = crate::server_fns::cleanup_empty_ancestors(parent, &profile_root).await;
     }
@@ -545,7 +599,7 @@ async fn promote_claimed(
 
     if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
         db,
-        &folder.user_id,
+        &source_folder.user_id,
         &track.artist,
         &track.title,
         "promoted",
@@ -560,7 +614,7 @@ async fn promote_claimed(
 
     info!(
         "Promoted discovery track: {} -> {}",
-        track.title, folder.path
+        track.title, target_folder.path
     );
     Ok(DiscoveryTrack {
         status: DiscoveryStatus::Promoted,

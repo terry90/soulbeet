@@ -20,11 +20,11 @@ use unlink::UnlinkError;
 mod listeners;
 pub mod paths;
 pub(crate) mod quota;
-mod rules;
+pub(crate) mod rules;
 pub(crate) mod staging;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod unlink;
+pub(crate) mod unlink;
 
 pub use listeners::{Listeners, LiveListeners};
 
@@ -542,7 +542,7 @@ impl Guard<'_> {
     /// Navidrome lists the canonical file `path` as `song` only, in `actor`'s view: their
     /// search for its tags finds `song`, and no other song it finds is or may be the same file
     /// (another_record).
-    async fn one_song(
+    pub(crate) async fn one_song(
         &self,
         actor: &UserId,
         song: &NativeSong,

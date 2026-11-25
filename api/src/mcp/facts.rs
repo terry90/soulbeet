@@ -1327,7 +1327,7 @@ mod tests {
         // The file stays in the library until deleted, which this app may not do.
         assert_eq!(
             doc["failure"]["user_action"],
-            json!({"code": "enable_deletion", "what": "Allow deleting music for this app",
+            json!({"code": "enable_deletion", "what": "Allow managing library files for this app",
                 "where": "Settings > Users > Connected apps"})
         );
         let allowed = job_document(&view, &untried, Detail::Full, &ReadNow::default(), true);
@@ -1675,6 +1675,7 @@ mod tests {
             bitrate_kbps: Some(912),
             size_bytes: Some(28_734_112),
             path: None,
+            folder: None,
             recording_mbid: Some("6b5e1a0c-9f0e-4c57-8a51-0d7a2c3c1f42".into()),
             rating: 0,
             starred: false,

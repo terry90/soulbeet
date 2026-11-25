@@ -122,10 +122,41 @@ mod tests {
         async fn relocate(&self, _: &Path, _: &[u64]) -> Relocation {
             unreachable!()
         }
+        async fn relocate_file(&self, _: &Path, _: &Path) -> Relocation {
+            unreachable!()
+        }
         fn refused(&self, _: String) -> ImportResult {
             unreachable!()
         }
         async fn forget(&self, _: &Path, _: &Path) -> ForgetOutcome {
+            unreachable!()
+        }
+        async fn register_in_place(&self, _: &Path, _: &Path) -> soulbeet::RegisterOutcome {
+            unreachable!()
+        }
+        async fn inspect_file(
+            &self,
+            _: &Path,
+            _: &Path,
+        ) -> Result<Option<soulbeet::BeetsTrackInfo>, String> {
+            unreachable!()
+        }
+        async fn modify_tags(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &soulbeet::TagEdits,
+        ) -> Result<soulbeet::BeetsTrackInfo, shared::failure::Failure> {
+            unreachable!()
+        }
+        async fn rematch_in_place(
+            &self,
+            _: &[&Path],
+            _: &Path,
+            _: ImportMode,
+            _: &DriverChoice,
+            _: bool,
+        ) -> ImportResult {
             unreachable!()
         }
         async fn prune(&self, _: &Path) -> PruneOutcome {

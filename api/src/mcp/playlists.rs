@@ -19,6 +19,7 @@ use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec, NAVIDROME_CODES};
 use super::McpCaller;
 use crate::connection::ConnectionState;
+use crate::core::library::FolderResolver;
 use crate::core::playlists::{
     self, MetaChange, NewPlaylist, NotEditable, PlaylistRefusal, Written, POSITION_MAX,
     SONG_IDS_MAX,
@@ -213,9 +214,16 @@ pub(crate) async fn get_playlist(
             let page = Page::read(&args, json!({"playlist_id": playlist_id}))?;
             args.finish()?;
             let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
-            let (playlist, entries) = playlists::get(&navi, &caller.ctx, &playlist_id)
-                .await
-                .map_err(|f| not_got(f, &playlist_id, &args))?;
+            let resolver = FolderResolver::load_in(
+                &state.db,
+                &caller.ctx.user_id,
+                state.navidrome_music_path.as_deref(),
+            )
+            .await;
+            let (playlist, entries) =
+                playlists::get_with_folders(&navi, &caller.ctx, &playlist_id, Some(&resolver))
+                    .await
+                    .map_err(|f| not_got(f, &playlist_id, &args))?;
             let mut fields = Map::new();
             fields.insert("playlist".into(), json!(playlist));
             Ok(fit(fields, "entries", page.of(&entries), &page, false))

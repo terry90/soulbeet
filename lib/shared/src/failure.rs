@@ -254,6 +254,8 @@ pub enum Stage {
     Index,
     Playlist,
     Delete,
+    Move,
+    Retag,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -433,6 +435,18 @@ failure_codes! {
     ResultRejected => "result_rejected",
     /// A search Soulful stopped before it ran, because the job it served was cancelled.
     SearchStopped => "search_stopped",
+    /// The track is already inside the target folder.
+    MoveSameFolder => "move_same_folder",
+    /// A file already exists at the destination path.
+    MoveTargetExists => "move_target_exists",
+    /// Another copy of this track already lives in the target folder.
+    MoveDuplicateInTarget => "move_duplicate_in_target",
+    /// The OS refused to move the file or finish cleaning up after it.
+    MoveFailed => "move_failed",
+    /// beets failed to modify tags or re-match the track.
+    RetagFailed => "retag_failed",
+    /// Relocating after re-tagging requires a linked Navidrome admin to scan between tag write and move.
+    RetagRelocateNeedsScan => "retag_relocate_needs_scan",
 }
 
 #[cfg(test)]
@@ -447,7 +461,7 @@ mod tests {
     /// `no_listening_data`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 85] = [
+    const NAMES: [&str; 91] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -533,6 +547,12 @@ mod tests {
         "sources_exhausted",
         "result_rejected",
         "search_stopped",
+        "move_same_folder",
+        "move_target_exists",
+        "move_duplicate_in_target",
+        "move_failed",
+        "retag_failed",
+        "retag_relocate_needs_scan",
     ];
 
     #[test]

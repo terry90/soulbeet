@@ -22,8 +22,9 @@ pub use beets::{duplicate_note, DuplicateNote};
 pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use traits::{
-    CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind, ForgetOutcome,
-    GeneratorOutput, ImportMode, ImportOutcome, ImportResult, ImportedItem, KnowledgeCache,
-    ListeningHistory, MetadataProvider, MusicImporter, MusicKnowledge, PruneOutcome, Relocation,
-    SkipReason, SourceFile, TaskCount, TimeoutKind, WantedRemoval,
+    BeetsTrackInfo, CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind,
+    ForgetOutcome, GeneratorOutput, ImportMode, ImportOutcome, ImportResult, ImportedItem,
+    KnowledgeCache, ListeningHistory, MetadataProvider, MusicImporter, MusicKnowledge,
+    PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile, TagEdits, TaskCount,
+    TimeoutKind, WantedRemoval,
 };

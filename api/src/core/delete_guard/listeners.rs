@@ -161,7 +161,7 @@ impl Listeners for LiveListeners {
 }
 
 /// What rule 3 read: the ratings rule 4 compares Navidrome's average with, and whose.
-pub(super) struct Read {
+pub(crate) struct Read {
     /// The other listeners' ratings of the song above 0.
     ratings: Vec<u8>,
     /// The Soulful names of the linked accounts whose rating of the song this check reads: the
@@ -205,7 +205,7 @@ impl Guard<'_> {
     /// Every listener is read, so each one's record for admins is current: a failed read is
     /// recorded, any other answer clears it. The refusal is that of the first listener who keeps
     /// the file.
-    pub(super) async fn others_permit(
+    pub(crate) async fn others_permit(
         &self,
         actor: &UserId,
         actor_name: &str,
@@ -349,7 +349,7 @@ impl Guard<'_> {
     /// `song_id` is not the actor's (`actor_name`, kept_in_playlist); else the actor's own
     /// playlists holding it, smart ones included, as Navidrome lists them, for the preview to
     /// show. A read error is the actor's own failure, with its error as the message.
-    pub(super) async fn own_playlists(
+    pub(crate) async fn own_playlists(
         &self,
         actor: &UserId,
         actor_name: &str,
@@ -381,7 +381,7 @@ impl Guard<'_> {
     /// is above 1, a Navidrome user Soulful cannot read who gave ratings that keep the mean
     /// hides in it, so the file passes only when no such user exists (every_rater_read). N2
     /// comes back for the caller to act on.
-    pub(super) async fn no_unknown_rater(
+    pub(crate) async fn no_unknown_rater(
         &self,
         actor: &UserId,
         song: &NativeSong,

@@ -9,14 +9,14 @@ pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 
 use crate::audio::count_audio_files;
 use crate::{
-    DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome, ImportResult,
-    MusicImporter, PruneOutcome, Relocation,
+    BeetsTrackInfo, DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome,
+    ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation, TagEdits,
 };
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
 use report::Report;
 pub use report::{duplicate_note, DuplicateNote};
-use shared::failure::{UserAction, UserActionCode};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::system::ImporterHealth;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,159 @@ impl BeetsImporter {
             warn!("beets output tail:\n{}", result.output_tail);
         }
         result
+    }
+
+    /// Registers an existing file in `target`'s beets DB without moving, copying, writing tags,
+    /// or deleting duplicates.
+    async fn run_register_in_place(&self, target: &Path, file: &Path) -> RegisterOutcome {
+        let s = &self.settings;
+        match library::item_ids_at(s, target, file).await {
+            Ok(ids) if !ids.is_empty() => return RegisterOutcome::AlreadyInLibrary,
+            Ok(_) => {}
+            Err(e) => return RegisterOutcome::Failed(e),
+        }
+        let Some(python) = s.python.as_deref() else {
+            return RegisterOutcome::Failed(NO_PYTHON.into());
+        };
+        let db_folder = library::library_folder(&s.libraries, target);
+        if let Err(e) = tokio::fs::create_dir_all(&db_folder).await {
+            return RegisterOutcome::Failed(format!(
+                "Could not create the folder of the beets library database {}: {e}",
+                db_folder.display()
+            ));
+        }
+        let db = match library::library_db(s, target).await {
+            Ok(db) => db,
+            Err(e) => return RegisterOutcome::Failed(e),
+        };
+        let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
+            (Ok(log), Ok(report)) => (log, report),
+            (Err(e), _) | (_, Err(e)) => {
+                return RegisterOutcome::Failed(format!(
+                    "Could not create the beets run files: {e}"
+                ))
+            }
+        };
+        let beet_args = import_args(s, &db, &[file], target, ImportMode::Singleton, &run_log.0);
+        let mut args: Vec<OsString> = vec![
+            "-P".into(),
+            "-c".into(),
+            IMPORT_PY.into(),
+            report_file.0.clone().into(),
+            "keep-no-remove".into(),
+            "register".into(),
+            "--".into(),
+        ];
+        args.extend(beet_args);
+        let spec = RunSpec {
+            program: python,
+            args,
+            limits: s.limits,
+        };
+        let mut classifier = Classifier::new(ImportMode::Singleton, target, 1, true);
+        let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
+        drop(run_log);
+        drop(report_file);
+        match run.end {
+            RunEnd::Exited(status) if status.success() => RegisterOutcome::Registered,
+            RunEnd::Exited(status) => RegisterOutcome::Failed(format!(
+                "beet register failed ({status}): {}",
+                run.tail
+            )),
+            RunEnd::Idle | RunEnd::Total => {
+                RegisterOutcome::Failed("beet register timed out".into())
+            }
+            RunEnd::SpawnFailed(e) => {
+                RegisterOutcome::Failed(format!("Could not start beets: {e}"))
+            }
+        }
+    }
+
+    /// Re-matches `sources` in place inside `target` (`--nocopy --nomove`), optionally with
+    /// `--pretend --nowrite` so dry runs return beets candidates without touching disk or DB.
+    async fn run_rematch_in_place(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        pretend: bool,
+    ) -> ImportResult {
+        let s = &self.settings;
+        let Some(python) = s.python.as_deref() else {
+            return ImportResult::failed(FailKind::Setup, NO_PYTHON.into());
+        };
+        let db_folder = library::library_folder(&s.libraries, target);
+        if let Err(e) = tokio::fs::create_dir_all(&db_folder).await {
+            return ImportResult::failed(
+                FailKind::Setup,
+                format!(
+                    "Could not create the folder of the beets library database {}: {e}",
+                    db_folder.display()
+                ),
+            );
+        }
+        let db = match library::library_db(s, target).await {
+            Ok(db) => db,
+            Err(e) => return ImportResult::failed(FailKind::Setup, e),
+        };
+        let submitted = count_audio_files(sources).await;
+        let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
+            (Ok(log), Ok(report)) => (log, report),
+            (Err(e), _) | (_, Err(e)) => {
+                return ImportResult::failed(
+                    FailKind::Setup,
+                    format!("Could not create the beets run files: {e}"),
+                )
+            }
+        };
+        let autotag_off = *choice == DriverChoice::AsIs
+            || self.state().report.as_ref().is_some_and(|r| !r.autotag);
+        let mut beet_args = import_args(s, &db, sources, target, mode, &run_log.0);
+        // Insert -C -M (and -p -W for dry runs) right after "import".
+        if let Some(pos) = beet_args.iter().position(|a| a == "import") {
+            let mut extra: Vec<OsString> = vec!["-C".into(), "-M".into()];
+            if pretend {
+                extra.push("-p".into());
+                extra.push("-W".into());
+            }
+            beet_args.splice(pos + 1..pos + 1, extra);
+        }
+        let mut args: Vec<OsString> = vec![
+            "-P".into(),
+            "-c".into(),
+            IMPORT_PY.into(),
+            report_file.0.clone().into(),
+            "keep-no-remove".into(),
+        ];
+        match choice {
+            DriverChoice::Auto => args.push("auto".into()),
+            DriverChoice::AsIs => args.push("asis".into()),
+            DriverChoice::Pick { data_source, id } => {
+                args.extend(["pick".into(), data_source.into(), id.into()])
+            }
+        }
+        args.push("--".into());
+        args.extend(beet_args);
+        let spec = RunSpec {
+            program: python,
+            args,
+            limits: s.limits,
+        };
+        let mut classifier = Classifier::new(mode, target, submitted, autotag_off);
+        let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
+        let entries = tokio::fs::read_to_string(&run_log.0)
+            .await
+            .map(|text| parse_run_log(&text))
+            .unwrap_or_default();
+        drop(run_log);
+        let report = read_report(&run.end, &report_file.0).await;
+        drop(report_file);
+        let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
+        match report {
+            Some(report) => report.apply(result, mode, choice, target),
+            None => result,
+        }
     }
 }
 
@@ -337,6 +490,10 @@ impl MusicImporter for BeetsImporter {
         library::move_items(&self.settings, library, item_ids).await
     }
 
+    async fn relocate_file(&self, library: &Path, file: &Path) -> Relocation {
+        library::relocate_file(&self.settings, library, file).await
+    }
+
     fn refused(&self, issue: String) -> ImportResult {
         let action = fix_beets(&issue);
         ImportResult::refused(issue).with_user_action(action)
@@ -344,6 +501,97 @@ impl MusicImporter for BeetsImporter {
 
     async fn forget(&self, library: &Path, file: &Path) -> ForgetOutcome {
         library::forget_item(&self.settings, library, file).await
+    }
+
+    async fn register_in_place(&self, library: &Path, file: &Path) -> RegisterOutcome {
+        self.run_register_in_place(library, file).await
+    }
+
+    async fn inspect_file(
+        &self,
+        library: &Path,
+        file: &Path,
+    ) -> std::result::Result<Option<BeetsTrackInfo>, String> {
+        library::inspect_file(&self.settings, library, file).await
+    }
+
+    async fn modify_tags(
+        &self,
+        library: &Path,
+        file: &Path,
+        edits: &TagEdits,
+    ) -> std::result::Result<BeetsTrackInfo, Failure> {
+        let ids = library::item_ids_at(&self.settings, library, file)
+            .await
+            .map_err(|e| {
+                Failure::new(
+                    FailureCode::RetagFailed,
+                    Stage::Retag,
+                    RetryAdvice::SameSourceLater,
+                    format!("Could not read the folder's beets library: {e}"),
+                )
+            })?;
+        let id = match ids.as_slice() {
+            [id] => *id,
+            [] => {
+                if let RegisterOutcome::Failed(e) = self.run_register_in_place(library, file).await
+                {
+                    return Err(Failure::new(
+                        FailureCode::RetagFailed,
+                        Stage::Retag,
+                        RetryAdvice::SameSourceLater,
+                        format!("Could not register the file in beets before editing tags: {e}"),
+                    ));
+                }
+                let ids = library::item_ids_at(&self.settings, library, file)
+                    .await
+                    .map_err(|e| {
+                        Failure::new(
+                            FailureCode::RetagFailed,
+                            Stage::Retag,
+                            RetryAdvice::SameSourceLater,
+                            format!("Could not read the registered beets item: {e}"),
+                        )
+                    })?;
+                match ids.as_slice() {
+                    [id] => *id,
+                    _ => {
+                        return Err(Failure::new(
+                            FailureCode::RetagFailed,
+                            Stage::Retag,
+                            RetryAdvice::NotRetryable,
+                            "The track could not be located uniquely in the folder's beets library after registration",
+                        ));
+                    }
+                }
+            }
+            several => {
+                return Err(Failure::new(
+                    FailureCode::RetagFailed,
+                    Stage::Retag,
+                    RetryAdvice::NotRetryable,
+                    format!(
+                        "Cannot edit tags: {} beets items match this file's path",
+                        several.len()
+                    ),
+                ));
+            }
+        };
+        library::modify_tags_by_id(&self.settings, library, id, file, edits).await
+    }
+
+    async fn rematch_in_place(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        pretend: bool,
+    ) -> ImportResult {
+        with_own_action(
+            self.run_rematch_in_place(sources, library, mode, choice, pretend)
+                .await,
+        )
     }
 
     async fn prune(&self, library: &Path) -> PruneOutcome {
