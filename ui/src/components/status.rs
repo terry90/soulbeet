@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
-use shared::system::{HealthLevel, NavidromeStatus, SystemHealth};
+use shared::backends::{BackendMeta, Delivery};
+use shared::failure::FailureCode;
+use shared::system::{DownloaderHealth, HealthLevel, NavidromeStatus, SystemHealth};
 
 use crate::{Chevron, FOCUS_RING};
 
@@ -89,39 +91,54 @@ impl Severity {
 
 /// One service in the status list.
 struct Service {
-    name: &'static str,
+    name: String,
     severity: Severity,
     dot: &'static str,
     label: String,
     reason: Option<String>,
 }
 
-/// The downloader, beets and Navidrome as the status list shows them.
-fn services(health: &SystemHealth, navidrome_status: NavidromeStatus) -> [Service; 3] {
-    let downloader = if health.downloader_online {
-        Service {
-            name: "Downloader",
-            severity: Severity::Fine,
-            dot: "bg-beet-leaf animate-pulse",
-            label: "DOWNLOADER ONLINE".to_string(),
-            reason: None,
-        }
+/// A download backend's row: `{NAME} ONLINE`, `OFFLINE` or `RATE-LIMITED`, ` · LOSSY` after it
+/// for a backend that delivers lossy files only. `meta` is the backend's, None for one this build
+/// does not know.
+fn downloader(health: &DownloaderHealth, meta: Option<&BackendMeta>) -> Service {
+    let name = health.name.to_uppercase();
+    let lossy = if meta.is_some_and(|m| m.delivery == Delivery::LossyOnly) {
+        " · LOSSY"
     } else {
-        Service {
-            name: "Downloader",
-            severity: Severity::Down,
-            dot: "bg-red-500",
-            label: "DOWNLOADER OFFLINE".to_string(),
-            reason: health
-                .downloader_failure
-                .as_ref()
-                .map(|failure| failure.message.clone()),
-        }
+        ""
     };
+    let rate_limited = health.failure.as_ref().is_some_and(|f| {
+        matches!(
+            f.code,
+            FailureCode::RateLimited | FailureCode::SearchRateLimited
+        )
+    });
+    let (severity, dot, state) = if health.online {
+        (Severity::Fine, "bg-beet-leaf animate-pulse", "ONLINE")
+    } else if rate_limited {
+        (Severity::Warning, "bg-yellow-500", "RATE-LIMITED")
+    } else {
+        (Severity::Down, "bg-red-500", "OFFLINE")
+    };
+    Service {
+        name: health.name.clone(),
+        severity,
+        dot,
+        label: format!("{name} {state}{lossy}"),
+        reason: health.failure.as_ref().map(|f| f.message.clone()),
+    }
+}
+
+/// Each download backend, beets and Navidrome as the status list shows them.
+fn services(health: &SystemHealth, navidrome_status: NavidromeStatus) -> Vec<Service> {
+    let mut services: Vec<Service> = (health.downloaders.iter())
+        .map(|d| downloader(d, shared::backends::meta(&d.id)))
+        .collect();
 
     let (beets_dot, beets_chip) = importer_chip(health.importer.level);
     let beets = Service {
-        name: "Beets",
+        name: "Beets".to_string(),
         severity: match health.importer.level {
             HealthLevel::Ready => Severity::Fine,
             HealthLevel::Checking => Severity::Checking,
@@ -143,7 +160,7 @@ fn services(health: &SystemHealth, navidrome_status: NavidromeStatus) -> [Servic
         NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown | NavidromeStatus::NotLinked
     );
     let navidrome = Service {
-        name: "Navidrome",
+        name: "Navidrome".to_string(),
         severity: if !health.navidrome_online {
             Severity::Down
         } else if nav_hint.is_some() {
@@ -167,7 +184,8 @@ fn services(health: &SystemHealth, navidrome_status: NavidromeStatus) -> [Servic
         reason: nav_hint,
     };
 
-    [downloader, beets, navidrome]
+    services.extend([beets, navidrome]);
+    services
 }
 
 /// The one line for all of `services`: the worst state, and what needs
@@ -182,7 +200,7 @@ fn summary(services: &[Service]) -> (Severity, String) {
         services
             .iter()
             .filter(|service| service.severity >= at)
-            .map(|service| service.name)
+            .map(|service| service.name.as_str())
             .collect::<Vec<_>>()
     };
     let line = match worst {
@@ -279,6 +297,15 @@ mod tests {
         &html[start..start + html[start..].find("</span>").unwrap()]
     }
 
+    fn soulseek(failure: Option<shared::failure::Failure>) -> DownloaderHealth {
+        DownloaderHealth {
+            id: "slskd".into(),
+            name: "Soulseek".into(),
+            online: failure.is_none(),
+            failure,
+        }
+    }
+
     fn ready_importer() -> shared::system::ImporterHealth {
         shared::system::ImporterHealth {
             level: HealthLevel::Ready,
@@ -291,14 +318,12 @@ mod tests {
         use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 
         let health = SystemHealth {
-            downloader_online: false,
-            downloader_failure: Some(Failure::new(
+            downloaders: vec![soulseek(Some(Failure::new(
                 FailureCode::BackendUnreachable,
                 Stage::SourceSearch,
                 RetryAdvice::SameSourceLater,
                 "slskd did not answer at http://slskd:5030",
-            )),
-            downloaders: vec![],
+            )))],
             importer: shared::system::ImporterHealth {
                 level: HealthLevel::Broken,
                 issues: vec![shared::system::HealthIssue {
@@ -309,7 +334,7 @@ mod tests {
                 facts: vec![],
             },
             navidrome_online: false,
-            navidrome_failure: None,
+            ..SystemHealth::default()
         };
         let html = render_status(health, NavidromeStatus::NotLinked);
         assert!(html.starts_with("<details"), "{html}");
@@ -318,9 +343,9 @@ mod tests {
             !crate::opening_tag(&html, "group/status").contains("open"),
             "{html}"
         );
-        assert_eq!(line(&html), "Downloader, Beets, Navidrome need attention");
+        assert_eq!(line(&html), "Soulseek, Beets, Navidrome need attention");
         for text in [
-            "DOWNLOADER OFFLINE",
+            "SOULSEEK OFFLINE",
             "slskd did not answer at http://slskd:5030",
             "BEETS BROKEN",
             "Cannot determine the Python that runs beet",
@@ -338,7 +363,7 @@ mod tests {
     #[test]
     fn one_service_in_trouble_is_named_alone() {
         let health = SystemHealth {
-            downloader_online: true,
+            downloaders: vec![soulseek(None)],
             importer: shared::system::ImporterHealth {
                 level: HealthLevel::Degraded,
                 ..Default::default()
@@ -354,7 +379,7 @@ mod tests {
     #[test]
     fn a_linked_account_missing_from_navidrome_needs_attention_while_it_is_online() {
         let health = SystemHealth {
-            downloader_online: true,
+            downloaders: vec![soulseek(None)],
             importer: ready_importer(),
             navidrome_online: true,
             ..SystemHealth::default()
@@ -371,14 +396,14 @@ mod tests {
     #[test]
     fn everything_up_reads_all_services_online_and_still_lists_them() {
         let health = SystemHealth {
-            downloader_online: true,
+            downloaders: vec![soulseek(None)],
             importer: ready_importer(),
             navidrome_online: true,
             ..SystemHealth::default()
         };
         let html = render_status(health.clone(), NavidromeStatus::Connected);
         assert_eq!(line(&html), "All services online");
-        for label in ["DOWNLOADER ONLINE", "BEETS READY", "NAVIDROME ONLINE"] {
+        for label in ["SOULSEEK ONLINE", "BEETS READY", "NAVIDROME ONLINE"] {
             assert!(
                 html.contains(&format!(">{label}</span>")),
                 "{label} in {html}"
@@ -391,6 +416,93 @@ mod tests {
         };
         let html = render_status(checking, NavidromeStatus::Connected);
         assert_eq!(line(&html), "Checking Beets");
+    }
+
+    #[test]
+    fn each_download_backend_has_its_row_and_one_down_names_only_itself() {
+        use shared::failure::{Failure, RetryAdvice, Stage};
+        let health = SystemHealth {
+            downloaders: vec![
+                soulseek(None),
+                DownloaderHealth {
+                    id: "archive".into(),
+                    name: "Internet Archive".into(),
+                    online: false,
+                    failure: Some(Failure::new(
+                        FailureCode::BackendUnreachable,
+                        Stage::SourceSearch,
+                        RetryAdvice::SameSourceLater,
+                        "archive.org did not answer",
+                    )),
+                },
+            ],
+            importer: ready_importer(),
+            navidrome_online: true,
+            ..SystemHealth::default()
+        };
+        let html = render_status(health, NavidromeStatus::Connected);
+        assert_eq!(line(&html), "Internet Archive needs attention");
+        for text in [
+            "SOULSEEK ONLINE",
+            "INTERNET ARCHIVE OFFLINE",
+            "archive.org did not answer",
+        ] {
+            assert!(
+                html.contains(&format!(">{text}</span>")),
+                "{text} in {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_limited_backend_is_a_warning_and_a_lossy_one_says_so() {
+        use shared::backends::{Switch, SLSKD};
+        use shared::failure::{Failure, RetryAdvice, Stage};
+        const YOUTUBE: BackendMeta = BackendMeta {
+            id: "ytdlp",
+            name: "YouTube Music",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        let health = |failure: Option<Failure>| DownloaderHealth {
+            id: "ytdlp".into(),
+            name: "YouTube Music".into(),
+            online: failure.is_none(),
+            failure,
+        };
+        let limited = |code| {
+            Some(Failure::new(
+                code,
+                Stage::SourceSearch,
+                RetryAdvice::SameSourceLater,
+                "YouTube asks to slow down",
+            ))
+        };
+        let online = downloader(&health(None), Some(&YOUTUBE));
+        assert_eq!(online.label, "YOUTUBE MUSIC ONLINE · LOSSY");
+        assert_eq!(online.severity, Severity::Fine);
+        for code in [FailureCode::RateLimited, FailureCode::SearchRateLimited] {
+            let row = downloader(&health(limited(code)), Some(&YOUTUBE));
+            assert_eq!(row.label, "YOUTUBE MUSIC RATE-LIMITED · LOSSY");
+            assert_eq!(
+                (row.severity, row.dot, row.reason.as_deref()),
+                (
+                    Severity::Warning,
+                    "bg-yellow-500",
+                    Some("YouTube asks to slow down")
+                )
+            );
+        }
+        let down = downloader(
+            &health(limited(FailureCode::BackendUnreachable)),
+            Some(&YOUTUBE),
+        );
+        assert_eq!(down.label, "YOUTUBE MUSIC OFFLINE · LOSSY");
+        assert_eq!(down.severity, Severity::Down);
+        let plain = downloader(&soulseek(None), Some(&SLSKD));
+        assert_eq!(plain.label, "SOULSEEK ONLINE");
+        assert_eq!(downloader(&soulseek(None), None).label, "SOULSEEK ONLINE");
     }
 
     #[test]

@@ -48,6 +48,31 @@ pub(crate) fn click(dom: &mut VirtualDom, target: ElementId) {
     fire(dom, "click", data, target);
 }
 
+/// Clicks `target`, runs what that starts, and returns the elements it rendered that listen for
+/// `name`, in document order.
+pub(crate) fn click_and_find(
+    dom: &mut VirtualDom,
+    target: ElementId,
+    name: &str,
+) -> Vec<ElementId> {
+    dioxus::html::set_event_converter(Box::new(dioxus::html::SerializedHtmlEventConverter));
+    let data = PlatformEventData::new(Box::<SerializedMouseData>::default());
+    let event = Event::new(Rc::new(data) as Rc<dyn Any>, true);
+    dom.runtime().handle_event("click", event, target);
+    let mut found = Vec::new();
+    loop {
+        let rendered = dom.render_immediate_to_vec();
+        found.extend(rendered.edits.into_iter().filter_map(|edit| match edit {
+            Mutation::NewEventListener { name: n, id } if n == name => Some(id),
+            _ => None,
+        }));
+        if dom.wait_for_work().now_or_never().is_none() {
+            break;
+        }
+    }
+    found
+}
+
 /// Fires a change at `target`, as a radio sends when it is chosen, and
 /// runs what that starts.
 pub(crate) fn change(dom: &mut VirtualDom, target: ElementId) {

@@ -1,4 +1,5 @@
 mod app_config;
+mod backends;
 mod choose_password;
 mod connected_apps;
 mod connection_status_row;

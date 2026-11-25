@@ -6,7 +6,7 @@ use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState
 
 use super::picker::{ChoicesLoader, MatchPicker};
 use super::Failure;
-use crate::{Disclosure, RowAction};
+use crate::{Disclosure, LossyChip, RowAction};
 
 /// How a row's state is shown: badge text and tooltip, plus row and badge classes.
 #[derive(Debug, PartialEq)]
@@ -208,6 +208,9 @@ pub fn DownloadItem(
             "{display_name}"
           }
           div { class: "flex items-center gap-1.5 shrink-0",
+            if let Some(meta) = file.backend.as_deref().and_then(shared::backends::meta) {
+              LossyChip { meta }
+            }
             span {
               class: "text-[10px] font-mono {badge_class} px-1.5 py-0.5 rounded uppercase cursor-help",
               title: "{status_text}",
@@ -468,6 +471,12 @@ mod tests {
         }
         let html = render(row(DownloadState::Imported, None));
         assert!(!html.contains("Navidrome"), "{html}");
+    }
+
+    #[test]
+    fn a_row_of_slskd_carries_no_lossy_chip() {
+        let html = render(row(DownloadState::InProgress, None).with_backend("slskd"));
+        assert!(!html.contains("LOSSY"), "{html}");
     }
 
     #[test]
