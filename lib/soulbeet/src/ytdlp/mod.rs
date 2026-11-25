@@ -193,7 +193,8 @@ impl Engine {
             return;
         }
         info!(
-            "YouTube Music: yt-dlp {}, ytmusicapi {}, deno {}, ffmpeg {}",
+            "YouTube Music: Python {}, yt-dlp {}, ytmusicapi {}, deno {}, ffmpeg {}",
+            versions.python.as_deref().unwrap_or_default(),
             versions.yt_dlp.as_deref().unwrap_or_default(),
             versions.ytmusicapi.as_deref().unwrap_or_default(),
             versions.deno.as_deref().unwrap_or_default(),

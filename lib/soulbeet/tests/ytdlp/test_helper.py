@@ -97,10 +97,8 @@ def test_fetch_reports_progress_then_the_file(helper, tmp_path):
     assert done == {
         "done": {
             "path": str(staging / "MdzF0rFOC9Y.opus"),
-            "format_id": "251",
             "acodec": "opus",
             "abr": 136.374,
-            "asr": 48000,
             "duration": 125,
         }
     }

@@ -116,7 +116,7 @@ else:
     shutil.copy(SILENCE, path)
 listed = 365 if video == "SHORTFILE01" else 356
 say({"progress": {"downloaded": 1024, "total": 2048, "speed": 100.0}})
-say({"done": {"path": path, "format_id": "251", "acodec": "opus", "abr": 136.374, "asr": 48000, "duration": listed}})
+say({"done": {"path": path, "acodec": "opus", "abr": 136.374, "duration": listed}})
 "#;
 
 /// A downloads folder, the fake helper, and what it reads and writes.
@@ -248,7 +248,6 @@ pub(crate) fn item(index: usize, video_id: &str) -> DownloadableItem {
     let page = crate::ytdlp::protocol::AlbumPage {
         title: "Spiderland".into(),
         artists: vec!["Slint".into()],
-        year: Some("1991".into()),
         tracks: (0..wanted.tracks.len())
             .map(|i| crate::ytdlp::protocol::AlbumTrack {
                 video_id: Some(if i == index {
@@ -257,7 +256,6 @@ pub(crate) fn item(index: usize, video_id: &str) -> DownloadableItem {
                     format!("other{i:06}")
                 }),
                 title: wanted.tracks[i].title.clone(),
-                track_number: Some(i as u32 + 1),
                 duration_s: wanted.tracks[i].duration_secs(),
                 available: true,
                 video_type: Some("MUSIC_VIDEO_TYPE_ATV".into()),
@@ -270,8 +268,6 @@ pub(crate) fn item(index: usize, video_id: &str) -> DownloadableItem {
         browse_id: "MPREb_ur8iGYISD11".into(),
         title: "Spiderland".into(),
         artists: vec!["Slint".into()],
-        year: None,
-        explicit: false,
     };
     let (group, _) = matching::album_group(&hit, &page, &wanted, false, 0);
     group.unwrap().items.remove(index)

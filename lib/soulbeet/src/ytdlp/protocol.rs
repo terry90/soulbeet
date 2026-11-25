@@ -139,8 +139,6 @@ pub(crate) struct AlbumHit {
     pub browse_id: String,
     pub title: String,
     pub artists: Vec<String>,
-    pub year: Option<String>,
-    pub explicit: bool,
 }
 
 /// An album and its tracklist.
@@ -148,7 +146,6 @@ pub(crate) struct AlbumHit {
 pub(crate) struct AlbumPage {
     pub title: String,
     pub artists: Vec<String>,
-    pub year: Option<String>,
     pub tracks: Vec<AlbumTrack>,
 }
 
@@ -156,7 +153,6 @@ pub(crate) struct AlbumPage {
 pub(crate) struct AlbumTrack {
     pub video_id: Option<String>,
     pub title: String,
-    pub track_number: Option<u32>,
     pub duration_s: Option<u32>,
     pub available: bool,
     pub video_type: Option<String>,
@@ -195,11 +191,9 @@ pub(crate) struct Progress {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct Done {
     pub path: PathBuf,
-    pub format_id: String,
     pub acodec: String,
     /// kbps, as YouTube lists the format.
     pub abr: Option<f64>,
-    pub asr: Option<u32>,
     /// Seconds, as YouTube lists the video.
     pub duration: Option<f64>,
 }

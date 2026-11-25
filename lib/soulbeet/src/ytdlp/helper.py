@@ -150,8 +150,6 @@ def search_albums(request, emit):
             "browse_id": a["browseId"],
             "title": a.get("title") or "",
             "artists": names(a.get("artists")),
-            "year": a.get("year"),
-            "explicit": bool(a.get("isExplicit")),
         }
         for a in found
         if a.get("browseId")
@@ -168,7 +166,6 @@ def album(request, emit):
         {
             "video_id": t.get("videoId"),
             "title": t.get("title") or "",
-            "track_number": t.get("trackNumber"),
             "duration_s": t.get("duration_seconds"),
             "available": bool(t.get("isAvailable")),
             "video_type": t.get("videoType"),
@@ -181,7 +178,6 @@ def album(request, emit):
         "album": {
             "title": page.get("title") or "",
             "artists": names(page.get("artists")),
-            "year": page.get("year"),
             "tracks": tracks,
         }
     }
@@ -301,10 +297,8 @@ def fetch(request, emit):
     return {
         "done": {
             "path": path,
-            "format_id": str(info.get("format_id") or ""),
             "acodec": str(info.get("acodec") or ""),
             "abr": info.get("abr"),
-            "asr": info.get("asr"),
             "duration": info.get("duration"),
         }
     }

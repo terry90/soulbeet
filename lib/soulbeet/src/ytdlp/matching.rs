@@ -816,14 +816,12 @@ pub(crate) mod tests {
         let page = AlbumPage {
             title: "GNX".into(),
             artists: vec!["Kendrick Lamar".into()],
-            year: None,
             tracks: found
                 .iter()
                 .take(2)
                 .map(|s| AlbumTrack {
                     video_id: Some(s.video_id.clone()),
                     title: s.title.clone(),
-                    track_number: Some(1),
                     duration_s: s.duration_s,
                     available: true,
                     video_type: s.video_type.clone(),
@@ -836,8 +834,6 @@ pub(crate) mod tests {
             browse_id: "MPREb_XGvjZBLVuzr".into(),
             title: "GNX".into(),
             artists: vec!["Kendrick Lamar".into()],
-            year: None,
-            explicit: true,
         };
         let album = Wanted {
             album: Some(shared::metadata::Album {
