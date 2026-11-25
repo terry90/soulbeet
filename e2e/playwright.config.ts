@@ -41,6 +41,7 @@ export default defineConfig({
         /navidrome\.spec\.ts/,
         /admin-password\.spec\.ts/,
         /archive-backend\.spec\.ts/,
+        /ytdlp\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -99,6 +100,15 @@ export default defineConfig({
       name: 'archive',
       dependencies: ['imports'],
       testMatch: /archive-backend\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Turns YouTube Music on for the whole instance, and ends with YouTube rate-limiting it,
+      // a pause that outlives the spec, so it runs alone, after the archive.
+      name: 'ytdlp',
+      dependencies: ['archive'],
+      testMatch: /ytdlp\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },
     },

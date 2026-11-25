@@ -111,6 +111,8 @@ up() {
     BEETS_CONFIG="$E2E_DIR/.fixtures/beets-e2e.yaml" \
     MUSICBRAINZ_HOST="127.0.0.1:5050" \
     ARCHIVE_HOST="127.0.0.1:5064" \
+    YTDLP_SITE_PACKAGES="$E2E_DIR/.fixtures/ytdlp-site-packages" \
+    YTDLP_DENO="$E2E_DIR/fixtures/ytdlp-bin/deno" \
     OIDC_ISSUER_URL="http://127.0.0.1:5070" \
     OIDC_CLIENT_ID="soulbeet-e2e" \
     OIDC_CLIENT_SECRET="e2e-oidc-secret" \

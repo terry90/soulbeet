@@ -1,17 +1,19 @@
 // Generates everything the stack needs that does not belong in git:
 // tagged audio files for every peer share and archive file (ffmpeg sine tones), the beets
 // config for the e2e stack (the shipped beets_config.yaml with MusicBrainz
-// pointed at the stub), the broken config the user90 instance starts with
-// and the runtime directories the services share. Run it before the stack
+// pointed at the stub), the broken config the user90 instance starts with,
+// the fake YouTube Music packages with their catalogue, and the runtime
+// directories the services share. Run it before the stack
 // starts, so the container runtime does not create those directories as root.
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
 import { archiveAudioFiles } from './archive-dataset.js';
 import { allAudioFiles, audioFileName, taggedRecording } from './dataset.js';
+import { ytmusicCatalogue } from './ytdlp-dataset.js';
 import { user90BrokenConfig } from '../helpers/env.js';
 
 const e2eRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -93,6 +95,15 @@ function generateBeetsConfig(): void {
   console.log(`generated ${target} (musicbrainz host ${mbHost})`);
 }
 
+// The fake yt-dlp and ytmusicapi the app's YouTube Music helper runs on, with the catalogue they
+// answer from beside them, copied so the committed fakes stay apart from what is generated.
+function generateYtdlpSitePackages(): void {
+  const target = join(e2eRoot, '.fixtures', 'ytdlp-site-packages');
+  cpSync(join(e2eRoot, 'fixtures', 'ytdlp-site-packages'), target, { recursive: true });
+  writeFileSync(join(target, 'catalogue.json'), JSON.stringify(ytmusicCatalogue(), null, 1));
+  console.log(`generated ${target}`);
+}
+
 function createRuntimeDirs(): void {
   for (const dir of [
     'downloads',
@@ -117,5 +128,6 @@ function generateUser90Config(): void {
 
 generateAudio();
 generateBeetsConfig();
+generateYtdlpSitePackages();
 createRuntimeDirs();
 generateUser90Config();
