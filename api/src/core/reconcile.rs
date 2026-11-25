@@ -1014,7 +1014,10 @@ async fn resume_batch(
     // As the failover would have once its next source was enqueued.
     for (source, id) in abandon {
         if let Err(e) = backend.cancel_download(&source, &id, false).await {
-            warn!("Failed to cancel abandoned transfer {id} in slskd: {e}");
+            warn!(
+                "Failed to cancel abandoned transfer {id} in {}: {e}",
+                backend.id()
+            );
         }
     }
     let found = match batch.import_mode {
@@ -1191,7 +1194,7 @@ mod tests {
     };
     use crate::server_fns::download::enqueue::file_taken_by_another_download;
     use crate::server_fns::download::test_support::{
-        batch, group, item, item_on, transfer, StubBackend, StubBackends,
+        batch, batch_on, group, item, item_on, transfer, StubBackend, StubBackends,
     };
     use crate::services::BackendLookupError;
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
@@ -1328,6 +1331,73 @@ mod tests {
             vec![("a/02.flac", Some(transfer_lost("slskd")))]
         );
         assert_eq!(resumed.failed[0].job, Some(slot(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_download_another_backend_lost_names_that_backend() {
+        let base = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        let resumed = resume_downloads(
+            &backend,
+            base.path(),
+            &batch_on("stub-1", "X"),
+            vec![(
+                JobSlot {
+                    job: "j1".into(),
+                    slot: 0,
+                },
+                record(
+                    0,
+                    JobState::Downloading,
+                    transfer("peer_a", "a/01.flac", "t-01", DownloadState::Queued),
+                    vec![None],
+                ),
+            )],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            resumed
+                .failed
+                .iter()
+                .map(|r| r.failure.as_ref().map(|f| f.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![Some(
+                "Soulbeet restarted and stub-1 no longer has this download"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_lost_slot_names_the_backend_of_its_pick_else_of_its_row() {
+        let row = || transfer("peer_a", "a/01.flac", "t-01", DownloadState::Queued);
+        let picked = record(
+            0,
+            JobState::Downloading,
+            row(),
+            vec![Some(item_on("stub-1", "peer_a", "One", "a/01.flac"))],
+        );
+        assert_eq!(lost_from(&picked), "stub-1");
+        let unpicked = record(
+            0,
+            JobState::Downloading,
+            DownloadProgress {
+                backend: Some("stub-2".into()),
+                ..row()
+            },
+            vec![None],
+        );
+        assert_eq!(lost_from(&unpicked), "stub-2");
+        let old = record(
+            0,
+            JobState::Downloading,
+            DownloadProgress {
+                backend: None,
+                ..row()
+            },
+            vec![None],
+        );
+        assert_eq!(lost_from(&old), "slskd");
     }
 
     #[tokio::test(start_paused = true)]

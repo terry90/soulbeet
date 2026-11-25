@@ -178,9 +178,13 @@ pub async fn enqueue_claimed(
 ) -> BackendResult<Vec<QueuedDownload>> {
     let registry = TransferRegistry::global();
     let keys: Vec<TransferKey> = items.iter().map(|i| item_key(backend.id(), i)).collect();
-    let owner = batch.owner.user_id.to_string();
-    let answered = match (backend)
-        .download(items, &batch.destination, request, &owner)
+    let answered = match backend
+        .download(
+            items,
+            &batch.destination,
+            request,
+            batch.owner.user_id.as_str(),
+        )
         .await
     {
         Ok(queued) => queued,

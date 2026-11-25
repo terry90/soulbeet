@@ -204,9 +204,13 @@ fn stalled(e: &BackendError, service: &str) -> Failure {
 }
 
 /// No download backend was available for `MAX_BACKEND_FAILURES` polls, the
-/// last lookup failing with `e`, whose failure this is.
+/// last lookup failing with `e`, whose failure this is. A backend an admin
+/// turned off says so.
 fn backend_unavailable(e: &BackendLookupError) -> Failure {
-    e.failure(Stage::Transfer, "Download backend unavailable")
+    match e {
+        BackendLookupError::Disabled(_) => e.failure(Stage::Transfer, e.to_string()),
+        _ => e.failure(Stage::Transfer, "Download backend unavailable"),
+    }
 }
 
 /// The downloads list of the backend whose texts name `service` kept failing to parse.
@@ -3752,6 +3756,119 @@ mod tests {
             FailureCode::TransferDisappeared,
             "Download disappeared from slskd",
         );
+    }
+
+    #[tokio::test]
+    async fn a_batch_on_another_backend_names_that_backend_when_its_track_never_appears() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (ledger, _recorded) = Ledger::recording();
+        let mut m = DownloadMonitor::new(
+            vec![
+                watched("peer_a", "one.flac", 0),
+                watched("peer_a", "two.flac", 1),
+            ],
+            PathBuf::from("/music"),
+            tx,
+            batch_on("stub-1", "X"),
+            ledger,
+        );
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        // Its sibling is listed, so the batch is not empty and the absent track is judged alone.
+        m.track_states[0].bound_at = ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1));
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "two.flac", DownloadState::InProgress)],
+            &backend,
+        )
+        .await;
+
+        let mut rows = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let DownloadEvent::Progress(sent) = event {
+                rows.extend(sent.into_iter().filter(|r| r.failure.is_some()));
+            }
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_failed(
+            &rows[0],
+            FailureCode::TransferNeverAppeared,
+            "Download never appeared in stub-1",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_on_another_backend_names_that_backend_when_its_track_disappears() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let (ledger, _recorded) = Ledger::recording();
+        let mut m = DownloadMonitor::new(
+            vec![watched("peer_a", "one.flac", 0)],
+            PathBuf::from("/music"),
+            tx,
+            batch_on("stub-1", "X"),
+            ledger,
+        );
+        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
+        m.track_states[0].seen = true;
+        m.track_states[0].missing_since = Some(ago(ABSENT_TRACK_TIMEOUT + Duration::from_secs(1)));
+
+        poll_tracks(&mut m, &[], &backend).await;
+
+        let Ok(DownloadEvent::Progress(rows)) = rx.try_recv() else {
+            panic!("the vanished transfer was never reported");
+        };
+        assert_failed(
+            &rows[0],
+            FailureCode::TransferDisappeared,
+            "Download disappeared from stub-1",
+        );
+    }
+
+    // Paused, so the polls between lookups take no real time.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_on_a_backend_turned_off_fails_saying_so() {
+        let backends = StubBackends::default();
+        backends.fail(
+            "archive",
+            BackendLookupError::Disabled("Internet Archive".into()),
+        );
+        let (tx, mut rx) = broadcast::channel(16);
+        let (ledger, _recorded) = Ledger::recording();
+        let mut m = DownloadMonitor::new(
+            vec![watched("peer_a", "01.flac", 0)],
+            PathBuf::from("/music"),
+            tx,
+            batch_on("archive", "X"),
+            ledger,
+        );
+
+        m.run(&backends).await;
+
+        // Each poll's lookup, then the cleanup's.
+        assert_eq!(
+            backends.asked(),
+            vec!["archive".to_string(); MAX_BACKEND_FAILURES as usize + 1]
+        );
+        let mut rows = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let DownloadEvent::Progress(sent) = event {
+                rows.extend(sent);
+            }
+        }
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_failed(
+            &rows[0],
+            FailureCode::BackendNotConfigured,
+            "Internet Archive is turned off in Settings > Config > Connections",
+        );
+        let action = rows[0]
+            .failure
+            .as_ref()
+            .unwrap()
+            .user_action
+            .clone()
+            .unwrap();
+        assert_eq!(action.what, "Turn on Internet Archive");
     }
 
     #[test]
