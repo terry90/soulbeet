@@ -8,10 +8,10 @@ import { nightGarden } from '../fixtures/dataset.js';
 import { loginViaApi, performSearch, registerUser, uniqueUser } from '../helpers/app.js';
 import { e2eRoot } from '../helpers/env.js';
 import { drawCovers } from './covers.js';
-import { stageApp } from './stage.js';
+import { stageApp, stageOutside } from './stage.js';
 
 /** What the pictures search for: five albums and EPs of two artists. */
-export const QUERY = nightGarden.title;
+const QUERY = nightGarden.title;
 
 /**
  * Stages the page (see stage.ts and covers.ts), signs a new account in and
@@ -19,7 +19,8 @@ export const QUERY = nightGarden.title;
  * outside URLs the page asked for, which stay refused.
  */
 export async function showSearch(page: Page): Promise<string[]> {
-  const outside = await stageApp(page);
+  const outside = await stageOutside(page);
+  await stageApp(page);
   await drawCovers(page);
   const user = uniqueUser('shots');
   await registerUser(page.request, user);

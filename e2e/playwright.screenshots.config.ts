@@ -2,8 +2,8 @@ import { defineConfig, devices } from '@playwright/test';
 import { baseUrl } from './helpers/env.js';
 
 // Retakes the pictures in ../screenshots on the stub stack (scripts/dev-stack.sh
-// up), then `npm run screenshots`. The suite's setup points the app at the
-// slskd stub first, so the downloader reads online for real.
+// up), then `npm run screenshots`. The suite's app configuration runs first and
+// points the app at the slskd stub, so the downloader reads online for real.
 export default defineConfig({
   testDir: '.',
   fullyParallel: false,
@@ -16,7 +16,7 @@ export default defineConfig({
   projects: [
     {
       name: 'setup',
-      testMatch: /tests\/setup\.app\.ts/,
+      testMatch: /screenshots\/setup\.shots\.ts/,
       use: { ...devices['Desktop Chrome'] },
     },
     {

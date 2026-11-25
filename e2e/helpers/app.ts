@@ -16,6 +16,7 @@ import {
   musicDirForApp,
   musicDirOnHost,
   slskdApiKey,
+  slskdUrlForApp,
 } from './env.js';
 
 export interface TestUser {
@@ -151,6 +152,25 @@ export async function configureInstance(page: Page, slskdUrl: string, musicDir: 
     data: { path: musicDir },
   });
   expect(roots.ok(), `allow folder root: ${roots.status()}`).toBeTruthy();
+}
+
+/**
+ * The global app configuration every project needs first: chooses the seeded
+ * admin's password, then points the app at the slskd stub through the real
+ * settings UI. The migration seeds admin/admin, which signs in only to choose
+ * a new password. The change renews the session, so the page is signed in. A
+ * rerun against the same database finds the password chosen and signs in
+ * with it.
+ */
+export async function configureApp(page: Page): Promise<void> {
+  const shipped = await page.request.post('/api/auth/login', { data: shippedAdmin });
+  if (shipped.ok()) {
+    await chooseAdminPassword(page.context(), appAdminPassword);
+    await page.goto('/');
+  } else {
+    await loginViaUi(page, admin);
+  }
+  await configureInstance(page, slskdUrlForApp, musicDirForApp);
 }
 
 export async function loginViaUi(page: Page, user: TestUser): Promise<void> {
