@@ -116,6 +116,29 @@ RUN . /tmp/tier.env \
 # rewrite shebang line in the executable script.
 RUN sed -i '1s|^.*$|#!/usr/bin/python3|' $VIRTUAL_ENV/bin/beet
 
+# --- YouTube Music helper packages: yt-dlp, ytmusicapi and the deno JS runtime ---
+# Only when the tier sets YTDLP=true (full). They go in a tree of their own, /opt/ytdlp, apart
+# from beets' venv, so neither one's pins touch the other's. Same base as beets-builder, for the
+# runtime's CPython 3.11. /out is empty for the other tiers, so their images do not grow.
+FROM python:3.11-slim-bookworm AS ytdlp-builder
+ARG TIER=light
+COPY build/tiers/${TIER}.env /tmp/tier.env
+COPY build/requirements-ytdlp.txt /tmp/requirements-ytdlp.txt
+RUN . /tmp/tier.env \
+  && mkdir -p /out \
+  && if [ "${YTDLP}" = "true" ]; then \
+       site=/out/opt/ytdlp/lib/python3.11/site-packages \
+       && pip install --no-cache-dir --no-deps --require-hashes --only-binary=:all: \
+            --target "$site" -r /tmp/requirements-ytdlp.txt \
+       && mkdir -p /out/opt/ytdlp/bin \
+       && mv "$site/bin/deno" /out/opt/ytdlp/bin/deno \
+       && rm -rf "${site:?}/bin" "${site:?}/share" "${site:?}/deno" "${site:?}"/deno-*.dist-info \
+       && find /out/opt/ytdlp -type d -name __pycache__ -prune -exec rm -rf {} + \
+       && find "$site" -type d \( -name tests -o -name test -o -name docs -o -name doc \) \
+            -prune -exec rm -rf {} + \
+       && find /out/opt/ytdlp -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete ; \
+     fi
+
 # Static ffmpeg binaries (consumed by chroma-native when FFMPEG=true).
 # Declared before chroma-native so the bind-mount forward-reference resolves.
 FROM docker.io/mwader/static-ffmpeg:8.0.1 AS ffmpeg-stage
@@ -175,6 +198,9 @@ COPY --from=chroma-native /out/ /
 
 # Copy beets virtual environment
 COPY --from=beets-builder /opt/venv /opt/venv
+
+# The YouTube Music helper's packages and deno at /opt/ytdlp when TIER=full; nothing otherwise.
+COPY --from=ytdlp-builder /out/ /
 
 # Working directory
 WORKDIR /app

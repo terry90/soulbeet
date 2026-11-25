@@ -1,0 +1,43 @@
+# The YouTube Music backend's helper packages, installed in the :full image only, into a tree of
+# their own (/opt/ytdlp) apart from beets': yt-dlp's pins never touch beets' and beets' never
+# touch yt-dlp's. Installed with --no-deps --require-hashes --only-binary=:all:, so this file is
+# the whole set: yt-dlp's default extras at the versions of its own "pin" extra, without mutagen
+# (Soulbeet tags the files itself), ytmusicapi and its requests, and deno, the JS runtime yt-dlp
+# solves YouTube's challenges in. Each hash is of a wheel for CPython 3.11 on glibc Linux,
+# amd64 or arm64, or of a pure Python wheel.
+#
+# To update: bump yt-dlp to a new stable release, take the versions of its "pin" extra from
+# PyPI, and replace the hashes with those PyPI lists for the new wheels.
+yt-dlp==2026.11.23 \
+    --hash=sha256:e9188e0c559905f7ee05acc1ba0b6fb3f310e7565bf6dea5f62b5300e0775e35
+yt-dlp-ejs==0.8.0 \
+    --hash=sha256:79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4
+ytmusicapi==1.12.4 \
+    --hash=sha256:6f2dd849f76850c8053cd40ecd7ae26e1195c0874463784a5203158a1ac453b0
+brotli==1.2.1 \
+    --hash=sha256:b0faa0b9af9367748388345d5b12f6add2a9cf896481e72910e88fbfe14ecd54 \
+    --hash=sha256:6b3c3d5794212a54434b4856f808f7bdf7ad48eacadaadb5b2346fc9a639365a
+certifi==2026.10.23 \
+    --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
+charset-normalizer==3.5.2 \
+    --hash=sha256:d760fe2a4d7c3b226cb9026d6a842868d52a7901bd98420e1baf14e80da85cf5 \
+    --hash=sha256:211d5a3eb6af8f513b8d4ca19a8c1b7accab1b5f0d3175f9826b03c1a920dc1f \
+    --hash=sha256:1c50fe28bbc2ced33386f298650d91218076c05420e6cbd790b913adc41659e7 \
+    --hash=sha256:d19fbd981a488e22cd04883659ca6b08f50b5974f9fd7c95655ef6a043e5893f \
+    --hash=sha256:b6b751274acb69d77b3323d6b7dbaa3c7fdfc1eb829b7eb61d262f32e1af9685
+idna==3.20 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+pycryptodomex==3.24.2 \
+    --hash=sha256:97dc6ea02ec1ed55dca0fbc98758ac23d0ca8ce9d7ea32d538c2851e23b8b27f \
+    --hash=sha256:e340408a601003f235b50117cd16f87b2a5b4760765aafe93340eeaadeb0414d
+requests==2.34.2 \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+websockets==17.4 \
+    --hash=sha256:cebad8f4796248b91fc2168515e507e5cb6b663a32befd09f3b1e7920acdcb1a \
+    --hash=sha256:954d43574f72be244b65f0fa61e2f814214b024f2ec849f487aa2f553f7c6e71 \
+    --hash=sha256:c6bd2c9781915592b209160d0f017d4c7c82ad53075e6b0c24d2a89299e7f9e9
+deno==2.9.8 \
+    --hash=sha256:3e286918a36f436134336c5c6ef37dfe3a27f16ea22cd6af452ab7daa4ef1da4 \
+    --hash=sha256:b1d1318e7deda8efd593aefa8b565a827fe71cf83aeff09d3a5ceb047444ca18
