@@ -13,6 +13,7 @@ The backends in this build:
 A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app relies on this:
 
 - `id()` is the registry id, and the backend is looked up only by it. `id()` and `name()` equal the backend's `BackendMeta` in `lib/shared/src/backends.rs`; a unit test of each backend checks it.
+- A search still running after 180 s is given up on: the app calls `stop_search` on it, which ends whatever it still asks of its service.
 - Every `DownloadableItem` that `poll_search` returns names `id()` in `backend`, and its `title` is the wanted MusicBrainz title, so failover can pair files of the same track.
 - `quality_score` is `(shared::download::format_score(extension, bitrate) + the backend's own terms).min(1.0)`, so every backend's files sit on one scale. A group's score is `soulbeet::matching::score::group_score`.
 - Files of a `download` call land at `<DOWNLOAD_PATH>/<destination>/<name>`, `name` being one of `shared::download::landing_names(last segment of DownloadableItem::id)` or a `ticks_copy` of it. That is what `resolve_in_destination` reads.
