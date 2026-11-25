@@ -3,9 +3,11 @@
 //! and lands the file in its batch folder, never replacing one. Each transfer is in the transfer
 //! book from the moment `download` answers for it, so a restart resumes it.
 
-use super::client::{path_of, SERVICE};
+use super::client::{path_of, Heard, SERVICE};
 use super::error::{ended, ArchiveError};
+use crate::audio::is_audio_path;
 use crate::partial::{land, PartialDir};
+use crate::polite::{HostGate, Pace, RemoteError};
 use crate::{BookEntry, TransferBook};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE, RETRY_AFTER};
 use reqwest::StatusCode;
@@ -50,6 +52,10 @@ pub struct Limits {
     pub connect_timeout: Duration,
     /// How long a body may send nothing.
     pub read_timeout: Duration,
+    /// The wait after a transfer book write failed, doubled after each up to a minute.
+    pub book_wait: Duration,
+    /// The space between two requests to archive.org, kept with its searches (`HostGate`).
+    pub interval: Duration,
 }
 
 impl Limits {
@@ -63,8 +69,13 @@ impl Limits {
         max_busy_wait: Duration::from_secs(600),
         connect_timeout: Duration::from_secs(15),
         read_timeout: Duration::from_secs(60),
+        book_wait: Duration::from_secs(1),
+        interval: Pace::ARCHIVE.min_interval,
     };
 }
+
+/// The longest wait between two tries of a transfer book write.
+const BOOK_WAIT_MAX: Duration = Duration::from_secs(60);
 
 /// What the engine needs of the server it runs in.
 #[derive(Clone)]
@@ -116,9 +127,27 @@ struct Data {
     ended_at: Option<i64>,
 }
 
+impl Data {
+    /// This data, ended now as `stored` with `failure`.
+    fn ended(&self, stored: Stored, failure: Option<Failure>) -> Data {
+        Data {
+            state: stored,
+            failure,
+            ended_at: Some(now()),
+            ..self.clone()
+        }
+    }
+
+    fn value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_default()
+    }
+}
+
 /// Where a transfer is in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    /// Going in the book: not answered for, listed or started yet.
+    Recording,
     Queued,
     Running,
     /// Being cancelled or stopped: its task is going away.
@@ -184,7 +213,7 @@ impl Record {
             item: self.item.clone(),
             request: self.request.clone(),
             target: self.destination.clone(),
-            data: serde_json::to_value(&self.data).unwrap_or_default(),
+            data: self.data.value(),
             created_at: self.created_at,
         }
     }
@@ -296,6 +325,17 @@ enum Step {
     Failed(Failure),
 }
 
+/// What a transfer's requests ran into so far.
+#[derive(Default)]
+struct Tries {
+    /// Failed connections in a row, each without progress.
+    failed: u32,
+    /// 429 and 503 answers.
+    busy: u32,
+    /// Times the bytes were thrown away and the whole file asked for again.
+    restarts: u32,
+}
+
 /// Why a transfer's bytes were thrown away.
 enum Mismatch {
     /// archive.org sent or names this many bytes, not the size it listed.
@@ -401,8 +441,10 @@ pub(crate) struct Transfers {
     base: String,
     limits: Limits,
     state: Mutex<State>,
-    /// No request goes out before this: archive.org asked to wait.
-    hold: Mutex<Instant>,
+    /// archive.org's pace and hold, which its searches keep too.
+    gate: Arc<HostGate>,
+    /// What archive.org last answered, which the health check reads.
+    heard: Heard,
 }
 
 impl Transfers {
@@ -413,6 +455,7 @@ impl Transfers {
     pub(crate) async fn start(
         settings: EngineSettings,
         limits: Limits,
+        heard: Heard,
     ) -> Result<Arc<Transfers>, ArchiveError> {
         let storage = |error| ArchiveError::Storage {
             download_path: settings.download_path.clone(),
@@ -420,18 +463,20 @@ impl Transfers {
         };
         let dir = PartialDir::open(&settings.download_path, &settings.instance, BACKEND_ID)
             .map_err(storage)?;
+        let unavailable = |detail| {
+            ArchiveError::Remote(RemoteError::Unavailable {
+                service: SERVICE,
+                detail,
+            })
+        };
+        let gate = HostGate::of(&settings.base_url).map_err(unavailable)?;
         let http = reqwest::Client::builder()
             .user_agent(crate::polite::USER_AGENT)
             .connect_timeout(limits.connect_timeout)
             .read_timeout(limits.read_timeout)
             .redirect(redirects(&settings.base_url))
             .build()
-            .map_err(|e| {
-                ArchiveError::Remote(crate::polite::RemoteError::Unavailable {
-                    service: SERVICE,
-                    detail: e.without_url().to_string(),
-                })
-            })?;
+            .map_err(|e| unavailable(e.without_url().to_string()))?;
         let entries = settings.book.all(BACKEND_ID).await?;
 
         let mut state = State::default();
@@ -484,7 +529,8 @@ impl Transfers {
             base: settings.base_url.trim_end_matches('/').to_string(),
             limits,
             state: Mutex::new(state),
-            hold: Mutex::new(Instant::now()),
+            gate,
+            heard,
         });
         transfers.pump();
         Ok(transfers)
@@ -547,12 +593,15 @@ impl Transfers {
         }
         let mut answers = Vec::new();
         for item in items.into_iter().filter(|i| i.backend == BACKEND_ID) {
+            // The item comes back from the browser: only an audio file is ever fetched.
             let Some(file) = item
                 .backend_data
                 .as_deref()
                 .and_then(|d| serde_json::from_str::<ArchiveFile>(d).ok())
                 .filter(|f| {
-                    f.identifier == item.source && item.id == format!("{}/{}", f.identifier, f.name)
+                    f.identifier == item.source
+                        && item.id == format!("{}/{}", f.identifier, f.name)
+                        && is_audio_path(Path::new(&f.name))
                 })
             else {
                 continue;
@@ -574,7 +623,7 @@ impl Transfers {
                     failure: None,
                     ended_at: None,
                 },
-                phase: Phase::Queued,
+                phase: Phase::Recording,
                 owner: Some(owner.to_string()),
                 transferred: 0,
                 speed: Speed::default(),
@@ -582,59 +631,63 @@ impl Transfers {
                 seq: 0,
                 task: None,
             };
-            if let Err(e) = self.book.put(&record.entry()).await {
-                let failure = ArchiveError::Book(e).failure(
-                    Stage::Enqueue,
-                    "The Internet Archive transfer could not be recorded",
-                );
-                answers.push(QueuedDownload {
-                    id: item.id.clone(),
-                    source: item.source.clone(),
-                    item: item.id.clone(),
-                    size: file.size,
-                    status: EnqueueStatus::Failed(failure),
-                });
-                continue;
-            }
-            let admitted = {
+            let entry = record.entry();
+            let answer = |status| QueuedDownload {
+                id: item.id.clone(),
+                source: item.source.clone(),
+                item: item.id.clone(),
+                size: file.size,
+                status,
+            };
+            // Held in memory before it goes in the book, so a call at the same time sees it
+            // and nothing goes in the book that is already fetched or was turned off.
+            {
                 let mut state = self.state.lock().unwrap();
                 if state.generation != generation {
-                    Admitted::TurnedOff
-                } else if state.records.values().any(|r| {
+                    return Err(ArchiveError::TurnedOff);
+                }
+                if state.records.values().any(|r| {
                     r.phase != Phase::Ended
                         && r.source == record.source
                         && r.item == record.item
                         && r.destination == record.destination
                 }) {
-                    Admitted::Fetching
-                } else {
-                    let mut record = record;
+                    answers.push(answer(EnqueueStatus::Failed(already_fetching())));
+                    continue;
+                }
+                state.records.insert(id.clone(), record);
+            }
+            if let Err(e) = self.book.put(&entry).await {
+                self.state.lock().unwrap().records.remove(&id);
+                let failure = ArchiveError::Book(e).failure(
+                    Stage::Enqueue,
+                    "The Internet Archive transfer could not be recorded",
+                );
+                answers.push(answer(EnqueueStatus::Failed(failure)));
+                continue;
+            }
+            let admitted = {
+                let mut guard = self.state.lock().unwrap();
+                let state = &mut *guard;
+                let current = state.generation == generation;
+                if let Some(record) = state.records.get_mut(&id).filter(|_| current) {
+                    record.phase = Phase::Queued;
                     record.seq = state.next_seq;
                     state.next_seq += 1;
-                    state.records.insert(id.clone(), record);
-                    Admitted::Yes
+                    true
+                } else {
+                    state.records.remove(&id);
+                    false
                 }
             };
-            let status = match admitted {
-                Admitted::Yes => EnqueueStatus::Enqueued,
-                Admitted::TurnedOff => {
-                    Self::forget_in(&*self.book, &id).await;
-                    return Err(ArchiveError::TurnedOff);
-                }
-                Admitted::Fetching => {
-                    Self::forget_in(&*self.book, &id).await;
-                    EnqueueStatus::Failed(already_fetching())
-                }
-            };
+            // Turned off while it went in the book.
+            if !admitted {
+                Self::forget_in(&*self.book, &id).await;
+                return Err(ArchiveError::TurnedOff);
+            }
             answers.push(QueuedDownload {
-                id: match status {
-                    EnqueueStatus::Enqueued => id,
-                    _ => item.id.clone(),
-                },
-                source: item.source.clone(),
-                item: item.id.clone(),
-                size: file.size,
-                status,
+                id,
+                ..answer(EnqueueStatus::Enqueued)
             });
         }
         self.pump();
@@ -645,21 +698,24 @@ impl Transfers {
     pub(crate) fn listed(&self, sources: &[String]) -> Vec<DownloadProgress> {
         let state = self.state.lock().unwrap();
         (state.records.values())
-            .filter(|r| sources.contains(&r.source))
+            .filter(|r| r.phase != Phase::Recording && sources.contains(&r.source))
             .map(|r| self.progress(&state, r))
             .collect()
     }
 
+    /// The record `id` of `source`, once `download` answered for it.
+    fn answered<'a>(state: &'a State, source: &str, id: &str) -> Option<&'a Record> {
+        (state.records.get(id)).filter(|r| r.phase != Phase::Recording && r.source == source)
+    }
+
     pub(crate) fn one(&self, source: &str, id: &str) -> Option<DownloadProgress> {
         let state = self.state.lock().unwrap();
-        (state.records.get(id))
-            .filter(|r| r.source == source)
-            .map(|r| self.progress(&state, r))
+        Self::answered(&state, source, id).map(|r| self.progress(&state, r))
     }
 
     pub(crate) fn queue_position(&self, source: &str, id: &str) -> Option<u32> {
         let state = self.state.lock().unwrap();
-        let record = state.records.get(id).filter(|r| r.source == source)?;
+        let record = Self::answered(&state, source, id)?;
         Some(match record.phase {
             Phase::Queued => state.place(record, self.limits.per_item).1,
             _ => 0,
@@ -680,7 +736,7 @@ impl Transfers {
             row.transferred as f64 * 100.0 / size as f64
         };
         match r.phase {
-            Phase::Queued => {
+            Phase::Recording | Phase::Queued => {
                 let (at_source, place) = state.place(r, self.limits.per_item);
                 row.queued_at_source = at_source;
                 row.queue_position = Some(place);
@@ -706,6 +762,8 @@ impl Transfers {
 
     /// Stops the transfer `id` of `source`, deletes its partial file and keeps it as
     /// cancelled, or with `remove` forgets it: an ended one too. A landed file is never touched.
+    /// The book is written first: when it cannot be, the error is answered and the record stays
+    /// as the book has it, for a later cancel or stop.
     pub(crate) async fn cancel(
         self: &Arc<Self>,
         source: &str,
@@ -714,7 +772,9 @@ impl Transfers {
     ) -> Result<(), ArchiveError> {
         let task = {
             let mut state = self.state.lock().unwrap();
-            let Some(record) = state.records.get_mut(id).filter(|r| r.source == source) else {
+            let Some(record) = (state.records.get_mut(id))
+                .filter(|r| r.phase != Phase::Recording && r.source == source)
+            else {
                 return Ok(());
             };
             if record.phase != Phase::Ended {
@@ -726,29 +786,36 @@ impl Transfers {
             task.abort();
             let _ = task.await;
         }
-        let unfinished = {
-            let state = self.state.lock().unwrap();
-            state
-                .records
-                .get(id)
-                .is_some_and(|r| r.data.state.unfinished())
+        let cancelled = self.cancelled(id, remove).await;
+        self.pump();
+        cancelled
+    }
+
+    /// The rest of `cancel`, once the record's task is gone: its data is the book's.
+    async fn cancelled(&self, id: &str, remove: bool) -> Result<(), ArchiveError> {
+        let Some(data) = self.data_of(id) else {
+            return Ok(());
         };
-        if unfinished {
+        if remove {
+            self.book.forget(BACKEND_ID, id).await?;
+            self.state.lock().unwrap().records.remove(id);
+        } else if data.state.unfinished() {
+            let data = data.ended(Stored::Cancelled, None);
+            self.book.set_data(BACKEND_ID, id, &data.value()).await?;
+            if let Some(record) = self.state.lock().unwrap().records.get_mut(id) {
+                record.data = data;
+                record.phase = Phase::Ended;
+            }
+        }
+        if data.state.unfinished() {
             self.remove_part(id);
         }
-        if remove {
-            self.state.lock().unwrap().records.remove(id);
-            self.book.forget(BACKEND_ID, id).await?;
-        } else if unfinished {
-            self.end(id, Stored::Cancelled, None);
-            self.persist(id).await;
-        }
-        self.pump();
         Ok(())
     }
 
     /// Stops every unfinished transfer: refuses older handles from now on, deletes the partial
-    /// files and forgets the book entries. Ended transfers stay.
+    /// files and forgets the book entries. Ended transfers stay. An entry the book cannot forget
+    /// keeps its record and its part, so the next stop forgets it.
     pub(crate) async fn stop(&self) {
         let tasks: Vec<(String, Option<JoinHandle<()>>)> = {
             let mut state = self.state.lock().unwrap();
@@ -766,21 +833,22 @@ impl Transfers {
                 task.abort();
                 let _ = task.await;
             }
-            let unfinished = {
-                let mut state = self.state.lock().unwrap();
-                // One that ended just before it was stopped stays.
-                let unfinished =
-                    (state.records.get(&id)).is_some_and(|r| r.data.state.unfinished());
-                if unfinished {
-                    state.records.remove(&id);
+            // One that ended, in the book, just before it was stopped stays.
+            if !self.data_of(&id).is_some_and(|d| d.state.unfinished()) {
+                continue;
+            }
+            match self.book.forget(BACKEND_ID, &id).await {
+                Ok(()) => {
+                    self.state.lock().unwrap().records.remove(&id);
+                    self.remove_part(&id);
                 }
-                unfinished
-            };
-            if unfinished {
-                self.remove_part(&id);
-                Self::forget_in(&*self.book, &id).await;
+                Err(e) => warn!("Could not forget archive transfer {id} on turning off: {e}"),
             }
         }
+    }
+
+    fn data_of(&self, id: &str) -> Option<Data> {
+        Some(self.state.lock().unwrap().records.get(id)?.data.clone())
     }
 
     fn remove_part(&self, id: &str) {
@@ -791,33 +859,37 @@ impl Transfers {
         }
     }
 
-    /// Ends the record `id` as `stored`, with `failure`.
-    fn end(&self, id: &str, stored: Stored, failure: Option<Failure>) {
+    /// Writes `data` to the book as the transfer `id`'s, trying again after a failed write until
+    /// it is written or the task is stopped. A restart reads the book, so a state goes there
+    /// before the record shows it.
+    async fn write(&self, id: &str, data: &Data) {
+        let value = data.value();
+        let mut wait = self.limits.book_wait;
+        while let Err(e) = self.book.set_data(BACKEND_ID, id, &value).await {
+            warn!(
+                "Could not record archive transfer {id}, trying again in {} s: {e}",
+                wait.as_secs_f32()
+            );
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(BOOK_WAIT_MAX);
+        }
+    }
+
+    /// Ends the transfer `id` as `stored`, with `failure`: in the book, then in its record.
+    async fn end(&self, id: &str, stored: Stored, failure: Option<Failure>) {
+        let Some(data) = self.data_of(id) else {
+            return;
+        };
+        let data = data.ended(stored, failure);
+        self.write(id, &data).await;
         let mut state = self.state.lock().unwrap();
         if let Some(record) = state.records.get_mut(id) {
+            record.data = data;
             record.phase = Phase::Ended;
-            record.data.state = stored;
-            record.data.failure = failure;
-            record.data.ended_at = Some(now());
             record.task = None;
             if stored == Stored::Completed {
                 record.transferred = record.data.size;
             }
-        }
-    }
-
-    /// Writes the record `id`'s data to the book; a failed write is logged, and a restart reads
-    /// the state written before it.
-    async fn persist(&self, id: &str) {
-        let data = {
-            let state = self.state.lock().unwrap();
-            let Some(record) = state.records.get(id) else {
-                return;
-            };
-            serde_json::to_value(&record.data).unwrap_or_default()
-        };
-        if let Err(e) = self.book.set_data(BACKEND_ID, id, &data).await {
-            warn!("Could not record archive transfer {id}: {e}");
         }
     }
 
@@ -843,23 +915,23 @@ impl Transfers {
         };
         match self.fetch(&job).await {
             Ok(landed) => {
-                self.end(&id, Stored::Completed, None);
                 info!(
                     "Internet Archive: {} landed at {}",
                     job.name,
                     landed.display()
                 );
+                self.end(&id, Stored::Completed, None).await;
             }
             Err(failure) => {
-                self.remove_part(&id);
                 warn!(
                     "Internet Archive transfer {id} of {} failed: {}",
                     job.name, failure.message
                 );
-                self.end(&id, Stored::Failed, Some(failure));
+                self.end(&id, Stored::Failed, Some(failure)).await;
+                // Only once the book says failed, so a restart never fetches it from nothing.
+                self.remove_part(&id);
             }
         }
-        self.persist(&id).await;
         self.pump();
     }
 
@@ -877,45 +949,59 @@ impl Transfers {
         }
     }
 
-    /// Records the ETag the bytes from now on are of.
+    /// Records the ETag the bytes from now on are of. A failed write is only logged: a restart
+    /// then sends an older ETag, which brings the whole file again, or none, and the md5 catches
+    /// a file that changed.
     async fn set_etag(&self, job: &mut Job, etag: Option<String>) {
         if job.etag == etag {
             return;
         }
         job.etag.clone_from(&etag);
-        if let Some(record) = self.state.lock().unwrap().records.get_mut(&job.id) {
+        let data = {
+            let mut state = self.state.lock().unwrap();
+            let Some(record) = state.records.get_mut(&job.id) else {
+                return;
+            };
             record.data.etag = etag;
+            record.data.value()
+        };
+        if let Err(e) = self.book.set_data(BACKEND_ID, &job.id, &data).await {
+            warn!(
+                "Could not record the ETag of archive transfer {}: {e}",
+                job.id
+            );
         }
-        self.persist(&job.id).await;
     }
 
     /// Fetches the job's file and lands it: where it landed.
     async fn fetch(&self, job: &Job) -> Result<PathBuf, Failure> {
         let mut job = job.clone();
-        if job.landing {
-            if let Some(landed) = self.landed_before(&job).await {
-                return Ok(landed);
-            }
+        // The part goes only once it is linked: the file landed, and is never fetched again.
+        if job.landing && !self.dir.part(&job.id).exists() {
+            return self
+                .landed_before(&job)
+                .await
+                .ok_or_else(ended::landed_gone);
         }
-        let (mut failed, mut busy, mut restarts) = (0u32, 0u32, 0u32);
+        let mut tries = Tries::default();
         loop {
-            match self.attempt(&mut job, &mut busy).await {
+            match self.attempt(&mut job, &mut tries).await {
                 Step::Verified => return self.land(&job).await,
                 // A connection that brought bytes is asked again at once.
                 Step::Resume {
                     progressed: true, ..
-                } => failed = 0,
+                } => tries.failed = 0,
                 Step::Resume { why, .. } => {
-                    failed += 1;
-                    if failed >= self.limits.tries {
+                    tries.failed += 1;
+                    if tries.failed >= self.limits.tries {
                         return Err(ended::connection(&why));
                     }
-                    tokio::time::sleep(self.limits.backoff * 2u32.pow(failed - 1)).await;
+                    tokio::time::sleep(self.limits.backoff * 2u32.pow(tries.failed - 1)).await;
                 }
                 Step::Busy => {}
                 Step::Restart(mismatch) => {
-                    restarts += 1;
-                    if restarts >= 2 {
+                    tries.restarts += 1;
+                    if tries.restarts >= 2 {
                         return Err(mismatch.failure(&job));
                     }
                     self.remove_part(&job.id);
@@ -927,7 +1013,7 @@ impl Transfers {
     }
 
     /// One request of the transfer, from where its partial bytes end.
-    async fn attempt(&self, job: &mut Job, busy: &mut u32) -> Step {
+    async fn attempt(&self, job: &mut Job, tries: &mut Tries) -> Step {
         let part = self.dir.part(&job.id);
         let mut have = length_of(&part);
         if have > job.size {
@@ -951,7 +1037,7 @@ impl Transfers {
         self.set_progress(&job.id, have);
         let before = have;
         let received = if have < job.size {
-            self.receive(job, &mut file, &mut hasher, &mut have, busy)
+            self.receive(job, &mut file, &mut hasher, &mut have, tries)
                 .await
         } else {
             None
@@ -982,17 +1068,17 @@ impl Transfers {
 
     /// Asks for the bytes from `have` on and writes them to `file`: None when the answer was
     /// read to its end, else the step it calls for. `have` and `hasher` follow every byte
-    /// written.
+    /// written. A cut made progress when the part ends past where it ended before the request.
     async fn receive(
         &self,
         job: &mut Job,
         file: &mut tokio::fs::File,
         hasher: &mut md5::Context,
         have: &mut u64,
-        busy: &mut u32,
+        tries: &mut Tries,
     ) -> Option<Step> {
-        let wait_until = *self.hold.lock().unwrap();
-        tokio::time::sleep_until(wait_until.into()).await;
+        let before = *have;
+        self.gate.wait_for_turn(self.limits.interval).await;
         let url = format!(
             "{}/download/{}/{}",
             self.base,
@@ -1002,21 +1088,35 @@ impl Transfers {
         let mut request = self.http.get(&url);
         if *have > 0 {
             request = request.header(RANGE, format!("bytes={have}-"));
-            if let Some(etag) = &job.etag {
-                request = request.header(IF_RANGE, etag.as_str());
+            // A weak ETag may not go in If-Range; the md5 then catches a file that changed.
+            if let Some(etag) = job.etag.as_deref().filter(|e| !e.starts_with("W/")) {
+                request = request.header(IF_RANGE, etag);
             }
         }
         self.count_attempt(&job.id);
         let response = match request.send().await {
             Ok(response) => response,
             Err(e) => {
+                let why = e.without_url().to_string();
+                self.heard.note::<()>(&Err(RemoteError::Unavailable {
+                    service: SERVICE,
+                    detail: why.clone(),
+                }));
                 return Some(Step::Resume {
                     progressed: false,
-                    why: e.without_url().to_string(),
-                })
+                    why,
+                });
             }
         };
         let status = response.status();
+        self.heard.note(&match status {
+            StatusCode::TOO_MANY_REQUESTS => Err(RemoteError::RateLimited { service: SERVICE }),
+            StatusCode::SERVICE_UNAVAILABLE => Err(RemoteError::Unavailable {
+                service: SERVICE,
+                detail: "HTTP 503".into(),
+            }),
+            _ => Ok(()),
+        });
         let headers = response.headers().clone();
         match status {
             StatusCode::PARTIAL_CONTENT => match content_range(&headers) {
@@ -1038,8 +1138,13 @@ impl Transfers {
                     return Some(Step::Restart(Mismatch::Size(length)));
                 }
                 if *have > 0 {
-                    // The file changed since its bytes were fetched, or the range was not
-                    // honoured: the whole file comes again.
+                    // The file changed since its bytes were fetched, or the range was ignored:
+                    // the whole file comes again, which counts as a restart.
+                    tries.restarts += 1;
+                    if tries.restarts >= 2 {
+                        let why = "archive.org ignored the range asked".to_string();
+                        return Some(Step::Failed(Mismatch::Range(why).failure(job)));
+                    }
                     match self.dir.open_part(&job.id, false) {
                         Ok(fresh) => *file = tokio::fs::File::from_std(fresh),
                         Err(e) => {
@@ -1052,18 +1157,17 @@ impl Transfers {
                 }
             }
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
-                *busy += 1;
+                tries.busy += 1;
                 let asked = retry_after(&headers);
                 let wait = asked.map_or_else(
-                    || self.limits.busy_wait * 2u32.pow((*busy - 1).min(16)),
+                    || self.limits.busy_wait * 2u32.pow((tries.busy - 1).min(16)),
                     Duration::from_secs,
                 );
-                if *busy > self.limits.busy_tries || wait > self.limits.max_busy_wait {
+                if tries.busy > self.limits.busy_tries || wait > self.limits.max_busy_wait {
                     return Some(Step::Failed(ended::busy(status.as_u16(), asked)));
                 }
-                // Every transfer waits it out, not only this one.
-                let mut hold = self.hold.lock().unwrap();
-                *hold = (*hold).max(Instant::now() + wait);
+                // Every transfer and search waits it out, not only this one.
+                self.gate.hold(wait);
                 info!(
                     "archive.org answered {} for {}; waiting {} s",
                     status.as_u16(),
@@ -1091,7 +1195,6 @@ impl Transfers {
             .map(str::to_string);
         self.set_etag(job, etag).await;
 
-        let start = *have;
         let mut response = response;
         loop {
             match response.chunk().await {
@@ -1112,7 +1215,7 @@ impl Transfers {
                     let why = e.without_url().to_string();
                     warn!("archive.org cut the transfer of {}: {why}", job.name);
                     return Some(Step::Resume {
-                        progressed: *have > start,
+                        progressed: *have > before,
                         why,
                     });
                 }
@@ -1120,13 +1223,15 @@ impl Transfers {
         }
     }
 
-    /// Lands the verified part of `job` in its batch folder, the book saying so first.
+    /// Lands the verified part of `job` in its batch folder, once the book says so.
     async fn land(&self, job: &Job) -> Result<PathBuf, Failure> {
-        if let Some(record) = self.state.lock().unwrap().records.get_mut(&job.id) {
-            record.data.state = Stored::Landing;
+        if let Some(mut data) = self.data_of(&job.id) {
+            data.state = Stored::Landing;
+            self.write(&job.id, &data).await;
+            if let Some(record) = self.state.lock().unwrap().records.get_mut(&job.id) {
+                record.data = data;
+            }
         }
-        self.persist(&job.id).await;
-        // No await from the link to the end of the record, so a cancel never comes between.
         land(
             &self.dir.part(&job.id),
             &self.download_path,
@@ -1136,13 +1241,9 @@ impl Transfers {
         .map_err(|e| ended::storage(&e, &self.download_path))
     }
 
-    /// The file a landing cut short already put in the batch folder: the part's own when it
-    /// is still there, else a file under one of the landing names with the job's size and md5.
+    /// The file a landing whose part is gone put in the batch folder: one under one of the
+    /// landing names with the job's size and md5.
     async fn landed_before(&self, job: &Job) -> Option<PathBuf> {
-        let part = self.dir.part(&job.id);
-        if part.exists() {
-            return None;
-        }
         let folder = self.download_path.join(&job.destination);
         let remote = basename(&format!("{}/{}", job.source, job.name)).to_string();
         let names = shared::download::landing_names(&remote);
@@ -1169,15 +1270,6 @@ impl Transfers {
     }
 }
 
-/// Whether `download` took a transfer in.
-enum Admitted {
-    Yes,
-    /// The backend was turned off since the handle was built.
-    TurnedOff,
-    /// The same file is already fetched into the same folder.
-    Fetching,
-}
-
 /// The same file is already fetched into the same folder.
 fn already_fetching() -> Failure {
     Failure::new(
@@ -1195,10 +1287,21 @@ pub(crate) mod tests {
     use crate::BookError;
     use async_trait::async_trait;
     use shared::download::FileFacts;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// A transfer book in memory, as the SQLite one behaves.
+    /// A transfer book in memory, as the SQLite one behaves. While `.1` is set it refuses
+    /// every write but `put`, as a database that cannot be written.
     #[derive(Default)]
-    pub(crate) struct MemoryBook(pub Mutex<Vec<BookEntry>>);
+    pub(crate) struct MemoryBook(pub Mutex<Vec<BookEntry>>, pub AtomicBool);
+
+    impl MemoryBook {
+        fn writable(&self) -> Result<(), BookError> {
+            match self.1.load(Ordering::SeqCst) {
+                true => Err(BookError("the database is locked".into())),
+                false => Ok(()),
+            }
+        }
+    }
 
     #[async_trait]
     impl TransferBook for MemoryBook {
@@ -1215,6 +1318,7 @@ pub(crate) mod tests {
             transfer_id: &str,
             file_id: Option<&str>,
         ) -> Result<(), BookError> {
+            self.writable()?;
             let mut entries = self.0.lock().unwrap();
             let entry = (entries.iter_mut())
                 .find(|e| e.backend == backend && e.key == key)
@@ -1229,6 +1333,7 @@ pub(crate) mod tests {
             key: &str,
             data: &serde_json::Value,
         ) -> Result<(), BookError> {
+            self.writable()?;
             let mut entries = self.0.lock().unwrap();
             let entry = (entries.iter_mut())
                 .find(|e| e.backend == backend && e.key == key)
@@ -1268,6 +1373,7 @@ pub(crate) mod tests {
             Ok(entries)
         }
         async fn forget(&self, backend: &str, key: &str) -> Result<(), BookError> {
+            self.writable()?;
             (self.0.lock().unwrap()).retain(|e| !(e.backend == backend && e.key == key));
             Ok(())
         }
@@ -1291,6 +1397,8 @@ pub(crate) mod tests {
             backoff: Duration::from_millis(10),
             busy_wait: Duration::from_millis(10),
             read_timeout: Duration::from_secs(30),
+            book_wait: Duration::from_millis(10),
+            interval: Duration::ZERO,
             ..Limits::ARCHIVE
         }
     }
@@ -1357,7 +1465,9 @@ pub(crate) mod tests {
         }
 
         async fn start(&self, base: &str, limits: Limits) -> Arc<Transfers> {
-            Transfers::start(self.settings(base), limits).await.unwrap()
+            Transfers::start(self.settings(base), limits, Heard::default())
+                .await
+                .unwrap()
         }
 
         pub(crate) fn part_dir(&self) -> PathBuf {
@@ -1950,6 +2060,26 @@ pub(crate) mod tests {
             std::fs::read(rig.folder(DESTINATION).join("01 Moon Age.flac")).unwrap(),
             file
         );
+
+        // Landed, its file taken away since, by an import or by hand.
+        let rig = Rig::new();
+        rig.recorded("t-gone", &file, None, "landing", &[]);
+        let transfers = rig.start(&base, fast()).await;
+        let row = wait_for(&transfers, "duster", "t-gone", ended).await;
+        let failure = row.failure.unwrap();
+        assert_eq!(
+            (failure.code, failure.retry),
+            (
+                FailureCode::FileNotFoundAfterDownload,
+                RetryAdvice::NotRetryable
+            )
+        );
+        assert!(seen.lock().unwrap().is_empty(), "never fetched again");
+        assert!(!rig.folder(DESTINATION).exists());
+        assert_eq!(
+            rig.book.states(),
+            [("t-gone".to_string(), "failed".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -2159,6 +2289,211 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(names, [name.to_string()]);
         }
+    }
+
+    #[tokio::test]
+    async fn a_state_the_book_cannot_take_is_not_shown_until_it_does() {
+        let rig = Rig::new();
+        let file = body(3000, 20);
+        let (base, _) = serve_file(
+            ServedFile {
+                body: file.clone(),
+                etag: None,
+            },
+            vec![FileAnswer::Whole],
+        );
+        let transfers = rig.start(&base, fast()).await;
+        rig.book.1.store(true, Ordering::SeqCst);
+        let id = sent(
+            &transfers,
+            item("duster", "01.flac", &file),
+            DESTINATION,
+            "u1",
+        )
+        .await;
+        wait_for(&transfers, "duster", &id, |r| r.transferred == 3000).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let row = transfers.one("duster", &id).unwrap();
+        assert_eq!(row.state, DownloadState::InProgress, "{row:?}");
+        assert!(
+            !rig.folder(DESTINATION).exists(),
+            "nothing lands before the book says it is landing"
+        );
+        assert_eq!(rig.book.states(), [(id.clone(), "queued".to_string())]);
+
+        rig.book.1.store(false, Ordering::SeqCst);
+        let row = wait_for(&transfers, "duster", &id, ended).await;
+        assert_eq!(row.state, DownloadState::Completed, "{row:?}");
+        assert_eq!(rig.book.states(), [(id, "completed".to_string())]);
+        assert_eq!(
+            std::fs::read(rig.folder(DESTINATION).join("01.flac")).unwrap(),
+            file
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_or_stop_the_book_refuses_keeps_the_transfer_for_the_next_one() {
+        let rig = Rig::new();
+        let file = body(4000, 21);
+        let (base, _) = serve_file(
+            ServedFile {
+                body: file.clone(),
+                etag: None,
+            },
+            vec![FileAnswer::Stall(1000)],
+        );
+        let transfers = rig.start(&base, fast()).await;
+        let id = sent(
+            &transfers,
+            item("duster", "01.flac", &file),
+            DESTINATION,
+            "u1",
+        )
+        .await;
+        wait_for(&transfers, "duster", &id, |r| r.transferred >= 1000).await;
+        rig.book.1.store(true, Ordering::SeqCst);
+
+        assert!(transfers.cancel("duster", &id, true).await.is_err());
+        assert!(transfers.cancel("duster", &id, false).await.is_err());
+        transfers.stop().await;
+        assert_eq!(
+            transfers.one("duster", &id).unwrap().state,
+            DownloadState::Cancelled
+        );
+        assert_eq!(rig.parts(), [id.as_str()]);
+        assert_eq!(rig.book.states(), [(id.clone(), "queued".to_string())]);
+
+        rig.book.1.store(false, Ordering::SeqCst);
+        transfers.stop().await;
+        assert!(transfers.one("duster", &id).is_none());
+        assert!(rig.parts().is_empty());
+        assert!(rig.book.states().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_the_range_fails_the_transfer_after_one_restart() {
+        let rig = Rig::new();
+        let file = body(6000, 22);
+        let (base, seen) = serve_file(
+            ServedFile {
+                body: file.clone(),
+                etag: Some("\"v1\"".into()),
+            },
+            vec![FileAnswer::NoRange(1500); 4],
+        );
+        let transfers = rig.start(&base, fast()).await;
+        let id = sent(
+            &transfers,
+            item("duster", "01.flac", &file),
+            DESTINATION,
+            "u1",
+        )
+        .await;
+        let row = wait_for(&transfers, "duster", &id, ended).await;
+        assert_eq!(
+            row.failure.unwrap().code,
+            FailureCode::TransferConnectionFailed
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[1].range.as_deref(), Some("bytes=1500-"));
+        assert!(!rig.folder(DESTINATION).exists());
+        assert!(rig.parts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_weak_etag_is_never_sent_in_if_range() {
+        let rig = Rig::new();
+        let file = body(3000, 23);
+        rig.recorded("t-weak", &file, Some("W/\"v1\""), "queued", &file[..1000]);
+        let (base, seen) = serve_file(
+            ServedFile {
+                body: file.clone(),
+                etag: Some("W/\"v1\"".into()),
+            },
+            vec![FileAnswer::Whole],
+        );
+        let transfers = rig.start(&base, fast()).await;
+        let row = wait_for(&transfers, "duster", "t-weak", ended).await;
+        assert_eq!(row.state, DownloadState::Completed, "{row:?}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (seen[0].range.as_deref(), seen[0].if_range.as_deref()),
+            (Some("bytes=1000-"), None)
+        );
+        assert_eq!(
+            std::fs::read(rig.folder(DESTINATION).join("01 Moon Age.flac")).unwrap(),
+            file
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_already_fetched_into_its_folder_or_not_audio_is_never_recorded() {
+        let rig = Rig::new();
+        let file = body(2000, 24);
+        let (base, _) = serve_file(
+            ServedFile {
+                body: file.clone(),
+                etag: None,
+            },
+            vec![FileAnswer::Stall(500)],
+        );
+        let transfers = rig.start(&base, fast()).await;
+        let first = sent(
+            &transfers,
+            item("duster", "01.flac", &file),
+            DESTINATION,
+            "u1",
+        )
+        .await;
+        let again = transfers
+            .download(
+                transfers.generation(),
+                vec![
+                    item("duster", "01.flac", &file),
+                    item("duster", "disc image.iso", &file),
+                ],
+                DESTINATION,
+                "r2",
+                "u1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 1, "the iso gets no answer: {again:?}");
+        let EnqueueStatus::Failed(failure) = &again[0].status else {
+            panic!("{again:?}");
+        };
+        assert_eq!(failure.code, FailureCode::EnqueueFailed);
+        assert_eq!(rig.book.states(), [(first, "queued".to_string())]);
+        transfers.stop().await;
+    }
+
+    #[tokio::test]
+    async fn what_archive_org_answers_a_download_is_heard() {
+        let rig = Rig::new();
+        let empty = |status| Reply {
+            status,
+            body: String::new(),
+        };
+        let (base, _) =
+            serve_with_headers(vec![(empty(429), vec![("Retry-After", "7200".into())])]);
+        let heard = Heard::default();
+        let transfers = Transfers::start(rig.settings(&base), fast(), heard.clone())
+            .await
+            .unwrap();
+        let file = body(100, 25);
+        let id = sent(
+            &transfers,
+            item("duster", "01.flac", &file),
+            DESTINATION,
+            "u1",
+        )
+        .await;
+        wait_for(&transfers, "duster", &id, ended).await;
+        assert_eq!(
+            heard.within(Duration::from_secs(60)),
+            Some(Err(RemoteError::RateLimited { service: SERVICE }))
+        );
     }
 
     #[test]
