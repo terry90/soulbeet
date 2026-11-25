@@ -543,7 +543,7 @@ The ones you are most likely to see:
 | `transfer_disappeared` | `transfer` | The transfer vanished from slskd's list. | The same source later. |
 | `transfer_stuck_in_remote_queue` | `transfer` | The transfer waited 15 minutes in the source's queue. | Another source. |
 | `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read, or the Internet Archive backend could not read or write its transfer records in Soulbeet's database. | Check slskd; update Soulbeet or slskd if their versions do not match. |
-| `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
+| `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. For archive.org, a file that landed before a restart is no longer in its batch folder; it is not downloaded again. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
 | `download_disk_full` | `transfer` | The disk the download backend writes to is full. User action `free_disk_space`. | Free disk space, then retry. |
 | `import_no_match` | `import` | beets found no close enough match. | The assistant reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
 | `import_already_in_library` | `import`, `index` | The library already holds this recording; the facts give its song ids. | Nothing. To replace it, preview with reason `replaced` and pass `replace_existing`. |
