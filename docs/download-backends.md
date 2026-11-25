@@ -21,7 +21,7 @@ A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app r
 - A backend that keeps transfers in memory loses them on restart; `get_download` then answers None, which reconcile treats as a lost transfer. An ended record may be forgotten 7 days after it ended.
 - `queue_position` is the transfer's place in the line it waits in before it starts: the source's queue for a peer backend, the backend's own queue otherwise; `Some(0)` once it is not waiting; None when the backend no longer has the transfer.
 - `source_status` says whether this backend can fetch from the source now. `Blocked` means the backend will not give this source's files.
-- `health_check` is called every 10 s per open tab. A backend that calls a third-party service costs it at most one request per minute, so it caches inside the backend. slskd is the user's own server and is checked live.
+- `health_check` is called every 10 s per open tab. A backend that calls a third-party service costs it at most one request per minute, so it caches inside the backend, or answers from its own last request to the service when that is recent (the Internet Archive does). slskd is the user's own server and is checked live.
 - Failures, their causes and health answers are shown to every user and written to the log, so they never hold a key, a password or a URL with credentials in it.
 - An item `download` cannot send gets no answer, and the caller fails it.
 
@@ -31,7 +31,8 @@ Failure texts the app writes for a backend name its `BackendMeta::service` ("Dow
 
 - `soulbeet::partial`: `PartialDir::open(download_path, instance, backend)` is `<DOWNLOAD_PATH>/.soulful-partial/<instance>/<backend>/`, the instance being `services::instance_id()`. Two installs sharing one downloads folder have different instance ids. The first open takes a lock that another server on the same database and downloads folder cannot get. The lock covers one (database, downloads folder) pair: two servers on one database are not supported, whatever their downloads folders.
 - A backend writes a partial file only through `PartialDir::open_part(transfer_id, resume)`. `part(transfer_id)` is its path, for reading its length or checksum. `open_part` refuses a part that already landed (a landing cut between its link and its removal) with `AlreadyExists`; the backend then calls `land` again, which only removes the part. Close the file before `land`, and never write through a handle opened before it.
-- `partial::land` moves a finished part to its landing name and never replaces a file.
+- `partial::land` moves a finished part to its landing name and never replaces a file. It returns once the link and the part's removal are on disk, so the backend may then record the file landed.
+- `soulbeet::polite::HostGate::of(base_url)`: the pace and the hold every client of one host shares. A backend that sends its own requests to a host its searches also use waits on it (`wait_for_turn`) and holds it on a 429 or 503 (`hold`), so a rate limit seen by one request holds them all.
 - `soulbeet::tags`: `write_tags` replaces a file's tags (FLAC, MP3, Ogg Opus). It runs on a part before `land`, and refuses a file with more than one link. The MusicBrainz ids go in only when the match facts given with them make a close match (title and album scores of 0.8 or more, a known length within 3 s).
 - `soulbeet::matching`: path, title, length and version matching, and `assign_tracks`, which gives each wanted track the best file no other track took.
 - `soulbeet::TransferBook`: records a backend keeps across restarts, in the `backend_transfers` table (`services::transfer_book()`).
