@@ -521,10 +521,10 @@ test('the Christmas playlist is filled through every injected failure by followi
       code: 'permission_not_granted',
       stage: 'delete',
       retry: 'needs_user',
-      message: 'Deleting music is turned off for this app',
+      message: 'Managing library files (delete, move, re-tag) is turned off for this app',
       user_action: {
         code: 'enable_deletion',
-        what: 'Allow deleting music for this app',
+        what: 'Allow managing library files for this app',
         where: 'Settings > Users > Connected apps',
       },
       next: [],
@@ -562,12 +562,12 @@ test('the Christmas playlist is filled through every injected failure by followi
     await pageA.goto('/');
     await openSettings(pageA);
     await pageA.getByRole('button', { name: 'Users' }).click();
-    const allow = pageA.getByRole('checkbox', { name: 'Allow deleting music' });
+    const allow = pageA.getByRole('checkbox', { name: 'Allow managing library files (delete, move, re-tag)' });
     await allow.click();
-    await expect(pageA.getByRole('button', { name: 'Allow deleting', exact: true })).toBeVisible();
+    await expect(pageA.getByRole('button', { name: 'Allow managing files', exact: true })).toBeVisible();
     await confirmIn(
       pageA,
-      'Let 127.0.0.1 delete music from your library? Before deleting tracks it has to show you what it would delete and get your yes. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. At most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored.',
+      'Let 127.0.0.1 manage library files (delete, move between folders, and re-tag)? Before deleting, moving or re-tagging tracks it has to ask you first. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. Deletions are limited to at most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored.',
     );
     // The box is disabled while it saves and then shows the stored value.
     await expect(allow).toBeChecked();
@@ -584,7 +584,9 @@ test('the Christmas playlist is filled through every injected failure by followi
       const aliceApp = adminPage.getByRole('listitem').filter({ hasText: `(${alice.username})` });
       await expect(aliceApp).toContainText('127.0.0.1');
       await expect(aliceApp.getByRole('button', { name: 'Disconnect' })).toBeVisible();
-      await expect(adminPage.getByRole('checkbox', { name: 'Allow deleting music' })).toHaveCount(0);
+      await expect(
+        adminPage.getByRole('checkbox', { name: 'Allow managing library files (delete, move, re-tag)' }),
+      ).toHaveCount(0);
     } finally {
       await adminContext.close();
     }
