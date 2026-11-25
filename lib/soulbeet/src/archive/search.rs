@@ -324,9 +324,9 @@ mod tests {
             // Best named first: "Stratosphere" twice, "Duster - Stratosphere" twice, then
             // "Duster - Stratosphere (1998)".
             ok(&files_of("files_1998-duster-stratosphere.json")),
-            ok(&files_of("missing.json")),
+            ok(&files_of("missing_files.json")),
             ok(&files_of("files_duster-stratosphere_202403.json")),
-            ok(&files_of("missing.json")),
+            ok(&files_of("missing_files.json")),
             ok(&files_of("files_a0165062421_10.json")),
         ]);
         let api = Api::unpaced(&base);

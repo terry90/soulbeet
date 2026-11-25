@@ -249,6 +249,17 @@ pub(crate) mod ended {
         )
     }
 
+    /// A restart found the transfer landed, and its file no longer in the batch folder: the
+    /// import took it, or someone removed it. It is not fetched again.
+    pub(crate) fn landed_gone() -> Failure {
+        Failure::new(
+            FailureCode::FileNotFoundAfterDownload,
+            Stage::FileLookup,
+            RetryAdvice::NotRetryable,
+            "The file landed before Soulbeet restarted and is no longer in its folder",
+        )
+    }
+
     /// Writing or landing the file under `download_path` failed with `e`.
     pub(crate) fn storage(e: &io::Error, download_path: &Path) -> Failure {
         if is_disk_full(e) {

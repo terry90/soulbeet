@@ -7,7 +7,8 @@ use crate::polite::{Pace, PoliteClient, RemoteError};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Deserializer};
 use shared::download::SourcePresence;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// What failure texts and causes call archive.org.
 pub(crate) const SERVICE: &str = "archive.org";
@@ -166,7 +167,8 @@ pub(crate) struct ItemFile {
     pub track: Text,
 }
 
-/// `/metadata/<id>/files`: `{}` for an item archive.org does not have.
+/// `/metadata/<id>/files`: `{"error": "Couldn't locate item '<id>'"}` for an item archive.org
+/// does not have.
 #[derive(Deserialize)]
 struct FilesAnswer {
     #[serde(default)]
@@ -192,11 +194,51 @@ struct ItemRecord {
 /// How long a health check waits for archive.org, inside the 30 s the status line gives it.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What archive.org last answered the backend, and when. Every search, file list, presence,
+/// download and health request tells it, so a health check asks archive.org only when nothing
+/// else did for a while.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Heard(Arc<Mutex<Option<(Instant, Answer)>>>);
+
+/// How archive.org answered: Ok when it was up.
+type Answer = Result<(), RemoteError>;
+
+impl Heard {
+    /// Notes how a request went. An answer says archive.org is up, and so does a refusal of the
+    /// request as written; an outage, a timeout, a rate limit or a browser check says it is not.
+    /// An unreadable answer says neither.
+    pub(crate) fn note<T>(&self, result: &Result<T, RemoteError>) {
+        let heard = match result {
+            Err(
+                e @ (RemoteError::Unavailable { .. }
+                | RemoteError::RateLimited { .. }
+                | RemoteError::Challenged { .. }
+                | RemoteError::Status { status: 408, .. }),
+            ) => Err(e.clone()),
+            Err(RemoteError::Unreadable { .. }) => return,
+            Ok(_) | Err(RemoteError::Status { .. }) => Ok(()),
+        };
+        self.set(heard);
+    }
+
+    fn set(&self, heard: Answer) {
+        *self.0.lock().unwrap() = Some((Instant::now(), heard));
+    }
+
+    /// What archive.org said less than `age` ago; None when it said nothing as recent.
+    pub(crate) fn within(&self, age: Duration) -> Option<Answer> {
+        (self.0.lock().unwrap().as_ref())
+            .filter(|(at, _)| at.elapsed() < age)
+            .map(|(_, heard)| heard.clone())
+    }
+}
+
 /// archive.org as the backend asks it.
 #[derive(Debug, Clone)]
 pub(crate) struct Api {
     base: String,
     pace: Pace,
+    heard: Heard,
 }
 
 impl Api {
@@ -204,7 +246,13 @@ impl Api {
         Api {
             base: base.trim_end_matches('/').to_string(),
             pace: Pace::ARCHIVE,
+            heard: Heard::default(),
         }
+    }
+
+    /// What archive.org last answered any of the backend's requests.
+    pub(crate) fn heard(&self) -> &Heard {
+        &self.heard
     }
 
     /// An `Api` that does not wait between requests, for the tests.
@@ -223,7 +271,10 @@ impl Api {
     }
 
     pub(crate) fn searcher(&self) -> Result<Searcher, RemoteError> {
-        Ok(Searcher(self.client(self.pace)?))
+        Ok(Searcher {
+            client: self.client(self.pace)?,
+            heard: self.heard.clone(),
+        })
     }
 
     /// Whether the item `identifier` can be fetched now.
@@ -233,7 +284,9 @@ impl Api {
             ..self.pace
         })?;
         let path = format!("/metadata/{}/metadata", path_of(identifier));
-        let answer: Option<MetadataAnswer> = client.get(&path).await?;
+        let answer = client.get::<MetadataAnswer>(&path).await;
+        self.heard.note(&answer);
+        let answer = answer?;
         Ok(match answer.and_then(|a| a.result) {
             None => SourcePresence::Offline,
             Some(record) if record.is_dark.get() == Some("true") => SourcePresence::Offline,
@@ -248,7 +301,14 @@ impl Api {
     }
 
     /// Ok when archive.org's search answers and finds any audio item: one request, no retry.
-    pub(crate) async fn health(&self) -> Result<(), ArchiveError> {
+    /// What it found is what archive.org was last heard to say.
+    pub(crate) async fn health(&self) -> Result<(), RemoteError> {
+        let answer = self.probe().await;
+        self.heard.set(answer.clone());
+        answer
+    }
+
+    async fn probe(&self) -> Result<(), RemoteError> {
         let client = self.client(Pace {
             retries: 0,
             timeout: HEALTH_TIMEOUT,
@@ -262,27 +322,33 @@ impl Api {
             _ => Err(RemoteError::Unreadable {
                 service: SERVICE,
                 detail: "the search for any audio item found none".into(),
-            }
-            .into()),
+            }),
         }
     }
 }
 
 /// The client of one search.
-pub(crate) struct Searcher(PoliteClient);
+pub(crate) struct Searcher {
+    client: PoliteClient,
+    heard: Heard,
+}
 
 impl Searcher {
     /// The items `q` finds, at most `query::ROWS`.
     pub(crate) async fn items(&self, q: &str) -> Result<Vec<Doc>, RemoteError> {
-        let answer: Option<SearchAnswer> = self.0.get(&query::search_path(q, query::ROWS)).await?;
-        Ok(answer.map(|a| a.response.docs).unwrap_or_default())
+        let answer = (self.client)
+            .get::<SearchAnswer>(&query::search_path(q, query::ROWS))
+            .await;
+        self.heard.note(&answer);
+        Ok(answer?.map(|a| a.response.docs).unwrap_or_default())
     }
 
     /// The files of the item `identifier`; none for an item archive.org does not have.
     pub(crate) async fn files(&self, identifier: &str) -> Result<Vec<ItemFile>, RemoteError> {
         let path = format!("/metadata/{}/files", path_of(identifier));
-        let answer: Option<FilesAnswer> = self.0.get(&path).await?;
-        Ok(answer.map(|a| a.result).unwrap_or_default())
+        let answer = self.client.get::<FilesAnswer>(&path).await;
+        self.heard.note(&answer);
+        Ok(answer?.map(|a| a.result).unwrap_or_default())
     }
 }
 
@@ -377,6 +443,39 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn what_archive_org_answers_any_request_is_heard() {
+        let refused = |status| Reply {
+            status,
+            body: String::new(),
+        };
+        let mut replies = vec![
+            ok(r#"{"response":{"numFound":0,"start":0,"docs":[]}}"#),
+            ok(include_str!("fixtures/missing_files.json")),
+            refused(400),
+        ];
+        replies.extend((0..4).map(|_| refused(429)));
+        let (base, _) = serve(replies);
+        let api = Api::unpaced(&base);
+        let heard = || api.heard().within(Duration::from_secs(60));
+        assert_eq!(heard(), None);
+        let searcher = api.searcher().unwrap();
+
+        searcher.items("x").await.unwrap();
+        assert_eq!(heard(), Some(Ok(())));
+        // A missing item has no files.
+        assert!(searcher.files("gone").await.unwrap().is_empty());
+        // A refusal of the request as written is an answer too.
+        assert!(searcher.items("x").await.is_err());
+        assert_eq!(heard(), Some(Ok(())));
+        assert!(searcher.items("x").await.is_err());
+        assert_eq!(
+            heard(),
+            Some(Err(RemoteError::RateLimited { service: SERVICE }))
+        );
+        assert_eq!(api.heard().within(Duration::ZERO), None);
+    }
+
+    #[tokio::test]
     async fn the_health_check_asks_once_for_any_audio_item() {
         let (base, seen) = serve(vec![
             ok(
@@ -390,13 +489,18 @@ pub(crate) mod tests {
         ]);
         let api = Api::unpaced(&base);
         api.health().await.unwrap();
+        assert_eq!(api.heard().within(Duration::from_secs(60)), Some(Ok(())));
         assert!(matches!(
             api.health().await,
-            Err(ArchiveError::Remote(RemoteError::Unreadable { .. }))
+            Err(RemoteError::Unreadable { .. })
+        ));
+        assert!(matches!(
+            api.heard().within(Duration::from_secs(60)),
+            Some(Err(RemoteError::Unreadable { .. }))
         ));
         assert!(matches!(
             api.health().await,
-            Err(ArchiveError::Remote(RemoteError::Unavailable { .. }))
+            Err(RemoteError::Unavailable { .. })
         ));
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 3, "a failed check is not retried");

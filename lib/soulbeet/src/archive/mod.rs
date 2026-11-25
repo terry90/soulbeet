@@ -35,14 +35,19 @@ use transfers::Transfers;
 /// How long a health check or a presence is answered from what archive.org last said.
 const CACHED: Duration = Duration::from_secs(60);
 
+/// What archive.org last said of an item, and when. A caller holds it while it asks, so the
+/// callers at once share one request.
+type Presence = Arc<tokio::sync::Mutex<Option<(Instant, SourcePresence)>>>;
+
 /// What the backend runs in this process: its transfers, its searches, and what it last heard
 /// from archive.org.
 pub struct Engine {
     api: Api,
     transfers: Arc<Transfers>,
     searches: Searches,
-    presence: Mutex<HashMap<String, (Instant, SourcePresence)>>,
-    health: tokio::sync::Mutex<Option<(Instant, Result<(), Failure>)>>,
+    presence: Mutex<HashMap<String, Presence>>,
+    /// Held while a health check asks archive.org, so the checks at once share one request.
+    probe: tokio::sync::Mutex<()>,
 }
 
 impl Engine {
@@ -52,13 +57,13 @@ impl Engine {
         limits: Limits,
     ) -> Result<Arc<Engine>, ArchiveError> {
         let api = Api::new(&settings.base_url);
-        let transfers = Transfers::start(settings, limits).await?;
+        let transfers = Transfers::start(settings, limits, api.heard().clone()).await?;
         Ok(Arc::new(Engine {
             api,
             transfers,
             searches: Searches::default(),
             presence: Mutex::new(HashMap::new()),
-            health: tokio::sync::Mutex::new(None),
+            probe: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -227,17 +232,25 @@ impl crate::DownloadBackend for ArchiveBackend {
     }
 
     async fn source_status(&self, source: &str) -> BackendResult<SourcePresence> {
-        let cached = {
+        let slot = {
             let mut presence = self.engine.presence.lock().unwrap();
-            presence.retain(|_, (at, _)| at.elapsed() < CACHED);
-            presence.get(source).map(|(_, p)| *p)
+            // Kept while a caller holds it or its answer is recent.
+            presence.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || slot
+                        .try_lock()
+                        .is_ok_and(|p| p.is_some_and(|(at, _)| at.elapsed() < CACHED))
+            });
+            presence.entry(source.to_string()).or_default().clone()
         };
-        if let Some(presence) = cached {
-            return Ok(presence);
+        let mut known = slot.lock().await;
+        if let Some((at, presence)) = *known {
+            if at.elapsed() < CACHED {
+                return Ok(presence);
+            }
         }
         let presence = self.engine.api.presence(source).await?;
-        (self.engine.presence.lock().unwrap())
-            .insert(source.to_string(), (Instant::now(), presence));
+        *known = Some((Instant::now(), presence));
         Ok(presence)
     }
 
@@ -246,21 +259,24 @@ impl crate::DownloadBackend for ArchiveBackend {
         Ok(())
     }
 
+    /// What archive.org answered the backend's last request, when that was less than a minute
+    /// ago; else one request of its own.
     async fn health_check(&self) -> Result<(), Failure> {
-        // Callers at once share one check.
-        let mut last = self.engine.health.lock().await;
-        if let Some((at, answer)) = &*last {
-            if at.elapsed() < CACHED {
-                return answer.clone();
+        let _probe = self.engine.probe.lock().await;
+        let heard = match self.engine.api.heard().within(CACHED) {
+            Some(heard) => heard,
+            None => {
+                let heard = self.engine.api.health().await;
+                if let Err(e) = &heard {
+                    warn!("Internet Archive health check failed: {e}");
+                }
+                heard
             }
-        }
-        let answer = self.engine.api.health().await.map_err(|e| {
-            let failure = e.failure(Stage::SourceSearch, e.to_string());
-            warn!("Internet Archive health check failed: {}", failure.message);
-            failure
-        });
-        *last = Some((Instant::now(), answer.clone()));
-        answer
+        };
+        heard.map_err(|e| {
+            let e = ArchiveError::from(e);
+            e.failure(Stage::SourceSearch, e.to_string())
+        })
     }
 }
 
@@ -312,6 +328,53 @@ mod tests {
         backend.health_check().await.unwrap();
         // A handle rebuilt meanwhile asks no more.
         ArchiveBackend::new(engine).health_check().await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_health_check_answers_from_the_backends_last_request_to_archive_org() {
+        let (base, seen) = serve(vec![ok(
+            r#"{"response":{"numFound":0,"start":0,"docs":[]}}"#,
+        )]);
+        let rig = Rig::new();
+        let engine = Engine::start(rig.settings(&base), Limits::ARCHIVE)
+            .await
+            .unwrap();
+        let backend = ArchiveBackend::new(engine.clone());
+        engine.api.searcher().unwrap().items("x").await.unwrap();
+        backend.health_check().await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "no request of its own");
+
+        engine
+            .api
+            .heard()
+            .note::<()>(&Err(crate::polite::RemoteError::RateLimited {
+                service: "archive.org",
+            }));
+        let failure = backend.health_check().await.unwrap_err();
+        assert_eq!(
+            failure.code,
+            shared::failure::FailureCode::SearchRateLimited
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn callers_at_once_share_one_presence_request() {
+        let (base, seen) = serve(vec![ok(
+            r#"{"result": {"identifier": "dmp003", "collection": ["netlabels"]}}"#,
+        )]);
+        let rig = Rig::new();
+        let engine = Engine::start(rig.settings(&base), Limits::ARCHIVE)
+            .await
+            .unwrap();
+        let (a, b) = (
+            ArchiveBackend::new(engine.clone()),
+            ArchiveBackend::new(engine),
+        );
+        let (first, second) = tokio::join!(a.source_status("dmp003"), b.source_status("dmp003"));
+        assert_eq!(first.unwrap(), SourcePresence::Online);
+        assert_eq!(second.unwrap(), SourcePresence::Online);
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
