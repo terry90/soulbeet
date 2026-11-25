@@ -19,6 +19,7 @@ use crate::core::library::{navidrome_failure, SongFacts};
 use crate::core::time;
 
 pub mod fill;
+pub mod smart;
 
 /// Most song ids one playlist write takes.
 pub(crate) const SONG_IDS_MAX: usize = 1000;
@@ -88,6 +89,12 @@ pub struct PlaylistFacts {
     pub duration_s: u32,
     pub created: Option<String>,
     pub changed: Option<String>,
+    /// True for a smart playlist; omitted for static playlists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart: Option<bool>,
+    /// Smart playlist criteria rules; omitted for static playlists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<serde_json::Value>,
 }
 
 /// A playlist entry: its 0-based place among all of the playlist's tracks,
@@ -118,6 +125,8 @@ pub(crate) fn facts(p: &SubsonicPlaylist, username: &str) -> PlaylistFacts {
         duration_s: p.duration,
         created: time::navidrome(&p.created),
         changed: time::navidrome(&p.changed),
+        smart: None,
+        rules: None,
     }
 }
 
@@ -437,11 +446,21 @@ pub(crate) struct NewPlaylist {
     pub allow_duplicate_name: bool,
 }
 
+/// A smart playlist to create: `name` is trimmed before use.
+pub(crate) struct NewSmartPlaylist {
+    pub name: String,
+    pub comment: Option<String>,
+    pub public: Option<bool>,
+    pub rules: serde_json::Value,
+    pub allow_duplicate_name: bool,
+}
+
 /// The parts of a playlist to change, each only when Some; an empty comment clears it.
 pub(crate) struct MetaChange {
     pub name: Option<String>,
     pub comment: Option<String>,
     pub public: Option<bool>,
+    pub rules: Option<serde_json::Value>,
     pub allow_duplicate_name: bool,
 }
 
@@ -668,6 +687,39 @@ async fn create_held(
     Ok(w)
 }
 
+/// Creates a smart playlist owned by the caller, under `names_key`: the name check,
+/// `POST /api/playlist` with the validated `.nsp` rules, then one read back via `get_playlist`
+/// and `playlist_tracks`. Once the playlist exists, a read-back failure is `Unfinished`.
+pub(crate) async fn create_smart(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    new: &NewSmartPlaylist,
+) -> Result<Written, PlaylistRefusal> {
+    let _names = lock(&names_key(ctx)).await;
+    let name = new.name.trim();
+    name_free(navi, ctx, name, None, new.allow_duplicate_name).await?;
+    let id = navi
+        .create_custom_smart_playlist(
+            name,
+            new.comment.as_deref(),
+            new.public.unwrap_or(false),
+            &new.rules,
+        )
+        .await
+        .map_err(|e| PlaylistRefusal::WriteFailed(navidrome_failure(Stage::Playlist, &e)))?;
+    let unfinished = |failure: Failure| PlaylistRefusal::Unfinished {
+        playlist_id: id.clone(),
+        failure,
+        described: true,
+    };
+    let (playlist, tracks) = read(navi, ctx, &id).await.map_err(unfinished)?;
+    let mut w = written(&playlist, &tracks, ctx);
+    w.playlist.smart = Some(true);
+    w.playlist.rules = Some(new.rules.clone());
+    shows(&w, &playlist, Some(name), new.comment.as_deref(), new.public)?;
+    Ok(w)
+}
+
 /// NotWritten for the first of the asked `name`, `comment` and `public` that `p`, the read
 /// back of `w`, does not show. Navidrome leaves an empty comment out, read as "".
 fn shows(
@@ -693,9 +745,10 @@ fn shows(
     })
 }
 
-/// Changes the name, comment or public flag of the caller's playlist `id`, under `names_key`
-/// when renaming and `playlist_key`: the owner check, the name check, updatePlaylist, then the
-/// read back, each changed part compared.
+/// Changes the name, comment, public flag or smart playlist rules of the caller's playlist `id`,
+/// under `names_key` when renaming and `playlist_key`: the owner check, the name check,
+/// `PUT /api/playlist/{id}` when `rules` is given or `updatePlaylist` otherwise, then the read
+/// back, each changed metadata part compared.
 pub(crate) async fn update(
     navi: &NavidromeClient,
     ctx: &UserCtx,
@@ -711,6 +764,25 @@ pub(crate) async fn update(
     owned(navi, ctx, id).await?;
     if let Some(name) = name {
         name_free(navi, ctx, name, Some(id), change.allow_duplicate_name).await?;
+    }
+    if let Some(rules) = change.rules.as_ref() {
+        navi.update_custom_smart_playlist(
+            id,
+            name,
+            change.comment.as_deref(),
+            change.public,
+            Some(rules),
+        )
+        .await
+        .map_err(|e| PlaylistRefusal::WriteFailed(navidrome_failure(Stage::Playlist, &e)))?;
+        let (playlist, tracks) = read(navi, ctx, id)
+            .await
+            .map_err(PlaylistRefusal::WriteFailed)?;
+        let mut w = written(&playlist, &tracks, ctx);
+        w.playlist.smart = Some(true);
+        w.playlist.rules = Some(rules.clone());
+        shows(&w, &playlist, name, change.comment.as_deref(), change.public)?;
+        return Ok(w);
     }
     let meta = PlaylistMeta {
         name,
@@ -1376,6 +1448,7 @@ mod tests {
             name: Some("Mine now".into()),
             comment: None,
             public: None,
+            rules: None,
             allow_duplicate_name: false,
         };
         let ctx = test_ctx("alice");
@@ -1436,6 +1509,7 @@ mod tests {
             name: name.map(str::to_string),
             comment: comment.map(str::to_string),
             public,
+            rules: None,
             allow_duplicate_name: false,
         };
         for (change, message) in [
@@ -1824,6 +1898,7 @@ mod tests {
             name: Some("Fresh Picks 2".into()),
             comment: None,
             public: None,
+            rules: None,
             allow_duplicate_name: true,
         };
         assert_eq!(
@@ -2208,5 +2283,122 @@ mod tests {
         );
         drop(first);
         second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_smart_posts_rules_checks_duplicates_and_reads_back() {
+        let navi = NavidromeStub::start();
+        let rules = json!({
+            "all": [{"is": {"loved": true}}],
+            "sort": "dateAdded",
+            "order": "desc",
+            "limit": 25
+        });
+        navi.answer(
+            "/rest/getPlaylists",
+            &[
+                &playlists_body(&[("p-old", "Loved", "alice", false)]),
+                &playlists_body(&[]),
+            ],
+        );
+        navi.answer("/api/playlist", &[&json!({"id": ADVENT}).to_string()]);
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(
+                ADVENT,
+                "Loved",
+                "alice",
+                true,
+                "Favorites",
+                &[HOLY],
+            )],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[(1, HOLY.0, HOLY.1, false)])],
+        );
+
+        let ctx = test_ctx("alice");
+        let new = NewSmartPlaylist {
+            name: " Loved ".into(),
+            comment: Some("Favorites".into()),
+            public: Some(true),
+            rules: rules.clone(),
+            allow_duplicate_name: false,
+        };
+        let refused = create_smart(&navi.client(), &ctx, &new).await.unwrap_err();
+        assert_eq!(
+            refused,
+            PlaylistRefusal::NameTaken {
+                name: "Loved".into(),
+                existing: vec!["p-old".into()],
+            }
+        );
+        assert!(!asked(&navi).contains(&"/api/playlist".to_string()));
+
+        let w = create_smart(&navi.client(), &ctx, &new).await.unwrap();
+        assert_eq!(w.playlist.playlist_id, ADVENT);
+        assert_eq!(w.playlist.smart, Some(true));
+        assert_eq!(w.playlist.rules, Some(rules));
+        assert_eq!(w.playlist.comment.as_deref(), Some("Favorites"));
+        assert!(w.playlist.public);
+        assert_eq!(w.song_ids, ids(&[HOLY.0]));
+        assert_eq!(
+            asked(&navi),
+            vec![
+                "/rest/getPlaylists".to_string(),
+                "/rest/getPlaylists".into(),
+                "/api/playlist".into(),
+                "/rest/getPlaylist".into(),
+                tracks_of(ADVENT),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_with_rules_puts_native_playlist_and_reads_back() {
+        let navi = NavidromeStub::start();
+        let new_rules = json!({"any": [{"gt": {"rating": 3}}]});
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer(
+            "/rest/getPlaylist",
+            &[
+                &playlist_body(ADVENT, "Top", "alice", false, "", &[HOLY]),
+                &playlist_body(ADVENT, "Top Rated", "alice", true, "4+ stars", &[HOLY, SILENT]),
+            ],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false)]),
+                &playlist_rows(&[
+                    (1, HOLY.0, HOLY.1, false),
+                    (2, SILENT.0, SILENT.1, false),
+                ]),
+            ],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&json!({"id": ADVENT}).to_string()],
+        );
+
+        let change = MetaChange {
+            name: Some("Top Rated".into()),
+            comment: Some("4+ stars".into()),
+            public: Some(true),
+            rules: Some(new_rules.clone()),
+            allow_duplicate_name: false,
+        };
+        let w = update(&navi.client(), &test_ctx("alice"), ADVENT, &change)
+            .await
+            .unwrap();
+        assert_eq!(w.playlist.name, "Top Rated");
+        assert_eq!(w.playlist.comment.as_deref(), Some("4+ stars"));
+        assert!(w.playlist.public);
+        assert_eq!(w.playlist.smart, Some(true));
+        assert_eq!(w.playlist.rules, Some(new_rules));
+        assert_eq!(w.song_ids, ids(&[HOLY.0, SILENT.0]));
+        assert!(!asked(&navi).contains(&"/rest/updatePlaylist".to_string()));
+        assert!(asked(&navi).contains(&format!("/api/playlist/{ADVENT}")));
     }
 }

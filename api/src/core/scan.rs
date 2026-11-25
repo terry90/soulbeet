@@ -130,9 +130,9 @@ impl ScanBy {
     }
 }
 
-/// Starts a Navidrome scan for `user`, whose own client is `own`: with their own account when it
-/// may, else with the other linked accounts other_scanners gives, in its order, until Navidrome
-/// takes one. An account Navidrome refuses is noted as one that may not.
+/// Starts a quick Navidrome scan for `user`, whose own client is `own`: with their own account
+/// when it may, else with the other linked accounts other_scanners gives, in its order, until
+/// Navidrome takes one. An account Navidrome refuses is noted as one that may not.
 pub(crate) async fn start_scan_for(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -140,14 +140,29 @@ pub(crate) async fn start_scan_for(
     user: &UserId,
     own: &Arc<NavidromeClient>,
 ) -> Result<ScanStart, NavidromeLookupError> {
+    start_scan_with_options_for(db, navidrome, roles, user, own, false).await
+}
+
+/// Starts a Navidrome scan for `user`, passing `fullScan=true` when `full_scan` is set: with
+/// their own account when it may, else with the other linked accounts other_scanners gives, in
+/// its order, until Navidrome takes one. An account Navidrome refuses is noted as one that may
+/// not.
+pub(crate) async fn start_scan_with_options_for(
+    db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
+    roles: &ScanRoles,
+    user: &UserId,
+    own: &Arc<NavidromeClient>,
+    full_scan: bool,
+) -> Result<ScanStart, NavidromeLookupError> {
     let own_may = may_scan(roles, user, own)
         .await
         .map_err(NavidromeLookupError::Client)?;
-    if own_may && scan_with(roles, user, own, user).await? {
+    if own_may && scan_with_options(roles, user, own, user, full_scan).await? {
         return Ok(ScanStart::Started);
     }
     for (other, client, _) in other_scanners(db, navidrome, roles, user).await? {
-        if scan_with(roles, &other, &client, user).await? {
+        if scan_with_options(roles, &other, &client, user, full_scan).await? {
             debug!("Started a Navidrome scan for {user} with the account of {other}");
             return Ok(ScanStart::Started);
         }
@@ -206,15 +221,16 @@ async fn other_scanners(
     Ok(others)
 }
 
-/// Asks the account of `by`, signed in as `client`, to start a scan for `user`, and notes what
-/// Navidrome's answer says of it. Ok(false) when Navidrome refuses it.
-async fn scan_with(
+/// Asks the account of `by`, signed in as `client`, to start a scan (full when `full_scan`) for
+/// `user`, and notes what Navidrome's answer says of it. Ok(false) when Navidrome refuses it.
+async fn scan_with_options(
     roles: &ScanRoles,
     by: &UserId,
     client: &Arc<NavidromeClient>,
     user: &UserId,
+    full_scan: bool,
 ) -> Result<bool, NavidromeLookupError> {
-    match client.start_scan().await {
+    match client.start_scan_options(full_scan).await {
         Ok(()) => {
             roles.learn(by, client, true, Instant::now());
             Ok(true)
@@ -496,5 +512,29 @@ mod tests {
         // Another client of the same user: other credentials, nothing known of them.
         assert_eq!(roles.known(&alice, &navi.client(), at), None);
         assert_eq!(roles.known(&UserId::new("bob"), &client, at), None);
+    }
+
+    #[tokio::test]
+    async fn start_scan_with_options_forwards_full_scan_flag() {
+        let db = crate::db::test_db::migrated().await;
+        let alice = linked(&db, "alice").await;
+        let own = account(true);
+        let navidrome = NavidromeEach::of(&[(&alice, &own)]);
+        let roles = ScanRoles::default();
+        let client = navidrome.client(&alice);
+
+        assert_eq!(
+            start_scan_with_options_for(&db, &navidrome, &roles, &alice, &client, false)
+                .await
+                .unwrap(),
+            ScanStart::Started
+        );
+        assert_eq!(
+            start_scan_with_options_for(&db, &navidrome, &roles, &alice, &client, true)
+                .await
+                .unwrap(),
+            ScanStart::Started
+        );
+        assert_eq!(own.posted("/rest/startScan"), vec!["", "fullScan=true"]);
     }
 }

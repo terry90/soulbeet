@@ -13,12 +13,13 @@ Each person connects their own Soulbeet account, and the client then acts as tha
 Through Soulbeet, an MCP client can:
 
 - read Soulbeet's status: whether slskd, beets and Navidrome work, your folders and their free space;
-- read your Navidrome library: search it, find tracks by MusicBrainz id or artist and title, list albums, starred items and playlists;
+- read and browse your Navidrome library: search it, filter/sort songs or albums by folder, genre, rating, format, bitrate, year or missing state, find tracks by MusicBrainz id or artist and title, list artists' albums, starred items and playlists, and trigger quick or full Navidrome scans;
+- summarize your listening history, preview recommendations read-only without downloading, audit library health (untracked files, missing tracks, split albums, missing MBIDs, art or lyrics), and fetch missing cover art and synced `.lrc` lyrics;
 - look up recordings and releases on MusicBrainz;
 - search Soulseek for sources and download a chosen one;
 - get a list of tracks or albums into your library in one batch, and follow it;
 - decide imports that beets skipped;
-- create, rename and edit your playlists, rate and star songs and albums;
+- create, rename and edit your static and smart playlists, rate and star songs and albums;
 - run discovery, keep or remove discovery tracks, and run your rating sync;
 - change some of your settings;
 - find duplicates, inspect library tracks, move tracks/albums between folders, re-tag or re-match via beets, and delete music; moving, re-tagging and deleting only work once you switch file management on for that app (see [Deleting music](#deleting-music)).
@@ -328,8 +329,8 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Playlists
 
-- `create_playlist`: creates a static playlist with the given songs in order.
-- `update_playlist`: renames a playlist or changes its comment or public flag.
+- `create_playlist`: creates a static playlist with the given `song_ids` in order, or a Navidrome smart playlist with `.nsp` JSON `rules` (`all`/`any`, operators, optional `sort`/`order`/`limit`/`offset`; mutually exclusive with non-empty `song_ids`).
+- `update_playlist`: renames a playlist, changes its comment or public flag, or updates a smart playlist's `rules`.
 - `delete_playlist`: deletes one of the user's playlists; the songs stay.
 - `set_playlist_tracks`: replaces every entry of a playlist, which also reorders it.
 - `add_playlist_tracks`: adds songs at the end or before a position.
@@ -362,6 +363,16 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 - `move_tracks`: moves up to 25 songs (`song_ids`) or one whole album (`album_id`, up to 100 tracks) to another of the user's folders (`target_folder_id`) while preserving file bytes, filename, beets libraries, Navidrome song id, ratings, stars, play counts and static playlists. Supports `dry_run: true` and `replace_existing: true` (through the delete guard).
 - `get_move_history`: lists the user's track moves between folders, newest first, with source and target folders/paths, status (`moved`, `moved_pending_scan`, `moved_id_changed`) and warnings.
 - `retag_tracks`: edits tags directly (`tags`) or re-matches against MusicBrainz via beets (`rematch`) for up to 25 songs or one album; keeps files in place by default so Navidrome keeps the same song id, or runs a two-scan dance with `relocate: true` when an admin can scan. Supports `dry_run: true`.
+
+### Library browsing, insights and maintenance
+
+- `scan_library`: triggers a quick or full (`full_scan: true`) Navidrome library scan (automatically using another linked admin account if the caller is not an admin), optionally waiting up to `wait_seconds` (max 30) for completion.
+- `browse_library`: paginated, filterable listing of songs or albums (`kind`: `songs` or `albums`) with filters for `folder_id`, `genre`, `min_rating`/`max_rating`/`unrated`, `starred`, `year_from`/`year_to`, `format`, `max_bitrate_kbps`, `missing`, and sorting (`recently_added`, `recently_played`, `most_played`, `highest_rated`, `title`, `artist`, `year`, `random`).
+- `get_library_artist`: shows one artist in the user's Navidrome library with a paginated list of their albums.
+- `get_listening_history`: read-only summary of recent plays, top tracks, top artists, top genres, and (when configured and `include_listenbrainz` is true) ListenBrainz recent listens and top artists.
+- `get_recommendations`: read-only preview of Soulbeet's recommendation engine (`Conservative`, `Balanced`, or `Adventurous`) returning ranked candidate tracks, signals and seed artists without downloading or modifying discovery state.
+- `audit_library`: read-only health audit of the user's library folders against Navidrome, reporting untracked audio files on disk, missing Navidrome files, albums split across folders/libraries, missing recording MBIDs, missing cover art, and missing lyrics.
+- `fetch_artwork_and_lyrics`: fetches missing album cover art (Cover Art Archive / MusicBrainz) and/or synced/plain `.lrc` lyrics (LRCLIB) for up to 25 songs or one album, writing files atomically inside the caller's owned folders and triggering a Navidrome scan. Supports `dry_run: true`; `overwrite: true` requires the file-management switch.
 
 ## Limits
 

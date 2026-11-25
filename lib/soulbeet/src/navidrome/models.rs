@@ -210,6 +210,26 @@ pub struct AlbumBody {
     pub album: Option<SubsonicAlbum>,
 }
 
+/// getArtist's body. Option so that an ok answer without its artist is reported as such.
+#[derive(Debug, Deserialize)]
+pub struct ArtistBody {
+    pub artist: Option<SubsonicArtistWithAlbums>,
+}
+
+/// getAlbumList2's body for browse_library, carrying `created`, `played` and `genres` alongside
+/// `SubsonicAlbum`.
+#[derive(Debug, Deserialize)]
+pub struct BrowseAlbumList2Body {
+    #[serde(rename = "albumList2")]
+    pub album_list: Option<BrowseAlbumList2>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowseAlbumList2 {
+    #[serde(default)]
+    pub album: Vec<SubsonicBrowseAlbum>,
+}
+
 // Core data types
 
 #[derive(Debug, Clone, Deserialize)]
@@ -297,6 +317,65 @@ pub struct SubsonicArtist {
     /// OpenSubsonic, sent empty when unknown.
     #[serde(default, rename = "musicBrainzId")]
     pub music_brainz_id: Option<String>,
+}
+
+/// responses.ArtistWithAlbumsID3 (server/subsonic/responses/responses.go:282-285), as getArtist
+/// sends it: ArtistID3 flattened with its `album` list (omitted when empty).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicArtistWithAlbums {
+    #[serde(flatten)]
+    pub artist: SubsonicArtist,
+    #[serde(default)]
+    pub album: Vec<SubsonicAlbum>,
+}
+
+/// A genre entry on a native MediaFile (`model.Genre`, model/genre.go:3-8) or an OpenSubsonic
+/// `ItemGenre` (responses.go).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct NamedGenre {
+    #[serde(default)]
+    pub name: String,
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A song from Navidrome's native API (`GET /api/song`) with the extra fields `browse_library`
+/// filters and sorts on: `genre`, `genres` (`omitempty`) and `createdAt` (model/mediafile.go:59-60,
+/// :93). Flattens `NativeSong` so existing `NativeSong` callers and literals stay unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeBrowseSong {
+    #[serde(flatten)]
+    pub song: NativeSong,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub genre: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub genres: Vec<NamedGenre>,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An album from `getAlbumList2` (`responses.AlbumID3`, responses.go:245-280) with the extra
+/// fields `browse_library` sorts and filters on (`created`, `played`, `genres`), flattening
+/// `SubsonicAlbum` so existing `SubsonicAlbum` callers and literals stay unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicBrowseAlbum {
+    #[serde(flatten)]
+    pub album: SubsonicAlbum,
+    #[serde(default)]
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub played: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub genres: Vec<NamedGenre>,
 }
 
 /// responses.Playlist (responses.go:305-327), as buildPlaylist fills it
@@ -581,5 +660,26 @@ mod tests {
         assert!(!status(true, "2026-11-15T10:00:05Z").ended_after(before));
         assert!(status(false, "2026-11-15T10:00:05Z").ended_after(before));
         assert!(status(false, "2026-11-15T10:00:05Z").ended_after(at("0001-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn artist_with_albums_and_browse_song_deserialize_null_or_missing_optional_fields() {
+        let artist: SubsonicArtistWithAlbums = serde_json::from_str(
+            r#"{"id":"ar1","name":"Marrow Choir","albumCount":1,"album":[{"id":"al1","name":"Winter Songs"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(artist.artist.id, "ar1");
+        assert_eq!(artist.artist.name, "Marrow Choir");
+        assert_eq!(artist.album.len(), 1);
+        assert_eq!(artist.album[0].id, "al1");
+
+        let song: NativeBrowseSong = serde_json::from_str(
+            r#"{"id":"s1","path":"a.flac","title":"T","size":1,"libraryId":1,"libraryPath":"/music","missing":false,"updatedAt":"2026-11-01T18:20:03Z","artist":"A","album":"Al","albumArtist":"A","genre":null,"genres":null,"createdAt":null}"#,
+        )
+        .unwrap();
+        assert_eq!(song.song.id, "s1");
+        assert_eq!(song.genre, "");
+        assert!(song.genres.is_empty());
+        assert_eq!(song.created_at, None);
     }
 }

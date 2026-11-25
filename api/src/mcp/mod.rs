@@ -20,12 +20,15 @@ use crate::oauth::{now_unix, oauth_error, SCOPE};
 
 mod args;
 mod batches;
+mod browse;
 pub(crate) mod contract;
 mod deletion;
 mod discovery;
 mod ensure;
+mod extras;
 mod facts;
 mod imports;
+mod insights;
 mod jobs;
 mod keys;
 pub(crate) mod library;

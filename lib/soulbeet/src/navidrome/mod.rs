@@ -1,6 +1,8 @@
+pub mod browse;
 pub mod client;
 pub mod error;
 pub mod models;
+pub mod smart_playlist;
 
 pub use client::{
     filepath_rules, NavidromeClient, NavidromeClientBuilder, PlaylistMeta, SmartPlaylistChange,

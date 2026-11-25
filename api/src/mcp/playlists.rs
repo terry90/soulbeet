@@ -21,13 +21,14 @@ use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::library::FolderResolver;
 use crate::core::playlists::{
-    self, MetaChange, NewPlaylist, NotEditable, PlaylistRefusal, Written, POSITION_MAX,
-    SONG_IDS_MAX,
+    self, MetaChange, NewPlaylist, NewSmartPlaylist, NotEditable, PlaylistRefusal, Written,
+    POSITION_MAX, SONG_IDS_MAX,
 };
 
 pub(crate) const CREATE_PLAYLIST_ARGS: &[&str] = &[
     "name",
     "song_ids",
+    "rules",
     "comment",
     "public",
     "allow_duplicate_name",
@@ -41,6 +42,7 @@ const UPDATE_PLAYLIST_ARGS: &[&str] = &[
     "name",
     "comment",
     "public",
+    "rules",
     "allow_duplicate_name",
     "request_key",
 ];
@@ -70,10 +72,10 @@ pub(crate) const CREATE_PLAYLIST: ToolSpec = ToolSpec {
     title: "Create a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Creates a static Navidrome playlist owned by this user with the given songs in the given order, then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty. Returns the playlist as Navidrome lists it. Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; next offers each with get_playlist, then the call with allow_duplicate_name to make another), playlist_tracks_not_written, playlist_not_written (a comment or public flag Navidrome answered but does not show), playlist_not_found (the playlist went before its comment or public flag was written), already_running (a call with this request_key still runs). A create that failed once its request was sent may have made the playlist: next offers list_playlists to look for it rather than the same call.")
+        format!(r#"Creates a Navidrome playlist owned by this user — either a static playlist (with optional song_ids) or a smart playlist (with rules) — then reads it back from Navidrome. song_ids are Navidrome song ids (find_in_library, search_library, get_playlist), at most 1000; the list may be empty, and must be omitted or empty when rules is given. rules is a Navidrome .nsp smart playlist JSON object with a non-empty "all" or "any" array of rule objects (operators: is, isNot, gt, lt, contains, notContains, startsWith, endsWith, inTheRange, before, after, inTheLast, notInTheLast, inPlaylist, notInPlaylist, or nested all/any) and optional "sort" (string), "order" ("asc"|"desc"), "limit" and "offset" (non-negative integers), e.g. {{"all": [{{"is": {{"loved": true}}}}, {{"gt": {{"rating": 3}}}}], "sort": "dateAdded", "order": "desc", "limit": 50}}. Returns the playlist as Navidrome lists it (with smart: true and rules for smart playlists). Playlist ids stay valid until the playlist is deleted; song ids while the file stays in the library. A repeat with the same request_key returns the first result. Takes a few seconds. Failure codes: {common}, {NAVIDROME_CODES}, unknown_handle (Navidrome does not list some song ids for this user, or their files are missing; facts name them and next repeats the call without them), playlist_name_taken (this user already has a playlist with that name; next offers each with get_playlist, then the call with allow_duplicate_name to make another), playlist_tracks_not_written, playlist_not_written (a comment or public flag Navidrome answered but does not show), playlist_not_found (the playlist went before its comment or public flag was written), already_running (a call with this request_key still runs). A create that failed once its request was sent may have made the playlist: next offers list_playlists to look for it rather than the same call."#)
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "song_ids": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}, "#,
+        r#"{"type": "object", "additionalProperties": false, "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 255}, "song_ids": {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 500}}, "rules": {"type": "object"}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -89,10 +91,10 @@ pub(crate) const UPDATE_PLAYLIST: ToolSpec = ToolSpec {
     title: "Rename or describe a playlist",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes the name, comment or public flag of one of this user's playlists; an empty comment clears it. Only the owner's playlists can be changed. Returns the playlist as Navidrome lists it afterwards. Playlist ids stay valid until the playlist is deleted. Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found, playlist_not_owner, playlist_name_taken, playlist_not_written, already_running.")
+        format!(r#"Changes the name, comment, public flag or smart playlist rules of one of this user's playlists; an empty comment clears it. rules uses the same Navidrome .nsp smart playlist JSON format as create_playlist (e.g. {{"all": [{{"is": {{"genre": "Jazz"}}}}], "sort": "title", "order": "asc"}}). Only the owner's playlists can be changed. Returns the playlist as Navidrome lists it afterwards. Playlist ids stay valid until the playlist is deleted. Failure codes: {common}, {NAVIDROME_CODES}, playlist_not_found, playlist_not_owner, playlist_name_taken, playlist_not_written, already_running."#)
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1, "maxLength": 255}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "allow_duplicate_name": {"type": "boolean"}, "#,
+        r#"{"type": "object", "additionalProperties": false, "required": ["playlist_id"], "properties": {"playlist_id": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1, "maxLength": 255}, "comment": {"type": "string", "maxLength": 2000}, "public": {"type": "boolean"}, "rules": {"type": "object"}, "allow_duplicate_name": {"type": "boolean"}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -260,36 +262,66 @@ fn get_playlist_call(playlist_id: &str) -> NextCall {
     NextCall::new("get_playlist", json!({"playlist_id": playlist_id}))
 }
 
-/// `create_playlist`: a new playlist of the caller's, once per request key.
+/// `create_playlist`: a new static or smart playlist of the caller's, once per request key.
 pub(crate) async fn create_playlist(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
+    enum CreateKind {
+        Static(NewPlaylist),
+        Smart(NewSmartPlaylist),
+    }
     let args = Args::new("create_playlist", args, CREATE_PLAYLIST_ARGS);
     let read = async {
         let name = name_arg(&args)?.ok_or_else(|| invalid_value(args.tool(), "name", A_NAME))?;
         let song_ids = args.opt_strings("song_ids", SONG_IDS_MAX)?;
-        let new = NewPlaylist {
-            name,
-            song_ids: song_ids.unwrap_or_default(),
-            comment: args.opt_text("comment", COMMENT_MAX_CHARS)?,
-            public: args.opt_bool("public")?,
-            allow_duplicate_name: args.opt_bool("allow_duplicate_name")?.unwrap_or(false),
-        };
+        let rules = rules_arg(&args)?;
+        let comment = args.opt_text("comment", COMMENT_MAX_CHARS)?;
+        let public = args.opt_bool("public")?;
+        let allow_duplicate_name = args.opt_bool("allow_duplicate_name")?.unwrap_or(false);
         let key = request_key(&args)?;
         args.finish()?;
+        let kind = match rules {
+            Some(rules) => {
+                if song_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+                    return Err(invalid_value(
+                        args.tool(),
+                        "song_ids",
+                        "empty or omitted when rules is given (smart playlists populate tracks from rules)",
+                    ));
+                }
+                CreateKind::Smart(NewSmartPlaylist {
+                    name,
+                    comment,
+                    public,
+                    rules,
+                    allow_duplicate_name,
+                })
+            }
+            None => CreateKind::Static(NewPlaylist {
+                name,
+                song_ids: song_ids.unwrap_or_default(),
+                comment,
+                public,
+                allow_duplicate_name,
+            }),
+        };
         let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
-        Ok::<_, ToolError>((new, key, navi))
+        Ok::<_, ToolError>((kind, key, navi))
     };
-    let (new, key, navi) = match read.await {
+    let (kind, key, navi) = match read.await {
         Ok(read) => read,
         Err(e) => return failed(e),
     };
     let call = args.as_value();
     let ctx = caller.ctx.clone();
     let work = async move {
-        match playlists::create(&navi, &ctx, &new).await {
+        let res = match &kind {
+            CreateKind::Static(new) => playlists::create(&navi, &ctx, new).await,
+            CreateKind::Smart(new) => playlists::create_smart(&navi, &ctx, new).await,
+        };
+        match res {
             Ok(w) => Keyed::Kept(success(playlist_fields(&w))),
             Err(r) => refused(&args, None, &r),
         }
@@ -297,7 +329,8 @@ pub(crate) async fn create_playlist(
     keyed(&state.acquire, caller, "create_playlist", key, &call, work).await
 }
 
-/// `update_playlist`: a new name, comment or public flag for one of the caller's playlists.
+/// `update_playlist`: a new name, comment, public flag or smart playlist rules for one of the
+/// caller's playlists.
 pub(crate) async fn update_playlist(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -310,11 +343,16 @@ pub(crate) async fn update_playlist(
             name: name_arg(&args)?,
             comment: args.opt_text("comment", COMMENT_MAX_CHARS)?,
             public: args.opt_bool("public")?,
+            rules: rules_arg(&args)?,
             allow_duplicate_name: args.opt_bool("allow_duplicate_name")?.unwrap_or(false),
         };
         let key = request_key(&args)?;
         args.finish()?;
-        if change.name.is_none() && change.comment.is_none() && change.public.is_none() {
+        if change.name.is_none()
+            && change.comment.is_none()
+            && change.public.is_none()
+            && change.rules.is_none()
+        {
             return Err(invalid_value(
                 args.tool(),
                 "name",
@@ -517,6 +555,21 @@ pub(crate) fn name_arg(args: &Args) -> Result<Option<String>, ToolError> {
         None if !args.has("name") => Ok(None),
         _ => Err(refused()),
     }
+}
+
+/// The optional `rules` argument: a validated Navidrome `.nsp` smart playlist criteria object.
+fn rules_arg(args: &Args) -> Result<Option<Value>, ToolError> {
+    if !args.has("rules") {
+        return Ok(None);
+    }
+    let value = args
+        .as_value()
+        .as_object()
+        .and_then(|map| map.get("rules"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    playlists::smart::validate_rules(&value).map_err(|reason| args.refuse("rules", &reason))?;
+    Ok(Some(value))
 }
 
 /// The playlist's facts, `song_ids` in Navidrome's order (null above 500 entries),
@@ -1773,5 +1826,216 @@ mod tests {
                 &json!([{"tool": "list_playlists", "args": {}}])
             )
         );
+    }
+
+    #[tokio::test]
+    async fn create_playlist_with_rules_creates_smart_playlist_and_returns_rules() {
+        let navi = NavidromeStub::start();
+        let rules = json!({
+            "all": [{"is": {"loved": true}}, {"gt": {"rating": 3}}],
+            "sort": "dateAdded",
+            "order": "desc",
+            "limit": 50
+        });
+        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer("/api/playlist", &[&json!({"id": ADVENT}).to_string()]);
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(
+                ADVENT,
+                "Loved Favorites",
+                "alice",
+                true,
+                "Auto-updated",
+                &[HOLY],
+            )],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[&playlist_rows(&[(1, HOLY.0, HOLY.1, false)])],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "create_playlist",
+                json!({
+                    "name": "Loved Favorites",
+                    "comment": "Auto-updated",
+                    "public": true,
+                    "rules": rules,
+                    "song_ids": []
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            doc,
+            json!({
+                "ok": true,
+                "playlist_id": ADVENT,
+                "name": "Loved Favorites",
+                "comment": "Auto-updated",
+                "owner": "alice",
+                "owned": true,
+                "public": true,
+                "song_count": 1,
+                "duration_s": 263,
+                "created": "2026-11-15T09:00:00Z",
+                "changed": "2026-11-15T09:00:04Z",
+                "smart": true,
+                "rules": rules,
+                "song_ids": [HOLY.0],
+                "song_ids_omitted": null,
+                "hidden_entries_dropped": 0
+            })
+        );
+        assert!(navi.asked().contains(&"/api/playlist".to_string()));
+        assert!(!navi.asked().contains(&"/rest/createPlaylist".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_playlist_refuses_rules_with_song_ids_or_invalid_rules_and_checks_duplicates() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&playlists_body(&[("p-old", "Loved", "alice", false)])],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+
+        let valid_rules = json!({"all": [{"is": {"loved": true}}]});
+
+        // Both rules and non-empty song_ids -> invalid_input
+        let err = &document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "create_playlist",
+                json!({"name": "Loved", "rules": valid_rules, "song_ids": [HOLY.0]}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (err["code"].as_str(), err["facts"]["field"].as_str()),
+            (Some("invalid_input"), Some("song_ids"))
+        );
+
+        // Invalid rules -> invalid_input on field "rules"
+        for bad_rules in [
+            json!({"sort": "title"}),
+            json!({"all": []}),
+            json!({"all": [{"unknownOp": {"title": "x"}}]}),
+            json!({"all": [{"is": {"loved": true}}], "bogus": 1}),
+            json!("not an object"),
+        ] {
+            let err = &document(
+                &call_tool(
+                    app.clone(),
+                    &token,
+                    "create_playlist",
+                    json!({"name": "Loved", "rules": bad_rules}),
+                )
+                .await,
+            )["error"];
+            assert_eq!(
+                (err["code"].as_str(), err["facts"]["field"].as_str()),
+                (Some("invalid_input"), Some("rules")),
+                "{bad_rules}"
+            );
+        }
+
+        // Duplicate name -> playlist_name_taken offering allow_duplicate_name with rules preserved
+        let err = &document(
+            &call_tool(
+                app,
+                &token,
+                "create_playlist",
+                json!({"name": "Loved", "rules": valid_rules}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(err["code"], "playlist_name_taken");
+        assert_eq!(
+            err["next"],
+            json!([
+                {"tool": "get_playlist", "args": {"playlist_id": "p-old"}},
+                {"tool": "create_playlist", "args": {"name": "Loved", "rules": valid_rules, "allow_duplicate_name": true}}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_playlist_with_rules_updates_smart_playlist_and_validates_input() {
+        let navi = NavidromeStub::start();
+        let rules = json!({
+            "any": [{"is": {"genre": "Jazz"}}, {"contains": {"genre": "Soul"}}],
+            "sort": "title",
+            "order": "asc"
+        });
+        navi.answer(
+            "/rest/getPlaylist",
+            &[
+                &playlist_body(ADVENT, "Jazz Mix", "alice", false, "", &[HOLY]),
+                &playlist_body(ADVENT, "Jazz Mix", "alice", false, "", &[HOLY, SILENT]),
+            ],
+        );
+        navi.answer(
+            &tracks_of(ADVENT),
+            &[
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false)]),
+                &playlist_rows(&[
+                    (1, HOLY.0, HOLY.1, false),
+                    (2, SILENT.0, SILENT.1, false),
+                ]),
+            ],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&json!({"id": ADVENT}).to_string()],
+        );
+        let (_, app, token) = mcp_app_with(Arc::new(NavidromeFor(Ok(navi.client())))).await;
+
+        // Invalid rules -> invalid_input before hitting Navidrome
+        let err = &document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "update_playlist",
+                json!({"playlist_id": ADVENT, "rules": {"all": [{"inTheRange": {"year": [1990]}}]}}),
+            )
+            .await,
+        )["error"];
+        assert_eq!(
+            (err["code"].as_str(), err["facts"]["field"].as_str()),
+            (Some("invalid_input"), Some("rules"))
+        );
+
+        // Valid rules alone (no name/comment/public) succeeds via PUT /api/playlist/{id}
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "update_playlist",
+                json!({"playlist_id": ADVENT, "rules": rules}),
+            )
+            .await,
+        );
+        assert_eq!(
+            (
+                &doc["ok"],
+                &doc["smart"],
+                &doc["rules"],
+                &doc["song_ids"],
+            ),
+            (
+                &json!(true),
+                &json!(true),
+                &rules,
+                &json!([HOLY.0, SILENT.0]),
+            )
+        );
+        assert!(navi.asked().contains(&format!("/api/playlist/{ADVENT}")));
+        assert!(!navi.asked().contains(&"/rest/updatePlaylist".to_string()));
     }
 }

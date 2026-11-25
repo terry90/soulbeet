@@ -13,10 +13,10 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const API_VERSION: &str = "1.16.1";
 const CLIENT_NAME: &str = "Soulbeet";
 pub struct NavidromeClient {
-    base_url: Url,
-    username: String,
+    pub(super) base_url: Url,
+    pub(super) username: String,
     password: String,
-    client: Client,
+    pub(super) client: Client,
     circuit_breaker: CircuitBreaker,
     native_token: tokio::sync::Mutex<Option<String>>,
 }
@@ -103,7 +103,7 @@ impl NavidromeClient {
         ]
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(
+    pub(super) async fn get<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
         extra_params: &[(&str, &str)],
@@ -125,7 +125,7 @@ impl NavidromeClient {
     /// query before every handler (server/subsonic/middlewares.go:32
     /// `postFormToQueryParams`, applied to all routes at
     /// server/subsonic/api.go:94, both in 0.64.2).
-    async fn post_form<T: serde::de::DeserializeOwned>(
+    pub(super) async fn post_form<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
         extra_params: &[(&str, &str)],
@@ -670,7 +670,10 @@ impl NavidromeClient {
 
     /// Send an authenticated native API request. Retries once with a fresh
     /// token if the first attempt gets a 401.
-    async fn native_request(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    pub(super) async fn native_request(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let send = |r: reqwest::RequestBuilder, token: &str| {
             r.header("x-nd-authorization", format!("Bearer {}", token))
         };
@@ -1000,7 +1003,10 @@ fn playlist_track(mut row: serde_json::Map<String, serde_json::Value>) -> Result
 
 /// A native API answer that is not a success, as an Http error of `action` whose cause keeps the
 /// answer's text; an empty one explains nothing and is not kept.
-async fn native_failure(action: &'static str, resp: reqwest::Response) -> NavidromeError {
+pub(super) async fn native_failure(
+    action: &'static str,
+    resp: reqwest::Response,
+) -> NavidromeError {
     let status = resp.status().as_u16();
     let raw = resp.text().await.ok().filter(|text| !text.is_empty());
     NavidromeError::Http {
@@ -1070,7 +1076,7 @@ pub fn filepath_rules(library_id: i64, path_prefix: &str) -> serde_json::Value {
 }
 
 /// A read's answer, None when Navidrome has no record the user can see (DATA_NOT_FOUND).
-fn found<T>(answer: Result<T>) -> Result<Option<T>> {
+pub(super) fn found<T>(answer: Result<T>) -> Result<Option<T>> {
     match answer {
         Ok(body) => Ok(Some(body)),
         Err(e) if e.is_not_found() => Ok(None),
@@ -1089,7 +1095,7 @@ fn transport(e: reqwest::Error) -> NavidromeError {
 }
 
 /// An answer that could not be read, without the URL it came from.
-fn parse(e: reqwest::Error) -> NavidromeError {
+pub(super) fn parse(e: reqwest::Error) -> NavidromeError {
     NavidromeError::Parse(e.without_url().to_string())
 }
 
