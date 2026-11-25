@@ -1,4 +1,4 @@
-//! One paced HTTP client for ListenBrainz, ListenBrainz Labs and Deezer. It
+//! One paced HTTP client for ListenBrainz, ListenBrainz Labs, Deezer and archive.org. It
 //! spaces requests per host, waits out rate limits, retries a bot challenge
 //! page like an outage and never hands one to a caller as data.
 
@@ -44,6 +44,15 @@ impl Pace {
         backoff: Duration::from_millis(5000),
         retries: 3,
         timeout: Duration::from_secs(15),
+    };
+
+    /// archive.org publishes no limit and blocks heavy automated traffic, so one request a
+    /// second, shared by every user's searches.
+    pub const ARCHIVE: Pace = Pace {
+        min_interval: Duration::from_millis(1000),
+        backoff: Duration::from_millis(5000),
+        retries: 3,
+        timeout: Duration::from_secs(30),
     };
 
     #[cfg(test)]
@@ -605,6 +614,20 @@ mod tests {
         assert_eq!(
             (Pace::DEEZER.min_interval, Pace::DEEZER.backoff),
             (Duration::from_millis(250), Duration::from_millis(5000))
+        );
+        assert_eq!(
+            (
+                Pace::ARCHIVE.min_interval,
+                Pace::ARCHIVE.backoff,
+                Pace::ARCHIVE.retries,
+                Pace::ARCHIVE.timeout
+            ),
+            (
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                3,
+                Duration::from_secs(30)
+            )
         );
     }
 }

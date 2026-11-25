@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod audio;
 pub mod backend_error;
 pub mod beets;

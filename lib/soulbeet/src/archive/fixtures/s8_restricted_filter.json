@@ -1,0 +1,441 @@
+{
+ "responseHeader": {
+  "status": 0,
+  "QTime": 39,
+  "params": {
+   "query": "collection:etree AND creator:&quot;Grateful Dead&quot; AND date:[1977-05-08T00\\:00\\:00Z TO 1977-05-08T23\\:59\\:59Z] AND -access-restricted-item:true",
+   "qin": "collection:etree AND creator:(&quot;Grateful Dead&quot;) AND date:[1977-05-08 TO 1977-05-08] AND -access-restricted-item:true",
+   "fields": "identifier,title,creator,date,collection,format,item_size,downloads,external-identifier,access-restricted-item,licenseurl,mediatype",
+   "wt": "json",
+   "sort": "downloads desc",
+   "rows": 30,
+   "start": 0
+  }
+ },
+ "response": {
+  "numFound": 15,
+  "start": 0,
+  "docs": [
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 575863,
+    "format": [
+     "Archive BitTorrent",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.shure57.stevenson.29303.flac16",
+    "item_size": 1469430170,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 542968,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Shorten",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd77-05-08.maizner.hicks.5002.sbeok.shnf",
+    "item_size": 1290661446,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 144088,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.mtx.dan.29511.flac16",
+    "item_size": 1404047665,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 58702,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Flac",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.ecm33p.moore.berger.miller.117026.flac16",
+    "item_size": 1402476615,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 58266,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.mtx.dan.35086.flac24",
+    "item_size": 3899912268,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 41951,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Shorten",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.aud.moore.cribbs.28301.shnf",
+    "item_size": 1492487624,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 35993,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.aud.moore.berger.28354.flac16",
+    "item_size": 1420345060,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 31122,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "Checksums",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.ecm33p.moore.berger.miller.117027.flac24",
+    "item_size": 4076716211,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 14258,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Flac FingerPrint",
+     "Item Tile",
+     "JPEG",
+     "JPEG Thumb",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.137571.mtx-2aud.dusborne.flac24",
+    "item_size": 4265993916,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 14089,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "BitTorrent",
+     "BitTorrentContents",
+     "Checksums",
+     "Columbia Peaks",
+     "Flac FingerPrint",
+     "Item Tile",
+     "JPEG",
+     "JPEG Thumb",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.137569.mtx.dusborne.flac24",
+    "item_size": 4183994693,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 13234,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Shorten",
+     "Single Page Processed JPEG",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd77-05-08.dts.dan.26856.sbeok.flacf",
+    "item_size": 881643131,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 13057,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.134093.aud.cooper.berger.flac24",
+    "item_size": 3507271309,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 11453,
+    "format": [
+     "Archive BitTorrent",
+     "Columbia Peaks",
+     "Essentia High GZ",
+     "Essentia Low GZ",
+     "Flac",
+     "Flac FingerPrint",
+     "Item Tile",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.mtx.dts.dan.30756.flac16",
+    "item_size": 1919895472,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall - Cornell University on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree",
+     "stream_only"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 10827,
+    "format": [
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Flac",
+     "Flac FingerPrint",
+     "Item Tile",
+     "JPEG",
+     "JPEG Thumb",
+     "Metadata",
+     "Ogg Vorbis",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.137572.mtx-2aud.dusborne.flac16",
+    "item_size": 1506328895,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall on 1977-05-08"
+   },
+   {
+    "collection": [
+     "GratefulDead",
+     "etree"
+    ],
+    "creator": "Grateful Dead",
+    "date": "1977-05-08T00:00:00Z",
+    "downloads": 5080,
+    "format": [
+     "24bit Flac",
+     "Archive BitTorrent",
+     "Checksums",
+     "Columbia Peaks",
+     "Flac FingerPrint",
+     "Item Tile",
+     "JPEG",
+     "JPEG Thumb",
+     "Metadata",
+     "PNG",
+     "Spectrogram",
+     "Text",
+     "VBR MP3"
+    ],
+    "identifier": "gd1977-05-08.152379.aud.petrunis.flac2448",
+    "item_size": 1205850997,
+    "mediatype": "etree",
+    "title": "Grateful Dead Live at Barton Hall, Cornell University on 1977-05-08"
+   }
+  ]
+ }
+}
