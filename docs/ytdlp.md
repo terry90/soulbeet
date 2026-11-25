@@ -50,6 +50,7 @@ The status line reads what YouTube answered Soulbeet's last search or download i
 - "Not in this image: use the :full image (… missing)": yt-dlp, yt-dlp-ejs, ytmusicapi, deno or ffmpeg is not there or does not run. Nothing is asked of YouTube.
 - "YouTube rate-limited this server until …", shown as RATE-LIMITED.
 - "YouTube asks this server to sign in …".
+- "YouTube refused to send a file": one download got HTTP 403. Three in an hour are taken as a sign-in request.
 - "YouTube did not answer".
 
 yt-dlp breaks when YouTube changes, every few weeks, until a newer yt-dlp is released. Each image pins one yt-dlp release, so keep the image updated; Soulbeet logs a warning when the yt-dlp it has is more than 60 days old.

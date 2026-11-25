@@ -297,7 +297,9 @@ impl Engine {
 /// What a health failure of `kind` reads.
 fn health_words(kind: Kind) -> &'static str {
     match kind {
-        Kind::BotCheck | Kind::Forbidden => "YouTube asks this server to sign in",
+        Kind::BotCheck => "YouTube asks this server to sign in",
+        // One refusal is no sign-in request: three in a row are, and pause the source.
+        Kind::Forbidden => "YouTube refused to send a file",
         Kind::Network | Kind::TimedOut => "YouTube did not answer",
         Kind::Tooling => NOT_IN_IMAGE,
         _ => "yt-dlp could not read YouTube's answer; update the image",
@@ -665,6 +667,22 @@ mod tests {
         assert!(failure
             .message
             .starts_with("YouTube asks this server to sign in"));
+    }
+
+    #[tokio::test]
+    async fn one_refused_download_says_so_and_asks_for_no_sign_in() {
+        let rig = Rig::new();
+        let engine = rig.engine(QUICK).await;
+        let backend = YtDlpBackend::new(engine.clone());
+        let refused = item(0, "FORBIDDEN01");
+        let sent = backend
+            .download(vec![refused.clone()], "S [1]", "r", "u1")
+            .await
+            .unwrap();
+        ended(&engine, &refused.source, &sent[0].id).await;
+        let failure = backend.health_check().await.unwrap_err();
+        assert_eq!(failure.message, "YouTube refused to send a file");
+        assert_eq!(probes(&rig), 0);
     }
 
     #[tokio::test]
