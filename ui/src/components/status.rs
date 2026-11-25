@@ -298,6 +298,7 @@ mod tests {
                 RetryAdvice::SameSourceLater,
                 "slskd did not answer at http://slskd:5030",
             )),
+            downloaders: vec![],
             importer: shared::system::ImporterHealth {
                 level: HealthLevel::Broken,
                 issues: vec![shared::system::HealthIssue {

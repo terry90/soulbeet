@@ -373,6 +373,8 @@ failure_codes! {
     SlskdTooOld => "slskd_too_old",
     TransferConnectionFailed => "transfer_connection_failed",
     TransferSizeMismatch => "transfer_size_mismatch",
+    /// The file's bytes do not match the checksum its source gave for it.
+    TransferChecksumMismatch => "transfer_checksum_mismatch",
     TransferRejectedNotShared => "transfer_rejected_not_shared",
     TransferRejectedPeerBusy => "transfer_rejected_peer_busy",
     TransferRejectedFailureLimit => "transfer_rejected_failure_limit",
@@ -385,6 +387,8 @@ failure_codes! {
     TransferStuckInRemoteQueue => "transfer_stuck_in_remote_queue",
     TransferListUnreadable => "transfer_list_unreadable",
     FileNotFoundAfterDownload => "file_not_found_after_download",
+    /// The disk a backend writes downloads to is full.
+    DownloadDiskFull => "download_disk_full",
     ImportNoMatch => "import_no_match",
     ImportAlreadyInLibrary => "import_already_in_library",
     ImportNothingToImport => "import_nothing_to_import",
@@ -457,11 +461,11 @@ mod tests {
     /// `backend_response_unreadable`, `search_query_rejected`,
     /// `search_already_running`, `search_lost`, `import_disk_full`,
     /// `import_library_locked`, `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
-    /// `sources_exhausted`, `result_rejected`, `search_stopped` and
-    /// `no_listening_data`, and
+    /// `sources_exhausted`, `result_rejected`, `search_stopped`,
+    /// `no_listening_data`, `transfer_checksum_mismatch` and `download_disk_full`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 91] = [
+    const NAMES: [&str; 93] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -496,6 +500,7 @@ mod tests {
         "slskd_too_old",
         "transfer_connection_failed",
         "transfer_size_mismatch",
+        "transfer_checksum_mismatch",
         "transfer_rejected_not_shared",
         "transfer_rejected_peer_busy",
         "transfer_rejected_failure_limit",
@@ -508,6 +513,7 @@ mod tests {
         "transfer_stuck_in_remote_queue",
         "transfer_list_unreadable",
         "file_not_found_after_download",
+        "download_disk_full",
         "import_no_match",
         "import_already_in_library",
         "import_nothing_to_import",

@@ -531,6 +531,7 @@ The ones you are most likely to see:
 | `slskd_too_old` | `enqueue` | slskd is older than 0.26. User action `upgrade_backend`. | Upgrade slskd to 0.26 or newer. |
 | `transfer_connection_failed` | `transfer` | The connection to the source failed or dropped, or slskd restarted during the transfer. | Another source; after a slskd restart, the same one later. |
 | `transfer_size_mismatch` | `transfer` | The source's file has another size than it announced. | Another source. |
+| `transfer_checksum_mismatch` | `transfer` | The downloaded bytes do not match the checksum the source gave for the file. | Another source. |
 | `transfer_rejected_not_shared` | `transfer` | The source says the file is not shared. | Another source. |
 | `transfer_rejected_peer_busy` | `transfer` | The source's queue is full, or it hit a daily or weekly quota. | The same source later for a full queue, another source for a quota. |
 | `transfer_rejected_failure_limit` | `transfer` | The source refuses after too many failed transfers today or this week. | Another source. |
@@ -543,6 +544,7 @@ The ones you are most likely to see:
 | `transfer_stuck_in_remote_queue` | `transfer` | The transfer waited 15 minutes in the source's queue. | Another source. |
 | `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read. | Check slskd; update Soulbeet or slskd if their versions do not match. |
 | `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
+| `download_disk_full` | `transfer` | The disk the download backend writes to is full. User action `free_disk_space`. | Free disk space, then retry. |
 | `import_no_match` | `import` | beets found no close enough match. | The assistant reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
 | `import_already_in_library` | `import`, `index` | The library already holds this recording; the facts give its song ids. | Nothing. To replace it, preview with reason `replaced` and pass `replace_existing`. |
 | `import_nothing_to_import` | `import` | beets found nothing to import in the downloaded files. | Another source. |

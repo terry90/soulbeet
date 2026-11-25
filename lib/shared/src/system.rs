@@ -69,17 +69,30 @@ impl From<String> for NavidromeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SystemHealth {
+    /// Whether the default download backend can take work.
     pub downloader_online: bool,
-    /// Why the download backend cannot take work, when it cannot: its
-    /// lookup failed, its health check failed, or the check did not answer.
+    /// Why the default download backend cannot take work, when it cannot:
+    /// its lookup failed, its health check failed, or the check did not answer.
     #[serde(default)]
     pub downloader_failure: Option<Failure>,
+    /// Every enabled download backend, the default one first.
+    #[serde(default)]
+    pub downloaders: Vec<DownloaderHealth>,
     #[serde(default)]
     pub importer: ImporterHealth,
     pub navidrome_online: bool,
     /// Why Navidrome is offline, when it is.
     #[serde(default)]
     pub navidrome_failure: Option<Failure>,
+}
+
+/// Whether one download backend can take work, and why not when it cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DownloaderHealth {
+    pub id: String,
+    pub name: String,
+    pub online: bool,
+    pub failure: Option<Failure>,
 }
 
 /// How well the importer can do its job; later variants are worse.
@@ -170,5 +183,6 @@ mod tests {
         let h: SystemHealth = serde_json::from_value(v).unwrap();
         assert_eq!(h.importer.level, HealthLevel::Checking);
         assert_eq!(h.navidrome_failure, None);
+        assert!(h.downloaders.is_empty());
     }
 }

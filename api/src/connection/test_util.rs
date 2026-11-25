@@ -693,6 +693,7 @@ pub(crate) fn sample_facts() -> StatusFacts {
         health: SystemHealth {
             downloader_online: true,
             downloader_failure: None,
+            downloaders: vec![],
             // Soulful's own beets probe issue, lib/soulbeet/src/beets/probe.rs:121-125
             importer: ImporterHealth {
                 level: HealthLevel::Degraded,

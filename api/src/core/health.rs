@@ -20,6 +20,7 @@ pub async fn system_health(ctx: &UserCtx) -> SystemHealth {
     SystemHealth {
         downloader_online,
         downloader_failure,
+        downloaders: Vec::new(),
         importer,
         navidrome_online: navidrome_failure.is_none(),
         navidrome_failure,
