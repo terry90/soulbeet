@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 use shared::backends::{BackendMeta, BackendSwitch, Switch};
 use shared::system::DownloaderHealth;
 
+use super::connection_status_row::StatusLine;
 use super::panel::LoadError;
 use super::toggle::{save_switch, Toggle};
 use crate::{friendly_error, use_auth, use_system_health};
@@ -125,7 +126,7 @@ fn BackendSwitchRow(
                 p { class: "text-xs text-red-400 font-mono", "{error}" }
             }
             if on() {
-                {status_line(id, health.as_ref())}
+                {status_line(health.as_ref())}
             }
             if let Some(form) = extra_settings(id) {
                 {form}
@@ -143,7 +144,7 @@ fn extra_settings(id: &str) -> Option<Element> {
 }
 
 /// Whether the backend can take work: what the last health check said, or that it is checked.
-fn status_line(id: &str, health: Option<&DownloaderHealth>) -> Element {
+fn status_line(health: Option<&DownloaderHealth>) -> Element {
     let (dot, summary) = match health {
         None => ("bg-gray-500 animate-pulse", "Checking...".to_string()),
         Some(h) if h.online => ("bg-beet-leaf", "Online".to_string()),
@@ -155,10 +156,7 @@ fn status_line(id: &str, health: Option<&DownloaderHealth>) -> Element {
         ),
     };
     rsx! {
-        div { class: "flex items-center gap-2", "data-backend": "{id}",
-            span { class: "w-2 h-2 rounded-full shrink-0 {dot}" }
-            span { class: "text-xs font-mono text-gray-300", "{summary}" }
-        }
+        StatusLine { dot_class: dot, summary }
     }
 }
 

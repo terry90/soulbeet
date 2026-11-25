@@ -22,9 +22,8 @@ pub(crate) fn ConnectionStatusRow(props: ConnectionStatusRowProps) -> Element {
     rsx! {
         div {
             h3 { class: "text-sm font-semibold text-white mb-3", "{props.label}" }
-            div { class: "flex items-center gap-2 mb-2",
-                span { class: "w-2 h-2 rounded-full shrink-0 {props.dot_class}" }
-                span { class: "text-xs font-mono text-gray-300", "{props.summary}" }
+            div { class: "mb-2",
+                StatusLine { dot_class: props.dot_class, summary: props.summary }
             }
             if let Some(note) = &props.note {
                 p { class: "text-xs text-gray-400 font-mono", "{note}" }
@@ -32,6 +31,17 @@ pub(crate) fn ConnectionStatusRow(props: ConnectionStatusRowProps) -> Element {
             if let Some(details) = props.details {
                 Disclosure { class: "mt-2", label: "details", {details} }
             }
+        }
+    }
+}
+
+/// A status dot and its summary.
+#[component]
+pub(crate) fn StatusLine(dot_class: &'static str, summary: String) -> Element {
+    rsx! {
+        div { class: "flex items-center gap-2",
+            span { class: "w-2 h-2 rounded-full shrink-0 {dot_class}" }
+            span { class: "text-xs font-mono text-gray-300", "{summary}" }
         }
     }
 }
