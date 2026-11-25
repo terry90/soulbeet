@@ -52,10 +52,13 @@ async fn downloaders_health_of(
     enabled: &[&BackendMeta],
 ) -> Vec<DownloaderHealth> {
     futures::future::join_all(enabled.iter().map(|meta| async move {
-        let checked = match backends.get(meta.id).await {
-            Ok(backend) => within(DOWNLOADER_WAIT, backend.health_check()).await,
-            Err(e) => Err(e.failure(Stage::SourceSearch, e.to_string())),
-        };
+        // The lookup is waited for too: a first lookup builds the backend.
+        let checked = within(DOWNLOADER_WAIT, async {
+            let backend = (backends.get(meta.id).await)
+                .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
+            backend.health_check().await
+        })
+        .await;
         DownloaderHealth {
             id: meta.id.to_string(),
             name: meta.name.to_string(),
@@ -164,6 +167,49 @@ mod tests {
                     false,
                     Some(FailureCode::BackendUnreachable)
                 ),
+            ]
+        );
+    }
+
+    /// `StubBackends` whose lookup of `hung` never answers, as a build stuck on a dead mount.
+    struct LookupHangs(StubBackends, &'static str);
+
+    #[async_trait::async_trait]
+    impl Backends for LookupHangs {
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<std::sync::Arc<dyn soulbeet::DownloadBackend>, BackendLookupError> {
+            if id == self.1 {
+                std::future::pending::<()>().await;
+            }
+            self.0.get(id).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_is_unreachable_and_holds_up_no_other_backend() {
+        const ARCHIVE: BackendMeta = BackendMeta {
+            id: "archive",
+            name: "Internet Archive",
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        let backends = LookupHangs(
+            StubBackends::default().with("slskd", StubBackend::new(vec![])),
+            "archive",
+        );
+
+        let health = downloaders_health_of(&backends, &[&SLSKD, &ARCHIVE]).await;
+
+        assert_eq!(
+            health
+                .iter()
+                .map(|d| (d.id.as_str(), d.online, d.failure.as_ref().map(|f| f.code)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("slskd", true, None),
+                ("archive", false, Some(FailureCode::BackendUnreachable))
             ]
         );
     }

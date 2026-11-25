@@ -3,7 +3,7 @@
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::models::app_config::{keys, AppConfig};
-use crate::services::{reload_download_backend, stop_backend};
+use crate::services::{reload_download_backend, stop_backend, turned_on};
 use async_trait::async_trait;
 use shared::backends::{BackendMeta, BackendSwitch, Switch};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
@@ -12,7 +12,8 @@ use sqlx::SqlitePool;
 /// What turning a backend on or off does to the running server.
 #[async_trait]
 pub(crate) trait Lifecycle: Send + Sync {
-    /// Stops the backend's searches and unfinished transfers, deleting their partial files.
+    /// Stops the backend's searches and unfinished transfers, deleting their partial files and
+    /// forgetting their transfer book entries.
     async fn stop(&self, id: &str);
     /// Drops the built backend, so the next lookup reads its switch again.
     async fn reload(&self, id: &str);
@@ -30,9 +31,9 @@ impl Lifecycle for Server {
     }
 }
 
-/// Turns the backend `id` on or off, for an admin. Off deletes its switch, stops what it runs
-/// and drops it: batches still on it then fail through the monitor's lookup, and finished files
-/// stay where they are.
+/// Turns the backend `id` on or off, for an admin. Off deletes its switch, drops it, so every
+/// later lookup reads the switch, then stops what it runs: batches still on it then fail through
+/// the monitor's lookup, and finished files stay where they are.
 pub async fn set_enabled(ctx: &UserCtx, id: &str, enabled: bool) -> Result<(), Failure> {
     set_enabled_in(
         &crate::db::DB,
@@ -85,9 +86,12 @@ pub(crate) async fn set_enabled_in(
         AppConfig::delete_in(db, &key)
             .await
             .map_err(|e| database_failure(Stage::Input, e))?;
+    }
+    // The reload waits for a build in flight, so the stop then covers whatever it started.
+    life.reload(id).await;
+    if !enabled {
         life.stop(id).await;
     }
-    life.reload(id).await;
     Ok(())
 }
 
@@ -102,12 +106,12 @@ pub(crate) async fn switches_in(
 ) -> Result<Vec<BackendSwitch>, Failure> {
     let mut switches = Vec::new();
     for meta in all.iter().filter(|m| m.switch == Switch::AdminToggle) {
-        let on = AppConfig::get_in(db, &keys::backend_enabled(meta.id))
+        let enabled = turned_on(db, meta.id)
             .await
             .map_err(|e| database_failure(Stage::Input, e))?;
         switches.push(BackendSwitch {
             id: meta.id.to_string(),
-            enabled: on.as_deref() == Some("true"),
+            enabled,
         });
     }
     Ok(switches)
@@ -151,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turning_a_backend_off_deletes_its_switch_then_stops_it_then_drops_it() {
+    async fn turning_a_backend_off_deletes_its_switch_then_drops_it_then_stops_it() {
         let db = test_db::migrated().await;
         let life = Recorded::default();
         let admin = user(Role::Admin);
@@ -177,7 +181,7 @@ mod tests {
         );
         assert_eq!(
             *life.0.lock().unwrap(),
-            ["reload archive", "stop archive", "reload archive"]
+            ["reload archive", "reload archive", "stop archive"]
         );
         assert!(!switches_in(&db, METAS).await.unwrap()[0].enabled);
     }
