@@ -529,6 +529,25 @@ fn the_next_transfer_is_of_the_user_served_longest_ago() {
             },
         );
     };
+    // The order they start in, after the place each was shown at first.
+    let drain = |state: &mut State| {
+        let places: HashMap<String, u32> = (state.queued())
+            .map(|r| (r.id.clone(), state.place(r)))
+            .collect();
+        let mut order = Vec::new();
+        while let Some(id) = state.next() {
+            state.turn += 1;
+            let record = state.records.get_mut(&id).unwrap();
+            record.phase = Phase::Completed;
+            let owner = record.owner.clone();
+            state.served.insert(owner, state.turn);
+            order.push(id);
+        }
+        for (at, id) in order.iter().enumerate() {
+            assert_eq!(places[id], at as u32 + 1, "{id} in {order:?}");
+        }
+        order
+    };
     for (id, owner) in [
         ("a1", "alice"),
         ("a2", "alice"),
@@ -537,16 +556,16 @@ fn the_next_transfer_is_of_the_user_served_longest_ago() {
     ] {
         add(&mut state, id, owner);
     }
-    let mut order = Vec::new();
-    while let Some(id) = state.next() {
-        state.turn += 1;
-        let record = state.records.get_mut(&id).unwrap();
-        record.phase = Phase::Completed;
-        let owner = record.owner.clone();
-        state.served.insert(owner, state.turn);
-        order.push(id);
+    assert_eq!(drain(&mut state), ["a1", "b1", "a2", "a3"]);
+
+    // Alice was just served and has many waiting: one bob adds goes next, and shows so.
+    for n in 0..50 {
+        add(&mut state, &format!("a{}", n + 10), "alice");
     }
-    assert_eq!(order, ["a1", "b1", "a2", "a3"]);
+    add(&mut state, "b2", "bob");
+    add(&mut state, "c1", "carol");
+    let order = drain(&mut state);
+    assert_eq!(order[..4], ["c1", "b2", "a10", "a11"]);
 }
 
 #[tokio::test(start_paused = true)]

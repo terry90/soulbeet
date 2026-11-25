@@ -172,10 +172,30 @@ impl State {
             .map(|r| r.id.clone())
     }
 
-    /// A queued transfer's place in the queue, 1 for the next one.
+    /// A queued transfer's place in the order `next` starts them, 1 for the next one. Users take
+    /// turns, so the transfer is in turn `round` of its user's: every user ahead of its user
+    /// in the turns goes `round + 1` times before it, every other user `round` times, each as
+    /// many times as it has transfers waiting.
     fn place(&self, record: &Record) -> u32 {
-        let ahead = self.queued().filter(|o| o.seq < record.seq).count();
-        ahead as u32 + 1
+        // Each user's turn (served longest ago, then first to come) and transfers waiting.
+        let turn_of = |owner: &str, first: u64| (self.served.get(owner).copied().unwrap_or(0), first);
+        let mut users: HashMap<&str, ((u64, u64), usize)> = HashMap::new();
+        let mut round = 0;
+        let mut own_first = record.seq;
+        for r in self.queued() {
+            let (turn, waiting) = users.entry(&r.owner).or_insert((turn_of(&r.owner, r.seq), 0));
+            turn.1 = turn.1.min(r.seq);
+            *waiting += 1;
+            if r.owner == record.owner && r.seq < record.seq {
+                round += 1;
+                own_first = own_first.min(r.seq);
+            }
+        }
+        let own = turn_of(&record.owner, own_first);
+        let ahead: usize = (users.values())
+            .map(|&(turn, waiting)| waiting.min(round + usize::from(turn < own)))
+            .sum();
+        u32::try_from(ahead + 1).unwrap_or(u32::MAX)
     }
 
     fn prune(&mut self) {
