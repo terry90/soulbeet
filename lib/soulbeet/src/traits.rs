@@ -111,8 +111,10 @@ pub trait DownloadBackend: Send + Sync {
     /// Ends a running search early; its next poll reads what it found so far.
     async fn stop_search(&self, search_id: &str) -> BackendResult<()>;
     /// Ok when the backend can take work now; else why not, as a failure
-    /// with the backend's own answer as its cause. Called every 10 s per open tab: it costs the
-    /// remote service at most one request per minute; cache inside the backend.
+    /// with the backend's own answer as its cause. Called every 10 s per open tab. A backend
+    /// that calls a third-party service costs it at most one request per minute, caching inside
+    /// the backend; slskd, the user's own server, is checked live. Its failure is shown to every
+    /// user and logged, so it never holds a key, a password or a URL with credentials in it.
     async fn health_check(&self) -> std::result::Result<(), Failure>;
 }
 
