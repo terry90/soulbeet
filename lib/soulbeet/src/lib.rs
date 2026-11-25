@@ -15,6 +15,7 @@ pub mod musicbrainz;
 pub mod navidrome;
 pub mod partial;
 pub mod polite;
+pub mod process;
 pub mod slskd;
 pub mod tags;
 #[cfg(test)]
