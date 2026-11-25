@@ -143,13 +143,17 @@ pub(crate) fn source_offline() -> Failure {
     )
 }
 
-/// same_source of a source slskd's blacklist holds, from which nothing downloads.
-pub(crate) fn source_blocked() -> Failure {
+/// same_source of a source the backend `backend` will not give files from.
+pub(crate) fn source_blocked(backend: &str) -> Failure {
+    let message = match shared::backends::meta(backend) {
+        Some(meta) => meta.blocked.to_string(),
+        None => format!("{backend} will not give files from this source"),
+    };
     Failure::new(
         FailureCode::EnqueueFailed,
         Stage::Enqueue,
         RetryAdvice::OtherSource,
-        "slskd's blacklist holds this source",
+        message,
     )
 }
 
@@ -335,7 +339,7 @@ async fn source_ready(acquire: &Acquire, tried: &DownloadableItem) -> Result<(),
     let refused = |failure| Err(RetryAnswer::Unavailable(failure, source_facts(source)));
     match backend.source_status(source).await {
         Ok(SourcePresence::Offline) => refused(source_offline()),
-        Ok(SourcePresence::Blocked) => refused(source_blocked()),
+        Ok(SourcePresence::Blocked) => refused(source_blocked(&tried.backend)),
         Ok(SourcePresence::Online | SourcePresence::Away) => Ok(()),
         Err(e) => refused(e.ask_failure(PeerAsk::Presence, Stage::Enqueue)),
     }
@@ -1125,7 +1129,12 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(f, source_blocked());
+        assert_eq!(f, source_blocked("slskd"));
+        assert_eq!(f.message, "slskd's blacklist holds this source");
+        assert_eq!(
+            source_blocked("stub-9").message,
+            "stub-9 will not give files from this source"
+        );
         effects.stub().set_presence(SourcePresence::Online);
         let again = retry(&acq, &alice(), &job, RetryMode::SameSource, None)
             .await

@@ -345,6 +345,12 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
             "online": health.downloader_online,
             "failure": health.downloader_failure,
         },
+        "download_backends": health.downloaders.iter().map(|d| json!({
+            "id": d.id,
+            "name": d.name,
+            "online": d.online,
+            "failure": d.failure,
+        })).collect::<Vec<Value>>(),
         "importer": {"level": level_name(health.importer.level), "issues": issues},
         "navidrome": {
             "connected": health.navidrome_online,
@@ -438,6 +444,7 @@ mod tests {
                 "mcp_url": "https://music.example.com/mcp",
                 "user": {"username": "alice", "role": "user"},
                 "download_backend": {"backend": "slskd", "online": true, "failure": null},
+                "download_backends": [{"id": "slskd", "name": "Soulseek", "online": true, "failure": null}],
                 "importer": {"level": "degraded", "issues": [{"severity": "degraded", "title": "beets config check timed out",
                              "detail": "A plugin may be waiting on the network or for input."}]},
                 "navidrome": {"connected": true, "failure": null, "admin": false, "admin_failure": null, "can_trigger_scan": false,
@@ -477,6 +484,8 @@ mod tests {
         facts.health.downloader_online = false;
         facts.health.downloader_failure =
             Some(lookup.failure(Stage::SourceSearch, lookup.to_string()));
+        facts.health.downloaders[0].online = false;
+        facts.health.downloaders[0].failure = facts.health.downloader_failure.clone();
         facts.health.navidrome_online = false;
         facts.health.navidrome_failure = Some(circuit());
         facts.navidrome = Some(NavidromeFacts {
@@ -491,6 +500,11 @@ mod tests {
             doc["download_backend"],
             json!({"backend": "slskd", "online": false,
                 "failure": failure(facts.health.downloader_failure.as_ref().unwrap())})
+        );
+        assert_eq!(
+            doc["download_backends"],
+            json!([{"id": "slskd", "name": "Soulseek", "online": false,
+                "failure": failure(facts.health.downloader_failure.as_ref().unwrap())}])
         );
         assert_eq!(
             doc["navidrome"],

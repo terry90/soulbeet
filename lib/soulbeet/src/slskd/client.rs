@@ -1498,6 +1498,7 @@ impl crate::DownloadBackend for SoulseekClient {
         items: Vec<shared::download::DownloadableItem>,
         destination: &str,
         request: &str,
+        _owner: &str,
     ) -> BackendResult<Vec<shared::download::QueuedDownload>> {
         let tracks: Vec<TrackResult> = items
             .into_iter()

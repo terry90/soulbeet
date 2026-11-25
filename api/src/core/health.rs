@@ -2,25 +2,32 @@
 
 use crate::auth::UserCtx;
 use crate::core::library::navidrome_failure;
-use crate::services::{download_backend, evict_navidrome_client, navidrome_client_for_user};
+use crate::services::{
+    enabled_download_backends, evict_navidrome_client, navidrome_client_for_user, Backends,
+    Registry, DEFAULT_DOWNLOAD_BACKEND,
+};
 use dioxus::logger::tracing::debug;
+use shared::backends::BackendMeta;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::system::SystemHealth;
+use shared::system::{DownloaderHealth, SystemHealth};
 use std::future::Future;
 use std::time::Duration;
 
-/// The three probes run at once, so the answer comes after the slowest.
+/// The probes run at once, so the answer comes after the slowest.
 pub async fn system_health(ctx: &UserCtx) -> SystemHealth {
-    let ((downloader_online, downloader_failure), importer, navidrome_failure) = tokio::join!(
-        downloader_health(),
+    let (downloaders, importer, navidrome_failure) = tokio::join!(
+        downloaders_health(),
         crate::importer_health::snapshot(),
         navidrome_health(ctx),
     );
+    let default = downloaders
+        .iter()
+        .find(|d| d.id == DEFAULT_DOWNLOAD_BACKEND);
 
     SystemHealth {
-        downloader_online,
-        downloader_failure,
-        downloaders: Vec::new(),
+        downloader_online: default.is_some_and(|d| d.online),
+        downloader_failure: default.and_then(|d| d.failure.clone()),
+        downloaders,
         importer,
         navidrome_online: navidrome_failure.is_none(),
         navidrome_failure,
@@ -32,17 +39,31 @@ pub async fn system_health(ctx: &UserCtx) -> SystemHealth {
 /// promises an answer within 30 s.
 const DOWNLOADER_WAIT: Duration = Duration::from_secs(30);
 
-/// Whether the download backend can take work, and why not when it cannot:
-/// its lookup failed, its own check failed, or it gave no answer in time.
-async fn downloader_health() -> (bool, Option<Failure>) {
-    let checked = match download_backend(None).await {
-        Ok(backend) => within(DOWNLOADER_WAIT, backend.health_check()).await,
-        Err(e) => Err(e.failure(Stage::SourceSearch, e.to_string())),
-    };
-    match checked {
-        Ok(()) => (true, None),
-        Err(failure) => (false, Some(failure)),
-    }
+/// Every enabled download backend, checked at once.
+async fn downloaders_health() -> Vec<DownloaderHealth> {
+    downloaders_health_of(&Registry, &enabled_download_backends().await).await
+}
+
+/// Whether each of `enabled` can take work, and why not when it cannot: its
+/// lookup failed, its own check failed, or it gave no answer in time. One
+/// backend's answer never waits for another's.
+async fn downloaders_health_of(
+    backends: &dyn Backends,
+    enabled: &[&BackendMeta],
+) -> Vec<DownloaderHealth> {
+    futures::future::join_all(enabled.iter().map(|meta| async move {
+        let checked = match backends.get(meta.id).await {
+            Ok(backend) => within(DOWNLOADER_WAIT, backend.health_check()).await,
+            Err(e) => Err(e.failure(Stage::SourceSearch, e.to_string())),
+        };
+        DownloaderHealth {
+            id: meta.id.to_string(),
+            name: meta.name.to_string(),
+            online: checked.is_ok(),
+            failure: checked.err(),
+        }
+    }))
+    .await
 }
 
 /// `check`'s answer, or `backend_unreachable` when it takes longer than
@@ -86,6 +107,66 @@ async fn navidrome_health(ctx: &UserCtx) -> Option<Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_fns::download::test_support::{StubBackend, StubBackends};
+    use crate::services::BackendLookupError;
+    use shared::backends::{Switch, SLSKD};
+
+    #[tokio::test(start_paused = true)]
+    async fn each_backend_has_its_own_entry_and_one_down_leaves_the_other_online() {
+        const ARCHIVE: BackendMeta = BackendMeta {
+            id: "archive",
+            name: "Internet Archive",
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        const SILENT: BackendMeta = BackendMeta {
+            id: "silent",
+            name: "Silent",
+            switch: Switch::AdminToggle,
+            ..SLSKD
+        };
+        let silent = StubBackend::new(vec![]);
+        silent.hang_health_check();
+        let backends = StubBackends::default()
+            .with("slskd", StubBackend::new(vec![]))
+            .with("silent", silent);
+        backends.fail(
+            "archive",
+            BackendLookupError::Disabled("Internet Archive".into()),
+        );
+
+        let health = downloaders_health_of(&backends, &[&SLSKD, &ARCHIVE, &SILENT]).await;
+
+        let rows: Vec<(&str, &str, bool, Option<FailureCode>)> = health
+            .iter()
+            .map(|d| {
+                (
+                    d.id.as_str(),
+                    d.name.as_str(),
+                    d.online,
+                    d.failure.as_ref().map(|f| f.code),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("slskd", "Soulseek", true, None),
+                (
+                    "archive",
+                    "Internet Archive",
+                    false,
+                    Some(FailureCode::BackendNotConfigured)
+                ),
+                (
+                    "silent",
+                    "Silent",
+                    false,
+                    Some(FailureCode::BackendUnreachable)
+                ),
+            ]
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_health_check_without_an_answer_in_time_is_unreachable() {

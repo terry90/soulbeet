@@ -140,21 +140,21 @@ fn transfer_failure(code: FailureCode, retry: RetryAdvice, message: &str) -> Fai
     Failure::new(code, Stage::Transfer, retry, message)
 }
 
-/// A transfer slskd never listed.
-fn never_appeared() -> Failure {
+/// A transfer the backend whose texts name `service` never listed.
+fn never_appeared(service: &str) -> Failure {
     transfer_failure(
         FailureCode::TransferNeverAppeared,
         RetryAdvice::OtherSource,
-        "Download never appeared in slskd",
+        &format!("Download never appeared in {service}"),
     )
 }
 
-/// A transfer slskd listed and then dropped.
-fn disappeared() -> Failure {
+/// A transfer the backend whose texts name `service` listed and then dropped.
+fn disappeared(service: &str) -> Failure {
     transfer_failure(
         FailureCode::TransferDisappeared,
         RetryAdvice::SameSourceLater,
-        "Download disappeared from slskd",
+        &format!("Download disappeared from {service}"),
     )
 }
 
@@ -189,14 +189,15 @@ pub(crate) fn cancelled_on_request() -> Failure {
     )
 }
 
-/// slskd's transfer list stayed unreadable for `BACKEND_STALL_TIMEOUT`, the
-/// last read failing with `e`. Its code, advice and cause are `e`'s: a
-/// refused API key needs a person, an unreachable slskd needs time.
-fn stalled(e: &BackendError) -> Failure {
+/// The transfer list of the backend whose texts name `service` stayed
+/// unreadable for `BACKEND_STALL_TIMEOUT`, the last read failing with `e`. Its
+/// code, advice and cause are `e`'s: a refused API key needs a person, an
+/// unreachable slskd needs time.
+fn stalled(e: &BackendError, service: &str) -> Failure {
     e.failure(
         Stage::Transfer,
         format!(
-            "slskd's transfer list was unreadable for {} minutes",
+            "{service}'s transfer list was unreadable for {} minutes",
             BACKEND_STALL_TIMEOUT.as_secs() / 60
         ),
     )
@@ -208,11 +209,11 @@ fn backend_unavailable(e: &BackendLookupError) -> Failure {
     e.failure(Stage::Transfer, "Download backend unavailable")
 }
 
-/// slskd's downloads list kept failing to parse.
-fn list_unreadable(e: &BackendError) -> Failure {
+/// The downloads list of the backend whose texts name `service` kept failing to parse.
+fn list_unreadable(e: &BackendError, service: &str) -> Failure {
     e.failure(
         Stage::Transfer,
-        format!("Could not read slskd downloads list: {e}"),
+        format!("Could not read {service} downloads list: {e}"),
     )
 }
 
@@ -390,6 +391,11 @@ pub struct DownloadMonitor {
 }
 
 impl DownloadMonitor {
+    /// The service the batch's failure texts name.
+    fn service(&self) -> &str {
+        shared::backends::service(&self.batch.backend)
+    }
+
     /// Create a new download monitor. The transfers must have been enqueued
     /// into `batch.destination`. Dropping the monitor closes the batch's
     /// inbox and releases every registry key the batch holds. Every row it
@@ -617,8 +623,10 @@ impl DownloadMonitor {
                 .await
             {
                 warn!(
-                    "Failed to cancel unwatched transfer {} in slskd: {}",
-                    slot.transfer_id, e
+                    "Failed to cancel unwatched transfer {} in {}: {}",
+                    slot.transfer_id,
+                    backend.id(),
+                    e
                 );
             }
             self.abandoned.push((slot.source, slot.transfer_id));
@@ -643,19 +651,22 @@ impl DownloadMonitor {
             // never appeared in slskd", issue #73).
             *invalid_responses += 1;
             warn!(
-                "Unparseable slskd downloads list ({}/{}): {}",
-                invalid_responses, MAX_INVALID_RESPONSES, e
+                "Unparseable {} downloads list ({}/{}): {}",
+                self.batch.backend, invalid_responses, MAX_INVALID_RESPONSES, e
             );
             if *invalid_responses >= MAX_INVALID_RESPONSES {
-                return Some(list_unreadable(&e));
+                return Some(list_unreadable(&e, self.service()));
             }
         } else {
-            warn!("Error fetching download status from slskd: {}", e);
+            warn!(
+                "Error fetching download status from {}: {}",
+                self.batch.backend, e
+            );
         }
         if self.last_readable_poll.elapsed() <= BACKEND_STALL_TIMEOUT {
             return None;
         }
-        let failure = stalled(&e);
+        let failure = stalled(&e, self.service());
         warn!(
             "{} - giving up on batch {:?}",
             failure.message,
@@ -1023,11 +1034,12 @@ impl DownloadMonitor {
         // Debug logging for first few polls
         if poll_count <= 3 {
             debug!("Looking for filenames: {:?}", self.filenames());
-            let slskd_filenames: Vec<_> = downloads.iter().map(|f| &f.item).collect();
+            let listed: Vec<_> = downloads.iter().map(|f| &f.item).collect();
             debug!(
-                "slskd returned {} downloads: {:?}",
+                "{} returned {} downloads: {:?}",
+                self.batch.backend,
                 downloads.len(),
-                slskd_filenames
+                listed
             );
         }
 
@@ -1043,8 +1055,8 @@ impl DownloadMonitor {
             .count();
         if poll_count <= 3 || found != watched {
             info!(
-                "Matched {} of {} watched downloads from slskd (poll {})",
-                found, watched, poll_count
+                "Matched {} of {} watched downloads from {} (poll {})",
+                found, watched, self.batch.backend, poll_count
             );
             self.log_unmatched_files(&matched);
         }
@@ -1082,7 +1094,8 @@ impl DownloadMonitor {
             }
             if (*consecutive_empty).is_multiple_of(5) {
                 info!(
-                    "Waiting for downloads to appear in slskd, attempt {}/{} ({}/{}s)",
+                    "Waiting for downloads to appear in {}, attempt {}/{} ({}/{}s)",
+                    self.batch.backend,
                     *consecutive_empty,
                     MAX_CONSECUTIVE_EMPTY,
                     *consecutive_empty * 2,
@@ -1523,10 +1536,11 @@ impl DownloadMonitor {
                 let missing_since = self.track_states[slot]
                     .missing_since
                     .get_or_insert_with(Instant::now);
-                (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT).then(disappeared)
+                (missing_since.elapsed() > ABSENT_TRACK_TIMEOUT)
+                    .then(|| disappeared(self.service()))
             } else {
                 (self.track_states[slot].bound_at.elapsed() > ABSENT_TRACK_TIMEOUT)
-                    .then(never_appeared)
+                    .then(|| never_appeared(self.service()))
             };
 
             if let Some(failure) = absent {
@@ -1562,7 +1576,7 @@ impl DownloadMonitor {
     /// two wait. A batch with more than one track only reaches them because
     /// a sibling showed up.
     async fn retry_or_fail_absent_batch(&mut self, backend: &Arc<dyn DownloadBackend>) -> bool {
-        let failure = never_appeared();
+        let failure = never_appeared(self.service());
         let mut retried = false;
         let mut failed: Vec<DownloadProgress> = Vec::new();
 
@@ -1742,8 +1756,10 @@ impl DownloadMonitor {
                 .await
             {
                 warn!(
-                    "Failed to remove finished transfer {} from slskd: {}",
-                    tracked.transfer_id, e
+                    "Failed to remove finished transfer {} from {}: {}",
+                    tracked.transfer_id,
+                    backend.id(),
+                    e
                 );
             }
             self.track_states[*slot].phase = SlotPhase::HandedOff;
@@ -1844,8 +1860,10 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         .await
     {
         warn!(
-            "Failed to remove finished transfer {} from slskd: {}",
-            h.row.id, e
+            "Failed to remove finished transfer {} from {}: {}",
+            h.row.id,
+            backend.id(),
+            e
         );
     }
     let job = import_job(
@@ -1892,8 +1910,10 @@ pub(crate) async fn cancel_abandoned(
 ) {
     if let Err(e) = backend.cancel_download(peer, transfer_id, false).await {
         warn!(
-            "Failed to cancel abandoned transfer {} in slskd: {}",
-            transfer_id, e
+            "Failed to cancel abandoned transfer {} in {}: {}",
+            transfer_id,
+            backend.id(),
+            e
         );
     }
 }
@@ -1925,7 +1945,8 @@ pub(crate) async fn await_ended(
         }
         if Instant::now() >= deadline {
             warn!(
-                "slskd had not ended every cancelled transfer after {:?}",
+                "{} had not ended every cancelled transfer after {:?}",
+                backend.id(),
                 CANCEL_SETTLE
             );
             return;
@@ -1977,8 +1998,10 @@ pub(crate) async fn remove_ended_transfers(
             .await
         {
             warn!(
-                "Failed to remove finished transfer {} from slskd: {}",
-                entry.id, e
+                "Failed to remove finished transfer {} from {}: {}",
+                entry.id,
+                backend.id(),
+                e
             );
         }
     }
@@ -3109,7 +3132,7 @@ mod tests {
             .expect("delivered");
 
         // The watched slot fails without a listed row, the undrained one is stopped.
-        m.fail_unprocessed_tracks(never_appeared());
+        m.fail_unprocessed_tracks(never_appeared("slskd"));
         m.close_inbox();
 
         let mut sent = Vec::new();
@@ -3732,19 +3755,44 @@ mod tests {
     }
 
     #[test]
+    fn monitor_failures_name_the_service_of_the_batchs_backend() {
+        let e: BackendError = StubFault { unreadable: true }.into();
+        for (f, message) in [
+            (
+                never_appeared("archive.org"),
+                "Download never appeared in archive.org",
+            ),
+            (
+                disappeared("archive.org"),
+                "Download disappeared from archive.org",
+            ),
+            (
+                stalled(&e, "AirDC++"),
+                "AirDC++'s transfer list was unreadable for 10 minutes",
+            ),
+            (
+                list_unreadable(&e, "AirDC++"),
+                "Could not read AirDC++ downloads list: stub answer unreadable",
+            ),
+        ] {
+            assert_eq!(f.message, message);
+        }
+    }
+
+    #[test]
     fn monitor_failures_keep_their_text() {
         use RetryAdvice::*;
         let e: BackendError = SoulseekError::InvalidResponse("bad json".into()).into();
         let unreadable = format!("Could not read slskd downloads list: {e}");
         for (f, code, retry, message) in [
             (
-                never_appeared(),
+                never_appeared("slskd"),
                 FailureCode::TransferNeverAppeared,
                 OtherSource,
                 "Download never appeared in slskd",
             ),
             (
-                disappeared(),
+                disappeared("slskd"),
                 FailureCode::TransferDisappeared,
                 SameSourceLater,
                 "Download disappeared from slskd",
@@ -3762,7 +3810,7 @@ mod tests {
                 "Waited 15 minutes in the source's queue",
             ),
             (
-                stalled(&e),
+                stalled(&e, "slskd"),
                 FailureCode::TransferListUnreadable,
                 NotRetryable,
                 "slskd's transfer list was unreadable for 10 minutes",
@@ -3774,7 +3822,7 @@ mod tests {
                 "Download backend unavailable",
             ),
             (
-                list_unreadable(&e),
+                list_unreadable(&e, "slskd"),
                 FailureCode::TransferListUnreadable,
                 NotRetryable,
                 unreadable.as_str(),

@@ -78,12 +78,15 @@ pub trait DownloadBackend: Send + Sync {
     /// Enqueue `items` into `destination`, a folder under the backend's
     /// download directory shared by every item of the call. `request` is
     /// one `new_request` gave, for this call only: every transfer the call
-    /// makes is listed with it as `DownloadProgress::request`.
+    /// makes is listed with it as `DownloadProgress::request`. `owner` is the
+    /// id of the user the batch is for, opaque, only for sharing the backend
+    /// fairly between users: never logged and never sent out.
     async fn download(
         &self,
         items: Vec<DownloadableItem>,
         destination: &str,
         request: &str,
+        owner: &str,
     ) -> BackendResult<Vec<QueuedDownload>>;
     /// Transfers held for the given peers. Scoped rather than global: the
     /// backend's full list grows with its whole history, and every caller

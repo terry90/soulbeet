@@ -30,7 +30,7 @@ use crate::server_fns::download::process::{
     find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use crate::server_fns::download::utils::{FileId, Unresolved};
-use crate::services::{BackendCache, Backends, Registry};
+use crate::services::{BackendCache, Backends, Registry, DEFAULT_DOWNLOAD_BACKEND};
 use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner, TransferRegistry};
 use async_trait::async_trait;
 use shared::download::{
@@ -46,14 +46,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
-/// A transfer Soulful watched before it stopped is gone from slskd.
-pub(crate) fn transfer_lost() -> Failure {
+/// A transfer Soulful watched before it stopped is gone from the backend whose texts name
+/// `service`.
+pub(crate) fn transfer_lost(service: &str) -> Failure {
     Failure::new(
         FailureCode::ServerRestarted,
         Stage::Transfer,
         RetryAdvice::SameSourceLater,
-        "Soulbeet restarted and slskd no longer has this download",
+        format!("Soulbeet restarted and {service} no longer has this download"),
     )
+}
+
+/// The service a lost slot's text names: its pick's backend's, else its row's, else the default
+/// backend's, which every row stored before rows named their backend came from.
+fn lost_from(record: &SlotRecord) -> &str {
+    let backend = current_pick(record)
+        .map(|pick| pick.backend.as_str())
+        .or_else(|| record.row.as_ref()?.backend.as_deref())
+        .unwrap_or(DEFAULT_DOWNLOAD_BACKEND);
+    shared::backends::service(backend)
 }
 
 /// An import Soulful ran when it stopped has no files left to import (D10).
@@ -235,7 +246,10 @@ pub(crate) async fn resume_downloads(
             Err(why) if lookup.row.state == DownloadState::Completed => {
                 resumed.failed.push(unresolved_row(lookup.row, base, why))
             }
-            Err(_) => resumed.failed.push(lookup.row.failed_with(transfer_lost())),
+            Err(_) => {
+                let lost = transfer_lost(shared::backends::service(&batch.backend));
+                resumed.failed.push(lookup.row.failed_with(lost))
+            }
         }
     }
     for (slot, record) in queued {
@@ -779,7 +793,8 @@ pub(crate) async fn resume_unfinished(
                     let backend = current_pick(&record).map(|pick| pick.backend.clone());
                     let (Some((batch_id, label)), Some(backend)) = (named.or(recorded), backend)
                     else {
-                        fail_slots(ledger, &user, &[(slot, record)], &transfer_lost()).await;
+                        let lost = transfer_lost(lost_from(&record));
+                        fail_slots(ledger, &user, &[(slot, record)], &lost).await;
                         continue;
                     };
                     batch_of(&mut downloads, &job, &batch_id, &label, &backend).add(
@@ -1178,7 +1193,7 @@ mod tests {
     use crate::server_fns::download::test_support::{
         batch, group, item, item_on, transfer, StubBackend, StubBackends,
     };
-    use crate::services::{BackendLookupError, DEFAULT_DOWNLOAD_BACKEND};
+    use crate::services::BackendLookupError;
     use shared::download::{DownloadQuery, DownloadState, DownloadableItem, JobSlot};
     use shared::failure::{FailureCode, RetryAdvice, Stage};
     use soulbeet::{DriverChoice, DuplicateRun, ImportedItem};
@@ -1310,7 +1325,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.item.as_str(), r.failure.clone()))
                 .collect::<Vec<_>>(),
-            vec![("a/02.flac", Some(transfer_lost()))]
+            vec![("a/02.flac", Some(transfer_lost("slskd")))]
         );
         assert_eq!(resumed.failed[0].job, Some(slot(1)));
     }
@@ -1390,7 +1405,7 @@ mod tests {
     fn restart_failures_say_where_the_work_stopped() {
         for (f, stage, retry, message) in [
             (
-                transfer_lost(),
+                transfer_lost("slskd"),
                 Stage::Transfer,
                 RetryAdvice::SameSourceLater,
                 "Soulbeet restarted and slskd no longer has this download",
