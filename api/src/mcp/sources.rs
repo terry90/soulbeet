@@ -1307,7 +1307,8 @@ mod tests {
             "query_text never reaches the lookup"
         );
         // A lookup MusicBrainz can answer later offers the same call: musicbrainz_rs gave up
-        // retrying its 503 answers (src/error.rs:20, lib/soulbeet/src/musicbrainz.rs:111-117).
+        // retrying its 503 answers, which `From<musicbrainz_rs::Error>` makes RateLimited with
+        // the crate's text as raw. The kind decides the call offered; the message is Soulbeet's.
         effects.fail_hydrate(MetadataError::RateLimited {
             service: Service::Musicbrainz,
             status: None,
@@ -1315,11 +1316,12 @@ mod tests {
         });
         let error = document(&find().await)["error"].clone();
         assert_eq!(
-            (error["code"].as_str(), &error["next"]),
+            (error["code"].as_str(), &error["next"], error["message"].as_str()),
             (
                 Some("metadata_rate_limited"),
                 &json!([{"tool": "find_sources", "args": {"reference": reference,
-                    "query_text": "kowloon come over"}}])
+                    "query_text": "kowloon come over"}}]),
+                Some("could not resolve tracklist for 'Come Over': MusicBrainz is busy. Try again shortly.")
             ),
             "{error}"
         );

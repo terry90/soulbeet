@@ -1237,6 +1237,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn musicbrainz_busy_past_the_clients_retries_is_said_in_soulbeets_words() {
+        let e = MetadataError::from(musicbrainz_rs::Error::MaxRetriesExceeded);
+        assert_eq!(e.to_string(), "MusicBrainz is busy. Try again shortly.");
+        // The client's own text stays the cause.
+        let f = e.failure(shared::failure::Stage::Metadata, e.to_string());
+        assert_eq!(
+            f.cause.map(|c| c.raw),
+            Some(musicbrainz_rs::Error::MaxRetriesExceeded.to_string())
+        );
+    }
+
     /// GET https://musicbrainz.org/ws/2/recording/4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8?inc=artists&fmt=json
     const RECORDING: &str = r#"{"title":"Silent Night","length":149000,"video":false,"first-release-date":"1995","id":"4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8","disambiguation":"","artist-credit":[{"artist":{"disambiguation":"","country":"US","sort-name":"Crosby, Bing","type-id":"b6e035f4-3ce9-331c-97df-83397230b0df","name":"Bing Crosby","id":"2437980f-513a-44fc-80f1-b90d9d7fcf8f","type":"Person"},"name":"Bing Crosby","joinphrase":""}]}"#;
     /// GET https://musicbrainz.org/ws/2/release?recording=4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8&inc=release-groups&limit=2&offset=0&fmt=json
