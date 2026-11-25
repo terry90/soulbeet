@@ -4,6 +4,7 @@
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, Tag, TagExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// The tags of the track a file was fetched for, from the metadata the search was for.
@@ -16,15 +17,45 @@ pub struct WantedTags {
     pub track_no: Option<u32>,
     pub track_total: Option<u32>,
     pub date: Option<String>,
-    /// Set only when the file is a `close_match` of the recording: the importer trusts it.
-    pub recording_mbid: Option<String>,
-    /// Set only when the file is a `close_match` of the release.
-    pub release_mbid: Option<String>,
+    /// The MusicBrainz ids of the wanted track, with how well the file matched it.
+    pub musicbrainz: Option<MusicBrainzIds>,
     pub comment: Option<String>,
+}
+
+/// The ids of the wanted recording and release, and the match facts that decide whether the
+/// file carries them: the importer trusts these ids, so a loose match must not.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MusicBrainzIds {
+    pub recording: String,
+    pub release: String,
+    /// The file's title score against the wanted title.
+    pub title_score: f64,
+    /// The file's album score against the wanted album.
+    pub album_score: f64,
+    /// How far the file's length is from the wanted one, when both are known.
+    pub length_diff_s: Option<u32>,
+}
+
+impl MusicBrainzIds {
+    /// Title and album scores of 0.8 or more, and a known length within 3 s.
+    fn close_match(&self) -> bool {
+        self.title_score >= 0.8
+            && self.album_score >= 0.8
+            && self.length_diff_s.is_some_and(|d| d <= 3)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum TagError {
+    /// The file has another name too, a landed file most likely: tags are written only on a
+    /// partial file before it lands.
+    #[error("{path} has more than one link, so its tags are not written")]
+    Linked { path: String },
+    #[error("could not read {path}: {source}")]
+    Stat {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("could not read the tags of {path}: {source}")]
     Read {
         path: String,
@@ -38,9 +69,19 @@ pub enum TagError {
 }
 
 /// Replaces every tag of the file at `path` with `tags`: Vorbis comments for FLAC and Ogg Opus,
-/// ID3v2.4 for MP3.
+/// ID3v2.4 for MP3. The MusicBrainz ids go in only on a close match. A file with more than one
+/// link is refused, so a part that already landed is never rewritten.
 pub fn write_tags(path: &Path, tags: &WantedTags) -> Result<(), TagError> {
     let shown = || path.display().to_string();
+    let links = std::fs::metadata(path)
+        .map_err(|source| TagError::Stat {
+            path: shown(),
+            source,
+        })?
+        .nlink();
+    if links > 1 {
+        return Err(TagError::Linked { path: shown() });
+    }
     let read = |source| TagError::Read {
         path: shown(),
         source,
@@ -57,6 +98,7 @@ pub fn write_tags(path: &Path, tags: &WantedTags) -> Result<(), TagError> {
             .map_err(write)?;
     }
     let mut tag = Tag::new(file.primary_tag_type());
+    let ids = tags.musicbrainz.as_ref().filter(|m| m.close_match());
     let texts = [
         (ItemKey::TrackTitle, Some(tags.title.clone())),
         (ItemKey::TrackArtist, Some(tags.artist.clone())),
@@ -65,8 +107,14 @@ pub fn write_tags(path: &Path, tags: &WantedTags) -> Result<(), TagError> {
         (ItemKey::TrackNumber, tags.track_no.map(|n| n.to_string())),
         (ItemKey::TrackTotal, tags.track_total.map(|n| n.to_string())),
         (ItemKey::RecordingDate, tags.date.clone()),
-        (ItemKey::MusicBrainzRecordingId, tags.recording_mbid.clone()),
-        (ItemKey::MusicBrainzReleaseId, tags.release_mbid.clone()),
+        (
+            ItemKey::MusicBrainzRecordingId,
+            ids.map(|m| m.recording.clone()),
+        ),
+        (
+            ItemKey::MusicBrainzReleaseId,
+            ids.map(|m| m.release.clone()),
+        ),
         (ItemKey::Comment, tags.comment.clone()),
     ];
     for (key, text) in texts {
@@ -75,12 +123,6 @@ pub fn write_tags(path: &Path, tags: &WantedTags) -> Result<(), TagError> {
         }
     }
     tag.save_to_path(path, options).map_err(write)
-}
-
-/// Whether a file matched its wanted track closely enough to carry the MusicBrainz ids: title
-/// and album scores of 0.8 or more, and a known length within 3 s.
-pub fn close_match(title_score: f64, album_score: f64, length_diff_s: Option<u32>) -> bool {
-    title_score >= 0.8 && album_score >= 0.8 && length_diff_s.is_some_and(|d| d <= 3)
 }
 
 #[cfg(test)]
@@ -222,8 +264,13 @@ mod tests {
             track_no: Some(7),
             track_total: Some(11),
             date: Some("2026-03-13".into()),
-            recording_mbid: Some("5c0e0f5c-8c35-4b1d-9d0a-1f6f2a8b9c01".into()),
-            release_mbid: Some("2b4e4a77-0e57-4d3e-8b4f-5d2f7c9e3a10".into()),
+            musicbrainz: Some(MusicBrainzIds {
+                recording: "5c0e0f5c-8c35-4b1d-9d0a-1f6f2a8b9c01".into(),
+                release: "2b4e4a77-0e57-4d3e-8b4f-5d2f7c9e3a10".into(),
+                title_score: 1.0,
+                album_score: 1.0,
+                length_diff_s: Some(1),
+            }),
             comment: Some("Lossy: test".into()),
         }
     }
@@ -304,7 +351,8 @@ mod tests {
 
     #[test]
     fn musicbrainz_ids_go_only_on_a_close_match() {
-        for (title, album, diff, close) in [
+        let dir = tempfile::tempdir().unwrap();
+        for (title_score, album_score, length_diff_s, written) in [
             (0.8, 0.8, Some(3), true),
             (1.0, 0.95, Some(0), true),
             (0.79, 1.0, Some(0), false),
@@ -312,26 +360,49 @@ mod tests {
             (1.0, 1.0, Some(4), false),
             (1.0, 1.0, None, false),
         ] {
-            assert_eq!(
-                close_match(title, album, diff),
-                close,
-                "{title} {album} {diff:?}"
-            );
-        }
+            let path = dir.path().join("a.flac");
+            std::fs::write(&path, flac_of_silence(1)).unwrap();
+            let mut tags = wanted();
+            let ids = tags.musicbrainz.as_mut().unwrap();
+            (ids.title_score, ids.album_score, ids.length_diff_s) =
+                (title_score, album_score, length_diff_s);
 
+            write_tags(&path, &tags).unwrap();
+
+            let (_, tag) = read_back(&path);
+            let case = format!("{title_score} {album_score} {length_diff_s:?}");
+            assert_eq!(text(&tag, ItemKey::TrackTitle), Some("Wake Up"), "{case}");
+            for (key, id) in [
+                (
+                    ItemKey::MusicBrainzRecordingId,
+                    "5c0e0f5c-8c35-4b1d-9d0a-1f6f2a8b9c01",
+                ),
+                (
+                    ItemKey::MusicBrainzReleaseId,
+                    "2b4e4a77-0e57-4d3e-8b4f-5d2f7c9e3a10",
+                ),
+            ] {
+                assert_eq!(text(&tag, key), written.then_some(id), "{case} {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_with_another_link_keeps_its_tags() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.flac");
-        std::fs::write(&path, flac_of_silence(1)).unwrap();
-        let loose = WantedTags {
-            recording_mbid: None,
-            release_mbid: None,
-            ..wanted()
-        };
-        write_tags(&path, &loose).unwrap();
-        let (_, tag) = read_back(&path);
-        assert_eq!(text(&tag, ItemKey::TrackTitle), Some("Wake Up"));
-        assert_eq!(text(&tag, ItemKey::MusicBrainzRecordingId), None);
-        assert_eq!(text(&tag, ItemKey::MusicBrainzReleaseId), None);
+        let part = dir.path().join("t1");
+        std::fs::write(&part, flac_of_silence(1)).unwrap();
+        let mut old = Tag::new(TagType::VorbisComments);
+        old.insert_text(ItemKey::TrackTitle, "As landed".into());
+        old.save_to_path(&part, WriteOptions::default()).unwrap();
+        let landed = dir.path().join("01.flac");
+        std::fs::hard_link(&part, &landed).unwrap();
+        let before = std::fs::read(&landed).unwrap();
+
+        let e = write_tags(&part, &wanted()).unwrap_err();
+
+        assert!(matches!(e, TagError::Linked { .. }), "{e}");
+        assert_eq!(std::fs::read(&landed).unwrap(), before);
     }
 
     #[test]
