@@ -33,12 +33,26 @@ slskd URL and API key are configured through the web UI (Settings > Config) and 
 
 ## Download sources
 
-Soulseek, through slskd, is always on. Every other download source is off until an admin turns it on in Settings > Config > Connections, under the slskd settings; turning one on asks first. A source that is on is searched by auto-download next to Soulseek, and the status line under the search bar has a row for it.
+Soulseek, through slskd, is always on. Every other download source is off until an admin turns it on in Settings > Config > Connections, under the slskd settings; turning one on asks first. A source that is on is searched by auto-download next to Soulseek, and the status line under the search bar has a row for it. A source whose files are lossy only, YouTube Music, is searched only when no other source has a match auto-download would take.
 
 Turning a source off stops its searches and its unfinished downloads and deletes their partial files. Downloads still waiting on it fail with "{name} is turned off in Settings > Config > Connections". Files it finished stay where they are.
 
 ### Internet Archive
 
 Downloads original files that uploaders gave archive.org, each checked against archive.org's md5 before it is imported; see [archive.md](archive.md) for what it offers and how it behaves. It needs no account and no address. Partial files sit in `DOWNLOAD_PATH/.soulful-partial/`, so `DOWNLOAD_PATH` must be writable by Soulbeet and have room for the files being downloaded. `ARCHIVE_HOST` (`host:port`, reached over http) points it at a test double instead of archive.org; leave it unset.
+
+### YouTube Music
+
+Searches YouTube Music and downloads Opus audio at about 130 kbps through yt-dlp, anonymously; see [ytdlp.md](ytdlp.md). YouTube's Terms of Service forbid downloading from it: turning it on is the admin's choice. Only the `:full` image has the tools it needs; in another image it says "Not in this image: use the :full image" on its status line and downloads nothing. Each user chooses in Settings > Library what auto-download does when only YouTube Music has an album: never use it, ask (the default), or download automatically. Its staging files sit in `DOWNLOAD_PATH/.soulful-partial/`, like the Internet Archive's.
+
+The paths of its tools, which the `:full` image sets up; change them only to run the helper elsewhere:
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `YTDLP_PYTHON` | The Python 3.11 or later that runs the helper | `/usr/bin/python3` |
+| `YTDLP_SITE_PACKAGES` | The folder that holds yt-dlp, yt-dlp-ejs and ytmusicapi, apart from beets' packages | `/opt/ytdlp/lib/python3.11/site-packages` |
+| `YTDLP_DENO` | The deno that runs YouTube's player code for yt-dlp, with no permissions | `/opt/ytdlp/bin/deno` |
+
+ffmpeg is the one on `PATH` (`/usr/local/bin/ffmpeg` in `:full`).
 
 How a download source plugs in is in [download-backends.md](download-backends.md).

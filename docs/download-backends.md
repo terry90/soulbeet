@@ -6,6 +6,7 @@ The backends in this build:
 
 - `slskd`, Soulseek through the user's slskd server ([configuration.md](configuration.md#settings-in-the-web-ui)).
 - `archive`, the Internet Archive ([archive.md](archive.md)): searches archive.org and downloads in Soulbeet's own engine, with partial files in `PartialDir` and its transfers in the transfer book, so a restart resumes them.
+- `ytdlp`, YouTube Music ([ytdlp.md](ytdlp.md)): lossy only. A Python helper runs ytmusicapi and yt-dlp, one child process per call; its queue is in memory, so a restart loses what was not finished, and its staging folders are in `PartialDir`.
 
 ## The contract
 
@@ -25,6 +26,12 @@ A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app r
 - Failures, their causes and health answers are shown to every user and written to the log, so they never hold a key, a password or a URL with credentials in it.
 - An item `download` cannot send gets no answer, and the caller fails it.
 
+A backend whose meta says `Delivery::LossyOnly` is a last resort, by its meta and never by its id:
+
+- auto-download searches it only when no group of the other backends would be picked (a score of `AUTO_SELECT_SCORE_THRESHOLD` or more), and lists its groups after every other group;
+- one of its groups is picked without the user only when the user's `lossy_fallback` setting is `auto`; with `never` it is not searched at all;
+- each of its batches gets `DuplicateRule::Skip` (`DuplicateRule::for_delivery`), whatever started it, so beets skips what the library has and no lossy file replaces a copy.
+
 Failure texts the app writes for a backend name its `BackendMeta::service` ("Download never appeared in slskd"). A backend's own errors implement `BackendFault`. A file whose bytes do not match the checksum its source gave fails with `transfer_checksum_mismatch`; a full disk with `download_disk_full` and the user action `free_disk_space`.
 
 ## Shared pieces
@@ -36,6 +43,7 @@ Failure texts the app writes for a backend name its `BackendMeta::service` ("Dow
 - `soulbeet::tags`: `write_tags` replaces a file's tags (FLAC, MP3, Ogg Opus). It runs on a part before `land`, and refuses a file with more than one link. The MusicBrainz ids go in only when the match facts given with them make a close match (title and album scores of 0.8 or more, a known length within 3 s).
 - `soulbeet::matching`: path, title, length and version matching, and `assign_tracks`, which gives each wanted track the best file no other track took.
 - `soulbeet::TransferBook`: records a backend keeps across restarts, in the `backend_transfers` table (`services::transfer_book()`).
+- `soulbeet::process::ProcessGroup`: a child process in a process group of its own, killed as a whole when the guard drops. beets and the YouTube Music helper run in one, so a cancel, a timeout or a turn-off ends every process they started.
 
 ## Building a backend
 
@@ -44,7 +52,7 @@ Failure texts the app writes for a backend name its `BackendMeta::service` ("Dow
 - Resume, prune and `clear_except` run once, when the engine is first created, never on a rebuild of the handle. A rebuild while transfers run must not touch their parts or their book entries.
 - An engine that keeps partial files opens its `PartialDir` before anything else. On any error (another server holds the lock, the downloads folder cannot be written) the backend reports it as its health failure and touches neither the book nor any file.
 - A build holds up the lookups of its own id only, so keep it short and never look the same backend up from inside it.
-- The Internet Archive engine (`soulbeet::archive::ENGINE`) is the model: the build starts it once and wraps each handle around it; the handle keeps the generation it was built in, and the engine's stop bumps the generation, so an older handle's `download` and `start_search` fail with `backend_not_configured`. When the backend is turned off before anything built it since a restart, its stop arm still forgets the unfinished transfers the previous run left in the book, and deletes their partial files.
+- The Internet Archive engine (`soulbeet::archive::ENGINE`) is the model, and the YouTube Music one (`soulbeet::ytdlp::ENGINE`) follows it: the build starts it once and wraps each handle around it; the handle keeps the generation it was built in, and the engine's stop bumps the generation, so an older handle's `download` and `start_search` fail with `backend_not_configured`. When the backend is turned off before anything built it since a restart, its stop arm still forgets the unfinished transfers the previous run left in the book, and deletes their partial files.
 
 ## Where a backend plugs in
 
