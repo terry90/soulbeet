@@ -5,12 +5,18 @@
 //! compressed again on every request. Everything else is gzipped here as it
 //! is sent: pages, server function answers, and the bundled files for
 //! clients that do not take br, which browsers often leave out on plain http.
+//! Images and fonts go as stored: they are compressed already (woff2 is
+//! brotli inside), and gzip only costs time on them.
 
+use std::sync::LazyLock;
+
+use axum::extract::Request;
 use axum::http::header::{CONTENT_ENCODING, VARY};
 use axum::http::HeaderValue;
-use axum::middleware::map_response;
+use axum::middleware::{from_fn, Next};
 use axum::response::Response;
 use axum::Router;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 
 /// `router` with its answers gzipped for clients that take gzip.
@@ -21,21 +27,37 @@ use tower_http::compression::CompressionLayer;
 /// Pages render in full before they are sent (Dioxus streaming is off), so
 /// gzip holds none of them back either.
 pub(crate) fn compress(router: Router) -> Router {
-    router
-        .layer(map_response(vary_on_encoding))
-        .layer(CompressionLayer::new().no_br())
+    let worth_compressing = DefaultPredicate::new().and(NotForContentType::const_new("font/woff2"));
+    router.layer(from_fn(vary_on_encoding)).layer(
+        CompressionLayer::new()
+            .no_br()
+            .compress_when(worth_compressing),
+    )
 }
 
-/// Dioxus sends a file's brotli copy without `Vary: Accept-Encoding`, and a
-/// shared cache would then hand brotli to a client that never asked for it.
-async fn vary_on_encoding(mut response: Response) -> Response {
+/// Where Dioxus serves the bundled files: the path manganis puts in front
+/// of each asset URL.
+static BUNDLED: LazyLock<String> = LazyLock::new(|| match dioxus::cli_config::base_path() {
+    Some(base) if !base.trim_matches('/').is_empty() => {
+        format!("/{}/assets/", base.trim_matches('/'))
+    }
+    _ => "/assets/".to_owned(),
+});
+
+/// Dioxus picks between a bundled file and its brotli copy by
+/// Accept-Encoding but says so in neither answer, and a shared cache could
+/// then hand the brotli copy to a client that never asked for it. So every
+/// bundled file varies on it, and so does any other answer sent encoded.
+async fn vary_on_encoding(request: Request, next: Next) -> Response {
+    let bundled = request.uri().path().starts_with(BUNDLED.as_str());
+    let mut response = next.run(request).await;
     let headers = response.headers_mut();
     let varies = headers.get_all(VARY).iter().any(|value| {
         value
             .to_str()
             .is_ok_and(|value| value.to_ascii_lowercase().contains("accept-encoding"))
     });
-    if headers.contains_key(CONTENT_ENCODING) && !varies {
+    if (bundled || headers.contains_key(CONTENT_ENCODING)) && !varies {
         headers.append(VARY, HeaderValue::from_static("accept-encoding"));
     }
     response
@@ -62,11 +84,16 @@ mod tests {
     use super::*;
 
     const CSS: &str = "/assets/tailwind.css";
+    const FONT: &str = "/assets/CommitMono-Variable.woff2";
     /// Long enough to be worth compressing, were it not already.
     const STORED: &[u8] = &[0x1b; 256];
 
     fn css_on_disk() -> Vec<u8> {
         std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/tailwind.css")).unwrap()
+    }
+
+    fn font_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/CommitMono-Variable.woff2")
     }
 
     #[component]
@@ -87,17 +114,23 @@ mod tests {
             .chain(futures::stream::pending())
     }
 
-    /// A page rendered by Dioxus, the stylesheet served the way Dioxus serves
-    /// each bundled file (dioxus-server `serve_dir_cached`), an answer that
-    /// is already brotli, and an event stream.
+    /// A page rendered by Dioxus, the stylesheet and a font served the way
+    /// Dioxus serves each bundled file (dioxus-server `serve_dir_cached`),
+    /// answers outside the bundle sent as brotli or as stored, and an event
+    /// stream.
     fn app() -> Router {
         let css = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/tailwind.css");
         compress(
             Router::new()
                 .route_service(CSS, ServeFile::new(css).precompressed_br())
+                .route_service(FONT, ServeFile::new(font_path()).precompressed_br())
                 .route(
-                    "/assets/copy.br",
+                    "/encoded",
                     get(|| async { ([(CONTENT_ENCODING, "br")], Bytes::from(STORED)) }),
+                )
+                .route(
+                    "/stored",
+                    get(|| async { ([("content-type", "image/png")], Bytes::from(STORED)) }),
                 )
                 .route(
                     "/assets/varies.br",
@@ -164,6 +197,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_font_is_sent_as_stored_and_varies_on_accept_encoding() {
+        for accept_encoding in [Some("gzip, deflate"), Some("gzip, br"), None] {
+            let response = get_with(FONT, accept_encoding).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "font/woff2");
+            assert_eq!(encoding(response.headers()), None);
+            assert!(
+                varies_on_encoding(response.headers()),
+                "{accept_encoding:?}"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body, std::fs::read(font_path()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_sent_as_stored_outside_the_bundle_does_not_vary() {
+        let response = get_with("/stored", Some("gzip, br")).await;
+        assert_eq!(encoding(response.headers()), None);
+        assert!(!varies_on_encoding(response.headers()));
+    }
+
+    #[tokio::test]
     async fn a_page_is_gzipped_for_a_client_that_takes_gzip_and_sent_as_is_otherwise() {
         let gzipped = get_with("/", Some("gzip")).await;
         assert_eq!(gzipped.status(), StatusCode::OK);
@@ -185,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_answer_already_encoded_is_sent_as_stored_and_varies_on_accept_encoding() {
-        let response = get_with("/assets/copy.br", Some("gzip, br")).await;
+        let response = get_with("/encoded", Some("gzip, br")).await;
         assert_eq!(encoding(response.headers()), Some("br"));
         assert!(varies_on_encoding(response.headers()));
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

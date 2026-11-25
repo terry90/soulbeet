@@ -24,6 +24,7 @@ use views::{
 mod auth;
 #[cfg(feature = "server")]
 mod compression;
+mod fonts;
 mod views;
 #[cfg(feature = "web")]
 mod websocket;
@@ -118,6 +119,7 @@ fn App() -> Element {
         // it) covers the rest.
         document::Link { rel: "icon", href: FAVICON, sizes: "16x16 32x32 48x48 256x256" }
         document::Link { rel: "icon", href: ui::LOGO, r#type: "image/svg+xml" }
+        fonts::Fonts {}
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
         document::Title { "SoulBeet" }

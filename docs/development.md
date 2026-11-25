@@ -22,7 +22,7 @@ This page covers running Soulbeet from source, running the tests and refreshing 
 
 ## Refreshing the screenshots
 
-The pictures in [screenshots](../screenshots) are taken on the e2e stub stack, so they need no running Soulbeet, no account and no real service. The specs register their own account, search the stub MusicBrainz for "Night Garden" (fixture albums kept for the pictures) and stage the rest in the browser: drawn covers, the downloads panel part way through an album, a Navidrome library for the dashboard and its health, two folders, and the fonts and version check the app fetches from the internet. The downloader and beets report their real health.
+The pictures in [screenshots](../screenshots) are taken on the e2e stub stack, so they need no running Soulbeet, no account and no real service. The specs register their own account, search the stub MusicBrainz for "Night Garden" (fixture albums kept for the pictures) and stage the rest in the browser: drawn covers, the downloads panel part way through an album, a Navidrome library for the dashboard and its health, two folders, and the version check the app fetches from the internet. The downloader and beets report their real health.
 
 1.  Build the app (the stack runs the release binary) from the repository root:
     ```bash

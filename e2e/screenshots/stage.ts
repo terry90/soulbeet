@@ -1,12 +1,11 @@
 // What the pictures need that the stub stack does not have, answered in the
-// browser. stageOutside answers the outside world (fonts and the footer's
-// version check) and refuses and lists anything else the page asks of another
-// host, so no picture depends on the network. stageApp answers a Navidrome
+// browser. stageOutside answers the outside world (the footer's version
+// check) and refuses and lists anything else the page asks of another host,
+// so no picture depends on the network. stageApp answers a Navidrome
 // (its health, the account's link and the dashboard's library), folders with
 // tidy paths and release notes already read.
 
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type { Page, Route } from '@playwright/test';
 import { expect } from '@playwright/test';
@@ -39,20 +38,6 @@ const LIBRARY_STATS = {
   ],
 };
 
-const fontPackage = dirname(createRequire(import.meta.url).resolve('@fontsource/space-grotesk/package.json'));
-const FONT_HOST = 'https://fonts.gstatic.com/fontsource/space-grotesk';
-
-/**
- * The stylesheet the app imports from Google Fonts (Space Grotesk at 300,
- * 500 and 700), served from the @fontsource package.
- */
-function fontStylesheet(): string {
-  return ['300', '500', '700']
-    .map((weight) => readFileSync(join(fontPackage, `${weight}.css`), 'utf8'))
-    .join('\n')
-    .replace(/url\(\.\/files\//g, `url(${FONT_HOST}/`);
-}
-
 /** Changes the JSON object the app answers `route` with by `edit`. */
 async function edited(route: Route, edit: (body: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
   const response = await route.fetch();
@@ -76,12 +61,6 @@ export async function stageOutside(page: Page): Promise<string[]> {
     },
   );
 
-  await page.route('https://fonts.googleapis.com/css2?*', (route) =>
-    route.fulfill({ contentType: 'text/css', body: fontStylesheet() }),
-  );
-  await page.route(`${FONT_HOST}/*`, (route) =>
-    route.fulfill({ path: join(fontPackage, 'files', new URL(route.request().url()).pathname.split('/').pop() as string) }),
-  );
   // The footer compares its version with the one on GitHub: the same, here.
   await page.route('https://raw.githubusercontent.com/**/api/Cargo.toml', (route) =>
     route.fulfill({ contentType: 'text/plain', body: readFileSync(join(dirname(e2eRoot), 'api', 'Cargo.toml'), 'utf8') }),

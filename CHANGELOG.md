@@ -10,7 +10,7 @@ An artist alone now lists their albums, the search bar is rebuilt as one layout 
 - **New search bar**: The artist filter opens with a tap on Artist, the download folder can be picked on phones too, and the three service lights are now one status line that opens to the details.
 - **Lighter pages**: The background glows are drawn without a blur filter, which Safari on iOS 26 could stall on for seconds, and the closed downloads drawer is no longer kept on screen.
 - **Typing and sign-in on phones**: Fields no longer make Safari zoom in, and password managers can fill and save the login and password forms.
-- **Faster first load**: The app is sent compressed, at about a third of its size.
+- **Faster first load**: The app is sent compressed, at about a third of its size. Its fonts, Space Grotesk and the new Commit Mono for the monospaced text, come with it instead of from Google, so pages look the same offline.
 
 ## 0.10.0 - 2026-11-22
 

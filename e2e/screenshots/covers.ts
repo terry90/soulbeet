@@ -5,14 +5,14 @@
 // Night Garden, so neighbouring releases look different, every run draws the
 // same covers, and Night Garden, which opens the pictures' results, always
 // gets the first design and palette: the light ones.
-// The lettering is Space Grotesk, embedded in each sleeve, so the covers do
-// not depend on the machine's fonts.
+// The lettering is the app's own Space Grotesk, embedded in each sleeve, so
+// the covers do not depend on the machine's fonts.
 
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { nightGarden, releases, type FixtureRelease } from '../fixtures/dataset.js';
+import { e2eRoot } from '../helpers/env.js';
 
 const SIZE = 250;
 
@@ -46,14 +46,11 @@ function escape(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Space Grotesk at the weights the sleeves use, as an SVG style. */
+/** The app's Space Grotesk, every weight it has, as an SVG style. */
 const FONTS = (() => {
-  const files = join(dirname(createRequire(import.meta.url).resolve('@fontsource/space-grotesk/package.json')), 'files');
-  const faces = [300, 700].map((weight) => {
-    const data = readFileSync(join(files, `space-grotesk-latin-${weight}-normal.woff2`)).toString('base64');
-    return `@font-face{font-family:Sleeve;font-weight:${weight};src:url(data:font/woff2;base64,${data}) format('woff2')}`;
-  });
-  return `<style>${faces.join('')} text{font-family:Sleeve}</style>`;
+  const file = join(dirname(e2eRoot), 'web', 'assets', 'fonts', 'SpaceGrotesk-Variable.woff2');
+  const data = readFileSync(file).toString('base64');
+  return `<style>@font-face{font-family:Sleeve;font-weight:300 700;src:url(data:font/woff2;base64,${data}) format('woff2')} text{font-family:Sleeve}</style>`;
 })();
 
 /** Relative luminance of a #rrggbb colour, enough to tell light from dark. */
