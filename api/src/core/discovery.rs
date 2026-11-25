@@ -809,7 +809,7 @@ mod tests {
             status: DiscoveryStatus::Pending,
             created_at: created_at.into(),
             exclude_from_core_taste: false,
-            reason_label: None,
+            reason: None,
             culture_bucket: None,
             pack_slug: None,
         };

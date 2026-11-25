@@ -102,7 +102,7 @@ pub(crate) fn track_candidate(
         primary_genre: None,
         release_year: None,
         artist_mbid: track.artist.mbid,
-        reason_label: None,
+        reason: None,
         culture_bucket: None,
     }
 }

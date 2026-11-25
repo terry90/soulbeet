@@ -36,7 +36,7 @@ impl From<DiscoveryCandidateRow> for Candidate {
             primary_genre: None,
             release_year: None,
             artist_mbid: None,
-            reason_label: None,
+            reason: None,
             culture_bucket: None,
         }
     }

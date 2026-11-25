@@ -23,7 +23,7 @@ pub struct DiscoveryTrackRow {
     #[serde(default)]
     pub exclude_from_core_taste: bool,
     #[serde(default)]
-    pub reason_label: Option<String>,
+    pub reason_json: Option<String>,
     #[serde(default)]
     pub culture_bucket: Option<String>,
     #[serde(default)]
@@ -32,6 +32,11 @@ pub struct DiscoveryTrackRow {
 
 impl From<DiscoveryTrackRow> for DiscoveryTrack {
     fn from(row: DiscoveryTrackRow) -> Self {
+        let reason = row
+            .reason_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .map(Box::new);
         DiscoveryTrack {
             id: row.id,
             song_id: row.song_id,
@@ -45,7 +50,7 @@ impl From<DiscoveryTrackRow> for DiscoveryTrack {
             status: row.status.parse().unwrap_or(DiscoveryStatus::Pending),
             created_at: row.created_at,
             exclude_from_core_taste: row.exclude_from_core_taste,
-            reason_label: row.reason_label,
+            reason,
             culture_bucket: row.culture_bucket,
             pack_slug: row.pack_slug,
         }

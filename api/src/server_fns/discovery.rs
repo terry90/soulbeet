@@ -215,15 +215,66 @@ pub async fn list_active_contextual_mixes(
     .map_err(failure_error)
 }
 
+#[get("/api/discovery/mix-definitions", auth: AuthSession)]
+pub async fn list_contextual_mix_definitions(
+) -> Result<Vec<shared::recommendation::ContextualMixDefinition>, ServerFnError> {
+    crate::core::contextual::list_mix_definitions_in(&crate::db::DB, &auth.0)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions", auth: AuthSession)]
+pub async fn upsert_contextual_mix_definition(
+    req: shared::recommendation::UpsertContextualMixRequest,
+) -> Result<shared::recommendation::ContextualMixDefinition, ServerFnError> {
+    crate::core::contextual::upsert_mix_definition_in(&crate::db::DB, &auth.0, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions/delete", auth: AuthSession)]
+pub async fn delete_contextual_mix_definition(slug: String) -> Result<(), ServerFnError> {
+    crate::core::contextual::delete_mix_definition_in(&crate::db::DB, &auth.0, &slug)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions/enabled", auth: AuthSession)]
+pub async fn set_contextual_mix_enabled(
+    req: shared::recommendation::SetMixEnabledRequest,
+) -> Result<shared::recommendation::ContextualMixDefinition, ServerFnError> {
+    crate::core::contextual::set_mix_enabled_in(&crate::db::DB, &auth.0, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[get("/api/discovery/contextual-mixes/playlist?slug&sync", auth: AuthSession)]
+pub async fn get_contextual_mix_playlist(
+    slug: String,
+    sync: Option<bool>,
+) -> Result<shared::recommendation::ContextualMixPlaylist, ServerFnError> {
+    crate::core::contextual::resolve_contextual_mix_playlist_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        &auth.0,
+        &slug,
+        sync.unwrap_or(false),
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(failure_error)
+}
+
 #[post("/api/discovery/seasonal/steer", auth: AuthSession)]
 pub async fn steer_seasonal_pack(
     req: shared::recommendation::SteerSeasonalPackRequest,
-) -> Result<shared::recommendation::SeasonalPackSpec, ServerFnError> {
+) -> Result<shared::recommendation::ContextualMixSummary, ServerFnError> {
     crate::core::contextual::steer_seasonal_pack_in(
         &crate::db::DB,
-        &auth.0.user_id,
+        &auth.0,
         &req.slug,
         req.steering,
+        chrono::Utc::now(),
     )
     .await
     .map_err(failure_error)
@@ -1383,13 +1434,53 @@ async fn scan_imports(
 /// auto-updates as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
+    let user = UserId::new(user_id);
+    let music_path = crate::config::CONFIG.navidrome_music_path();
     reconcile_in(
         &crate::db::DB,
         &crate::core::index::ServerNavidrome,
-        crate::config::CONFIG.navidrome_music_path(),
-        &UserId::new(user_id),
+        music_path,
+        &user,
     )
-    .await
+    .await?;
+
+    // Also reconcile active seasonal packs as Navidrome smart playlists (`Discovery/Seasonal/<slug>/`)
+    // and clean up expired seasonal playlists.
+    if let Ok(settings) = UserSettings::get_in(&crate::db::DB, user_id).await {
+        if settings.discovery_enabled {
+            if let Some(ref folder_id) = settings.discovery_folder_id {
+                if let Ok(Some(folder)) = Folder::get_by_id_in(&crate::db::DB, folder_id).await {
+                    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
+                        if let Ok(Some(discovery)) = crate::core::discovery::discovery_place_in(
+                            &crate::db::DB,
+                            &navi,
+                            music_path,
+                            &folder,
+                        )
+                        .await
+                        {
+                            if let Err(e) = crate::core::contextual::reconcile_seasonal_playlists_in(
+                                &crate::db::DB,
+                                &navi,
+                                user_id,
+                                &discovery,
+                                chrono::Utc::now(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "Failed to reconcile seasonal playlists for user {}: {}",
+                                    user_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// reconcile_discovery_playlists on `db` and `navidrome`, `music_path` the root of Navidrome's

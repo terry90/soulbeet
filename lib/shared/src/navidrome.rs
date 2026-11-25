@@ -98,7 +98,7 @@ pub struct DiscoveryTrack {
     #[serde(default)]
     pub exclude_from_core_taste: bool,
     #[serde(default)]
-    pub reason_label: Option<String>,
+    pub reason: Option<Box<crate::recommendation::CandidateReason>>,
     #[serde(default)]
     pub culture_bucket: Option<String>,
     #[serde(default)]
