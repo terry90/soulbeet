@@ -77,30 +77,41 @@ function weakHit(hit: RecordingHit): RecordingHit {
 // ---- Lucene query handling -------------------------------------------------
 
 /**
+ * The status clause of Soulful's discography search: groups with an official
+ * release, or whose releases have no status at all.
+ */
+const RELEASE_TO_SHOW = 'NOT (status:* AND NOT status:official)';
+
+/**
  * Parses the Lucene subset the two clients emit: `field:"phrase"` pairs
  * whose `"` and `\` are escaped (Soulful) and `field:(escaped terms)`
  * groups (beets), joined with AND or whitespace. Soulful's artist filter is
  * `(name:"phrase" OR arid:"mbid" ...)`; every `arid` is kept in `arids`.
  * Soulful's discography search is `arid:"mbid" AND (primarytype:album OR
- * primarytype:ep) AND [NOT ]secondarytype:* AND status:official`: every
- * `primarytype` is kept in `primaryTypes`, and `secondarytype:*` sets
- * `hasSecondaryType`, false after NOT.
+ * primarytype:ep) AND [NOT ]secondarytype:* AND RELEASE_TO_SHOW`: every
+ * `primarytype` is kept in `primaryTypes`, `secondarytype:*` sets
+ * `hasSecondaryType`, false after NOT, and RELEASE_TO_SHOW sets
+ * `releaseToShow`.
  */
 function parseLucene(query: string): {
   fields: Map<string, string>;
   arids: string[];
   primaryTypes: string[];
   hasSecondaryType: boolean | undefined;
+  releaseToShow: boolean;
   freeText: string[];
 } {
   const fields = new Map<string, string>();
   const arids: string[] = [];
   const primaryTypes: string[] = [];
   let hasSecondaryType: boolean | undefined;
+  const releaseToShow = query.includes(RELEASE_TO_SHOW);
+  // The rest, parsed field by field.
+  const clauses = query.replace(RELEASE_TO_SHOW, ' ');
   const fieldPattern = /([a-z]+):(?:"((?:[^"\\]|\\.)*)"|\(([^)]*)\)|([^\s()]+))/gi;
   let match: RegExpExecArray | null;
   const consumed: string[] = [];
-  while ((match = fieldPattern.exec(query)) !== null) {
+  while ((match = fieldPattern.exec(clauses)) !== null) {
     const key = (match[1] ?? '').toLowerCase();
     const value = match[2] ?? match[3] ?? match[4] ?? '';
     // beets escapes Lucene metacharacters, and Soulful a phrase's quote and
@@ -111,13 +122,13 @@ function parseLucene(query: string): {
     } else if (key === 'primarytype') {
       primaryTypes.push(text);
     } else if (key === 'secondarytype' && text === '*') {
-      hasSecondaryType = !/\bNOT\s+$/.test(query.slice(0, match.index));
+      hasSecondaryType = !/\bNOT\s+$/.test(clauses.slice(0, match.index));
     } else {
       fields.set(key, text);
     }
     consumed.push(match[0] as string);
   }
-  let rest = query;
+  let rest = clauses;
   for (const piece of consumed) {
     rest = rest.replace(piece, ' ');
   }
@@ -126,7 +137,7 @@ function parseLucene(query: string): {
     .toLowerCase()
     .split(/\s+/)
     .filter((t) => t.length > 0);
-  return { fields, arids, primaryTypes, hasSecondaryType, freeText };
+  return { fields, arids, primaryTypes, hasSecondaryType, releaseToShow, freeText };
 }
 
 /**
@@ -202,20 +213,21 @@ function secondaryTypes(release: FixtureRelease): string[] {
 
 type ReleaseStatus = NonNullable<FixtureRelease['status']>;
 
-function releaseStatus(release: FixtureRelease): ReleaseStatus {
-  return release.status ?? 'Official';
+/** The release's status; null when it has none. */
+function releaseStatus(release: FixtureRelease): ReleaseStatus | null {
+  return release.status === undefined ? 'Official' : release.status;
 }
 
 /**
- * A release group matches `status:` when one of its releases has that
- * status; each fixture group holds one release.
+ * A release group matches RELEASE_TO_SHOW when it has an official release or
+ * its releases have no status; each fixture group holds one release.
  */
 function searchReleaseGroups(query: string): FixtureRelease[] {
-  const { fields, arids, primaryTypes, hasSecondaryType, freeText } = parseLucene(query);
+  const { fields, arids, primaryTypes, hasSecondaryType, releaseToShow, freeText } =
+    parseLucene(query);
   const title =
     fields.get('releasegroup') ?? fields.get('releasegroupaccent') ?? fields.get('release');
   const artist = fields.get('artist') ?? fields.get('artistname');
-  const status = fields.get('status');
   const free = freeText.join(' ');
   const hasCriteria =
     title !== undefined || artist !== undefined || arids.length > 0 || free.length > 0;
@@ -231,7 +243,8 @@ function searchReleaseGroups(query: string): FixtureRelease[] {
       primaryTypes.length === 0 || primaryTypes.includes(release.primaryType.toLowerCase());
     const secondaryOk =
       hasSecondaryType === undefined || hasSecondaryType === secondaryTypes(release).length > 0;
-    const statusOk = status === undefined || releaseStatus(release).toLowerCase() === status;
+    const status = releaseStatus(release);
+    const statusOk = !releaseToShow || status === 'Official' || status === null;
     return hasCriteria && titleOk && artistOk && freeOk && typeOk && secondaryOk && statusOk;
   });
 }
@@ -261,17 +274,18 @@ function artistCreditJson(release: FixtureRelease): Array<Record<string, unknown
 }
 
 function releaseJson(release: FixtureRelease): Record<string, unknown> {
+  const status = releaseStatus(release);
   return {
     id: release.releaseMbid,
     title: release.title,
-    status: releaseStatus(release),
+    status,
     date: release.date,
     country: 'XW',
     disambiguation: '',
     quality: 'normal',
     barcode: null,
     packaging: null,
-    'status-id': STATUS_IDS[releaseStatus(release)],
+    'status-id': status === null ? null : STATUS_IDS[status],
     'release-events': [{ date: release.date, area: null }],
     'text-representation': { language: 'eng', script: 'Latn' },
     'artist-credit': artistCreditJson(release),

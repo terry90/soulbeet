@@ -396,7 +396,7 @@ pub async fn search(
 }
 
 /// The album an album search shows for `group`: None unless the group is an
-/// album or an EP with an official release.
+/// album or an EP that `album_release` finds a release of.
 fn album_result(group: &ReleaseGroup) -> Option<Album> {
     if !matches!(
         group.primary_type,
@@ -417,19 +417,31 @@ fn album_result(group: &ReleaseGroup) -> Option<Album> {
     })
 }
 
-/// The release an album search shows for `group`: an official one titled as
-/// the group, else the first official one. A release titled otherwise is often
+/// The release an album search shows for `group`: the one titled as the
+/// group, else the first, among its official releases, or among its releases
+/// with no status when it has no official one. A release with no status is
+/// one no editor gave a status, such as the only release of Chevelle's
+/// "Basement Tapes"; a group whose releases are all bootlegs, promotions or
+/// of another status has none to show. A release titled otherwise is often
 /// another edition of the album, such as its extended mixes alone. A release
 /// group search sends each release's id, title and status but no date or
 /// tracklist, so the order MusicBrainz lists them in decides among the rest.
 fn album_release(group: &ReleaseGroup) -> Option<&Release> {
-    let official: Vec<&Release> = (group.releases.iter().flatten())
-        .filter(|r| r.status == Some(ReleaseStatus::Official))
-        .collect();
+    let with_status = |status: Option<ReleaseStatus>| -> Vec<&Release> {
+        (group.releases.iter().flatten())
+            .filter(|r| r.status == status)
+            .collect()
+    };
+    let official = with_status(Some(ReleaseStatus::Official));
+    let candidates = if official.is_empty() {
+        with_status(None)
+    } else {
+        official
+    };
     let group_title = group.title.to_lowercase();
-    (official.iter())
+    (candidates.iter())
         .find(|r| r.title.to_lowercase() == group_title)
-        .or(official.first())
+        .or(candidates.first())
         .copied()
 }
 
@@ -466,14 +478,23 @@ enum Tier {
 }
 
 /// The search for artist `mbid`'s release groups of `tier` that are albums
-/// or EPs with an official release.
+/// or EPs with an official release or releases with no status at all, as `album_release`
+/// takes them. The index holds no status for a release that has none, so
+/// `NOT (status:* AND NOT status:official)` leaves out exactly the groups
+/// that have a status and no official release: of Chevelle's 44 groups it
+/// kept the 27 with an official release and "Basement Tapes", whose one
+/// release has no status, and left out every bootleg-only and
+/// promotion-only one (searched 2026-11-25). `status:official OR (*:* NOT
+/// status:*)` found no group without a status there. A group mixing
+/// bootlegs with releases of no status is left out too: the index cannot
+/// tell it from a bootleg-only one.
 fn discography_query(mbid: &str, tier: Tier) -> String {
     let secondary = match tier {
         Tier::Studio => "NOT secondarytype:*",
         Tier::Other => "secondarytype:*",
     };
     query_param(&format!(
-        "{} AND (primarytype:album OR primarytype:ep) AND {secondary} AND status:official",
+        "{} AND (primarytype:album OR primarytype:ep) AND {secondary} AND NOT (status:* AND NOT status:official)",
         phrase("arid", mbid)
     ))
 }
@@ -1564,25 +1585,90 @@ mod tests {
             Some("032e6446-2867-4ebe-b2d2-0a96ee460cd8")
         );
 
-        // Only the release that has no status.
-        let mut unofficial: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
-        let first = unofficial["releases"][0].clone();
-        unofficial["releases"] = serde_json::json!([first]);
-        let unofficial: ReleaseGroup = serde_json::from_value(unofficial).unwrap();
-        assert!(album_release(&unofficial).is_none());
+        // With no official release, one with no status stands for the group; a bootleg never does.
+        let only = |statuses: &[Option<&str>]| {
+            let mut group: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
+            let releases: Vec<serde_json::Value> = (statuses.iter().enumerate())
+                .map(|(i, status)| {
+                    let mut release = serde_json::json!({"id": format!("r{i}"), "title": "Bigger Than All of Us"});
+                    if let Some(status) = status {
+                        release["status"] = (*status).into();
+                    }
+                    release
+                })
+                .collect();
+            group["releases"] = releases.into();
+            let group: ReleaseGroup = serde_json::from_value(group).unwrap();
+            album_release(&group).map(|r| r.id.clone())
+        };
+        assert_eq!(only(&[None]).as_deref(), Some("r0"));
+        assert_eq!(only(&[Some("Bootleg"), None]).as_deref(), Some("r1"));
+        assert_eq!(only(&[None, Some("Official")]).as_deref(), Some("r1"));
+        assert_eq!(only(&[Some("Bootleg"), Some("Promotion")]), None);
     }
 
     #[test]
-    fn a_discography_asks_for_one_tier_of_official_albums_and_eps() {
+    fn a_discography_asks_for_one_tier_of_albums_and_eps_with_a_release_to_show() {
         let chevelle = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+        let status = "NOT (status:* AND NOT status:official)";
         assert_eq!(
             lucene(&discography_query(chevelle, Tier::Studio)),
-            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND NOT secondarytype:* AND status:official"#
+            format!(
+                r#"arid:"{chevelle}" AND (primarytype:album OR primarytype:ep) AND NOT secondarytype:* AND {status}"#
+            )
         );
         assert_eq!(
             lucene(&discography_query(chevelle, Tier::Other)),
-            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND secondarytype:* AND status:official"#
+            format!(
+                r#"arid:"{chevelle}" AND (primarytype:album OR primarytype:ep) AND secondarytype:* AND {status}"#
+            )
         );
+    }
+
+    /// The release groups GET https://musicbrainz.org/ws/2/release-group?query=arid:"8456e9f7-debf-4579-a86c-33a325a35d2d"
+    /// AND NOT (status:* AND NOT status:official)&limit=100&fmt=json answered, fetched 2026-11-25: 28 of the 44.
+    const CHEVELLE_WITH_A_RELEASE_TO_SHOW: [&str; 28] = [
+        "0988939c-a318-4d97-87db-504ddd344ae5",
+        "0c1dd7ec-f44f-4814-94b5-fe377d58b2bb",
+        "13adbf35-1c95-4c14-a156-0839cf8c239c",
+        "1d8e751e-2e24-4acd-999f-f2937119989d",
+        "24f654ae-1316-3bcf-9805-14507646f86b",
+        "3361c06e-d206-4516-866c-38a71172a737",
+        "383fc228-fe32-4033-a9b4-6342dad33766",
+        "41622d70-d319-4bbb-8b42-ea6d4f165f4a",
+        "4ae1d590-4135-4fd4-8d98-922cdb9b53bd",
+        "605778cf-c222-46cc-ad65-392ba8ba028d",
+        "6d80fd4d-4de0-3b81-af98-c8b1584725ef",
+        "76995141-f5d4-4148-a91f-5ad72384dfe3",
+        "7d58e1cf-9490-4348-9535-2c1fcd4cefcf",
+        "87b380eb-3101-3618-819b-38ddec289cf8",
+        "92e1287f-c4bf-49b2-94cc-b18a28f3cd15",
+        "97d1e844-c82a-3fab-a7a6-b4a6ffc9cde3",
+        "99ac2205-efd7-4e00-9717-b17672142d1a",
+        "ac57206e-2884-39a4-8969-eaf9a4c14232",
+        "b5978973-537a-4f47-860e-ca7b6df79035",
+        "c41b6870-01fe-42fe-a560-0e3d179fe972",
+        "c64094f0-8f7d-4595-89f2-588aaa8b1120",
+        "cae2397e-65d3-4ada-883f-e6a8ff4af610",
+        "d132db5b-d7b4-4c06-b3ed-ea0d6e4b39ca",
+        "d52f8bb2-5752-4edf-9e40-f3aed288b0fb",
+        "dabb19c6-f5ac-354a-b49b-4823e954ee54",
+        "eb397436-c727-4aa4-9cdd-57e98ebc4d62",
+        "f031b0f9-501e-4506-ba79-c13f59604427",
+        "fedf2ea7-6951-445e-bb3f-fcd4002fd963",
+    ];
+
+    #[test]
+    fn the_status_clause_keeps_the_groups_album_release_has_a_release_of() {
+        for g in chevelle_groups() {
+            assert_eq!(
+                album_release(&g).is_some(),
+                CHEVELLE_WITH_A_RELEASE_TO_SHOW.contains(&g.id.as_str()),
+                "{} {}",
+                g.id,
+                g.title
+            );
+        }
     }
 
     /// GET https://musicbrainz.org/ws/2/release-group?query=arid:"8456e9f7-debf-4579-a86c-33a325a35d2d"&limit=100&fmt=json,
@@ -1688,16 +1774,12 @@ mod tests {
                 "Music as a Weapon II",
                 "Any Last Words",
                 "The Blue Album",
+                "Basement Tapes",
             ]
         );
-        // No single, and neither the Sci‐Fi Crimes EP nor Basement Tapes, which have no
-        // official release.
-        let unofficial: Vec<ReleaseGroup> = chevelle_groups()
-            .into_iter()
-            .filter(|g| g.id.starts_with("77493e52") || g.id.starts_with("41622d70"))
-            .collect();
-        assert_eq!(unofficial.len(), 2);
-        assert_eq!(discography_albums(unofficial), []);
+        // No single, nor the Sci‐Fi Crimes EP, whose releases are promotions. Basement Tapes is
+        // listed by its one release, which has no status.
+        assert_eq!(albums[18].id, "37272390-9c78-485d-879e-95d4225e8ec5");
         // The official release titled as the group, here with its ’, not the first official one,
         // which writes "Wonder What's Next"; and for Point #1 the first official one, after a
         // release with no status.
@@ -1792,7 +1874,7 @@ mod tests {
             )
         };
         assert!(complete(true, Some(true), DISCOGRAPHY_MAX).complete);
-        assert!(complete(true, Some(true), 18).complete);
+        assert!(complete(true, Some(true), 19).complete);
         assert!(!complete(false, Some(true), DISCOGRAPHY_MAX).complete);
         assert!(!complete(true, None, DISCOGRAPHY_MAX).complete);
         assert!(!complete(true, Some(false), DISCOGRAPHY_MAX).complete);
@@ -1810,6 +1892,50 @@ mod tests {
                 disambiguation: None
             }
         );
+    }
+
+    #[test]
+    fn a_release_with_no_status_is_looked_up_with_its_tracks() {
+        // GET https://musicbrainz.org/ws/2/release/37272390-9c78-485d-879e-95d4225e8ec5?inc=recordings+artist-credits+release-groups&fmt=json,
+        // fetched 2026-11-25 and trimmed to the fields read: "status" and "status-id" are null.
+        let release: Release = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/release_basement_tapes.json"
+        ))
+        .unwrap();
+        assert_eq!(release.status, None);
+        let r = album_from_release(release);
+        assert_eq!(
+            (
+                r.album.id.as_str(),
+                r.album.title.as_str(),
+                r.album.artist.as_str(),
+                r.album.release_types.clone()
+            ),
+            (
+                "37272390-9c78-485d-879e-95d4225e8ec5",
+                "Basement Tapes",
+                "Chevelle",
+                Some(vec!["Album".to_string(), "Demo".to_string()])
+            )
+        );
+        let tracks: Vec<(&str, Option<&str>)> = (r.tracks.iter())
+            .map(|t| (t.title.as_str(), t.duration.as_deref()))
+            .collect();
+        assert_eq!(
+            tracks,
+            [
+                ("Open", Some("06:53")),
+                ("Build", Some("04:14")),
+                ("Commuter", Some("04:32")),
+                ("Credit to You", Some("03:32")),
+                ("Humidity", Some("04:32")),
+                ("Untitled (Dos)", Some("06:04")),
+            ]
+        );
+        assert!(r
+            .tracks
+            .iter()
+            .all(|t| t.release_mbid.as_deref() == Some("37272390-9c78-485d-879e-95d4225e8ec5")));
     }
 
     /// GET https://musicbrainz.org/ws/2/artist?query=artist:"Nirvana" OR alias:"Nirvana"&limit=25&fmt=json,
@@ -1931,7 +2057,7 @@ mod tests {
             panic!("Chevelle is found");
         };
         assert_eq!(sent(), 5);
-        assert_eq!((all.albums.len(), all.complete), (18, true));
+        assert_eq!((all.albums.len(), all.complete), (19, true));
         let targets: Vec<String> = (seen.lock().unwrap().iter())
             .map(|s| s.target.clone())
             .collect();
