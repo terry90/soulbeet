@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -94,33 +94,25 @@ pub fn build_client(user_agent: &str) -> Client {
         .expect("failed to build HTTP client")
 }
 
-// --- Per-service rate limiters ---
-//
-// Each service has its own limiter so they don't block each other.
-// The interval is the minimum time between requests to that service.
+// --- MusicBrainz rate limit ---
 
-struct RateLimiter(Mutex<Instant>);
-
-impl RateLimiter {
-    fn new() -> Self {
-        Self(Mutex::new(Instant::now() - Duration::from_secs(2)))
-    }
-
-    async fn wait(&self, min_interval: Duration) {
-        let mut last = self.0.lock().await;
-        let elapsed = last.elapsed();
-        if elapsed < min_interval {
-            tokio::time::sleep(min_interval - elapsed).await;
-        }
-        *last = Instant::now();
-    }
-}
+/// The limiter every MusicBrainz request waits on right before it goes out.
+/// The MusicBrainz client holds it too, so a 503 it sends again waits on it
+/// like any other request.
+pub type MbLimiter = governor::DefaultDirectRateLimiter;
 
 // MusicBrainz: 1 req/sec (documented hard limit, 503 if exceeded)
-static MB_LIMITER: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
-
 const MB_INTERVAL: Duration = Duration::from_millis(1100);
 
+static MB_LIMITER: LazyLock<Arc<MbLimiter>> = LazyLock::new(|| {
+    let quota = governor::Quota::with_period(MB_INTERVAL).expect("MB_INTERVAL is not zero");
+    Arc::new(governor::RateLimiter::direct(quota))
+});
+
+pub fn mb_limiter() -> Arc<MbLimiter> {
+    MB_LIMITER.clone()
+}
+
 pub async fn mb_rate_limit() {
-    MB_LIMITER.wait(MB_INTERVAL).await;
+    MB_LIMITER.until_ready().await;
 }

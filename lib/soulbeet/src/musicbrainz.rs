@@ -11,7 +11,7 @@ use musicbrainz_rs::{
 };
 use serde::Serialize;
 use shared::failure::{cut_chars, Service, RAW_MAX_CHARS};
-use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
+use shared::metadata::{Album, AlbumWithTracks, ArtistSummary, Discography, SearchResult, Track};
 use shared::recommendation::{fold_name, without_marks};
 use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
@@ -31,25 +31,37 @@ const BASE_DELAY_MS: u64 = 500;
 /// Maximum backoff delay cap (milliseconds)
 const MAX_BACKOFF_MS: u64 = 5000;
 
+/// A MusicBrainz client for `host` (host[:port], no scheme), else for
+/// musicbrainz.org. Each request it sends, a 503 sent again included, waits
+/// on `http::mb_limiter` and gets REQUEST_TIMEOUT_SECS to be answered.
+fn new_client(host: Option<&str>) -> MusicBrainzClient {
+    let version = env!("CARGO_PKG_VERSION");
+    let reqwest_client = reqwest::Client::builder()
+        .user_agent(format!(
+            "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
+        ))
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        // As MusicBrainzClient::new sets it (hyperium/hyper#2136).
+        .pool_max_idle_per_host(0)
+        .build()
+        .expect("a client with a user agent and timeouts builds");
+    let mut client = MusicBrainzClient::new_with_reqwest_client(reqwest_client);
+    client.rate_limit = Some(crate::http::mb_limiter());
+    if let Some(host) = host {
+        client.musicbrainz_domain = host.to_string();
+    }
+    client
+}
+
 // This ensures the client is initialized only once with a proper user agent.
 fn musicbrainz_client() -> &'static MusicBrainzClient {
     static CLIENT: OnceLock<MusicBrainzClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let version = env!("CARGO_PKG_VERSION");
-        let mut client = MusicBrainzClient::new(&format!(
-            "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
-        ))
-        .expect("Failed to create MusicBrainz client - invalid user agent format");
         // MUSICBRAINZ_HOST points the client at a MusicBrainz mirror
         // (host[:port], no scheme). Mirrors the `musicbrainz.host` option
         // beets exposes for the same purpose.
-        if let Ok(host) = std::env::var("MUSICBRAINZ_HOST") {
-            let host = host.trim();
-            if !host.is_empty() {
-                client.musicbrainz_domain = host.to_string();
-            }
-        }
-        client
+        let host = std::env::var("MUSICBRAINZ_HOST").ok();
+        new_client(host.as_deref().map(str::trim).filter(|h| !h.is_empty()))
     })
 }
 
@@ -116,6 +128,11 @@ impl From<musicbrainz_rs::Error> for MetadataError {
                 status: None,
                 raw: e.to_string(),
             },
+            Error::ReqwestError(e) if e.is_timeout() => MetadataError::Unavailable {
+                service,
+                status: None,
+                raw: format!("no answer within {REQUEST_TIMEOUT_SECS} s"),
+            },
             Error::ReqwestError(e) => MetadataError::Unavailable {
                 service,
                 status: e.status().map(|s| s.as_u16()),
@@ -135,9 +152,10 @@ impl From<musicbrainz_rs::Error> for MetadataError {
     }
 }
 
-/// Retries an async operation with exponential backoff and request timeout.
-/// Only retries transient errors (`MetadataError::is_transient`): no answer
-/// within REQUEST_TIMEOUT_SECS, or an HTTP exchange that failed.
+/// Retries an async operation with exponential backoff. Only retries
+/// transient errors (`MetadataError::is_transient`): no answer within
+/// REQUEST_TIMEOUT_SECS, or an HTTP exchange that failed. The client waits on
+/// the rate limit before each request it sends, so this does not.
 async fn with_retry<T, F, Fut>(operation_name: &str, mut operation: F) -> Result<T, MetadataError>
 where
     F: FnMut() -> Fut,
@@ -145,19 +163,9 @@ where
 {
     let mut attempt = 0;
     loop {
-        // Respect MusicBrainz rate limit (1 req/sec)
-        crate::http::mb_rate_limit().await;
-
-        let result =
-            tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), operation()).await;
-        let e = match result {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(e)) => MetadataError::from(e),
-            Err(_timeout) => MetadataError::Unavailable {
-                service: Service::Musicbrainz,
-                status: None,
-                raw: format!("no answer within {REQUEST_TIMEOUT_SECS} s"),
-            },
+        let e = match operation().await {
+            Ok(value) => return Ok(value),
+            Err(e) => MetadataError::from(e),
         };
         attempt += 1;
         if !e.is_transient() || attempt == MAX_RETRIES {
@@ -241,13 +249,15 @@ fn carries_name(m: &ArtistMatch, wanted: &str) -> bool {
 
 /// The artists of `found` that carry `name` whole. The artist search matches
 /// the name anywhere in a name or alias, so "Queen" also finds Ella
-/// Fitzgerald by her alias "Queen of Jazz".
+/// Fitzgerald by her alias "Queen of Jazz". Those named so come before those
+/// that carry it only as an alias, each in MusicBrainz's order.
 fn named_artists(name: &str, found: Vec<ArtistMatch>) -> Vec<ArtistMatch> {
     let wanted = search_fold(name);
-    found
+    let (named, aliased): (Vec<_>, Vec<_>) = found
         .into_iter()
         .filter(|m| carries_name(m, &wanted))
-        .collect()
+        .partition(|m| search_fold(&m.name) == wanted);
+    named.into_iter().chain(aliased).collect()
 }
 
 /// Artists the artist search returns for an artist filter, of which those
@@ -373,29 +383,38 @@ pub async fn search(
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            for release_group in release_groups {
-                if release_group.primary_type != Some(ReleaseGroupPrimaryType::Album)
-                    && release_group.primary_type != Some(ReleaseGroupPrimaryType::Ep)
-                {
-                    continue;
-                }
-
-                if let Some(final_release) = album_release(&release_group) {
-                    results.push(SearchResult::Album(Album {
-                        id: final_release.id.clone(),
-                        title: release_group.title.clone(),
-                        artist: credited_artist(&release_group.artist_credit),
-                        release_date: final_release.date.as_ref().map(|d| d.0.clone()),
-                        mbid: Some(final_release.id.clone()),
-                        cover_url: None,
-                        release_types: release_types(&release_group),
-                    }));
-                }
-            }
+            results.extend(
+                release_groups
+                    .iter()
+                    .filter_map(album_result)
+                    .map(SearchResult::Album),
+            );
         }
     }
 
     Ok(results)
+}
+
+/// The album an album search shows for `group`: None unless the group is an
+/// album or an EP with an official release.
+fn album_result(group: &ReleaseGroup) -> Option<Album> {
+    if !matches!(
+        group.primary_type,
+        Some(ReleaseGroupPrimaryType::Album | ReleaseGroupPrimaryType::Ep)
+    ) {
+        return None;
+    }
+    let release = album_release(group)?;
+    Some(Album {
+        id: release.id.clone(),
+        title: group.title.clone(),
+        artist: credited_artist(&group.artist_credit),
+        release_date: release.date.as_ref().map(|d| d.0.clone()),
+        mbid: Some(release.id.clone()),
+        cover_url: None,
+        release_types: release_types(group),
+        first_release_date: given(group.first_release_date.as_ref().map(|d| d.0.clone())),
+    })
 }
 
 /// The release an album search shows for `group`: an official one titled as
@@ -412,6 +431,242 @@ fn album_release(group: &ReleaseGroup) -> Option<&Release> {
         .find(|r| r.title.to_lowercase() == group_title)
         .or(official.first())
         .copied()
+}
+
+/// Release groups a discography page asks for: the most MusicBrainz answers.
+const DISCOGRAPHY_PAGE: u8 = 100;
+
+/// Release groups a discography reads at most. Bob Dylan's 210 official
+/// albums and EPs fit.
+pub const DISCOGRAPHY_MAX: usize = 300;
+
+/// The order albums and EPs with secondary types list in, by those types.
+const SECONDARY_ORDER: [ReleaseGroupSecondaryType; 11] = [
+    ReleaseGroupSecondaryType::Compilation,
+    ReleaseGroupSecondaryType::Soundtrack,
+    ReleaseGroupSecondaryType::Live,
+    ReleaseGroupSecondaryType::Remix,
+    ReleaseGroupSecondaryType::DjMix,
+    ReleaseGroupSecondaryType::MixtapeStreet,
+    ReleaseGroupSecondaryType::Demo,
+    ReleaseGroupSecondaryType::Spokenword,
+    ReleaseGroupSecondaryType::Interview,
+    ReleaseGroupSecondaryType::Audiobook,
+    ReleaseGroupSecondaryType::AudioDrama,
+];
+
+/// The part of a discography one search reads: the release groups with no
+/// secondary type, or those with one. A search with only an artist clause
+/// scores every group alike and answers them in index order, so the studio
+/// albums are read whole before anything else.
+#[derive(Debug, Clone, Copy)]
+enum Tier {
+    Studio,
+    Other,
+}
+
+/// The search for artist `mbid`'s release groups of `tier` that are albums
+/// or EPs with an official release.
+fn discography_query(mbid: &str, tier: Tier) -> String {
+    let secondary = match tier {
+        Tier::Studio => "NOT secondarytype:*",
+        Tier::Other => "secondarytype:*",
+    };
+    query_param(&format!(
+        "{} AND (primarytype:album OR primarytype:ep) AND {secondary} AND status:official",
+        phrase("arid", mbid)
+    ))
+}
+
+/// Artist `mbid`'s release groups of `tier`, read a page at a time up to
+/// `budget` of them, and whether that is every group of the tier.
+async fn tier_groups(
+    client: &MusicBrainzClient,
+    mbid: &str,
+    tier: Tier,
+    budget: usize,
+) -> Result<(Vec<ReleaseGroup>, bool), MetadataError> {
+    let mut groups = Vec::new();
+    while groups.len() < budget {
+        let limit = u8::try_from((budget - groups.len()).min(DISCOGRAPHY_PAGE.into()))
+            .expect("a page is at most DISCOGRAPHY_PAGE");
+        let offset = u16::try_from(groups.len()).expect("DISCOGRAPHY_MAX fits an offset");
+        let page = with_retry("MusicBrainz discography", || {
+            let search_query = discography_query(mbid, tier);
+            async move {
+                ReleaseGroup::search(search_query)
+                    .limit(limit)
+                    .offset(offset)
+                    .with_releases()
+                    .execute_with_client(client)
+                    .await
+            }
+        })
+        .await?;
+        let Ok(count) = usize::try_from(page.count) else {
+            return Err(MetadataError::Unreadable {
+                service: Service::Musicbrainz,
+                status: None,
+                raw: "MusicBrainz answered a negative release group count".into(),
+            });
+        };
+        let empty = page.entities.is_empty();
+        groups.extend(page.entities);
+        let whole = groups.len() >= count;
+        if whole || empty {
+            return Ok((groups, whole));
+        }
+    }
+    Ok((groups, false))
+}
+
+/// Where `group` lists in a discography: albums with no secondary type,
+/// then such EPs, then those with secondary types in SECONDARY_ORDER; each
+/// oldest first, an undated one last, then by title and id.
+fn discography_key(group: &ReleaseGroup) -> (bool, u8, Vec<usize>, bool, String, String, String) {
+    let primary = match group.primary_type {
+        Some(ReleaseGroupPrimaryType::Album) => 0,
+        _ => 1,
+    };
+    let mut secondary: Vec<usize> = (group.secondary_types.iter())
+        .map(|t| {
+            (SECONDARY_ORDER.iter())
+                .position(|o| o == t)
+                .unwrap_or(SECONDARY_ORDER.len())
+        })
+        .collect();
+    secondary.sort_unstable();
+    let date = (group.first_release_date.as_ref())
+        .map(|d| d.0.clone())
+        .unwrap_or_default();
+    (
+        !group.secondary_types.is_empty(),
+        primary,
+        secondary,
+        date.is_empty(),
+        date,
+        fold_name(&group.title),
+        group.id.clone(),
+    )
+}
+
+/// The albums of `groups` in discography order, each group once.
+fn discography_albums(groups: Vec<ReleaseGroup>) -> Vec<Album> {
+    let mut seen = HashSet::new();
+    let mut groups: Vec<ReleaseGroup> = (groups.into_iter())
+        .filter(|g| seen.insert(g.id.clone()))
+        .collect();
+    groups.sort_by_cached_key(discography_key);
+    groups.iter().filter_map(album_result).collect()
+}
+
+/// The artist of `found` whose MBID is `chosen`, else the first, and the
+/// others; `found` itself when there is no such artist.
+fn pick_artist(
+    mut found: Vec<ArtistMatch>,
+    chosen: Option<&str>,
+) -> Result<(ArtistMatch, Vec<ArtistMatch>), Vec<ArtistMatch>> {
+    let at = match chosen {
+        Some(mbid) => found.iter().position(|a| a.mbid == mbid),
+        None => (!found.is_empty()).then_some(0),
+    };
+    match at {
+        Some(at) => {
+            let artist = found.remove(at);
+            Ok((artist, found))
+        }
+        None => Err(found),
+    }
+}
+
+fn artist_summary(a: ArtistMatch) -> ArtistSummary {
+    ArtistSummary {
+        mbid: a.mbid,
+        name: a.name,
+        disambiguation: a.disambiguation,
+    }
+}
+
+/// The discography of `artist` from the groups its tiers gave, cut to
+/// `limit` albums. `other` is None when that tier was not read.
+fn discography_from(
+    artist: ArtistMatch,
+    others: Vec<ArtistMatch>,
+    studio: Vec<ReleaseGroup>,
+    studio_whole: bool,
+    other: Option<(Vec<ReleaseGroup>, bool)>,
+    limit: usize,
+) -> Discography {
+    let other_whole = other.as_ref().is_some_and(|(_, whole)| *whole);
+    let mut groups = studio;
+    groups.extend(other.into_iter().flat_map(|(groups, _)| groups));
+    let mut albums = discography_albums(groups);
+    let complete = studio_whole && other_whole && albums.len() <= limit;
+    albums.truncate(limit);
+    Discography {
+        artist: artist_summary(artist),
+        others: others.into_iter().map(artist_summary).collect(),
+        albums,
+        complete,
+    }
+}
+
+/// What an artist-only search found for a name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArtistAlbums {
+    /// No artist carries the name.
+    NoArtist,
+    /// The artists that carry the name, none of them the one chosen.
+    NotAmong(Vec<ArtistSummary>),
+    Found(Discography),
+}
+
+/// The first `limit` albums and EPs of the artist named `name`: of the
+/// artist whose MBID is `chosen` when given, else of the first that carries
+/// the name.
+pub async fn discography(
+    name: &str,
+    chosen: Option<&str>,
+    limit: usize,
+) -> Result<ArtistAlbums, MetadataError> {
+    discography_with(musicbrainz_client(), name, chosen, limit).await
+}
+
+async fn discography_with(
+    client: &MusicBrainzClient,
+    name: &str,
+    chosen: Option<&str>,
+    limit: usize,
+) -> Result<ArtistAlbums, MetadataError> {
+    let found = named_artists(
+        name,
+        search_artists_with(client, name, FILTER_ARTISTS).await?,
+    );
+    let (artist, others) = match pick_artist(found, chosen) {
+        Ok(picked) => picked,
+        Err(found) if found.is_empty() => return Ok(ArtistAlbums::NoArtist),
+        Err(found) => {
+            return Ok(ArtistAlbums::NotAmong(
+                found.into_iter().map(artist_summary).collect(),
+            ))
+        }
+    };
+    let (studio, studio_whole) =
+        tier_groups(client, &artist.mbid, Tier::Studio, DISCOGRAPHY_MAX).await?;
+    let other = if studio.len() < limit.min(DISCOGRAPHY_MAX) {
+        let budget = DISCOGRAPHY_MAX - studio.len();
+        Some(tier_groups(client, &artist.mbid, Tier::Other, budget).await?)
+    } else {
+        None
+    };
+    Ok(ArtistAlbums::Found(discography_from(
+        artist,
+        others,
+        studio,
+        studio_whole,
+        other,
+        limit,
+    )))
 }
 
 /// Fetches a release (album) by its ID and returns it with its full tracklist.
@@ -470,6 +725,9 @@ fn album_from_release(release: Release) -> AlbumWithTracks {
         mbid: Some(release.id),
         cover_url: None,
         release_types: release.release_group.as_ref().and_then(release_types),
+        first_release_date: release
+            .release_group
+            .and_then(|g| given(g.first_release_date.map(|d| d.0))),
     };
 
     AlbumWithTracks { album, tracks }
@@ -540,7 +798,14 @@ pub struct RecordingReleases {
 
 /// Searches MusicBrainz for artists by name or alias.
 pub async fn search_artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, MetadataError> {
-    let client = musicbrainz_client();
+    search_artists_with(musicbrainz_client(), query, limit).await
+}
+
+async fn search_artists_with(
+    client: &MusicBrainzClient,
+    query: &str,
+    limit: u8,
+) -> Result<Vec<ArtistMatch>, MetadataError> {
     let found = with_retry("MusicBrainz artist search", || {
         let search_query = artist_search_query(query);
         async move {
@@ -1110,7 +1375,11 @@ mod tests {
     #[test]
     fn an_artist_whose_alias_only_holds_the_typed_name_is_not_matched() {
         // The first two hits of artist:"Queen" OR alias:"Queen", fetched 2026-11-21.
-        let queen = found("0383dadf-2a4e-4d10-a46a-e9e041da8eb3", "Queen", &["クイーン"]);
+        let queen = found(
+            "0383dadf-2a4e-4d10-a46a-e9e041da8eb3",
+            "Queen",
+            &["クイーン"],
+        );
         let kept = named_artists(
             "queen",
             vec![
@@ -1233,6 +1502,7 @@ mod tests {
                 Some(vec!["Album".to_string(), "Compilation".to_string()])
             )
         );
+        assert_eq!(r.album.first_release_date.as_deref(), Some("1945"));
         assert_eq!(
             (r.tracks[0].id.as_str(), r.tracks[0].duration.as_deref()),
             ("4d04e9b5-ecd1-4ef3-bae0-5c98492af1c8", Some("02:29"))
@@ -1260,6 +1530,19 @@ mod tests {
             album_release(&group).map(|r| r.id.as_str()),
             Some("e6f0e965-99cb-47ab-8ccd-616a11ce83e3")
         );
+        let album = album_result(&group).unwrap();
+        assert_eq!(
+            (
+                album.id.as_str(),
+                album.first_release_date.as_deref(),
+                album.release_types
+            ),
+            (
+                "e6f0e965-99cb-47ab-8ccd-616a11ce83e3",
+                Some("2025-07-18"),
+                Some(vec!["Album".to_string()])
+            )
+        );
 
         let mut others: serde_json::Value = serde_json::from_str(RELEASE_GROUP).unwrap();
         others["title"] = "Bigger Than All of Us: The Remixes".into();
@@ -1275,6 +1558,423 @@ mod tests {
         unofficial["releases"] = serde_json::json!([first]);
         let unofficial: ReleaseGroup = serde_json::from_value(unofficial).unwrap();
         assert!(album_release(&unofficial).is_none());
+    }
+
+    #[test]
+    fn a_discography_asks_for_one_tier_of_official_albums_and_eps() {
+        let chevelle = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+        assert_eq!(
+            lucene(&discography_query(chevelle, Tier::Studio)),
+            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND NOT secondarytype:* AND status:official"#
+        );
+        assert_eq!(
+            lucene(&discography_query(chevelle, Tier::Other)),
+            r#"arid:"8456e9f7-debf-4579-a86c-33a325a35d2d" AND (primarytype:album OR primarytype:ep) AND secondarytype:* AND status:official"#
+        );
+    }
+
+    /// GET https://musicbrainz.org/ws/2/release-group?query=arid:"8456e9f7-debf-4579-a86c-33a325a35d2d"&limit=100&fmt=json,
+    /// fetched 2026-11-24: all 44 of Chevelle's release groups, every one scored 100, in index order.
+    /// Trimmed of the artists' aliases and the ids no code reads.
+    fn chevelle_groups() -> Vec<ReleaseGroup> {
+        let page: musicbrainz_rs::entity::search::SearchResult<ReleaseGroup> =
+            serde_json::from_str(include_str!(
+                "fixtures/musicbrainz/release_group_search_chevelle.json"
+            ))
+            .unwrap();
+        assert_eq!(page.entities.len(), 44);
+        page.entities
+    }
+
+    /// The client for the stub server at `base`, which needs no rate limit.
+    fn stub_client(base: &str) -> MusicBrainzClient {
+        let mut client = new_client(Some(base.trim_start_matches("http://")));
+        client.drop_ratelimit();
+        client
+    }
+
+    /// A release group search answer of `count` groups in all, holding `ids`.
+    fn groups_page(count: i64, ids: std::ops::Range<usize>) -> String {
+        let groups: Vec<serde_json::Value> = ids
+            .map(|i| serde_json::json!({"id": format!("g{i}"), "title": format!("Album {i}")}))
+            .collect();
+        serde_json::json!({"created": "2026-11-24T20:53:37.277Z", "count": count, "offset": 0,
+            "release-groups": groups})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_tier_is_read_page_by_page_up_to_its_budget() {
+        use crate::test_http::{serve, Reply};
+        let reply = |body: String| Reply { status: 200, body };
+        let (base, seen) = serve(vec![
+            reply(groups_page(250, 0..100)),
+            reply(groups_page(250, 100..150)),
+            reply(groups_page(3, 0..3)),
+            reply(groups_page(-1, 0..0)),
+        ]);
+        let client = stub_client(&base);
+        let mbid = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+
+        let (groups, whole) = tier_groups(&client, mbid, Tier::Other, 150).await.unwrap();
+        assert_eq!((groups.len(), whole), (150, false));
+        let targets: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.target.clone())
+            .collect();
+        let query = discography_query(mbid, Tier::Other);
+        assert!(
+            targets[0].contains(&format!("&{query}&limit=100&offset=0")),
+            "{}",
+            targets[0]
+        );
+        assert!(
+            targets[1].contains("&limit=50&offset=100"),
+            "{}",
+            targets[1]
+        );
+
+        let (groups, whole) = tier_groups(&client, mbid, Tier::Studio, DISCOGRAPHY_MAX)
+            .await
+            .unwrap();
+        assert_eq!((groups.len(), whole), (3, true));
+        assert_eq!(seen.lock().unwrap().len(), 3);
+
+        let e = tier_groups(&client, mbid, Tier::Studio, DISCOGRAPHY_MAX)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "Unreadable MusicBrainz answer: MusicBrainz answered a negative release group count"
+        );
+    }
+
+    #[test]
+    fn a_discography_lists_studio_albums_first_oldest_first() {
+        let albums = discography_albums(chevelle_groups());
+        let titles: Vec<&str> = albums.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "Point #1",
+                "Wonder What’s Next",
+                "This Type of Thinking (Could Do Us In)",
+                "Vena Sera",
+                "Sci‐Fi Crimes",
+                "Hats Off to the Bull",
+                "La Gárgola",
+                "The North Corridor",
+                "NIRATIAS",
+                "Bright as Blasphemy",
+                "The Collection: Chevelle",
+                "Stray Arrows: A Collection of Favorites",
+                "12 Bloody Spies: B‐sides and Rarities",
+                "Live From the Road",
+                "Live from the Norva",
+                "Music as a Weapon II",
+                "Any Last Words",
+                "The Blue Album",
+            ]
+        );
+        // No single, and neither the Sci‐Fi Crimes EP nor Basement Tapes, which have no
+        // official release.
+        let unofficial: Vec<ReleaseGroup> = chevelle_groups()
+            .into_iter()
+            .filter(|g| g.id.starts_with("77493e52") || g.id.starts_with("41622d70"))
+            .collect();
+        assert_eq!(unofficial.len(), 2);
+        assert_eq!(discography_albums(unofficial), []);
+        // The official release titled as the group, here with its ’, not the first official one,
+        // which writes "Wonder What's Next"; and for Point #1 the first official one, after a
+        // release with no status.
+        assert_eq!(albums[1].id, "accde5f7-04da-4c66-bb8e-7bb3d39ad326");
+        assert_eq!(albums[0].id, "c9a3fe11-45a8-4045-9d15-1b80b8333f81");
+        let next = &albums[1];
+        assert_eq!(
+            (
+                next.title.as_str(),
+                next.first_release_date.as_deref(),
+                next.release_types.clone()
+            ),
+            (
+                "Wonder What’s Next",
+                Some("2002-08-27"),
+                Some(vec!["Album".to_string()])
+            )
+        );
+    }
+
+    /// A release group of `primary` and `secondary` types, first out on `date`, with one
+    /// official release titled as itself.
+    fn group(id: &str, title: &str, primary: &str, secondary: &[&str], date: &str) -> ReleaseGroup {
+        let mut group = serde_json::json!({
+            "id": id, "title": title, "primary-type": primary, "secondary-types": secondary,
+            "releases": [{"id": format!("{id}-release"), "title": title, "status": "Official"}],
+        });
+        if !date.is_empty() {
+            group["first-release-date"] = date.into();
+        }
+        serde_json::from_value(group).unwrap()
+    }
+
+    #[test]
+    fn the_discography_order_is_type_then_secondary_then_date_then_title() {
+        let groups = vec![
+            group("01", "Live EP", "EP", &["Live"], "1990"),
+            group("02", "Soundtrack", "Album", &["Soundtrack"], "1990"),
+            group("03", "Live", "Album", &["Live"], "1980"),
+            group("04", "Undated", "Album", &[], ""),
+            group("05", "b", "Album", &[], "2004"),
+            group(
+                "06",
+                "Compilation Live",
+                "Album",
+                &["Compilation", "Live"],
+                "1970",
+            ),
+            group("07", "EP", "EP", &[], "1970"),
+            group("08", "Compilation", "Album", &["Compilation"], "2000"),
+            group("09", "A", "Album", &[], "2004"),
+            group("10", "Later", "Album", &[], "2004-02-23"),
+            group("11", "First", "Album", &[], "1999"),
+        ];
+        let titles: Vec<String> = discography_albums(groups)
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "First",
+                "A",
+                "b",
+                "Later",
+                "Undated",
+                "EP",
+                "Compilation",
+                "Compilation Live",
+                "Soundtrack",
+                "Live",
+                "Live EP",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_discography_is_complete_only_when_every_tier_was_read_whole_and_fits() {
+        let artist = found("8456e9f7-debf-4579-a86c-33a325a35d2d", "Chevelle", &[]);
+        let (studio, other): (Vec<_>, Vec<_>) = chevelle_groups()
+            .into_iter()
+            .partition(|g| g.secondary_types.is_empty());
+        let complete = |studio_whole, other_whole: Option<bool>, limit| {
+            let other = other_whole.map(|whole| (other.clone(), whole));
+            discography_from(
+                artist.clone(),
+                vec![],
+                studio.clone(),
+                studio_whole,
+                other,
+                limit,
+            )
+        };
+        assert!(complete(true, Some(true), DISCOGRAPHY_MAX).complete);
+        assert!(complete(true, Some(true), 18).complete);
+        assert!(!complete(false, Some(true), DISCOGRAPHY_MAX).complete);
+        assert!(!complete(true, None, DISCOGRAPHY_MAX).complete);
+        assert!(!complete(true, Some(false), DISCOGRAPHY_MAX).complete);
+        let cut = complete(true, Some(true), 12);
+        assert!(!cut.complete);
+        assert_eq!(cut.albums.len(), 12);
+        assert!(cut.albums[..10]
+            .iter()
+            .all(|a| a.release_types == Some(vec!["Album".to_string()])));
+        assert_eq!(
+            cut.artist,
+            ArtistSummary {
+                mbid: "8456e9f7-debf-4579-a86c-33a325a35d2d".into(),
+                name: "Chevelle".into(),
+                disambiguation: None
+            }
+        );
+    }
+
+    /// GET https://musicbrainz.org/ws/2/artist?query=artist:"Nirvana" OR alias:"Nirvana"&limit=25&fmt=json,
+    /// fetched 2026-11-24: eight of its artists, trimmed to their names, disambiguations and aliases.
+    fn nirvanas() -> Vec<ArtistMatch> {
+        let page: musicbrainz_rs::entity::search::SearchResult<Artist> = serde_json::from_str(
+            include_str!("fixtures/musicbrainz/artist_search_nirvana.json"),
+        )
+        .unwrap();
+        named_artists(
+            "Nirvana",
+            page.entities.into_iter().map(artist_match).collect(),
+        )
+    }
+
+    const NIRVANA_US: &str = "5b11f4ce-a62d-471e-81fc-a69a8278c7da";
+    const NIRVANA_UK: &str = "9282c8b4-ca0b-4c6b-b7e3-4f7762dfc4d6";
+    const NIRVANA_2002: &str = "f2dfdff9-3862-4be0-bf85-9c833fa3059e";
+
+    #[test]
+    fn an_artist_named_so_comes_before_one_aliased_so() {
+        let kept = nirvanas();
+        let mbids: Vec<&str> = kept.iter().map(|a| a.mbid.as_str()).collect();
+        assert_eq!(mbids[0], NIRVANA_US);
+        // Nirvana 2002 carries the name only as an alias; "Approaching Nirvana" not at all.
+        assert_eq!(mbids.last(), Some(&NIRVANA_2002));
+        assert!(kept[..kept.len() - 1].iter().all(|a| a.name == "Nirvana"));
+        assert!(!mbids.contains(&"c3a64a25-251b-4d03-afba-1471440245b8"));
+        assert_eq!(kept.len(), 7);
+    }
+
+    #[test]
+    fn a_chosen_artist_is_picked_among_those_carrying_the_name() {
+        let (first, others) = pick_artist(nirvanas(), None).unwrap();
+        assert_eq!(first.mbid, NIRVANA_US);
+        assert_eq!(others.len(), 6);
+        assert!(others.iter().all(|a| a.mbid != NIRVANA_US));
+        let (uk, others) = pick_artist(nirvanas(), Some(NIRVANA_UK)).unwrap();
+        assert_eq!(
+            (uk.mbid.as_str(), uk.disambiguation.as_deref()),
+            (NIRVANA_UK, Some("60s band from the UK"))
+        );
+        assert_eq!(others[0].mbid, NIRVANA_US);
+        assert_eq!(
+            pick_artist(nirvanas(), Some("00000000-0000-4000-8000-000000000000")),
+            Err(nirvanas())
+        );
+        assert_eq!(pick_artist(vec![], None), Err(vec![]));
+    }
+
+    const CHEVELLE: &str = "8456e9f7-debf-4579-a86c-33a325a35d2d";
+
+    /// An artist search answer holding `artists`.
+    fn artists_page(artists: serde_json::Value) -> String {
+        let count = artists.as_array().unwrap().len();
+        serde_json::json!({"created": "2026-11-24T20:53:37.277Z", "count": count, "offset": 0,
+            "artists": artists})
+        .to_string()
+    }
+
+    fn chevelle_found() -> String {
+        artists_page(
+            serde_json::json!([{"id": CHEVELLE, "name": "Chevelle", "sort-name": "Chevelle"}]),
+        )
+    }
+
+    /// Chevelle's release groups of `tier` from the fixture, as one search answer.
+    fn chevelle_tier(tier: Tier) -> String {
+        let mut page: serde_json::Value = serde_json::from_str(include_str!(
+            "fixtures/musicbrainz/release_group_search_chevelle.json"
+        ))
+        .unwrap();
+        let groups: Vec<serde_json::Value> = page["release-groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| {
+                let studio = g["secondary-types"].as_array().is_none_or(|t| t.is_empty());
+                studio == matches!(tier, Tier::Studio)
+            })
+            .cloned()
+            .collect();
+        page["count"] = groups.len().into();
+        page["release-groups"] = groups.into();
+        page.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_discography_reads_only_the_tiers_its_limit_needs() {
+        use crate::test_http::{serve, Reply};
+        let reply = |body: String| Reply { status: 200, body };
+        let (base, seen) = serve(vec![
+            reply(chevelle_found()),
+            reply(chevelle_tier(Tier::Studio)),
+            reply(chevelle_found()),
+            reply(chevelle_tier(Tier::Studio)),
+            reply(chevelle_tier(Tier::Other)),
+            reply(artists_page(serde_json::json!([]))),
+            reply(include_str!("fixtures/musicbrainz/artist_search_nirvana.json").into()),
+        ]);
+        let client = stub_client(&base);
+        let sent = || seen.lock().unwrap().len();
+
+        // Five rows are all studio albums: the other tier is not asked for.
+        let ArtistAlbums::Found(five) = discography_with(&client, "Chevelle", None, 5)
+            .await
+            .unwrap()
+        else {
+            panic!("Chevelle is found");
+        };
+        assert_eq!(sent(), 2);
+        assert_eq!((five.albums.len(), five.complete), (5, false));
+        assert_eq!(five.albums[1].title, "Wonder What’s Next");
+
+        let ArtistAlbums::Found(all) = discography_with(&client, "Chevelle", None, DISCOGRAPHY_MAX)
+            .await
+            .unwrap()
+        else {
+            panic!("Chevelle is found");
+        };
+        assert_eq!(sent(), 5);
+        assert_eq!((all.albums.len(), all.complete), (18, true));
+        let targets: Vec<String> = (seen.lock().unwrap().iter())
+            .map(|s| s.target.clone())
+            .collect();
+        assert!(targets[3].contains(&discography_query(CHEVELLE, Tier::Studio)));
+        assert!(targets[4].contains(&discography_query(CHEVELLE, Tier::Other)));
+
+        assert_eq!(
+            discography_with(&client, "Zqxvb Plorbnik Quintet", None, DISCOGRAPHY_MAX)
+                .await
+                .unwrap(),
+            ArtistAlbums::NoArtist
+        );
+        assert_eq!(sent(), 6);
+
+        // A chosen artist not among those of the name gets them back, with no release search.
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        let ArtistAlbums::NotAmong(named) =
+            discography_with(&client, "Nirvana", Some(unknown), DISCOGRAPHY_MAX)
+                .await
+                .unwrap()
+        else {
+            panic!("the chosen artist is not among those named Nirvana");
+        };
+        assert_eq!(sent(), 7);
+        assert_eq!(named.len(), 7);
+        assert_eq!(named[0].mbid, NIRVANA_US);
+    }
+
+    #[tokio::test]
+    async fn every_request_waits_its_turn_even_one_sent_again_after_a_503() {
+        use crate::test_http::{serve_with_headers, Reply};
+        let reply = |status, body: String| Reply { status, body };
+        let (base, seen) = serve_with_headers(vec![
+            (
+                reply(503, String::new()),
+                vec![("Retry-After", "0".to_string())],
+            ),
+            (reply(200, chevelle_found()), vec![]),
+            (reply(200, chevelle_tier(Tier::Studio)), vec![]),
+        ]);
+        let client = new_client(Some(base.trim_start_matches("http://")));
+        let found = search_artists_with(&client, "Chevelle", FILTER_ARTISTS)
+            .await
+            .unwrap();
+        assert_eq!(found[0].mbid, CHEVELLE);
+        tier_groups(&client, CHEVELLE, Tier::Studio, DISCOGRAPHY_MAX)
+            .await
+            .unwrap();
+        let at: Vec<std::time::Instant> = seen.lock().unwrap().iter().map(|s| s.at).collect();
+        assert_eq!(at.len(), 3);
+        // MB_INTERVAL apart, less what the loopback may shift an arrival by.
+        for pair in at.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap >= Duration::from_millis(1050), "{gap:?}");
+        }
     }
 
     #[test]

@@ -3,7 +3,9 @@
 use shared::download::DownloadQuery;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, AlbumWithTracks, SearchResult};
-use soulbeet::musicbrainz::{self, ArtistMatch, MusicBrainzProvider, RecordingReleases};
+use soulbeet::musicbrainz::{
+    self, ArtistAlbums, ArtistMatch, MusicBrainzProvider, RecordingReleases,
+};
 use soulbeet::{MetadataError, MetadataProvider};
 
 /// Which provider search runs: search_albums or search_tracks.
@@ -60,6 +62,22 @@ pub(crate) fn provider_failure(e: &MetadataError) -> Failure {
 /// Artists MusicBrainz finds by name or alias.
 pub async fn artists(query: &str, limit: u8) -> Result<Vec<ArtistMatch>, Failure> {
     musicbrainz::search_artists(query, limit)
+        .await
+        .map_err(|e| provider_failure(&e))
+}
+
+/// Albums the web UI's artist-only search shows.
+pub(crate) const DISCOGRAPHY_LIMIT: usize = musicbrainz::DISCOGRAPHY_MAX;
+
+/// The first `limit` albums and EPs of the artist named `name`, or of the one
+/// of that name whose MBID is `chosen`; `ArtistAlbums` says when MusicBrainz
+/// has no artist of that name, or none of them is `chosen`.
+pub async fn discography(
+    name: &str,
+    chosen: Option<&str>,
+    limit: usize,
+) -> Result<ArtistAlbums, Failure> {
+    musicbrainz::discography(name, chosen, limit)
         .await
         .map_err(|e| provider_failure(&e))
 }
@@ -293,6 +311,7 @@ mod tests {
                 mbid: None,
                 cover_url: None,
                 release_types: None,
+                first_release_date: None,
             };
             let mut query = DownloadQuery::new(vec![]).album(album.clone());
             // Unanswered fails with metadata_unavailable: any other code shows it was not asked.
@@ -335,6 +354,7 @@ mod tests {
             mbid: None,
             cover_url: None,
             release_types: None,
+            first_release_date: None,
         };
         let mut query = DownloadQuery::new(vec![]).album(album);
         let f = hydrate_in(&Unanswered, &mut query).await.unwrap_err();

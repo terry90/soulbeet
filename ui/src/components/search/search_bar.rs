@@ -1,5 +1,6 @@
 use api::models::folder::Folder;
 use dioxus::prelude::*;
+use shared::metadata::asks_no_title;
 
 use super::folder_chip::FolderChip;
 use super::search_type_toggle::{SearchType, SearchTypeToggle};
@@ -18,6 +19,12 @@ const ROW_CLASS: &str =
 
 /// The icon or word before a row's field, which turns magenta with it.
 const LEAD_CLASS: &str = "flex-none w-[48px] self-stretch flex items-center justify-center text-gray-500 cursor-text group-focus-within/row:text-beet-accent";
+
+/// Whether the form has something to search for: a title, or an artist
+/// whose albums to list.
+fn can_search(query: &str, artist: Option<&str>) -> bool {
+    !asks_no_title(query) || artist.is_some_and(|a| !a.trim().is_empty())
+}
 
 #[derive(Props, Clone, PartialEq)]
 pub struct SearchBarProps {
@@ -66,9 +73,12 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
     };
 
     let artist_shown = artist_open() || artist.read().is_some();
-    let placeholder = match search_type() {
-        SearchType::Album => "Search albums",
-        SearchType::Track => "Search tracks",
+    // With an artist, the title may be left out to list the artist's albums.
+    let placeholder = match (search_type(), artist_shown) {
+        (SearchType::Album, false) => "Search albums",
+        (SearchType::Track, false) => "Search tracks",
+        (SearchType::Album, true) => "Album title (optional)",
+        (SearchType::Track, true) => "Track title (optional)",
     };
 
     rsx! {
@@ -81,7 +91,8 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             evt.prevent_default();
             search.set(submitted_text(&evt, QUERY));
             let typed = submitted_text(&evt, ARTIST);
-            artist.set((!typed.is_empty()).then_some(typed));
+            let typed = typed.trim();
+            artist.set((!typed.is_empty()).then(|| typed.to_string()));
             on_search.call(());
         },
 
@@ -122,7 +133,7 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             Button {
               class: "flex-none inline-flex items-center justify-center min-h-[44px] min-w-[92px] md:min-w-[104px] ml-[8px] whitespace-nowrap {FOCUS_RING}",
               submit: true,
-              disabled: search.read().is_empty(),
+              disabled: !can_search(&search.read(), artist.read().as_deref()),
               busy: loading,
               if loading {
                 span {
@@ -330,6 +341,55 @@ mod tests {
             SEARCHED.with(|s| s.take()),
             [("Abbey Road".to_string(), Some("The Beatles".to_string()))]
         );
+    }
+
+    #[test]
+    fn an_artist_alone_can_be_searched() {
+        let chevelle = || Setup {
+            artist: Some("Chevelle".to_string()),
+            ..Setup::default()
+        };
+        let html = render(chevelle());
+        let button = opening_tag(&html, "retro-btn");
+        assert!(!button.contains("disabled=true"), "{button}");
+        assert!(
+            html.contains("placeholder=\"Album title (optional)\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"sr-only\">Album title (optional)</span>"),
+            "{html}"
+        );
+        let html = render(Setup {
+            search_type: SearchType::Track,
+            ..chevelle()
+        });
+        assert!(
+            html.contains("placeholder=\"Track title (optional)\""),
+            "{html}"
+        );
+
+        let mut dom = bar(chevelle());
+        let submits = crate::listeners(&mut dom, "submit");
+        crate::submit_form(&mut dom, submits[0], &[(QUERY, ""), (ARTIST, " Chevelle ")]);
+        // The artist is kept trimmed, and a blank one is no artist.
+        crate::submit_form(
+            &mut dom,
+            submits[0],
+            &[(QUERY, "Vena Sera"), (ARTIST, "  ")],
+        );
+        assert_eq!(
+            SEARCHED.with(|s| s.take()),
+            [
+                (String::new(), Some("Chevelle".to_string())),
+                ("Vena Sera".to_string(), None)
+            ]
+        );
+
+        assert!(!can_search("*", None));
+        assert!(!can_search(" ", Some("  ")));
+        assert!(can_search("*", Some("Chevelle")));
+        assert!(can_search("Vena Sera", None));
     }
 
     #[test]
