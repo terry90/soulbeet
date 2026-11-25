@@ -17,6 +17,7 @@ use soulbeet::{
     beets::{BeetsImporter, BeetsSettings},
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
+    ytdlp::YtDlpBackend,
     BackendError, DownloadBackend, MusicImporter, NavidromeClient,
 };
 #[cfg(feature = "server")]
@@ -32,6 +33,7 @@ pub mod providers {
 pub mod downloaders {
     pub const SLSKD: &str = shared::slskd::BACKEND_ID;
     pub const ARCHIVE: &str = shared::archive::BACKEND_ID;
+    pub const YTDLP: &str = shared::ytdlp::BACKEND_ID;
 }
 
 pub mod importers {
@@ -205,6 +207,9 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
         downloaders::ARCHIVE => {
             archive_backend(&soulbeet::archive::ENGINE, archive_settings().await?).await
         }
+        downloaders::YTDLP => {
+            ytdlp_backend(&soulbeet::ytdlp::ENGINE, ytdlp_settings().await?).await
+        }
         _ => Err(BackendLookupError::Unknown(id.to_string())),
     }
 }
@@ -231,6 +236,29 @@ async fn archive_backend(
     let engine =
         (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
     Ok(Arc::new(ArchiveBackend::new(engine)))
+}
+
+/// What the YouTube Music engine runs on: this install's downloads folder, its id, and the
+/// helper's programs.
+#[cfg(feature = "server")]
+async fn ytdlp_settings() -> Result<soulbeet::ytdlp::EngineSettings, BackendLookupError> {
+    Ok(soulbeet::ytdlp::EngineSettings {
+        download_path: crate::config::CONFIG.download_path().clone(),
+        instance: instance_id().await.map_err(BackendLookupError::Settings)?,
+        tools: crate::config::CONFIG.ytdlp_tools().clone(),
+    })
+}
+
+/// A handle on the YouTube Music engine of `cell`, started on the first build: a rebuilt handle
+/// shares the transfers the engine runs.
+#[cfg(feature = "server")]
+async fn ytdlp_backend(
+    cell: &soulbeet::ytdlp::EngineCell,
+    settings: soulbeet::ytdlp::EngineSettings,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    let engine =
+        (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
+    Ok(Arc::new(YtDlpBackend::new(engine)))
 }
 
 /// The backend `download_backend(None)` gives.
@@ -320,8 +348,6 @@ pub async fn reload_download_backend(id: &str) {
 /// lookup gets it; a handle taken earlier must then be refused `download` and `start_search`
 /// until the backend is built again. Each backend that can be turned off adds its arm.
 #[cfg(feature = "server")]
-// A match each switchable backend adds its arm to; one arm until the next backend lands.
-#[allow(clippy::single_match)]
 pub(crate) async fn stop_backend(id: &str) {
     match id {
         downloaders::ARCHIVE => {
@@ -337,6 +363,21 @@ pub(crate) async fn stop_backend(id: &str) {
             };
             if let Err(e) = forgotten {
                 tracing::warn!("Could not forget the unfinished Internet Archive transfers: {e}");
+            }
+        }
+        downloaders::YTDLP => {
+            let engine = &soulbeet::ytdlp::ENGINE;
+            if engine.stop().await {
+                return;
+            }
+            let forgotten = match ytdlp_settings().await {
+                Ok(settings) => {
+                    (engine.forget_unfinished(settings).await).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = forgotten {
+                tracing::warn!("Could not delete what YouTube Music left unfinished: {e}");
             }
         }
         _ => {}
@@ -1531,5 +1572,87 @@ mod tests {
             found[2]
         );
         cell.stop().await;
+    }
+
+    /// A downloads folder and a test database's install id; the helper runs the python3 on
+    /// PATH on site-packages that hold none of its modules.
+    async fn ytdlp_settings_at() -> (tempfile::TempDir, soulbeet::ytdlp::EngineSettings) {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db::migrated().await;
+        let settings = soulbeet::ytdlp::EngineSettings {
+            download_path: root.path().join("downloads"),
+            instance: instance_id_in(&db).await.unwrap(),
+            tools: soulbeet::ytdlp::Tools {
+                python: soulbeet::beets::resolve_on_path("python3").expect("python3 on PATH"),
+                site_packages: root.path().join("site-packages"),
+                deno: root.path().join("deno"),
+                ffmpeg: None,
+            },
+        };
+        (root, settings)
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_youtube_handle_shares_the_engine_and_an_image_without_the_tools_says_so() {
+        let (_root, settings) = ytdlp_settings_at().await;
+        let cell = soulbeet::ytdlp::EngineCell::new();
+        let first = ytdlp_backend(&cell, settings.clone()).await.unwrap();
+        assert_eq!(
+            answering_to(downloaders::YTDLP, first.clone())
+                .map(|b| b.id())
+                .ok(),
+            Some("ytdlp")
+        );
+        let failure = first.health_check().await.unwrap_err();
+        assert_eq!(failure.code, FailureCode::BackendNotConfigured);
+        assert!(
+            failure
+                .message
+                .starts_with("Not in this image: use the :full image"),
+            "{}",
+            failure.message
+        );
+        // A rebuild while the engine runs keeps it, and what it knows.
+        let rebuilt = ytdlp_backend(&cell, settings).await.unwrap();
+        assert_eq!(rebuilt.health_check().await.unwrap_err(), failure);
+        assert!(cell.stop().await);
+    }
+
+    #[tokio::test]
+    async fn turning_youtube_off_with_no_engine_deletes_what_a_previous_run_left() {
+        let (_root, settings) = ytdlp_settings_at().await;
+        let partial = settings
+            .download_path
+            .join(soulbeet::partial::PARTIAL_FOLDER)
+            .join(&settings.instance)
+            .join(downloaders::YTDLP);
+        std::fs::create_dir_all(partial.join("a-transfer")).unwrap();
+        std::fs::write(partial.join("a-transfer").join("x.webm.part"), b"x").unwrap();
+        let cell = soulbeet::ytdlp::EngineCell::new();
+        assert!(!cell.stop().await);
+        cell.forget_unfinished(settings).await.unwrap();
+        assert!(!partial.join("a-transfer").exists());
+    }
+
+    #[tokio::test]
+    async fn a_youtube_track_lands_where_the_monitor_looks_for_it() {
+        use crate::server_fns::download::utils::resolve_in_destination;
+        let root = tempfile::tempdir().unwrap();
+        let destination = "Spiderland [bbbb2222]";
+        for title in [
+            "What's Next to the Moon?",
+            "AC/DC: Live\\Wire",
+            &"Long ".repeat(80),
+        ] {
+            let id = soulbeet::ytdlp::item_name("Slint", title, "gBfoQjJ7guk");
+            let part = root.path().join("part");
+            std::fs::write(&part, title.as_bytes()).unwrap();
+            // As the engine lands it, under the item id.
+            soulbeet::partial::land(&part, root.path(), destination, &id).unwrap();
+            let path =
+                resolve_in_destination(&id, root.path(), destination, &HashSet::new()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), title.as_bytes());
+            assert_eq!(path.file_name().unwrap().to_string_lossy(), id);
+        }
     }
 }
