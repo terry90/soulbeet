@@ -709,6 +709,114 @@ export const wytheChapelCarols: FixtureRelease = {
   ],
 };
 
+// What the README pictures search for (e2e/screenshots): an album search for
+// "Night Garden" finds five albums and EPs of two artists. No spec searches
+// for them and no peer shares them.
+const hollowPinesMbid = 'f2fc621f-63a2-410b-9660-524eb4c49032';
+
+/** A track of the pictures' releases, `length` as "m:ss". */
+function shotTrack(mbid: string, position: number, title: string, length: string): FixtureTrack {
+  const [minutes, seconds] = length.split(':').map(Number) as [number, number];
+  return { mbid, title, position, lengthMs: (minutes * 60 + seconds) * 1000 };
+}
+
+export const nightGarden: FixtureRelease = {
+  releaseMbid: '30710de2-0045-4112-8c9d-c098f1a8ab28',
+  releaseGroupMbid: 'd63cac23-3538-42c1-8acc-a341ecbfb64d',
+  title: 'Night Garden',
+  artist: 'Hollow Pines',
+  artistMbid: hollowPinesMbid,
+  date: '2016-04-22',
+  primaryType: 'Album',
+  rating: 95,
+  tracks: [
+    shotTrack('b85b83d4-7ff0-47de-b1da-237dbd6f3678', 1, 'Moth Lantern', '4:12'),
+    shotTrack('42503ab4-f4d9-4162-92a6-56b588d5f9ef', 2, 'Cold Frame', '3:47'),
+    shotTrack('33fc0cae-1580-4b13-9fbf-db6ebe949148', 3, 'Wisteria', '5:03'),
+    shotTrack('187d83bd-8727-4df5-a767-ff97d5009174', 4, 'Greenhouse Radio', '3:58'),
+    shotTrack('724c8be3-e0dd-432d-b9a7-87ec87c9c1d6', 5, 'Under the Glass Roof', '4:36'),
+    shotTrack('b6c69c28-d972-4acf-920b-f1100a256af0', 6, 'Pollen Count', '2:54'),
+    shotTrack('9ddd1d38-66fb-48ca-83ff-da837ed6f27d', 7, 'Sleepwalkers', '4:21'),
+    shotTrack('19d83ba1-c815-4599-89f9-480defd57257', 8, 'Lamplit', '3:33'),
+    shotTrack('20c93314-086d-4aa2-8214-8be61527df9f', 9, 'Fernwood', '4:48'),
+    shotTrack('eb0749c9-2c53-4eae-86a3-0d87ca22a9ae', 10, 'Dew Point', '6:15'),
+  ],
+};
+
+const nightGardenSessions: FixtureRelease = {
+  releaseMbid: 'a7191aea-39fa-44cb-b411-a49ee6bac5d7',
+  releaseGroupMbid: '05da56d9-5f69-4a0a-9de6-e22565d7bf02',
+  title: 'Night Garden Sessions',
+  artist: 'Hollow Pines',
+  artistMbid: hollowPinesMbid,
+  date: '2017-02-10',
+  primaryType: 'EP',
+  rating: 90,
+  tracks: [
+    shotTrack('a4a1fddb-7fcc-4324-bef7-efafa8795d36', 1, 'Moth Lantern (Acoustic)', '4:05'),
+    shotTrack('f5ab2363-1b3a-4452-b046-e6bd4e0d55c9', 2, 'Orchard Wall', '3:29'),
+    shotTrack('2af052eb-2463-4358-88b2-b97e83626f07', 3, 'Ivy Hours', '5:12'),
+  ],
+};
+
+const nightGardenLive: FixtureRelease = {
+  releaseMbid: '0d1d0664-cdf1-4295-a13e-a117be866a6c',
+  releaseGroupMbid: 'ec64c898-8376-4d72-b35f-16d4470fb99a',
+  title: 'Night Garden: Live in Lisbon',
+  artist: 'Hollow Pines',
+  artistMbid: hollowPinesMbid,
+  date: '2018-10-05',
+  primaryType: 'Album',
+  secondaryTypes: ['Live'],
+  rating: 87,
+  tracks: [
+    shotTrack('3eaa1298-2889-473b-aef4-84cf33d8221c', 1, 'Moth Lantern (Live)', '4:44'),
+    shotTrack('73a80e9c-d171-4bf6-818e-94c77d77cb2a', 2, 'Wisteria (Live)', '5:51'),
+    shotTrack('ddffdaf6-c53a-4ec3-8c2d-a8c94aadc004', 3, 'Dew Point (Live)', '7:02'),
+  ],
+};
+
+const theNightGarden: FixtureRelease = {
+  releaseMbid: '96c8a36b-edae-456b-a0bc-3afd56a097f1',
+  releaseGroupMbid: 'be0d137a-4a6b-407a-9597-8b305ae2a43d',
+  title: 'The Night Garden',
+  artist: 'Mira Kestrel',
+  artistMbid: '8c508bea-6b6e-44ee-b7dc-067160108a05',
+  date: '2009-06-15',
+  primaryType: 'Album',
+  rating: 84,
+  tracks: [
+    shotTrack('57a542f0-7677-4f04-8e06-f2ead956049b', 1, 'Blue Hour', '3:41'),
+    shotTrack('5d56d739-bcb9-4e89-8529-1a9f758e4031', 2, 'Lanternfish', '4:27'),
+    shotTrack('7ddab6b0-5c6f-426c-8c4e-01c6677c63ed', 3, 'Nocturne for Ferns', '6:08'),
+  ],
+};
+
+const songsFromTheNightGarden: FixtureRelease = {
+  releaseMbid: 'eddf9d73-536f-429e-82d1-00a14d304034',
+  releaseGroupMbid: 'cfe59c8a-7c75-4064-876a-64c141f1d6b1',
+  title: 'Songs from the Night Garden',
+  artist: 'Hollow Pines',
+  artistMbid: hollowPinesMbid,
+  date: '2021-11-19',
+  primaryType: 'Album',
+  secondaryTypes: ['Compilation'],
+  rating: 82,
+  tracks: [
+    shotTrack('9ffc870c-56e1-454d-8d1a-38182dc44ccd', 1, 'Wisteria (2021 Remaster)', '5:01'),
+    shotTrack('1f6a3993-f20e-4b5f-bb77-0dfe31ed7e7d', 2, 'Greenhouse Radio (Single Edit)', '3:30'),
+    shotTrack('025ebebb-0bd5-4d89-a116-49baac5fca93', 3, 'Moonflower', '4:16'),
+  ],
+};
+
+const screenshotReleases: FixtureRelease[] = [
+  nightGarden,
+  nightGardenSessions,
+  nightGardenLive,
+  theNightGarden,
+  songsFromTheNightGarden,
+];
+
 /** Releases peers share but the MusicBrainz stub does not know: beets finds no candidate for their files. */
 export const releasesMusicBrainzLacks: FixtureRelease[] = [wytheChapelCarols];
 
@@ -723,6 +831,7 @@ export const releases: FixtureRelease[] = [
   bellwether,
   ...orchidTelegraphReleases,
   fenwickCarols,
+  ...screenshotReleases,
 ];
 
 export function findRelease(releaseMbid: string): FixtureRelease | undefined {

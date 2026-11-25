@@ -1,37 +1,43 @@
-// What the screenshot specs share: the instance and account the pictures are
-// taken on, and where a picture is saved.
-//
-// The pictures come from a real install, so they show real covers and a real
-// library. Nothing is downloaded or changed there: the specs only search and
-// open pages.
+// What the screenshot specs share: a new account on the stub stack with the
+// pictures' search done, and where a picture is saved.
 
 import { dirname, join } from 'node:path';
 import type { Page } from '@playwright/test';
-import { loginViaUi, performSearch } from '../helpers/app.js';
+import { expect } from '@playwright/test';
+import { nightGarden } from '../fixtures/dataset.js';
+import { loginViaApi, performSearch, registerUser, uniqueUser } from '../helpers/app.js';
 import { e2eRoot } from '../helpers/env.js';
+import { drawCovers } from './covers.js';
+import { stageApp, stageOutside } from './stage.js';
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (value === undefined || value === '') {
-    throw new Error(
-      `${name} is not set. Run: E2E_BASE_URL=https://your.soulbeet SHOTS_USER=you SHOTS_PASSWORD=... SHOTS_QUERY="an album title" npm run screenshots`,
-    );
-  }
-  return value;
-}
+/** What the pictures search for: five albums and EPs of two artists. */
+const QUERY = nightGarden.title;
 
-/** Signs in as SHOTS_USER and shows the album results for SHOTS_QUERY. */
-export async function searchAsUser(page: Page): Promise<void> {
-  // Release notes the account has not read would open over the pictures.
-  // Answered here, so nothing is marked as read on the instance.
-  await page.route('**/api/changelog/seen', (route) => route.fulfill({ json: { major: 9999, minor: 0, patch: 0 } }));
-  await loginViaUi(page, { username: required('SHOTS_USER'), password: required('SHOTS_PASSWORD') });
-  await performSearch(page, required('SHOTS_QUERY'), 'ALBUM');
+/**
+ * Stages the page (see stage.ts and covers.ts), signs a new account in and
+ * searches albums for QUERY once every service reads online. Returns the
+ * outside URLs the page asked for, which stay refused.
+ */
+export async function showSearch(page: Page): Promise<string[]> {
+  const outside = await stageOutside(page);
+  await stageApp(page);
+  await drawCovers(page);
+  const user = uniqueUser('shots');
+  await registerUser(page.request, user);
+  await loginViaApi(page.context(), user);
+  await page.goto('/');
+  // The first health answers come while beets is still being checked.
+  await expect(page.getByText('All services online')).toBeVisible({ timeout: 60_000 });
+  await performSearch(page, QUERY, 'ALBUM');
+  return outside;
 }
 
 /** Saves the visible page as `screenshots/<name>.png` at the repository root, once it has settled. */
 export async function save(page: Page, name: string): Promise<void> {
+  // Off every control, so no row shows its hover look.
+  await page.mouse.move(1, 1);
   await page.waitForLoadState('networkidle');
+  await page.evaluate(() => document.fonts.ready);
   await page.screenshot({
     path: join(dirname(e2eRoot), 'screenshots', `${name}.png`),
     animations: 'disabled',

@@ -22,9 +22,18 @@ This page covers running Soulbeet from source, running the tests and refreshing 
 
 ## Refreshing the screenshots
 
-The pictures in [screenshots](../screenshots) are taken on a running Soulbeet, so they show a real library. Nothing is downloaded or changed there: the downloads panel is staged, it shows the album you searched for part way through without fetching it.
+The pictures in [screenshots](../screenshots) are taken on the e2e stub stack, so they need no running Soulbeet, no account and no real service. The specs register their own account, search the stub MusicBrainz for "Night Garden" (fixture albums kept for the pictures) and stage the rest in the browser: drawn covers, the downloads panel part way through an album, a Navidrome library for the dashboard and its health, two folders, and the fonts and version check the app fetches from the internet. The downloader and beets report their real health.
 
-```bash
-cd e2e && npm ci && npx playwright install chromium
-E2E_BASE_URL=https://music.example.com SHOTS_USER=you SHOTS_PASSWORD=... SHOTS_QUERY="an album title" npm run screenshots
-```
+1.  Build the app (the stack runs the release binary) from the repository root:
+    ```bash
+    npm ci && npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
+    dx bundle --package web --release
+    ```
+2.  Start the stub stack and take the pictures:
+    ```bash
+    cd e2e && npm ci && npx playwright install chromium
+    scripts/dev-stack.sh up
+    npm run screenshots
+    scripts/dev-stack.sh down
+    ```
+    The stack needs a Python 3.11 interpreter, as in the image (`PYTHON=/path/to/python3.11` if it is not `python3.11` on the PATH).

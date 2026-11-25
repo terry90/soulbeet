@@ -2255,6 +2255,12 @@
   .has-focus-visible\:border-beet-accent:has(:focus-visible) {
     border-color: var(--color-beet-accent);
   }
+  .aria-\[current\=page\]\:border-beet-accent[aria-current="page"] {
+    border-color: var(--color-beet-accent);
+  }
+  .aria-\[current\=page\]\:text-white[aria-current="page"] {
+    color: var(--color-white);
+  }
   @media (prefers-reduced-motion: reduce) {
     .motion-reduce\:animate-none {
       animation: none;

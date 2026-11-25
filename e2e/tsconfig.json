@@ -14,5 +14,5 @@
 		"skipLibCheck": true,
 		"noEmit": true
 	},
-	"include": ["fixtures", "stubs/src", "helpers", "tests", "acceptance", "playwright.config.ts", "playwright.mcp.config.ts", "eslint.config.js"]
+	"include": ["fixtures", "stubs/src", "helpers", "tests", "acceptance", "screenshots", "playwright.config.ts", "playwright.mcp.config.ts", "playwright.screenshots.config.ts", "eslint.config.js"]
 }
