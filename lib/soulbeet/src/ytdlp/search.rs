@@ -43,7 +43,7 @@ impl Run {
     fn add(&self, groups: impl IntoIterator<Item = DownloadableGroup>) {
         let mut progress = self.progress.lock().unwrap();
         progress.groups.extend(groups);
-        // Stable: equal groups keep the order YouTube Music gave them in.
+        // Stable: equal groups keep the order they were found in.
         progress.groups.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)

@@ -478,7 +478,9 @@ pub(crate) fn album_group(
     (Some(group), counts)
 }
 
-/// One group per song a track search found that is the wanted track `index`, and what was read.
+/// One group per song a track search found that is the wanted track `index`, best first, and
+/// what was read. Between two songs that match as well, the explicit one comes first, as on an
+/// album.
 pub(crate) fn song_groups(
     songs: &[Song],
     index: usize,
@@ -532,16 +534,23 @@ pub(crate) fn song_groups(
         };
         let item = of.item(&seen, index, scored);
         let title = album.map_or(song.title.as_str(), |a| a.name.as_str());
-        groups.push(group_of(
+        let group = group_of(
             vec![item],
             1,
             &song.video_id,
             &source_of(browse_id, &song.video_id),
             title,
             &song.artists,
-        ));
+        );
+        groups.push((song.explicit, group));
     }
-    (groups, counts)
+    // Stable: songs alike in both keep YouTube Music's order.
+    groups.sort_by(|(a_explicit, a), (b_explicit, b)| {
+        (b.score.partial_cmp(&a.score))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b_explicit.cmp(a_explicit))
+    });
+    (groups.into_iter().map(|(_, g)| g).collect(), counts)
 }
 
 fn group_of(
@@ -848,6 +857,12 @@ pub(crate) mod tests {
             group.unwrap().items[0].facts.backend_facts["explicit"],
             true
         );
+
+        // A track search puts the explicit one first too, though YouTube Music listed it second.
+        let (groups, _) = song_groups(&found[..2], 0, &album, false, 0);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].score, groups[1].score);
+        assert_eq!(groups[0].items[0].facts.backend_facts["explicit"], true);
     }
 
     #[test]
