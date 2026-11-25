@@ -7,9 +7,10 @@
 #   scripts/dev-stack.sh up      start stubs + servers, wait until ready
 #   scripts/dev-stack.sh down    stop them
 #
-# Requires Python 3.11 or newer (the beets config check runs `python -P`).
-# beets is installed into .runtime/beets-venv, pinned like the image
-# (build/requirements-beets.txt). PYTHON picks the interpreter for a new venv.
+# Requires Python 3.11, as in the image: beets is installed into
+# .runtime/beets-venv with the image's pins (build/requirements-beets.txt),
+# which are chosen for that Python. PYTHON names the interpreter for a new
+# venv (default python3.11).
 
 set -euo pipefail
 
@@ -84,10 +85,10 @@ up() {
 
   local venv="$RUNTIME/beets-venv"
   if [[ ! -x "$venv/bin/python" ]]; then
-    "${PYTHON:-python3}" -m venv "$venv"
+    "${PYTHON:-python3.11}" -m venv "$venv"
   fi
-  "$venv/bin/python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
-    echo "beets needs Python 3.11 or newer; remove $venv and set PYTHON to one" >&2
+  "$venv/bin/python" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 11))' || {
+    echo "beets is pinned for Python 3.11 like the image; remove $venv and set PYTHON to a 3.11 interpreter" >&2
     exit 1
   }
   "$venv/bin/pip" install --quiet -c "$REPO_DIR/build/requirements-beets.txt" \

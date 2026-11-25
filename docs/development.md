@@ -36,4 +36,4 @@ The pictures in [screenshots](../screenshots) are taken on the e2e stub stack, s
     npm run screenshots
     scripts/dev-stack.sh down
     ```
-    The stack installs beets into `e2e/.runtime/beets-venv` with the image's pins, which install on Python 3.11 (on 3.13 beets asks for a newer numpy than they pin). Point `PYTHON` at a 3.11 interpreter when the system one is newer: `PYTHON=python3.11 scripts/dev-stack.sh up`.
+    The stack needs a Python 3.11 interpreter, as in the image (`PYTHON=/path/to/python3.11` if it is not `python3.11` on the PATH).
