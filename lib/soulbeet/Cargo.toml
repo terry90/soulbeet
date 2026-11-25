@@ -25,6 +25,8 @@ md5 = "0.7"
 rand = "0.9"
 sha2 = "0.10"
 libc = "0.2.175"
+# Pinned: writes the tags beets reads, which a minor release may change.
+lofty = "=0.25.5"
 uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]

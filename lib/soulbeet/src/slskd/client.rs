@@ -1,4 +1,5 @@
-use super::{processing, utils::WantedTrack, wildcard};
+use super::{processing, wildcard};
+use crate::matching::path::WantedTrack;
 use crate::{
     backend_error::BackendResult,
     error::{MissingSetting, Result, SoulseekError},
@@ -1533,11 +1534,11 @@ impl crate::DownloadBackend for SoulseekClient {
 
     async fn cancel_download(
         &self,
-        username: &str,
+        source: &str,
         download_id: &str,
         remove: bool,
     ) -> BackendResult<()> {
-        Ok(self.cancel_download(username, download_id, remove).await?)
+        Ok(self.cancel_download(source, download_id, remove).await?)
     }
 
     async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>> {

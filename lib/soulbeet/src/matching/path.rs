@@ -1,91 +1,39 @@
+//! How well a file's path names what was searched for.
+
+use super::duration::{duration_score, DURATION_WEIGHT};
+use super::text::{
+    clean_name, containment_sim, extract_track_title, jaccard_sim, score_artist, title_scores,
+    CleanedText,
+};
 use regex::Regex;
 use shared::slskd::MatchResult;
-use std::{collections::HashSet, path::Path, sync::LazyLock};
+use std::{path::Path, sync::LazyLock};
 
-static RE_NON_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\w\s]").unwrap());
-static RE_LEAD_TRACK_FIXED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d{1,3}|[A-D]\d{1,2})\s*[\.\-]\s*").unwrap());
-static RE_TRAIL_BRACKET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s*\[\s*[^\]]*\]\s*$").unwrap());
-static RE_TRAIL_YEAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s*[-\(\[]?\d{4}[-\)\]]?\s*$").unwrap());
 static RE_DISC_FOLDER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(cd|disc|disk)[\s._-]*\d{1,2}\b").unwrap());
 
 /// Whether a folder is one disc of a release (`CD1`, `Disc 2`, `Disk 1 - Live`),
 /// whose name is in the folder above it.
-pub(super) fn is_disc_folder(name: &str) -> bool {
+pub fn is_disc_folder(name: &str) -> bool {
     RE_DISC_FOLDER.is_match(name.trim())
 }
 
-// A struct to hold pre-processed text for efficient comparisons.
-#[derive(Debug, Clone)]
-struct CleanedText {
-    original: String,
-    words: HashSet<String>,
+/// The remote folder of a file a source names with `\` or `/` between its folders.
+pub fn remote_folder(filename: &str) -> &str {
+    filename
+        .rsplit_once(['\\', '/'])
+        .map_or("", |(folder, _)| folder)
 }
 
-impl CleanedText {
-    fn new(s: &str) -> Self {
-        let original = s.to_string();
-        let s = s.replace('_', " ");
-        let cleaned = RE_NON_WORD.replace_all(&s, " ").to_string();
-        let words = cleaned
-            .to_lowercase()
-            .split_whitespace()
-            .filter(|w| !w.trim().is_empty())
-            .map(|w| w.to_string())
-            .collect();
-        CleanedText { original, words }
-    }
-
-    pub fn words(&self) -> &HashSet<String> {
-        &self.words
-    }
-}
-
-fn jaccard_sim(a: &CleanedText, b: &CleanedText) -> f64 {
-    let inter = a.words().intersection(b.words()).count();
-    let uni = a.words().len() + b.words().len() - inter;
-    if uni == 0 {
-        0.0
+/// The remote folder of the release a file is in: its own folder, or the one
+/// above it when its folder is one disc of the release.
+pub fn release_folder(filename: &str) -> &str {
+    let folder = remote_folder(filename);
+    let (above, name) = folder.rsplit_once(['\\', '/']).unwrap_or(("", folder));
+    if is_disc_folder(name) {
+        above
     } else {
-        inter as f64 / uni as f64
-    }
-}
-
-fn containment_sim(candidate: &CleanedText, target: &CleanedText) -> f64 {
-    if target.words().is_empty() {
-        return 0.0;
-    }
-    let inter = candidate.words().intersection(target.words()).count();
-    inter as f64 / target.words().len() as f64
-}
-
-fn dice_sim(a: &CleanedText, b: &CleanedText) -> f64 {
-    let inter = a.words().intersection(b.words()).count();
-    let total = a.words().len() + b.words().len();
-    if total == 0 {
-        1.0
-    } else {
-        (2.0 * inter as f64) / total as f64
-    }
-}
-
-fn clean_name(name: &str) -> String {
-    let name = name.replace('_', " ");
-    let mut cleaned = RE_LEAD_TRACK_FIXED.replace(&name, "").to_string();
-    cleaned = RE_TRAIL_BRACKET.replace(&cleaned, "").to_string();
-    cleaned = RE_TRAIL_YEAR.replace(&cleaned, "").to_string();
-    cleaned.trim().to_string()
-}
-
-fn extract_track_title(stem: &str) -> String {
-    let stem_clean = clean_name(stem);
-    if let Some(pos) = stem_clean.rfind(" - ") {
-        stem_clean[pos + 3..].trim().to_string()
-    } else {
-        stem_clean
+        folder
     }
 }
 
@@ -140,73 +88,11 @@ fn score_album(folders: &[CleanedText], target_album: &CleanedText) -> (f64, Cle
         .unwrap_or((0.0, CleanedText::new("")))
 }
 
-fn score_artist(
-    folders: &[CleanedText],
-    stem: &CleanedText,
-    target_artist: &CleanedText,
-) -> (f64, CleanedText) {
-    let folder_candidate = folders
-        .iter()
-        .map(|folder| (containment_sim(folder, target_artist), folder.clone()))
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or((0.0, CleanedText::new("")));
-
-    let stem_artist_part = if let Some(pos) = stem.original.rfind(" - ") {
-        clean_name(&stem.original[..pos])
-    } else {
-        clean_name(&stem.original)
-    };
-    let stem_candidate_c = CleanedText::new(&stem_artist_part);
-    let stem_score = containment_sim(&stem_candidate_c, target_artist);
-
-    if stem_score > folder_candidate.0 {
-        return (stem_score, stem_candidate_c);
-    }
-    if folder_candidate.0 > stem_score {
-        return folder_candidate;
-    }
-
-    if stem_score > 0.9 && stem_candidate_c.original.len() > folder_candidate.1.original.len() {
-        return (stem_score, stem_candidate_c);
-    }
-    folder_candidate
-}
-
-/// How well the title in `stem` matches each of `expected_tracks`.
-fn title_scores(stem: &CleanedText, expected_tracks: &[CleanedText]) -> Vec<f64> {
-    let track_title_from_stem = CleanedText::new(&extract_track_title(&stem.original));
-
-    expected_tracks
-        .iter()
-        .map(|expected| {
-            (dice_sim(&track_title_from_stem, expected) * 0.6)
-                + (containment_sim(&track_title_from_stem, expected) * 0.4)
-        })
-        .collect()
-}
-
 /// A track the search is for, with its length when the metadata provider knows it.
 #[derive(Debug, Clone)]
 pub struct WantedTrack {
     pub title: String,
     pub duration_s: Option<u32>,
-}
-
-pub const DURATION_WEIGHT: f64 = 0.3;
-
-/// Full credit up to this many seconds of difference, none from `DURATION_NONE_S` on.
-const DURATION_FULL_S: u32 = 3;
-const DURATION_NONE_S: u32 = 30;
-
-fn duration_score(wanted_s: u32, file_s: u32) -> f64 {
-    let diff = wanted_s.abs_diff(file_s);
-    if diff <= DURATION_FULL_S {
-        1.0
-    } else if diff >= DURATION_NONE_S {
-        0.0
-    } else {
-        1.0 - f64::from(diff - DURATION_FULL_S) / f64::from(DURATION_NONE_S - DURATION_FULL_S)
-    }
 }
 
 /// A file scored as one of the expected tracks.
