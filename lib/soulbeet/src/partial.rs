@@ -27,7 +27,9 @@ pub struct PartialDir {
 impl PartialDir {
     /// The folder, made if missing. The first open of an instance in this process takes an
     /// exclusive lock on `<instance>/.lock`, held until the process ends; when another process
-    /// holds it (a second server on the same database) the open fails.
+    /// holds it (a second server on the same database and downloads folder) the open fails.
+    /// The lock covers one (database, downloads folder) pair: two servers on one database with
+    /// different downloads folders do not see each other, and are not supported.
     pub fn open(download_path: &Path, instance: &str, backend: &str) -> io::Result<PartialDir> {
         for part in [instance, backend] {
             plain_name(part)?;
@@ -40,9 +42,36 @@ impl PartialDir {
         Ok(PartialDir { dir })
     }
 
-    /// The partial file of the transfer `transfer_id`.
+    /// Where the partial file of the transfer `transfer_id` is, or the folder a backend's tool
+    /// writes it in. A partial file is read through this path (its length, a checksum) and
+    /// written only through `open_part`.
     pub fn part(&self, transfer_id: &str) -> PathBuf {
         self.dir.join(transfer_id)
+    }
+
+    /// The partial file of `transfer_id`, opened to write: made if missing, emptied unless
+    /// `resume`, else written at its end. A part that is also a landed file (a landing cut
+    /// between its link and its removal) is refused with `AlreadyExists`, so nothing rewrites a
+    /// finished file: call `land` again, which then only removes the part.
+    pub fn open_part(&self, transfer_id: &str, resume: bool) -> io::Result<File> {
+        plain_name(transfer_id)?;
+        let path = self.part(transfer_id);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .append(resume)
+            .write(true)
+            .open(&path)?;
+        if file.metadata()?.nlink() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already landed, call land to finish", path.display()),
+            ));
+        }
+        if !resume {
+            file.set_len(0)?;
+        }
+        Ok(file)
     }
 
     /// Deletes every partial file whose transfer id is not in `keep`.
@@ -94,7 +123,7 @@ fn lock_once(path: &Path) -> io::Result<()> {
             io::ErrorKind::WouldBlock => io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!(
-                    "Another Soulful server on this database holds {}",
+                    "Another Soulful server on this database and downloads folder holds {}",
                     path.display()
                 ),
             ),
@@ -105,7 +134,7 @@ fn lock_once(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Moves the finished partial file `part` to `<download_path>/<destination>/<name>`, `name`
+/// Moves the finished partial file `part`, closed, to `<download_path>/<destination>/<name>`, `name`
 /// being the first free name of `landing_names(remote_basename)`, else a `ticks_copy` of the
 /// first one. It never replaces a file: it links `part` under a free name, then removes `part`.
 /// When one of those names already is `part` (a crash between the link and the removal), it
@@ -185,6 +214,7 @@ fn already_landed(part: &Path, folder: &Path, names: &[String]) -> io::Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn instance() -> String {
         uuid::Uuid::new_v4().to_string()
@@ -193,9 +223,8 @@ mod tests {
     /// A finished partial file holding `bytes`, in a backend's partial folder under `root`.
     fn part(root: &Path, id: &str, bytes: &[u8]) -> PathBuf {
         let dir = PartialDir::open(root, &instance(), "archive").unwrap();
-        let part = dir.part(id);
-        std::fs::write(&part, bytes).unwrap();
-        part
+        dir.open_part(id, false).unwrap().write_all(bytes).unwrap();
+        dir.part(id)
     }
 
     #[test]
@@ -288,6 +317,56 @@ mod tests {
     }
 
     #[test]
+    fn a_part_is_written_from_the_start_or_resumed_at_its_end() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = PartialDir::open(root.path(), &instance(), "archive").unwrap();
+        dir.open_part("t1", false)
+            .unwrap()
+            .write_all(b"abc")
+            .unwrap();
+        dir.open_part("t1", true)
+            .unwrap()
+            .write_all(b"def")
+            .unwrap();
+        assert_eq!(std::fs::read(dir.part("t1")).unwrap(), b"abcdef");
+        dir.open_part("t1", false).unwrap().write_all(b"x").unwrap();
+        assert_eq!(std::fs::read(dir.part("t1")).unwrap(), b"x");
+        for bad in ["", "..", "a/b"] {
+            let e = dir.open_part(bad, false).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_part_that_already_landed_is_never_written_again() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = PartialDir::open(root.path(), &instance(), "archive").unwrap();
+        dir.open_part("t1", false)
+            .unwrap()
+            .write_all(b"finished")
+            .unwrap();
+        // The crash: linked under its landing name, the part still there.
+        let folder = root.path().join("F");
+        std::fs::create_dir_all(&folder).unwrap();
+        let landed = folder.join("01.flac");
+        std::fs::hard_link(dir.part("t1"), &landed).unwrap();
+
+        for resume in [false, true] {
+            let e = dir.open_part("t1", resume).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{resume}");
+        }
+        assert_eq!(std::fs::read(&landed).unwrap(), b"finished");
+
+        assert_eq!(
+            land(&dir.part("t1"), root.path(), "F", "01.flac").unwrap(),
+            landed
+        );
+        assert!(!dir.part("t1").exists());
+        assert_eq!(std::fs::read(&landed).unwrap(), b"finished");
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
+    }
+
+    #[test]
     fn a_lock_another_process_holds_refuses_the_open() {
         let root = tempfile::tempdir().unwrap();
         let id = instance();
@@ -315,8 +394,15 @@ mod tests {
         let (a, b) = (instance(), instance());
         let mine = PartialDir::open(root.path(), &a, "archive").unwrap();
         let theirs = PartialDir::open(root.path(), &b, "archive").unwrap();
-        std::fs::write(mine.part("t1"), b"a").unwrap();
-        std::fs::write(theirs.part("t1"), b"b").unwrap();
+        mine.open_part("t1", false)
+            .unwrap()
+            .write_all(b"a")
+            .unwrap();
+        theirs
+            .open_part("t1", false)
+            .unwrap()
+            .write_all(b"b")
+            .unwrap();
         assert_ne!(mine.part("t1"), theirs.part("t1"));
 
         mine.clear_except(&HashSet::new()).unwrap();
@@ -337,7 +423,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = PartialDir::open(root.path(), &instance(), "ytdlp").unwrap();
         for id in ["keep", "drop"] {
-            std::fs::write(dir.part(id), id).unwrap();
+            dir.open_part(id, false)
+                .unwrap()
+                .write_all(id.as_bytes())
+                .unwrap();
         }
         std::fs::create_dir_all(dir.part("staging")).unwrap();
         std::fs::write(dir.part("staging").join("a.opus"), b"x").unwrap();
