@@ -174,7 +174,8 @@ async fn start_backend_search(
 }
 
 /// Polls the backend's search `search_id` until it ends: the groups it found
-/// and how it ended.
+/// and how it ended. A search still running at SEARCH_TIMEOUT is stopped at
+/// the backend, so it spends no more requests on results nobody reads.
 async fn poll_backend_search(
     id: &str,
     backend: &Arc<dyn DownloadBackend>,
@@ -189,6 +190,7 @@ async fn poll_backend_search(
     loop {
         if tokio::time::Instant::now() >= deadline {
             warn!("Backend {} search timed out", id);
+            stop_at_backend(backend, search_id).await;
             return (latest_groups, SearchStop::TimedOut);
         }
         tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
@@ -1130,11 +1132,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_search_still_running_at_the_deadline_is_a_timeout() {
+    async fn a_search_still_running_at_the_deadline_is_a_timeout_and_stopped() {
         let stub = StubBackend::new(vec![]);
 
-        let (_, f) = searched(stub).await;
+        let (_, f) = searched(stub.clone()).await;
 
+        assert_eq!(stub.stopped_searches(), ["search"]);
         assert_eq!(
             advice(&f),
             (
