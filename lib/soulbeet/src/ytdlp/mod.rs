@@ -95,8 +95,11 @@ impl Engine {
             download_path: settings.download_path.clone(),
             error,
         };
-        let dir = PartialDir::open(&settings.download_path, &settings.instance, BACKEND_ID)
-            .map_err(storage)?;
+        // The helper runs in a folder of its own, so every path it is given must be absolute.
+        let download_path = std::path::absolute(&settings.download_path).map_err(storage)?;
+        let tools = settings.tools.absolute().map_err(storage)?;
+        let dir =
+            PartialDir::open(&download_path, &settings.instance, BACKEND_ID).map_err(storage)?;
         let clearing = dir.clone();
         let cleared = tokio::task::spawn_blocking(move || {
             clearing.clear_except(&HashSet::from([CACHE.to_string()]))?;
@@ -108,11 +111,11 @@ impl Engine {
         .and_then(|r| r);
         cleared.map_err(storage)?;
 
-        let helper = Helper::new(settings.tools, script, dir.part(HOME), dir.part(CACHE));
+        let helper = Helper::new(tools, script, dir.part(HOME), dir.part(CACHE));
         let standing = Arc::new(Standing::default());
         let queue = Queue::start(
             dir.clone(),
-            settings.download_path,
+            download_path,
             helper.clone(),
             standing.clone(),
             pace,

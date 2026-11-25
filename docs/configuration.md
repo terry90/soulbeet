@@ -53,6 +53,6 @@ The paths of its tools, which the `:full` image sets up; change them only to run
 | `YTDLP_SITE_PACKAGES` | The folder that holds yt-dlp, yt-dlp-ejs and ytmusicapi, apart from beets' packages | `/opt/ytdlp/lib/python3.11/site-packages` |
 | `YTDLP_DENO` | The deno that runs YouTube's player code for yt-dlp, with no permissions | `/opt/ytdlp/bin/deno` |
 
-ffmpeg is the one on `PATH` (`/usr/local/bin/ffmpeg` in `:full`).
+ffmpeg is the one on `PATH` (`/usr/local/bin/ffmpeg` in `:full`). A relative path in one of these variables, or in `DOWNLOAD_PATH`, is read from the folder Soulbeet was started in.
 
 How a download source plugs in is in [download-backends.md](download-backends.md).

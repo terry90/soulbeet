@@ -37,6 +37,18 @@ pub struct Tools {
     pub ffmpeg: Option<PathBuf>,
 }
 
+impl Tools {
+    /// These tools with every relative path read from the server's working folder.
+    pub(crate) fn absolute(self) -> std::io::Result<Tools> {
+        Ok(Tools {
+            python: std::path::absolute(&self.python)?,
+            site_packages: std::path::absolute(&self.site_packages)?,
+            deno: std::path::absolute(&self.deno)?,
+            ffmpeg: self.ffmpeg.map(std::path::absolute).transpose()?,
+        })
+    }
+}
+
 /// What one call asks the helper.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -737,6 +749,23 @@ time.sleep(60)
                 "cache_dir": "/d/.soulful-partial/i/ytdlp/cache",
             })
         );
+    }
+
+    #[test]
+    fn relative_tool_paths_are_read_from_the_working_folder() {
+        let cwd = std::env::current_dir().unwrap();
+        let tools = Tools {
+            python: "/usr/bin/python3".into(),
+            site_packages: "venv/site-packages".into(),
+            deno: "bin/deno".into(),
+            ffmpeg: Some("ffmpeg".into()),
+        }
+        .absolute()
+        .unwrap();
+        assert_eq!(tools.python, PathBuf::from("/usr/bin/python3"));
+        assert_eq!(tools.site_packages, cwd.join("venv/site-packages"));
+        assert_eq!(tools.deno, cwd.join("bin/deno"));
+        assert_eq!(tools.ffmpeg, Some(cwd.join("ffmpeg")));
     }
 
     #[test]

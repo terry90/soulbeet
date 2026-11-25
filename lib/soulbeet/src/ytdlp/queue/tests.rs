@@ -380,6 +380,38 @@ async fn a_taken_name_lands_as_a_copy_and_the_file_there_is_left_alone() {
     assert_eq!(copies.len(), 1, "{copies:?}");
 }
 
+/// `path` as a path relative to the working folder.
+fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let mut relative: PathBuf = (cwd.components().skip(1)).map(|_| "..").collect();
+    relative.push(path.strip_prefix("/").unwrap());
+    relative
+}
+
+#[tokio::test]
+async fn a_relative_downloads_folder_lands_where_the_server_reads_it() {
+    let rig = Rig::new();
+    let mut settings = rig.settings();
+    settings.download_path = relative_to_cwd(&rig.downloads());
+    assert!(settings.download_path.is_relative());
+    let engine = Engine::start_with(settings, QUICK, rig.script().into())
+        .await
+        .unwrap();
+    let wanted = item(0, "MdzF0rFOC9Y");
+    let ids = enqueued(
+        &engine
+            .queue
+            .download(0, vec![wanted.clone()], "Spiderland [1]", "r1", "u1")
+            .unwrap(),
+    );
+    let row = ended(&engine, &wanted.source, &ids[0]).await;
+    assert_eq!(row.state, DownloadState::Completed, "{row:?}");
+    assert!(rig.downloads().join("Spiderland [1]").join(&wanted.id).is_file());
+    // Nothing was written under the helper's own folder.
+    let home = rig.partial().join("home");
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "{home:?}");
+}
+
 #[tokio::test]
 async fn titles_with_separators_and_long_ones_land_under_the_name_the_monitor_reads() {
     let rig = Rig::new();
