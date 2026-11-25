@@ -22,7 +22,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
@@ -153,8 +153,6 @@ struct Record {
 struct State {
     records: HashMap<String, Record>,
     next_seq: u64,
-    /// Bumped by each stop: a handle built before it is refused.
-    generation: u64,
     /// The turn each owner was last served in; an owner never served goes first.
     served: HashMap<String, u64>,
     turn: u64,
@@ -206,6 +204,8 @@ pub(crate) struct Queue {
     queued: Notify,
     /// Notified when the running transfer is gone.
     ended: Notify,
+    /// Bumped by each stop, while `state` is held: a handle built before it is refused.
+    generation: watch::Sender<u64>,
 }
 
 fn plain_folder(name: &str) -> bool {
@@ -230,13 +230,21 @@ impl Queue {
             state: Mutex::new(State::default()),
             queued: Notify::new(),
             ended: Notify::new(),
+            generation: watch::Sender::new(0),
         });
         tokio::spawn(queue.clone().work());
         queue
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.state.lock().unwrap().generation
+        *self.generation.borrow()
+    }
+
+    /// Ends once a stop came after `generation`: at once when one did already.
+    pub(crate) async fn turned_off(&self, generation: u64) {
+        let mut seen = self.generation.subscribe();
+        // The sender lives as long as the queue, so only a stop ends the wait.
+        let _ = seen.wait_for(|now| *now != generation).await;
     }
 
     /// Runs `f` while `generation` is the current one, so no stop comes between the check and
@@ -246,8 +254,8 @@ impl Queue {
         generation: u64,
         f: impl FnOnce() -> Result<T, YtDlpError>,
     ) -> Result<T, YtDlpError> {
-        let state = self.state.lock().unwrap();
-        if state.generation != generation {
+        let _state = self.state.lock().unwrap();
+        if self.generation() != generation {
             return Err(YtDlpError::TurnedOff);
         }
         f()
@@ -344,7 +352,7 @@ impl Queue {
         owner: &str,
     ) -> Result<Vec<QueuedDownload>, YtDlpError> {
         let mut state = self.state.lock().unwrap();
-        if state.generation != generation {
+        if self.generation() != generation {
             return Err(YtDlpError::TurnedOff);
         }
         if !plain_folder(destination) {
@@ -490,7 +498,7 @@ impl Queue {
     pub(crate) async fn stop(&self) {
         let tasks: Vec<(String, Option<JoinHandle<()>>)> = {
             let mut state = self.state.lock().unwrap();
-            state.generation += 1;
+            self.generation.send_modify(|g| *g += 1);
             (state.records.values_mut())
                 .filter(|r| !r.phase.ended())
                 .map(|r| {

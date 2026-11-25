@@ -76,6 +76,9 @@ if command == "version":
     say({"version": json.load(open(VERSIONS))})
     sys.exit(0)
 if command == "probe":
+    if os.path.exists(PROBE_HANGS):
+        open(PROBE_HANGS, "w").write(str(os.getpid()))
+        time.sleep(60)
     if os.path.exists(PROBE_FAILS):
         fail("network", "timed out")
     say({"probe": "ok"})
@@ -179,6 +182,7 @@ impl Rig {
             ("LOG", quoted("log")),
             ("VERSIONS", quoted("versions.json")),
             ("PROBE_FAILS", quoted("probe-fails")),
+            ("PROBE_HANGS", quoted("probe-hangs")),
             ("SILENCE", quoted("silence.opus")),
             ("OUTSIDE", quoted("outside.opus")),
             ("FIXTURES", format!("{:?}", fixtures.display().to_string())),

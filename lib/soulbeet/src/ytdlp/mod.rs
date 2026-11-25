@@ -142,9 +142,9 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Stops every search and unfinished transfer, killing their helpers, and deletes their
-    /// staging folders. Every handle built before is refused `download` and `start_search` from
-    /// now on.
+    /// Stops every search, unfinished transfer and health probe, killing their helpers, and
+    /// deletes their staging folders. Every handle built before is refused `download` and
+    /// `start_search` from now on, and starts no probe.
     pub async fn stop(&self) {
         self.searches.stop_all();
         self.queue.stop().await;
@@ -210,8 +210,9 @@ impl Engine {
     }
 
     /// Why the backend cannot work now, or Ok: the image's tools, then a pause, then what
-    /// YouTube last answered, else a probe of its own.
-    async fn health(&self) -> Result<(), Failure> {
+    /// YouTube last answered, else a probe of its own, for a handle of `generation`. A stop
+    /// kills the probe's helper, and a handle built before one starts no probe.
+    async fn health(&self, generation: u64) -> Result<(), Failure> {
         let _probe = self.probe.lock().await;
         let versions = self.versions().await.map_err(|fault| {
             let message = health_words(fault.kind);
@@ -228,7 +229,16 @@ impl Engine {
         let heard = match self.standing.heard_within(PROBE_EVERY) {
             Some(heard) => heard,
             None => {
-                let probed = self.run_probe().await;
+                let probed = tokio::select! {
+                    biased;
+                    () = self.queue.turned_off(generation) => None,
+                    probed = self.run_probe() => Some(probed),
+                };
+                self.remove_probe_folder();
+                let Some(probed) = probed else {
+                    let turned_off = YtDlpError::TurnedOff;
+                    return Err(turned_off.failure(Stage::SourceSearch, turned_off.to_string()));
+                };
                 if probed.is_ok() {
                     self.standing.passed_probe();
                 }
@@ -256,7 +266,7 @@ impl Engine {
             Ok(()) => {
                 let request = Request::Probe {
                     video_id: PROBE_VIDEO.to_string(),
-                    staging_dir: staging.clone(),
+                    staging_dir: staging,
                 };
                 match self.helper.call(&request, Limits::PROBE, &mut |_| {}).await {
                     Ok(Answer::Probe(_)) => Ok(()),
@@ -268,16 +278,19 @@ impl Engine {
                 }
             }
         };
-        if let Err(e) = std::fs::remove_dir_all(&staging) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Could not delete the YouTube Music probe folder: {e}");
-            }
-        }
         if let Err(fault) = &probed {
             warn!("YouTube Music health probe failed: {}", fault.message);
         }
         self.standing.heard_download(probed.as_ref().map(|_| ()));
         probed
+    }
+
+    fn remove_probe_folder(&self) {
+        if let Err(e) = std::fs::remove_dir_all(self.dir.part(PROBE)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Could not delete the YouTube Music probe folder: {e}");
+            }
+        }
     }
 }
 
@@ -487,7 +500,7 @@ impl crate::DownloadBackend for YtDlpBackend {
     /// The image's tools, a pause, and what YouTube answered in the last 30 minutes; only when
     /// it answered nothing in that time, a probe of its own. No request to YouTube otherwise.
     async fn health_check(&self) -> Result<(), Failure> {
-        self.engine.health().await
+        self.engine.health(self.generation).await
     }
 }
 
@@ -728,6 +741,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent[0].status, EnqueueStatus::Enqueued);
+    }
+
+    #[tokio::test]
+    async fn turning_off_kills_a_running_probe_and_an_old_handle_starts_none() {
+        let rig = Rig::new();
+        let hangs = rig.path("probe-hangs");
+        std::fs::write(&hangs, b"").unwrap();
+        let engine = rig.engine(QUICK).await;
+        let before = Arc::new(YtDlpBackend::new(engine.clone()));
+        let checking = before.clone();
+        let check = tokio::spawn(async move { checking.health_check().await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&hangs)
+                .ok()
+                .and_then(|p| p.parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        engine.stop().await;
+
+        let failure = tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .expect("the health check ended")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            failure.code,
+            shared::failure::FailureCode::BackendNotConfigured
+        );
+        assert!(protocol::tests::gone(pid).await);
+        assert!(!rig.partial().join(PROBE).exists());
+        // The old handle asks YouTube nothing more.
+        assert!(before.health_check().await.is_err());
+        assert_eq!(probes(&rig), 1);
     }
 
     #[tokio::test]
