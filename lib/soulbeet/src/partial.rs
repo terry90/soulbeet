@@ -138,7 +138,8 @@ fn lock_once(path: &Path) -> io::Result<()> {
 /// being the first free name of `landing_names(remote_basename)`, else a `ticks_copy` of the
 /// first one. It never replaces a file: it links `part` under a free name, then removes `part`.
 /// When one of those names already is `part` (a crash between the link and the removal), it
-/// only removes `part`. Returns where the file is.
+/// only removes `part`. Returns where the file is, once the link and the removal are on disk,
+/// so a backend may record the file landed when it returns.
 pub fn land(
     part: &Path,
     download_path: &Path,
@@ -154,18 +155,28 @@ pub fn land(
         ));
     }
     let folder = download_path.join(destination);
-    std::fs::create_dir_all(&folder)?;
-    if let Some(landed) = already_landed(part, &folder, &names)? {
-        std::fs::remove_file(part)?;
-        return Ok(landed);
+    if !folder.is_dir() {
+        std::fs::create_dir_all(&folder)?;
+        sync_dir(download_path)?;
     }
-    for name in &names {
+    let landed = match already_landed(part, &folder, &names)? {
+        Some(landed) => landed,
+        None => link_free(part, &folder, &names)?,
+    };
+    sync_dir(&folder)?;
+    std::fs::remove_file(part)?;
+    if let Some(parts) = part.parent() {
+        sync_dir(parts)?;
+    }
+    Ok(landed)
+}
+
+/// Links `part` under the first free name of `names` in `folder`, else a ticks copy.
+fn link_free(part: &Path, folder: &Path, names: &[String]) -> io::Result<PathBuf> {
+    for name in names {
         let target = folder.join(name);
         match std::fs::hard_link(part, &target) {
-            Ok(()) => {
-                std::fs::remove_file(part)?;
-                return Ok(target);
-            }
+            Ok(()) => return Ok(target),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -176,14 +187,28 @@ pub fn land(
             dotnet_ticks(std::time::SystemTime::now()),
         ));
         match std::fs::hard_link(part, &copy) {
-            Ok(()) => {
-                std::fs::remove_file(part)?;
-                return Ok(copy);
-            }
+            Ok(()) => return Ok(copy),
             // Another copy in the same tick: the next tick is free.
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Puts the entries of the folder `dir` on disk: a name linked or removed there survives a
+/// power cut once this returns. Some network and FUSE file systems cannot sync a folder and
+/// answer EINVAL; PostgreSQL takes that answer as done too.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    match File::open(dir)?.sync_all() {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+            ) =>
+        {
+            Ok(())
+        }
+        synced => synced,
     }
 }
 
