@@ -105,11 +105,13 @@ export default defineConfig({
     },
     {
       // Turns YouTube Music on for the whole instance, and ends with YouTube rate-limiting it,
-      // a pause that outlives the spec, so it runs alone, after the archive.
+      // a pause that outlives the spec, so it runs alone, after the archive. No retry: a rerun
+      // starts inside that pause, where its first test cannot pass.
       name: 'ytdlp',
       dependencies: ['archive'],
       testMatch: /ytdlp\.spec\.ts/,
       workers: 1,
+      retries: 0,
       use: { ...devices['Desktop Chrome'] },
     },
   ],
