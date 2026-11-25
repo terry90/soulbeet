@@ -22,6 +22,7 @@ pub mod tags;
 pub(crate) mod test_http;
 pub mod traits;
 pub mod transfer_book;
+pub mod ytdlp;
 
 pub use backend_error::{BackendError, BackendFault, BackendResult, PeerAsk};
 pub use beets::{duplicate_note, DuplicateNote};

@@ -1,0 +1,80 @@
+[
+ {
+  "category": "Albums",
+  "resultType": "album",
+  "title": "Spiderland",
+  "type": "Album",
+  "playlistId": "OLAK5uy_k62V_DypQV555aJil4o3rMio-Lmuwor74",
+  "duration": null,
+  "year": "1991",
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "browseId": "MPREb_ur8iGYISD11",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w226-h226-l90-rj",
+    "width": 226,
+    "height": 226
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w544-h544-l90-rj",
+    "width": 544,
+    "height": 544
+   }
+  ]
+ },
+ {
+  "category": "Albums",
+  "resultType": "album",
+  "title": "Tweez",
+  "type": "Album",
+  "playlistId": "OLAK5uy_kUCjduCG7X2lq1nnxensA9gkYW_MMZIws",
+  "duration": null,
+  "year": "2024",
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "browseId": "MPREb_2NqRxRpdkwL",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/0WC37Xc-OE3wCF0BVHGygYwzjEffxGrR-Y9OO_R_GiYvSB0L8sIu6hnR01tXxbqAjISK8oLE4xFAY6Q1=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/0WC37Xc-OE3wCF0BVHGygYwzjEffxGrR-Y9OO_R_GiYvSB0L8sIu6hnR01tXxbqAjISK8oLE4xFAY6Q1=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/0WC37Xc-OE3wCF0BVHGygYwzjEffxGrR-Y9OO_R_GiYvSB0L8sIu6hnR01tXxbqAjISK8oLE4xFAY6Q1=w226-h226-l90-rj",
+    "width": 226,
+    "height": 226
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/0WC37Xc-OE3wCF0BVHGygYwzjEffxGrR-Y9OO_R_GiYvSB0L8sIu6hnR01tXxbqAjISK8oLE4xFAY6Q1=w544-h544-l90-rj",
+    "width": 544,
+    "height": 544
+   }
+  ]
+ }
+]

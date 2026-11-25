@@ -1,0 +1,742 @@
+[
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Breadcrumb Trail",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "gBfoQjJ7guk",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:56",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 356,
+  "views": "1.2M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Breadcrumb Trail",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "7jst4--Wsv8",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:55",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 355,
+  "views": "1.2M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Breadcrumb Trail (Original Alternate “Dry” Mixes from 1990)",
+  "album": {
+   "name": "Breadcrumb Trail / Good Morning, Captain (Original Alternate “Dry” Mixes from 1990)",
+   "id": "MPREb_tr8Sgwrjs81"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "XF6xT2Cya2I",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "6:00",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 360,
+  "views": "1.2M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/fNnnztm10wqeAO_T3bR-9EAtR0SiLLy0xFQZcPTKk0Ho1L_G1K-VWgf3YqmVaoGKp1Zo8faQld2FnIU=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/fNnnztm10wqeAO_T3bR-9EAtR0SiLLy0xFQZcPTKk0Ho1L_G1K-VWgf3YqmVaoGKp1Zo8faQld2FnIU=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Good Morning, Captain",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "CuqEpjcBfaU",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "7:40",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 460,
+  "views": "3M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Don, Aman",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "qMHh02UhQhs",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "6:29",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 389,
+  "views": "739K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Good Morning, Captain",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "-TAt3Sjqywg",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "7:42",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 462,
+  "views": "3M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Good Morning, Captain (Original Alternate “Dry” Mixes from 1990)",
+  "album": {
+   "name": "Breadcrumb Trail / Good Morning, Captain (Original Alternate “Dry” Mixes from 1990)",
+   "id": "MPREb_tr8Sgwrjs81"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "Pvy5BiVIGfw",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "7:41",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 461,
+  "views": "3M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/fNnnztm10wqeAO_T3bR-9EAtR0SiLLy0xFQZcPTKk0Ho1L_G1K-VWgf3YqmVaoGKp1Zo8faQld2FnIU=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/fNnnztm10wqeAO_T3bR-9EAtR0SiLLy0xFQZcPTKk0Ho1L_G1K-VWgf3YqmVaoGKp1Zo8faQld2FnIU=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Nosferatu Man",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "5ugdrdFrhI0",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:35",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 335,
+  "views": "1.1M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Pam (Rough Mix, Spiderland Outtake)",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "o7Iyv5pFpxQ",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:45",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 285,
+  "views": "23K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Kent",
+  "album": {
+   "name": "Tweez",
+   "id": "MPREb_2mTkNbAWopa"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "GHbIOVqotJ8",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:49",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 349,
+  "views": "63K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/o5u3MgoPd_PxLa3ycRGEOYu7b6K1j791cymPRcewhbnrw-txjqLZuQqoVcHU6OlaZErE3aqhvr_tiWJF=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/o5u3MgoPd_PxLa3ycRGEOYu7b6K1j791cymPRcewhbnrw-txjqLZuQqoVcHU6OlaZErE3aqhvr_tiWJF=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Rhoda",
+  "album": {
+   "name": "Slint",
+   "id": "MPREb_0TmgI2i0iHB"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "BeccQq0qpdQ",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "6:54",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 414,
+  "views": "73K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/ssmisAnmoRM5O26xmcKne_6OarCZuZb79sx2A7xjhKNZCIFkGpBdtYulsqjc2nTl6xODxTkxIjxQOCk=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/ssmisAnmoRM5O26xmcKne_6OarCZuZb79sx2A7xjhKNZCIFkGpBdtYulsqjc2nTl6xODxTkxIjxQOCk=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Slint",
+  "album": {
+   "name": "All Bright Electric (Deluxe Version)",
+   "id": "MPREb_A2D74OTyTP8"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "1io0J4vr0Hk",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "3:18",
+  "year": null,
+  "artists": [
+   {
+    "name": "Feeder",
+    "id": "UCQ2IUaFcoUn1MXSiJA8rGOQ"
+   }
+  ],
+  "duration_seconds": 198,
+  "views": "986",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/CThF-q-cjBgijzGX7eT1q1GjIAwa2fr_xT_tBncG8QP_mdo_-pk-CsMxJLazQHND3g-bpuAlKLov6BI=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/CThF-q-cjBgijzGX7eT1q1GjIAwa2fr_xT_tBncG8QP_mdo_-pk-CsMxJLazQHND3g-bpuAlKLov6BI=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Good Morning, Captain (Demo)",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "Z6woQHlAo_A",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "7:35",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 455,
+  "views": "1.1M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Washer",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "nmL7rXt1fvI",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "8:51",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 531,
+  "views": "2.8M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Washer (Basement Practice)",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "0ahPUZCACB0",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:49",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 289,
+  "views": "16K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Glenn (Spiderland Outtake)",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "zNI6Xw59st8",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "8:00",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 480,
+  "views": "60K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Washer",
+  "album": {
+   "name": "Spiderland (remastered)",
+   "id": "MPREb_N2vE2gM47Qd"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "v_WasYXxjDI",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "8:50",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 530,
+  "views": "2.8M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/2PdyEggBLXM8-yZ50VsYQxgj7IxKq5jT3N_rDSm3NMes_CCd1lecl7s3rvwCnkn2ekss1a3pX8XA1Is=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Glenn",
+  "album": {
+   "name": "Slint",
+   "id": "MPREb_0TmgI2i0iHB"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "-hixo_2OaBg",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "6:12",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 372,
+  "views": "395K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/ssmisAnmoRM5O26xmcKne_6OarCZuZb79sx2A7xjhKNZCIFkGpBdtYulsqjc2nTl6xODxTkxIjxQOCk=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/ssmisAnmoRM5O26xmcKne_6OarCZuZb79sx2A7xjhKNZCIFkGpBdtYulsqjc2nTl6xODxTkxIjxQOCk=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Ron",
+  "album": {
+   "name": "Tweez",
+   "id": "MPREb_2mTkNbAWopa"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "ToOHwcW4wS0",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "1:56",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 116,
+  "views": "173K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/o5u3MgoPd_PxLa3ycRGEOYu7b6K1j791cymPRcewhbnrw-txjqLZuQqoVcHU6OlaZErE3aqhvr_tiWJF=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/o5u3MgoPd_PxLa3ycRGEOYu7b6K1j791cymPRcewhbnrw-txjqLZuQqoVcHU6OlaZErE3aqhvr_tiWJF=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "For Dinner…",
+  "album": {
+   "name": "Spiderland",
+   "id": "MPREb_ur8iGYISD11"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "oKINKblbx2s",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:06",
+  "year": null,
+  "artists": [
+   {
+    "name": "Slint",
+    "id": "UCiHdxkS3T69_-I0uCRQbZVA"
+   }
+  ],
+  "duration_seconds": 306,
+  "views": "324K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/AhfoXPrgLxA4aPb2nRXzAIJGkbsykhty6ifE9660ynw3RBLFHzhlpn1HZq-TmVStb3OrNkmPdvz6JcHB=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ }
+]
