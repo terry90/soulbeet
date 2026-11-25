@@ -311,7 +311,7 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Downloads
 
-- `find_sources`: searches Soulseek through slskd for a track or an album and ranks what it finds; searches run one at a time for the whole server. A search no peer answers at all is sent again with wildcards (see [Known limits](#known-limits)), and `facts.query_texts_retried` lists the texts sent after `query_text_sent`.
+- `find_sources`: searches Soulseek through slskd for a track or an album and ranks what it finds; searches run one at a time for the whole server. Another download backend an admin turned on, such as the Internet Archive, is not searched here nor by the jobs this tool's results start: the web app's auto-download searches it. A search no peer answers at all is sent again with wildcards (see [Known limits](#known-limits)), and `facts.query_texts_retried` lists the texts sent after `query_text_sent`.
 - `get_sources`: reads a search `find_sources` started, a page at a time.
 - `get_jobs`: shows jobs by id or by batch: state, current download, earlier attempts, import, and the calls that can be made next.
 - `get_batch`: follows a batch, and can wait up to 30 seconds for a change; for a batch with a playlist, how far the playlist is.
@@ -512,15 +512,15 @@ The ones you are most likely to see:
 | `navidrome_not_linked` | `library_check`, `index`, `playlist`, `delete` | The account is not linked to Navidrome or its stored password cannot be read (user action `relink_navidrome`), or `NAVIDROME_URL` is not set (user action `configure_navidrome`). | Enter your Navidrome password under Connect Navidrome, in Soulbeet's Settings > Users, or set `NAVIDROME_URL`. |
 | `navidrome_circuit_open` | `library_check`, `index`, `playlist`, `delete` | Navidrome failed 5 times in a row, so Soulbeet sends it nothing for 60 seconds. | Wait a minute; check Navidrome. |
 | `navidrome_refused` | `library_check`, `index`, `playlist`, `delete` | Navidrome answered with an error other than a refused login, for example an account that may not do what was asked. | Read `cause`; trying again gives the same answer. |
-| `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key; or the download backend is turned off. User action `configure_backend`. | An admin sets the slskd URL and API key in Settings > Config, or turns the backend on in Settings > Config > Connections. |
-| `backend_unreachable` | `source_search`, `enqueue`, `transfer` | slskd did not answer, is not connected to the Soulseek network, or is not logged in (then user action `configure_backend`: check slskd's Soulseek user name and password). At `source_search` also: slskd ended the search with an error before any peer answered. | Check slskd; try again later. |
+| `backend_not_configured` | `source_search`, `enqueue`, `transfer` | The slskd URL or API key is missing, does not parse, or slskd refused the key; or the download backend is turned off (user action `configure_backend`); or the Internet Archive backend cannot keep its partial files in `DOWNLOAD_PATH` (user action `fix_download_path`), or another Soulbeet server on the same database and downloads folder holds them. | An admin sets the slskd URL and API key in Settings > Config, or turns the backend on in Settings > Config > Connections. |
+| `backend_unreachable` | `source_search`, `enqueue`, `transfer` | slskd did not answer, is not connected to the Soulseek network, or is not logged in (then user action `configure_backend`: check slskd's Soulseek user name and password); or archive.org did not answer. At `source_search` also: slskd ended the search with an error before any peer answered. | Check slskd; try again later. |
 | `settings_unreadable` | any | Soulbeet could not read its own database. | Check the server's disk and log; try again later. |
 | `backend_response_unreadable` | `source_search`, `enqueue`, `transfer`, `metadata` | slskd, or MusicBrainz, answered something Soulbeet cannot read. For slskd, user action `update_soulful_or_backend`. | Update Soulbeet or slskd so that their versions match. |
-| `search_rate_limited` | `source_search` | slskd refused the search for too many requests. | Try again later. |
+| `search_rate_limited` | `source_search` | slskd refused the search for too many requests, or archive.org kept answering 429. | Try again later. |
 | `search_no_results` | `source_search` | Nothing on the Soulseek network matched, or the Soulseek server dropped the search. When no peer answered at all, even with the wildcards Soulbeet tried, the message says the server may be blocking it. | Search with other words: write a word with `*` in place of its first letter (`*GMT Kids`), keeping one word as it is in a text of three words or more, or leave a word out. |
 | `search_all_filtered` | `source_search` | Results came back, but each one scored too low or was cut by the filters; the facts count each. | Loosen the filters (for example `lossless_only`) or change the query. |
 | `search_timeout` | `source_search` | The search did not end in time. | Try again later. |
-| `search_query_rejected` | `source_search` | slskd refused the search text as unusable, for example one of exclusion terms only. | Search with other words. |
+| `search_query_rejected` | `source_search` | slskd refused the search text as unusable, for example one of exclusion terms only, or archive.org refused the query. | Search with other words. |
 | `search_already_running` | `source_search` | slskd already runs a search under the id asked for. | Try again later. |
 | `search_lost` | `source_search` | slskd no longer has the search Soulbeet was reading. | Run the search again. |
 | `peer_offline` | `enqueue`, `transfer` | The source is offline. | Another source, or the same one later. |
@@ -529,20 +529,20 @@ The ones you are most likely to see:
 | `already_in_flight_other_folder` | `enqueue` | This user already downloads the same file into another folder. | Wait for it, or another source. |
 | `enqueue_failed` | `enqueue` | slskd did not take the download: it could not reach the source, its blacklist holds the source, or it refused the request. | Another source, or as `retry` says. |
 | `slskd_too_old` | `enqueue` | slskd is older than 0.26. User action `upgrade_backend`. | Upgrade slskd to 0.26 or newer. |
-| `transfer_connection_failed` | `transfer` | The connection to the source failed or dropped, or slskd restarted during the transfer. | Another source; after a slskd restart, the same one later. |
-| `transfer_size_mismatch` | `transfer` | The source's file has another size than it announced. | Another source. |
+| `transfer_connection_failed` | `transfer` | The connection to the source failed or dropped, or slskd restarted during the transfer. For archive.org, 5 connections in a row brought no byte. | Another source; after a slskd restart, the same one later. |
+| `transfer_size_mismatch` | `transfer` | The source's file has another size than it announced (for archive.org, twice). | Another source. |
 | `transfer_checksum_mismatch` | `transfer` | The downloaded bytes do not match the checksum the source gave for the file. | Another source. |
-| `transfer_rejected_not_shared` | `transfer` | The source says the file is not shared. | Another source. |
-| `transfer_rejected_peer_busy` | `transfer` | The source's queue is full, or it hit a daily or weekly quota. | The same source later for a full queue, another source for a quota. |
+| `transfer_rejected_not_shared` | `transfer` | The source says the file is not shared; archive.org refused the file (restricted) or no longer has it. | Another source. |
+| `transfer_rejected_peer_busy` | `transfer` | The source's queue is full, or it hit a daily or weekly quota; or archive.org answered 429 or 503 six times, or asked for a wait over 10 minutes (then `retry_after_seconds`). | The same source later for a full queue, another source for a quota. |
 | `transfer_rejected_failure_limit` | `transfer` | The source refuses after too many failed transfers today or this week. | Another source. |
 | `transfer_rejected_other` | `transfer` | The source refused for another reason, given in `cause`. | Another source. |
 | `transfer_timed_out` | `transfer` | The transfer timed out in slskd, or ran past Soulbeet's time for one track. | Another source. |
-| `transfer_aborted` | `transfer` | slskd aborted the transfer. | Another source. |
+| `transfer_aborted` | `transfer` | slskd aborted the transfer, or the Internet Archive backend could not write the file into the downloads folder (user action `fix_download_path`). | Another source. |
 | `transfer_cancelled` | `transfer`, `import` | The transfer was cancelled, in Soulbeet or in slskd. | Nothing, or retry the job. |
 | `transfer_never_appeared` | `transfer` | slskd took the request but never listed the transfer. | Another source. |
 | `transfer_disappeared` | `transfer` | The transfer vanished from slskd's list. | The same source later. |
 | `transfer_stuck_in_remote_queue` | `transfer` | The transfer waited 15 minutes in the source's queue. | Another source. |
-| `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read. | Check slskd; update Soulbeet or slskd if their versions do not match. |
+| `transfer_list_unreadable` | `transfer` | slskd's list of downloads could not be read, or the Internet Archive backend could not read or write its transfer records in Soulbeet's database. | Check slskd; update Soulbeet or slskd if their versions do not match. |
 | `file_not_found_after_download` | `file_lookup` | slskd finished, but Soulbeet cannot find the file where it looks. User action `fix_download_path` when the file is not on disk. | Mount slskd's download folder in Soulbeet at `DOWNLOAD_PATH`. |
 | `download_disk_full` | `transfer` | The disk the download backend writes to is full. User action `free_disk_space`. | Free disk space, then retry. |
 | `import_no_match` | `import` | beets found no close enough match. | The assistant reads `get_import_choices` and decides with `resolve_import`, or you decide in the web page. |
@@ -615,7 +615,7 @@ A failure only a person can fix carries a `user_action` with a code, what to do 
 
 ## Failure causes
 
-A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `filesystem`, `database` (Soulbeet's own settings database), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
+A failure's `cause.service` names whose answer `cause.raw` holds: `slskd`, `beets`, `navidrome`, `musicbrainz`, `filesystem`, `database` (Soulbeet's own settings database), `internet_archive` (archive.org, for the Internet Archive download backend), or `soulful` (Soulbeet's own words about what it found wrong, or lines it could not read from a service). `cause.status` is the service's status code when it gave one.
 
 ## Known limits
 

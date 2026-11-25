@@ -2,6 +2,11 @@
 
 A download backend finds files and fetches them. slskd (Soulseek) is the default one and is always on. Every other backend is off until an admin turns it on. This page is for whoever adds a backend: what the app expects of it, where it plugs in, and what turning it off does.
 
+The backends in this build:
+
+- `slskd`, Soulseek through the user's slskd server ([configuration.md](configuration.md#settings-in-the-web-ui)).
+- `archive`, the Internet Archive ([archive.md](archive.md)): searches archive.org and downloads in Soulbeet's own engine, with partial files in `PartialDir` and its transfers in the transfer book, so a restart resumes them.
+
 ## The contract
 
 A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app relies on this:
@@ -38,6 +43,7 @@ Failure texts the app writes for a backend name its `BackendMeta::service` ("Dow
 - Resume, prune and `clear_except` run once, when the engine is first created, never on a rebuild of the handle. A rebuild while transfers run must not touch their parts or their book entries.
 - An engine that keeps partial files opens its `PartialDir` before anything else. On any error (another server holds the lock, the downloads folder cannot be written) the backend reports it as its health failure and touches neither the book nor any file.
 - A build holds up the lookups of its own id only, so keep it short and never look the same backend up from inside it.
+- The Internet Archive engine (`soulbeet::archive::ENGINE`) is the model: the build starts it once and wraps each handle around it; the handle keeps the generation it was built in, and the engine's stop bumps the generation, so an older handle's `download` and `start_search` fail with `backend_not_configured`. When the backend is turned off before anything built it since a restart, its stop arm still forgets the unfinished transfers the previous run left in the book, and deletes their partial files.
 
 ## Where a backend plugs in
 
