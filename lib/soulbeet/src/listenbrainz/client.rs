@@ -110,6 +110,34 @@ impl ListenBrainzClient {
             .collect())
     }
 
+    /// Searches public ListenBrainz community playlists by title/description (`GET /1/playlist/search`).
+    /// Works without a token; ListenBrainz requires queries of at least 3 characters.
+    pub async fn search_playlists(
+        &self,
+        query: &str,
+        count: usize,
+    ) -> Result<Vec<PlaylistSearchHit>, RemoteError> {
+        let trimmed = query.trim();
+        if trimmed.chars().count() < 3 || count == 0 {
+            return Ok(Vec::new());
+        }
+        let path = format!(
+            "/1/playlist/search?query={}&count={count}",
+            encode(trimmed)
+        );
+        let listing: Option<PlaylistListing> = self.http.get(&path).await?;
+        Ok(listing
+            .map(|l| l.playlists)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| PlaylistSearchHit {
+                mbid: last_segment(&p.playlist.identifier).to_string(),
+                title: p.playlist.title,
+                creator: p.playlist.creator,
+            })
+            .collect())
+    }
+
     /// A track missing its title or artist name is left out, since a
     /// candidate needs both.
     pub async fn playlist(&self, playlist_mbid: &str) -> Result<Vec<PlaylistTrack>, RemoteError> {
@@ -189,6 +217,27 @@ impl ListenBrainzClient {
             .post("/1/popularity/artist", &body)
             .await?
             .unwrap_or_default())
+    }
+
+    /// Recording-level listen/user counts (`POST /1/popularity/recording`), batched 100 at a time.
+    /// Works without a token.
+    pub async fn recording_popularity(
+        &self,
+        recording_mbids: &[String],
+    ) -> Result<Vec<RecordingPopularityEntry>, RemoteError> {
+        let mut all = Vec::new();
+        for chunk in recording_mbids.chunks(100) {
+            let body = RecordingMbids {
+                recording_mbids: chunk,
+            };
+            let entries: Vec<RecordingPopularityEntry> = self
+                .http
+                .post("/1/popularity/recording", &body)
+                .await?
+                .unwrap_or_default();
+            all.extend(entries);
+        }
+        Ok(all)
     }
 
     pub async fn sitewide_artists(&self, count: usize) -> Result<Vec<SitewideArtist>, RemoteError> {
@@ -787,5 +836,33 @@ mod tests {
             seen.lock().unwrap()[0].target,
             "/1/user/a%20b%26c/listens?count=1000"
         );
+    }
+
+    #[tokio::test]
+    async fn search_playlists_and_recording_popularity_round_trip() {
+        let search_body = r#"{"playlists":[{"playlist":{"identifier":"https://listenbrainz.org/playlist/00403793-6e93-49ae-aed3-4b2e7ba5fb26","title":"Christmas","creator":"Gronald"}}]}"#;
+        let pop_body = r#"[{"recording_mbid":"r1","total_listen_count":100000,"total_user_count":75283}]"#;
+        let (base, seen) = serve(vec![ok(search_body), ok(pop_body)]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+
+        let hits = lb.search_playlists("christmas", 5).await.unwrap();
+        assert_eq!(
+            hits,
+            vec![PlaylistSearchHit {
+                mbid: "00403793-6e93-49ae-aed3-4b2e7ba5fb26".into(),
+                title: "Christmas".into(),
+                creator: "Gronald".into(),
+            }]
+        );
+        // Queries shorter than 3 chars are skipped without calling ListenBrainz.
+        assert!(lb.search_playlists("ab", 5).await.unwrap().is_empty());
+
+        let pop = lb.recording_popularity(&["r1".into()]).await.unwrap();
+        assert_eq!(pop.len(), 1);
+        assert_eq!(pop[0].total_user_count, Some(75_283));
+
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs[0].target, "/1/playlist/search?query=christmas&count=5");
+        assert_eq!(reqs[1].target, "/1/popularity/recording");
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use shared::recommendation::fold_name;
 
-use super::models::{ArtistHit, DeezerPlaylist, DeezerTrack, Envelope, PlaylistHit, RadioTrack};
+use super::models::{ArtistHit, DeezerTrack, Envelope, RadioTrack};
 use crate::knowledge::{cached, KnowledgeError, TTL_DEEZER_ARTIST, TTL_DEEZER_RADIO};
 use crate::polite::{Pace, PoliteClient, RemoteError};
 use crate::traits::KnowledgeCache;
@@ -47,85 +47,6 @@ impl DeezerClient {
         cached(self.cache.as_ref(), &key, TTL_DEEZER_RADIO, async {
             let tracks: Vec<RadioTrack> =
                 self.list(&format!("/artist/{id}/radio?limit=100")).await?;
-            Ok(tracks
-                .into_iter()
-                .map(|t| DeezerTrack {
-                    artist: t.artist.name,
-                    title: t.title,
-                })
-                .collect())
-        })
-        .await
-    }
-
-    /// Searches public Deezer playlists matching `query` (`GET /search/playlist?q=...`).
-    pub async fn search_playlists(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<DeezerPlaylist>, KnowledgeError> {
-        let folded = fold_name(query);
-        if folded.is_empty() || limit == 0 {
-            return Ok(Vec::new());
-        }
-        let key = format!("kc1:deezer:pl-search:{folded}:{limit}");
-        cached(self.cache.as_ref(), &key, TTL_DEEZER_RADIO, async {
-            let q: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
-            let hits: Vec<PlaylistHit> = self
-                .list(&format!("/search/playlist?q={q}&limit={limit}"))
-                .await?;
-            Ok(hits
-                .into_iter()
-                .map(|p| DeezerPlaylist {
-                    id: p.id,
-                    title: p.title,
-                    nb_tracks: p.nb_tracks,
-                })
-                .collect())
-        })
-        .await
-    }
-
-    /// Reads tracks of public Deezer playlist `playlist_id` (`GET /playlist/{id}/tracks`).
-    pub async fn playlist_tracks(
-        &self,
-        playlist_id: u64,
-        limit: usize,
-    ) -> Result<Vec<DeezerTrack>, KnowledgeError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let key = format!("kc1:deezer:pl-tracks:{playlist_id}:{limit}");
-        cached(self.cache.as_ref(), &key, TTL_DEEZER_RADIO, async {
-            let tracks: Vec<RadioTrack> = self
-                .list(&format!("/playlist/{playlist_id}/tracks?limit={limit}"))
-                .await?;
-            Ok(tracks
-                .into_iter()
-                .map(|t| DeezerTrack {
-                    artist: t.artist.name,
-                    title: t.title,
-                })
-                .collect())
-        })
-        .await
-    }
-
-    /// Reads Deezer's public editorial chart tracks for `genre_id` (`0` = global chart,
-    /// `GET /chart/{genre_id}/tracks`).
-    pub async fn editorial_chart(
-        &self,
-        genre_id: u64,
-        limit: usize,
-    ) -> Result<Vec<DeezerTrack>, KnowledgeError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let key = format!("kc1:deezer:chart:{genre_id}:{limit}");
-        cached(self.cache.as_ref(), &key, TTL_DEEZER_RADIO, async {
-            let tracks: Vec<RadioTrack> = self
-                .list(&format!("/chart/{genre_id}/tracks?limit={limit}"))
-                .await?;
             Ok(tracks
                 .into_iter()
                 .map(|t| DeezerTrack {
@@ -197,33 +118,6 @@ mod tests {
             "/search/artist?q=Fishmans&limit=10"
         );
         assert_eq!(dz.artist_id("Fishman").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn playlists_tracks_and_editorial_charts_are_read_and_cached() {
-        let playlists_json = r#"{"data":[{"id":42,"title":"Noël Français","nb_tracks":30}]}"#;
-        let tracks_json = r#"{"data":[{"title":"Petit Papa Noël","artist":{"name":"Tino Rossi"}}]}"#;
-        let chart_json = r#"{"data":[{"title":"Last Christmas","artist":{"name":"Wham!"}}]}"#;
-        let (base, seen) = serve(vec![ok(playlists_json), ok(tracks_json), ok(chart_json)]);
-        let dz = client(&base);
-
-        let pls = dz.search_playlists("Noël Français", 5).await.unwrap();
-        assert_eq!(pls.len(), 1);
-        assert_eq!(pls[0].id, 42);
-        assert_eq!(pls[0].nb_tracks, 30);
-
-        let pl_tracks = dz.playlist_tracks(42, 20).await.unwrap();
-        assert_eq!(pl_tracks.len(), 1);
-        assert_eq!(pl_tracks[0].artist, "Tino Rossi");
-
-        let chart = dz.editorial_chart(0, 10).await.unwrap();
-        assert_eq!(chart.len(), 1);
-        assert_eq!(chart[0].title, "Last Christmas");
-
-        // Second call hits cache with zero extra requests.
-        let cached_chart = dz.editorial_chart(0, 10).await.unwrap();
-        assert_eq!(cached_chart, chart);
-        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

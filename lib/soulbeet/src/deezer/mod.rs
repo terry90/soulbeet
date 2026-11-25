@@ -2,4 +2,4 @@ pub mod client;
 pub mod models;
 
 pub use client::DeezerClient;
-pub use models::{DeezerPlaylist, DeezerTrack};
+pub use models::DeezerTrack;

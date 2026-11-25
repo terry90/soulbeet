@@ -1,19 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// A track from an artist radio, playlist, or editorial chart, in order.
+/// A track from an artist radio, in radio order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeezerTrack {
     pub artist: String,
     pub title: String,
-}
-
-/// A public Deezer playlist hit from `/search/playlist`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeezerPlaylist {
-    pub id: u64,
-    pub title: String,
-    #[serde(default)]
-    pub nb_tracks: u32,
 }
 
 /// Deezer answers errors with HTTP 200 and an `error` object.
@@ -33,14 +24,6 @@ pub(super) struct ApiError {
 pub(super) struct ArtistHit {
     pub id: u64,
     pub name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct PlaylistHit {
-    pub id: u64,
-    pub title: String,
-    #[serde(default)]
-    pub nb_tracks: u32,
 }
 
 #[derive(Debug, Deserialize)]

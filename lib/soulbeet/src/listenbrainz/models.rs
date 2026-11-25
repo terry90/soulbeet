@@ -34,6 +34,20 @@ pub(crate) struct ArtistMbids<'a> {
     pub artist_mbids: &'a [String],
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RecordingMbids<'a> {
+    pub recording_mbids: &'a [String],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingPopularityEntry {
+    pub recording_mbid: String,
+    #[serde(default)]
+    pub total_listen_count: Option<u64>,
+    #[serde(default)]
+    pub total_user_count: Option<u64>,
+}
+
 /// Field order is the order ListenBrainz documents the body in.
 #[derive(Debug, Serialize)]
 pub(crate) struct RecordingMetadataQuery<'a> {
@@ -122,6 +136,13 @@ pub struct PlaylistTrack {
     pub artist_mbid: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistSearchHit {
+    pub mbid: String,
+    pub title: String,
+    pub creator: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistListing {
     pub playlists: Vec<PlaylistEnvelope<PlaylistHeader>>,
@@ -136,6 +157,11 @@ pub(crate) struct PlaylistEnvelope<T> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistHeader {
     pub identifier: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub creator: String,
+    #[serde(default)]
     pub date: String,
     #[serde(default)]
     extension: Option<PlaylistHeaderExtension>,
