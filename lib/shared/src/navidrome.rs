@@ -95,6 +95,14 @@ pub struct DiscoveryTrack {
     pub rating: Option<u8>,
     pub status: DiscoveryStatus,
     pub created_at: String,
+    #[serde(default)]
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub reason_label: Option<String>,
+    #[serde(default)]
+    pub culture_bucket: Option<String>,
+    #[serde(default)]
+    pub pack_slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

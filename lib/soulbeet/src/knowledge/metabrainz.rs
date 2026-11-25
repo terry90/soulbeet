@@ -21,7 +21,7 @@ use crate::listenbrainz::labs::LabsClient;
 use crate::listenbrainz::models::{ArtistTags, RecordingMetadata};
 use crate::musicbrainz::exact_artist;
 use crate::polite::RemoteError;
-use crate::traits::{KnowledgeCache, MusicBrainzLookup, MusicKnowledge};
+use crate::traits::{KnowledgeCache, MusicBrainzLookup, MusicKnowledge, TagOp};
 
 pub const SIMILAR_ARTISTS_ALGORITHM: &str =
     "session_based_days_7500_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30";
@@ -237,6 +237,32 @@ impl MusicKnowledge for MetaBrainzKnowledge {
         .await
     }
 
+    async fn artist_areas(
+        &self,
+        artist_mbids: &[String],
+    ) -> Result<HashMap<String, Option<String>>, KnowledgeError> {
+        let lb = &self.listenbrainz;
+        cached_each(
+            self.cache.as_ref(),
+            "kc1:lb:artist-area:",
+            artist_mbids,
+            TTL_ARTIST_TAGS,
+            ARTIST_METADATA_BATCH,
+            |batch| async move {
+                Ok(lb
+                    .artist_metadata(&batch)
+                    .await?
+                    .into_iter()
+                    .map(|e| {
+                        let code = e.area.as_deref().and_then(normalize_area_code);
+                        (e.artist_mbid, code)
+                    })
+                    .collect())
+            },
+        )
+        .await
+    }
+
     async fn artist_popularity(
         &self,
         artist_mbids: &[String],
@@ -344,6 +370,58 @@ impl MusicKnowledge for MetaBrainzKnowledge {
         .await
     }
 
+    async fn multi_tag_tracks(
+        &self,
+        tags: &[&str],
+        operator: TagOp,
+        pop_range: Option<(u8, u8)>,
+        count: usize,
+    ) -> Result<Vec<TrackRef>, KnowledgeError> {
+        if tags.is_empty() || count == 0 {
+            return Ok(Vec::new());
+        }
+        let (pop_begin, pop_end) = pop_range.unwrap_or((0, 100));
+        let normalized_tags: Vec<String> = tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if normalized_tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = format!(
+            "kc1:lb:multi-tag:{}:{}-{}:{}:{}",
+            operator.as_str(),
+            pop_begin,
+            pop_end,
+            normalized_tags.join("+"),
+            count
+        );
+        cached(self.cache.as_ref(), &key, TTL_TAG_TRACKS, async {
+            let refs: Vec<&str> = normalized_tags.iter().map(String::as_str).collect();
+            let ids: Vec<String> = self
+                .listenbrainz
+                .multi_tag_radio(&refs, operator.as_str(), pop_begin, pop_end, count)
+                .await?
+                .into_iter()
+                .map(|r| r.recording_mbid)
+                .collect();
+            let mut facts = self.recordings(&ids).await?;
+            Ok(ids
+                .into_iter()
+                .filter_map(|id| {
+                    let f = facts.remove(&id)?;
+                    Some(TrackRef {
+                        artist: f.artist,
+                        title: f.title,
+                        mbid: Some(id),
+                    })
+                })
+                .collect())
+        })
+        .await
+    }
+
     async fn recordings(
         &self,
         recording_mbids: &[String],
@@ -370,6 +448,50 @@ impl MusicKnowledge for MetaBrainzKnowledge {
             .filter_map(|(mbid, f)| Some((mbid, f?)))
             .collect())
     }
+}
+
+/// Normalizes a MusicBrainz / ListenBrainz artist `area` string into a 2-letter ISO-3166
+/// country code (e.g. `"France"` -> `"FR"`, `"fr"` -> `"FR"`).
+pub(crate) fn normalize_area_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == 2 && trimmed.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Some(trimmed.to_ascii_uppercase());
+    }
+    let code = match trimmed.to_ascii_lowercase().as_str() {
+        "france" => "FR",
+        "united states" | "united states of america" | "usa" => "US",
+        "united kingdom" | "england" | "scotland" | "wales" | "northern ireland" | "uk" => "GB",
+        "canada" => "CA",
+        "germany" => "DE",
+        "japan" => "JP",
+        "spain" => "ES",
+        "italy" => "IT",
+        "belgium" => "BE",
+        "switzerland" => "CH",
+        "netherlands" => "NL",
+        "sweden" => "SE",
+        "norway" => "NO",
+        "denmark" => "DK",
+        "finland" => "FI",
+        "ireland" => "IE",
+        "australia" => "AU",
+        "new zealand" => "NZ",
+        "brazil" => "BR",
+        "mexico" => "MX",
+        "argentina" => "AR",
+        "south korea" | "korea, republic of" => "KR",
+        "portugal" => "PT",
+        "poland" => "PL",
+        "austria" => "AT",
+        "iceland" => "IS",
+        "mali" => "ML",
+        "india" => "IN",
+        _ => return None,
+    };
+    Some(code.to_string())
 }
 
 /// True when the seed's folded name sits in the neighbour's as a whole word,

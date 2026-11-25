@@ -92,10 +92,12 @@ pub(crate) struct FakeKnowledge {
     pub neighbours: HashMap<&'static str, Vec<Neighbour>>,
     pub top_tracks: HashMap<&'static str, Vec<TrackRef>>,
     pub tags: HashMap<&'static str, Vec<WeightedTag>>,
+    pub areas: HashMap<&'static str, Option<String>>,
     pub users: HashMap<&'static str, u64>,
     pub reference: u64,
     pub related: HashMap<&'static str, Vec<&'static str>>,
     pub tag_tracks: HashMap<&'static str, Vec<TrackRef>>,
+    pub multi_tag_tracks: HashMap<String, Vec<TrackRef>>,
     pub recordings: HashMap<&'static str, RecordingFacts>,
     /// `"{method}"` fails every call of a method, `"{method}:{key}"` one key.
     pub failing: HashSet<String>,
@@ -202,6 +204,36 @@ impl MusicKnowledge for FakeKnowledge {
     async fn tag_tracks(&self, tag: &str, count: usize) -> Result<Vec<TrackRef>, KnowledgeError> {
         self.check("tag_tracks", [tag])?;
         Ok(listed(&self.tag_tracks, tag, count))
+    }
+
+    async fn artist_areas(
+        &self,
+        artist_mbids: &[String],
+    ) -> Result<HashMap<String, Option<String>>, KnowledgeError> {
+        self.each("artist_areas", &self.areas, artist_mbids)
+    }
+
+    async fn multi_tag_tracks(
+        &self,
+        tags: &[&str],
+        operator: crate::traits::TagOp,
+        _pop_range: Option<(u8, u8)>,
+        count: usize,
+    ) -> Result<Vec<TrackRef>, KnowledgeError> {
+        let joined = tags
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("+");
+        let key = format!("{}:{}", operator.as_str(), joined);
+        self.check("multi_tag_tracks", [key.as_str()])?;
+        if let Some(found) = self.multi_tag_tracks.get(&key) {
+            return Ok(found.iter().take(count).cloned().collect());
+        }
+        if let Some(found) = self.multi_tag_tracks.get(&joined) {
+            return Ok(found.iter().take(count).cloned().collect());
+        }
+        Ok(Vec::new())
     }
 
     async fn recordings(

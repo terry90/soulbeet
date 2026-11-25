@@ -20,6 +20,14 @@ pub struct DiscoveryTrackRow {
     pub rating: Option<i32>,
     pub status: String,
     pub created_at: String,
+    #[serde(default)]
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub reason_label: Option<String>,
+    #[serde(default)]
+    pub culture_bucket: Option<String>,
+    #[serde(default)]
+    pub pack_slug: Option<String>,
 }
 
 impl From<DiscoveryTrackRow> for DiscoveryTrack {
@@ -36,6 +44,10 @@ impl From<DiscoveryTrackRow> for DiscoveryTrack {
             rating: row.rating.map(|r| r as u8),
             status: row.status.parse().unwrap_or(DiscoveryStatus::Pending),
             created_at: row.created_at,
+            exclude_from_core_taste: row.exclude_from_core_taste,
+            reason_label: row.reason_label,
+            culture_bucket: row.culture_bucket,
+            pack_slug: row.pack_slug,
         }
     }
 }

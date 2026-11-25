@@ -155,6 +155,30 @@ impl ListenBrainzClient {
         Ok(self.http.get(&path).await?.unwrap_or_default())
     }
 
+    /// Multi-tag LB Radio query (`GET /1/lb-radio/tags?tag=a&tag=b&operator=AND&pop_begin=...`).
+    pub async fn multi_tag_radio(
+        &self,
+        tags: &[&str],
+        operator: &str,
+        pop_begin: u8,
+        pop_end: u8,
+        count: usize,
+    ) -> Result<Vec<TagRadioRecording>, RemoteError> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query: Vec<String> = tags
+            .iter()
+            .map(|t| format!("tag={}", encode(t)))
+            .collect();
+        query.push(format!("operator={}", encode(operator)));
+        query.push(format!("pop_begin={}", pop_begin.min(100)));
+        query.push(format!("pop_end={}", pop_end.min(100)));
+        query.push(format!("count={count}"));
+        let path = format!("/1/lb-radio/tags?{}", query.join("&"));
+        Ok(self.http.get(&path).await?.unwrap_or_default())
+    }
+
     pub async fn artist_popularity(
         &self,
         artist_mbids: &[String],
@@ -534,6 +558,18 @@ mod tests {
         assert_eq!(
             (radio[0].recording_mbid.as_str(), radio[0].percent),
             ("0671db54-477b-4a41-81bd-b8cc4f9927e7", 100.0)
+        );
+
+        let (mbase, mseen) = serve(vec![ok(include_str!("fixtures/tag_radio_desert_blues.json"))]);
+        let mlb = ListenBrainzClient::new(&mbase, None, Pace::immediate()).unwrap();
+        let multi = mlb
+            .multi_tag_radio(&["christmas", "french"], "AND", 65, 100, 15)
+            .await
+            .unwrap();
+        assert_eq!(multi.len(), 4);
+        assert_eq!(
+            mseen.lock().unwrap()[0].target,
+            "/1/lb-radio/tags?tag=christmas&tag=french&operator=AND&pop_begin=65&pop_end=100&count=15"
         );
 
         let top = lb

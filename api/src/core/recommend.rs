@@ -446,6 +446,8 @@ mod tests {
             primary_genre: None,
             release_year: None,
             artist_mbid: None,
+            reason_label: None,
+            culture_bucket: None,
         }
     }
 

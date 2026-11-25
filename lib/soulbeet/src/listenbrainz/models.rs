@@ -250,6 +250,8 @@ pub struct TopRecordingForArtist {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtistMetadataEntry {
     pub artist_mbid: String,
+    #[serde(default)]
+    pub area: Option<String>,
     pub tag: Option<ArtistTags>,
 }
 

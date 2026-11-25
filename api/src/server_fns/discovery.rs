@@ -186,6 +186,90 @@ pub async fn get_discovery_progress(
     Ok(progress.and_then(|p| current_progress(&p, chrono::Utc::now())))
 }
 
+#[get("/api/discovery/culture-profile", auth: AuthSession)]
+pub async fn get_culture_profile(
+) -> Result<shared::recommendation::UserCultureProfile, ServerFnError> {
+    crate::core::contextual::get_culture_profile_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/culture-profile", auth: AuthSession)]
+pub async fn update_culture_profile(
+    req: shared::recommendation::UpdateCultureProfileRequest,
+) -> Result<shared::recommendation::UserCultureProfile, ServerFnError> {
+    crate::core::contextual::update_culture_profile_in(&crate::db::DB, &auth.0.user_id, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[get("/api/discovery/contextual-mixes", auth: AuthSession)]
+pub async fn list_active_contextual_mixes(
+) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
+    crate::core::contextual::list_active_contextual_mixes_in(
+        &crate::db::DB,
+        &auth.0,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[post("/api/discovery/seasonal/steer", auth: AuthSession)]
+pub async fn steer_seasonal_pack(
+    req: shared::recommendation::SteerSeasonalPackRequest,
+) -> Result<shared::recommendation::SeasonalPackSpec, ServerFnError> {
+    crate::core::contextual::steer_seasonal_pack_in(
+        &crate::db::DB,
+        &auth.0.user_id,
+        &req.slug,
+        req.steering,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[get("/api/discovery/triage", auth: AuthSession)]
+pub async fn list_triage_queue() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
+    crate::core::contextual::list_triage_queue_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/radio/start", auth: AuthSession)]
+pub async fn start_seed_radio(
+    req: shared::recommendation::SeedRadioRequest,
+) -> Result<shared::recommendation::SeedRadioResponse, ServerFnError> {
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
+    let services = crate::core::recommend::DiscoveryServices::live();
+    let plan = crate::core::recommend::plan_for(&settings);
+    let lb = soulbeet::listenbrainz::client::ListenBrainzClient::new(
+        &services.hosts.listenbrainz,
+        plan.listenbrainz_token,
+        services.metabrainz_pace,
+    )
+    .map_err(server_error)?;
+    let labs =
+        soulbeet::listenbrainz::labs::LabsClient::new(&services.hosts.labs, services.metabrainz_pace)
+            .map_err(server_error)?;
+    let knowledge = soulbeet::knowledge::metabrainz::MetaBrainzKnowledge::new(
+        Arc::new(lb),
+        labs,
+        services.musicbrainz,
+        services.cache,
+    );
+    crate::core::contextual::start_seed_radio_in(
+        &crate::core::index::ServerNavidrome,
+        &knowledge,
+        &auth.0,
+        &req,
+    )
+    .await
+    .map_err(failure_error)
+}
+
 /// Discovery as the running server does it: runs in `DISCOVERY_PROGRESS`, the generation in
 /// its own task, imports through the library's import queue.
 #[cfg(feature = "server")]

@@ -623,6 +623,22 @@ pub trait ListeningHistory: Send + Sync {
     async fn known(&self) -> std::result::Result<KnownMusic, HistoryError>;
 }
 
+/// Boolean operator for ListenBrainz multi-tag radio queries (`GET /1/lb-radio/tags`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagOp {
+    And,
+    Or,
+}
+
+impl TagOp {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TagOp::And => "AND",
+            TagOp::Or => "OR",
+        }
+    }
+}
+
 #[async_trait]
 pub trait MusicKnowledge: Send + Sync {
     fn name(&self) -> &'static str;
@@ -646,6 +662,11 @@ pub trait MusicKnowledge: Send + Sync {
         &self,
         artist_mbids: &[String],
     ) -> std::result::Result<HashMap<String, Vec<WeightedTag>>, KnowledgeError>;
+    /// ISO-3166 country/area code (e.g. `"FR"`, `"US"`) per artist MBID when known.
+    async fn artist_areas(
+        &self,
+        artist_mbids: &[String],
+    ) -> std::result::Result<HashMap<String, Option<String>>, KnowledgeError>;
     async fn artist_popularity(
         &self,
         artist_mbids: &[String],
@@ -655,6 +676,15 @@ pub trait MusicKnowledge: Send + Sync {
     async fn tag_tracks(
         &self,
         tag: &str,
+        count: usize,
+    ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
+    /// Multi-tag track query backed by ListenBrainz `GET /1/lb-radio/tags` with `operator` and
+    /// optional popularity bounds `(pop_begin, pop_end)` in `0..=100`.
+    async fn multi_tag_tracks(
+        &self,
+        tags: &[&str],
+        operator: TagOp,
+        pop_range: Option<(u8, u8)>,
         count: usize,
     ) -> std::result::Result<Vec<TrackRef>, KnowledgeError>;
     async fn recordings(

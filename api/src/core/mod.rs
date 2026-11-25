@@ -9,6 +9,7 @@ pub mod acquire;
 pub mod backends;
 pub mod browse;
 pub mod connect;
+pub mod contextual;
 pub mod curation;
 pub mod delete_guard;
 pub mod deletion;

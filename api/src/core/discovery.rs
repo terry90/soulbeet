@@ -808,6 +808,10 @@ mod tests {
             rating: None,
             status: DiscoveryStatus::Pending,
             created_at: created_at.into(),
+            exclude_from_core_taste: false,
+            reason_label: None,
+            culture_bucket: None,
+            pack_slug: None,
         };
         let lifetimes = HashMap::from([("Balanced".to_string(), 14u32)]);
         assert_eq!(

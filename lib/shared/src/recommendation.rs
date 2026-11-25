@@ -170,6 +170,12 @@ pub struct Candidate {
     pub release_year: Option<u16>,
     #[serde(default)]
     pub artist_mbid: Option<String>,
+    /// Consumer-facing explanation pill (e.g. "FRENCH NOËL PICK", "BECAUSE YOU LIKE ELECTRO").
+    #[serde(default)]
+    pub reason_label: Option<String>,
+    /// Which cultural/contextual bucket produced this candidate.
+    #[serde(default)]
+    pub culture_bucket: Option<CultureBucket>,
 }
 
 /// A set of candidates from a single pipeline
@@ -649,6 +655,433 @@ impl EngineReport {
 
         out
     }
+}
+
+// --- Discovery 2.0: Contextual, Cultural & Seasonal Types ---
+
+/// Which cultural/contextual bucket produced a recommendation candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CultureBucket {
+    Local,
+    International,
+    TasteWildcard,
+    OwnedLibrary,
+}
+
+impl CultureBucket {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CultureBucket::Local => "local",
+            CultureBucket::International => "international",
+            CultureBucket::TasteWildcard => "taste_wildcard",
+            CultureBucket::OwnedLibrary => "owned_library",
+        }
+    }
+}
+
+/// Explainable reason metadata attached to a recommendation candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateReason {
+    pub label: String,
+    #[serde(default)]
+    pub bucket: Option<CultureBucket>,
+}
+
+/// User cultural & linguistic listening profile combining zero-config inference with explicit
+/// preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserCultureProfile {
+    #[serde(default)]
+    pub home_country: Option<String>,
+    #[serde(default)]
+    pub preferred_languages: Vec<String>,
+    /// Target share of local-culture tracks in seasonal/contextual packs (0.0..=1.0).
+    #[serde(default = "default_local_culture_ratio")]
+    pub local_culture_ratio: f32,
+    /// Auto-inferred ISO-3166 country weights from Navidrome history + MusicBrainz artist areas.
+    #[serde(default)]
+    pub inferred_area_weights: Vec<(String, f32)>,
+    /// Auto-inferred local sub-genres (e.g. "french electro", "chanson").
+    #[serde(default)]
+    pub inferred_local_tags: Vec<String>,
+}
+
+fn default_local_culture_ratio() -> f32 {
+    0.45
+}
+
+impl Default for UserCultureProfile {
+    fn default() -> Self {
+        Self {
+            home_country: None,
+            preferred_languages: Vec::new(),
+            local_culture_ratio: default_local_culture_ratio(),
+            inferred_area_weights: Vec::new(),
+            inferred_local_tags: Vec::new(),
+        }
+    }
+}
+
+impl UserCultureProfile {
+    /// Effective ISO country code: explicit `home_country` first, else highest inferred area.
+    pub fn effective_country(&self) -> Option<&str> {
+        self.home_country
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.inferred_area_weights.first().map(|(c, _)| c.as_str()))
+    }
+}
+
+/// Live ratio steering for seasonal/contextual packs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CultureSteering {
+    MoreLocal,
+    #[default]
+    Balanced,
+    MoreInternational,
+}
+
+impl CultureSteering {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CultureSteering::MoreLocal => "more_local",
+            CultureSteering::Balanced => "balanced",
+            CultureSteering::MoreInternational => "more_international",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "more_local" | "local" => CultureSteering::MoreLocal,
+            "more_international" | "international" | "intl" => CultureSteering::MoreInternational,
+            _ => CultureSteering::Balanced,
+        }
+    }
+
+    /// Computes the effective local-culture track share given a base ratio (0.0..=1.0).
+    pub fn effective_ratio(self, base: f32) -> f32 {
+        let base = base.clamp(0.0, 1.0);
+        match self {
+            CultureSteering::MoreLocal => (base + 0.25).clamp(0.15, 0.85),
+            CultureSteering::Balanced => base,
+            CultureSteering::MoreInternational => (base - 0.25).clamp(0.10, 0.85),
+        }
+    }
+}
+
+/// Calendar-driven seasonal pack kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeasonalKind {
+    Noel,
+    NewYearsEve,
+    Summer,
+    Halloween,
+    Autumn,
+    Spring,
+}
+
+impl SeasonalKind {
+    pub const ALL: [SeasonalKind; 6] = [
+        SeasonalKind::Noel,
+        SeasonalKind::NewYearsEve,
+        SeasonalKind::Summer,
+        SeasonalKind::Halloween,
+        SeasonalKind::Autumn,
+        SeasonalKind::Spring,
+    ];
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            SeasonalKind::Noel => "noel",
+            SeasonalKind::NewYearsEve => "nye",
+            SeasonalKind::Summer => "summer",
+            SeasonalKind::Halloween => "halloween",
+            SeasonalKind::Autumn => "autumn",
+            SeasonalKind::Spring => "spring",
+        }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        let normalized = slug.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|k| k.slug() == normalized)
+    }
+
+    /// Returns the seasonal pack active for a `(month, day)` calendar date (1-based).
+    pub fn active_for(month: u32, day: u32) -> Option<Self> {
+        match (month, day) {
+            (11, 20..=30) | (12, 1..=27) => Some(SeasonalKind::Noel),
+            (12, 28..=31) | (1, 1..=2) => Some(SeasonalKind::NewYearsEve),
+            (3, 20..=31) | (4, 1..=30) | (5, 1..=31) => Some(SeasonalKind::Spring),
+            (6, 1..=30) | (7, 1..=31) | (8, 1..=31) => Some(SeasonalKind::Summer),
+            (10, 15..=31) | (11, 1) => Some(SeasonalKind::Halloween),
+            (9, 22..=30) | (10, 1..=14) | (11, 2..=19) => Some(SeasonalKind::Autumn),
+            _ => None,
+        }
+    }
+
+    pub fn localized_title(self, country: Option<&str>) -> String {
+        let is_fr = country.is_some_and(|c| c.eq_ignore_ascii_case("FR"));
+        match self {
+            SeasonalKind::Noel if is_fr => "Noël à la Française".to_string(),
+            SeasonalKind::Noel => "Holiday Classics & Gems".to_string(),
+            SeasonalKind::NewYearsEve if is_fr => "Réveillon Bangers".to_string(),
+            SeasonalKind::NewYearsEve => "New Year's Eve Party".to_string(),
+            SeasonalKind::Summer if is_fr => "Soleil & Été".to_string(),
+            SeasonalKind::Summer => "Summer Anthems".to_string(),
+            SeasonalKind::Halloween => "Halloween Dark Mode".to_string(),
+            SeasonalKind::Autumn if is_fr => "Automne Cosy".to_string(),
+            SeasonalKind::Autumn => "Autumn Cozy".to_string(),
+            SeasonalKind::Spring if is_fr => "Printemps — Fresh Cuts".to_string(),
+            SeasonalKind::Spring => "Spring Fresh Cuts".to_string(),
+        }
+    }
+
+    pub fn subtitle(self, country: Option<&str>) -> String {
+        let is_fr = country.is_some_and(|c| c.eq_ignore_ascii_case("FR"));
+        match self {
+            SeasonalKind::Noel if is_fr => {
+                "French holiday staples blended with international winter classics".to_string()
+            }
+            SeasonalKind::Noel => {
+                "Festive local favorites and international holiday classics".to_string()
+            }
+            SeasonalKind::NewYearsEve => {
+                "High-energy dance, pop, and party anthems for midnight".to_string()
+            }
+            SeasonalKind::Summer => {
+                "Sun-soaked local hits, festival anthems, and warm grooves".to_string()
+            }
+            SeasonalKind::Halloween => {
+                "Darksynth, post-punk, and spooky classics tuned to your taste".to_string()
+            }
+            SeasonalKind::Autumn => {
+                "Warm acoustic, indie, and mellow folk for crisp evenings".to_string()
+            }
+            SeasonalKind::Spring => {
+                "Fresh releases and upbeat indie cuts across your orbit".to_string()
+            }
+        }
+    }
+
+    pub fn active_window_label(self) -> &'static str {
+        match self {
+            SeasonalKind::Noel => "Nov 20 – Dec 27",
+            SeasonalKind::NewYearsEve => "Dec 28 – Jan 2",
+            SeasonalKind::Summer => "Jun 1 – Aug 31",
+            SeasonalKind::Halloween => "Oct 15 – Nov 1",
+            SeasonalKind::Autumn => "Sep 22 – Nov 19",
+            SeasonalKind::Spring => "Mar 20 – May 31",
+        }
+    }
+
+    pub fn expires_label(self) -> &'static str {
+        match self {
+            SeasonalKind::Noel => "Auto-cleans Jan 5 unless kept",
+            SeasonalKind::NewYearsEve => "Auto-cleans Jan 8 unless kept",
+            SeasonalKind::Summer => "Auto-cleans Sep 7 unless kept",
+            SeasonalKind::Halloween => "Auto-cleans Nov 8 unless kept",
+            SeasonalKind::Autumn => "Auto-cleans Nov 26 unless kept",
+            SeasonalKind::Spring => "Auto-cleans Jun 7 unless kept",
+        }
+    }
+
+    /// Primary ListenBrainz / MusicBrainz theme tag for this seasonal pack.
+    pub fn primary_tag(self) -> &'static str {
+        match self {
+            SeasonalKind::Noel => "christmas",
+            SeasonalKind::NewYearsEve => "dance",
+            SeasonalKind::Summer => "summer",
+            SeasonalKind::Halloween => "gothic rock",
+            SeasonalKind::Autumn => "acoustic",
+            SeasonalKind::Spring => "indie pop",
+        }
+    }
+}
+
+/// Complete specification for a culturally blended seasonal pack.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeasonalPackSpec {
+    pub slug: String,
+    pub kind: SeasonalKind,
+    pub title: String,
+    pub subtitle: String,
+    pub steering: CultureSteering,
+    pub local_ratio: f32,
+    pub exclude_from_core_taste: bool,
+    pub active_window: String,
+    pub expires_label: String,
+}
+
+impl SeasonalPackSpec {
+    pub fn for_kind(
+        kind: SeasonalKind,
+        culture: &UserCultureProfile,
+        steering: CultureSteering,
+    ) -> Self {
+        let country = culture.effective_country();
+        Self {
+            slug: kind.slug().to_string(),
+            kind,
+            title: kind.localized_title(country),
+            subtitle: kind.subtitle(country),
+            steering,
+            local_ratio: steering.effective_ratio(culture.local_culture_ratio),
+            exclude_from_core_taste: true,
+            active_window: kind.active_window_label().to_string(),
+            expires_label: kind.expires_label().to_string(),
+        }
+    }
+}
+
+/// Contextual Moment Mix kinds blending ~75% owned library + ~25% fresh Discovery tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MomentKind {
+    Drive,
+    Morning,
+    Focus,
+    LateNight,
+}
+
+impl MomentKind {
+    pub const ALL: [MomentKind; 4] = [
+        MomentKind::Drive,
+        MomentKind::Morning,
+        MomentKind::Focus,
+        MomentKind::LateNight,
+    ];
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            MomentKind::Drive => "drive",
+            MomentKind::Morning => "morning",
+            MomentKind::Focus => "focus",
+            MomentKind::LateNight => "late_night",
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            MomentKind::Drive => "Drive Mix",
+            MomentKind::Morning => "Morning Boost",
+            MomentKind::Focus => "Focus Flow",
+            MomentKind::LateNight => "Late Night",
+        }
+    }
+
+    pub const fn subtitle(self) -> &'static str {
+        match self {
+            MomentKind::Drive => "Consistent energy, offline-ready favorites & fresh road picks",
+            MomentKind::Morning => "Upbeat openers to start the day with momentum",
+            MomentKind::Focus => "Steady grooves and instrumental textures for deep work",
+            MomentKind::LateNight => "Warm downtempo, atmospheric cuts for after dark",
+        }
+    }
+
+    pub fn active_for_hour(hour: u32) -> Self {
+        match hour {
+            6..=10 => MomentKind::Morning,
+            11..=17 => MomentKind::Focus,
+            22..=23 | 0..=4 => MomentKind::LateNight,
+            _ => MomentKind::Drive,
+        }
+    }
+
+    pub fn mood_tags(self) -> &'static [&'static str] {
+        match self {
+            MomentKind::Drive => &["indie rock", "electronic", "synthpop"],
+            MomentKind::Morning => &["pop", "indie pop", "funk"],
+            MomentKind::Focus => &["ambient", "downtempo", "instrumental"],
+            MomentKind::LateNight => &["trip hop", "dream pop", "chillout"],
+        }
+    }
+
+    pub const fn owned_ratio(self) -> f32 {
+        0.75
+    }
+}
+
+/// Unified mix card returned by `GET /api/discovery/contextual-mixes`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextualMixSummary {
+    pub slug: String,
+    pub kind: ContextualMixKind,
+    pub title: String,
+    pub subtitle: String,
+    pub badge: String,
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub steering: Option<CultureSteering>,
+    #[serde(default)]
+    pub local_ratio: Option<f32>,
+    #[serde(default)]
+    pub expires_label: Option<String>,
+    pub track_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextualMixKind {
+    Seasonal,
+    Moment,
+    Rolling,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateCultureProfileRequest {
+    #[serde(default)]
+    pub home_country: Option<String>,
+    #[serde(default)]
+    pub preferred_languages: Option<Vec<String>>,
+    #[serde(default)]
+    pub local_culture_ratio: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerSeasonalPackRequest {
+    pub slug: String,
+    pub steering: CultureSteering,
+}
+
+/// Request to start an on-demand Seed Radio from a track or artist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedRadioRequest {
+    #[serde(default)]
+    pub seed_song_id: Option<String>,
+    #[serde(default)]
+    pub seed_artist: Option<String>,
+    #[serde(default)]
+    pub seed_track: Option<String>,
+    #[serde(default)]
+    pub seed_artist_mbid: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Owned library track returned immediately by Seed Radio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedRadioTrack {
+    pub song_id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u32>,
+    pub reason_label: String,
+}
+
+/// Response from `POST /api/radio/start`: owned matches play immediately while unowned
+/// `prefetch_candidates` can be fast-acquired seamlessly in the background.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedRadioResponse {
+    pub radio_id: String,
+    pub seed_label: String,
+    pub owned_tracks: Vec<SeedRadioTrack>,
+    pub prefetch_candidates: Vec<Candidate>,
 }
 
 #[cfg(test)]
