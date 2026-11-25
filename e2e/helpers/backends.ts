@@ -26,34 +26,59 @@ async function openConnections(page: Page, name: string): Promise<void> {
   await expect(heading(page, name)).toBeVisible();
 }
 
+const ON = /\bbg-beet-leaf\b/;
+const OFF = /\bbg-gray-600\b/;
+
 async function isOn(toggle: Locator): Promise<boolean> {
-  return /\bbg-beet-leaf\b/.test((await toggle.getAttribute('class')) ?? '');
+  return ON.test((await toggle.getAttribute('class')) ?? '');
 }
 
 /**
- * Turns the backend `name` on, confirming as the settings ask, and waits until its status
- * line says it is online. A backend already on is left as it is.
+ * Runs `click`, which saves the switch of `name`, and waits for the server to answer the save.
+ * The switch flips before the save is sent, so its look alone proves nothing.
+ */
+async function saved(page: Page, name: string, click: () => Promise<void>): Promise<void> {
+  const answer = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === '/api/backends/switch' && r.request().method() === 'POST',
+  );
+  await click();
+  const response = await answer;
+  expect(response.ok(), `save the ${name} switch: ${response.status()}`).toBeTruthy();
+}
+
+/** Reloads Settings > Config, which reads the switches from the server, and checks `name`'s. */
+async function storedAs(page: Page, name: string, state: RegExp): Promise<void> {
+  await page.reload();
+  await page.getByRole('button', { name: 'Config' }).click();
+  await expect(backendSwitch(page, name)).toHaveClass(state);
+}
+
+/**
+ * Turns the backend `name` on, confirming as the settings ask, and waits until the server
+ * stored it and its status line says it is online. A backend already on is left as it is.
  */
 export async function enableBackend(page: Page, name: string): Promise<void> {
   await openConnections(page, name);
   const toggle = backendSwitch(page, name);
   if (!(await isOn(toggle))) {
     await toggle.click();
-    await page.getByRole('button', { name: `Turn on ${name}`, exact: true }).click();
-    await expect(toggle).toHaveClass(/\bbg-beet-leaf\b/);
+    await saved(page, name, () =>
+      page.getByRole('button', { name: `Turn on ${name}`, exact: true }).click(),
+    );
   }
+  await storedAs(page, name, ON);
   await expect(backendBlock(page, name).getByText('Online', { exact: true })).toBeVisible({
     timeout: 30_000,
   });
 }
 
-/** Turns the backend `name` off; one already off is left as it is. */
+/** Turns the backend `name` off and waits until the server stored it; one already off is left. */
 export async function disableBackend(page: Page, name: string): Promise<void> {
   await openConnections(page, name);
   const toggle = backendSwitch(page, name);
   if (await isOn(toggle)) {
-    await toggle.click();
+    await saved(page, name, () => toggle.click());
   }
-  await expect(toggle).toHaveClass(/\bbg-gray-600\b/);
+  await storedAs(page, name, OFF);
   await expect(backendBlock(page, name).getByText('Online', { exact: true })).toHaveCount(0);
 }

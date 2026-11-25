@@ -203,7 +203,7 @@ export function createArchiveServer(audioDir: string): Server {
         handler: ({ res, params }) => {
           const item = archiveItems.find((i) => i.identifier === params.id);
           if (!item) {
-            sendJson(res, 200, {});
+            sendJson(res, 200, { error: `Couldn't locate item '${params.id}'` });
             return;
           }
           const result: Record<string, string>[] = item.files.flatMap((file) => {
