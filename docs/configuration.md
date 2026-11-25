@@ -37,4 +37,8 @@ Soulseek, through slskd, is always on. Every other download source is off until 
 
 Turning a source off stops its searches and its unfinished downloads and deletes their partial files. Downloads still waiting on it fail with "{name} is turned off in Settings > Config > Connections". Files it finished stay where they are.
 
+### Internet Archive
+
+Downloads original files that uploaders gave archive.org, each checked against archive.org's md5 before it is imported; see [archive.md](archive.md) for what it offers and how it behaves. It needs no account and no address. Partial files sit in `DOWNLOAD_PATH/.soulful-partial/`, so `DOWNLOAD_PATH` must be writable by Soulbeet and have room for the files being downloaded. `ARCHIVE_HOST` (`host:port`, reached over http) points it at a test double instead of archive.org; leave it unset.
+
 How a download source plugs in is in [download-backends.md](download-backends.md).
