@@ -271,6 +271,8 @@ pub enum Service {
     /// Soulful itself: lines it could not read from a service, or what it found wrong, in its
     /// own words.
     Soulful,
+    /// archive.org, the Internet Archive download backend's service.
+    InternetArchive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -630,6 +632,21 @@ mod tests {
                 "code": "transfer_rejected_not_shared", "stage": "transfer", "message": "File not shared.",
                 "cause": {"service": "slskd", "status": null, "raw": "File not shared."},
                 "retry": "other_source", "retry_after_seconds": null, "user_action": null })
+        );
+    }
+
+    #[test]
+    fn the_internet_archive_is_written_internet_archive() {
+        let f = Failure::new(
+            FailureCode::TransferChecksumMismatch,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "The file does not match its md5",
+        )
+        .with_cause(Service::InternetArchive, Some(200), "md5 differs");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap()["cause"],
+            serde_json::json!({"service": "internet_archive", "status": 200, "raw": "md5 differs"})
         );
     }
 

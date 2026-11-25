@@ -65,6 +65,7 @@ pub(crate) fn logged(f: &Failure) -> String {
         Service::Filesystem => "filesystem",
         Service::Database => "database",
         Service::Soulful => "soulful",
+        Service::InternetArchive => "internet_archive",
     };
     let status = cause.status.map(|s| format!(" {s}")).unwrap_or_default();
     format!("{} (cause: {service}{status}: {})", f.message, cause.raw)
