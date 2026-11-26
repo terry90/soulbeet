@@ -31,7 +31,7 @@ test('taps a track to download it', async ({ context, page }) => {
 
   // The page must stay responsive while the pipeline runs: this used to
   // freeze when a dropped-signal write panicked the WASM runtime.
-  await page.getByRole('button', { name: 'Downloads', exact: true }).tap();
+  await page.getByRole('button', { name: 'Active transfers drawer' }).tap();
   await expect(page.getByRole('heading', { name: 'Active Transfers' })).toBeVisible();
 
   const imported = importedTrackPath(

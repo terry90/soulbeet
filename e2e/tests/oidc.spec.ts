@@ -86,7 +86,7 @@ test('creates an account on first sign-in and keeps it when the username changes
 
   await signInWithSso(page, { username, subject });
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByRole('searchbox')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open Command Palette' })).toBeVisible();
   const first = await currentUser(page);
   expect(first.username).toBe(username);
   // The login state was single use.
@@ -98,7 +98,7 @@ test('creates an account on first sign-in and keeps it when the username changes
     ).toBeVisible();
   }
 
-  await page.getByRole('button', { name: 'Logout' }).click();
+  await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page).toHaveURL(/\/login$/);
 
   // Renamed at the provider: still the same account, found by subject.
