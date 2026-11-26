@@ -23,3 +23,15 @@ secret.key
 # Generated Android native libraries & UniFFI Kotlin bindings (built by scripts/build-android-core.sh)
 android/core-bindings/src/main/jniLibs/
 android/core-bindings/src/main/kotlin/org/soulbeet/core/
+
+# Android / Gradle build outputs (keep android/gradle/wrapper/gradle-wrapper.jar tracked)
+android/.gradle/
+android/.kotlin/
+android/**/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/**/*.iml
+android/captures/
+android/.cxx/
+android/kotlin-js-store/
