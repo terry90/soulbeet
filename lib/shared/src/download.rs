@@ -702,9 +702,228 @@ pub enum DownloadEvent {
     },
     /// Auto-download lifecycle events (displayed inline on search rows, not in download panel)
     AutoDownload(AutoDownloadEvent),
+    /// 1-tap Acquire & Play lifecycle events (`Acquiring -> Importing -> Indexing -> Ready`)
+    /// used by clients to animate the `seam-light` sweep and start playback the instant
+    /// Navidrome indexes the track.
+    AcquireAndPlay(AcquireAndPlayEvent),
     /// The server's build id, the first frame on a socket whose client asked
     /// for it. A bundle from another build may misread every event after it.
     Build(String),
+}
+
+/// Request payload for `POST /api/acquire-and-play`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayRequest {
+    pub artist: String,
+    pub title: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub recording_mbid: Option<String>,
+    #[serde(default)]
+    pub release_mbid: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<u32>,
+    /// Target folder id; when omitted, uses the user's default download folder (or first owned folder).
+    #[serde(default)]
+    pub folder_id: Option<String>,
+    /// Prefer fast secondary backends before falling back to archival P2P (Soulseek).
+    #[serde(default = "default_prefer_fast")]
+    pub prefer_fast: bool,
+}
+
+fn default_prefer_fast() -> bool {
+    true
+}
+
+/// Initial response from `POST /api/acquire-and-play`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayResponse {
+    pub request_id: String,
+    pub status: AcquireAndPlayInitialStatus,
+}
+
+/// Whether the requested track was already playable in Navidrome or entered acquisition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AcquireAndPlayInitialStatus {
+    /// Already present in the caller's Navidrome library — play immediately without downloading.
+    AlreadyOwned {
+        navidrome_song_id: String,
+        codec: Option<String>,
+        is_lossy: bool,
+    },
+    /// Acquisition pipeline started; progress arrives over `/api/downloads/updates` as
+    /// `DownloadEvent::AcquireAndPlay`.
+    Started {
+        batch_id: String,
+        job_id: String,
+        backend_ids: Vec<String>,
+    },
+}
+
+/// Real-time stage progression for an in-flight Acquire & Play request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum AcquireAndPlayStage {
+    /// Searching or transferring the file from a download backend.
+    Acquiring {
+        backend_id: String,
+        backend_name: String,
+        source: Option<String>,
+        quality: Option<String>,
+    },
+    /// Tagging and moving into the library via beets.
+    Importing,
+    /// Waiting for Navidrome to scan and expose the playable song ID.
+    Indexing,
+    /// Track is indexed and ready to stream from Navidrome.
+    Ready {
+        navidrome_song_id: Option<String>,
+        codec: Option<String>,
+        is_lossy: bool,
+        already_owned: bool,
+        backend_id: Option<String>,
+    },
+    /// Best candidate scored below the automatic threshold; prompt the user to pick a source.
+    NeedsManualChoice {
+        search_id: String,
+        results: Vec<DownloadableGroup>,
+        best_score: f64,
+        threshold: f64,
+    },
+    /// Pipeline terminated with an error.
+    Failed { failure: Failure },
+}
+
+/// WebSocket event pushed on the user's download channel during Acquire & Play.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcquireAndPlayEvent {
+    pub request_id: String,
+    pub artist: String,
+    pub title: String,
+    #[serde(default)]
+    pub recording_mbid: Option<String>,
+    pub stage: AcquireAndPlayStage,
+}
+
+/// Lifecycle state of an On-Keep background archival FLAC upgrade job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivalUpgradeStatus {
+    Queued,
+    Searching,
+    Downloading,
+    Completed,
+    SkippedAlreadyLossless,
+    Failed,
+}
+
+impl ArchivalUpgradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchivalUpgradeStatus::Queued => "queued",
+            ArchivalUpgradeStatus::Searching => "searching",
+            ArchivalUpgradeStatus::Downloading => "downloading",
+            ArchivalUpgradeStatus::Completed => "completed",
+            ArchivalUpgradeStatus::SkippedAlreadyLossless => "skipped_already_lossless",
+            ArchivalUpgradeStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "searching" => ArchivalUpgradeStatus::Searching,
+            "downloading" => ArchivalUpgradeStatus::Downloading,
+            "completed" => ArchivalUpgradeStatus::Completed,
+            "skipped_already_lossless" => ArchivalUpgradeStatus::SkippedAlreadyLossless,
+            "failed" => ArchivalUpgradeStatus::Failed,
+            _ => ArchivalUpgradeStatus::Queued,
+        }
+    }
+}
+
+/// An On-Keep-only background archival FLAC upgrade job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivalUpgradeJob {
+    pub id: String,
+    pub user_id: String,
+    pub folder_id: String,
+    pub navidrome_song_id: Option<String>,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub recording_mbid: Option<String>,
+    pub original_codec: String,
+    pub original_backend: String,
+    pub trigger_reason: String,
+    pub status: ArchivalUpgradeStatus,
+    pub job_id: Option<String>,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Request to trigger an archival FLAC upgrade when a user explicitly keeps/stars a track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerArchivalUpgradeRequest {
+    pub navidrome_song_id: Option<String>,
+    pub discovery_track_id: Option<String>,
+    pub artist: String,
+    pub title: String,
+    pub album: Option<String>,
+    pub recording_mbid: Option<String>,
+    pub folder_id: Option<String>,
+    /// Reported codec of the kept track (e.g., "opus", "mp3", "flac"), when known.
+    pub codec: Option<String>,
+    /// Reason that gated this upgrade (`"keep"`, `"star"`, `"promote"`, `"manual"`).
+    pub trigger_reason: String,
+}
+
+/// Outcome of evaluating an On-Keep archival FLAC upgrade hook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ArchivalUpgradeOutcome {
+    Enqueued { job: Box<ArchivalUpgradeJob> },
+    AlreadyScheduled { upgrade_id: String },
+    AlreadyLossless { codec: String },
+    NotFastAcquired,
+    /// Track is still a pending (unpromoted) discovery track, so it cannot be upgraded yet.
+    SkippedNotKept,
+}
+
+fn has_format_token(input: &str, tokens: &[&str]) -> bool {
+    input
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| tokens.iter().any(|known| tok.eq_ignore_ascii_case(known)))
+}
+
+/// Returns `true` when an audio format/codec/extension label explicitly names a lossless
+/// format (`flac`, `alac`, `wav`, `aiff`, `aif`, `ape`, `wv`, `wavpack`, `dsd`, `dsf`,
+/// `dff`, `pcm`, `lossless`). Returns `false` for empty or unknown strings and avoids
+/// substring false positives such as `"tape"` or `"wave"`.
+pub fn is_lossless_format(codec_or_ext: &str) -> bool {
+    const LOSSLESS_TOKENS: &[&str] = &[
+        "flac", "alac", "wav", "aiff", "aif", "ape", "wv", "wavpack", "dsd", "dsf", "dff", "pcm",
+        "lossless",
+    ];
+    has_format_token(codec_or_ext, LOSSLESS_TOKENS)
+}
+
+/// Returns `true` when an audio format/codec label explicitly names a lossy format
+/// (and does not name a lossless codec). Returns `false` for empty or unknown strings
+/// so unknown codecs are never blindly classified as lossy or lossless.
+pub fn is_lossy_format(codec_or_quality: &str) -> bool {
+    const LOSSY_TOKENS: &[&str] = &[
+        "mp3", "opus", "ogg", "oga", "vorbis", "aac", "m4a", "m4b", "mp4", "wma", "mpc",
+        "musepack", "ac3", "eac3", "mp2", "spx", "speex", "amr", "lossy",
+    ];
+    if is_lossless_format(codec_or_quality) {
+        return false;
+    }
+    has_format_token(codec_or_quality, LOSSY_TOKENS)
 }
 
 /// Events from the auto-download pipeline, sent over WebSocket
@@ -1100,5 +1319,62 @@ mod tests {
         assert!(long.len() <= 200 + " [1f2e3d4c]".len());
         assert!(long.ends_with(" [1f2e3d4c]"));
         assert!(!long.contains('/'));
+    }
+
+    #[test]
+    fn format_classification_uses_exact_tokens_and_rejects_unknown() {
+        for lossless in [
+            "flac",
+            "FLAC",
+            "FLAC 24/96",
+            ".flac",
+            "audio/flac",
+            "alac",
+            "m4a (ALAC)",
+            "wav",
+            "aiff",
+            "aif",
+            "ape",
+            "wv",
+            "wavpack",
+            "dsd",
+            "dsf",
+            "dff",
+            "pcm",
+            "lossless",
+        ] {
+            assert!(is_lossless_format(lossless), "expected lossless: {lossless}");
+            assert!(!is_lossy_format(lossless), "expected not lossy: {lossless}");
+        }
+
+        for lossy in [
+            "mp3",
+            "MP3 320",
+            "320kbps MP3",
+            "OPUS 160",
+            "opus",
+            "ogg",
+            "vorbis",
+            "aac",
+            "m4a",
+            "wma",
+            "lossy",
+        ] {
+            assert!(!is_lossless_format(lossy), "expected not lossless: {lossy}");
+            assert!(is_lossy_format(lossy), "expected lossy: {lossy}");
+        }
+
+        // Empty, unknown, and substring traps ("tape" contains "ape", "wave" contains "wav")
+        // must be neither lossless nor lossy.
+        for ambiguous in ["", "   ", "unknown", "UNKNOWN", "tape", "cassette tape", "wave", "synthwave"] {
+            assert!(
+                !is_lossless_format(ambiguous),
+                "expected not lossless: {ambiguous:?}"
+            );
+            assert!(
+                !is_lossy_format(ambiguous),
+                "expected not lossy: {ambiguous:?}"
+            );
+        }
     }
 }

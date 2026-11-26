@@ -6,6 +6,8 @@ use crate::services::BackendLookupError;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
 pub mod acquire;
+pub mod acquire_play;
+pub mod archival;
 pub mod backends;
 pub mod browse;
 pub mod connect;

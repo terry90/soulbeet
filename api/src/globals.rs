@@ -263,6 +263,27 @@ pub fn start_channel_cleanup_task() {
             tokio::time::sleep(delay).await;
             repeat_spaced(RECOMMENDATION_INTERVAL, run_recommendations).await;
         });
+
+        tokio::spawn(async {
+            // Reset any archival upgrade jobs left in 'searching' by a previous process.
+            match crate::models::archival_upgrade::ArchivalUpgradeRow::reset_stale_searching_in(
+                &crate::db::DB,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => info!("Reset {n} archival upgrade jobs left searching by a previous run"),
+                Err(e) => warn!("Could not reset archival upgrade jobs left searching: {e}"),
+            }
+            // Wait 45s after startup before running low-priority archival FLAC upgrades.
+            tokio::time::sleep(Duration::from_secs(45)).await;
+            repeat_spaced(
+                crate::core::archival::ARCHIVAL_WORKER_INTERVAL,
+                crate::core::archival::run_archival_worker_tick,
+            )
+            .await;
+        });
+        info!("Started low-priority archival FLAC upgrade worker");
     });
 }
 
