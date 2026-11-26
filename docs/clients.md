@@ -152,6 +152,12 @@ cd android
 
 The built APK lands in `android/app/build/outputs/apk/debug/`.
 
-### Prebuilt releases and optional release signing
+### Prebuilt releases, release signing, and Google Play publishing
 
-Every GitHub Release attaches an installable Android APK alongside `SHA256SUMS.txt`. To publish release-signed APKs (`soulbeet-<tag>-android.apk`) instead of debug-signed APKs (`soulbeet-<tag>-android-debug.apk`), configure all four repository secrets in GitHub Actions: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Local Gradle builds continue to work without any signing environment variables.
+Every GitHub Release attaches an installable Android APK alongside `SHA256SUMS.txt`. To publish release-signed APKs (`soulbeet-<tag>-android.apk`) and signed Android App Bundles (`.aab`) instead of debug-signed APKs (`soulbeet-<tag>-android-debug.apk`), configure all four signing secrets in GitHub Actions: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Local Gradle builds continue to work without any signing environment variables.
+
+To enable automated Google Play uploads on every signed release, add the `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` repository secret containing the JSON key for a Google Play Console API service account with release permissions on `soulbeet.insynia.fr`:
+
+- Prerelease tags (such as `v1.0.0-alpha-1`) automatically upload to the `internal` testing track; stable tags (`v1.0.0`) default to `beta`.
+- Manual `workflow_dispatch` runs accept `play_track` (`auto`, `internal`, `alpha`, `beta`, `production`, `skip`) and `play_status` (`completed` or `draft`). While the app is still in Play Console's initial Draft state before first review approval, either dispatch with `play_status=draft` or set repository variable `GOOGLE_PLAY_DEFAULT_STATUS=draft`.
+- Note that Google Play requires uploading the very first signed `.aab` manually in Play Console to enroll the app in Play App Signing before API uploads succeed.

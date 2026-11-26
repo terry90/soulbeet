@@ -52,11 +52,15 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "org.soulbeet.app"
+        applicationId = "soulbeet.insynia.fr"
         minSdk = 26
         targetSdk = 35
         versionCode = soulbeetVersionCode
         versionName = soulbeetVersionName
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
 
         vectorDrawables {
             useSupportLibrary = true

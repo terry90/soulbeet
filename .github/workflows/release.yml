@@ -24,6 +24,26 @@ on:
         required: false
         default: false
         type: boolean
+      play_track:
+        description: 'Google Play track (auto = internal for prereleases, beta for stable)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - internal
+          - alpha
+          - beta
+          - production
+          - skip
+      play_status:
+        description: 'Google Play release status (use draft until first Play Console review approves the app)'
+        required: false
+        default: 'completed'
+        type: choice
+        options:
+          - completed
+          - draft
 
 jobs:
   bump-version:
@@ -88,6 +108,9 @@ jobs:
     needs: bump-version
     if: "!cancelled() && (needs.bump-version.result == 'success' || github.event_name == 'push')"
     runs-on: ubuntu-latest
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      version_name: ${{ steps.version.outputs.version_name }}
     permissions:
       contents: read
     steps:
@@ -144,6 +167,7 @@ jobs:
         run: ./scripts/build-android-core.sh --profile release --abis "arm64-v8a armeabi-v7a x86_64"
 
       - name: Compute Android version metadata
+        id: version
         env:
           RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
         run: |
@@ -158,17 +182,31 @@ jobs:
           [[ "$MINOR" =~ ^[0-9]+$ ]] || MINOR=0
           [[ "$PATCH" =~ ^[0-9]+$ ]] || PATCH=0
 
-          # Reserve 0..98 for prereleases and 99 for stable so prereleases always
-          # sort strictly below the final release and upgrade cleanly on Android.
+          # Partition 0..98 by prerelease channel so Play versionCode stays strictly monotonic:
+          # unnumbered -> 0, alpha-0..31 -> 1..32, beta-0..32 -> 33..65, rc-0..32 -> 66..98, stable -> 99.
           if [[ "$WITHOUT_META" == *-* ]]; then
             PRERELEASE="${WITHOUT_META#*-}"
-            if [[ "$PRERELEASE" =~ ([0-9]+)$ ]]; then
-              PRE=$((10#${BASH_REMATCH[1]}))
-              if [[ "$PRE" -lt 1 ]]; then
-                PRE=1
-              elif [[ "$PRE" -gt 98 ]]; then
-                PRE=98
+            PRERELEASE_LOWER="${PRERELEASE,,}"
+            if [[ "$PRERELEASE_LOWER" =~ ([0-9]+)$ ]]; then
+              NUM=$((10#${BASH_REMATCH[1]}))
+              if [[ "$PRERELEASE_LOWER" == alpha* ]]; then
+                BASE=1
+                MAX_NUM=31
+              elif [[ "$PRERELEASE_LOWER" == beta* ]]; then
+                BASE=33
+                MAX_NUM=32
+              elif [[ "$PRERELEASE_LOWER" == rc* ]]; then
+                BASE=66
+                MAX_NUM=32
+              else
+                BASE=1
+                MAX_NUM=97
               fi
+              if [[ "$NUM" -gt "$MAX_NUM" ]]; then
+                echo "ERROR: prerelease number ${NUM} exceeds bucket limit ${MAX_NUM} for ${RELEASE_TAG}" >&2
+                exit 1
+              fi
+              PRE=$((BASE + NUM))
             else
               PRE=0
             fi
@@ -183,6 +221,7 @@ jobs:
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           echo "SOULBEET_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
           echo "SOULBEET_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "Android versionName=$VERSION_NAME versionCode=$VERSION_CODE"
 
       - name: Decode release keystore (if configured)
@@ -210,7 +249,7 @@ jobs:
             test -s "$KEYSTORE_PATH"
             echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
             echo "signed=true" >> "$GITHUB_OUTPUT"
-            echo "Release signing configured; building signed release APK."
+            echo "Release signing configured; building signed release APK and Play Store AAB."
           elif [[ "$present" -eq 0 ]]; then
             echo "signed=false" >> "$GITHUB_OUTPUT"
             echo "Release signing secrets not configured; building installable debug-signed APK."
@@ -219,7 +258,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build Android APK
+      - name: Build Android APK and Play Store AAB
         working-directory: android
         env:
           IS_SIGNED: ${{ steps.signing.outputs.signed }}
@@ -227,16 +266,17 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          mkdir -p ../dist
+          mkdir -p ../dist ../dist-play
           if [[ "$IS_SIGNED" == "true" ]]; then
-            ./gradlew :app:assembleRelease --no-daemon
+            ./gradlew :app:assembleRelease :app:bundleRelease --no-daemon
             cp app/build/outputs/apk/release/app-release.apk "../dist/soulbeet-${RELEASE_TAG}-android.apk"
+            cp app/build/outputs/bundle/release/app-release.aab "../dist-play/soulbeet-${RELEASE_TAG}-android.aab"
           else
             unset ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
             ./gradlew :app:assembleDebug --no-daemon
             cp app/build/outputs/apk/debug/app-debug.apk "../dist/soulbeet-${RELEASE_TAG}-android-debug.apk"
           fi
-          ls -lh ../dist/
+          ls -lh ../dist/ ../dist-play/
 
       - name: Remove temporary keystore
         if: always()
@@ -247,6 +287,14 @@ jobs:
         with:
           name: release-android
           path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Upload Android App Bundle (AAB) for Google Play
+        if: steps.signing.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: play-store-aab
+          path: dist-play/*.aab
           if-no-files-found: error
 
   build-desktop-linux:
@@ -518,3 +566,130 @@ jobs:
             --generate-notes \
             "${flags[@]}" \
             release-assets/*
+
+  # Optional automated Google Play upload (runs once GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is set).
+  publish-google-play:
+    needs: [bump-version, build-android, create-release]
+    if: >-
+      !cancelled() &&
+      needs.build-android.result == 'success' &&
+      needs.build-android.outputs.signed == 'true' &&
+      needs.create-release.result == 'success' &&
+      (inputs.play_track || 'auto') != 'skip'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check Google Play service account secret
+        id: check-sa
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          trimmed="$(printf '%s' "$GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" | tr -d '[:space:]')"
+          if [[ -n "$trimmed" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not configured; skipping Google Play upload."
+          fi
+
+      - name: Checkout repository
+        if: steps.check-sa.outputs.configured == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag || github.ref }}
+
+      - name: Download Android App Bundle (AAB)
+        if: steps.check-sa.outputs.configured == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: play-store-aab
+          path: play-assets
+
+      - name: Resolve Play track and extract release notes
+        if: steps.check-sa.outputs.configured == 'true'
+        id: play
+        env:
+          RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+          VERSION_NAME: ${{ needs.build-android.outputs.version_name }}
+          REQUESTED_TRACK: ${{ inputs.play_track || 'auto' }}
+          REQUESTED_STATUS: ${{ inputs.play_status || vars.GOOGLE_PLAY_DEFAULT_STATUS || 'completed' }}
+        run: |
+          if [[ "$REQUESTED_TRACK" == "auto" ]]; then
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              TRACK="internal"
+            else
+              TRACK="beta"
+            fi
+          else
+            TRACK="$REQUESTED_TRACK"
+          fi
+          echo "track=$TRACK" >> "$GITHUB_OUTPUT"
+          echo "status=$REQUESTED_STATUS" >> "$GITHUB_OUTPUT"
+          echo "release_name=${VERSION_NAME:-${RELEASE_TAG#v}}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p play-whatsnew
+          python3 - <<'PY' > play-whatsnew/whatsnew-en-US
+          import os, re
+
+          tag = os.environ.get("RELEASE_TAG", "")
+          core = tag.lstrip("v").split("+")[0].split("-")[0]
+
+          def extract_lines(section_body):
+              out = []
+              for raw in section_body:
+                  s = raw.strip()
+                  if not s or s.startswith("["):
+                      continue
+                  s = re.sub(r"^###\s+", "", s)
+                  s = s.replace("**", "").replace("`", "")
+                  out.append(s)
+              return out
+
+          chosen = []
+          try:
+              with open("CHANGELOG.md", encoding="utf-8") as f:
+                  text = f.read()
+              sections = re.split(r"(?m)^## ", text)[1:]
+              parsed = []
+              for sec in sections:
+                  sec_lines = sec.splitlines()
+                  heading = sec_lines[0].strip() if sec_lines else ""
+                  items = extract_lines(sec_lines[1:])
+                  parsed.append((heading, items))
+              # Prefer the section matching the tag's core version (e.g. "1.0.0 - ...").
+              for heading, items in parsed:
+                  if core and heading.startswith(f"{core} ") and items:
+                      chosen = items
+                      break
+              # Fall back to the first non-empty section (skipping an empty Unreleased header).
+              if not chosen:
+                  for _heading, items in parsed:
+                      if items:
+                          chosen = items
+                          break
+          except OSError:
+              pass
+
+          notes = "\n".join(chosen).strip() or f"Soulbeet {tag}"
+          if len(notes) > 495:
+              cut = notes[:492]
+              if " " in cut:
+                  cut = cut.rsplit(" ", 1)[0]
+              notes = cut.rstrip(" ,;:-") + "..."
+          print(notes)
+          PY
+          echo "Uploading to Google Play track=$TRACK status=$REQUESTED_STATUS"
+          cat play-whatsnew/whatsnew-en-US
+
+      - name: Upload AAB to Google Play
+        if: steps.check-sa.outputs.configured == 'true'
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: soulbeet.insynia.fr
+          releaseFiles: play-assets/*.aab
+          releaseName: ${{ steps.play.outputs.release_name }}
+          tracks: ${{ steps.play.outputs.track }}
+          status: ${{ steps.play.outputs.status }}
+          whatsNewDirectory: play-whatsnew
