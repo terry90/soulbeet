@@ -27,128 +27,132 @@ pub fn use_studio_shortcuts() {
 
         let window = web_sys::window()?;
         let win_for_cb = window.clone();
+        let runtime = dioxus::core::Runtime::current();
+        let scope_id = dioxus::core::current_scope_id();
 
         let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |evt: web_sys::KeyboardEvent| {
-            let key = evt.key();
-            let ctrl_or_meta = evt.ctrl_key() || evt.meta_key();
-            let shift = evt.shift_key();
+            runtime.in_scope(scope_id, || {
+                let key = evt.key();
+                let ctrl_or_meta = evt.ctrl_key() || evt.meta_key();
+                let shift = evt.shift_key();
 
-            let cmdk_open = *studio.cmdk_open.peek();
-            let downloads_open = *studio.downloads_drawer_open.peek();
-            let (tag_name, role, is_editable, dom_dialog_open) = inspect_dom_focus(&win_for_cb);
-            let dialog_open = dom_dialog_open || downloads_open;
+                let cmdk_open = *studio.cmdk_open.peek();
+                let downloads_open = *studio.downloads_drawer_open.peek();
+                let (tag_name, role, is_editable, dom_dialog_open) = inspect_dom_focus(&win_for_cb);
+                let dialog_open = dom_dialog_open || downloads_open;
 
-            if ui::should_ignore_shortcut_target(
-                &tag_name,
-                role.as_deref(),
-                is_editable,
-                dialog_open,
-                cmdk_open,
-                &key,
-                ctrl_or_meta,
-            ) {
-                return;
-            }
+                if ui::should_ignore_shortcut_target(
+                    &tag_name,
+                    role.as_deref(),
+                    is_editable,
+                    dialog_open,
+                    cmdk_open,
+                    &key,
+                    ctrl_or_meta,
+                ) {
+                    return;
+                }
 
-            // Ctrl+K / Cmd+K -> Toggle Command Palette
-            if ctrl_or_meta && key.eq_ignore_ascii_case("k") {
-                evt.prevent_default();
-                studio.cmdk_open.toggle();
-                return;
-            }
+                // Ctrl+K / Cmd+K -> Toggle Command Palette
+                if ctrl_or_meta && key.eq_ignore_ascii_case("k") {
+                    evt.prevent_default();
+                    studio.cmdk_open.toggle();
+                    return;
+                }
 
-            if key == "Escape" {
-                if *studio.cmdk_open.peek() {
-                    evt.prevent_default();
-                    studio.cmdk_open.set(false);
-                } else if *studio.downloads_drawer_open.peek() {
-                    evt.prevent_default();
-                    studio.downloads_drawer_open.set(false);
-                }
-                return;
-            }
-
-            // Ignore other modified chords (Ctrl+C, Ctrl+R, Alt+Left, etc.)
-            if ctrl_or_meta || evt.alt_key() {
-                return;
-            }
-
-            match key.as_str() {
-                " " => {
-                    evt.prevent_default();
-                    player.toggle_play_pause();
-                }
-                "ArrowLeft" => {
-                    evt.prevent_default();
-                    if shift {
-                        player.previous();
-                    } else {
-                        let cur = *player.position_signal().peek();
-                        player.seek((cur - 5.0).max(0.0));
-                    }
-                }
-                "ArrowRight" => {
-                    evt.prevent_default();
-                    if shift {
-                        player.next();
-                    } else {
-                        let cur = *player.position_signal().peek();
-                        player.seek(cur + 5.0);
-                    }
-                }
-                "m" | "M" => {
-                    evt.prevent_default();
-                    player.toggle_mute();
-                }
-                "l" | "L" => {
-                    evt.prevent_default();
-                    studio.toggle_drawer(DrawerTab::Lyrics);
-                }
-                "q" | "Q" => {
-                    evt.prevent_default();
-                    studio.toggle_drawer(DrawerTab::Queue);
-                }
-                "i" | "I" => {
-                    evt.prevent_default();
-                    studio.toggle_drawer(DrawerTab::Inspector);
-                }
-                "s" | "S" => {
-                    if let Some(track) = player.state_signal().peek().current_track.clone() {
+                if key == "Escape" {
+                    if *studio.cmdk_open.peek() {
                         evt.prevent_default();
-                        let next_star = !track.starred;
-                        studio.star_track(auth, player, track, next_star);
+                        studio.cmdk_open.set(false);
+                    } else if *studio.downloads_drawer_open.peek() {
+                        evt.prevent_default();
+                        studio.downloads_drawer_open.set(false);
                     }
+                    return;
                 }
-                "p" | "P" => {
-                    if let Some(track) = player.state_signal().peek().current_track.clone() {
-                        if track.is_discovery {
-                            evt.prevent_default();
-                            studio.keep_track(auth, player, track);
+
+                // Ignore other modified chords (Ctrl+C, Ctrl+R, Alt+Left, etc.)
+                if ctrl_or_meta || evt.alt_key() {
+                    return;
+                }
+
+                match key.as_str() {
+                    " " => {
+                        evt.prevent_default();
+                        player.toggle_play_pause();
+                    }
+                    "ArrowLeft" => {
+                        evt.prevent_default();
+                        if shift {
+                            player.previous();
+                        } else {
+                            let cur = *player.position_signal().peek();
+                            player.seek((cur - 5.0).max(0.0));
                         }
                     }
-                }
-                "x" | "X" => {
-                    if let Some(track) = player.state_signal().peek().current_track.clone() {
+                    "ArrowRight" => {
                         evt.prevent_default();
-                        studio.drop_track(auth, player, track);
-                    }
-                }
-                "r" | "R" => {
-                    if let Some(track) = player.state_signal().peek().current_track.clone() {
-                        evt.prevent_default();
-                        studio.start_radio(auth, player, track);
-                    }
-                }
-                "1" | "2" | "3" | "4" | "5" => {
-                    if let Some(track) = player.state_signal().peek().current_track.clone() {
-                        if let Ok(rating) = key.parse::<u8>() {
-                            evt.prevent_default();
-                            studio.rate_track(auth, player, track, rating);
+                        if shift {
+                            player.next();
+                        } else {
+                            let cur = *player.position_signal().peek();
+                            player.seek(cur + 5.0);
                         }
                     }
+                    "m" | "M" => {
+                        evt.prevent_default();
+                        player.toggle_mute();
+                    }
+                    "l" | "L" => {
+                        evt.prevent_default();
+                        studio.toggle_drawer(DrawerTab::Lyrics);
+                    }
+                    "q" | "Q" => {
+                        evt.prevent_default();
+                        studio.toggle_drawer(DrawerTab::Queue);
+                    }
+                    "i" | "I" => {
+                        evt.prevent_default();
+                        studio.toggle_drawer(DrawerTab::Inspector);
+                    }
+                    "s" | "S" => {
+                        if let Some(track) = player.state_signal().peek().current_track.clone() {
+                            evt.prevent_default();
+                            let next_star = !track.starred;
+                            studio.star_track(auth, player, track, next_star);
+                        }
+                    }
+                    "p" | "P" => {
+                        if let Some(track) = player.state_signal().peek().current_track.clone() {
+                            if track.is_discovery {
+                                evt.prevent_default();
+                                studio.keep_track(auth, player, track);
+                            }
+                        }
+                    }
+                    "x" | "X" => {
+                        if let Some(track) = player.state_signal().peek().current_track.clone() {
+                            evt.prevent_default();
+                            studio.drop_track(auth, player, track);
+                        }
+                    }
+                    "r" | "R" => {
+                        if let Some(track) = player.state_signal().peek().current_track.clone() {
+                            evt.prevent_default();
+                            studio.start_radio(auth, player, track);
+                        }
+                    }
+                    "1" | "2" | "3" | "4" | "5" => {
+                        if let Some(track) = player.state_signal().peek().current_track.clone() {
+                            if let Ok(rating) = key.parse::<u8>() {
+                                evt.prevent_default();
+                                studio.rate_track(auth, player, track, rating);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
+            });
         });
 
         let _ = window.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref());

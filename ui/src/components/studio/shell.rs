@@ -263,26 +263,27 @@ pub fn StudioTopBar(
     #[props(default)] culture_badge: Option<String>,
 ) -> Element {
     rsx! {
-        header { class: "h-14 px-4 sm:px-6 border-b border-beet-border-subtle bg-beet-canvas/90 backdrop-blur-md flex items-center justify-between gap-3 shrink-0 z-20",
-            // Left: Mobile Logo + Section Title
-            div { class: "flex items-center gap-2.5 min-w-0",
+        header { class: "h-14 px-3 sm:px-6 border-b border-beet-border-subtle bg-beet-canvas/90 backdrop-blur-md flex items-center justify-between gap-2 sm:gap-3 shrink-0 z-20",
+            // Left: Mobile Logo + Section Title (shrink-0 prevents 390px logo clipping)
+            div { class: "flex items-center gap-2 sm:gap-2.5 shrink-0",
                 div { class: "lg:hidden shrink-0",
                     Logo { size: 32 }
                 }
-                h1 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary truncate",
+                h1 { class: "text-[16px] sm:text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary whitespace-nowrap",
                     "{active.label()}"
                 }
             }
 
-            // Center: Clickable Command Palette Trigger
+            // Center: Clickable Command Palette Trigger (`min-w-0` prevents flex overflow on 390px)
             button {
                 r#type: "button",
                 aria_label: "Open Command Palette",
-                class: "flex-1 max-w-md h-9 px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 transition-colors cursor-pointer",
+                class: "flex-1 min-w-0 max-w-md h-9 px-2.5 sm:px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 transition-colors cursor-pointer",
                 onclick: move |_| on_open_palette.call(()),
-                span { class: "flex items-center gap-2 min-w-0 text-[13px]",
+                span { class: "flex items-center gap-1.5 sm:gap-2 min-w-0 text-[13px]",
                     IconSearch { size: 15 }
-                    span { class: "truncate", "Jump to view, track, or command…" }
+                    span { class: "sm:hidden truncate", "Search…" }
+                    span { class: "hidden sm:inline truncate", "Jump to view, track, or command…" }
                 }
                 span { class: "hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-secondary shrink-0",
                     IconCommand { size: 10 }
@@ -291,18 +292,19 @@ pub fn StudioTopBar(
             }
 
             // Right: Culture Pill, Offline Toggle, Active Transfers, Mobile Sign Out
-            div { class: "flex items-center gap-2 shrink-0",
+            div { class: "flex items-center gap-1.5 sm:gap-2 shrink-0",
                 if let Some(badge) = culture_badge.as_deref().filter(|b| !b.is_empty()) {
                     span { class: "hidden xl:inline-flex items-center px-2.5 h-8 rounded-full bg-beet-surface-low border border-beet-border-subtle tabular-nums-mono text-[11px] font-semibold text-beet-text-secondary",
                         "{badge}"
                     }
                 }
 
-                div { class: "lg:hidden",
+                div { class: "lg:hidden shrink-0",
                     OfflineTogglePill {
                         offline_only,
                         on_toggle: move |next| on_toggle_offline.call(next),
                         compact: true,
+                        class: "px-2.5".to_string(),
                     }
                 }
 
@@ -316,9 +318,9 @@ pub fn StudioTopBar(
                         }
                     },
                     class: if active_transfers_count > 0 {
-                        "inline-flex items-center gap-1.5 h-9 px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 text-beet-accent-text tabular-nums-mono text-[12px] font-semibold cursor-pointer transition-colors"
+                        "inline-flex items-center justify-center gap-1.5 h-9 w-9 sm:w-auto sm:px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 text-beet-accent-text tabular-nums-mono text-[12px] font-semibold cursor-pointer transition-colors shrink-0"
                     } else {
-                        "inline-flex items-center gap-1.5 h-9 px-3 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high text-[12px] font-medium cursor-pointer transition-colors"
+                        "inline-flex items-center justify-center gap-1.5 h-9 w-9 sm:w-auto sm:px-3 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high text-[12px] font-medium cursor-pointer transition-colors shrink-0"
                     },
                     onclick: move |_| on_open_downloads.call(()),
                     IconActivity { size: 15 }
@@ -336,7 +338,7 @@ pub fn StudioTopBar(
                         r#type: "button",
                         aria_label: "Sign out",
                         title: "Sign out",
-                        class: "lg:hidden w-9 h-9 rounded-full inline-flex items-center justify-center bg-beet-surface border border-beet-border-default text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer",
+                        class: "lg:hidden w-9 h-9 rounded-full inline-flex items-center justify-center bg-beet-surface border border-beet-border-default text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer shrink-0",
                         onclick: move |_| logout_cb.call(()),
                         IconLogOut { size: 16 }
                     }
