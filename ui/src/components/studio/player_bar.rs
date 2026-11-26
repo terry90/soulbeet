@@ -19,7 +19,11 @@ use super::DrawerTab;
 /// so 4–10Hz audio time updates ONLY re-render this compact scrubber and never the rest of the
 /// player bar or studio shell.
 #[component]
-fn PlayerScrubber(has_track: bool, codec_badge: Option<String>) -> Element {
+fn PlayerScrubber(
+    has_track: bool,
+    codec_badge: Option<String>,
+    #[props(default)] full_width: bool,
+) -> Element {
     let player = use_player();
     let pos = *player.position_signal().read();
     let dur = *player.duration_signal().read();
@@ -39,14 +43,25 @@ fn PlayerScrubber(has_track: bool, codec_badge: Option<String>) -> Element {
         0.0
     };
 
+    let container_class = if full_width {
+        "flex items-center gap-2.5 w-full"
+    } else {
+        "flex items-center gap-2.5 w-full max-w-xl"
+    };
+    let track_height_class = if full_width {
+        "w-full h-1.5 rounded-full bg-beet-surface-highest overflow-hidden"
+    } else {
+        "w-full h-1 rounded-full bg-beet-surface-highest overflow-hidden"
+    };
+
     rsx! {
-        div { class: "flex items-center gap-2.5 w-full max-w-xl",
+        div { class: "{container_class}",
             span { class: "w-10 text-right tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
                 "{format_duration(clamped_pos.floor() as u32)}"
             }
 
-            div { class: "relative flex-1 h-4 flex items-center group",
-                div { class: "w-full h-1 rounded-full bg-beet-surface-highest overflow-hidden",
+            div { class: "relative flex-1 h-5 flex items-center group",
+                div { class: "{track_height_class}",
                     div {
                         class: "h-full rounded-full bg-beet-leaf-solid transition-[width] duration-75",
                         style: "width: {pct:.2}%;",
@@ -132,7 +147,7 @@ pub fn StudioPlayerBar(
     rsx! {
         footer {
             aria_label: "Audio player",
-            class: "relative shrink-0 h-[84px] bg-beet-surface-low border-t border-beet-border-subtle px-3 sm:px-5 flex items-center justify-between gap-3 z-30",
+            class: "relative shrink-0 bg-beet-surface-low border-t border-beet-border-subtle px-3 sm:px-5 pt-2 pb-2.5 md:py-0 md:h-[84px] flex flex-col md:flex-row md:items-center md:justify-between gap-2 md:gap-3 z-30",
 
             // Signature Soulbeet 2px seam-light sweep when buffering / loading / acquiring
             if is_busy {
@@ -142,15 +157,26 @@ pub fn StudioPlayerBar(
                 }
             }
 
+            // Mobile (< md): Dedicated full-width seek bar above controls so it is clear and easy to scrub
+            div { class: "w-full md:hidden",
+                PlayerScrubber {
+                    has_track,
+                    codec_badge: None,
+                    full_width: true,
+                }
+            }
+
+            // Controls row (flex row on mobile; dissolved via `md:contents` into the 3-column desktop bar)
+            div { class: "flex items-center justify-between gap-2 w-full md:contents",
             // LEFT (32%): Artwork, Title/Artist, Discovery pill, Context-Aware Curation
-            div { class: "flex items-center gap-3 min-w-0 flex-1 lg:w-[32%] lg:flex-none",
-                // 52px Cover Art
+            div { class: "flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 lg:w-[32%] lg:flex-none",
+                // Cover Art (40px on mobile, 52px on desktop)
                 button {
                     r#type: "button",
                     aria_label: "Open Track Inspector",
                     title: "Inspect current track",
                     disabled: !has_track,
-                    class: "relative w-12 h-12 sm:w-[52px] sm:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle shrink-0 flex items-center justify-center cursor-pointer disabled:cursor-default",
+                    class: "relative w-10 h-10 md:w-[52px] md:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle shrink-0 flex items-center justify-center cursor-pointer disabled:cursor-default",
                     onclick: move |_| on_toggle_drawer.call(DrawerTab::Inspector),
                     if let Some(url) = show_art {
                         img {
@@ -271,9 +297,9 @@ pub fn StudioPlayerBar(
                 }
             }
 
-            // CENTER (40%): Transport + Isolated Scrubber
-            div { class: "flex flex-col items-center justify-center gap-1 flex-1 max-w-xl",
-                div { class: "flex items-center gap-2 sm:gap-3",
+            // CENTER (40%): Transport + Isolated Scrubber (scrubber shown inline on md+; full-width row on mobile)
+            div { class: "flex flex-col items-center justify-center gap-1 shrink-0 md:flex-1 md:max-w-xl",
+                div { class: "flex items-center gap-1 sm:gap-3",
                     button {
                         r#type: "button",
                         aria_pressed: if state.shuffle { "true" } else { "false" },
@@ -342,9 +368,11 @@ pub fn StudioPlayerBar(
                     }
                 }
 
-                PlayerScrubber {
-                    has_track,
-                    codec_badge: current.as_ref().and_then(|t| t.codec_badge.clone()),
+                div { class: "hidden md:flex w-full justify-center",
+                    PlayerScrubber {
+                        has_track,
+                        codec_badge: current.as_ref().and_then(|t| t.codec_badge.clone()),
+                    }
                 }
             }
 
@@ -531,6 +559,7 @@ pub fn StudioPlayerBar(
                         },
                     }
                 }
+            }
             }
         }
     }

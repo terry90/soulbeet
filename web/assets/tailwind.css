@@ -677,9 +677,6 @@
   .h-\[44px\] {
     height: 44px;
   }
-  .h-\[84px\] {
-    height: 84px;
-  }
   .h-full {
     height: 100%;
   }
@@ -1973,6 +1970,9 @@
   .pb-2 {
     padding-bottom: calc(var(--spacing) * 2);
   }
+  .pb-2\.5 {
+    padding-bottom: calc(var(--spacing) * 2.5);
+  }
   .pb-3 {
     padding-bottom: calc(var(--spacing) * 3);
   }
@@ -3069,6 +3069,9 @@
       -webkit-box-orient: vertical;
       -webkit-line-clamp: 1;
     }
+    .sm\:block {
+      display: block;
+    }
     .sm\:flex {
       display: flex;
     }
@@ -3084,14 +3087,8 @@
     .sm\:h-44 {
       height: calc(var(--spacing) * 44);
     }
-    .sm\:h-\[52px\] {
-      height: 52px;
-    }
     .sm\:w-44 {
       width: calc(var(--spacing) * 44);
-    }
-    .sm\:w-\[52px\] {
-      width: 52px;
     }
     .sm\:w-auto {
       width: auto;
@@ -3145,9 +3142,6 @@
       font-size: var(--text-2xl);
       line-height: var(--tw-leading, var(--text-2xl--line-height));
     }
-    .sm\:text-\[17px\] {
-      font-size: 17px;
-    }
     .sm\:text-\[32px\] {
       font-size: 32px;
     }
@@ -3156,17 +3150,38 @@
     .md\:block {
       display: block;
     }
+    .md\:contents {
+      display: contents;
+    }
+    .md\:flex {
+      display: flex;
+    }
     .md\:hidden {
       display: none;
     }
     .md\:inline-flex {
       display: inline-flex;
     }
+    .md\:h-\[52px\] {
+      height: 52px;
+    }
+    .md\:h-\[84px\] {
+      height: 84px;
+    }
     .md\:w-96 {
       width: calc(var(--spacing) * 96);
     }
+    .md\:w-\[52px\] {
+      width: 52px;
+    }
+    .md\:max-w-xl {
+      max-width: var(--container-xl);
+    }
     .md\:min-w-\[104px\] {
       min-width: 104px;
+    }
+    .md\:flex-1 {
+      flex: 1;
     }
     .md\:grid-cols-2 {
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3177,8 +3192,20 @@
     .md\:flex-row {
       flex-direction: row;
     }
+    .md\:items-center {
+      align-items: center;
+    }
+    .md\:justify-between {
+      justify-content: space-between;
+    }
     .md\:justify-start {
       justify-content: flex-start;
+    }
+    .md\:gap-3 {
+      gap: calc(var(--spacing) * 3);
+    }
+    .md\:py-0 {
+      padding-block: 0px;
     }
     .md\:text-left {
       text-align: left;

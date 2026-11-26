@@ -263,25 +263,25 @@ pub fn StudioTopBar(
     #[props(default)] culture_badge: Option<String>,
 ) -> Element {
     rsx! {
-        header { class: "h-14 px-3 sm:px-6 border-b border-beet-border-subtle bg-beet-canvas/90 backdrop-blur-md flex items-center justify-between gap-2 sm:gap-3 shrink-0 z-20",
-            // Left: Mobile Logo + Section Title (shrink-0 prevents 390px logo clipping)
+        header { class: "h-14 px-3 sm:px-6 border-b border-beet-border-subtle bg-beet-canvas/90 backdrop-blur-md flex items-center justify-between gap-2 sm:gap-3 shrink-0 z-20 overflow-hidden",
+            // Left: Mobile Logo + Section Title (title shown on sm+ so 390px mobile stays uncrowded)
             div { class: "flex items-center gap-2 sm:gap-2.5 shrink-0",
-                div { class: "lg:hidden shrink-0",
-                    Logo { size: 32 }
+                div { class: "lg:hidden w-8 h-8 shrink-0 flex items-center justify-center",
+                    Logo { size: 32, class: "w-8 h-8 shrink-0 block".to_string() }
                 }
-                h1 { class: "text-[16px] sm:text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary whitespace-nowrap",
+                h1 { class: "hidden sm:block text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary whitespace-nowrap",
                     "{active.label()}"
                 }
             }
 
-            // Center: Clickable Command Palette Trigger (`min-w-0` prevents flex overflow on 390px)
+            // Center: Clickable Command Palette Trigger (`min-w-0 overflow-hidden` prevents overlap on 390px)
             button {
                 r#type: "button",
                 aria_label: "Open Command Palette",
-                class: "flex-1 min-w-0 max-w-md h-9 px-2.5 sm:px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 transition-colors cursor-pointer",
+                class: "flex-1 min-w-0 max-w-md h-9 px-2.5 sm:px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 overflow-hidden transition-colors cursor-pointer",
                 onclick: move |_| on_open_palette.call(()),
-                span { class: "flex items-center gap-1.5 sm:gap-2 min-w-0 text-[13px]",
-                    IconSearch { size: 15 }
+                span { class: "flex items-center gap-1.5 sm:gap-2 min-w-0 overflow-hidden text-[13px]",
+                    span { class: "shrink-0 inline-flex", IconSearch { size: 15 } }
                     span { class: "sm:hidden truncate", "Search…" }
                     span { class: "hidden sm:inline truncate", "Jump to view, track, or command…" }
                 }
