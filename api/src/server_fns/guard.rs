@@ -109,7 +109,7 @@ pub(crate) async fn load_any_session_claims(
     key: &SecretKey,
 ) -> Result<(UserCtx, Claims), (StatusCode, String)> {
     let Some(token) = token else {
-        tracing::warn!("Auth failure: No auth token found in request cookies");
+        tracing::warn!("Auth failure: No auth token found in request cookies or Authorization header");
         return Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string()));
     };
     let claims = crate::auth::verify_token(key, token).map_err(|e| {
@@ -136,23 +136,56 @@ pub(crate) async fn load_any_session_claims(
     Ok((ctx, claims))
 }
 
-/// The token of the request's auth cookie.
+/// Extracts a bearer JWT from an `Authorization: Bearer <token>` header,
+/// matching the `"Bearer"` scheme case-insensitively.
+#[cfg(feature = "server")]
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let trimmed = raw.trim();
+    let (scheme, rest) = trimmed.split_once(|c: char| c.is_ascii_whitespace())?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Extracts the session JWT from the `auth_token` cookie or an
+/// `Authorization: Bearer <jwt>` header.
+#[cfg(feature = "server")]
+pub(crate) fn extract_session_token(
+    cookies: Option<&tower_cookies::Cookies>,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    if let Some(token) = cookies
+        .and_then(|c| c.get(crate::AUTH_COOKIE_NAME))
+        .map(|c| c.value().trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(token);
+    }
+    bearer_token(headers)
+}
+
+/// The token of the request's auth cookie or `Authorization: Bearer <jwt>` header.
 #[cfg(feature = "server")]
 fn session_token(
     parts: &axum::http::request::Parts,
 ) -> Result<Option<String>, (StatusCode, String)> {
-    let cookies = parts
-        .extensions
-        .get::<tower_cookies::Cookies>()
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                String::from("Missing cookie middleware"),
-            )
-        })?;
-    Ok(cookies
-        .get(crate::AUTH_COOKIE_NAME)
-        .map(|c| c.value().to_string()))
+    let cookies = parts.extensions.get::<tower_cookies::Cookies>();
+    if let Some(token) = extract_session_token(cookies, &parts.headers) {
+        return Ok(Some(token));
+    }
+    if cookies.is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            String::from("Missing cookie middleware"),
+        ));
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "server")]
@@ -450,6 +483,63 @@ mod tests {
         assert_eq!(
             load(Some(&token), &db).await.unwrap_err(),
             (StatusCode::UNAUTHORIZED, SESSION_SIGNED_OUT.to_string())
+        );
+    }
+
+    #[test]
+    fn bearer_token_parses_case_insensitively_and_rejects_other_schemes() {
+        let header_with = |val: &str| {
+            let mut map = axum::http::HeaderMap::new();
+            map.insert(axum::http::header::AUTHORIZATION, val.parse().unwrap());
+            map
+        };
+
+        assert_eq!(
+            bearer_token(&header_with("Bearer tok.123")).as_deref(),
+            Some("tok.123")
+        );
+        assert_eq!(
+            bearer_token(&header_with("bearer   tok.456  ")).as_deref(),
+            Some("tok.456")
+        );
+        assert_eq!(
+            bearer_token(&header_with("BEARER\ttok.789")).as_deref(),
+            Some("tok.789")
+        );
+        assert_eq!(bearer_token(&header_with("Bearer ")), None);
+        assert_eq!(bearer_token(&header_with("Bearer")), None);
+        assert_eq!(bearer_token(&header_with("Bearertok")), None);
+        assert_eq!(bearer_token(&header_with("Basic dXNlcjpwYXNz")), None);
+        assert_eq!(bearer_token(&axum::http::HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn session_token_accepts_bearer_header_and_verifies_via_load_session() {
+        let db = db_with_user().await;
+        let jwt = create_token("u1", 0).unwrap();
+
+        let (parts, ()) = axum::http::Request::builder()
+            .header(axum::http::header::AUTHORIZATION, format!("bearer  {jwt}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        // Works even when no cookie middleware extension is present.
+        let extracted = session_token(&parts).unwrap();
+        assert_eq!(extracted.as_deref(), Some(jwt.as_str()));
+
+        let ctx = load(extracted.as_deref(), &db).await.unwrap();
+        assert_eq!(ctx.user_id, "u1");
+        assert_eq!(ctx.username, "bob");
+
+        // Without bearer and without cookie middleware, preserves missing middleware rejection.
+        let (bare_parts, ()) = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            session_token(&bare_parts).unwrap_err(),
+            (StatusCode::UNAUTHORIZED, "Missing cookie middleware".into())
         );
     }
 }

@@ -5,13 +5,15 @@ use url::Url;
 
 use crate::http::{resolve_docker_url, CircuitBreaker};
 
-use super::error::{NavidromeError, Result};
+use super::error::{NavidromeError, Result, NOT_AUTHORIZED};
 use super::models::*;
 
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
-const API_VERSION: &str = "1.16.1";
-const CLIENT_NAME: &str = "Soulbeet";
+pub const SUBSONIC_API_VERSION: &str = "1.16.1";
+pub const SUBSONIC_CLIENT_NAME: &str = "Soulbeet";
+const API_VERSION: &str = SUBSONIC_API_VERSION;
+const CLIENT_NAME: &str = SUBSONIC_CLIENT_NAME;
 pub struct NavidromeClient {
     pub(super) base_url: Url,
     pub(super) username: String,
@@ -81,7 +83,17 @@ impl NavidromeClientBuilder {
 }
 
 impl NavidromeClient {
-    fn auth_params(&self) -> Vec<(&str, String)> {
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Generates a fresh `(salt, token)` pair for Subsonic token auth
+    /// (`token = md5(password + salt)`) without exposing the plaintext password.
+    pub fn subsonic_credentials(&self) -> (String, String) {
         let salt: String = (0..12)
             .map(|_| {
                 let idx = rand::random::<u8>() % 36;
@@ -93,14 +105,24 @@ impl NavidromeClient {
             })
             .collect();
         let token = format!("{:x}", md5::compute(format!("{}{}", self.password, salt)));
+        (salt, token)
+    }
+
+    fn media_auth_params(&self) -> Vec<(&str, String)> {
+        let (salt, token) = self.subsonic_credentials();
         vec![
             ("u", self.username.clone()),
             ("t", token),
             ("s", salt),
             ("v", API_VERSION.to_string()),
             ("c", CLIENT_NAME.to_string()),
-            ("f", "json".to_string()),
         ]
+    }
+
+    fn auth_params(&self) -> Vec<(&str, String)> {
+        let mut params = self.media_auth_params();
+        params.push(("f", "json".to_string()));
+        params
     }
 
     pub(super) async fn get<T: serde::de::DeserializeOwned>(
@@ -459,6 +481,166 @@ impl NavidromeClient {
         };
         let _: PingBody = self.post_form(endpoint, &[param]).await?;
         Ok(())
+    }
+
+    /// Authenticated `/rest/stream` URL for `id` (`server/subsonic/stream.go:52-81`).
+    /// `max_bitrate` (kbps, omitted when `None` or `0`) and `format` (e.g. `"raw"`, `"opus"`,
+    /// `"mp3"`) control server-side transcoding.
+    pub fn stream_url(
+        &self,
+        id: &str,
+        max_bitrate: Option<u32>,
+        format: Option<&str>,
+    ) -> Result<Url> {
+        let mut url = self.base_url.join("rest/stream")?;
+        {
+            let mut query = url.query_pairs_mut();
+            for (k, v) in self.media_auth_params() {
+                query.append_pair(k, &v);
+            }
+            query.append_pair("id", id);
+            if let Some(bitrate) = max_bitrate.filter(|b| *b > 0) {
+                query.append_pair("maxBitRate", &bitrate.to_string());
+            }
+            if let Some(fmt) = format.filter(|f| !f.is_empty()) {
+                query.append_pair("format", fmt);
+            }
+        }
+        Ok(url)
+    }
+
+    /// Authenticated `/rest/download` URL for raw file download (`server/subsonic/stream.go:83`).
+    pub fn download_url(&self, id: &str) -> Result<Url> {
+        let mut url = self.base_url.join("rest/download")?;
+        {
+            let mut query = url.query_pairs_mut();
+            for (k, v) in self.media_auth_params() {
+                query.append_pair(k, &v);
+            }
+            query.append_pair("id", id);
+        }
+        Ok(url)
+    }
+
+    /// Authenticated `/rest/getCoverArt` URL (`server/subsonic/media_retrieval.go:56-92`).
+    pub fn cover_art_url(&self, id: &str, size: Option<u32>) -> Result<Url> {
+        let mut url = self.base_url.join("rest/getCoverArt")?;
+        {
+            let mut query = url.query_pairs_mut();
+            for (k, v) in self.media_auth_params() {
+                query.append_pair(k, &v);
+            }
+            query.append_pair("id", id);
+            if let Some(px) = size.filter(|s| *s > 0) {
+                query.append_pair("size", &px.to_string());
+            }
+        }
+        Ok(url)
+    }
+
+    /// Subsonic `scrobble` (`server/subsonic/media_annotation.go:157-184`): sends a now-playing
+    /// update when `submission` is `false` or a completed scrobble when `true`. `time_ms` is the
+    /// Unix timestamp in milliseconds.
+    pub async fn scrobble(
+        &self,
+        id: &str,
+        submission: bool,
+        time_ms: Option<i64>,
+    ) -> Result<()> {
+        let sub_str = if submission { "true" } else { "false" };
+        let time_str = time_ms.map(|t| t.to_string());
+        let mut params = vec![("id", id), ("submission", sub_str)];
+        if let Some(ref ts) = time_str {
+            params.push(("time", ts.as_str()));
+        }
+        let _: PingBody = self.post_form("scrobble", &params).await?;
+        Ok(())
+    }
+
+    /// OpenSubsonic `getLyricsBySongId` (`server/subsonic/media_retrieval.go:133-153`).
+    /// Returns an empty list on DATA_NOT_FOUND or when no lyrics exist.
+    pub async fn get_lyrics_by_song_id(&self, id: &str) -> Result<Vec<StructuredLyrics>> {
+        let Some(body) = found(
+            self.get::<LyricsListBody>("getLyricsBySongId", &[("id", id)])
+                .await,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(body
+            .lyrics_list
+            .map(|l| l.structured_lyrics)
+            .unwrap_or_default())
+    }
+
+    /// Legacy Subsonic `getLyrics` (`server/subsonic/media_retrieval.go:94-131`).
+    /// Returns `Ok(None)` on `DATA_NOT_FOUND` (Subsonic error 70) or when lyrics are empty.
+    pub async fn get_lyrics(&self, artist: &str, title: &str) -> Result<Option<LegacyLyrics>> {
+        let Some(body) = found(
+            self.get::<LegacyLyricsBody>("getLyrics", &[("artist", artist), ("title", title)])
+                .await,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(body.lyrics.filter(|l| !l.value.trim().is_empty()))
+    }
+
+    /// Reads structured lyrics via `getLyricsBySongId`, falling back to legacy `getLyrics`
+    /// when structured lyrics are unavailable and `artist`/`title` are supplied.
+    /// Auth/authorization errors (Subsonic 40/50) are always propagated instead of swallowed.
+    pub async fn get_song_lyrics(
+        &self,
+        id: &str,
+        artist: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<Vec<StructuredLyrics>> {
+        match self.get_lyrics_by_song_id(id).await {
+            Ok(list) if !list.is_empty() => return Ok(list),
+            Ok(_) => {}
+            Err(e)
+                if e.is_wrong_credentials()
+                    || matches!(
+                        e,
+                        NavidromeError::Subsonic {
+                            code: NOT_AUTHORIZED,
+                            ..
+                        }
+                    ) =>
+            {
+                return Err(e);
+            }
+            Err(NavidromeError::Subsonic { .. }) => {}
+            Err(e) => return Err(e),
+        }
+
+        let (Some(artist), Some(title)) = (
+            artist.filter(|s| !s.trim().is_empty()),
+            title.filter(|s| !s.trim().is_empty()),
+        ) else {
+            return Ok(Vec::new());
+        };
+
+        let Some(legacy) = self.get_lyrics(artist, title).await? else {
+            return Ok(Vec::new());
+        };
+
+        let lines = legacy
+            .value
+            .lines()
+            .map(|line| LyricLine {
+                start: None,
+                value: line.to_string(),
+            })
+            .collect();
+        Ok(vec![StructuredLyrics {
+            display_artist: legacy.artist.or_else(|| Some(artist.to_string())),
+            display_title: legacy.title.or_else(|| Some(title.to_string())),
+            lang: String::new(),
+            line: lines,
+            offset: None,
+            synced: false,
+        }])
     }
 
     /// The native playlist record of `id`, as this user may read it. Ok(None) only for Navidrome's
@@ -2661,5 +2843,149 @@ mod tests {
             ),
             ("/rest/unstar", vec!["7hQ2nLr5VxZ0cYbM8wTkAf"])
         );
+    }
+
+    #[test]
+    fn media_urls_carry_subsonic_auth_and_optional_params() {
+        let c = client("http://navidrome.local:4533");
+
+        let stream = c
+            .stream_url("song-1", Some(160), Some("opus"))
+            .unwrap();
+        assert_eq!(stream.path(), "/rest/stream");
+        let qs: std::collections::HashMap<_, _> = stream.query_pairs().into_owned().collect();
+        assert_eq!(qs.get("id").map(String::as_str), Some("song-1"));
+        assert_eq!(qs.get("maxBitRate").map(String::as_str), Some("160"));
+        assert_eq!(qs.get("format").map(String::as_str), Some("opus"));
+        assert_eq!(qs.get("u").map(String::as_str), Some("alice"));
+        assert_eq!(qs.get("v").map(String::as_str), Some(SUBSONIC_API_VERSION));
+        assert_eq!(qs.get("c").map(String::as_str), Some(SUBSONIC_CLIENT_NAME));
+        assert!(!qs.contains_key("f"), "binary stream URL must not set f=json");
+        let salt = qs.get("s").unwrap();
+        let expected_token = format!("{:x}", md5::compute(format!("secret-password{salt}")));
+        assert_eq!(qs.get("t").unwrap(), &expected_token);
+
+        let raw_stream = c.stream_url("song-1", Some(0), Some("")).unwrap();
+        let raw_qs: std::collections::HashMap<_, _> =
+            raw_stream.query_pairs().into_owned().collect();
+        assert!(!raw_qs.contains_key("maxBitRate"));
+        assert!(!raw_qs.contains_key("format"));
+
+        let dl = c.download_url("song-2").unwrap();
+        assert_eq!(dl.path(), "/rest/download");
+        let dl_qs: std::collections::HashMap<_, _> = dl.query_pairs().into_owned().collect();
+        assert_eq!(dl_qs.get("id").map(String::as_str), Some("song-2"));
+
+        let art = c.cover_art_url("al-9", Some(512)).unwrap();
+        assert_eq!(art.path(), "/rest/getCoverArt");
+        let art_qs: std::collections::HashMap<_, _> = art.query_pairs().into_owned().collect();
+        assert_eq!(art_qs.get("id").map(String::as_str), Some("al-9"));
+        assert_eq!(art_qs.get("size").map(String::as_str), Some("512"));
+    }
+
+    #[tokio::test]
+    async fn scrobble_posts_submission_flag_and_optional_timestamp() {
+        let (url, seen) = serve(vec![reply(OK), reply(OK)]);
+        let c = client(&url);
+        c.scrobble("song-1", false, None).await.unwrap();
+        c.scrobble("song-1", true, Some(1_732_560_000_000))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].target, "/rest/scrobble");
+        assert_eq!(form_values(&seen[0].body, "id"), vec!["song-1"]);
+        assert_eq!(form_values(&seen[0].body, "submission"), vec!["false"]);
+        assert!(form_values(&seen[0].body, "time").is_empty());
+
+        assert_eq!(seen[1].target, "/rest/scrobble");
+        assert_eq!(form_values(&seen[1].body, "submission"), vec!["true"]);
+        assert_eq!(
+            form_values(&seen[1].body, "time"),
+            vec!["1732560000000"]
+        );
+    }
+
+    #[tokio::test]
+    async fn lyrics_reads_structured_lyrics_and_falls_back_to_legacy_get_lyrics() {
+        let structured = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonic":true,"lyricsList":{"structuredLyrics":[{"displayArtist":"Air","displayTitle":"La Femme d'Argent","lang":"fr","synced":true,"offset":0,"line":[{"start":12000,"value":"First line"},{"start":18500,"value":"Second line"}]}]}}}"#;
+        let empty_structured = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonic":true,"lyricsList":{}}}"#;
+        let legacy = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","lyrics":{"artist":"Air","title":"Playground Love","value":"I'm a high school lover\nAnd you're my favorite flavor"}}}"#;
+
+        let (url, seen) = serve(vec![
+            reply(structured),
+            reply(empty_structured),
+            reply(legacy),
+        ]);
+        let c = client(&url);
+
+        let synced = c
+            .get_song_lyrics("song-1", Some("Air"), Some("La Femme d'Argent"))
+            .await
+            .unwrap();
+        assert_eq!(synced.len(), 1);
+        assert!(synced[0].synced);
+        assert_eq!(synced[0].line.len(), 2);
+        assert_eq!(synced[0].line[0].start, Some(12000));
+        assert_eq!(synced[0].line[0].value, "First line");
+
+        let fallback = c
+            .get_song_lyrics("song-2", Some("Air"), Some("Playground Love"))
+            .await
+            .unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert!(!fallback[0].synced);
+        assert_eq!(fallback[0].line.len(), 2);
+        assert_eq!(fallback[0].line[0].start, None);
+        assert_eq!(fallback[0].line[0].value, "I'm a high school lover");
+
+        let seen = seen.lock().unwrap();
+        assert!(seen[0].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[1].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[2].target.starts_with("/rest/getLyrics?"));
+    }
+
+    #[tokio::test]
+    async fn lyrics_propagates_auth_errors_and_handles_null_arrays_and_not_found() {
+        let auth_err_40 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}"#;
+        let auth_err_50 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"User is not authorized"}}}"#;
+        let null_structured = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonic":true,"lyricsList":{"structuredLyrics":null}}}"#;
+        let not_found_70 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":70,"message":"data not found"}}}"#;
+
+        let (url, seen) = serve(vec![
+            reply(auth_err_40),
+            reply(auth_err_50),
+            reply(null_structured),
+            reply(not_found_70),
+        ]);
+        let c = client(&url);
+
+        let err40 = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap_err();
+        assert!(err40.is_wrong_credentials(), "{err40:?}");
+
+        let err50 = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err50, NavidromeError::Subsonic { code: 50, .. }),
+            "{err50:?}"
+        );
+
+        let empty = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Auth errors must not trigger the legacy fallback request.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen[0].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[1].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[2].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[3].target.starts_with("/rest/getLyrics?"));
     }
 }
