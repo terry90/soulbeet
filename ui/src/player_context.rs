@@ -61,8 +61,10 @@ pub struct PlayerTrack {
     pub artist: String,
     pub album: Option<String>,
     pub cover_art_url: Option<String>,
+    pub cover_art_id: Option<String>,
     pub duration_secs: Option<u32>,
     pub is_discovery: bool,
+    pub discovery_track_id: Option<String>,
     pub days_remaining: Option<u32>,
     pub starred: bool,
     pub rating: u8,
@@ -377,6 +379,43 @@ impl PlayerState {
         *position_secs = 0.0;
         *duration_secs = 0.0;
         self.status = PlaybackStatus::Idle;
+    }
+
+    /// Applies curation mutations (`starred`, `rating`, discovery promotion) to `current_track`
+    /// and every matching item in `queue`.
+    pub fn apply_curation_update(
+        &mut self,
+        song_id: &str,
+        starred: Option<bool>,
+        rating: Option<u8>,
+        promoted_discovery: bool,
+    ) {
+        let update_one = |t: &mut PlayerTrack| {
+            let matches = t.id == song_id
+                || t.discovery_track_id
+                    .as_deref()
+                    .is_some_and(|did| did == song_id);
+            if !matches {
+                return;
+            }
+            if let Some(s) = starred {
+                t.starred = s;
+            }
+            if let Some(r) = rating {
+                t.rating = r.min(5);
+            }
+            if promoted_discovery {
+                t.is_discovery = false;
+                t.discovery_track_id = None;
+                t.days_remaining = None;
+            }
+        };
+        if let Some(ref mut cur) = self.current_track {
+            update_one(cur);
+        }
+        for item in &mut self.queue {
+            update_one(item);
+        }
     }
 }
 

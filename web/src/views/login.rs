@@ -55,7 +55,7 @@ pub(crate) fn leave_login(navigator: dioxus::router::Navigator, return_to: Optio
             return;
         }
     }
-    navigator.replace(Route::SearchPage {});
+    navigator.replace(Route::HomePage {});
 }
 
 /// Signs in; `AuthGuard` then sees the session and leaves the page.
