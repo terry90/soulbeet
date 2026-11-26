@@ -61,8 +61,10 @@ pub struct PlayerTrack {
     pub artist: String,
     pub album: Option<String>,
     pub cover_art_url: Option<String>,
+    pub cover_art_id: Option<String>,
     pub duration_secs: Option<u32>,
     pub is_discovery: bool,
+    pub discovery_track_id: Option<String>,
     pub days_remaining: Option<u32>,
     pub starred: bool,
     pub rating: u8,
@@ -116,6 +118,10 @@ pub struct PlayerState {
     pub repeat: RepeatMode,
     pub offline_only: bool,
     pub active_device_name: Option<String>,
+    /// Deterministic shuffled index order (`0..queue.len()`) when `shuffle` is enabled.
+    shuffle_order: Vec<usize>,
+    /// Current cursor inside `shuffle_order`.
+    shuffle_cursor: Option<usize>,
 }
 
 impl Default for PlayerState {
@@ -131,6 +137,8 @@ impl Default for PlayerState {
             repeat: RepeatMode::Off,
             offline_only: false,
             active_device_name: None,
+            shuffle_order: Vec::new(),
+            shuffle_cursor: None,
         }
     }
 }
@@ -155,6 +163,7 @@ impl PlayerState {
                 *position_secs = 0.0;
                 *duration_secs = dur;
                 self.status = PlaybackStatus::Loading;
+                self.sync_shuffle_order();
             }
             PlayerCommand::PlayQueue {
                 tracks,
@@ -167,10 +176,16 @@ impl PlayerState {
                 let idx = (*start_index).min(tracks.len() - 1);
                 self.queue = tracks.clone();
                 self.select_queue_index(idx, PlaybackStatus::Loading, position_secs, duration_secs);
+                self.sync_shuffle_order();
             }
             PlayerCommand::TogglePlayPause => match self.status {
                 PlaybackStatus::Playing => self.status = PlaybackStatus::Paused,
                 PlaybackStatus::Paused => self.status = PlaybackStatus::Playing,
+                PlaybackStatus::Error(_) => {
+                    if self.current_track.is_some() {
+                        self.status = PlaybackStatus::Loading;
+                    }
+                }
                 PlaybackStatus::Idle => {
                     if self.current_track.is_some() {
                         self.status = PlaybackStatus::Loading;
@@ -181,6 +196,7 @@ impl PlayerState {
                             position_secs,
                             duration_secs,
                         );
+                        self.sync_shuffle_order();
                     }
                 }
                 _ => {}
@@ -197,6 +213,33 @@ impl PlayerState {
                 }
                 if *position_secs > 3.0 {
                     *position_secs = 0.0;
+                    return;
+                }
+                if self.shuffle && !self.shuffle_order.is_empty() {
+                    let cur_pos = self.shuffle_cursor.unwrap_or(0);
+                    if cur_pos > 0 {
+                        let next_pos = cur_pos - 1;
+                        let target = self.shuffle_order[next_pos];
+                        self.shuffle_cursor = Some(next_pos);
+                        self.select_queue_index(
+                            target,
+                            PlaybackStatus::Loading,
+                            position_secs,
+                            duration_secs,
+                        );
+                    } else if self.repeat == RepeatMode::All {
+                        let last_pos = self.shuffle_order.len() - 1;
+                        let target = self.shuffle_order[last_pos];
+                        self.shuffle_cursor = Some(last_pos);
+                        self.select_queue_index(
+                            target,
+                            PlaybackStatus::Loading,
+                            position_secs,
+                            duration_secs,
+                        );
+                    } else {
+                        *position_secs = 0.0;
+                    }
                     return;
                 }
                 let cur = self.queue_index.unwrap_or(0);
@@ -244,6 +287,7 @@ impl PlayerState {
             }
             PlayerCommand::ToggleShuffle => {
                 self.shuffle = !self.shuffle;
+                self.sync_shuffle_order();
             }
             PlayerCommand::CycleRepeat => {
                 self.repeat = self.repeat.cycle();
@@ -263,6 +307,7 @@ impl PlayerState {
                         .map_or(0, |idx| (idx + 1).min(self.queue.len()));
                     self.queue.insert(insert_at, track.clone());
                 }
+                self.sync_shuffle_order();
             }
             PlayerCommand::EnqueueLast(track) => {
                 let was_empty = self.queue.is_empty();
@@ -272,6 +317,7 @@ impl PlayerState {
                     let keep_status = self.status.clone();
                     self.select_queue_index(idx, keep_status, position_secs, duration_secs);
                 }
+                self.sync_shuffle_order();
             }
             PlayerCommand::RemoveFromQueue(idx) => {
                 if *idx >= self.queue.len() {
@@ -283,6 +329,7 @@ impl PlayerState {
                     return;
                 }
                 let Some(cur) = self.queue_index else {
+                    self.sync_shuffle_order();
                     return;
                 };
                 if *idx < cur {
@@ -307,6 +354,7 @@ impl PlayerState {
                         *duration_secs = 0.0;
                     }
                 }
+                self.sync_shuffle_order();
             }
             PlayerCommand::ClearQueue => {
                 self.clear_playback(position_secs, duration_secs);
@@ -331,6 +379,46 @@ impl PlayerState {
             self.status = PlaybackStatus::Loading;
             return;
         }
+        if self.shuffle && !self.shuffle_order.is_empty() {
+            match self.shuffle_cursor {
+                Some(cur) if cur + 1 < self.shuffle_order.len() => {
+                    let next_pos = cur + 1;
+                    let target = self.shuffle_order[next_pos];
+                    self.shuffle_cursor = Some(next_pos);
+                    self.select_queue_index(
+                        target,
+                        PlaybackStatus::Loading,
+                        position_secs,
+                        duration_secs,
+                    );
+                }
+                None => {
+                    let target = self.shuffle_order[0];
+                    self.shuffle_cursor = Some(0);
+                    self.select_queue_index(
+                        target,
+                        PlaybackStatus::Loading,
+                        position_secs,
+                        duration_secs,
+                    );
+                }
+                Some(_) if self.repeat == RepeatMode::All => {
+                    let target = self.shuffle_order[0];
+                    self.shuffle_cursor = Some(0);
+                    self.select_queue_index(
+                        target,
+                        PlaybackStatus::Loading,
+                        position_secs,
+                        duration_secs,
+                    );
+                }
+                Some(_) => {
+                    *position_secs = *duration_secs;
+                    self.status = PlaybackStatus::Paused;
+                }
+            }
+            return;
+        }
         match self.queue_index {
             Some(cur) if cur + 1 < self.queue.len() => {
                 self.select_queue_index(
@@ -350,6 +438,42 @@ impl PlayerState {
                 *position_secs = *duration_secs;
                 self.status = PlaybackStatus::Paused;
             }
+        }
+    }
+
+    fn sync_shuffle_order(&mut self) {
+        if !self.shuffle || self.queue.is_empty() {
+            self.shuffle_order.clear();
+            self.shuffle_cursor = None;
+            return;
+        }
+        let len = self.queue.len();
+        let current = self.queue_index.filter(|&i| i < len);
+        let mut indices: Vec<usize> = (0..len).filter(|&i| Some(i) != current).collect();
+
+        // Deterministic Fisher-Yates shuffle seeded from queue length & track IDs.
+        let mut seed = (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA076_1D64_78BD_642F;
+        for track in &self.queue {
+            for b in track.id.bytes().chain(track.title.bytes()) {
+                seed = seed.wrapping_mul(0x517C_C1B7_2722_0A95) ^ u64::from(b);
+            }
+        }
+        let mut i = indices.len();
+        while i > 1 {
+            i -= 1;
+            seed = splitmix64(seed);
+            let j = (seed as usize) % (i + 1);
+            indices.swap(i, j);
+        }
+
+        self.shuffle_order.clear();
+        if let Some(cur) = current {
+            self.shuffle_order.push(cur);
+            self.shuffle_order.extend(indices);
+            self.shuffle_cursor = Some(0);
+        } else {
+            self.shuffle_order = indices;
+            self.shuffle_cursor = None;
         }
     }
 
@@ -374,10 +498,60 @@ impl PlayerState {
         self.queue.clear();
         self.queue_index = None;
         self.current_track = None;
+        self.shuffle_order.clear();
+        self.shuffle_cursor = None;
         *position_secs = 0.0;
         *duration_secs = 0.0;
         self.status = PlaybackStatus::Idle;
     }
+
+    /// Applies curation mutations (`starred`, `rating`, discovery promotion) to `current_track`
+    /// and every matching item in `queue`. Empty `song_id` values are safely ignored.
+    pub fn apply_curation_update(
+        &mut self,
+        song_id: &str,
+        starred: Option<bool>,
+        rating: Option<u8>,
+        promoted_discovery: bool,
+    ) {
+        if song_id.trim().is_empty() {
+            return;
+        }
+        let update_one = |t: &mut PlayerTrack| {
+            let matches = (!t.id.is_empty() && t.id == song_id)
+                || t.discovery_track_id
+                    .as_deref()
+                    .is_some_and(|did| !did.is_empty() && did == song_id);
+            if !matches {
+                return;
+            }
+            if let Some(s) = starred {
+                t.starred = s;
+            }
+            if let Some(r) = rating {
+                t.rating = r.min(5);
+            }
+            if promoted_discovery {
+                t.is_discovery = false;
+                t.discovery_track_id = None;
+                t.days_remaining = None;
+            }
+        };
+        if let Some(ref mut cur) = self.current_track {
+            update_one(cur);
+        }
+        for item in &mut self.queue {
+            update_one(item);
+        }
+    }
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Shared Dioxus context exposing reactive playback state, isolated high-frequency clock
@@ -799,6 +973,69 @@ mod tests {
         assert_eq!(state.queue_index, Some(0));
         assert_eq!(state.current_track.as_ref().unwrap().id, "a");
         assert_eq!(state.status, PlaybackStatus::Loading);
+    }
+
+    #[test]
+    fn toggle_play_pause_retries_errored_track_and_empty_song_id_is_ignored() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        let mut unindexed = track("", 120);
+        unindexed.is_discovery = true;
+        state.apply_local_command(&PlayerCommand::PlayTrack(unindexed), &mut pos, &mut dur);
+        state.status = PlaybackStatus::Error("network".into());
+
+        // Retrying errored track transitions cleanly back to Loading
+        state.apply_local_command(&PlayerCommand::TogglePlayPause, &mut pos, &mut dur);
+        assert_eq!(state.status, PlaybackStatus::Loading);
+
+        // Empty song_id never mutates unindexed tracks
+        state.apply_curation_update("", Some(true), Some(5), true);
+        assert!(state.current_track.as_ref().unwrap().is_discovery);
+        assert!(!state.current_track.as_ref().unwrap().starred);
+    }
+
+    #[test]
+    fn shuffle_visits_every_track_preserving_current_and_supports_previous() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![
+                    track("a", 100),
+                    track("b", 100),
+                    track("c", 100),
+                    track("d", 100),
+                    track("e", 100),
+                ],
+                start_index: 2,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.apply_local_command(&PlayerCommand::ToggleShuffle, &mut pos, &mut dur);
+        assert!(state.shuffle);
+        assert_eq!(state.current_track.as_ref().unwrap().id, "c");
+
+        let mut visited = vec![state.current_track.as_ref().unwrap().id.clone()];
+        for _ in 0..4 {
+            state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+            visited.push(state.current_track.as_ref().unwrap().id.clone());
+        }
+        let unique: std::collections::HashSet<_> = visited.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            5,
+            "shuffle must visit all 5 unique tracks: {visited:?}"
+        );
+
+        // Next at end of shuffle with Repeat::Off pauses cleanly
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.status, PlaybackStatus::Paused);
+
+        // Previous walks backwards through the shuffled order
+        pos = 0.0;
+        state.apply_local_command(&PlayerCommand::Previous, &mut pos, &mut dur);
+        assert_eq!(state.current_track.as_ref().unwrap().id, visited[3]);
     }
 
     #[test]

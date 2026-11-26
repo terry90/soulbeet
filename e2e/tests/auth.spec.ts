@@ -25,9 +25,9 @@ test('logs a registered user in and out through the UI', async ({ page }) => {
   await registerUser(page.context().request, user);
 
   await loginViaUi(page, user);
-  await expect(page.getByRole('searchbox')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Open Command Palette' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'Logout' }).click();
+  await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page).toHaveURL(/\/login$/);
 
   // Session is actually gone, not just the page swapped.

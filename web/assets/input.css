@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @source "../src/**/*.{rs,html,css}";
 @source "../../ui/src/**/*.{rs,html,css}";
+@source "../../desktop/src/**/*.{rs,html,css}";
 
 /* ==========================================================================
    Soulbeet — Refined Midnight Studio Design Tokens (CSS / Tailwind v4)

@@ -1,31 +1,25 @@
 use auth::{use_auth, AuthProvider};
 use dioxus::prelude::*;
-#[cfg(feature = "web")]
-use shared::download::DownloadEvent;
-use shared::download::DownloadProgress;
+#[cfg(test)]
 use shared::system::NavidromeStatus;
-use std::collections::HashMap;
 
-#[cfg(feature = "web")]
-use dioxus::fullstack::WebSocketOptions;
-#[cfg(feature = "web")]
-use websocket::use_resilient_websocket;
-
-use ui::{
-    AutoDownloadSignal, Downloads, HealthProvider, Layout, Navbar, SearchPrefill, SearchReset,
-    SettingsProvider, StatusAction, StatusBanner,
-};
+use ui::{HealthProvider, SettingsProvider};
+#[cfg(test)]
+use views::navidrome_banner;
 use views::{
-    leave_login, DashboardPage, LoginErrorPage, LoginErrorReturnPage, LoginPage, LoginReturnPage,
-    ReturnTo, SearchPage, SettingsPage, SettingsTab, SettingsTabRequest, SsoLinkNotice,
-    SsoLinkResultPage,
+    leave_login, ActivityPage, DashboardPage, DiscoverPage, HomePage, LibraryPage, LoginErrorPage,
+    LoginErrorReturnPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
+    SsoLinkResultPage, StudioShell,
 };
 
 mod auth;
 #[cfg(feature = "server")]
 mod compression;
 mod fonts;
+mod navidrome_web;
+mod shortcuts;
 mod views;
+mod web_player;
 #[cfg(feature = "web")]
 mod websocket;
 
@@ -42,9 +36,17 @@ pub enum Route {
         #[route("/login/error/:code/return?:..return_to")]
         LoginErrorReturnPage { code: String, return_to: ReturnTo },
 
-        #[layout(WebNavbar)]
+        #[layout(StudioShell)]
             #[route("/")]
+            HomePage {},
+            #[route("/discover")]
+            DiscoverPage {},
+            #[route("/search")]
             SearchPage {},
+            #[route("/library")]
+            LibraryPage {},
+            #[route("/activity")]
+            ActivityPage {},
             #[route("/dashboard")]
             DashboardPage {},
             #[route("/settings")]
@@ -122,7 +124,7 @@ fn App() -> Element {
         fonts::Fonts {}
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         document::Meta { name: "viewport", content: "width=device-width, initial-scale=1" }
-        document::Title { "SoulBeet" }
+        document::Title { "SoulBeet Studio" }
 
         AuthProvider {
             SettingsProvider {
@@ -162,337 +164,6 @@ fn AuthGuard() -> Element {
 
     rsx! {
         Outlet::<Route> {}
-    }
-}
-
-#[component]
-fn WebNavbar() -> Element {
-    let mut auth = use_auth();
-    let mut downloads_open = use_signal(|| false);
-    let mut downloads_toggle = use_signal(|| None::<std::rc::Rc<MountedData>>);
-    let mut search_reset = use_signal(|| 0);
-    #[allow(unused_mut)] // mutated in websocket callback (web feature only)
-    let mut downloads = use_signal::<HashMap<String, DownloadProgress>>(HashMap::new);
-
-    let search_prefill = use_signal(|| None::<(String, String)>);
-    use_context_provider(|| SearchReset(search_reset));
-    use_context_provider(|| SearchPrefill(search_prefill));
-    let settings_tab_request = use_signal(|| None::<SettingsTab>);
-    use_context_provider(|| SettingsTabRequest(settings_tab_request));
-    let sso_link_notice = use_signal(|| None::<api::auth::SsoLinkResult>);
-    use_context_provider(|| SsoLinkNotice(sso_link_notice));
-
-    #[allow(unused_mut)]
-    let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
-    use_context_provider(|| AutoDownloadSignal(auto_download_signal));
-
-    // Set once the server names another build than this bundle's.
-    #[allow(unused_mut)] // mutated in websocket callback (web feature only)
-    let mut outdated = use_signal(|| false);
-
-    #[cfg(feature = "web")]
-    use_resilient_websocket(
-        || api::download_updates_ws(Some(true), Some(true), WebSocketOptions::new()),
-        move |event: DownloadEvent| {
-            // This bundle may misread what another build sends.
-            if *outdated.peek() {
-                return;
-            }
-            match event {
-                DownloadEvent::Progress(data) => {
-                    let mut map = downloads.write();
-                    for file in data {
-                        map.insert(file.item.clone(), file);
-                    }
-                }
-                // First on every socket, a reconnect included, and again after the socket
-                // missed events.
-                DownloadEvent::Snapshot(rows) => {
-                    shared::download::apply_snapshot(&mut downloads.write(), rows);
-                }
-                DownloadEvent::Replaced {
-                    previous_item,
-                    entry,
-                } => {
-                    let mut map = downloads.write();
-                    map.remove(&previous_item);
-                    map.insert(entry.item.clone(), *entry);
-                }
-                DownloadEvent::AutoDownload(auto_event) => {
-                    auto_download_signal.set(Some(auto_event));
-                }
-                DownloadEvent::AcquireAndPlay(_acquire_event) => {
-                    // Consumed by the Studio Player UI in Phase 3 (PR 3A/3B) to animate `seam-light`
-                    // and start playback automatically when Navidrome indexes the track.
-                }
-                DownloadEvent::Build(server_build) => {
-                    if !api::build_id::is_current(&server_build) {
-                        outdated.set(true);
-                    }
-                }
-            }
-        },
-    );
-
-    // Set while the server could not end the session: the user is still
-    // signed in.
-    let mut logout_error = use_signal(|| None::<String>);
-    let logout = move |_| {
-        spawn(async move {
-            let failed = auth.logout().await.err();
-            logout_error.set(failed.map(|e| {
-                format!(
-                    "Sign-out failed, you are still signed in. {}",
-                    ui::friendly_error(&e)
-                )
-            }));
-        });
-    };
-
-    rsx! {
-        Layout {
-            Navbar {
-                home: Route::SearchPage {},
-                Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
-                    to: Route::SearchPage {},
-                    onclick: move |_| search_reset += 1,
-                    span { class: "hidden md:block", "Search" }
-                    svg {
-                        class: "md:hidden w-6 h-6",
-                        fill: "none",
-                        stroke: "currentColor",
-                        view_box: "0 0 24 24",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            stroke_width: "2",
-                            d: "M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z",
-                        }
-                    }
-                }
-                Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
-                    to: Route::DashboardPage {},
-                    span { class: "hidden md:block", "Dashboard" }
-                    svg {
-                        class: "md:hidden w-6 h-6",
-                        fill: "none",
-                        stroke: "currentColor",
-                        view_box: "0 0 24 24",
-                        stroke_width: "1.5",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            d: "M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z",
-                        }
-                    }
-                }
-                Link {
-                    class: "nav-link text-white font-medium border-b-2 border-transparent hover:border-beet-accent aria-[current=page]:border-beet-accent aria-[current=page]:text-white pb-0.5",
-                    to: Route::SettingsPage {},
-                    span { class: "hidden md:block", "Settings" }
-                    svg {
-                        class: "md:hidden w-6 h-6",
-                        fill: "none",
-                        stroke: "currentColor",
-                        view_box: "0 0 24 24",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            stroke_width: "2",
-                            d: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z",
-                        }
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            stroke_width: "2",
-                            d: "M15 12a3 3 0 11-6 0 3 3 0 016 0z",
-                        }
-                    }
-                }
-
-                // Separator
-                div { class: "h-4 w-px bg-white/10" }
-
-                // Downloads Toggle
-                button {
-                    class: "relative group p-2 hover:bg-white/5 rounded-lg transition-colors focus:outline-none cursor-pointer",
-                    aria_label: "Downloads",
-                    onmounted: move |e| downloads_toggle.set(Some(e.data())),
-                    onclick: move |_| downloads_open.set(!downloads_open()),
-                    svg {
-                        class: "w-5 h-5 text-gray-300 group-hover:text-beet-leaf transition-colors",
-                        fill: "none",
-                        stroke: "currentColor",
-                        view_box: "0 0 24 24",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            stroke_width: "2",
-                            d: "M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4",
-                        }
-                    }
-
-                    if !downloads.read().is_empty() {
-                        span { class: "absolute top-1.5 right-1.5 flex h-2.5 w-2.5",
-                            span { class: "animate-ping absolute inline-flex h-full w-full rounded-full bg-beet-accent opacity-75" }
-                            span { class: "relative inline-flex rounded-full h-2.5 w-2.5 bg-beet-accent" }
-                        }
-                    }
-                }
-
-                button {
-                    class: "nav-link text-red-400 hover:text-red-300 text-xs uppercase tracking-widest font-mono cursor-pointer",
-                    onclick: logout,
-                    "Logout"
-                }
-            }
-
-            if outdated() {
-                StatusBanner {
-                    dot_class: "bg-beet-accent",
-                    label: "UPDATE",
-                    message: "Soulbeet was updated. Reload this page.".to_string(),
-                    StatusAction {
-                        label: "Reload",
-                        onclick: |_| {
-                            if let Some(window) = web_sys::window() {
-                                let _ = window.location().reload();
-                            }
-                        },
-                    }
-                }
-            }
-            ImporterBanner {}
-            NavidromeBanner {}
-            if let Some(message) = logout_error() {
-                StatusBanner { dot_class: "bg-beet-accent", label: "SIGN-OUT", message,
-                    StatusAction { label: "Try again", onclick: logout }
-                }
-            }
-
-            main { class: "px-4 sm:px-6 lg:px-8 flex-grow flex flex-col relative overflow-y-auto w-full py-8 no-scrollbar",
-                Outlet::<Route> {}
-            }
-            Downloads { is_open: downloads_open, downloads, return_focus_to: downloads_toggle }
-        }
-    }
-}
-
-/// Shown while beets cannot import. Not dismissible: downloads are refused until it is fixed.
-#[component]
-fn ImporterBanner() -> Element {
-    let health = ui::use_system_health();
-    let SettingsTabRequest(mut requested_tab) = use_context();
-
-    let importer = health.importer();
-    let Some(issue) = importer.blocking_issue() else {
-        return rsx! {};
-    };
-
-    rsx! {
-        StatusBanner {
-            dot_class: ui::importer_chip(importer.level).0,
-            label: "BEETS",
-            message: issue.title.clone(),
-            Link {
-                class: ui::STATUS_ACTION_CLASS,
-                to: Route::SettingsPage {},
-                onclick: move |_| requested_tab.set(Some(SettingsTab::Config)),
-                "Fix in Config"
-            }
-        }
-    }
-}
-
-/// The Navidrome banner for `status`: its dot, its message, and whether it
-/// links to Connect Navidrome. `None` when there is nothing to say.
-fn navidrome_banner(status: NavidromeStatus) -> Option<(&'static str, &'static str, bool)> {
-    match status {
-        NavidromeStatus::InvalidCredentials => Some((
-            "bg-beet-accent",
-            "Navidrome refused your password. Enter your current Navidrome password under \
-             Connect Navidrome.",
-            true,
-        )),
-        NavidromeStatus::NotLinked => Some((
-            "bg-beet-accent",
-            "Not connected. Connect Navidrome to use discovery and rating sync.",
-            true,
-        )),
-        NavidromeStatus::Offline => Some((
-            "bg-gray-500",
-            "Unreachable. Discovery and rating sync paused.",
-            false,
-        )),
-        NavidromeStatus::Connected | NavidromeStatus::Unknown => None,
-    }
-}
-
-#[component]
-fn NavidromeBanner() -> Element {
-    let auth = use_auth();
-    let SettingsTabRequest(mut requested_tab) = use_context();
-    let mut settings = ui::use_settings();
-    let health = ui::use_system_health();
-    let status = auth.navidrome_status();
-
-    let dismissed = settings
-        .get()
-        .map(|s| s.navidrome_banner_dismissed)
-        .unwrap_or(false);
-
-    // The status is a login-time snapshot; live health overrides it, so the
-    // banner clears on its own once Navidrome answers again.
-    let back_online = matches!(status, NavidromeStatus::Offline) && health.navidrome_online();
-
-    if dismissed || back_online {
-        return rsx! {};
-    }
-
-    let Some((dot_color, message, connect)) = navidrome_banner(status) else {
-        return rsx! {};
-    };
-
-    let dismiss = move |_| {
-        spawn(async move {
-            let _ = settings
-                .update(api::UpdateUserSettings {
-                    navidrome_banner_dismissed: Some(true),
-                    ..Default::default()
-                })
-                .await;
-        });
-    };
-
-    rsx! {
-        StatusBanner { dot_class: dot_color, label: "NAVIDROME", message: message.to_string(),
-            if connect {
-                Link {
-                    class: ui::STATUS_ACTION_CLASS,
-                    to: Route::SettingsPage {},
-                    onclick: move |_| requested_tab.set(Some(SettingsTab::Users)),
-                    "Connect"
-                }
-            }
-            button {
-                class: "shrink-0 text-gray-600 hover:text-gray-300 transition-colors cursor-pointer p-2 -mr-1",
-                onclick: dismiss,
-                svg {
-                    class: "w-3.5 h-3.5",
-                    fill: "none",
-                    stroke: "currentColor",
-                    view_box: "0 0 24 24",
-                    path {
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                        stroke_width: "2",
-                        d: "M6 18L18 6M6 6l12 12",
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -597,5 +268,22 @@ mod tests {
         let route: Route = "/login".parse().unwrap();
         assert_eq!(route, Route::LoginPage {});
         assert_eq!(route.to_string(), "/login");
+    }
+
+    #[test]
+    fn studio_routes_parse_and_roundtrip_cleanly() {
+        for (path, expected) in [
+            ("/", Route::HomePage {}),
+            ("/discover", Route::DiscoverPage {}),
+            ("/search", Route::SearchPage {}),
+            ("/library", Route::LibraryPage {}),
+            ("/activity", Route::ActivityPage {}),
+            ("/dashboard", Route::DashboardPage {}),
+            ("/settings", Route::SettingsPage {}),
+        ] {
+            let parsed: Route = path.parse().unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), path);
+        }
     }
 }

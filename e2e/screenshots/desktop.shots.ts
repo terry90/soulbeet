@@ -35,7 +35,7 @@ test('search, album, downloads, dashboard and settings', async ({ page }) => {
   await save(page, 'downloads');
   await page.getByRole('button', { name: 'Close downloads' }).click();
 
-  await page.getByRole('link', { name: 'Dashboard' }).click();
+  await page.goto('/dashboard');
   await expect(page).toHaveURL(/\/dashboard$/);
   await expect(page.getByText('Rating Distribution')).toBeVisible();
   await save(page, 'dashboard');

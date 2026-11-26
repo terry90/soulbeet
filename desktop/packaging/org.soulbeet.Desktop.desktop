@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Soulbeet
+GenericName=Music Studio & Player
+Comment=Refined Midnight Studio offline-first music player & discovery workbench
+Exec=soulbeet-desktop %U
+Icon=org.soulbeet.Desktop
+Terminal=false
+Categories=AudioVideo;Audio;Music;Player;
+Keywords=Music;Audio;FLAC;Navidrome;Subsonic;Discovery;Soulbeet;
+StartupNotify=true
+StartupWMClass=Soulbeet

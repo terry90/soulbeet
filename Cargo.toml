@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "ui",
   "web",
-  # "desktop",
+  "desktop",
   # "mobile",
   "api",
   "lib/soulbeet",

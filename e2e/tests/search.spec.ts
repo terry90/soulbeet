@@ -2,7 +2,7 @@
 
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { freshSession } from '../helpers/app.js';
+import { freshSession, openSoulseekSearch } from '../helpers/app.js';
 import {
   atticSignals,
   collectedDispatches,
@@ -16,6 +16,7 @@ import {
 } from '../fixtures/dataset.js';
 
 async function search(page: Page, query: string, type?: 'ALBUM' | 'TRACK') {
+  await openSoulseekSearch(page);
   if (type) {
     await page.getByRole('radio', { name: type }).check();
   }
@@ -24,6 +25,7 @@ async function search(page: Page, query: string, type?: 'ALBUM' | 'TRACK') {
 }
 
 async function searchByArtist(page: Page, artist: string, query: string, type: 'ALBUM' | 'TRACK') {
+  await openSoulseekSearch(page);
   await page.getByRole('button', { name: 'Add artist filter' }).click();
   await page.getByPlaceholder('Artist name').fill(artist);
   await search(page, query, type);
@@ -73,6 +75,7 @@ test('finds a track with artist and album metadata', async ({ context, page }) =
 test('narrows a track search with the artist field', async ({ context, page }) => {
   await freshSession(context, page, 'search-artist');
 
+  await openSoulseekSearch(page);
   await page.getByRole('button', { name: 'Add artist filter' }).click();
   await page.getByPlaceholder('Artist name').fill(maritime.artist);
   await search(page, 'Maritime', 'TRACK');

@@ -46,8 +46,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test the workspace
-        run: cargo test --workspace --features server,dioxus/server --lib --locked
+      - name: Test the workspace (headless server/shared/ui crates)
+        run: cargo test --workspace --exclude desktop --features server,dioxus/server --lib --locked
 
       # The routes live in the web binary, which --lib leaves out.
       - name: Test the web routes
@@ -56,6 +56,33 @@ jobs:
       # Without feature unification from the other crates, to catch missing features.
       - name: Test soulbeet on its own
         run: cargo test -p soulbeet --lib --locked
+
+  desktop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install desktop native dependencies (libmpv, WebKitGTK, GTK3, D-Bus, libxdo)
+        run: >
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          pkg-config libssl-dev libmpv-dev libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test desktop crate (including headless libmpv smoke tests)
+        run: cargo test -p desktop --locked
+
+      - name: Lint desktop crate
+        run: cargo clippy -p desktop --all-targets --locked -- -D warnings
 
   probe:
     runs-on: ubuntu-latest
@@ -108,6 +135,7 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      # The image interpreter is 3.11, and probe.py and import.py need -P (3.11+).
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
