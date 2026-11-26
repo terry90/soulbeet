@@ -2,50 +2,192 @@
 @source "../src/**/*.{rs,html,css}";
 @source "../../ui/src/**/*.{rs,html,css}";
 
+/* ==========================================================================
+   Soulbeet — Refined Midnight Studio Design Tokens (CSS / Tailwind v4)
+   WCAG 2.1 AA+ verified across all surface tiers.
+   ========================================================================== */
+
+:root {
+    /* Surface Scale (Tonal Elevation — Violet-Tinted OLED) */
+    --beet-canvas: #0f0518;
+    --beet-canvas-oled: #000000;
+    --beet-sunken: #0b0312;
+    --beet-surface-low: #160a24;
+    --beet-surface: #1c0d2e;
+    --beet-surface-high: #26133d;
+    --beet-surface-highest: #321a4f;
+    --beet-scrim: rgba(9, 3, 15, 0.76);
+
+    /* Stepped Surface Aliases */
+    --beet-surface-1: var(--beet-surface-low);
+    --beet-surface-2: var(--beet-surface);
+    --beet-surface-3: var(--beet-surface-high);
+    --beet-surface-4: var(--beet-surface-highest);
+
+    /* Borders */
+    --beet-border-subtle: rgba(216, 194, 245, 0.08);
+    --beet-border-default: rgba(216, 194, 245, 0.14);
+    --beet-border-strong: #4a2b6b;
+
+    /* Text Hierarchy (Violet-Tinted Off-White — Zero Pure-White Halation) */
+    --beet-text-primary: #f6f2fb;
+    --beet-text-secondary: #b8aac9;
+    --beet-text-tertiary: #9e8eb3;
+    --beet-text-disabled: #5e4f73;
+
+    --text-primary: var(--beet-text-primary);
+    --text-secondary: var(--beet-text-secondary);
+    --text-muted: var(--beet-text-tertiary);
+
+    /* Brand & Semantic Accents (Strict 10% Budget) */
+    --beet-accent-glow: #ff00ff;
+    --beet-accent-text: #f472f4;
+    --beet-accent-solid: #a81ba8;
+    --beet-accent-surface: rgba(255, 0, 255, 0.12);
+
+    --beet-leaf-glow: #00ff9d;
+    --beet-leaf-solid: #00e58d;
+    --beet-leaf-ink: #081410;
+    --beet-leaf-text: #33ffb0;
+    --beet-leaf-surface: rgba(0, 255, 157, 0.12);
+
+    --beet-gold: #ffd166;
+    --beet-gold-surface: rgba(255, 209, 102, 0.12);
+
+    --beet-crimson-text: #ff668c;
+    --beet-crimson-solid: #c81e4c;
+    --beet-crimson-surface: rgba(255, 102, 140, 0.14);
+
+    /* Typography */
+    --font-display: "Space Grotesk", system-ui, -apple-system, sans-serif;
+    --font-mono: "Commit Mono", ui-monospace, monospace;
+
+    /* 4/8px Spacing Scale */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-6: 24px;
+    --space-8: 32px;
+    --space-12: 48px;
+    --space-16: 64px;
+
+    /* Radii */
+    --radius-xs: 6px;
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-full: 9999px;
+
+    /* Motion */
+    --dur-fast: 140ms;
+    --dur-base: 220ms;
+    --dur-slow: 360ms;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+    /* Focus Ring (WCAG 2.2 AA/AAA visible 2px offset) */
+    --focus-ring: 0 0 0 2px var(--beet-canvas), 0 0 0 4px var(--beet-leaf-solid);
+}
+
+[data-oled="true"],
+.oled-dark {
+    --beet-canvas: #000000;
+    --beet-sunken: #000000;
+    --beet-surface-low: #0c0614;
+    --beet-surface: #140922;
+}
+
 @theme {
-    /* Soulbeet Color Palette */
+    /* Stepped Studio Surfaces */
+    --color-beet-sunken: #0b0312;
+    --color-beet-canvas: #0f0518;
+    --color-beet-canvas-oled: #000000;
+    --color-beet-surface-low: #160a24;
+    --color-beet-surface: #1c0d2e;
+    --color-beet-surface-high: #26133d;
+    --color-beet-surface-highest: #321a4f;
+
+    /* Borders */
+    --color-beet-border-subtle: rgba(216, 194, 245, 0.08);
+    --color-beet-border-default: rgba(216, 194, 245, 0.14);
+    --color-beet-border-strong: #4a2b6b;
+
+    /* Text Hierarchy */
+    --color-beet-text-primary: #f6f2fb;
+    --color-beet-text-secondary: #b8aac9;
+    --color-beet-text-tertiary: #9e8eb3;
+    --color-beet-text-disabled: #5e4f73;
+
+    /* Semantic & Brand Accents */
+    --color-beet-accent-glow: #ff00ff;
+    --color-beet-accent-text: #f472f4;
+    --color-beet-accent-solid: #a81ba8;
+    --color-beet-accent-surface: rgba(255, 0, 255, 0.12);
+
+    --color-beet-leaf-glow: #00ff9d;
+    --color-beet-leaf-solid: #00e58d;
+    --color-beet-leaf-ink: #081410;
+    --color-beet-leaf-text: #33ffb0;
+    --color-beet-leaf-surface: rgba(0, 255, 157, 0.12);
+
+    --color-beet-gold: #ffd166;
+    --color-beet-gold-surface: rgba(255, 209, 102, 0.12);
+
+    --color-beet-crimson-text: #ff668c;
+    --color-beet-crimson-solid: #c81e4c;
+    --color-beet-crimson-surface: rgba(255, 102, 140, 0.14);
+
+    /* Legacy Soulbeet Palette Aliases (preserved for existing views until PR 3B) */
     --color-beet-dark: #0f0518;
-    --color-beet-panel: #1a0b2e;
-    --color-beet-accent: #ff00ff; /* Neon Pink */
-    --color-beet-leaf: #00ff9d;   /* Cyber Green */
+    --color-beet-panel: #1c0d2e;
+    --color-beet-accent: #ff00ff;
+    --color-beet-leaf: #00ff9d;
     --color-beet-dim: #4a2b6b;
-    
+
     /* Fonts, bundled with the app (web/src/fonts.rs). Commit Mono turns on
        the stylistic sets its own download has on by default: symbols cased
        to their neighbours (ss03), runs of symbols drawn closer (ss04) and
        its smart kerning (ss05). The display font sets its own, so it never
        takes those sets from a mono parent. */
-    --font-mono: "Commit Mono", monospace;
+    --font-mono: "Commit Mono", ui-monospace, monospace;
     --font-mono--font-feature-settings: "ss03", "ss04", "ss05";
-    --font-display: "Space Grotesk", sans-serif;
+    --font-display: "Space Grotesk", system-ui, -apple-system, sans-serif;
     --font-display--font-feature-settings: normal;
-
-    /* Custom Animations */
-    --animate-glow: glow 2s ease-in-out infinite alternate;
-    --animate-scanline: scanline 8s linear infinite;
-
-    @keyframes glow {
-        from { box-shadow: 0 0 5px var(--color-beet-accent), 0 0 10px var(--color-beet-accent); }
-        to { box-shadow: 0 0 2px var(--color-beet-accent), 0 0 5px var(--color-beet-accent); }
-    }
-    @keyframes scanline {
-        0% { background-position: 0% 0%; }
-        100% { background-position: 0% 100%; }
-    }
+    --font-sans: "Space Grotesk", system-ui, -apple-system, sans-serif;
+    --font-sans--font-feature-settings: normal;
 }
 
 /* Custom Utilities */
 @layer utilities {
     .glass-panel {
-        @apply bg-beet-panel/80 backdrop-blur-md border border-white/10 shadow-xl;
+        @apply bg-beet-surface/85 backdrop-blur-md border border-beet-border-default;
     }
-    
+
+    .studio-card {
+        background-color: var(--beet-surface);
+        border: 1px solid var(--beet-border-subtle);
+        border-radius: var(--radius-md);
+    }
+
+    .studio-card-low {
+        background-color: var(--beet-surface-low);
+        border: 1px solid var(--beet-border-subtle);
+        border-radius: var(--radius-md);
+    }
+
+    .tabular-nums-mono {
+        font-family: var(--font-mono);
+        font-feature-settings: "ss03", "ss04", "ss05";
+        font-variant-numeric: tabular-nums;
+    }
+
     /* Only the hover look fades. WebKit hangs, then crashes, when a button
        fading its opacity and filter at once, as from disabled to enabled,
        gets a new opacity before the fade ends. */
     .retro-btn {
-        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf
-               transition-[color,background-color,border-color,box-shadow] duration-200 hover:bg-beet-leaf hover:text-beet-dark hover:shadow-[0_0_15px_rgba(0,255,157,0.6)] cursor-pointer;
+        @apply font-mono uppercase text-xs tracking-widest px-6 py-3 border border-beet-leaf/30 text-beet-leaf-text
+               transition-[color,background-color,border-color] duration-150 hover:bg-beet-leaf-solid hover:text-beet-leaf-ink cursor-pointer;
     }
 
     /* For a scrolling box: fades its bottom edge so cut-off content reads as more to scroll.
@@ -54,14 +196,8 @@
         mask-image: linear-gradient(to bottom, black calc(100% - 2.5rem), transparent);
     }
 
-    /* The two soft discs of colour behind a page: what a 16rem disc of a
-       colour at 10% looks like under a Gaussian blur, painted as a gradient
-       with no filter. Safari on iOS 26 stalls for seconds on a large
-       filter: blur() over fixed elements (WebKit bug 319187).
-       --glow-spread is the blur's radius, --glow-peak the opacity left at
-       the centre, 10% * (1 - exp(-R^2 / (2 * spread^2))) for the disc's
-       radius R, and the stops follow the blurred disc's falloff out to
-       three radii of the blur. */
+    /* Adaptive / ambient radial glow painted as a gradient with no filter: blur().
+       Safari on iOS stalls on large filter: blur() over fixed elements (WebKit bug 319187). */
     .glow {
         position: fixed;
         inset: 0;
@@ -90,7 +226,6 @@
         --glow-at: calc(100% - 5.5rem) calc(75% - 8rem);
     }
 
-    /* The disc is 16rem, and a rem is 14px below md and 16px from it. */
     .glow-wide {
         --glow-spread: 150px;
         --glow-peak: 2.43%;
@@ -107,32 +242,66 @@
         }
     }
 
-    /* A light that runs along a seam between two rows while something
-       loads. Without motion it rests as a still line across the seam. */
-    .seam-light {
-        background: linear-gradient(90deg, transparent, var(--color-beet-accent), var(--color-beet-leaf), transparent) no-repeat;
-        background-size: 40% 100%;
-        animation: seam-sweep 1.4s ease-in-out infinite;
-        @variant motion-reduce {
-            animation: none;
-            background-size: 100% 100%;
-        }
+    /* Signature Soulbeet Seam-Light (Acquiring / Importing / Indexing / Buffering).
+       Without motion it rests as a calm static gradient line across the seam. */
+    .seam-light,
+    .beet-seam-light {
+        height: 2px;
+        background: linear-gradient(
+            90deg,
+            transparent,
+            var(--beet-accent-glow),
+            var(--beet-leaf-glow),
+            transparent
+        ) no-repeat;
+        background-size: 42% 100%;
+        animation: beet-seam-sweep 1.4s ease-in-out infinite;
+    }
+
+    /* Linear 5-second undo countdown rail */
+    .beet-countdown-rail {
+        transform-origin: left center;
+        animation: beet-countdown var(--beet-countdown-duration, 5000ms) linear forwards;
+    }
+
+    /* Subtle 3-bar active playing equalizer */
+    .beet-eq-bar {
+        transform-origin: bottom center;
+        animation: beet-eq-pulse 900ms ease-in-out infinite alternate;
     }
 
     .nav-link {
-        @apply font-display text-sm text-gray-400 hover:text-white hover:scale-105 transition-transform duration-200;
+        @apply font-display text-sm text-beet-text-secondary hover:text-beet-text-primary transition-colors duration-150;
     }
 
-    .crt-overlay {
-        background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
-        background-size: 100% 2px, 3px 100%;
-        pointer-events: none;
+    /* Custom subtle themed scrollbars */
+    .studio-scrollbar {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(158, 142, 179, 0.28) transparent;
+    }
+
+    .studio-scrollbar::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+    }
+
+    .studio-scrollbar::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    .studio-scrollbar::-webkit-scrollbar-thumb {
+        background-color: rgba(158, 142, 179, 0.24);
+        border-radius: 9999px;
+    }
+
+    .studio-scrollbar::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(158, 142, 179, 0.42);
     }
 
     .no-scrollbar::-webkit-scrollbar {
         display: none;
     }
-    
+
     .no-scrollbar {
         -ms-overflow-style: none;
         scrollbar-width: none;
@@ -141,6 +310,7 @@
 
 html {
     @apply text-sm md:text-base;
+    color-scheme: dark;
 }
 
 /* Safari on iOS zooms the page into a field under 16px when it takes focus,
@@ -154,16 +324,65 @@ textarea {
     }
 }
 
-@keyframes seam-sweep {
-    from { background-position: -60% 0; }
-    to { background-position: 160% 0; }
+/* Accessible WCAG 2.2 focus-visible ring across all interactive elements */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
 }
 
-/* Base Styles */
+@keyframes beet-seam-sweep {
+    0% {
+        background-position: -60% 0;
+    }
+    100% {
+        background-position: 160% 0;
+    }
+}
+
+@keyframes beet-countdown {
+    from {
+        transform: scaleX(1);
+    }
+    to {
+        transform: scaleX(0);
+    }
+}
+
+@keyframes beet-eq-pulse {
+    0% {
+        transform: scaleY(0.32);
+    }
+    100% {
+        transform: scaleY(1);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .seam-light,
+    .beet-seam-light {
+        animation: none;
+        background-size: 100% 100%;
+    }
+
+    .beet-countdown-rail {
+        animation: none;
+    }
+
+    .beet-eq-bar {
+        animation: none;
+        transform: scaleY(0.75);
+    }
+}
+
+/* Base Styles — Clean Midnight Violet Canvas (Zero Grid Lines / Zero CRT Scanlines) */
 body {
-    @apply bg-beet-dark text-white min-h-screen overflow-hidden font-display;
-    background-image: 
-        linear-gradient(rgba(26, 11, 46, 0.5) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(26, 11, 46, 0.5) 1px, transparent 1px);
-    background-size: 40px 40px;
+    background-color: var(--beet-canvas);
+    color: var(--beet-text-primary);
+    min-height: 100vh;
+    overflow: hidden;
+    font-family: var(--font-display);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(158, 142, 179, 0.24) transparent;
 }

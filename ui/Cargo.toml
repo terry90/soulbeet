@@ -4,7 +4,7 @@ version = "0.10.0"
 edition = "2021"
 
 [dependencies]
-dioxus = { workspace = true, features = ["fullstack"] }
+dioxus = { workspace = true, features = ["router", "fullstack"] }
 api = { workspace = true }
 shared = { workspace = true }
 web-sys = { version = "0.3.91", features = ["Storage", "Window", "Location"] }
