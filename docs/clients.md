@@ -106,7 +106,7 @@ Prebuilt Linux (`soulbeet-<tag>-linux-x86_64.AppImage`) and Windows (`soulbeet-<
 
 ## Android & Android Auto
 
-The Android client (`android/`, `minSdk = 26`, `targetSdk = 35`) is a multi-module Gradle project wrapping the same Rust `client-core` engine.
+The Android client (`android/`, `minSdk = 26`, `targetSdk = 36`) is a multi-module Gradle project wrapping the same Rust `client-core` engine.
 
 ### Architecture
 

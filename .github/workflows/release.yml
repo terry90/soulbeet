@@ -141,8 +141,8 @@ jobs:
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
             "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "ndk;27.2.12479018"
           NDK_DIR="${SDK_ROOT}/ndk/27.2.12479018"
           test -d "${NDK_DIR}/toolchains/llvm/prebuilt"
