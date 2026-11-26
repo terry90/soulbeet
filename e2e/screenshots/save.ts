@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import type { Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { nightGarden } from '../fixtures/dataset.js';
-import { loginViaApi, performSearch, registerUser, uniqueUser } from '../helpers/app.js';
+import { loginViaApi, openSoulseekSearch, performSearch, registerUser, uniqueUser } from '../helpers/app.js';
 import { e2eRoot } from '../helpers/env.js';
 import { drawCovers } from './covers.js';
 import { stageApp, stageOutside } from './stage.js';
@@ -26,6 +26,7 @@ export async function showSearch(page: Page): Promise<string[]> {
   await registerUser(page.request, user);
   await loginViaApi(page.context(), user);
   await page.goto('/');
+  await openSoulseekSearch(page);
   // The first health answers come while beets is still being checked.
   await expect(page.getByText('All services online')).toBeVisible({ timeout: 60_000 });
   await performSearch(page, QUERY, 'ALBUM');

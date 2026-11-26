@@ -57,6 +57,7 @@ fn StudioShellContent() -> Element {
     // Changelog / "What's new" check (preserved from ui::Layout)
     let seen = use_resource(move || async move { auth.call(api::get_changelog_seen()).await });
     let mut auto_closed = use_signal(|| false);
+    let mut showing_all_whats_new = use_signal(|| false);
     let unseen_notes = match &*seen.read() {
         Some(Ok(version)) if !auto_closed() => changelog()
             .unseen(*version, running_version())
@@ -142,6 +143,7 @@ fn StudioShellContent() -> Element {
                         nav.push(Route::LibraryPage {});
                     },
                     username: auth.username(),
+                    on_whats_new: move |_| showing_all_whats_new.set(true),
                     on_logout: move |_| do_logout(),
                 }
 
@@ -336,8 +338,13 @@ fn StudioShellContent() -> Element {
                 return_focus_to: studio.downloads_toggle_ref,
             }
 
-            // Release Notes Modal (when new version ships)
-            if !unseen_notes.is_empty() {
+            // Release Notes Modal (manual "What's new" or when a new version ships)
+            if showing_all_whats_new() {
+                WhatsNew {
+                    sections: changelog().sections.clone(),
+                    on_close: move |_| showing_all_whats_new.set(false),
+                }
+            } else if !unseen_notes.is_empty() {
                 WhatsNew {
                     sections: unseen_notes,
                     on_close: move |_| {

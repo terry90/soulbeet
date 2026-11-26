@@ -33,6 +33,17 @@ impl StudioNavSection {
             Self::Settings => "Settings",
         }
     }
+
+    pub const fn href(self) -> &'static str {
+        match self {
+            Self::Home => "/",
+            Self::Discover => "/discover",
+            Self::Search => "/search",
+            Self::Library => "/library",
+            Self::Activity => "/activity",
+            Self::Settings => "/settings",
+        }
+    }
 }
 
 /// Lightweight playlist entry displayed in the Left Rail's scrollable Playlists list.
@@ -58,6 +69,7 @@ pub fn StudioSidebar(
     #[props(default)] playlists: Vec<SidebarPlaylistItem>,
     #[props(default)] on_select_playlist: Option<EventHandler<String>>,
     #[props(default)] username: Option<String>,
+    #[props(default)] on_whats_new: Option<EventHandler<()>>,
     on_logout: EventHandler<()>,
 ) -> Element {
     let nav_items = [
@@ -108,12 +120,15 @@ pub fn StudioSidebar(
                             "text-beet-text-tertiary".to_string()
                         };
                         rsx! {
-                            button {
+                            a {
                                 key: "{section.label()}",
-                                r#type: "button",
+                                href: "{section.href()}",
                                 aria_current: if is_active { Some("page") } else { None },
                                 class: "w-full h-9 px-3 rounded-[8px] border flex items-center justify-between gap-2 text-[14px] font-medium transition-colors duration-150 cursor-pointer {item_cls}",
-                                onclick: move |_| on_navigate.call(section),
+                                onclick: move |evt| {
+                                    evt.prevent_default();
+                                    on_navigate.call(section);
+                                },
                                 span { class: "flex items-center gap-2.5 min-w-0",
                                     match section {
                                         StudioNavSection::Home => rsx! { IconHome { size: 17, class: icon_cls } },
@@ -231,15 +246,25 @@ pub fn StudioSidebar(
                     p { class: "text-[13px] font-medium text-beet-text-primary truncate",
                         {username.as_deref().unwrap_or("Listener")}
                     }
-                    p { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary",
-                        "SOULBEET"
+                    div { class: "flex items-center gap-2",
+                        p { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary",
+                            "SOULBEET"
+                        }
+                        if let Some(whats_new_cb) = on_whats_new {
+                            button {
+                                r#type: "button",
+                                class: "tabular-nums-mono text-[10px] text-beet-text-tertiary hover:text-beet-accent-text transition-colors cursor-pointer",
+                                onclick: move |_| whats_new_cb.call(()),
+                                "What's new"
+                            }
+                        }
                     }
                 }
                 button {
                     r#type: "button",
                     aria_label: "Sign out",
                     title: "Sign out",
-                    class: "w-8 h-8 rounded-[8px] inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer",
+                    class: "w-8 h-8 rounded-[8px] inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer shrink-0",
                     onclick: move |_| on_logout.call(()),
                     IconLogOut { size: 16 }
                 }
@@ -269,7 +294,7 @@ pub fn StudioTopBar(
                 div { class: "lg:hidden w-8 h-8 shrink-0 flex items-center justify-center",
                     Logo { size: 32, class: "w-8 h-8 shrink-0 block".to_string() }
                 }
-                h1 { class: "hidden sm:block text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary whitespace-nowrap",
+                span { class: "hidden sm:block text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary whitespace-nowrap",
                     "{active.label()}"
                 }
             }
@@ -376,12 +401,15 @@ pub fn StudioMobileNav(
                         "text-beet-text-tertiary hover:text-beet-text-primary"
                     };
                     rsx! {
-                        button {
+                        a {
                             key: "mob-{section.label()}",
-                            r#type: "button",
+                            href: "{section.href()}",
                             aria_current: if is_active { Some("page") } else { None },
                             class: "flex flex-col items-center justify-center gap-0.5 min-w-[48px] h-12 rounded-[8px] transition-colors cursor-pointer {cls}",
-                            onclick: move |_| on_navigate.call(section),
+                            onclick: move |evt| {
+                                evt.prevent_default();
+                                on_navigate.call(section);
+                            },
                             match section {
                                 StudioNavSection::Home => rsx! { IconHome { size: 17 } },
                                 StudioNavSection::Discover => rsx! { IconCompass { size: 17 } },

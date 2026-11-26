@@ -199,6 +199,22 @@ export async function openConfigTab(page: Page): Promise<void> {
 }
 
 /**
+ * Opens the Advanced Soulseek search view (/search -> Advanced Soulseek tab),
+ * which hosts the MusicBrainz album/track search and the service status line.
+ */
+export async function openSoulseekSearch(page: Page): Promise<void> {
+  if (new URL(page.url()).pathname !== '/search') {
+    await page.getByRole('link', { name: 'Search' }).click();
+  }
+  await expect(page).toHaveURL(/\/search$/);
+  const albumRadio = page.getByRole('radio', { name: 'ALBUM' });
+  if (!(await albumRadio.isVisible())) {
+    await page.getByRole('button', { name: 'Advanced Soulseek' }).click();
+    await expect(albumRadio).toBeVisible();
+  }
+}
+
+/**
  * Runs a metadata search through the UI and waits for results. The app
  * spaces MusicBrainz requests out (1 req/s by design), so under parallel
  * test load results can take a while to come back.
@@ -208,6 +224,7 @@ export async function performSearch(
   query: string,
   type: 'ALBUM' | 'TRACK',
 ): Promise<void> {
+  await openSoulseekSearch(page);
   await page.getByRole('radio', { name: type }).check();
   await page.getByRole('searchbox').fill(query);
   await page.getByRole('button', { name: 'Search', exact: true }).click();
@@ -216,6 +233,7 @@ export async function performSearch(
 
 /** Opens the status line under the search bar, which lists each service. */
 export async function openServiceStatus(page: Page): Promise<void> {
+  await openSoulseekSearch(page);
   await page
     .locator('summary')
     .filter({ hasText: /attention|online|Checking/ })
@@ -223,7 +241,7 @@ export async function openServiceStatus(page: Page): Promise<void> {
 }
 
 export async function openDownloadsPanel(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Downloads', exact: true }).click();
+  await page.getByRole('button', { name: 'Active transfers drawer' }).click();
   await expect(page.getByRole('heading', { name: 'Active Transfers' })).toBeVisible();
 }
 
