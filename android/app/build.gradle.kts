@@ -49,14 +49,18 @@ val hasReleaseSigning = if (signingVars.values.any { it != null }) {
 
 android {
     namespace = "org.soulbeet.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
-        applicationId = "org.soulbeet.app"
+        applicationId = "soulbeet.insynia.fr"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = soulbeetVersionCode
         versionName = soulbeetVersionName
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
 
         vectorDrawables {
             useSupportLibrary = true
