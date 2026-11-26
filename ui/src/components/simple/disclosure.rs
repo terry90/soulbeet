@@ -57,7 +57,7 @@ pub fn Disclosure(props: DisclosureProps) -> Element {
     rsx! {
         div { class: "{props.class}",
             button {
-                class: "text-xs font-mono text-gray-500 hover:text-gray-300 cursor-pointer underline decoration-dotted disabled:cursor-wait",
+                class: "text-xs font-medium text-beet-text-tertiary hover:text-beet-text-primary cursor-pointer underline decoration-dotted underline-offset-4 transition-colors disabled:cursor-wait",
                 aria_expanded: open(),
                 aria_busy: loading(),
                 disabled: loading(),

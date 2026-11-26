@@ -7,7 +7,9 @@ use shared::system::NavidromeStatus;
 
 use crate::friendly_error;
 use crate::use_auth;
-use crate::{use_open_handler, ConfirmModal, Disclosure};
+use crate::{
+    use_open_handler, ConfirmModal, Disclosure, IconCheck, IconSparkles, IconStar, IconX,
+};
 
 fn format_relative_time(ts: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
@@ -29,18 +31,15 @@ fn format_relative_time(ts: &str) -> String {
         return format!("{}h ago", hours);
     }
     let days = delta.num_days();
-    if days < 30 {
-        return format!("{}d ago", days);
-    }
     format!("{}d ago", days)
 }
 
 fn profile_badge_class(profile: &str) -> &'static str {
     match profile {
-        "Conservative" => "bg-blue-600/30 text-blue-300 border-blue-500/40",
-        "Balanced" => "bg-green-600/30 text-green-300 border-green-500/40",
-        "Adventurous" => "bg-purple-600/30 text-purple-300 border-purple-500/40",
-        _ => "bg-gray-600/30 text-gray-300 border-gray-500/40",
+        "Conservative" => "bg-beet-leaf-surface text-beet-leaf-text border-beet-leaf/30",
+        "Balanced" => "bg-beet-gold-surface text-beet-gold border-beet-gold/30",
+        "Adventurous" => "bg-beet-accent-surface text-beet-accent-text border-beet-accent/30",
+        _ => "bg-beet-surface-high text-beet-text-secondary border-beet-border-default",
     }
 }
 
@@ -118,46 +117,53 @@ pub fn DiscoveryOverview() -> Element {
 
     rsx! {
         div { class: "space-y-4",
-            h3 { class: "text-sm font-semibold text-white", "Discovery" }
+            div { class: "flex items-center gap-2",
+                IconSparkles { size: 16, class: "text-beet-accent-text".to_string() }
+                h3 { class: "text-[16px] font-semibold text-beet-text-primary", "Discovery" }
+            }
 
             if nav_status == NavidromeStatus::NotLinked {
-                p { class: "text-xs font-mono text-beet-accent",
-                    "Your account is not connected to Navidrome yet. Use Connect Navidrome in Settings > Users for discovery playlists and rating sync."
+                div { class: "rounded-[10px] bg-beet-accent-surface border border-beet-accent/30 px-3.5 py-2.5 text-[12px] text-beet-accent-text",
+                    "Your account is not connected to Navidrome yet. Use Connect Navidrome in Settings → Users for discovery playlists and rating sync."
                 }
             } else if matches!(nav_status, NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown) {
-                p { class: "text-xs font-mono text-beet-accent",
+                div { class: "rounded-[10px] bg-beet-accent-surface border border-beet-accent/30 px-3.5 py-2.5 text-[12px] text-beet-accent-text",
                     "Your username is not linked to Navidrome. Discovery playlists and rating sync require a matching Navidrome account."
                 }
             }
 
             match info {
                 None => rsx! {
-                    p { class: "text-gray-500 font-mono text-sm", "Loading..." }
+                    div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-[13px] text-beet-text-tertiary",
+                        "Loading discovery settings…"
+                    }
                 },
                 Some(cfg) => {
                     if !cfg.enabled {
                         rsx! {
-                            p { class: "text-gray-500 font-mono text-sm",
-                                "Discovery is not enabled. Turn it on in Settings > Library."
+                            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-[13px] text-beet-text-secondary",
+                                "Discovery is not enabled. Turn it on in Settings → Library."
                             }
                         }
                     } else {
                         rsx! {
-                            div { class: "bg-beet-panel border border-white/10 rounded-lg p-4",
-                                div { class: "flex justify-between items-start",
-                                    div {
+                            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-5",
+                                div { class: "flex flex-wrap justify-between items-start gap-4",
+                                    div { class: "space-y-1.5 min-w-0",
                                         if let Some(ref name) = cfg.folder_name {
-                                            p { class: "text-white font-medium", "Folder: {name}" }
+                                            p { class: "text-[14px] font-semibold text-beet-text-primary",
+                                                "Folder: {name}"
+                                            }
                                         }
-                                        div { class: "mt-1 space-y-0.5",
+                                        div { class: "flex flex-wrap gap-2 pt-0.5",
                                             for (profile, name) in &cfg.playlist_names {
                                                 {
                                                     let tc = cfg.track_counts.get(profile).copied().unwrap_or(10);
                                                     let lt = cfg.lifetime_days.get(profile).copied().unwrap_or(7);
                                                     rsx! {
-                                                        p { class: "text-gray-400 text-xs font-mono",
-                                                            span { class: "text-green-400", "{name}" }
-                                                            span { class: "text-gray-600 ml-1", "({tc} tracks / {lt}d)" }
+                                                        span { class: "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-beet-surface-low border border-beet-border-subtle text-[11px] tabular-nums-mono",
+                                                            span { class: "text-beet-leaf-text font-semibold", "{name}" }
+                                                            span { class: "text-beet-text-tertiary", "{tc} tracks · {lt}d" }
                                                         }
                                                     }
                                                 }
@@ -170,22 +176,23 @@ pub fn DiscoveryOverview() -> Element {
                                             {
                                                 let ago = format_relative_time(ts);
                                                 rsx! {
-                                                    p { class: "text-gray-500 text-xs font-mono mt-1",
+                                                    p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary pt-0.5",
                                                         "Last generated: {ago}"
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    div { class: "flex flex-col items-end gap-2",
+                                    div { class: "flex flex-col items-end gap-2 shrink-0",
                                         button {
-                                            class: "retro-btn rounded text-xs",
+                                            r#type: "button",
+                                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-50 disabled:cursor-wait transition cursor-pointer",
                                             disabled: is_generating,
                                             onclick: handle_generate,
-                                            if is_generating { "Generating..." } else { "Generate" }
+                                            if is_generating { "Generating…" } else { "Generate" }
                                         }
                                         if !start_error().is_empty() {
-                                            span { class: "text-xs font-mono text-red-400", "{start_error}" }
+                                            span { class: "text-[12px] text-beet-crimson-text", "{start_error}" }
                                         }
                                     }
                                 }
@@ -212,13 +219,13 @@ fn LastRunLine(run: LastRun) -> Element {
     let used = run.sources.join(", ");
     rsx! {
         if run.state == EngineState::NoListeningData {
-            p { class: "text-beet-accent text-xs font-mono mt-1", "{NO_LISTENING_DATA}" }
+            p { class: "text-[12px] text-beet-accent-text pt-0.5", "{NO_LISTENING_DATA}" }
         } else if !run.sources.is_empty() {
             // A run that failed before recommending used no source.
-            p { class: "text-gray-400 text-xs font-mono mt-1", "Last run used: {used}" }
+            p { class: "text-[12px] text-beet-text-secondary pt-0.5", "Last run used: {used}" }
         }
         for e in &run.source_errors {
-            p { class: "text-red-400 text-xs font-mono", "{e.source} failed: {e.message}" }
+            p { class: "text-[12px] text-beet-crimson-text", "{e.source} failed: {e.message}" }
         }
     }
 }
@@ -228,11 +235,11 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
     match progress.status {
         GenerationStatus::Running => {
             rsx! {
-                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
-                    p { class: "text-xs font-mono font-semibold text-white mb-3 uppercase tracking-wider",
+                div { class: "mt-4 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle p-4 space-y-3",
+                    p { class: "tabular-nums-mono text-[11px] font-semibold text-beet-text-primary uppercase tracking-wider",
                         "Generating Discovery"
                     }
-                    div { class: "space-y-2",
+                    div { class: "space-y-2.5",
                         for pp in &progress.profiles {
                             { render_profile_row(pp) }
                         }
@@ -258,10 +265,14 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
                 })
                 .unwrap_or_default();
             rsx! {
-                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
-                    p { class: "text-xs font-mono text-beet-leaf", "{total} tracks imported" }
+                div { class: "mt-4 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle p-4",
+                    p { class: "tabular-nums-mono text-[12px] font-semibold text-beet-leaf-text",
+                        "{total} tracks imported"
+                    }
                     if !detail.is_empty() {
-                        p { class: "text-xs font-mono text-gray-400 mt-1", "{detail}" }
+                        p { class: "tabular-nums-mono text-[11px] text-beet-text-secondary mt-1",
+                            "{detail}"
+                        }
                     }
                 }
             }
@@ -273,8 +284,8 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
                 .map(|f| f.message.as_str())
                 .unwrap_or("Unknown error");
             rsx! {
-                div { class: "mt-4 bg-beet-dark/50 border border-white/10 rounded-lg p-4",
-                    p { class: "text-xs font-mono text-red-400", "{msg}" }
+                div { class: "mt-4 rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-solid/30 p-4",
+                    p { class: "text-[12px] text-beet-crimson-text", "{msg}" }
                 }
             }
         }
@@ -285,10 +296,10 @@ fn ProgressPanel(progress: DiscoveryProgress) -> Element {
 fn render_profile_row(pp: &shared::navidrome::ProfileProgress) -> Element {
     let badge_class = profile_badge_class(&pp.profile);
     let phase_color = match pp.phase {
-        ProfilePhase::Waiting => "text-gray-500",
-        ProfilePhase::Done => "text-beet-leaf",
-        ProfilePhase::Skipped => "text-gray-600",
-        _ => "text-white",
+        ProfilePhase::Waiting => "text-beet-text-tertiary",
+        ProfilePhase::Done => "text-beet-leaf-text",
+        ProfilePhase::Skipped => "text-beet-text-disabled",
+        _ => "text-beet-text-primary",
     };
     let phase_text = pp.phase.to_string();
     let show_bar = !matches!(
@@ -304,23 +315,25 @@ fn render_profile_row(pp: &shared::navidrome::ProfileProgress) -> Element {
     rsx! {
         div { class: "flex items-center gap-3",
             span {
-                class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class} w-24 text-center shrink-0",
+                class: "tabular-nums-mono text-[11px] font-semibold px-2 py-0.5 rounded-full border {badge_class} w-28 text-center shrink-0",
                 "{pp.profile}"
             }
-            span { class: "text-xs font-mono {phase_color} flex-1", "{phase_text}" }
+            span { class: "text-[12px] {phase_color} flex-1 truncate", "{phase_text}" }
             if show_bar {
-                div { class: "h-1.5 w-24 bg-gray-800 rounded-full overflow-hidden relative shrink-0",
+                div { class: "h-1.5 w-24 bg-beet-surface-high rounded-full overflow-hidden relative shrink-0",
                     div {
-                        class: "h-full bg-beet-accent absolute top-0 left-0 transition-all duration-300",
+                        class: "h-full bg-beet-accent-solid rounded-full absolute top-0 left-0 transition-all duration-300",
                         style: "width: {percent}%",
                     }
                 }
-                span { class: "text-xs font-mono text-gray-400 w-12 text-right shrink-0",
+                span { class: "tabular-nums-mono text-[11px] text-beet-text-secondary w-12 text-right shrink-0",
                     "{pp.current}/{pp.total}"
                 }
             }
             if pp.phase == ProfilePhase::Done {
-                span { class: "text-xs font-mono text-beet-leaf shrink-0", "100%" }
+                span { class: "tabular-nums-mono text-[11px] font-semibold text-beet-leaf-text shrink-0",
+                    "100%"
+                }
             }
         }
     }
@@ -345,10 +358,10 @@ fn EngineReportView() -> Element {
     });
 
     rsx! {
-        Disclosure { class: "mt-4", label: "engine reports", on_open: load,
-            div { class: "mt-2 max-h-96 overflow-y-auto border border-white/10 rounded bg-beet-dark",
+        Disclosure { class: "pt-2", label: "engine reports", on_open: load,
+            div { class: "mt-2 max-h-96 overflow-y-auto studio-scrollbar border border-beet-border-subtle rounded-[12px] bg-beet-surface-low",
                 if entries().is_empty() {
-                    p { class: "p-3 text-xs font-mono text-gray-500",
+                    p { class: "p-4 text-[12px] text-beet-text-tertiary",
                         "No engine reports available. Run discovery generation first."
                     }
                 } else {
@@ -361,9 +374,10 @@ fn EngineReportView() -> Element {
                             let count = entry.candidate_count;
                             let text = entry.text.clone();
                             rsx! {
-                                div { class: "border-b border-white/5 last:border-b-0",
+                                div { class: "border-b border-beet-border-subtle last:border-b-0",
                                     button {
-                                        class: "w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 cursor-pointer",
+                                        r#type: "button",
+                                        class: "w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-beet-surface-high/60 transition-colors cursor-pointer",
                                         onclick: move |_| {
                                             if expanded_idx() == Some(idx) {
                                                 expanded_idx.set(None);
@@ -372,17 +386,21 @@ fn EngineReportView() -> Element {
                                             }
                                         },
                                         span {
-                                            class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class}",
+                                            class: "tabular-nums-mono text-[11px] font-semibold px-2 py-0.5 rounded-full border {badge_class}",
                                             "{badge_label}"
                                         }
-                                        span { class: "text-xs font-mono text-gray-500 flex-1", "{date}" }
-                                        span { class: "text-xs font-mono text-gray-400", "{count} candidates" }
-                                        span { class: "text-xs text-gray-600 ml-1",
+                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary flex-1 truncate",
+                                            "{date}"
+                                        }
+                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-secondary",
+                                            "{count} candidates"
+                                        }
+                                        span { class: "text-[11px] text-beet-text-tertiary ml-1",
                                             if is_expanded { "\u{25BC}" } else { "\u{25B6}" }
                                         }
                                     }
                                     if is_expanded {
-                                        pre { class: "px-3 pb-3 text-xs font-mono text-gray-400 whitespace-pre-wrap overflow-x-auto",
+                                        pre { class: "px-3.5 pb-3.5 text-[11px] tabular-nums-mono text-beet-text-secondary whitespace-pre-wrap overflow-x-auto",
                                             "{text}"
                                         }
                                     }
@@ -474,7 +492,9 @@ fn DiscoveryTrackList() -> Element {
 
     if active.is_empty() && history.is_empty() {
         return rsx! {
-            p { class: "text-gray-500 font-mono text-sm", "No discovery tracks" }
+            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-center text-[13px] text-beet-text-secondary",
+                "No discovery tracks staged yet."
+            }
         };
     }
 
@@ -486,60 +506,73 @@ fn DiscoveryTrackList() -> Element {
                     let badge_class = profile_badge_class(profile);
                     let count = profile_tracks.len();
                     rsx! {
-                        div { class: "space-y-1.5",
-                            div { class: "flex items-center gap-2",
+                        div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-4 space-y-2.5",
+                            div { class: "flex items-center justify-between gap-2",
                                 span {
-                                    class: "text-xs font-mono px-1.5 py-0.5 rounded border {badge_class}",
+                                    class: "tabular-nums-mono text-[11px] font-semibold px-2.5 py-0.5 rounded-full border {badge_class}",
                                     "{profile}"
                                 }
-                                span { class: "text-xs font-mono text-gray-500",
-                                    "{count} tracks"
+                                span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                    "{count} TRACKS"
                                 }
                             }
-                            for track in profile_tracks {
-                                {
-                                    let id_promote = track.id.clone();
-                                    let id_remove = track.id.clone();
-                                    let title_remove = track.title.clone();
-                                    let artist_remove = track.artist.clone();
-                                    let action_error = action_errors.read().get(&track.id).cloned();
-                                    rsx! {
-                                        div { class: "p-2 bg-beet-panel border border-white/10 rounded text-sm",
-                                            div { class: "flex items-center justify-between",
-                                                div { class: "flex-1 min-w-0",
-                                                    span { class: "text-white truncate", "{track.title}" }
-                                                    span { class: "text-gray-400 mx-2", "-" }
-                                                    span { class: "text-gray-400 truncate", "{track.artist}" }
-                                                    if let Some(r) = track.rating {
-                                                        span { class: "text-yellow-500 text-xs font-mono ml-2",
-                                                            "({r})"
+                            div { class: "space-y-1.5",
+                                for track in profile_tracks {
+                                    {
+                                        let id_promote = track.id.clone();
+                                        let id_remove = track.id.clone();
+                                        let title_remove = track.title.clone();
+                                        let artist_remove = track.artist.clone();
+                                        let action_error = action_errors.read().get(&track.id).cloned();
+                                        rsx! {
+                                            div { class: "px-3 py-2.5 bg-beet-surface-low border border-beet-border-subtle rounded-[8px] text-[13px]",
+                                                div { class: "flex items-center justify-between gap-3",
+                                                    div { class: "flex-1 min-w-0 flex items-center gap-2",
+                                                        span { class: "font-medium text-beet-text-primary truncate",
+                                                            "{track.title}"
+                                                        }
+                                                        span { class: "text-beet-text-disabled shrink-0", "·" }
+                                                        span { class: "text-beet-text-secondary truncate",
+                                                            "{track.artist}"
+                                                        }
+                                                        if let Some(r) = track.rating {
+                                                            span { class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                                                IconStar { size: 10, filled: true }
+                                                                span { "{r}" }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "flex items-center gap-1.5 shrink-0",
+                                                        button {
+                                                            r#type: "button",
+                                                            class: "inline-flex items-center gap-1 h-7 px-2.5 text-[12px] font-medium rounded-full bg-beet-leaf-surface border border-beet-leaf/30 text-beet-leaf-text hover:bg-beet-leaf-solid hover:text-beet-leaf-ink transition-colors cursor-pointer",
+                                                            onclick: move |_| {
+                                                                let id = id_promote.clone();
+                                                                async move { handle_promote(id).await }
+                                                            },
+                                                            IconCheck { size: 12 }
+                                                            span { "Keep" }
+                                                        }
+                                                        button {
+                                                            r#type: "button",
+                                                            class: "inline-flex items-center gap-1 h-7 px-2.5 text-[12px] font-medium rounded-full bg-beet-crimson-surface border border-beet-crimson-solid/30 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white transition-colors cursor-pointer",
+                                                            onclick: move |_| {
+                                                                pending_drop.set(Some(PendingDrop {
+                                                                    track_id: id_remove.clone(),
+                                                                    title: title_remove.clone(),
+                                                                    artist: artist_remove.clone(),
+                                                                }));
+                                                            },
+                                                            IconX { size: 12 }
+                                                            span { "Drop" }
                                                         }
                                                     }
                                                 }
-                                                div { class: "flex gap-1 ml-2",
-                                                    button {
-                                                        class: "px-2 py-0.5 text-xs rounded bg-green-900/50 text-green-400 hover:bg-green-800/50 cursor-pointer",
-                                                        onclick: move |_| {
-                                                            let id = id_promote.clone();
-                                                            async move { handle_promote(id).await }
-                                                        },
-                                                        "Keep"
-                                                    }
-                                                    button {
-                                                        class: "px-2 py-0.5 text-xs rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer",
-                                                        onclick: move |_| {
-                                                            pending_drop.set(Some(PendingDrop {
-                                                                track_id: id_remove.clone(),
-                                                                title: title_remove.clone(),
-                                                                artist: artist_remove.clone(),
-                                                            }));
-                                                        },
-                                                        "Drop"
+                                                if let Some(error) = action_error {
+                                                    p { class: "text-[12px] text-beet-crimson-text mt-1.5 break-words",
+                                                        "{error}"
                                                     }
                                                 }
-                                            }
-                                            if let Some(error) = action_error {
-                                                p { class: "text-xs font-mono text-red-400 mt-1 break-words", "{error}" }
                                             }
                                         }
                                     }
@@ -552,20 +585,20 @@ fn DiscoveryTrackList() -> Element {
 
             // Collapsed history for promoted/removed
             if !history.is_empty() {
-                Disclosure { class: "mt-2", label: format!("history ({})", history.len()),
-                    div { class: "mt-2 space-y-1",
+                Disclosure { class: "pt-1", label: format!("history ({})", history.len()),
+                    div { class: "mt-2 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle p-2 space-y-1",
                         for track in &history {
                             {
                                 let (icon, color) = match track.status {
-                                    DiscoveryStatus::Promoted => ("\u{2713}", "text-green-600"),
-                                    DiscoveryStatus::Removed => ("\u{2717}", "text-red-600"),
-                                    _ => ("", "text-gray-600"),
+                                    DiscoveryStatus::Promoted => ("\u{2713}", "text-beet-leaf-text"),
+                                    DiscoveryStatus::Removed => ("\u{2717}", "text-beet-crimson-text"),
+                                    _ => ("", "text-beet-text-tertiary"),
                                 };
                                 rsx! {
-                                    div { class: "flex items-center gap-2 px-2 py-1 text-xs font-mono text-gray-600",
-                                        span { class: "{color}", "{icon}" }
-                                        span { "{track.artist} - {track.title}" }
-                                        span { class: "text-gray-700 ml-auto",
+                                    div { class: "flex items-center gap-2 px-2.5 py-1.5 rounded-[6px] text-[12px] text-beet-text-secondary",
+                                        span { class: "tabular-nums-mono font-semibold {color}", "{icon}" }
+                                        span { class: "truncate", "{track.artist} · {track.title}" }
+                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary ml-auto shrink-0",
                                             "{track.profile}"
                                         }
                                     }

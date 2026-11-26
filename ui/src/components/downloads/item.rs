@@ -6,7 +6,7 @@ use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState
 
 use super::picker::{ChoicesLoader, MatchPicker};
 use super::Failure;
-use crate::{Disclosure, LossyChip, RowAction};
+use crate::{Disclosure, IconLoader, IconX, LossyChip, RowAction};
 
 /// How a row's state is shown: badge text and tooltip, plus row and badge classes.
 #[derive(Debug, PartialEq)]
@@ -17,60 +17,71 @@ struct Badge {
     text: &'static str,
 }
 
-fn badge(state: &DownloadState) -> Badge {
+fn active_backend_badge(backend: Option<&str>) -> &'static str {
+    match backend {
+        None | Some("slskd") => "SLSK",
+        Some("archive") => "ARCHIVE",
+        Some("ytdlp") => "YTM",
+        Some("gdstudio") => "NETEASE",
+        Some("airdcpp") => "DC++",
+        Some(_) => "DL",
+    }
+}
+
+fn badge(state: &DownloadState, backend: Option<&str>) -> Badge {
     let (title, border, class, text) = match state {
         DownloadState::Queued => (
             "Queued".to_string(),
-            "border-white/5 opacity-60",
-            "border border-gray-600 text-gray-400",
+            "border-beet-border-subtle opacity-75",
+            "bg-beet-surface-high text-beet-text-tertiary border border-beet-border-subtle",
             "QUEUED",
         ),
         DownloadState::InProgress => (
             "Downloading".to_string(),
-            "border-beet-accent/50",
-            "bg-blue-500/20 text-blue-300",
-            "SLSK",
+            "border-beet-leaf-solid/30",
+            "bg-beet-accent-surface text-beet-accent-text border border-beet-accent-solid/30",
+            active_backend_badge(backend),
         ),
         DownloadState::Completed => (
             "Completed".to_string(),
-            "border-beet-leaf/50",
-            "bg-beet-leaf/20 text-beet-leaf",
+            "border-beet-leaf-solid/30",
+            "bg-beet-leaf-surface text-beet-leaf-text border border-beet-leaf-solid/25",
             "DOWNLOADED",
         ),
         DownloadState::ImportQueued(n) => (
             waiting_text(*n),
-            "border-beet-leaf/30",
-            "border border-beet-leaf/40 text-beet-leaf",
+            "border-beet-border-default",
+            "bg-beet-leaf-surface text-beet-leaf-text border border-beet-leaf-solid/25",
             "WAIT",
         ),
         DownloadState::Importing => (
             "Importing...".to_string(),
-            "border-beet-leaf/50",
-            "bg-beet-leaf/20 text-beet-leaf",
+            "border-beet-leaf-solid/30",
+            "bg-beet-leaf-surface text-beet-leaf-text border border-beet-leaf-solid/25",
             "BEETS",
         ),
         DownloadState::Imported => (
             "Imported".to_string(),
-            "border-green-500/50",
-            "bg-green-500/20 text-green-300",
+            "border-beet-leaf-solid/30",
+            "bg-beet-leaf-surface text-beet-leaf-glow border border-beet-leaf-solid/25",
             "LIB",
         ),
         DownloadState::ImportSkipped => (
             "Import Skipped".to_string(),
-            "border-yellow-500/50",
-            "bg-yellow-500/20 text-yellow-300",
+            "border-beet-gold/30",
+            "bg-beet-gold-surface text-beet-gold border border-beet-gold/30",
             "SKIP",
         ),
         DownloadState::Failed(_) => (
             "Failed".to_string(),
-            "border-red-500/50",
-            "bg-red-500/20 text-red-300",
+            "border-beet-crimson-text/35",
+            "bg-beet-crimson-surface text-beet-crimson-text border border-beet-crimson-text/30",
             "ERR",
         ),
         DownloadState::Cancelled => (
             "Cancelled".to_string(),
-            "border-orange-500/50",
-            "bg-orange-500/20 text-orange-300",
+            "border-beet-border-subtle",
+            "bg-beet-surface-high text-beet-text-tertiary border border-beet-border-subtle",
             "CANCEL",
         ),
     };
@@ -86,8 +97,8 @@ fn badge(state: &DownloadState) -> Badge {
 /// know about an import that went through (untagged, warnings).
 fn reason(row: &DownloadProgress) -> Option<(&'static str, &str)> {
     let class = match row.state {
-        DownloadState::ImportSkipped | DownloadState::Imported => "text-yellow-400",
-        DownloadState::Failed(_) => "text-red-400",
+        DownloadState::ImportSkipped | DownloadState::Imported => "text-beet-gold",
+        DownloadState::Failed(_) => "text-beet-crimson-text",
         _ => return None,
     };
     row.error.as_deref().map(|note| (class, note))
@@ -98,7 +109,7 @@ fn note<'a>(
     row: &'a DownloadProgress,
     cancel_refusal: Option<&'a str>,
 ) -> Option<(&'static str, &'a str)> {
-    reason(row).or_else(|| cancel_refusal.map(|refusal| ("text-red-400", refusal)))
+    reason(row).or_else(|| cancel_refusal.map(|refusal| ("text-beet-crimson-text", refusal)))
 }
 
 /// An imported row's line on Navidrome and its text class: whether it lists the file yet, or why
@@ -108,9 +119,9 @@ fn index_line(row: &DownloadProgress) -> Option<(&'static str, &str)> {
         return None;
     }
     Some(match row.index.as_ref()? {
-        IndexState::Waiting => ("text-gray-300", "Waiting for Navidrome"),
-        IndexState::Listed => ("text-gray-300", "In Navidrome"),
-        IndexState::Failed(failure) => ("text-yellow-400", failure.message.as_str()),
+        IndexState::Waiting => ("text-beet-text-secondary", "Waiting for Navidrome"),
+        IndexState::Listed => ("text-beet-leaf-text", "In Navidrome"),
+        IndexState::Failed(failure) => ("text-beet-gold", failure.message.as_str()),
     })
 }
 
@@ -177,42 +188,58 @@ pub fn DownloadItem(
     let refusal = cancel_refusal();
     let note = note(&file, refusal.as_deref());
     let is_cancellable = matches!(state, DownloadState::Queued | DownloadState::InProgress);
+    let backend_meta = file.backend.as_deref().and_then(shared::backends::meta);
     let Badge {
         title: status_text,
         border: border_class,
         class: badge_class,
         text: badge_text,
-    } = badge(state);
+    } = badge(state, file.backend.as_deref());
 
     let percent = file.percent as i32;
 
-    // Clean up filename for display (remove path)
+    // Clean up filename for display (extract file name and optional parent folder)
     let filename_str = file.item.replace('\\', "/");
     let path = std::path::Path::new(&filename_str);
-    let components: Vec<_> = path.components().collect();
+    let normal_parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
 
-    let display_name = match components.len() {
-        0 => "Unknown".to_string(),
-        _ => components[components.len() - 1]
-            .as_os_str()
-            .to_string_lossy()
-            .into_owned(),
+    let display_name = normal_parts
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "Unknown".to_string());
+    let parent_folder = if normal_parts.len() >= 2 {
+        Some(normal_parts[normal_parts.len() - 2].clone())
+    } else {
+        None
     };
 
     rsx! {
-      div { class: "bg-white/5 border {border_class} p-4 rounded-lg hover:border-beet-accent/50 transition-colors group",
-        div { class: "flex justify-between items-start mb-2",
-          div {
-            class: "text-sm font-bold text-white truncate w-3/4 pr-2",
-            title: "{file.item}",
-            "{display_name}"
+      div { class: "bg-beet-surface border {border_class} rounded-[12px] p-3.5 transition-colors group hover:border-beet-border-default",
+        div { class: "flex justify-between items-start gap-2 mb-2",
+          div { class: "min-w-0 flex-1",
+            div {
+              class: "text-[13px] font-medium text-beet-text-primary truncate leading-snug",
+              title: "{file.item}",
+              "{display_name}"
+            }
+            if let Some(folder) = parent_folder {
+              div { class: "text-[11px] text-beet-text-tertiary truncate mt-0.5",
+                "{folder}"
+              }
+            }
           }
           div { class: "flex items-center gap-1.5 shrink-0",
-            if let Some(meta) = file.backend.as_deref().and_then(shared::backends::meta) {
+            if let Some(meta) = backend_meta {
               LossyChip { meta }
             }
             span {
-              class: "text-[10px] font-mono {badge_class} px-1.5 py-0.5 rounded uppercase cursor-help",
+              class: "text-[10px] tabular-nums-mono font-semibold {badge_class} px-1.5 py-0.5 rounded-full uppercase cursor-help",
               title: "{status_text}",
               "{badge_text}"
             }
@@ -220,8 +247,10 @@ pub fn DownloadItem(
               { let file_clone = file.clone();
               rsx! {
                 button {
-                  class: "text-[10px] font-mono px-1.5 py-0.5 rounded uppercase border border-transparent text-gray-600 opacity-0 group-hover:opacity-100 hover:border-red-500/40 hover:text-red-400 transition-all cursor-pointer",
+                  r#type: "button",
+                  class: "w-6 h-6 rounded-[6px] inline-flex items-center justify-center text-beet-text-tertiary opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-beet-crimson-surface hover:text-beet-crimson-text transition-all cursor-pointer",
                   title: "Cancel download",
+                  aria_label: "Cancel download",
                   onclick: move |evt: Event<MouseData>| {
                       evt.stop_propagation();
                       let file = file_clone.clone();
@@ -229,58 +258,69 @@ pub fn DownloadItem(
                           cancel_refusal.set(on_cancel.call(file).await.err());
                       });
                   },
-                  "\u{00d7}"
+                  IconX { size: 13 }
                 }
               }}
             }
           }
         }
-        div { class: "flex justify-between text-xs text-gray-400 font-mono mb-1",
-          span {
-            if matches!(state, DownloadState::InProgress) && file.speed > 0.0 {
-              "{format_size(file.speed as u64)}/s"
-            } else {
-              "{format_size(file.size)}"
+        div { class: "flex items-center justify-between gap-2 tabular-nums-mono text-[11px] text-beet-text-tertiary mb-1.5",
+          div { class: "flex items-center gap-1.5 min-w-0",
+            span { class: "shrink-0",
+              if matches!(state, DownloadState::InProgress) && file.speed > 0.0 {
+                "{format_size(file.speed as u64)}/s"
+              } else {
+                "{format_size(file.size)}"
+              }
+            }
+            if let Some(meta) = backend_meta {
+              span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle text-[10px] text-beet-text-secondary truncate",
+                "{meta.name}"
+              }
             }
           }
-          span { "{percent}%" }
+          span { class: "shrink-0", "{percent}%" }
         }
         // Progress Bar
         if matches!(state, DownloadState::InProgress | DownloadState::Importing) {
-          div { class: "h-2 w-full bg-gray-800 rounded-full overflow-hidden relative",
-            div {
-              class: "h-full bg-beet-accent absolute top-0 left-0 transition-all duration-300",
-              style: "width: {percent}%",
-            }
-            // Striped animation overlay (using inline SVG for pattern)
-            div {
-              class: "h-full w-full absolute top-0 left-0 opacity-30",
-              style: "background-image: repeating-linear-gradient(45deg, transparent, transparent 5px, rgba(255,255,255,0.5) 5px, rgba(255,255,255,0.5) 10px);",
+          {
+            let fill_class = if matches!(state, DownloadState::Importing) {
+                "bg-beet-leaf-solid"
+            } else {
+                "bg-beet-accent-solid"
+            };
+            rsx! {
+              div { class: "h-1 w-full bg-beet-surface-high rounded-full overflow-hidden",
+                div {
+                  class: "h-full {fill_class} rounded-full transition-all duration-300",
+                  style: "width: {percent}%",
+                }
+              }
             }
           }
         } else if matches!(state, DownloadState::Queued) {
-          div { class: "h-1 w-full bg-gray-800 rounded-full mt-2" }
+          div { class: "h-1 w-full bg-beet-surface-high rounded-full overflow-hidden" }
         }
         if let DownloadState::ImportQueued(n) = state {
-          div { class: "text-xs text-gray-300 font-mono mt-2", "{waiting_text(*n)}" }
+          div { class: "text-[11px] text-beet-text-secondary tabular-nums-mono mt-2", "{waiting_text(*n)}" }
         }
         // The only element holding the reason: e2e matches it by text.
         if let Some((note_class, note)) = note {
-          div { class: "text-xs {note_class} mt-1 break-words", "{note}" }
+          div { class: "text-[12px] {note_class} mt-1.5 break-words leading-snug", "{note}" }
         }
         if let Some((index_class, index)) = index_line(&file) {
-          div { class: "text-xs {index_class} font-mono mt-1 break-words", "{index}" }
+          div { class: "text-[11px] {index_class} tabular-nums-mono mt-1.5 break-words", "{index}" }
         }
         if let (true, Some(kept)) = (file.retryable, &file.local_path) {
-          div { class: "text-xs text-gray-500 font-mono mt-1 break-all", "Kept in {kept}" }
+          div { class: "text-[11px] text-beet-text-tertiary tabular-nums-mono mt-1.5 break-all", "Kept in {kept}" }
         }
         if let (Some(_), Some(tail)) = (note, &file.import_output) {
           Disclosure { class: "mt-2", label: "beets output",
-            pre { class: "mt-1 max-h-48 overflow-y-auto text-xs font-mono text-gray-400 whitespace-pre-wrap break-all", "{tail}" }
+            pre { class: "mt-1.5 p-2.5 rounded-[8px] bg-beet-sunken border border-beet-border-subtle max-h-48 overflow-y-auto studio-scrollbar text-[11px] tabular-nums-mono text-beet-text-secondary whitespace-pre-wrap break-all", "{tail}" }
           }
         }
         if shows_retry(&file) {
-          div { class: "mt-2 flex flex-wrap gap-2",
+          div { class: "mt-2.5 flex flex-wrap gap-2",
             RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::Auto), "Retry import" }
             RowAction { busy: busy(), onclick: move |_| import.call(ImportChoice::AsIs), "Import as-is" }
           }
@@ -295,26 +335,9 @@ pub fn DownloadItem(
           }
         }
         if matches!(state, DownloadState::Importing) {
-          div { class: "flex items-center gap-2 text-xs text-gray-300 font-mono mt-2",
-            svg {
-              class: "w-3 h-3 animate-spin",
-              fill: "none",
-              view_box: "0 0 24 24",
-              circle {
-                class: "opacity-25",
-                cx: "12",
-                cy: "12",
-                r: "10",
-                stroke: "currentColor",
-                stroke_width: "4",
-              }
-              path {
-                class: "opacity-75",
-                fill: "currentColor",
-                d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z",
-              }
-            }
-            "Moving and tagging..."
+          div { class: "flex items-center gap-2 text-[11px] text-beet-leaf-text tabular-nums-mono mt-2",
+            IconLoader { size: 12 }
+            span { "Moving and tagging..." }
           }
         }
       }
@@ -353,9 +376,23 @@ mod tests {
 
     #[test]
     fn wait_badge_and_text() {
-        let b = badge(&DownloadState::ImportQueued(2));
+        let b = badge(&DownloadState::ImportQueued(2), None);
         assert_eq!(b.text, "WAIT");
         assert_eq!(b.title, "Waiting for library (2 ahead)");
+    }
+
+    #[test]
+    fn in_progress_badge_reflects_backend() {
+        assert_eq!(badge(&DownloadState::InProgress, None).text, "SLSK");
+        assert_eq!(
+            badge(&DownloadState::InProgress, Some("slskd")).text,
+            "SLSK"
+        );
+        assert_eq!(
+            badge(&DownloadState::InProgress, Some("archive")).text,
+            "ARCHIVE"
+        );
+        assert_eq!(badge(&DownloadState::InProgress, Some("ytdlp")).text, "YTM");
     }
 
     #[test]
@@ -367,13 +404,13 @@ mod tests {
         let untagged = with_error(DownloadState::Imported, Some("Imported as-is (untagged)"));
         assert_eq!(
             reason(&untagged),
-            Some(("text-yellow-400", "Imported as-is (untagged)"))
+            Some(("text-beet-gold", "Imported as-is (untagged)"))
         );
         assert_eq!(reason(&with_error(DownloadState::Imported, None)), None);
         let skipped = with_error(DownloadState::ImportSkipped, Some("No close match"));
         assert_eq!(
             reason(&skipped),
-            Some(("text-yellow-400", "No close match"))
+            Some(("text-beet-gold", "No close match"))
         );
         let failed = with_error(
             DownloadState::Failed("x".into()),
@@ -381,7 +418,7 @@ mod tests {
         );
         assert_eq!(
             reason(&failed),
-            Some(("text-red-400", "beets exited with code 1"))
+            Some(("text-beet-crimson-text", "beets exited with code 1"))
         );
         assert_eq!(
             reason(&with_error(DownloadState::InProgress, Some("stale"))),
@@ -394,7 +431,7 @@ mod tests {
         let running = row(DownloadState::InProgress, None);
         assert_eq!(
             note(&running, Some("Download not found")),
-            Some(("text-red-400", "Download not found"))
+            Some(("text-beet-crimson-text", "Download not found"))
         );
         assert_eq!(note(&running, None), None);
         let failed = DownloadProgress {
@@ -403,7 +440,7 @@ mod tests {
         };
         assert_eq!(
             note(&failed, Some("Download not found")),
-            Some(("text-red-400", "beets exited with code 1"))
+            Some(("text-beet-crimson-text", "beets exited with code 1"))
         );
     }
 

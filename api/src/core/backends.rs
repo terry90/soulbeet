@@ -117,6 +117,30 @@ pub(crate) async fn switches_in(
     Ok(switches)
 }
 
+/// Every download backend currently enabled (always-on or admin-toggled on in `app_config`).
+pub async fn enabled() -> Result<Vec<BackendMeta>, Failure> {
+    enabled_in(&crate::db::DB, shared::backends::ALL).await
+}
+
+pub(crate) async fn enabled_in(
+    db: &SqlitePool,
+    all: &'static [BackendMeta],
+) -> Result<Vec<BackendMeta>, Failure> {
+    let mut out = Vec::new();
+    for meta in all {
+        let is_on = match meta.switch {
+            Switch::AlwaysOn => true,
+            Switch::AdminToggle => turned_on(db, meta.id)
+                .await
+                .map_err(|e| database_failure(Stage::Input, e))?,
+        };
+        if is_on {
+            out.push(*meta);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +236,34 @@ mod tests {
         assert_eq!(
             AppConfig::get_in(&db, "archive_enabled").await.unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_lists_always_on_and_toggled_on_backends() {
+        let db = test_db::migrated().await;
+        let life = Recorded::default();
+        let admin = user(Role::Admin);
+
+        assert_eq!(
+            enabled_in(&db, METAS).await.unwrap(),
+            vec![shared::backends::SLSKD]
+        );
+
+        set_enabled_in(&db, METAS, &life, &admin, "archive", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            enabled_in(&db, METAS).await.unwrap(),
+            vec![shared::backends::SLSKD, ARCHIVE]
+        );
+
+        set_enabled_in(&db, METAS, &life, &admin, "archive", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            enabled_in(&db, METAS).await.unwrap(),
+            vec![shared::backends::SLSKD]
         );
     }
 }

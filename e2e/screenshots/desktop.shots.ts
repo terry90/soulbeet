@@ -19,7 +19,8 @@ test('search, album, downloads, dashboard and settings', async ({ page }) => {
     });
   await save(page, 'search');
 
-  const album = page.getByRole('listitem').first();
+  const results = page.locator('section', { has: page.getByRole('heading', { name: 'Search Results' }) });
+  const album = results.getByRole('listitem').first();
   await album.getByRole('paragraph').first().click();
   // The album has one Download button, and then one per track.
   await expect(album.getByRole('button', { name: 'Download' }).nth(1)).toBeVisible({ timeout: 45_000 });

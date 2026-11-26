@@ -1,10 +1,29 @@
 use dioxus::logger::tracing::info;
 use dioxus::prelude::*;
-use shared::backends::{BackendMeta, Delivery, DEFAULT_ID};
+use shared::backends::{BackendMeta, Delivery};
 use shared::download::{DownloadableGroup, DownloadableItem};
 use std::collections::HashSet;
 
-use crate::{use_auth, Checkbox, LossyChip, FIELD_CLASS};
+use crate::{use_auth, Checkbox, LossyChip};
+
+/// Live polling state of one download backend in a manual source search.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendPollState {
+    Searching,
+    Done,
+    Failed,
+}
+
+/// Live status of a download backend participating in a manual source search.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BackendSearchStatus {
+    pub id: String,
+    pub name: String,
+    pub delivery: Delivery,
+    pub state: BackendPollState,
+    pub group_count: usize,
+    pub warning: Option<String>,
+}
 
 /// Format a sample rate in Hz as kHz, trimming a trailing .0 (44100 -> "44.1", 48000 -> "48").
 fn format_khz(hz: u32) -> String {
@@ -24,7 +43,7 @@ fn estimated_kbps(item: &DownloadableItem) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
-/// The badge text and colour of a file, from the facts its backend reported.
+/// The badge text and Midnight Studio color tokens of a file, from the facts its backend reported.
 fn quality_label(item: &DownloadableItem) -> (String, &'static str) {
     let format = item
         .facts
@@ -59,9 +78,11 @@ fn quality_label(item: &DownloadableItem) -> (String, &'static str) {
     };
 
     let color = match format.as_str() {
-        "flac" | "wav" => "bg-blue-600/30 text-blue-300 border-blue-500/40",
-        "m4a" | "aac" | "ogg" => "bg-green-600/30 text-green-300 border-green-500/40",
-        _ => "bg-gray-600/30 text-gray-300 border-gray-500/40",
+        "flac" | "wav" => "bg-beet-leaf-surface text-beet-leaf-text border-beet-leaf/30",
+        "m4a" | "aac" | "ogg" | "opus" => {
+            "bg-beet-accent-surface text-beet-accent-text border-beet-accent/30"
+        }
+        _ => "bg-beet-surface-high text-beet-text-secondary border-beet-border-default",
     };
     (label, color)
 }
@@ -70,18 +91,42 @@ fn quality_badge(item: &DownloadableItem) -> Element {
     let (label, color) = quality_label(item);
     rsx! {
         span {
-            class: "text-[10px] font-mono px-1.5 py-0.5 rounded border {color} uppercase shrink-0",
+            class: "text-[10px] tabular-nums-mono font-semibold px-1.5 py-0.5 rounded border {color} shrink-0",
             "{label}"
         }
     }
 }
 
-/// The backend a group's files came from, when this build knows it.
-fn backend_of(group: &DownloadableGroup) -> Option<&'static BackendMeta> {
+/// The registry backend ID of a group's items, when non-empty.
+pub fn group_backend_id(group: &DownloadableGroup) -> Option<&str> {
     group
         .items
         .first()
-        .and_then(|i| shared::backends::meta(&i.backend))
+        .map(|i| i.backend.as_str())
+        .filter(|b| !b.is_empty())
+}
+
+/// The backend a group's files came from, when this build knows it.
+fn backend_of(group: &DownloadableGroup) -> Option<&'static BackendMeta> {
+    group_backend_id(group).and_then(shared::backends::meta)
+}
+
+/// Sorts merged multi-backend groups: `Delivery::AsFound` (lossless/original) first
+/// ordered by score descending, then `Delivery::LossyOnly` ordered by score descending.
+pub fn sort_merged_groups(groups: &mut [DownloadableGroup]) {
+    let delivery_rank = |group: &DownloadableGroup| match group_backend_id(group)
+        .map(shared::backends::delivery)
+    {
+        Some(Delivery::LossyOnly) => 1u8,
+        _ => 0u8,
+    };
+    groups.sort_by(|a, b| {
+        delivery_rank(a).cmp(&delivery_rank(b)).then_with(|| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
 }
 
 /// The page of the group's source at its backend, when the backend gave an https one.
@@ -103,6 +148,9 @@ fn is_lossy(meta: Option<&BackendMeta>) -> bool {
 #[derive(Props, PartialEq, Clone)]
 pub struct Props {
     pub results: Vec<DownloadableGroup>,
+    /// Live per-backend polling statuses (for multi-backend filter pills and inline warnings).
+    #[props(default)]
+    pub backend_statuses: Vec<BackendSearchStatus>,
     /// Shown under "No results found": why no source may have answered.
     pub unanswered_note: Option<String>,
     pub is_searching: bool,
@@ -133,7 +181,7 @@ struct TrackItemProps {
 }
 
 fn get_track_id(track: &DownloadableItem) -> String {
-    format!("{}{}", track.id, track.source)
+    format!("{}::{}::{}", track.backend, track.id, track.source)
 }
 
 #[component]
@@ -143,12 +191,12 @@ fn TrackItem(props: TrackItemProps) -> Element {
     rsx! {
         li {
             key: "{unique_id}",
-            class: "flex items-center gap-2 p-1 rounded-md hover:bg-white/10 cursor-pointer",
+            class: "flex items-center gap-2.5 px-2 py-1.5 rounded-[8px] hover:bg-beet-surface-high cursor-pointer transition-colors",
             onclick: move |_| props.on_toggle.call(unique_id.clone()),
 
             Checkbox { is_selected: props.is_selected }
 
-            label { class: "cursor-pointer text-gray-300 font-mono text-sm flex-1 min-w-0 truncate",
+            label { class: "cursor-pointer text-beet-text-primary text-[13px] flex-1 min-w-0 truncate",
                 "{props.track.title}"
             }
 
@@ -164,9 +212,9 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     let mut is_expanded = use_signal(|| props.starts_expanded);
 
     rsx! {
+        // Keep `rounded-md` on the group card container for stable E2E group selection.
         div {
-            key: "{album.group_id}",
-            class: "bg-white/5 border border-white/5 p-3 sm:p-4 rounded-md",
+            class: "bg-beet-surface-low border border-beet-border-subtle hover:border-beet-border-default p-3.5 sm:p-4 rounded-md transition-colors",
 
             // Clickable header for expand/collapse
             div {
@@ -174,31 +222,38 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                 onclick: move |_| is_expanded.toggle(),
 
                 div { class: "flex-grow min-w-0",
-                    if props.is_best {
-                        span {
-                            class: "inline-block mb-2 text-[10px] font-mono px-1.5 py-0.5 rounded border bg-beet-accent/20 text-beet-accent border-beet-accent/40 uppercase",
-                            "Best match"
+                    div { class: "flex flex-wrap items-center gap-1.5 mb-2",
+                        if props.is_best {
+                            span {
+                                class: "text-[10px] tabular-nums-mono font-semibold px-2 py-0.5 rounded-full border bg-beet-accent-surface text-beet-accent-text border-beet-accent/40",
+                                "Best match"
+                            }
+                        }
+                        if let Some(meta) = props.backend {
+                            span {
+                                class: "text-[10px] tabular-nums-mono font-semibold px-2 py-0.5 rounded-full border bg-beet-surface-high text-beet-text-secondary border-beet-border-default",
+                                "{meta.name}"
+                            }
+                            LossyChip { meta }
                         }
                     }
-                    if let Some(meta) = props.backend {
-                        LossyChip { meta }
+                    h4 { class: "text-[15px] leading-snug font-semibold text-beet-leaf-text break-words",
+                        "{album.title}"
                     }
-                    h4 { class: "text-base leading-snug font-bold text-beet-leaf break-words", "{album.title}" }
                     if let Some(artist) = album.artist.as_ref().filter(|a| !a.is_empty()) {
-                        p { class: "mt-1 text-sm text-gray-300 font-mono break-words", "{artist}" }
+                        p { class: "mt-0.5 text-[13px] text-beet-text-secondary break-words", "{artist}" }
                     }
-                    p { class: "mt-1 text-xs text-gray-400 font-mono uppercase tracking-wide",
+                    p { class: "mt-1 text-[11px] text-beet-text-tertiary tabular-nums-mono uppercase tracking-wide",
                         "{album.quality} · Score {album.score:.2}"
                     }
-                    if let Some(meta) = props.backend.filter(|m| m.id != DEFAULT_ID) {
-                        p { class: "mt-1 text-xs text-gray-300 font-mono", "{meta.name}" }
-                    }
                     if let Some(attribution) = props.backend.and_then(|m| m.attribution) {
-                        p { class: "mt-1 text-xs text-gray-400 font-mono break-words", "{attribution}" }
+                        p { class: "mt-1 text-[11px] text-beet-text-tertiary tabular-nums-mono break-words",
+                            "{attribution}"
+                        }
                     }
                     if let Some(url) = source_page {
                         a {
-                            class: "mt-1 inline-block text-xs font-mono text-gray-300 hover:text-white underline decoration-dotted",
+                            class: "mt-1 inline-block text-[12px] text-beet-leaf-text hover:underline decoration-dotted",
                             href: "{url}",
                             target: "_blank",
                             rel: "noopener noreferrer",
@@ -211,7 +266,11 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
                 // Expand/collapse chevron
                 svg {
                     class: "w-4 h-4 transition-transform duration-200 shrink-0",
-                    class: if *is_expanded.read() { "rotate-90 text-gray-400" } else { "text-gray-600" },
+                    class: if *is_expanded.read() {
+                        "rotate-90 text-beet-text-secondary"
+                    } else {
+                        "text-beet-text-tertiary"
+                    },
                     fill: "none",
                     stroke: "currentColor",
                     stroke_width: "2",
@@ -227,7 +286,8 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
             // Track list and Select All only visible when expanded
             if *is_expanded.read() {
                 button {
-                    class: "font-mono uppercase text-[10px] whitespace-nowrap tracking-widest px-3 py-1 mt-4 mb-2 border border-beet-leaf/30 text-beet-leaf hover:bg-beet-leaf hover:text-beet-dark transition-colors cursor-pointer rounded",
+                    r#type: "button",
+                    class: "tabular-nums-mono uppercase text-[10px] whitespace-nowrap tracking-wider font-semibold px-3 py-1.5 mt-3 mb-2 border border-beet-leaf/30 text-beet-leaf-text hover:bg-beet-leaf-solid hover:text-beet-leaf-ink transition-colors cursor-pointer rounded-[8px]",
                     onclick: move |_| props.on_album_select_all.call(album.clone()),
                     "Select All"
                 }
@@ -256,12 +316,37 @@ fn GroupList(
     on_track_toggle: EventHandler<String>,
 ) -> Element {
     let first_lossy = backends.iter().position(|b| is_lossy(*b));
+    let lossy_header_meta = first_lossy.and_then(|idx| backends.get(idx).copied().flatten());
+    let mut head: Vec<(usize, DownloadableGroup, Option<&'static BackendMeta>)> = groups
+        .into_iter()
+        .zip(backends)
+        .enumerate()
+        .map(|(idx, (album, backend))| (idx, album, backend))
+        .collect();
+    let split_at = first_lossy.unwrap_or(head.len());
+    let tail = head.split_off(split_at);
+
     rsx! {
-        for (idx, (album, backend)) in groups.into_iter().zip(backends).enumerate() {
-            if let Some(meta) = backend.filter(|_| Some(idx) == first_lossy) {
-                h4 { class: "pt-2 text-sm font-mono text-amber-300", "Lossy, from {meta.name}" }
-            }
+        for (idx, album, backend) in head {
             AlbumResultItem {
+                key: "{album.group_id}-{album.source}",
+                backend,
+                album,
+                selected_tracks,
+                on_album_select_all,
+                on_track_toggle,
+                is_best: idx == 0,
+                starts_expanded: idx == 0,
+            }
+        }
+        if let Some(meta) = lossy_header_meta {
+            h4 { class: "pt-2 text-[13px] tabular-nums-mono font-semibold text-beet-gold",
+                "Lossy, from {meta.name}"
+            }
+        }
+        for (idx, album, backend) in tail {
+            AlbumResultItem {
+                key: "{album.group_id}-{album.source}",
                 backend,
                 album,
                 selected_tracks,
@@ -274,13 +359,52 @@ fn GroupList(
     }
 }
 
-/// Main component responsible for displaying all download options.
+/// Builds the list of backend filter entries (id, display name, group count, live state)
+/// from explicit `backend_statuses` when present, or inferred from `results`.
+fn backend_filter_entries(
+    results: &[DownloadableGroup],
+    statuses: &[BackendSearchStatus],
+) -> Vec<(String, String, usize, BackendPollState)> {
+    if !statuses.is_empty() {
+        return statuses
+            .iter()
+            .map(|st| {
+                let count = results
+                    .iter()
+                    .filter(|g| group_backend_id(g) == Some(st.id.as_str()))
+                    .count();
+                (st.id.clone(), st.name.clone(), count, st.state)
+            })
+            .collect();
+    }
+
+    let mut entries: Vec<(String, String, usize, BackendPollState)> = Vec::new();
+    for group in results {
+        let Some(id) = group_backend_id(group) else {
+            continue;
+        };
+        if let Some(entry) = entries.iter_mut().find(|(eid, _, _, _)| eid == id) {
+            entry.2 += 1;
+        } else {
+            entries.push((
+                id.to_string(),
+                shared::backends::name(id).to_string(),
+                1,
+                BackendPollState::Done,
+            ));
+        }
+    }
+    entries
+}
+
+/// Main component responsible for displaying multi-backend manual download options.
 #[component]
 pub fn DownloadResults(props: Props) -> Element {
     let mut selected_tracks = use_signal(HashSet::<String>::new);
+    let mut active_backend_filter = use_signal(|| None::<String>);
     let results = props.results.clone();
     let mut folders = use_signal(std::vec::Vec::new);
-    let mut selected_folder = use_signal(|| "".to_string());
+    let mut selected_folder = use_signal(String::new);
     let mut is_downloading = props.is_downloading;
     let auth = use_auth();
 
@@ -290,7 +414,6 @@ pub fn DownloadResults(props: Props) -> Element {
 
             // Only select if the user has exactly one folder
             // It could be error prone to auto-select if there are multiple folders
-            // (I failed multiple times because of this)
             if user_folders.len() == 1 {
                 selected_folder.set(user_folders[0].path.clone());
             }
@@ -355,15 +478,35 @@ pub fn DownloadResults(props: Props) -> Element {
             .call((items_to_download, selected_folder()));
     };
 
+    let filter_entries = backend_filter_entries(&results, &props.backend_statuses);
+    let show_backend_filters = filter_entries.len() > 1;
+    let active_filter = active_backend_filter();
+    let visible_results: Vec<DownloadableGroup> = match active_filter.as_deref() {
+        Some(bid) => results
+            .iter()
+            .filter(|g| group_backend_id(g) == Some(bid))
+            .cloned()
+            .collect(),
+        None => results.clone(),
+    };
+    let warnings: Vec<(&str, &str)> = props
+        .backend_statuses
+        .iter()
+        .filter_map(|st| st.warning.as_deref().map(|w| (st.name.as_str(), w)))
+        .collect();
+    let selected_count = selected_tracks.read().len();
+
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 text-white p-4 sm:p-8 rounded-lg shadow-2xl w-full max-w-2xl mx-auto my-10 font-display relative",
-            div { class: "relative mb-6",
+        div { class: "bg-beet-surface border border-beet-border-subtle text-beet-text-primary p-4 sm:p-6 rounded-[16px] w-full max-w-3xl mx-auto font-display relative space-y-5",
+            // Header
+            div { class: "relative flex items-center justify-center min-h-[40px]",
                 button {
-                    class: "absolute left-0 top-1/2 -translate-y-1/2 p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer",
+                    r#type: "button",
+                    class: "absolute left-0 top-1/2 -translate-y-1/2 p-2 rounded-full hover:bg-beet-surface-high text-beet-text-secondary hover:text-beet-text-primary transition-colors cursor-pointer",
                     aria_label: "Back",
                     onclick: move |_| props.on_back.call(()),
                     svg {
-                        class: "w-5 h-5 text-gray-400",
+                        class: "w-5 h-5",
                         fill: "none",
                         stroke: "currentColor",
                         view_box: "0 0 24 24",
@@ -375,17 +518,89 @@ pub fn DownloadResults(props: Props) -> Element {
                         }
                     }
                 }
-                h3 { class: "text-2xl font-bold text-center text-beet-accent", "Download Options" }
+                h3 { class: "text-[20px] font-bold text-center text-beet-text-primary",
+                    "Download Options"
+                }
             }
-            div { class: "mb-4",
+
+            // Dynamic Backend Filter Pills (when >1 backend is enabled/present)
+            if show_backend_filters {
+                div { class: "flex flex-wrap items-center gap-2",
+                    {
+                        let all_active = active_filter.is_none();
+                        let all_cls = if all_active {
+                            "bg-beet-accent-surface border-beet-accent/40 text-beet-accent-text"
+                        } else {
+                            "bg-beet-surface-high border-beet-border-subtle text-beet-text-secondary hover:text-beet-text-primary"
+                        };
+                        rsx! {
+                            button {
+                                r#type: "button",
+                                class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[12px] font-medium transition-colors cursor-pointer {all_cls}",
+                                onclick: move |_| active_backend_filter.set(None),
+                                "All Sources ({results.len()})"
+                            }
+                        }
+                    }
+                    for (bid, name, count, state) in filter_entries.iter() {
+                        {
+                            let bid_click = bid.clone();
+                            let is_active = active_filter.as_deref() == Some(bid.as_str());
+                            let pill_cls = if is_active {
+                                "bg-beet-accent-surface border-beet-accent/40 text-beet-accent-text"
+                            } else {
+                                "bg-beet-surface-high border-beet-border-subtle text-beet-text-secondary hover:text-beet-text-primary"
+                            };
+                            rsx! {
+                                button {
+                                    key: "backend-filter-{bid}",
+                                    r#type: "button",
+                                    class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full border text-[12px] font-medium transition-colors cursor-pointer {pill_cls}",
+                                    onclick: move |_| active_backend_filter.set(Some(bid_click.clone())),
+                                    if *state == BackendPollState::Searching {
+                                        span {
+                                            class: "size-2.5 rounded-full border-[1.5px] border-beet-border-default border-t-beet-leaf-text animate-spin shrink-0",
+                                            aria_hidden: "true",
+                                        }
+                                    } else if *state == BackendPollState::Failed {
+                                        span {
+                                            class: "size-1.5 rounded-full bg-beet-gold shrink-0",
+                                            aria_hidden: "true",
+                                        }
+                                    }
+                                    span { "{name} ({count})" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Non-fatal per-backend warning pills
+            if !warnings.is_empty() {
+                div { class: "space-y-1.5",
+                    for (name, msg) in warnings {
+                        div {
+                            key: "warn-{name}",
+                            class: "rounded-[10px] bg-beet-gold-surface border border-beet-gold/30 px-3 py-2 text-[12px] text-beet-gold",
+                            span { class: "font-semibold", "{name}: " }
+                            span { "{msg}" }
+                        }
+                    }
+                }
+            }
+
+            // Target folder selector
+            div {
                 label {
                     r#for: "dl_folder",
-                    class: "block text-sm font-medium mb-1 text-gray-400 font-mono",
+                    class: "block text-[12px] font-medium mb-1.5 text-beet-text-secondary",
                     "Select Target Folder"
                 }
                 select {
+                    id: "dl_folder",
                     name: "dl_folder",
-                    class: FIELD_CLASS,
+                    class: "w-full h-10 px-3 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-border-strong text-[13px] text-beet-text-primary outline-none transition-colors",
                     value: "{selected_folder}",
                     onchange: move |e| selected_folder.set(e.value()),
                     option { value: "", disabled: true, "Select a folder" }
@@ -395,42 +610,50 @@ pub fn DownloadResults(props: Props) -> Element {
                 }
             }
 
-            div { class: "space-y-4",
+            // Live search status & candidate groups
+            div { class: "space-y-3",
                 if props.is_searching {
-                    div { class: "flex flex-col items-center justify-center p-4 bg-white/5 rounded-lg",
-                        div { class: "animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-beet-accent mb-2" }
-                        p { class: "text-sm text-gray-300 animate-pulse text-center font-mono",
-                            "Searching... The rarer your track is, the longer the search can take."
+                    div { class: "relative overflow-hidden flex flex-col items-center justify-center p-4 bg-beet-surface-low border border-beet-border-subtle rounded-[12px] gap-2",
+                        div { class: "size-6 animate-spin rounded-full border-2 border-beet-border-default border-t-beet-leaf-text" }
+                        p { class: "text-[13px] text-beet-text-secondary text-center",
+                            "Searching enabled sources… Results appear as each backend responds."
+                        }
+                        span {
+                            class: "beet-seam-light absolute inset-x-0 bottom-0",
+                            aria_hidden: "true",
                         }
                     }
-                } else if results.is_empty() {
-                    div { class: "text-center text-gray-500 py-8 font-mono",
+                } else if visible_results.is_empty() {
+                    div { class: "text-center text-beet-text-tertiary py-8 text-[13px]",
                         p { "No results found" }
                         if let Some(note) = &props.unanswered_note {
-                            p { class: "text-sm mt-2", "{note}" }
+                            p { class: "text-[12px] mt-2 tabular-nums-mono", "{note}" }
                         }
                     }
                 }
                 GroupList {
-                    backends: results.iter().map(backend_of).collect::<Vec<_>>(),
-                    groups: results.clone(),
+                    backends: visible_results.iter().map(backend_of).collect::<Vec<_>>(),
+                    groups: visible_results,
                     selected_tracks,
                     on_album_select_all: handle_album_select_all,
                     on_track_toggle: handle_track_toggle,
                 }
             }
+
+            // Floating Studio "Start download" button (positioned above the 84px Studio player bar)
             div { class: "fixed bottom-28 md:bottom-24 right-6 z-40",
                 button {
-                    class: "bg-beet-accent hover:bg-fuchsia-400 text-white font-bold p-4 rounded-full shadow-[0_0_15px_rgba(255,0,255,0.5)] transition-transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center cursor-pointer",
+                    r#type: "button",
+                    class: "inline-flex items-center justify-center gap-2 h-12 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-[14px] shadow-lg hover:brightness-105 transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer",
                     aria_label: "Start download",
-                    disabled: selected_tracks.read().is_empty() || selected_folder.read().is_empty() || *is_downloading.read(),
+                    disabled: selected_count == 0 || selected_folder.read().is_empty() || *is_downloading.read(),
                     onclick: handle_download,
                     if *is_downloading.read() {
-                        // Show spinner when downloading
-                        div { class: "animate-spin rounded-full h-6 w-6 border-t-2 border-b-2 border-white" }
+                        div { class: "animate-spin rounded-full h-5 w-5 border-2 border-beet-leaf-ink/30 border-t-beet-leaf-ink" }
+                        span { "Starting…" }
                     } else {
                         svg {
-                            class: "w-6 h-6",
+                            class: "w-5 h-5",
                             fill: "none",
                             stroke: "currentColor",
                             view_box: "0 0 24 24",
@@ -440,6 +663,11 @@ pub fn DownloadResults(props: Props) -> Element {
                                 stroke_width: "2",
                                 d: "M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4",
                             }
+                        }
+                        if selected_count > 0 {
+                            span { "Download ({selected_count})" }
+                        } else {
+                            span { "Start download" }
                         }
                     }
                 }
@@ -451,7 +679,7 @@ pub fn DownloadResults(props: Props) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::backends::{Switch, SLSKD};
+    use shared::backends::{Switch, ARCHIVE, SLSKD};
     use shared::download::FileFacts;
 
     static GD: BackendMeta = BackendMeta {
@@ -563,20 +791,24 @@ mod tests {
     }
 
     fn group(backend: &str, url: Option<&str>) -> DownloadableGroup {
+        group_scored(backend, url, 0.9)
+    }
+
+    fn group_scored(backend: &str, url: Option<&str>, score: f64) -> DownloadableGroup {
         let mut facts = facts("flac");
         if let Some(url) = url {
             facts.backend_facts.insert("item_url".into(), url.into());
         }
         DownloadableGroup {
             source: format!("{backend}-source"),
-            group_id: format!("{backend}/group"),
+            group_id: format!("{backend}/group-{score}"),
             title: format!("Come Over from {backend}"),
             artist: Some("Kowloon".into()),
             item_count: 1,
             total_size: 1,
             items: vec![item(backend, facts)],
             quality: "flac".into(),
-            score: 0.9,
+            score,
         }
     }
 
@@ -604,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn a_group_of_another_backend_names_it_and_its_source_page() {
+    fn every_known_backend_shows_its_badge_and_source_page_when_https() {
         let html = render(
             vec![
                 group("slskd", None),
@@ -613,9 +845,8 @@ mod tests {
             ],
             vec![Some(&SLSKD), Some(&GD), None],
         );
-        let slskd = &html[..html.find("Come Over from gdstudio").unwrap()];
-        assert!(!slskd.contains("Soulseek"), "{slskd}");
-        assert!(html.contains(">NetEase (GD Studio)</p>"), "{html}");
+        assert!(html.contains(">Soulseek</span>"), "{html}");
+        assert!(html.contains(">NetEase (GD Studio)</span>"), "{html}");
         assert!(
             html.contains(">NetEase via GD音乐台 (music.gdstudio.xyz)</p>"),
             "{html}"
@@ -648,5 +879,74 @@ mod tests {
         let heading = html.find("Lossy, from YouTube Music").unwrap();
         assert!(html.find("Come Over from slskd").unwrap() < heading);
         assert!(heading < html.find("Come Over from ytdlp").unwrap());
+    }
+
+    #[test]
+    fn sort_merged_groups_places_as_found_before_lossy_by_score_desc() {
+        let mut groups = vec![
+            group_scored("ytdlp", None, 0.99),
+            group_scored("archive", None, 0.72),
+            group_scored("slskd", None, 0.91),
+            group_scored("ytdlp", None, 0.65),
+        ];
+        sort_merged_groups(&mut groups);
+        let order: Vec<(&str, f64)> = groups
+            .iter()
+            .map(|g| (group_backend_id(g).unwrap_or(""), g.score))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("slskd", 0.91),
+                ("archive", 0.72),
+                ("ytdlp", 0.99),
+                ("ytdlp", 0.65),
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_filter_entries_preserve_status_order_and_counts() {
+        let groups = vec![
+            group_scored("slskd", None, 0.9),
+            group_scored("archive", None, 0.8),
+            group_scored("archive", None, 0.7),
+        ];
+        let statuses = vec![
+            BackendSearchStatus {
+                id: SLSKD.id.into(),
+                name: SLSKD.name.into(),
+                delivery: SLSKD.delivery,
+                state: BackendPollState::Searching,
+                group_count: 1,
+                warning: None,
+            },
+            BackendSearchStatus {
+                id: ARCHIVE.id.into(),
+                name: ARCHIVE.name.into(),
+                delivery: ARCHIVE.delivery,
+                state: BackendPollState::Done,
+                group_count: 2,
+                warning: None,
+            },
+        ];
+        let entries = backend_filter_entries(&groups, &statuses);
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "slskd".to_string(),
+                    "Soulseek".to_string(),
+                    1,
+                    BackendPollState::Searching
+                ),
+                (
+                    "archive".to_string(),
+                    "Internet Archive".to_string(),
+                    2,
+                    BackendPollState::Done
+                ),
+            ]
+        );
     }
 }

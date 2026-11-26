@@ -9,7 +9,7 @@ use shared::system::DownloaderHealth;
 
 use super::connection_status_row::StatusLine;
 use super::direct_connect::DirectConnectSettings;
-use super::panel::LoadError;
+use super::panel::{LoadError, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS};
 use super::toggle::{save_switch, Toggle};
 use crate::{friendly_error, use_auth, use_system_health};
 
@@ -48,7 +48,7 @@ pub(super) fn BackendSwitches() -> Element {
         Some(Ok(switches)) => switches.clone(),
     };
     rsx! {
-        div { class: "mt-6 pt-6 border-t border-white/10 space-y-6",
+        div { class: "mt-6 pt-6 border-t border-beet-border-subtle space-y-4",
             for meta in switchable {
                 BackendSwitchRow {
                     key: "{meta.id}",
@@ -78,12 +78,12 @@ fn BackendSwitchRow(
     let store = move |value: bool| save.call((id.to_string(), value));
 
     rsx! {
-        div { class: "space-y-2",
+        div { class: "p-4 rounded-[12px] bg-beet-surface border border-beet-border-subtle space-y-2.5",
             div { class: "flex items-center justify-between gap-3",
-                h3 { class: "text-sm font-semibold text-white", "{meta.name}" }
+                h3 { class: "text-sm font-semibold text-beet-text-primary", "{meta.name}" }
                 Toggle {
                     on: on(),
-                    on_class: "bg-beet-leaf",
+                    on_class: "bg-beet-leaf-solid",
                     onclick: move |_| {
                         if on() {
                             confirming.set(false);
@@ -95,11 +95,11 @@ fn BackendSwitchRow(
                 }
             }
             for line in meta.about {
-                p { class: "text-xs text-gray-400 font-mono", "{line}" }
+                p { class: "text-xs text-beet-text-secondary leading-relaxed", "{line}" }
             }
             if let Some((text, url)) = meta.link {
                 a {
-                    class: "text-xs font-mono text-gray-300 hover:text-white underline decoration-dotted",
+                    class: "inline-block text-xs font-medium text-beet-leaf-text hover:text-beet-text-primary underline decoration-dotted underline-offset-4 transition-colors",
                     href: "{url}",
                     target: "_blank",
                     rel: "noopener noreferrer",
@@ -107,9 +107,9 @@ fn BackendSwitchRow(
                 }
             }
             if confirming() {
-                div { class: "flex flex-wrap items-center gap-3",
+                div { class: "flex flex-wrap items-center gap-2.5 pt-1",
                     button {
-                        class: "retro-btn rounded",
+                        class: PRIMARY_BUTTON_CLASS,
                         onclick: move |_| {
                             confirming.set(false);
                             spawn(save_switch(on, error, store));
@@ -117,14 +117,14 @@ fn BackendSwitchRow(
                         "Turn on {meta.name}"
                     }
                     button {
-                        class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
+                        class: SECONDARY_BUTTON_CLASS,
                         onclick: move |_| confirming.set(false),
                         "Cancel"
                     }
                 }
             }
             if !error().is_empty() {
-                p { class: "text-xs text-red-400 font-mono", "{error}" }
+                p { class: "text-xs text-beet-crimson-text", "{error}" }
             }
             if on() {
                 {status_line(health.as_ref())}
@@ -147,10 +147,10 @@ fn extra_settings(id: &str) -> Option<Element> {
 /// Whether the backend can take work: what the last health check said, or that it is checked.
 fn status_line(health: Option<&DownloaderHealth>) -> Element {
     let (dot, summary) = match health {
-        None => ("bg-gray-500 animate-pulse", "Checking...".to_string()),
-        Some(h) if h.online => ("bg-beet-leaf", "Online".to_string()),
+        None => ("bg-beet-text-tertiary animate-pulse", "Checking...".to_string()),
+        Some(h) if h.online => ("bg-beet-leaf-solid", "Online".to_string()),
         Some(h) => (
-            "bg-red-500",
+            "bg-beet-crimson-text",
             h.failure
                 .as_ref()
                 .map_or_else(|| "Offline".to_string(), |f| f.message.clone()),
@@ -257,7 +257,7 @@ mod tests {
         crate::click(&mut dom, buttons[0]);
         let html = dioxus_ssr::render(&dom);
         assert_eq!(*asked.borrow(), vec![true]);
-        assert!(html.contains("bg-beet-leaf"), "{html}");
+        assert!(html.contains("bg-beet-leaf-solid"), "{html}");
         assert!(!html.contains("Turn on Internet Archive"), "{html}");
         assert!(html.contains(">Online</span>"), "{html}");
     }
@@ -271,7 +271,7 @@ mod tests {
         let html = dioxus_ssr::render(&dom);
         assert!(asked.borrow().is_empty());
         assert!(!html.contains("Turn on Internet Archive"), "{html}");
-        assert!(html.contains("bg-gray-600"), "{html}");
+        assert!(html.contains("bg-beet-surface-highest"), "{html}");
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod tests {
         assert!(shown.is_empty(), "no question before turning off");
         let html = dioxus_ssr::render(&dom);
         assert_eq!(*asked.borrow(), vec![false]);
-        assert!(html.contains("bg-beet-leaf"), "{html}");
+        assert!(html.contains("bg-beet-leaf-solid"), "{html}");
         assert!(html.contains("Only an admin can do this"), "{html}");
     }
 }

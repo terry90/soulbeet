@@ -4,7 +4,7 @@ use ui::settings::{
     AccountPanel, AppConfigManager, ConnectedAppsPanel, ConnectionStatusPanel, DeletionChecksPanel,
     FolderAdminPanel, FolderManager, RemoteAccessPanel, SecurityStatusPanel, UserManager,
 };
-use ui::{BackgroundGlows, GlowColor, GlowSpread};
+use ui::{IconLibrary, IconSlidersHorizontal};
 
 #[derive(PartialEq, Clone, Copy, Default)]
 pub(crate) enum SettingsTab {
@@ -56,42 +56,45 @@ pub fn SettingsPage() -> Element {
     });
 
     rsx! {
-        BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Tight }
-
-        div { class: "space-y-6 text-white w-full max-w-3xl z-10 mx-auto",
-            div { class: "text-center mb-6",
-                h1 { class: "text-4xl font-bold text-beet-accent mb-2 font-display",
+        div { class: "w-full max-w-4xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6 text-beet-text-primary",
+            header { class: "space-y-1.5",
+                h1 { class: "text-[24px] font-semibold tracking-tight text-beet-text-primary leading-tight",
                     "Settings"
+                }
+                p { class: "text-[13px] text-beet-text-secondary",
+                    "Manage library folders, accounts, download backends, and server connections."
                 }
             }
 
-            // Tab navigation - pill style matching navbar
-            nav { class: "flex items-center justify-center gap-1 bg-beet-panel/50 p-1.5 rounded-full border border-white/5 backdrop-blur-sm w-fit mx-auto",
+            // Segmented Studio tab strip
+            nav {
+                aria_label: "Settings sections",
+                class: "inline-flex items-center gap-1 p-1 rounded-[12px] bg-beet-surface-low border border-beet-border-subtle max-w-full overflow-x-auto no-scrollbar",
                 TabButton {
                     label: "Library",
-                    icon_path: "M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z",
+                    tab: SettingsTab::Library,
                     active: active_tab() == SettingsTab::Library,
                     onclick: move |_| active_tab.set(SettingsTab::Library),
                 }
                 TabButton {
                     label: "Users",
-                    icon_path: "M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z",
+                    tab: SettingsTab::Users,
                     active: active_tab() == SettingsTab::Users,
                     onclick: move |_| active_tab.set(SettingsTab::Users),
                 }
                 TabButton {
                     label: "Config",
-                    icon_path: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z",
+                    tab: SettingsTab::Config,
                     active: active_tab() == SettingsTab::Config,
                     onclick: move |_| active_tab.set(SettingsTab::Config),
                 }
             }
 
             // Tab content
-            div { class: "pt-8",
+            div { class: "pt-2",
                 match active_tab() {
                     SettingsTab::Library => rsx! {
-                        div { class: "space-y-8",
+                        div { class: "space-y-6",
                             FolderManager {}
                             DeletionChecksPanel {}
                             if auth.is_admin() {
@@ -100,7 +103,7 @@ pub fn SettingsPage() -> Element {
                         }
                     },
                     SettingsTab::Users => rsx! {
-                        div { class: "space-y-8",
+                        div { class: "space-y-6",
                             AccountPanel { sso_notice }
                             ConnectedAppsPanel {}
                             if auth.is_admin() {
@@ -109,7 +112,7 @@ pub fn SettingsPage() -> Element {
                         }
                     },
                     SettingsTab::Config => rsx! {
-                        div { class: "space-y-8",
+                        div { class: "space-y-6",
                             if auth.is_admin() {
                                 AppConfigManager {}
                                 SecurityStatusPanel {}
@@ -127,31 +130,51 @@ pub fn SettingsPage() -> Element {
 #[component]
 fn TabButton(
     label: &'static str,
-    icon_path: &'static str,
+    tab: SettingsTab,
     active: bool,
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
-    let class = if active {
-        "flex items-center gap-2 px-4 py-2 rounded-full bg-white/10 text-white text-sm font-medium transition-all cursor-pointer"
+    let state_class = if active {
+        "bg-beet-surface-high text-beet-text-primary border-beet-border-default"
     } else {
-        "flex items-center gap-2 px-4 py-2 rounded-full text-gray-400 text-sm font-medium hover:text-white hover:bg-white/5 transition-all cursor-pointer"
+        "text-beet-text-secondary border-transparent hover:text-beet-text-primary hover:bg-beet-surface/60"
     };
 
     rsx! {
         button {
-            class,
+            r#type: "button",
+            aria_current: active.then_some("page"),
+            class: "inline-flex items-center gap-2 h-9 px-3.5 rounded-[8px] border text-[13px] font-medium transition-colors cursor-pointer shrink-0 {state_class}",
             onclick: move |e| onclick.call(e),
-            svg {
-                class: "w-4 h-4",
-                fill: "none",
-                stroke: "currentColor",
-                stroke_width: "2",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                view_box: "0 0 24 24",
-                path { d: icon_path }
+            match tab {
+                SettingsTab::Library => rsx! { IconLibrary { size: 15 } },
+                SettingsTab::Users => rsx! { IconUsers { size: 15 } },
+                SettingsTab::Config => rsx! { IconSlidersHorizontal { size: 15 } },
             }
             span { "{label}" }
+        }
+    }
+}
+
+/// Crisp Lucide `users` icon matching `ui::icons` geometry (`1.75` stroke).
+#[component]
+fn IconUsers(#[props(default = 15)] size: u32) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0",
+            path { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }
+            circle { cx: "9", cy: "7", r: "4" }
+            path { d: "M22 21v-2a4 4 0 0 0-3-3.87" }
+            path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
         }
     }
 }

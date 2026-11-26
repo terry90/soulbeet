@@ -791,12 +791,14 @@ class SoulbeetApiClient(
         private fun defaultMixCopy(slug: String, i18nKey: String, country: String?): Pair<String, String> =
             when {
                 slug.contains("noel") || slug.contains("christmas") || i18nKey.contains("winter_holiday") -> {
-                    val title = if (country.equals("FR", ignoreCase = true)) {
-                        "Noël à la Française"
-                    } else {
-                        "Winter Holiday Mix"
+                    val title = when (country?.uppercase()) {
+                        "FR" -> "Noël à la Française"
+                        "DE", "AT", "CH" -> "Weihnachten Mix"
+                        "ES", "MX" -> "Navidad Mix"
+                        "IT" -> "Natale Mix"
+                        else -> "Christmas Mix"
                     }
-                    title to "Seasonal pack · excluded from core taste until kept"
+                    title to "Christmas favorites · excluded from core taste until kept"
                 }
                 slug == "comfort" || i18nKey.contains("comfort") ->
                     "Comfort Mix" to "Your highest-rated favorites & warm repeats"

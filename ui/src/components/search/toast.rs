@@ -41,17 +41,15 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
     let toast_id = toast.id.clone();
     let toast_id_pick = toast.id.clone();
     let message = fallback_message(&toast.track_name, &toast.reason);
-    let choices = SourceChoices {
-        search_id: toast.search_id.clone(),
-        groups: toast.results.clone(),
-        unanswered_note: None,
-    };
+    let choices = SourceChoices::single(toast.search_id.clone(), toast.results.clone(), None);
 
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 rounded-lg shadow-2xl p-4 relative",
+        div { class: "bg-beet-surface-high border border-beet-border-default rounded-[12px] shadow-xl p-4 relative",
             // Close button
             button {
-                class: "absolute top-2 right-2 text-gray-500 hover:text-white cursor-pointer p-1",
+                r#type: "button",
+                aria_label: "Dismiss notice",
+                class: "absolute top-2.5 right-2.5 text-beet-text-tertiary hover:text-beet-text-primary transition-colors cursor-pointer p-1 rounded-[6px]",
                 onclick: move |_| {
                     on_dismiss.call(toast_id.clone());
                 },
@@ -59,7 +57,7 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
                     class: "w-4 h-4",
                     fill: "none",
                     stroke: "currentColor",
-                    stroke_width: "2",
+                    stroke_width: "1.75",
                     view_box: "0 0 24 24",
                     path {
                         stroke_linecap: "round",
@@ -70,13 +68,13 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
             }
 
             // Line 1: fallback message
-            p { class: "text-sm text-gray-300 font-mono pr-6",
+            p { class: "text-[13px] text-beet-text-primary pr-6 leading-snug",
                 "{message}"
             }
 
             // Line 2: pick source link
             p {
-                class: "text-xs text-beet-leaf font-mono cursor-pointer hover:underline mt-1",
+                class: "text-[12px] text-beet-leaf-text font-medium cursor-pointer hover:underline mt-1.5",
                 onclick: move |_| {
                     on_pick_source.call(choices.clone());
                     on_dismiss.call(toast_id_pick.clone());

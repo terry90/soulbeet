@@ -2,6 +2,8 @@
 //! scrubber, context-aware curation (Discovery vs Permanent Library), Connect device switcher,
 //! volume control, and right-drawer toggles.
 
+use std::rc::Rc;
+
 use dioxus::prelude::*;
 use shared::client::{ConnectDevice, DevicePlatform};
 
@@ -15,83 +17,427 @@ use crate::{
 
 use super::DrawerTab;
 
+/// Computes the hovered percentage (`0.0..=100.0`) from a local horizontal offset and track width.
+fn compute_hover_pct(offset_x: f64, width: f64) -> Option<f64> {
+    if !offset_x.is_finite() || !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    Some(((offset_x / width).clamp(0.0, 1.0)) * 100.0)
+}
+
+/// Clamps floating tooltip horizontal anchor percentage so it never clips past the track edges.
+fn clamp_tooltip_left_pct(pct: f64) -> f64 {
+    if !pct.is_finite() {
+        return 6.0;
+    }
+    pct.clamp(6.0, 94.0)
+}
+
+/// Computes normalized playback progress (`0.0..=100.0`) for a given position and duration.
+fn compute_progress_pct(pos: f64, dur: f64) -> f64 {
+    if !pos.is_finite() || !dur.is_finite() || dur <= 0.0 {
+        return 0.0;
+    }
+    ((pos.clamp(0.0, dur) / dur) * 100.0).clamp(0.0, 100.0)
+}
+
+/// Formats the preview timestamp for a hovered percentage along a track of `duration` seconds.
+fn format_hover_timestamp(duration: f64, hover_pct: f64) -> String {
+    if !duration.is_finite() || duration <= 0.0 || !hover_pct.is_finite() {
+        return format_duration(0);
+    }
+    let frac = (hover_pct.clamp(0.0, 100.0)) / 100.0;
+    let secs = (duration * frac).clamp(0.0, duration);
+    format_duration(secs.floor() as u32)
+}
+
+/// Computes the integer volume percentage (`0..=100`), accounting for mute state and non-finite inputs.
+fn compute_volume_pct(volume: f32, muted: bool) -> u32 {
+    if muted || !volume.is_finite() {
+        return 0;
+    }
+    (volume.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
 /// Isolated playback scrubber reading `player.position_signal()` and `player.duration_signal()`
 /// so 4–10Hz audio time updates ONLY re-render this compact scrubber and never the rest of the
 /// player bar or studio shell.
 #[component]
 fn PlayerScrubber(
+    track_id: Option<String>,
     has_track: bool,
     codec_badge: Option<String>,
     #[props(default)] full_width: bool,
 ) -> Element {
     let player = use_player();
+    let mut track_el = use_signal(|| None::<Rc<MountedData>>);
+    let mut track_rect = use_signal(|| (0.0f64, 0.0f64));
+    let mut is_hovered = use_signal(|| false);
+    let mut hover_pct = use_signal(|| None::<f64>);
+    let mut drag_secs = use_signal(|| None::<f64>);
+
+    use_effect(use_reactive(&track_id, move |_| {
+        drag_secs.set(None);
+    }));
+
     let pos = *player.position_signal().read();
     let dur = *player.duration_signal().read();
-    let max_dur = if dur.is_finite() && dur > 0.0 {
-        dur
-    } else {
-        1.0
-    };
-    let clamped_pos = if pos.is_finite() {
+    let can_seek = has_track && dur.is_finite() && dur > 0.0;
+    let max_dur = if can_seek { dur } else { 1.0 };
+
+    let active_drag = if can_seek { drag_secs() } else { None };
+    let is_dragging = active_drag.is_some();
+
+    let display_pos = if let Some(ds) = active_drag {
+        ds.clamp(0.0, max_dur)
+    } else if pos.is_finite() {
         pos.clamp(0.0, max_dur)
     } else {
         0.0
     };
-    let pct = if dur > 0.0 {
-        ((clamped_pos / dur) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
+    let pct = compute_progress_pct(display_pos, if can_seek { dur } else { 0.0 });
+    let active_hover = if can_seek { hover_pct() } else { None };
 
     let container_class = if full_width {
         "flex items-center gap-2.5 w-full"
     } else {
         "flex items-center gap-2.5 w-full max-w-xl"
     };
-    let track_height_class = if full_width {
-        "w-full h-1.5 rounded-full bg-beet-surface-highest overflow-hidden"
-    } else {
-        "w-full h-1 rounded-full bg-beet-surface-highest overflow-hidden"
+
+    let rail_height_class = match (full_width, is_dragging) {
+        (true, true) => "h-2",
+        (true, false) => "h-1.5 group-hover:h-2 group-focus-within:h-2",
+        (false, true) => "h-1.5",
+        (false, false) => "h-1 group-hover:h-1.5 group-focus-within:h-1.5",
     };
+
+    let fill_class = if is_dragging {
+        "relative h-full rounded-full bg-beet-leaf-glow transition-[background-color] duration-150"
+    } else {
+        "relative h-full rounded-full bg-beet-leaf-solid group-hover:bg-beet-leaf-glow group-focus-within:bg-beet-leaf-glow transition-[width,background-color] duration-75"
+    };
+
+    let thumb_visibility_class = if is_dragging {
+        "scale-100 opacity-100"
+    } else {
+        "scale-0 opacity-0 group-hover:scale-100 group-hover:opacity-100 group-focus-within:scale-100 group-focus-within:opacity-100"
+    };
+
+    let tooltip_pct = if is_dragging {
+        Some(pct)
+    } else {
+        active_hover
+    };
+
+    let dur_secs = if can_seek { dur.floor() as u32 } else { 0 };
+    let display_secs = display_pos.floor() as u32;
 
     rsx! {
         div { class: "{container_class}",
             span { class: "w-10 text-right tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
-                "{format_duration(clamped_pos.floor() as u32)}"
+                "{format_duration(display_secs)}"
             }
 
-            div { class: "relative flex-1 h-5 flex items-center group",
-                div { class: "{track_height_class}",
+            div {
+                class: "relative flex-1 h-5 flex items-center group",
+                onmounted: move |evt| {
+                    let data = evt.data();
+                    track_el.set(Some(data.clone()));
+                    spawn(async move {
+                        if let Ok(rect) = data.get_client_rect().await {
+                            let w = rect.size.width;
+                            if w.is_finite() && w > 0.0 {
+                                track_rect.set((rect.origin.x, w));
+                            }
+                        }
+                    });
+                },
+                onmouseenter: move |evt: MouseEvent| {
+                    is_hovered.set(true);
+                    let client_x = evt.data().client_coordinates().x;
+                    if let Some(el) = track_el.read().clone() {
+                        spawn(async move {
+                            if let Ok(rect) = el.get_client_rect().await {
+                                let w = rect.size.width;
+                                if w.is_finite() && w > 0.0 {
+                                    track_rect.set((rect.origin.x, w));
+                                    if *is_hovered.peek() {
+                                        hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                },
+                onmousemove: move |evt: MouseEvent| {
+                    is_hovered.set(true);
+                    let client_x = evt.data().client_coordinates().x;
+                    let (left, width) = *track_rect.read();
+                    if width > 0.0 {
+                        hover_pct.set(compute_hover_pct(client_x - left, width));
+                    } else if let Some(el) = track_el.read().clone() {
+                        spawn(async move {
+                            if let Ok(rect) = el.get_client_rect().await {
+                                let w = rect.size.width;
+                                if w.is_finite() && w > 0.0 {
+                                    track_rect.set((rect.origin.x, w));
+                                    if *is_hovered.peek() {
+                                        hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                },
+                onmouseleave: move |evt: MouseEvent| {
+                    is_hovered.set(false);
+                    hover_pct.set(None);
+                    if evt.data().held_buttons().is_empty() {
+                        drag_secs.set(None);
+                    }
+                },
+
+                // Floating Commit Mono timestamp preview tooltip
+                if let Some(tp) = tooltip_pct {
                     div {
-                        class: "h-full rounded-full bg-beet-leaf-solid transition-[width] duration-75",
+                        class: "absolute -top-7 -translate-x-1/2 px-1.5 py-0.5 rounded-[6px] bg-beet-surface-high border border-beet-border-default text-[10px] tabular-nums-mono text-beet-text-primary shadow-md whitespace-nowrap pointer-events-none z-10",
+                        style: "left: {clamp_tooltip_left_pct(tp):.1}%;",
+                        "{format_hover_timestamp(dur, tp)}"
+                    }
+                }
+
+                // Visible scrubber rail with smooth expansion and keyboard focus ring
+                div { class: "relative w-full rounded-full bg-beet-surface-highest overflow-hidden transition-[height,background-color] duration-150 pointer-events-none group-focus-within:ring-2 group-focus-within:ring-beet-leaf-glow/70 group-focus-within:ring-offset-1 group-focus-within:ring-offset-beet-canvas {rail_height_class}",
+                    // Subtle cursor ghost fill behind active fill
+                    if let Some(hp) = active_hover {
+                        div {
+                            class: "absolute inset-y-0 left-0 rounded-full bg-beet-leaf-glow/20 pointer-events-none",
+                            style: "width: {hp:.2}%;",
+                        }
+                    }
+                    // Active playback fill
+                    div {
+                        class: "{fill_class}",
                         style: "width: {pct:.2}%;",
                     }
                 }
+
+                // Glowing playhead scrubber thumb
+                if can_seek {
+                    div {
+                        class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
+                        style: "left: {pct:.2}%;",
+                    }
+                }
+
                 input {
                     r#type: "range",
                     min: "0",
                     max: "{max_dur:.1}",
                     step: "0.5",
-                    value: "{clamped_pos:.1}",
-                    disabled: !has_track || dur <= 0.0,
+                    value: "{display_pos:.1}",
+                    disabled: !can_seek,
                     aria_label: "Seek playback position",
                     class: "absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-default",
                     oninput: move |evt| {
                         if let Ok(next) = evt.value().parse::<f64>() {
-                            player.seek(next);
+                            let clamped = next.clamp(0.0, max_dur);
+                            drag_secs.set(Some(clamped));
+                            player.seek(clamped);
                         }
+                    },
+                    onchange: move |evt| {
+                        if let Ok(next) = evt.value().parse::<f64>() {
+                            player.seek(next.clamp(0.0, max_dur));
+                        }
+                        drag_secs.set(None);
+                    },
+                    onpointerup: move |_| {
+                        drag_secs.set(None);
+                    },
+                    onmouseup: move |_| {
+                        drag_secs.set(None);
+                    },
+                    onpointercancel: move |_| {
+                        drag_secs.set(None);
+                    },
+                    onkeyup: move |_| {
+                        drag_secs.set(None);
+                    },
+                    onblur: move |_| {
+                        drag_secs.set(None);
                     },
                 }
             }
 
             span { class: "w-10 text-left tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
-                "{format_duration(dur.floor() as u32)}"
+                "{format_duration(dur_secs)}"
             }
 
             if let Some(badge) = codec_badge.as_deref().filter(|b| !b.trim().is_empty()) {
                 span { class: "hidden md:inline-flex items-center px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle text-beet-text-tertiary tabular-nums-mono text-[10px] font-semibold tracking-wider shrink-0",
                     "{badge}"
                 }
+            }
+        }
+    }
+}
+
+/// Custom-rail studio volume slider matching `PlayerScrubber`'s visual language:
+/// hover-expand rail, active glow fill, playhead knob, floating `%` tooltip, and focus-within ring.
+#[component]
+fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) -> Element {
+    let mut track_el = use_signal(|| None::<Rc<MountedData>>);
+    let mut track_rect = use_signal(|| (0.0f64, 0.0f64));
+    let mut is_hovered = use_signal(|| false);
+    let mut hover_pct = use_signal(|| None::<f64>);
+    let mut is_dragging = use_signal(|| false);
+
+    let effective_vol = if muted {
+        0.0f32
+    } else if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let vol_pct = compute_volume_pct(volume, muted);
+    let dragging = is_dragging();
+
+    let rail_height_class = if dragging {
+        "h-1.5"
+    } else {
+        "h-1 group-hover:h-1.5 group-focus-within:h-1.5"
+    };
+
+    let fill_class = if dragging {
+        "relative h-full rounded-full bg-beet-leaf-glow transition-[background-color] duration-150"
+    } else {
+        "relative h-full rounded-full bg-beet-leaf-solid group-hover:bg-beet-leaf-glow group-focus-within:bg-beet-leaf-glow transition-[width,background-color] duration-75"
+    };
+
+    let thumb_visibility_class = if dragging {
+        "scale-100 opacity-100"
+    } else {
+        "scale-0 opacity-0 group-hover:scale-100 group-hover:opacity-100 group-focus-within:scale-100 group-focus-within:opacity-100"
+    };
+
+    let tooltip = if dragging {
+        Some((f64::from(vol_pct), vol_pct))
+    } else {
+        hover_pct().map(|hp| (hp, hp.round().clamp(0.0, 100.0) as u32))
+    };
+
+    rsx! {
+        div {
+            class: "relative w-20 h-5 flex items-center group",
+            onmounted: move |evt| {
+                let data = evt.data();
+                track_el.set(Some(data.clone()));
+                spawn(async move {
+                    if let Ok(rect) = data.get_client_rect().await {
+                        let w = rect.size.width;
+                        if w.is_finite() && w > 0.0 {
+                            track_rect.set((rect.origin.x, w));
+                        }
+                    }
+                });
+            },
+            onmouseenter: move |evt: MouseEvent| {
+                is_hovered.set(true);
+                let client_x = evt.data().client_coordinates().x;
+                if let Some(el) = track_el.read().clone() {
+                    spawn(async move {
+                        if let Ok(rect) = el.get_client_rect().await {
+                            let w = rect.size.width;
+                            if w.is_finite() && w > 0.0 {
+                                track_rect.set((rect.origin.x, w));
+                                if *is_hovered.peek() {
+                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+            onmousemove: move |evt: MouseEvent| {
+                is_hovered.set(true);
+                let client_x = evt.data().client_coordinates().x;
+                let (left, width) = *track_rect.read();
+                if width > 0.0 {
+                    hover_pct.set(compute_hover_pct(client_x - left, width));
+                } else if let Some(el) = track_el.read().clone() {
+                    spawn(async move {
+                        if let Ok(rect) = el.get_client_rect().await {
+                            let w = rect.size.width;
+                            if w.is_finite() && w > 0.0 {
+                                track_rect.set((rect.origin.x, w));
+                                if *is_hovered.peek() {
+                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+            onmouseleave: move |evt: MouseEvent| {
+                is_hovered.set(false);
+                hover_pct.set(None);
+                if evt.data().held_buttons().is_empty() {
+                    is_dragging.set(false);
+                }
+            },
+
+            if let Some((anchor_pct, label_pct)) = tooltip {
+                div {
+                    class: "absolute -top-7 -translate-x-1/2 px-1.5 py-0.5 rounded-[6px] bg-beet-surface-high border border-beet-border-default text-[10px] tabular-nums-mono text-beet-text-primary shadow-md whitespace-nowrap pointer-events-none z-10",
+                    style: "left: {clamp_tooltip_left_pct(anchor_pct):.1}%;",
+                    "{label_pct}%"
+                }
+            }
+
+            div { class: "relative w-full rounded-full bg-beet-surface-highest overflow-hidden transition-[height,background-color] duration-150 pointer-events-none group-focus-within:ring-2 group-focus-within:ring-beet-leaf-glow/70 group-focus-within:ring-offset-1 group-focus-within:ring-offset-beet-canvas {rail_height_class}",
+                if let Some(hp) = hover_pct() {
+                    div {
+                        class: "absolute inset-y-0 left-0 rounded-full bg-beet-leaf-glow/20 pointer-events-none",
+                        style: "width: {hp:.2}%;",
+                    }
+                }
+                div {
+                    class: "{fill_class}",
+                    style: "width: {vol_pct}%;",
+                }
+            }
+
+            div {
+                class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
+                style: "left: {vol_pct}%;",
+            }
+
+            input {
+                r#type: "range",
+                min: "0",
+                max: "1",
+                step: "0.02",
+                value: "{effective_vol:.2}",
+                aria_label: "Volume",
+                class: "absolute inset-0 w-full h-full opacity-0 cursor-pointer",
+                oninput: move |evt| {
+                    if let Ok(v) = evt.value().parse::<f32>() {
+                        is_dragging.set(true);
+                        on_change.call(v.clamp(0.0, 1.0));
+                    }
+                },
+                onchange: move |evt| {
+                    if let Ok(v) = evt.value().parse::<f32>() {
+                        on_change.call(v.clamp(0.0, 1.0));
+                    }
+                    is_dragging.set(false);
+                },
+                onpointerup: move |_| is_dragging.set(false),
+                onmouseup: move |_| is_dragging.set(false),
+                onpointercancel: move |_| is_dragging.set(false),
+                onkeyup: move |_| is_dragging.set(false),
+                onblur: move |_| is_dragging.set(false),
             }
         }
     }
@@ -135,12 +481,6 @@ pub fn StudioPlayerBar(
         .filter(|u| !u.is_empty() && failed_art.read().as_ref() != Some(*u))
         .cloned();
 
-    let vol_pct = if state.muted {
-        0
-    } else {
-        (state.volume.clamp(0.0, 1.0) * 100.0).round() as u32
-    };
-
     let other_device_count = connect_devices
         .iter()
         .filter(|d| d.device_id != local_device_id)
@@ -162,6 +502,7 @@ pub fn StudioPlayerBar(
             // Mobile (< md): Dedicated full-width seek bar above controls so it is clear and easy to scrub
             div { class: "w-full md:hidden",
                 PlayerScrubber {
+                    track_id: current.as_ref().map(|t| t.id.clone()),
                     has_track,
                     codec_badge: None,
                     full_width: true,
@@ -178,17 +519,24 @@ pub fn StudioPlayerBar(
                     aria_label: "Open Track Inspector",
                     title: "Inspect current track",
                     disabled: !has_track,
-                    class: "relative w-10 h-10 md:w-[52px] md:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle shrink-0 flex items-center justify-center cursor-pointer disabled:cursor-default",
+                    class: "group/art relative w-10 h-10 md:w-[52px] md:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle hover:border-beet-border-strong disabled:hover:border-beet-border-subtle shrink-0 flex items-center justify-center cursor-pointer disabled:cursor-default transition-colors",
                     onclick: move |_| on_toggle_drawer.call(DrawerTab::Inspector),
                     if let Some(url) = show_art {
                         img {
                             src: "{url}",
                             alt: "",
-                            class: "w-full h-full object-cover",
+                            class: "w-full h-full object-cover group-hover/art:scale-105 transition-transform duration-200",
                             onerror: move |_| failed_art.set(Some(url.clone())),
                         }
                     } else {
                         IconMusic { size: 20, class: "text-beet-text-disabled".to_string() }
+                    }
+                    if has_track {
+                        span {
+                            class: "absolute inset-0 bg-beet-canvas/55 opacity-0 group-hover/art:opacity-100 transition-opacity duration-150 flex items-center justify-center pointer-events-none",
+                            aria_hidden: "true",
+                            IconInfo { size: 16, class: "text-beet-text-primary".to_string() }
+                        }
                     }
                 }
 
@@ -308,7 +656,7 @@ pub fn StudioPlayerBar(
                         aria_label: "Toggle shuffle",
                         title: "Shuffle",
                         class: if state.shuffle {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface cursor-pointer transition-colors"
+                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
                         } else {
                             "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
                         },
@@ -357,7 +705,7 @@ pub fn StudioPlayerBar(
                         aria_label: "{state.repeat.aria_label()}",
                         title: "{state.repeat.aria_label()}",
                         class: if state.repeat != RepeatMode::Off {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface cursor-pointer transition-colors"
+                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
                         } else {
                             "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
                         },
@@ -372,6 +720,7 @@ pub fn StudioPlayerBar(
 
                 div { class: "hidden md:flex w-full justify-center",
                     PlayerScrubber {
+                        track_id: current.as_ref().map(|t| t.id.clone()),
                         has_track,
                         codec_badge: current.as_ref().and_then(|t| t.codec_badge.clone()),
                     }
@@ -479,7 +828,7 @@ pub fn StudioPlayerBar(
                                                     key: "{dev.device_id}",
                                                     r#type: "button",
                                                     class: if dev.is_active {
-                                                        "w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-[8px] bg-beet-leaf-surface border border-beet-leaf-solid/35 text-left cursor-pointer"
+                                                        "w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-[8px] bg-beet-leaf-surface border border-beet-leaf-solid/35 hover:bg-beet-surface-high hover:border-beet-leaf-solid/55 hover:brightness-110 text-left cursor-pointer transition-[background-color,border-color,filter]"
                                                     } else {
                                                         "w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-[8px] hover:bg-beet-surface-highest border border-transparent text-left cursor-pointer transition-colors"
                                                     },
@@ -547,18 +896,10 @@ pub fn StudioPlayerBar(
                             IconVolume2 { size: 16 }
                         }
                     }
-                    input {
-                        r#type: "range",
-                        min: "0",
-                        max: "100",
-                        value: "{vol_pct}",
-                        aria_label: "Volume",
-                        class: "w-20 accent-beet-leaf-solid cursor-pointer h-1",
-                        oninput: move |evt| {
-                            if let Ok(v) = evt.value().parse::<f32>() {
-                                player.set_volume((v / 100.0).clamp(0.0, 1.0));
-                            }
-                        },
+                    PlayerVolumeSlider {
+                        volume: state.volume,
+                        muted: state.muted,
+                        on_change: move |v| player.set_volume(v),
                     }
                 }
 
@@ -586,8 +927,68 @@ pub fn StudioPlayerBar(
 
 fn drawer_toggle_class(active: bool) -> &'static str {
     if active {
-        "w-8 h-8 rounded-lg inline-flex items-center justify-center bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text cursor-pointer transition-colors"
+        "w-8 h-8 rounded-lg inline-flex items-center justify-center bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text hover:bg-beet-surface-high hover:border-beet-accent/50 hover:brightness-110 cursor-pointer transition-[color,background-color,border-color,filter]"
     } else {
         "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_hover_pct_clamps_and_handles_invalid_inputs() {
+        assert_eq!(compute_hover_pct(0.0, 200.0), Some(0.0));
+        assert_eq!(compute_hover_pct(100.0, 200.0), Some(50.0));
+        assert_eq!(compute_hover_pct(200.0, 200.0), Some(100.0));
+        assert_eq!(compute_hover_pct(-20.0, 200.0), Some(0.0));
+        assert_eq!(compute_hover_pct(260.0, 200.0), Some(100.0));
+
+        assert_eq!(compute_hover_pct(50.0, 0.0), None);
+        assert_eq!(compute_hover_pct(50.0, -10.0), None);
+        assert_eq!(compute_hover_pct(f64::NAN, 200.0), None);
+        assert_eq!(compute_hover_pct(50.0, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn clamp_tooltip_left_pct_keeps_tooltip_within_rail_bounds() {
+        assert_eq!(clamp_tooltip_left_pct(0.0), 6.0);
+        assert_eq!(clamp_tooltip_left_pct(5.9), 6.0);
+        assert_eq!(clamp_tooltip_left_pct(42.5), 42.5);
+        assert_eq!(clamp_tooltip_left_pct(95.0), 94.0);
+        assert_eq!(clamp_tooltip_left_pct(100.0), 94.0);
+        assert_eq!(clamp_tooltip_left_pct(f64::NAN), 6.0);
+    }
+
+    #[test]
+    fn compute_progress_pct_normalizes_and_guards_edges() {
+        assert_eq!(compute_progress_pct(0.0, 240.0), 0.0);
+        assert_eq!(compute_progress_pct(120.0, 240.0), 50.0);
+        assert_eq!(compute_progress_pct(300.0, 240.0), 100.0);
+        assert_eq!(compute_progress_pct(-5.0, 240.0), 0.0);
+        assert_eq!(compute_progress_pct(10.0, 0.0), 0.0);
+        assert_eq!(compute_progress_pct(f64::NAN, 240.0), 0.0);
+    }
+
+    #[test]
+    fn format_hover_timestamp_handles_boundaries_and_hours() {
+        assert_eq!(format_hover_timestamp(200.0, 0.0), "00:00");
+        assert_eq!(format_hover_timestamp(200.0, 50.0), "01:40");
+        assert_eq!(format_hover_timestamp(200.0, 100.0), "03:20");
+        assert_eq!(format_hover_timestamp(200.0, 150.0), "03:20");
+        assert_eq!(format_hover_timestamp(200.0, -10.0), "00:00");
+        assert_eq!(format_hover_timestamp(7200.0, 50.0), "1:00:00");
+        assert_eq!(format_hover_timestamp(0.0, 50.0), "00:00");
+        assert_eq!(format_hover_timestamp(f64::NAN, 50.0), "00:00");
+    }
+
+    #[test]
+    fn compute_volume_pct_respects_mute_and_clamping() {
+        assert_eq!(compute_volume_pct(0.8, false), 80);
+        assert_eq!(compute_volume_pct(0.8, true), 0);
+        assert_eq!(compute_volume_pct(1.5, false), 100);
+        assert_eq!(compute_volume_pct(-0.2, false), 0);
+        assert_eq!(compute_volume_pct(f32::NAN, false), 0);
     }
 }

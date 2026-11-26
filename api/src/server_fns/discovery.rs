@@ -133,9 +133,18 @@ pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError
         .await
         .map_err(server_error)?;
     if let Some(ref folder_id) = settings.discovery_folder_id {
-        DiscoveryTrackRow::get_by_folder(folder_id)
+        let mut tracks = DiscoveryTrackRow::get_by_folder(folder_id)
             .await
-            .map_err(server_error)
+            .map_err(server_error)?;
+        crate::core::contextual::maybe_reconcile_discovery_song_ids_in(
+            &crate::db::DB,
+            &crate::core::index::ServerNavidrome,
+            crate::config::CONFIG.navidrome_music_path(),
+            &auth.0.user_id,
+            &mut tracks,
+        )
+        .await;
+        Ok(tracks)
     } else {
         Ok(vec![])
     }
@@ -209,6 +218,8 @@ pub async fn list_active_contextual_mixes(
 ) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
     crate::core::contextual::list_active_contextual_mixes_in(
         &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
         &auth.0,
         chrono::Utc::now(),
         local_hour,
@@ -258,6 +269,7 @@ pub async fn get_contextual_mix_playlist(
     crate::core::contextual::resolve_contextual_mix_playlist_in(
         &crate::db::DB,
         &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
         &auth.0,
         &slug,
         sync.unwrap_or(false),
@@ -273,6 +285,8 @@ pub async fn steer_seasonal_pack(
 ) -> Result<shared::recommendation::ContextualMixSummary, ServerFnError> {
     crate::core::contextual::steer_seasonal_pack_in(
         &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
         &auth.0,
         &req.slug,
         req.steering,
@@ -284,9 +298,14 @@ pub async fn steer_seasonal_pack(
 
 #[get("/api/discovery/triage", auth: AuthSession)]
 pub async fn list_triage_queue() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
-    crate::core::contextual::list_triage_queue_in(&crate::db::DB, &auth.0.user_id)
-        .await
-        .map_err(failure_error)
+    crate::core::contextual::list_triage_queue_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
+        &auth.0.user_id,
+    )
+    .await
+    .map_err(failure_error)
 }
 
 #[post("/api/radio/start", auth: AuthSession)]
@@ -1331,6 +1350,43 @@ pub async fn generate_discovery_playlist_internal(
             let navidrome = crate::core::index::ServerNavidrome;
             let user = UserId::new(user_id);
             if scan_imports(&crate::db::DB, &navidrome, &user, &navi, total_downloads).await {
+                // Reconcile pending discovery tracks' Navidrome song_ids immediately now that
+                // the scan completed so Triage & Moment mixes can play them right away.
+                match DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, user_id).await {
+                    Ok(mut pending)
+                        if pending
+                            .iter()
+                            .any(crate::core::contextual::needs_song_id_reconciliation) =>
+                    {
+                        match navi.get_all_songs_with_ratings().await {
+                            Ok(library) => {
+                                let reconciled =
+                                    crate::core::contextual::reconcile_discovery_song_ids_in(
+                                        &crate::db::DB,
+                                        &library,
+                                        crate::config::CONFIG.navidrome_music_path(),
+                                        &mut pending,
+                                    )
+                                    .await;
+                                if reconciled > 0 {
+                                    info!(
+                                        "Reconciled {} discovery track song_ids after scan for user {}",
+                                        reconciled, user_id
+                                    );
+                                }
+                            }
+                            Err(e) => warn!(
+                                "Failed to fetch Navidrome library to reconcile discovery song_ids for user {}: {}",
+                                user_id, e
+                            ),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Failed to load pending discovery tracks for song_id reconciliation (user {}): {}",
+                        user_id, e
+                    ),
+                }
                 // Create/update smart playlists now that tracks are indexed
                 if let Err(e) = reconcile_discovery_playlists(user_id).await {
                     warn!("Playlist reconciliation after generation failed: {}", e);

@@ -3,10 +3,7 @@ use std::pin::Pin;
 
 use dioxus::prelude::*;
 
-use crate::{
-    submitted_text, Autofill, BackgroundGlows, FieldKind, FieldLook, GlowColor, GlowSpread, Logo,
-    TextInput,
-};
+use crate::{submitted_text, Autofill, FieldKind, FieldLook, Logo, TextInput};
 
 type LoginCallback = Callback<(String, String), Pin<Box<dyn Future<Output = Result<(), String>>>>>;
 
@@ -48,22 +45,19 @@ pub fn Login(props: Props) -> Element {
     };
 
     rsx! {
-      div { class: "flex flex-col items-center justify-center min-h-screen text-white font-display",
-        // bg decorations
-        BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Wide }
-
-        div { class: "p-8 bg-beet-panel border border-white/10 rounded-lg shadow-2xl w-full max-w-md relative z-10",
-          // Header
-          div { class: "flex flex-col items-center mb-8",
+      div { class: "flex flex-col items-center justify-center min-h-screen px-4 py-8 bg-beet-canvas text-beet-text-primary font-display",
+        div { class: "w-full max-w-[400px] bg-beet-surface-low border border-beet-border-subtle rounded-[16px] p-7",
+          // Brand lockup
+          div { class: "flex flex-col items-center text-center mb-7",
             Logo {
-              size: 64,
-              class: "mb-4 drop-shadow-[0_0_14px_rgba(255,0,255,0.5)] hover:-translate-y-1 transition-transform",
+              size: 48,
+              class: "mb-3.5",
             }
-            h1 { class: "text-2xl font-bold tracking-tighter uppercase text-transparent bg-clip-text bg-gradient-to-r from-white to-gray-400",
+            h1 { class: "text-2xl font-bold tracking-tight text-beet-text-primary",
               "Soulbeet"
             }
-            p { class: "text-sm text-beet-leaf font-mono mt-2 tracking-widest",
-              "YOUR LIBRARY MANAGER"
+            p { class: "text-sm text-beet-text-secondary mt-1",
+              "Sign in to your personal studio"
             }
           }
 
@@ -76,60 +70,62 @@ pub fn Login(props: Props) -> Element {
                 e.prevent_default();
                 handle_login(submitted_text(&e, USERNAME), submitted_text(&e, PASSWORD));
             },
-            div {
-              label {
-                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
-                r#for: "login-username",
-                "Username"
+            div { class: "space-y-4",
+              div {
+                label {
+                  class: "block text-xs font-medium text-beet-text-secondary mb-1.5",
+                  r#for: "login-username",
+                  "Username"
+                }
+                TextInput {
+                  look: FieldLook::Login,
+                  id: "login-username",
+                  name: USERNAME,
+                  autofill: Autofill::Username,
+                  placeholder: "Enter username",
+                }
               }
-              TextInput {
-                look: FieldLook::Login,
-                id: "login-username",
-                name: USERNAME,
-                autofill: Autofill::Username,
-                placeholder: "Enter username",
-              }
-            }
-            div {
-              label {
-                class: "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider",
-                r#for: "login-password",
-                "Password"
-              }
-              TextInput {
-                look: FieldLook::Login,
-                id: "login-password",
-                name: PASSWORD,
-                autofill: Autofill::CurrentPassword,
-                placeholder: "Enter password",
-                kind: FieldKind::Password,
+              div {
+                label {
+                  class: "block text-xs font-medium text-beet-text-secondary mb-1.5",
+                  r#for: "login-password",
+                  "Password"
+                }
+                TextInput {
+                  look: FieldLook::Login,
+                  id: "login-password",
+                  name: PASSWORD,
+                  autofill: Autofill::CurrentPassword,
+                  placeholder: "Enter password",
+                  kind: FieldKind::Password,
+                }
               }
             }
 
             if !shown_error.is_empty() {
-              div { class: "p-3 bg-red-500/10 border border-red-500/50 rounded text-red-400 text-sm font-mono flex items-center gap-2",
+              div { class: "px-3.5 py-2.5 bg-beet-crimson-surface border border-beet-crimson-solid/40 rounded-[10px] text-beet-crimson-text text-sm flex items-center gap-2.5",
                 svg {
-                  class: "w-4 h-4",
+                  class: "w-4 h-4 shrink-0",
                   fill: "none",
                   view_box: "0 0 24 24",
                   stroke: "currentColor",
                   path {
                     stroke_linecap: "round",
                     stroke_linejoin: "round",
-                    stroke_width: "2",
+                    stroke_width: "1.75",
                     d: "M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z",
                   }
                 }
-                "{shown_error}"
+                span { "{shown_error}" }
               }
             }
 
             button {
-              class: "w-full retro-btn flex justify-center items-center gap-2 group",
+              class: "w-full h-10 px-4 rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-sm tracking-wide flex justify-center items-center gap-2 hover:brightness-105 transition-all cursor-pointer group",
               "type": "submit",
               span { "AUTHENTICATE" }
               svg {
-                class: "w-4 h-4 group-hover:translate-x-1 transition-transform",
+                class: "w-4 h-4 group-hover:translate-x-0.5 transition-transform",
                 fill: "none",
                 view_box: "0 0 24 24",
                 stroke: "currentColor",
@@ -145,9 +141,9 @@ pub fn Login(props: Props) -> Element {
 
           if let Some(provider) = props.sso_provider {
             div { class: "flex items-center gap-3 my-6",
-              div { class: "flex-1 h-px bg-white/10" }
-              span { class: "text-xs font-mono text-gray-500 uppercase tracking-widest", "or" }
-              div { class: "flex-1 h-px bg-white/10" }
+              div { class: "flex-1 h-px bg-beet-border-subtle" }
+              span { class: "text-xs text-beet-text-tertiary uppercase tracking-wider", "or" }
+              div { class: "flex-1 h-px bg-beet-border-subtle" }
             }
             // A native form, not a link: the router would handle a link
             // inside the app, and this must be a full page load so the
@@ -159,7 +155,7 @@ pub fn Login(props: Props) -> Element {
                 input { "type": "hidden", name: "return_to", value: "{back}" }
               }
               button {
-                class: "w-full retro-btn flex justify-center items-center gap-2",
+                class: "w-full h-10 px-4 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-default hover:border-beet-border-strong text-beet-text-primary font-medium text-sm flex justify-center items-center gap-2 transition-colors cursor-pointer",
                 "type": "submit",
                 "Sign in with {provider}"
               }

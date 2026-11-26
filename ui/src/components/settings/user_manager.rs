@@ -7,15 +7,16 @@ use api::{
 use dioxus::prelude::*;
 
 use super::panel::{
-    ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, REMOVE_BUTTON_CLASS,
+    ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, PRIMARY_BUTTON_CLASS,
+    REMOVE_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
 };
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{Autofill, ConfirmModal, FieldKind, FieldLook, TextInput};
 
-const LINK_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-beet-accent transition-colors underline decoration-dotted cursor-pointer";
-const TAG_CLASS: &str = "text-xs font-mono text-gray-500 uppercase tracking-wider";
+const LINK_BUTTON_CLASS: &str = "text-xs font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors underline decoration-dotted underline-offset-4 cursor-pointer";
+const TAG_CLASS: &str = "inline-flex items-center px-2 py-0.5 rounded-full bg-beet-surface-high border border-beet-border-subtle text-[11px] tabular-nums-mono text-beet-text-secondary uppercase tracking-wider";
 
 /// How an account signs in, when it is not just with a password: the
 /// provider's name for its single sign-on identity, and a missing password.
@@ -79,14 +80,14 @@ pub fn AccountPanel(sso_notice: Signal<Option<SsoLinkResult>>) -> Element {
         Messages { error: error(), success: success_msg() }
 
         if auth.rename_allowed() {
-          div { class: "mb-4",
+          div { class: "mb-5",
             label { class: LABEL_CLASS, "Username" }
             TextInput {
               value: new_username(),
               oninput: move |v| new_username.set(v),
               placeholder: "New username",
             }
-            button { class: "retro-btn mt-2 rounded", onclick: handle_rename, "Rename" }
+            button { class: "{PRIMARY_BUTTON_CLASS} mt-3", onclick: handle_rename, "Rename" }
           }
         }
 
@@ -268,7 +269,7 @@ pub fn UserManager() -> Element {
           }
         }
         button {
-          class: "retro-btn mb-6 rounded",
+          class: "{PRIMARY_BUTTON_CLASS} mb-6",
           onclick: handle_create_user,
           "Create User"
         }
@@ -276,7 +277,7 @@ pub fn UserManager() -> Element {
         // User List
         SectionTitle { title: "Existing Users" }
         if users.read().is_empty() {
-          p { class: "text-gray-500 font-mono italic", "No users found." }
+          p { class: "text-xs text-beet-text-tertiary italic", "No users found." }
         } else {
           ul { class: "space-y-2",
             {
@@ -302,8 +303,8 @@ pub fn UserManager() -> Element {
                         rsx! {
                           ListRow {
                             if editing_user_id() == Some(user.id.clone()) {
-                              div { class: "flex flex-col gap-2",
-                                div { class: "font-bold text-white font-display", "{user.username}" }
+                              div { class: "flex flex-col gap-2.5",
+                                div { class: "font-semibold text-beet-text-primary font-display text-sm", "{user.username}" }
                                 OtherAccountPassword {
                                   look: FieldLook::Compact,
                                   value: edit_user_password(),
@@ -311,16 +312,16 @@ pub fn UserManager() -> Element {
                                   placeholder: "New password",
                                 }
                                 if let Some(note) = reset_note {
-                                  p { class: "text-xs text-gray-500 font-mono", "{note}" }
+                                  p { class: "text-xs text-beet-text-tertiary leading-relaxed", "{note}" }
                                 }
                                 div { class: "flex gap-2 mt-1",
                                   button {
-                                    class: "text-xs uppercase tracking-wider font-bold text-beet-leaf hover:text-white transition-colors cursor-pointer",
+                                    class: "{PRIMARY_BUTTON_CLASS} h-8 px-3 text-xs",
                                     onclick: move |_| handle_update_password(id_pw.clone()),
                                     "[ Save ]"
                                   }
                                   button {
-                                    class: "text-xs uppercase tracking-wider font-bold text-gray-500 hover:text-white transition-colors cursor-pointer",
+                                    class: "{SECONDARY_BUTTON_CLASS} h-8 px-3",
                                     onclick: move |_| editing_user_id.set(None),
                                     "[ Cancel ]"
                                   }
@@ -328,8 +329,8 @@ pub fn UserManager() -> Element {
                               }
                             } else {
                               div { class: "flex justify-between items-center flex-wrap gap-2",
-                                div { class: "flex items-center flex-wrap gap-x-3 gap-y-1",
-                                  span { class: "font-bold text-white font-display", "{user.username}" }
+                                div { class: "flex items-center flex-wrap gap-x-2.5 gap-y-1",
+                                  span { class: "font-semibold text-beet-text-primary font-display text-sm", "{user.username}" }
                                   span { class: TAG_CLASS, "{role_label}" }
                                   for tag in tags {
                                     span { class: TAG_CLASS, "{tag}" }

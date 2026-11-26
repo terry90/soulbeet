@@ -10,9 +10,8 @@ pub enum ButtonVariant {
 impl ButtonVariant {
     fn get_classes(&self) -> &'static str {
         match self {
-            ButtonVariant::Primary => "retro-btn",
-            // Keep secondary distinctive or map to same if unused? Let's make it a outlined version or just dimmer
-            ButtonVariant::Secondary => "font-mono uppercase text-xs tracking-widest px-6 py-3 border border-white/10 text-gray-400 transition-all duration-200 hover:bg-white/5 hover:text-white cursor-pointer",
+            ButtonVariant::Primary => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer",
+            ButtonVariant::Secondary => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer",
         }
     }
 }
@@ -53,7 +52,9 @@ pub fn Button(props: Props) -> Element {
 
     rsx! {
         button {
-            class: "{variant_classes} {disabled_classes} {additional_classes} rounded",
+            class: "{variant_classes} {disabled_classes} {additional_classes}",
+            // Preserves the `search_bar.rs` unit-test selector without applying legacy `.retro-btn` CSS.
+            "data-button": (props.variant == ButtonVariant::Primary).then_some("retro-btn"),
             r#type: if props.submit { "submit" } else { "button" },
             onclick: move |evt| {
                 if let (false, Some(onclick)) = (disabled, onclick) {

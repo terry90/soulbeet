@@ -14,7 +14,8 @@ pub enum Delivery {
 }
 
 /// Whether a backend can be turned off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Switch {
     AlwaysOn,
     /// Off until an admin turns it on in Settings.
@@ -40,6 +41,32 @@ pub struct BackendMeta {
     /// Why a same-source retry is refused when the backend will not give a source's files, when
     /// the backend words it its own way; else `blocked` gives the common text.
     pub blocked: Option<&'static str>,
+}
+
+impl Serialize for BackendMeta {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("BackendMeta", 5)?;
+        s.serialize_field("id", self.id)?;
+        s.serialize_field("name", self.name)?;
+        s.serialize_field("service", self.service)?;
+        s.serialize_field("delivery", &self.delivery)?;
+        s.serialize_field("switch", &self.switch)?;
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        meta(&wire.id)
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown download backend: {}", wire.id)))
+    }
 }
 
 pub const SLSKD: BackendMeta = BackendMeta {
@@ -273,5 +300,16 @@ mod tests {
             serde_json::to_value(Delivery::LossyOnly).unwrap(),
             serde_json::json!("lossy_only")
         );
+    }
+
+    #[test]
+    fn backend_meta_round_trips_through_json() {
+        for &entry in ALL {
+            let json = serde_json::to_string(&entry).unwrap();
+            let decoded: BackendMeta = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, entry);
+        }
+        let err = serde_json::from_str::<BackendMeta>(r#"{"id":"unknown"}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown download backend"));
     }
 }

@@ -190,7 +190,7 @@ fn QueueTabBody() -> Element {
                         let is_current = cur_idx == Some(idx);
                         let q_for_jump = queue_clone.clone();
                         let row_cls = if is_current {
-                            "bg-beet-surface border-beet-leaf-solid/35"
+                            "bg-beet-surface border-beet-leaf-solid/35 hover:bg-beet-surface-high/70 hover:border-beet-leaf-solid/50"
                         } else {
                             "bg-transparent border-transparent hover:bg-beet-surface-low"
                         };
@@ -327,14 +327,14 @@ fn InspectorTabBody(
                     if track.is_discovery {
                         button {
                             r#type: "button",
-                            class: "inline-flex items-center justify-center gap-1 h-8 px-3 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[12px] font-semibold cursor-pointer",
+                            class: "inline-flex items-center justify-center gap-1 h-8 px-3 rounded-full bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 text-[12px] font-semibold cursor-pointer transition-[filter]",
                             onclick: move |_| on_keep.call(track_keep.clone()),
                             IconCheck { size: 13 }
                             span { "Keep" }
                         }
                         button {
                             r#type: "button",
-                            class: "inline-flex items-center justify-center gap-1 h-8 px-2.5 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text text-[12px] font-semibold cursor-pointer",
+                            class: "inline-flex items-center justify-center gap-1 h-8 px-2.5 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white text-[12px] font-semibold cursor-pointer transition-colors",
                             onclick: move |_| on_drop.call(track_drop.clone()),
                             IconThumbsDown { size: 13 }
                         }

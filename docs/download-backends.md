@@ -10,6 +10,14 @@ The backends in this build:
 - `gdstudio`, NetEase through GD Studio's API ([gdstudio.md](gdstudio.md)): searches and downloads in Soulbeet's own engine under a call budget for the whole install, with partial files in `PartialDir`. Its transfers are kept in memory only: a restart loses the unfinished ones, which reconcile then treats as lost, and the engine clears its partial folder when it starts.
 - `airdcpp`, Direct Connect ([direct-connect.md](direct-connect.md)): an AirDC++ Web Client the admin runs, reached over its Web API as slskd is. AirDC++ downloads and checks each file's TTH; the backend keeps its files in the transfer book, so a restart finds them again, and gives up on a file that got no byte for 5 minutes.
 
+## Studio search and 1-tap Acquire & Play
+
+The Studio UI exposes enabled backends in two ways:
+
+- **Unified search and manual source picker**: the search view queries `GET /api/backends/enabled` to discover every active backend. When picking sources manually, results from all enabled backends appear together under **All Sources**, with dynamic per-backend filter pills so users can narrow down to any enabled source.
+- **1-tap Acquire & Play fast-path**: clicking play on an unowned track checks the user's Navidrome library first and starts playing immediately if the track is already owned. Otherwise Soulbeet splits enabled backends into a fast tier (`Delivery::LossyOnly` backends when `prefer_fast` is enabled) and an archival tier (`Delivery::AsFound` backends such as Soulseek and Internet Archive), searching the fast tier first so playback starts without waiting on a slow P2P sweep and falling back to the archival tier when no high-confidence match is found. Real-time stages (`Acquiring -> Importing -> Indexing -> Ready`) stream over the user WebSocket for automatic playback handoff.
+- **On-Keep archival FLAC upgrade**: lossy fast acquisitions are recorded in `fast_acquisitions` without auto-upgrading. Only when the user explicitly Keeps, Stars, or Promotes the track does Soulbeet enqueue a low-priority background upgrade job on an archival backend to replace the lossy file with a lossless FLAC copy.
+
 ## The contract
 
 A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app relies on this:

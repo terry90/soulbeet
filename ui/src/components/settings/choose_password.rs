@@ -28,10 +28,10 @@ pub fn ChoosePassword() -> Element {
     };
 
     rsx! {
-      div { class: "flex flex-col items-center justify-center min-h-screen px-4 text-white font-display",
-        div { class: "w-full max-w-md",
+      div { class: "flex flex-col items-center justify-center min-h-screen px-4 bg-beet-canvas text-beet-text-primary font-display",
+        div { class: "w-full max-w-[420px]",
           Panel { title: "Choose a new password",
-            p { class: "text-sm text-gray-400 font-mono mb-4",
+            p { class: "text-sm text-beet-text-secondary leading-relaxed mb-5",
               "This account still has the default password, which anyone can guess. Choose a new one to continue."
             }
             PasswordSection {
@@ -40,7 +40,7 @@ pub fn ChoosePassword() -> Element {
             }
             Messages { error: sign_out_error() }
             button {
-              class: "mt-6 text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted cursor-pointer",
+              class: "mt-6 text-xs font-medium text-beet-text-tertiary hover:text-beet-crimson-text transition-colors underline decoration-dotted underline-offset-4 cursor-pointer",
               onclick: sign_out,
               "Sign out"
             }

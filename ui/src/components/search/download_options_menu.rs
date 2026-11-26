@@ -35,9 +35,9 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
     let selected_folder_id = &props.selected_folder_id;
 
     let align_class = if props.align == "right" {
-        "absolute right-0 top-full mt-2 w-52 bg-beet-panel border border-white/10 rounded-lg shadow-2xl z-50 overflow-hidden"
+        "absolute right-0 top-full mt-2 w-56 bg-beet-surface-high border border-beet-border-default rounded-[12px] shadow-xl z-50 overflow-hidden"
     } else {
-        "absolute left-0 top-full mt-2 w-52 bg-beet-panel border border-white/10 rounded-lg shadow-2xl z-50 overflow-hidden"
+        "absolute left-0 top-full mt-2 w-56 bg-beet-surface-high border border-beet-border-default rounded-[12px] shadow-xl z-50 overflow-hidden"
     };
 
     rsx! {
@@ -46,8 +46,8 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
             onclick: move |evt| evt.stop_propagation(),
 
             // Header
-            div { class: "px-3 py-2 border-b border-white/5",
-                p { class: "text-[10px] font-mono text-gray-500 uppercase tracking-widest", "Download to" }
+            div { class: "px-3 py-2 border-b border-beet-border-subtle",
+                p { class: "text-[10px] tabular-nums-mono text-beet-text-tertiary uppercase tracking-widest", "Download to" }
             }
 
             // Folder list
@@ -59,9 +59,9 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
                         button {
                             r#type: "button",
                             class: if is_active {
-                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] text-sm font-mono cursor-pointer bg-beet-leaf/10 text-beet-leaf"
+                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] text-[13px] font-medium cursor-pointer bg-beet-leaf-surface text-beet-leaf-text transition-colors"
                             } else {
-                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] hover:bg-white/5 text-sm font-mono cursor-pointer text-gray-300"
+                                "flex items-center gap-2 w-full text-left px-3 py-2.5 min-h-[44px] hover:bg-beet-surface-highest text-[13px] cursor-pointer text-beet-text-secondary hover:text-beet-text-primary transition-colors"
                             },
                             onclick: move |_| on_select_folder.call(folder_clone.clone()),
                             if is_active {
@@ -79,10 +79,10 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
                                 }
                             } else {
                                 svg {
-                                    class: "w-3.5 h-3.5 shrink-0 opacity-40",
+                                    class: "w-3.5 h-3.5 shrink-0 opacity-60",
                                     fill: "none",
                                     stroke: "currentColor",
-                                    stroke_width: "1.5",
+                                    stroke_width: "1.75",
                                     view_box: "0 0 24 24",
                                     path {
                                         stroke_linecap: "round",
@@ -99,9 +99,9 @@ pub fn FolderDropdown(props: FolderDropdownProps) -> Element {
 
             // Quality override placeholder (D-02)
             if props.show_quality {
-                div { class: "border-t border-white/5" }
+                div { class: "border-t border-beet-border-subtle" }
                 div { class: "px-3 py-2",
-                    p { class: "text-[10px] font-mono text-gray-600 italic", "Quality: auto" }
+                    p { class: "text-[10px] tabular-nums-mono text-beet-text-tertiary italic", "Quality: auto" }
                 }
             }
         }

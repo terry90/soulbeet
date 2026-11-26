@@ -188,7 +188,7 @@ pub fn TrackRow(
     let row_surface = if is_offline_unavailable {
         "opacity-[0.42] bg-transparent cursor-not-allowed"
     } else if is_playing {
-        "bg-beet-surface-low border-beet-leaf-solid/25"
+        "bg-beet-surface-low border-beet-leaf-solid/25 hover:bg-beet-surface-high/60"
     } else if is_unowned_idle {
         "opacity-[0.78] hover:opacity-100 hover:bg-beet-surface-low"
     } else {

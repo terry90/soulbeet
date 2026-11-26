@@ -22,7 +22,7 @@ pub fn RowAction(props: RowActionProps) -> Element {
     };
     rsx! {
         button {
-            class: "text-xs font-mono px-2 py-1 rounded border border-white/10 text-gray-300 enabled:hover:border-beet-accent/50 enabled:hover:text-white transition-colors disabled:opacity-50 {cursor}",
+            class: "text-xs font-medium px-2.5 py-1 rounded-[8px] bg-beet-surface border border-beet-border-default text-beet-text-secondary enabled:hover:bg-beet-surface-high enabled:hover:border-beet-border-strong enabled:hover:text-beet-text-primary transition-colors disabled:opacity-50 {cursor}",
             disabled: props.busy || props.disabled,
             aria_busy: props.busy,
             onclick: move |evt: Event<MouseData>| {

@@ -114,33 +114,34 @@ fn AppList(
 
     rsx! {
         if apps.is_empty() {
-            p { class: "text-sm font-mono text-gray-300",
+            p { class: "text-sm text-beet-text-secondary leading-relaxed",
                 "No app is connected. Add {origin}/mcp as a remote MCP server in your AI assistant to connect one."
             }
         } else {
-            ul { class: "space-y-2",
+            ul { class: "space-y-2.5",
                 for app in apps {
                     ListRow { key: "{app.grant_id}",
-                        div { class: "flex justify-between items-start flex-wrap gap-2",
-                            div { class: "text-sm font-mono text-gray-300 space-y-1",
+                        div { class: "flex justify-between items-start flex-wrap gap-3",
+                            div { class: "text-sm text-beet-text-secondary space-y-1",
                                 div {
-                                    span { class: "font-bold text-white font-display", "{app.app_host}" }
+                                    span { class: "font-semibold text-beet-text-primary font-display", "{app.app_host}" }
                                     if let Some(owner) = &app.owner {
-                                        span { class: "text-gray-500 ml-2", "({owner})" }
+                                        span { class: "text-xs text-beet-text-tertiary ml-2", "({owner})" }
                                     }
                                 }
                                 if let Some(name) = &app.client_name {
-                                    div { class: "text-xs text-gray-400", "It calls itself \"{name}\"." }
+                                    div { class: "text-xs text-beet-text-secondary", "It calls itself \"{name}\"." }
                                 }
-                                div { class: "text-xs text-gray-400",
+                                div { class: "text-xs tabular-nums-mono text-beet-text-tertiary",
                                     match app.last_used_at {
                                         Some(at) => format!("Last used {}", utc_time(at, "%Y-%m-%d")),
                                         None => "Never used".to_string(),
                                     }
                                 }
                                 if app.mine {
-                                    label { class: "flex items-center gap-2 text-xs cursor-pointer",
+                                    label { class: "flex items-center gap-2 pt-1 text-xs text-beet-text-secondary cursor-pointer",
                                         input {
+                                            class: "accent-beet-leaf-solid",
                                             r#type: "checkbox",
                                             checked: app.allow_delete,
                                             // A box being saved fires no click, so a second click

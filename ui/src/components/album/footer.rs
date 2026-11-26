@@ -11,7 +11,7 @@ pub struct Props {
 #[component]
 pub fn AlbumFooter(props: Props) -> Element {
     rsx! {
-      div { class: "p-4 border-t border-white/10 mt-auto",
+      div { class: "p-4 border-t border-beet-border-subtle mt-auto",
         Button {
           class: "w-full",
           disabled: props.is_selection_empty,

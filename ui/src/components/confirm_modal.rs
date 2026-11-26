@@ -16,21 +16,21 @@ pub struct ConfirmModalProps {
 #[component]
 pub fn ConfirmModal(props: ConfirmModalProps) -> Element {
     let confirm_class = if props.danger {
-        "px-3 py-1.5 text-sm font-mono rounded bg-red-900/50 text-red-400 hover:bg-red-800/50 cursor-pointer"
+        "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-solid/40 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white transition-colors cursor-pointer"
     } else {
-        "retro-btn rounded text-sm"
+        "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer"
     };
 
     rsx! {
         Modal {
             on_close: move |_| props.on_cancel.call(()),
             header: rsx! {
-                h2 { class: "text-lg font-bold text-white font-display", "Confirm" }
+                h2 { class: "text-base font-semibold text-beet-text-primary font-display", "Confirm" }
             },
-            p { class: "text-gray-300 text-sm font-mono mb-4", "{props.message}" }
-            div { class: "flex justify-end gap-2",
+            p { class: "text-beet-text-secondary text-sm leading-relaxed mb-5", "{props.message}" }
+            div { class: "flex justify-end gap-2.5",
                 button {
-                    class: "px-3 py-1.5 text-sm font-mono text-gray-400 hover:text-white transition-colors cursor-pointer",
+                    class: "px-4 py-2 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer",
                     onclick: move |_| props.on_cancel.call(()),
                     "Cancel"
                 }

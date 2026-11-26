@@ -27,33 +27,33 @@ pub fn InlineTrackPanel(props: Props) -> Element {
 
     rsx! {
         div {
-            class: "border-t border-white/10 bg-beet-dark/50 p-4",
+            class: "border-t border-beet-border-subtle bg-beet-surface-low rounded-b-[12px] p-3",
 
             match &props.tracks {
                 None => rsx! {
                     for width in SKELETON_WIDTHS {
                         div {
                             class: "flex items-center gap-3 p-2",
-                            div { class: "w-6 h-4 bg-white/5 rounded animate-pulse" }
+                            div { class: "w-6 h-4 bg-beet-surface-high rounded animate-pulse" }
                             div {
-                                class: "flex-grow h-4 bg-white/5 rounded animate-pulse",
+                                class: "flex-grow h-4 bg-beet-surface-high rounded animate-pulse",
                                 style: "max-width: {width}%",
                             }
-                            div { class: "w-10 h-4 bg-white/5 rounded animate-pulse" }
-                            div { class: "w-5 h-5 bg-white/5 rounded-full animate-pulse" }
+                            div { class: "w-10 h-4 bg-beet-surface-high rounded animate-pulse" }
+                            div { class: "w-5 h-5 bg-beet-surface-high rounded-full animate-pulse" }
                         }
                     }
                 },
                 Some(tracks) if tracks.is_empty() => rsx! {
                     p {
-                        class: "text-sm text-gray-500 font-mono text-center py-4",
+                        class: "text-[13px] text-beet-text-tertiary text-center py-4",
                         "No tracks found for this album."
                     }
                 },
                 Some(tracks) => {
                     rsx! {
                         div {
-                            class: "max-h-[400px] overflow-y-auto space-y-0.5",
+                            class: "max-h-[400px] overflow-y-auto studio-scrollbar space-y-0.5",
                             for (idx, track) in tracks.iter().enumerate() {
                                 {
                                     let dl_state = if !has_folders {

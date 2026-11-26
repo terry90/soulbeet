@@ -17,12 +17,12 @@ pub struct Props {
 #[component]
 pub fn TrackList(props: Props) -> Element {
     rsx! {
-      ul { class: "list-none p-4 space-y-2 overflow-y-auto",
+      ul { class: "list-none p-4 space-y-2 overflow-y-auto studio-scrollbar",
         li {
-          class: "flex items-center gap-3 p-2 rounded-md cursor-pointer hover:bg-white/10 transition-colors",
+          class: "flex items-center gap-3 px-3 py-2 rounded-[8px] cursor-pointer hover:bg-beet-surface-high transition-colors",
           onclick: move |_| props.on_toggle_select_all.call(()),
           Checkbox { is_selected: props.all_selected }
-          span { class: "font-bold text-white font-mono text-sm", "Select / Deselect All" }
+          span { class: "font-semibold text-beet-text-primary text-[13px]", "Select / Deselect All" }
         }
         for track in props.tracks.read().iter() {
           TrackItem {

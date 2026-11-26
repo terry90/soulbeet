@@ -225,10 +225,18 @@ impl DiscoveryTrackRow {
     }
 
     pub async fn update_song_id(id: &str, song_id: &str) -> Result<(), String> {
+        Self::update_song_id_in(&DB, id, song_id).await
+    }
+
+    pub(crate) async fn update_song_id_in(
+        db: &sqlx::SqlitePool,
+        id: &str,
+        song_id: &str,
+    ) -> Result<(), String> {
         sqlx::query("UPDATE discovery_tracks SET song_id = ? WHERE id = ?")
             .bind(song_id)
             .bind(id)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

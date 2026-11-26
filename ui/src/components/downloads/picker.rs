@@ -159,12 +159,12 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                         let on_enter = choice.clone();
                         let id_label = id_label(choices.kind);
                         rsx! {
-                            div { class: "mt-2 space-y-2",
+                            div { class: "mt-2 p-2.5 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle space-y-2.5",
                                 if list.is_empty() {
-                                    p { class: "text-xs font-mono text-gray-500", "beets found no matches." }
+                                    p { class: "text-[12px] tabular-nums-mono text-beet-text-tertiary", "beets found no matches." }
                                 } else {
                                     ChoiceList {
-                                        class: "max-h-80 overflow-y-auto",
+                                        class: "max-h-80 overflow-y-auto studio-scrollbar",
                                         name: "matches-{props.item}",
                                         label: "Matches beets found",
                                         choices: list,
@@ -176,7 +176,7 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                                     }
                                 }
                                 TextInput {
-                                    class: "text-sm placeholder-gray-600",
+                                    class: "text-[13px] rounded-[8px] text-beet-text-primary placeholder:text-beet-text-disabled tabular-nums-mono",
                                     placeholder: id_label,
                                     aria_label: id_label,
                                     value: typed(),
@@ -209,7 +209,7 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
             }
             // Always present, so a screen reader announces the text it gets.
             p {
-                class: if notice.read().is_some() { "mt-2 text-xs font-mono text-red-400 break-words" },
+                class: if notice.read().is_some() { "mt-2 text-[12px] tabular-nums-mono text-beet-crimson-text break-words" },
                 role: "status",
                 aria_live: "polite",
                 if let Some(text) = notice() {

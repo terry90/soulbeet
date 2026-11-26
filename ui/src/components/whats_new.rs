@@ -26,13 +26,13 @@ pub fn WhatsNew(props: WhatsNewProps) -> Element {
         Modal {
             on_close: move |_| on_close.call(()),
             header: rsx! {
-                h2 { class: "text-xs font-mono uppercase tracking-widest text-gray-400", "What's new in Soulbeet" }
+                h2 { class: "text-sm font-semibold text-beet-text-primary font-display", "What's new in Soulbeet" }
             },
             footer: rsx! {
                 div { class: "flex flex-wrap items-center gap-x-4 gap-y-3",
                     if let Some(link) = &newest.link {
                         a {
-                            class: "inline-flex items-center gap-1.5 py-2 -my-2 text-xs font-mono text-gray-300 hover:text-beet-leaf underline decoration-dotted underline-offset-4 transition-colors",
+                            class: "inline-flex items-center gap-1.5 py-2 -my-2 text-xs font-medium text-beet-text-secondary hover:text-beet-leaf-text underline decoration-dotted underline-offset-4 transition-colors",
                             href: "{link.url}",
                             target: "_blank",
                             rel: "noopener noreferrer",
@@ -46,14 +46,14 @@ pub fn WhatsNew(props: WhatsNewProps) -> Element {
                                 path {
                                     stroke_linecap: "round",
                                     stroke_linejoin: "round",
-                                    stroke_width: "2",
+                                    stroke_width: "1.75",
                                     d: "M14 5h5v5M19 5l-8 8M10 5H6a1 1 0 00-1 1v12a1 1 0 001 1h12a1 1 0 001-1v-4",
                                 }
                             }
                         }
                     }
                     button {
-                        class: "retro-btn rounded ml-auto",
+                        class: "ml-auto px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer",
                         onclick: move |_| on_close.call(()),
                         "Got it"
                     }
@@ -61,8 +61,8 @@ pub fn WhatsNew(props: WhatsNewProps) -> Element {
             },
             ReleaseCard { section: newest.clone() }
             if !earlier.is_empty() {
-                div { class: "mt-6 pt-4 border-t border-white/10",
-                    h3 { class: "text-[10px] font-mono uppercase tracking-widest text-gray-400",
+                div { class: "mt-6 pt-4 border-t border-beet-border-subtle",
+                    h3 { class: "text-[11px] tabular-nums-mono uppercase tracking-wider text-beet-text-tertiary",
                         "Earlier releases"
                     }
                     for section in earlier {
@@ -83,16 +83,16 @@ fn ReleaseLabel(release: Option<Release>) -> Element {
             let iso = format!("{:04}-{:02}-{:02}", date.year, date.month, date.day);
             rsx! {
                 div { class: "flex flex-wrap items-center gap-2",
-                    span { class: "px-2 py-0.5 rounded-full border border-beet-leaf/30 bg-beet-leaf/10 text-beet-leaf text-[11px] font-mono tracking-wider",
+                    span { class: "px-2.5 py-0.5 rounded-full border border-beet-leaf-solid/25 bg-beet-leaf-surface text-beet-leaf-text text-[11px] tabular-nums-mono font-semibold tracking-wider",
                         "v{release.version}"
                     }
-                    time { class: "text-[11px] font-mono text-gray-400", datetime: "{iso}", "{date}" }
+                    time { class: "text-[11px] tabular-nums-mono text-beet-text-tertiary", datetime: "{iso}", "{date}" }
                 }
             }
         }
         None => rsx! {
             div { class: "flex",
-                span { class: "px-2 py-0.5 rounded-full border border-beet-accent/40 bg-beet-accent/10 text-beet-accent text-[11px] font-mono tracking-wider",
+                span { class: "px-2.5 py-0.5 rounded-full border border-beet-accent-solid/35 bg-beet-accent-surface text-beet-accent-text text-[11px] tabular-nums-mono font-semibold tracking-wider",
                     "{NEXT_RELEASE}"
                 }
             }
@@ -104,24 +104,24 @@ fn ReleaseLabel(release: Option<Release>) -> Element {
 fn ReleaseCard(section: Section) -> Element {
     rsx! {
         ReleaseLabel { release: section.release }
-        h3 { class: "mt-3 text-xl sm:text-2xl font-bold font-display text-white leading-tight",
+        h3 { class: "mt-3 text-xl sm:text-2xl font-bold font-display text-beet-text-primary leading-tight tracking-tight",
             RichText { text: section.headline }
         }
-        p { class: "mt-2 text-sm text-gray-300 leading-relaxed",
+        p { class: "mt-2 text-sm text-beet-text-secondary leading-relaxed",
             RichText { text: section.intro }
         }
         ul { class: "mt-5 space-y-3", role: "list",
             for highlight in section.highlights {
                 li { class: "flex gap-3",
                     span {
-                        class: "mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-beet-leaf shadow-[0_0_6px_rgba(0,255,157,0.7)]",
+                        class: "mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-beet-leaf-solid",
                         aria_hidden: "true",
                     }
                     div { class: "min-w-0",
-                        p { class: "text-sm font-semibold text-white",
+                        p { class: "text-sm font-semibold text-beet-text-primary",
                             RichText { text: highlight.title }
                         }
-                        p { class: "text-sm text-gray-400 leading-relaxed",
+                        p { class: "text-sm text-beet-text-secondary leading-relaxed",
                             RichText { text: highlight.text }
                         }
                     }
@@ -137,20 +137,20 @@ fn CompactRelease(section: Section) -> Element {
     rsx! {
         div { class: "mt-4",
             ReleaseLabel { release: section.release }
-            h4 { class: "mt-1.5 text-sm font-semibold font-display text-white",
+            h4 { class: "mt-1.5 text-sm font-semibold font-display text-beet-text-primary",
                 RichText { text: section.headline }
             }
-            ul { class: "mt-1 space-y-0.5", role: "list",
+            ul { class: "mt-1.5 space-y-1", role: "list",
                 for highlight in section.highlights {
-                    li { class: "flex gap-2 text-xs text-gray-400",
-                        span { class: "mt-1.5 h-1 w-1 shrink-0 rounded-full bg-gray-500", aria_hidden: "true" }
+                    li { class: "flex gap-2 text-xs text-beet-text-secondary",
+                        span { class: "mt-1.5 h-1 w-1 shrink-0 rounded-full bg-beet-text-tertiary", aria_hidden: "true" }
                         span { RichText { text: highlight.title } }
                     }
                 }
             }
             if let Some(link) = section.link {
                 a {
-                    class: "-mt-1 -mb-2 inline-block py-2 text-xs font-mono text-gray-400 hover:text-beet-leaf underline decoration-dotted underline-offset-4 transition-colors",
+                    class: "-mt-1 -mb-2 inline-block py-2 text-xs font-medium text-beet-text-tertiary hover:text-beet-leaf-text underline decoration-dotted underline-offset-4 transition-colors",
                     href: "{link.url}",
                     target: "_blank",
                     rel: "noopener noreferrer",
@@ -168,7 +168,7 @@ fn RichText(text: Text) -> Element {
             match span {
                 Span::Plain(words) => rsx! { "{words}" },
                 Span::Code(code) => rsx! {
-                    code { class: "font-mono text-[0.85em] px-1 py-0.5 rounded bg-black/30 text-beet-leaf/90 break-words",
+                    code { class: "tabular-nums-mono text-[0.85em] px-1.5 py-0.5 rounded-[6px] bg-beet-sunken border border-beet-border-subtle text-beet-leaf-text break-words",
                         "{code}"
                     }
                 },

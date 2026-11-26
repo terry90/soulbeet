@@ -7,7 +7,7 @@ use super::panel::{utc_time, LoadError, Loading, Panel, SectionTitle};
 use crate::auth::use_auth;
 use crate::friendly_error;
 
-const CELL_CLASS: &str = "px-2 py-1 align-top";
+const CELL_CLASS: &str = "px-2.5 py-2 align-top";
 
 /// Admin-only panel: the address Soulful derives for the page's own request,
 /// what keeps MCP clients from connecting there, and the latest connection
@@ -41,32 +41,34 @@ pub fn RemoteAccessPanel() -> Element {
 #[component]
 fn RemoteAccessView(access: RemoteAccess) -> Element {
     rsx! {
-        div { class: "text-sm font-mono text-gray-300 space-y-1 mb-4",
+        div { class: "text-sm text-beet-text-primary space-y-1 mb-4",
             match (&access.derived_base, &access.base_problem) {
                 (Some(base), _) => rsx! { p { "Soulbeet sees this page's request at {base}" } },
                 (None, Some(problem)) => rsx! {
-                    p { class: "text-red-400", "Soulbeet cannot tell this page's address: {problem}" }
+                    p { class: "text-beet-crimson-text", "Soulbeet cannot tell this page's address: {problem}" }
                 },
                 (None, None) => rsx! {},
             }
-            p { class: "text-xs text-gray-400",
+            p { class: "text-xs tabular-nums-mono text-beet-text-tertiary",
                 "host from {access.host_from}, scheme from {access.scheme_from}"
             }
         }
-        ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400 mb-6",
-            for line in access.advice {
-                li { "{line}" }
+        if !access.advice.is_empty() {
+            ul { class: "list-disc pl-5 space-y-1.5 text-sm text-beet-gold mb-6",
+                for line in access.advice {
+                    li { "{line}" }
+                }
             }
         }
         SectionTitle { title: "Latest connection requests" }
         if access.recent.is_empty() {
-            p { class: "text-gray-500 font-mono italic",
+            p { class: "text-xs text-beet-text-tertiary italic",
                 "No request has reached the connection paths since Soulbeet started."
             }
         } else {
-            div { class: "overflow-x-auto",
-                table { class: "w-full text-xs font-mono text-gray-300 text-left",
-                    thead { class: "text-gray-400 uppercase tracking-wider",
+            div { class: "overflow-x-auto rounded-[12px] bg-beet-surface border border-beet-border-subtle",
+                table { class: "w-full text-xs tabular-nums-mono text-beet-text-secondary text-left",
+                    thead { class: "text-[11px] text-beet-text-tertiary uppercase tracking-wider bg-beet-sunken/40 border-b border-beet-border-subtle",
                         tr {
                             for heading in ["Time (UTC)", "Request", "Address", "From", "Headers", "Status"] {
                                 th { class: CELL_CLASS, "{heading}" }
@@ -107,9 +109,9 @@ fn RequestRow(request: LoggedRequest) -> Element {
     };
 
     rsx! {
-        tr { class: "border-t border-white/5",
-            td { class: "{CELL_CLASS} whitespace-nowrap", "{time}" }
-            td { class: "{CELL_CLASS} break-all", "{request.method} {request.path}" }
+        tr { class: "border-t border-beet-border-subtle",
+            td { class: "{CELL_CLASS} whitespace-nowrap text-beet-text-tertiary", "{time}" }
+            td { class: "{CELL_CLASS} break-all text-beet-text-primary", "{request.method} {request.path}" }
             td { class: "{CELL_CLASS} break-all", "{address}" }
             td { class: CELL_CLASS, "host from {request.host_from}, scheme from {request.scheme_from}" }
             td { class: "{CELL_CLASS} break-all",
@@ -120,7 +122,7 @@ fn RequestRow(request: LoggedRequest) -> Element {
             td { class: CELL_CLASS,
                 "{status}"
                 if let Some(refusal) = &request.refusal {
-                    div { class: "text-yellow-400", "{refusal}" }
+                    div { class: "text-beet-gold mt-0.5", "{refusal}" }
                 }
             }
         }

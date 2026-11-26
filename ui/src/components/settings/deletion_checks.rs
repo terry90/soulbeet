@@ -56,7 +56,7 @@ pub fn DeletionChecksPanel() -> Element {
 fn MusicPathProblem(problem: Option<String>) -> Element {
     rsx! {
         if let Some(problem) = problem {
-            p { class: "text-sm font-mono text-yellow-400 mb-4", "{problem}" }
+            p { class: "px-3.5 py-2.5 rounded-[10px] bg-beet-gold-surface border border-beet-gold/25 text-sm text-beet-gold mb-4", "{problem}" }
         }
     }
 }
@@ -66,11 +66,11 @@ fn KeptList(kept: Vec<BlockedDeletion>) -> Element {
     rsx! {
         SectionTitle { title: "Kept by auto-delete" }
         if kept.is_empty() {
-            p { class: "text-sm font-mono text-gray-300 mb-4",
+            p { class: "text-sm text-beet-text-secondary mb-5",
                 "Auto-delete is not keeping any track."
             }
         } else {
-            ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400 mb-4",
+            ul { class: "list-disc pl-5 space-y-1.5 text-sm text-beet-gold mb-5",
                 for row in kept {
                     li { "{row.title} - {row.artist}: {row.message}" }
                 }
@@ -84,14 +84,14 @@ fn UnreadableList(listeners: Vec<UnreadableListener>) -> Element {
     rsx! {
         SectionTitle { title: "Accounts Soulbeet cannot read" }
         if listeners.is_empty() {
-            p { class: "text-sm font-mono text-gray-300",
+            p { class: "text-sm text-beet-text-secondary",
                 "Soulbeet can read every linked account."
             }
         } else {
-            p { class: "text-sm font-mono text-gray-300 mb-3",
+            p { class: "text-sm text-beet-text-secondary mb-3",
                 "While an account cannot be read, no file it might have rated is deleted."
             }
-            ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400",
+            ul { class: "list-disc pl-5 space-y-1.5 text-sm text-beet-gold",
                 for l in listeners {
                     li { "{l.username}: {l.error} (since {l.since})" }
                 }

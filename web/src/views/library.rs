@@ -2,9 +2,11 @@
 //! Pending Discovery tracks, and Library Stats overview.
 
 use dioxus::prelude::*;
+use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
-    dashboard::StatsOverview, use_player, IconDisc3, IconListMusic, IconLoader, IconPlay,
-    OfflineTogglePill, PlayerTrack, TrackRow, TrackRowState,
+    dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconDisc3,
+    IconListMusic, IconLoader, IconPlay, IconRefreshCw, OfflineTogglePill, PlayerTrack, TrackRow,
+    TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -124,12 +126,12 @@ pub fn LibraryPage() -> Element {
             // Header + Offline Switch + Category Tabs
             div { class: "flex flex-wrap items-center justify-between gap-3",
                 div { class: "flex flex-wrap items-center gap-2",
-                    for (tab, label) in [
-                        (LibraryTab::Playlists, "Playlists"),
-                        (LibraryTab::Albums, "Albums"),
-                        (LibraryTab::Starred, "Starred"),
-                        (LibraryTab::Discovery, "Discovery"),
-                        (LibraryTab::Stats, "Stats"),
+                    for (tab, label, badge) in [
+                        (LibraryTab::Playlists, "Playlists", (!playlists.is_empty()).then_some(playlists.len())),
+                        (LibraryTab::Albums, "Albums", (!albums.is_empty()).then_some(albums.len())),
+                        (LibraryTab::Starred, "Starred", (!starred.is_empty()).then_some(starred.len())),
+                        (LibraryTab::Discovery, "Discovery", (!triage.is_empty()).then_some(triage.len())),
+                        (LibraryTab::Stats, "Stats", None),
                     ] {
                         {
                             let active = active_tab() == tab;
@@ -142,12 +144,17 @@ pub fn LibraryPage() -> Element {
                                 button {
                                     key: "{label}",
                                     r#type: "button",
-                                    class: "h-9 px-4 rounded-full border text-[13px] font-medium transition-colors cursor-pointer {cls}",
+                                    class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full border text-[13px] font-medium transition-colors cursor-pointer {cls}",
                                     onclick: move |_| {
                                         active_tab.set(tab);
                                         detail_title.set(None);
                                     },
-                                    "{label}"
+                                    span { "{label}" }
+                                    if let Some(count) = badge {
+                                        span { class: "tabular-nums-mono text-[11px] opacity-75",
+                                            "{count}"
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -423,14 +430,106 @@ pub fn LibraryPage() -> Element {
 #[component]
 fn LibraryStatsPanel() -> Element {
     let auth = use_auth();
-    let stats_resource = use_resource(move || async move { auth.call(api::get_library_stats()).await });
-    let binding = stats_resource.read();
+    let player = use_player();
+    let mut studio = use_studio();
+
+    let mut refreshing = use_signal(|| false);
+    let mut stats_state: Signal<Option<Result<LibraryStats, String>>> = use_signal(|| None);
+
+    let fetch_stats = use_callback(move |()| {
+        refreshing.set(true);
+        spawn(async move {
+            let res = auth
+                .call(api::get_library_stats())
+                .await
+                .map_err(|e| friendly_error(&e));
+            stats_state.set(Some(res));
+            refreshing.set(false);
+        });
+    });
+
+    use_effect(move || {
+        if stats_state.peek().is_none() {
+            fetch_stats.call(());
+        }
+    });
+
+    let on_play_track = use_callback(move |clicked: TopPlayedTrack| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active: remote playback is unavailable.");
+            return;
+        }
+        let nav = studio.navidrome_info();
+        let top_tracks: Vec<TopPlayedTrack> = stats_state
+            .peek()
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .map(|s| s.top_played_tracks.clone())
+            .unwrap_or_else(|| vec![clicked.clone()]);
+
+        let start_idx = top_tracks
+            .iter()
+            .position(|t| t.song_id == clicked.song_id)
+            .unwrap_or(0);
+
+        let queue: Vec<PlayerTrack> = top_tracks
+            .into_iter()
+            .map(|t| {
+                let cover = nav
+                    .as_ref()
+                    .map(|info| subsonic_cover_art_url(info, &t.song_id, 256));
+                let mut track = PlayerTrack {
+                    id: t.song_id.clone(),
+                    title: t.title,
+                    artist: t.artist,
+                    album: (!t.album.is_empty()).then_some(t.album),
+                    cover_art_url: cover,
+                    cover_art_id: Some(t.song_id),
+                    duration_secs: t.duration,
+                    rating: t.rating.unwrap_or(0).min(5),
+                    ..Default::default()
+                };
+                studio.apply_curation_overrides(&mut track);
+                track
+            })
+            .collect();
+
+        if !queue.is_empty() {
+            player.play_queue(queue, start_idx);
+        }
+    });
+
+    let culture = studio.culture_profile.read().clone();
+    let pending_triage = studio.visible_triage_tracks().len();
+    let binding = stats_state.read();
 
     match &*binding {
-        Some(Ok(stats)) => rsx! { StatsOverview { stats: stats.clone() } },
-        Some(Err(_)) => rsx! {
-            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-center text-[13px] text-beet-text-secondary",
-                "Could not load library stats. Check Navidrome connection in Settings."
+        Some(Ok(stats)) => rsx! {
+            StatsOverview {
+                stats: stats.clone(),
+                culture: Some(culture),
+                pending_triage: Some(pending_triage),
+                on_play_track,
+                on_refresh: move |_| fetch_stats.call(()),
+                refreshing: refreshing(),
+            }
+        },
+        Some(Err(err)) => rsx! {
+            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-center space-y-3",
+                p { class: "text-[13px] text-beet-text-secondary",
+                    "Could not load library stats: {err}"
+                }
+                button {
+                    r#type: "button",
+                    disabled: refreshing(),
+                    class: "inline-flex items-center gap-1.5 h-8 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] font-medium text-beet-text-primary hover:bg-beet-surface-highest disabled:opacity-50 transition-colors cursor-pointer",
+                    onclick: move |_| fetch_stats.call(()),
+                    IconRefreshCw {
+                        size: 13,
+                        class: if refreshing() { "animate-spin motion-reduce:animate-none".to_string() } else { String::new() },
+                    }
+                    span { if refreshing() { "Retrying…" } else { "Retry" } }
+                }
             }
         },
         None => rsx! {

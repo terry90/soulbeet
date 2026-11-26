@@ -3,7 +3,7 @@ use shared::system::NavidromeStatus;
 
 use super::backends::BackendSwitches;
 use super::connection_status_row::{beets_row, ConnectionStatusRow, ImporterDetails};
-use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS};
+use super::panel::{LoadError, Loading, Messages, Panel, LABEL_CLASS, PRIMARY_BUTTON_CLASS};
 use crate::friendly_error;
 use crate::{use_auth, use_system_health, FieldKind, TextInput, NOT_LINKED_HINT};
 
@@ -59,7 +59,7 @@ pub fn AppConfigManager() -> Element {
             div { class: "space-y-6 mb-6",
                 // Soulseek
                 div {
-                    h3 { class: "text-sm font-semibold text-white mb-3", "Soulseek (slskd)" }
+                    h3 { class: "text-sm font-semibold text-beet-text-primary mb-3", "Soulseek (slskd)" }
                     div { class: "space-y-4",
                         div {
                             label { class: LABEL_CLASS, "slskd URL" }
@@ -67,6 +67,7 @@ pub fn AppConfigManager() -> Element {
                                 value: slskd_url(),
                                 oninput: move |v| slskd_url.set(v),
                                 placeholder: "http://localhost:5030",
+                                class: "tabular-nums-mono",
                             }
                         }
                         div {
@@ -83,7 +84,7 @@ pub fn AppConfigManager() -> Element {
             }
 
             button {
-                class: "retro-btn rounded",
+                class: PRIMARY_BUTTON_CLASS,
                 disabled: saving(),
                 onclick: handle_save,
                 if saving() { "Saving..." } else { "Save Configuration" }
@@ -102,14 +103,14 @@ pub fn ConnectionStatusPanel() -> Element {
 
     rsx! {
         Panel { title: "Status",
-            div { class: "space-y-6",
+            div { class: "space-y-4",
                 {
                     let (dot_class, summary) = match auth.navidrome_status() {
-                        NavidromeStatus::Connected => ("bg-blue-400", "Connected"),
-                        NavidromeStatus::InvalidCredentials => ("bg-beet-accent", "User not found in Navidrome"),
-                        NavidromeStatus::Offline => ("bg-gray-500", "Server unreachable"),
-                        NavidromeStatus::NotLinked => ("bg-beet-accent", NOT_LINKED_HINT),
-                        NavidromeStatus::Unknown => ("bg-gray-500", "Not configured"),
+                        NavidromeStatus::Connected => ("bg-beet-leaf-solid", "Connected"),
+                        NavidromeStatus::InvalidCredentials => ("bg-beet-gold", "User not found in Navidrome"),
+                        NavidromeStatus::Offline => ("bg-beet-text-tertiary", "Server unreachable"),
+                        NavidromeStatus::NotLinked => ("bg-beet-gold", NOT_LINKED_HINT),
+                        NavidromeStatus::Unknown => ("bg-beet-text-tertiary", "Not configured"),
                     };
                     rsx! {
                         ConnectionStatusRow {
