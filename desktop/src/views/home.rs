@@ -17,15 +17,16 @@ pub fn HomeView() -> Element {
     let mut studio = use_desktop_studio();
     let player = use_player();
     let offline_only = player.offline_only();
-    let rev = (studio.library_revision)();
-    let core_opt = studio.core.read().clone();
 
+    // All reactive reads happen INSIDE `use_resource` so Dioxus tracks `core`,
+    // `library_revision`, and `offline_only` automatically!
     let snapshot = use_resource(move || {
-        let core = core_opt.clone();
-        let _rev = rev;
+        let core = studio.core.read().clone();
+        let _rev = (studio.library_revision)();
+        let offline = player.offline_only();
         async move {
             match core {
-                Some(c) => load_home_snapshot(&c, offline_only).await,
+                Some(c) => load_home_snapshot(&c, offline).await,
                 None => HomeSnapshot::default(),
             }
         }
@@ -102,6 +103,7 @@ pub fn HomeView() -> Element {
                                 let album_id = album.id.clone();
                                 let album_id_pin = album.id.clone();
                                 let album_name = album.name.clone();
+                                let album_name_play = album.name.clone();
                                 let art_url = desktop_cover_art_url(album.cover_art_id.as_deref());
                                 rsx! {
                                     div {
@@ -112,12 +114,11 @@ pub fn HomeView() -> Element {
                                             class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center cursor-pointer",
                                             onclick: move |_| {
                                                 let aid = album_id.clone();
+                                                let label = album_name_play.clone();
                                                 if let Some(core) = studio.core.peek().clone() {
                                                     spawn(async move {
                                                         let tracks = load_tracks_for_album(&core, &aid).await;
-                                                        if !tracks.is_empty() {
-                                                            player.play_queue(tracks, 0);
-                                                        }
+                                                        studio.play_collection(player, tracks, 0, &label);
                                                     });
                                                 }
                                             },
@@ -182,7 +183,7 @@ pub fn HomeView() -> Element {
                                     button {
                                         r#type: "button",
                                         class: "inline-flex items-center gap-1.5 h-8 px-3.5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[12px] font-semibold cursor-pointer",
-                                        onclick: move |_| player.play_queue(tracks_play.clone(), 0),
+                                        onclick: move |_| studio.play_collection(player, tracks_play.clone(), 0, "Starred Favorites"),
                                         IconPlay { size: 12, filled: true }
                                         span { "Play All" }
                                     }

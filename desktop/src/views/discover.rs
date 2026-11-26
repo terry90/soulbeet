@@ -1,5 +1,6 @@
 //! Desktop Studio Discover & Triage View — Pending Discovery queue with 1-click Keep / Drop
-//! (5-second Undo via `DesktopStudio`), Seasonal Hero card, and Taste DNA summary.
+//! (5-second Undo via `DesktopStudio`), Seasonal Hero card with real server steering, and
+//! Taste DNA populated from `ClientBootstrap` + local SQLite top genres fallback.
 
 use client_core::models::PinTarget;
 use dioxus::prelude::*;
@@ -9,7 +10,8 @@ use ui::{
 };
 
 use crate::desktop_state::{
-    load_pending_discovery_tracks, load_tracks_for_playlist, use_desktop_studio,
+    load_local_top_genres, load_pending_discovery_tracks, load_tracks_for_playlist,
+    use_desktop_studio,
 };
 
 #[component]
@@ -17,26 +19,29 @@ pub fn DiscoverView() -> Element {
     let mut studio = use_desktop_studio();
     let player = use_player();
     let offline_only = player.offline_only();
-    let rev = (studio.library_revision)();
-    let core_opt = studio.core.read().clone();
     let mut steering = use_signal(|| CultureSteering::Balanced);
 
+    // Reactive reads INSIDE `use_resource` so triage & genres refresh automatically on sync/curation.
     let pending_res = use_resource(move || {
-        let core = core_opt.clone();
-        let _rev = rev;
+        let core = studio.core.read().clone();
+        let _rev = (studio.library_revision)();
+        let offline = player.offline_only();
         async move {
             match core {
-                Some(c) => load_pending_discovery_tracks(&c, offline_only).await,
-                None => Vec::new(),
+                Some(c) => {
+                    let tracks = load_pending_discovery_tracks(&c, offline).await;
+                    let genres = load_local_top_genres(&c).await;
+                    (tracks, genres)
+                }
+                None => (Vec::new(), Vec::new()),
             }
         }
     });
 
+    let (raw_tracks, local_genres) = pending_res.read().clone().unwrap_or_default();
+
     let drops_queue = studio.pending_drops.read();
-    let visible_tracks: Vec<_> = pending_res
-        .read()
-        .clone()
-        .unwrap_or_default()
+    let visible_tracks: Vec<_> = raw_tracks
         .into_iter()
         .filter(|t| {
             !drops_queue.is_hidden(&t.id)
@@ -61,18 +66,36 @@ pub fn DiscoverView() -> Element {
     let current_id = player.current_track().map(|t| t.id);
     let is_playing = player.is_playing();
 
+    let boot_culture = studio
+        .bootstrap
+        .read()
+        .as_ref()
+        .and_then(|b| b.active_culture_profile.clone());
+    let base_ratio = boot_culture
+        .as_ref()
+        .map(|c| c.local_culture_ratio)
+        .unwrap_or(0.45);
+    let local_code = boot_culture
+        .as_ref()
+        .map(|c| c.home_country.clone())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "LOCAL".to_string());
     let effective_ratio = match steering() {
-        CultureSteering::MoreLocal => 0.70,
-        CultureSteering::Balanced => 0.45,
-        CultureSteering::MoreInternational => 0.20,
+        CultureSteering::MoreLocal => (base_ratio + 0.25).min(0.85),
+        CultureSteering::Balanced => base_ratio,
+        CultureSteering::MoreInternational => (base_ratio - 0.25).max(0.15),
     };
 
     let taste_profile = UserCultureProfile {
-        home_country: Some("LOCAL".into()),
-        preferred_languages: vec!["EN".into()],
+        home_country: Some(local_code.clone()),
+        preferred_languages: boot_culture
+            .as_ref()
+            .map(|c| c.primary_languages.clone())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["EN".into()]),
         local_culture_ratio: effective_ratio,
         inferred_area_weights: Vec::new(),
-        inferred_local_tags: vec!["Discovery Radar".into(), "Offline Studio".into()],
+        inferred_local_tags: Vec::new(),
     };
 
     rsx! {
@@ -86,7 +109,9 @@ pub fn DiscoverView() -> Element {
                         .slug
                         .clone()
                         .unwrap_or_else(|| seasonal.playlist.id.clone());
+                    let slug_steer = slug.clone();
                     let title = seasonal.playlist.name.clone();
+                    let title_play = title.clone();
                     let title_pin = title.clone();
                     let is_pinned = seasonal.is_pinned;
                     let count = u32::try_from(seasonal.playlist.song_count.max(0)).unwrap_or(0);
@@ -97,18 +122,17 @@ pub fn DiscoverView() -> Element {
                             window_badge: Some("SEASONAL PACK · AUTO-EXPIRES".to_string()),
                             track_count: count,
                             local_ratio: effective_ratio,
-                            local_label: "LOCAL".to_string(),
+                            local_label: local_code.clone(),
                             steering: steering(),
                             is_pinned_offline: is_pinned,
                             exclude_from_core_taste: true,
                             on_play: move |_| {
                                 let pid = pl_id.clone();
+                                let label = title_play.clone();
                                 if let Some(core) = studio.core.peek().clone() {
                                     spawn(async move {
                                         let tracks = load_tracks_for_playlist(&core, &pid).await;
-                                        if !tracks.is_empty() {
-                                            player.play_queue(tracks, 0);
-                                        }
+                                        studio.play_collection(player, tracks, 0, &label);
                                     });
                                 }
                             },
@@ -125,7 +149,10 @@ pub fn DiscoverView() -> Element {
                                     );
                                 }
                             },
-                            on_steer: move |next| steering.set(next),
+                            on_steer: move |next| {
+                                steering.set(next);
+                                studio.steer_seasonal_pack(slug_steer.clone(), next);
+                            },
                         }
                     }
                 }
@@ -141,19 +168,17 @@ pub fn DiscoverView() -> Element {
                             window_badge: Some("DISCOVERY TRIAGE · OFFLINE READY".to_string()),
                             track_count: visible_tracks.len() as u32,
                             local_ratio: effective_ratio,
-                            local_label: "LOCAL".to_string(),
+                            local_label: local_code.clone(),
                             steering: steering(),
                             is_pinned_offline: is_pinned,
                             exclude_from_core_taste: false,
                             on_play: move |_| {
                                 if !tracks_play.is_empty() {
-                                    player.play_queue(tracks_play.clone(), 0);
+                                    studio.play_collection(player, tracks_play.clone(), 0, "Weekly Radar");
                                 } else if let (Some(pid), Some(core)) = (radar_id.clone(), studio.core.peek().clone()) {
                                     spawn(async move {
                                         let tracks = load_tracks_for_playlist(&core, &pid).await;
-                                        if !tracks.is_empty() {
-                                            player.play_queue(tracks, 0);
-                                        }
+                                        studio.play_collection(player, tracks, 0, "Weekly Radar");
                                     });
                                 }
                             },
@@ -189,7 +214,7 @@ pub fn DiscoverView() -> Element {
                                 button {
                                     r#type: "button",
                                     class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 cursor-pointer",
-                                    onclick: move |_| player.play_queue(play_all.clone(), 0),
+                                    onclick: move |_| studio.play_collection(player, play_all.clone(), 0, "Discovery Triage"),
                                     IconPlay { size: 13, filled: true }
                                     span { "Triage All ({visible_tracks.len()})" }
                                 }
@@ -247,10 +272,10 @@ pub fn DiscoverView() -> Element {
                 }
             }
 
-            // Taste DNA Bar
+            // Taste DNA Bar (populated from ClientBootstrap + local SQLite top genres)
             TasteDnaBar {
                 profile: taste_profile,
-                top_genres: vec!["Lossless FLAC".into(), "Gapless Studio".into()],
+                top_genres: local_genres,
             }
         }
     }

@@ -5,8 +5,8 @@
 //! - Title, Artist, and crisp mono codec badge (`FLAC · 24/96`, `OPUS 160`)
 //! - Prev / Play-Pause / Next transport + Star toggle
 //! - 1-click context-aware Discovery `Keep` / `Drop` when a staged Discovery track plays
-//! - Slim 2px progress rail (swaps to Soulbeet `seam-light` while loading/buffering)
-//! - Restore Studio & Close buttons
+//! - Interactive seekable progress rail (swaps to Soulbeet `seam-light` while loading/buffering)
+//! - Restore Studio & Close buttons with monotonic window generation guard
 
 use dioxus::prelude::*;
 use dioxus_desktop::{Config, DesktopContext, LogicalSize, WindowBuilder};
@@ -45,25 +45,27 @@ struct MiniPlayerProps {
 }
 
 impl PartialEq for MiniPlayerProps {
-    fn eq(&self, _other: &Self) -> bool {
-        true
+    fn eq(&self, other: &Self) -> bool {
+        self.bridge.generation == other.bridge.generation
     }
 }
 
 #[component]
 fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
     let bridge = props.bridge.clone();
+    let generation = bridge.generation;
     let core_for_art = bridge.core.clone();
     use_cover_art_asset_handler(move || core_for_art.clone());
 
     let mut snapshot = use_signal(|| bridge.snapshot_rx.borrow().clone());
     let action_tx = bridge.action_tx.clone();
 
-    // Notify main window if user closes the Mini-Player via OS shortcut (Alt+F4 / Super+Q).
+    // Emit `Closed(generation)` strictly once on window teardown so rapid close/reopen
+    // never races with a newer Mini-Player window.
     {
         let tx_drop = action_tx.clone();
         use_drop(move || {
-            let _ = tx_drop.send(MiniPlayerAction::Closed);
+            let _ = tx_drop.send(MiniPlayerAction::Closed(generation));
         });
     }
 
@@ -95,7 +97,6 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
     let tx_toggle = action_tx.clone();
     let tx_next = action_tx.clone();
     let tx_restore = action_tx.clone();
-    let tx_close = action_tx.clone();
     let tx_star = action_tx.clone();
     let tx_keep = action_tx.clone();
     let tx_drop = action_tx.clone();
@@ -193,7 +194,7 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
                                 aria_label: "Close Mini-Player",
                                 class: "w-6 h-6 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface cursor-pointer transition-colors",
                                 onclick: move |_| {
-                                    let _ = tx_close.send(MiniPlayerAction::Closed);
+                                    // `use_drop` emits `Closed(generation)` once the window closes.
                                     dioxus_desktop::window().close();
                                 },
                                 IconX { size: 13 }

@@ -29,7 +29,7 @@ fi
 
 APPDIR="$REPO_ROOT/target/AppDir"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/scalable/apps"
 
 BIN_SRC="$REPO_ROOT/target/release/desktop"
 if [[ ! -f "$BIN_SRC" ]]; then
@@ -45,6 +45,10 @@ install -m 0755 "$BIN_SRC" "$APPDIR/usr/bin/soulbeet-desktop"
 install -m 0644 "$REPO_ROOT/desktop/packaging/org.soulbeet.Desktop.desktop" \
     "$APPDIR/usr/share/applications/org.soulbeet.Desktop.desktop"
 cp "$REPO_ROOT/desktop/packaging/org.soulbeet.Desktop.desktop" "$APPDIR/org.soulbeet.Desktop.desktop"
+install -m 0644 "$REPO_ROOT/desktop/packaging/org.soulbeet.Desktop.svg" \
+    "$APPDIR/usr/share/icons/hicolor/scalable/apps/org.soulbeet.Desktop.svg"
+cp "$REPO_ROOT/desktop/packaging/org.soulbeet.Desktop.svg" "$APPDIR/org.soulbeet.Desktop.svg"
+cp "$REPO_ROOT/desktop/packaging/org.soulbeet.Desktop.svg" "$APPDIR/.DirIcon"
 
 cat > "$APPDIR/AppRun" <<'EOF'
 #!/usr/bin/env bash

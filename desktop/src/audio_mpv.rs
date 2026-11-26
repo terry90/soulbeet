@@ -6,7 +6,8 @@
 //! and Navidrome OpenSubsonic HTTP range streams (`PlaybackSource::RemoteStream`) with
 //! gapless next-track preloading (`gapless-audio=yes`, `prefetch-playlist=yes`) and ReplayGain.
 
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,18 @@ use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, Format, Mpv};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+/// Forces `LC_NUMERIC=C` on Unix before initializing `libmpv`.
+///
+/// GTK3 (`dioxus-desktop`) initializes the process locale from the user's environment
+/// (e.g. `fr_FR.UTF-8`, `de_DE.UTF-8`), which causes `mpv_initialize()` to fail unless
+/// `LC_NUMERIC` is reset to `"C"`.
+pub fn ensure_c_numeric_locale() {
+    #[cfg(unix)]
+    unsafe {
+        libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+    }
+}
 
 /// ReplayGain loudness normalization mode configured in `libmpv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -161,6 +174,7 @@ pub enum MpvCommand {
     LoadTrack {
         source: MpvPlaybackSource,
         start_paused: bool,
+        start_position_secs: Option<f64>,
     },
     PrefetchNext {
         source: MpvPlaybackSource,
@@ -222,6 +236,7 @@ pub trait AudioBackend: Send + Sync {
 /// Dedicated-thread native `libmpv` audio player handle.
 pub struct MpvEngine {
     cmd_tx: mpsc::Sender<MpvCommand>,
+    shutdown_flag: Arc<AtomicBool>,
     event_rx: Option<mpsc::UnboundedReceiver<MpvEvent>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -254,20 +269,24 @@ impl MpvEngine {
 
     /// Spawns the `libmpv` worker thread with explicit initialization options.
     pub fn with_options(options: MpvInitOptions) -> Result<Self, String> {
+        ensure_c_numeric_locale();
         let (cmd_tx, cmd_rx) = mpsc::channel::<MpvCommand>(64);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<MpvEvent>();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown_flag.clone();
 
         let worker = thread::Builder::new()
             .name("soulbeet-mpv".to_string())
             .spawn(move || {
-                run_mpv_worker(options, cmd_rx, event_tx, ready_tx);
+                run_mpv_worker(options, cmd_rx, worker_shutdown, event_tx, ready_tx);
             })
             .map_err(|e| format!("failed to spawn libmpv worker thread: {e}"))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 cmd_tx,
+                shutdown_flag,
                 event_rx: Some(event_rx),
                 worker: Some(worker),
             }),
@@ -299,8 +318,10 @@ impl MpvEngine {
             .map_err(|e| format!("failed to enqueue mpv command: {e}"))
     }
 
-    /// Explicitly requests shutdown and joins the worker thread cleanly.
+    /// Explicitly requests shutdown (via lock-free `AtomicBool` + best-effort command)
+    /// and joins the worker thread cleanly without deadlocking even if the command channel is full.
     pub fn shutdown(&mut self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
         let _ = self.cmd_tx.try_send(MpvCommand::Shutdown);
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
@@ -314,13 +335,14 @@ impl Drop for MpvEngine {
     }
 }
 
-/// Formats `(name, value)` HTTP headers for `libmpv`'s `http-header-fields` option.
-/// Strips CR/LF to prevent header injection and skips empty keys.
-pub fn format_http_header_fields(headers: &[(String, String)]) -> String {
+/// Sanitizes `(name, value)` HTTP headers into individual `"Key: Value"` list entries for
+/// mpv's `change-list http-header-fields append ...` API. Strips CR/LF to prevent header
+/// injection while preserving commas inside header values (e.g. `Cookie` or `Date`).
+pub fn sanitize_http_headers(headers: &[(String, String)]) -> Vec<String> {
     headers
         .iter()
         .filter_map(|(k, v)| {
-            let key = k.replace(['\r', '\n', ','], "").trim().to_string();
+            let key = k.replace(['\r', '\n', ':'], "").trim().to_string();
             let val = v.replace(['\r', '\n'], "").trim().to_string();
             if key.is_empty() {
                 None
@@ -328,8 +350,7 @@ pub fn format_http_header_fields(headers: &[(String, String)]) -> String {
                 Some(format!("{key}: {val}"))
             }
         })
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect()
 }
 
 fn normalize_codec_label(lower: &str) -> &'static str {
@@ -353,11 +374,7 @@ fn parse_bit_depth_from_mpv_format(fmt: &str) -> Option<u8> {
     let lower = fmt.trim().to_ascii_lowercase();
     if lower.starts_with("s16") || lower.starts_with("u16") {
         Some(16)
-    } else if lower.starts_with("s24") {
-        Some(24)
-    } else if lower.starts_with("s32") || lower.starts_with("float") {
-        // libmpv frequently decodes 24-bit FLAC into s32p or floatp internally;
-        // s32 indicates high-bit-depth (>16-bit) PCM pipeline.
+    } else if lower.starts_with("s24") || lower.starts_with("s32") || lower.starts_with("float") {
         Some(24)
     } else if lower.starts_with("u8") || lower.starts_with("s8") {
         Some(8)
@@ -397,6 +414,10 @@ struct WorkerTrackState {
     buffering: bool,
     loading: bool,
     has_active_track: bool,
+    /// Number of `loadfile replace` commands whose corresponding `StartFile` has not arrived yet.
+    /// Suppresses stale `EndFile(Eof)` events from a track being replaced!
+    pending_replace_loads: u32,
+    pending_start_seek_secs: Option<f64>,
     prefetched_next: bool,
     current_is_local: bool,
     prefetched_is_local: bool,
@@ -416,6 +437,8 @@ impl WorkerTrackState {
             buffering: false,
             loading: false,
             has_active_track: false,
+            pending_replace_loads: 0,
+            pending_start_seek_secs: None,
             prefetched_next: false,
             current_is_local: false,
             prefetched_is_local: false,
@@ -466,6 +489,7 @@ impl WorkerTrackState {
 }
 
 fn init_mpv_handle(options: &MpvInitOptions) -> Result<Mpv, String> {
+    ensure_c_numeric_locale();
     let mpv = Mpv::with_initializer(|init| {
         init.set_option("vid", "no")?;
         init.set_option("audio-display", "no")?;
@@ -524,7 +548,6 @@ fn query_telemetry_snapshot(mpv: &Mpv, st: &mut WorkerTrackState) {
 }
 
 fn clear_prefetched_playlist_tail(mpv: &Mpv) {
-    // Keep index 0 (currently playing) and remove any appended gapless entries.
     if let Ok(count) = mpv.get_property::<i64>("playlist-count") {
         for idx in (1..count).rev() {
             let idx_str = idx.to_string();
@@ -533,14 +556,13 @@ fn clear_prefetched_playlist_tail(mpv: &Mpv) {
     }
 }
 
+/// Applies HTTP headers using mpv's comma-safe `change-list` command so commas inside header
+/// values (like `Cookie:` or HTTP dates) never split into separate malformed headers.
 fn apply_source_headers(mpv: &Mpv, source: &MpvPlaybackSource) {
-    match source {
-        MpvPlaybackSource::StreamUrl { headers, .. } if !headers.is_empty() => {
-            let formatted = format_http_header_fields(headers);
-            let _ = mpv.set_property("http-header-fields", formatted);
-        }
-        _ => {
-            let _ = mpv.set_property("http-header-fields", "");
+    let _ = mpv.command("change-list", &["http-header-fields", "clr", ""]);
+    if let MpvPlaybackSource::StreamUrl { headers, .. } = source {
+        for entry in sanitize_http_headers(headers) {
+            let _ = mpv.command("change-list", &["http-header-fields", "append", &entry]);
         }
     }
 }
@@ -548,6 +570,7 @@ fn apply_source_headers(mpv: &Mpv, source: &MpvPlaybackSource) {
 fn run_mpv_worker(
     options: MpvInitOptions,
     mut cmd_rx: mpsc::Receiver<MpvCommand>,
+    shutdown_flag: Arc<AtomicBool>,
     event_tx: mpsc::UnboundedSender<MpvEvent>,
     ready_tx: std_mpsc::SyncSender<Result<(), String>>,
 ) {
@@ -565,8 +588,15 @@ fn run_mpv_worker(
     let mut st = WorkerTrackState::new(options.replaygain);
 
     'worker: loop {
-        // 1. Drain all queued commands without blocking.
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break 'worker;
+        }
+
+        // 1. Drain queued commands without blocking (re-checking shutdown_flag each step).
         loop {
+            if shutdown_flag.load(Ordering::SeqCst) {
+                break 'worker;
+            }
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     if !handle_command(&mpv, cmd, &mut st, &event_tx) {
@@ -578,7 +608,7 @@ fn run_mpv_worker(
             }
         }
 
-        // 2. Poll libmpv events with a short timeout (20ms) so commands stay responsive.
+        // 2. Poll libmpv events with a short timeout (20ms) so commands & shutdown stay instant.
         match mpv.wait_event(0.02) {
             None => continue,
             Some(Ok(event)) => {
@@ -594,7 +624,6 @@ fn run_mpv_worker(
     }
 
     let _ = mpv.command("stop", &[]);
-    // `Mpv::drop` calls `mpv_destroy` cleanly on this thread.
 }
 
 fn handle_command(
@@ -607,6 +636,7 @@ fn handle_command(
         MpvCommand::LoadTrack {
             source,
             start_paused,
+            start_position_secs,
         } => {
             apply_source_headers(mpv, &source);
             st.current_is_local = source.is_local();
@@ -616,7 +646,9 @@ fn handle_command(
             st.loading = true;
             st.buffering = false;
             st.paused = start_paused;
-            st.position_secs = 0.0;
+            st.pending_replace_loads = st.pending_replace_loads.saturating_add(1);
+            st.pending_start_seek_secs = start_position_secs.filter(|s| s.is_finite() && *s > 0.0);
+            st.position_secs = st.pending_start_seek_secs.unwrap_or(0.0);
             st.duration_secs = 0.0;
             st.last_playlist_pos = 0;
             st.telemetry.codec_name = None;
@@ -629,6 +661,8 @@ fn handle_command(
             if let Err(err) = mpv.command("loadfile", &[source.uri(), "replace"]) {
                 st.loading = false;
                 st.has_active_track = false;
+                st.pending_replace_loads = st.pending_replace_loads.saturating_sub(1);
+                st.pending_start_seek_secs = None;
                 let _ = event_tx.send(MpvEvent::Error(format!("failed to load audio: {err:?}")));
             }
             st.emit_state_if_changed(event_tx);
@@ -637,6 +671,7 @@ fn handle_command(
             if !st.has_active_track {
                 return true;
             }
+            apply_source_headers(mpv, &source);
             clear_prefetched_playlist_tail(mpv);
             if let Err(err) = mpv.command("loadfile", &[source.uri(), "append"]) {
                 tracing::debug!("gapless prefetch append failed: {err:?}");
@@ -668,12 +703,18 @@ fn handle_command(
         MpvCommand::Seek(secs) => {
             if secs.is_finite() {
                 let clamped = secs.max(0.0);
-                let target = format!("{clamped:.3}");
-                if let Err(err) = mpv.command("seek", &[target.as_str(), "absolute"]) {
-                    tracing::debug!("mpv seek failed: {err:?}");
-                } else {
+                if st.loading {
+                    st.pending_start_seek_secs = Some(clamped);
                     st.position_secs = clamped;
                     st.emit_progress(event_tx, true);
+                } else {
+                    let target = format!("{clamped:.3}");
+                    if let Err(err) = mpv.command("seek", &[target.as_str(), "absolute"]) {
+                        tracing::debug!("mpv seek failed: {err:?}");
+                    } else {
+                        st.position_secs = clamped;
+                        st.emit_progress(event_tx, true);
+                    }
                 }
             }
         }
@@ -699,6 +740,8 @@ fn handle_command(
             st.loading = false;
             st.buffering = false;
             st.prefetched_next = false;
+            st.pending_replace_loads = 0;
+            st.pending_start_seek_secs = None;
             st.position_secs = 0.0;
             st.duration_secs = 0.0;
             st.last_playlist_pos = -1;
@@ -720,6 +763,9 @@ fn handle_mpv_event(
     match event {
         Event::Shutdown => return false,
         Event::StartFile => {
+            if st.pending_replace_loads > 0 {
+                st.pending_replace_loads -= 1;
+            }
             if st.has_active_track {
                 st.loading = true;
                 st.emit_state_if_changed(event_tx);
@@ -732,7 +778,17 @@ fn handle_mpv_event(
                     st.duration_secs = dur;
                 }
             }
-            if let Ok(pos) = mpv.get_property::<f64>("time-pos") {
+            if let Some(seek_to) = st.pending_start_seek_secs.take() {
+                let clamped = if st.duration_secs > 0.0 {
+                    seek_to.clamp(0.0, (st.duration_secs - 0.1).max(0.0))
+                } else {
+                    seek_to.max(0.0)
+                };
+                let target = format!("{clamped:.3}");
+                if mpv.command("seek", &[target.as_str(), "absolute"]).is_ok() {
+                    st.position_secs = clamped;
+                }
+            } else if let Ok(pos) = mpv.get_property::<f64>("time-pos") {
                 if pos.is_finite() && pos >= 0.0 {
                     st.position_secs = pos;
                 }
@@ -749,9 +805,11 @@ fn handle_mpv_event(
             st.emit_state_if_changed(event_tx);
         }
         Event::EndFile(reason) => {
+            // Suppress stale EndFile events from a previous track while a replacement load is queued.
+            if st.pending_replace_loads > 0 {
+                return true;
+            }
             if reason == mpv_end_file_reason::Eof {
-                // If mpv has a prefetched next item at playlist index 1, mpv will transition
-                // `playlist-pos` to 1 gaplessly; defer to `playlist-pos` handler so we don't double-fire!
                 let playlist_count = mpv.get_property::<i64>("playlist-count").unwrap_or(0);
                 if !(st.prefetched_next && playlist_count > 1) {
                     st.loading = false;
@@ -800,14 +858,15 @@ fn handle_mpv_event(
                 st.emit_state_if_changed(event_tx);
             }
             (PROP_PLAYLIST_POS, PropertyData::Int64(pos)) => {
-                // Detect seamless gapless transition from index 0 -> index 1.
-                if st.prefetched_next && st.last_playlist_pos == 0 && pos >= 1 {
+                if st.pending_replace_loads == 0
+                    && st.prefetched_next
+                    && st.last_playlist_pos == 0
+                    && pos >= 1
+                {
                     st.prefetched_next = false;
                     st.current_is_local = st.prefetched_is_local;
                     st.prefetched_is_local = false;
                     st.position_secs = 0.0;
-                    // Remove the finished index 0 entry so current track becomes index 0 again
-                    // without interrupting audio output.
                     let _ = mpv.command("playlist-remove", &["0"]);
                     st.last_playlist_pos = 0;
                     query_telemetry_snapshot(mpv, st);
@@ -929,15 +988,20 @@ mod tests {
     }
 
     #[test]
-    fn formats_http_headers_and_sanitizes_newlines() {
-        let formatted = format_http_header_fields(&[
+    fn sanitizes_http_headers_preserving_commas_and_stripping_crlf() {
+        let formatted = sanitize_http_headers(&[
             ("Authorization".into(), "Bearer tok\r\nEvil: 1".into()),
             ("".into(), "ignored".into()),
+            ("Cookie".into(), "a=1, b=2".into()),
             ("X-Client".into(), "Soulbeet".into()),
         ]);
         assert_eq!(
             formatted,
-            "Authorization: Bearer tokEvil: 1,X-Client: Soulbeet"
+            vec![
+                "Authorization: Bearer tokEvil: 1",
+                "Cookie: a=1, b=2",
+                "X-Client: Soulbeet",
+            ]
         );
     }
 
@@ -952,7 +1016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_libmpv_loads_wav_reports_telemetry_seeks_pauses_and_shuts_down() {
+    async fn headless_libmpv_loads_wav_with_start_position_reports_telemetry_and_shuts_down() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let wav_path = tmp.path().join("silence.wav");
         write_silent_wav(&wav_path, 3);
@@ -967,22 +1031,32 @@ mod tests {
                     path: wav_path.display().to_string(),
                 },
                 start_paused: false,
+                start_position_secs: Some(1.5),
             })
             .expect("send load");
 
         let mut saw_duration = false;
+        let mut saw_start_seek = false;
         let mut saw_telemetry = false;
         let mut saw_playing = false;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline
-            && !(saw_duration && saw_telemetry && saw_playing)
+            && !(saw_duration && saw_start_seek && saw_telemetry && saw_playing)
         {
             if let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), events.recv()).await
             {
                 match ev {
-                    MpvEvent::Progress { duration_secs, .. } if duration_secs >= 2.5 => {
-                        saw_duration = true;
+                    MpvEvent::Progress {
+                        position_secs,
+                        duration_secs,
+                    } => {
+                        if duration_secs >= 2.5 {
+                            saw_duration = true;
+                        }
+                        if position_secs >= 1.2 {
+                            saw_start_seek = true;
+                        }
                     }
                     MpvEvent::Telemetry(t) => {
                         if t.sample_rate_hz == Some(44_100) && t.codec_name.is_some() {
@@ -1000,18 +1074,16 @@ mod tests {
 
         assert!(saw_duration, "expected libmpv to report ~3s WAV duration");
         assert!(
+            saw_start_seek,
+            "expected libmpv to honor start_position_secs >= 1.2s"
+        );
+        assert!(
             saw_telemetry,
             "expected libmpv to report 44.1kHz PCM telemetry"
         );
         assert!(saw_playing, "expected libmpv to enter Playing state");
 
-        // Exercise seek, replaygain switch, and pause
-        engine.send_command(MpvCommand::Seek(1.5)).unwrap();
-        engine
-            .send_command(MpvCommand::SetReplayGain(ReplayGainMode::Album))
-            .unwrap();
         engine.send_command(MpvCommand::Pause).unwrap();
-
         let mut saw_paused = false;
         let pause_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < pause_deadline && !saw_paused {
@@ -1025,7 +1097,10 @@ mod tests {
         }
         assert!(saw_paused, "expected libmpv to transition to Paused");
 
-        // Verify clean shutdown without hanging
+        // Saturate command queue to verify atomic shutdown_flag NEVER deadlocks!
+        for _ in 0..80 {
+            let _ = engine.send_command(MpvCommand::SetVolume(0.5));
+        }
         engine.shutdown();
     }
 
@@ -1047,6 +1122,7 @@ mod tests {
                     path: wav1.display().to_string(),
                 },
                 start_paused: false,
+                start_position_secs: None,
             })
             .unwrap();
         engine

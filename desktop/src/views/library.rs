@@ -25,52 +25,43 @@ pub fn LibraryView() -> Element {
     let mut studio = use_desktop_studio();
     let player = use_player();
     let offline_only = player.offline_only();
-    let rev = (studio.library_revision)();
-    let core_opt = studio.core.read().clone();
 
     let mut active_tab = use_signal(|| LibraryTab::Playlists);
     let selected_playlist = studio.selected_playlist_id.read().clone();
 
-    let albums_res = use_resource({
-        let core_opt = core_opt.clone();
-        move || {
-            let core = core_opt.clone();
-            let _rev = rev;
-            async move {
-                match core {
-                    Some(c) => load_library_albums(&c, offline_only).await,
-                    None => Vec::new(),
-                }
+    // All reactive reads happen INSIDE each `use_resource` closure so Dioxus tracks them!
+    let albums_res = use_resource(move || {
+        let core = studio.core.read().clone();
+        let _rev = (studio.library_revision)();
+        let offline = player.offline_only();
+        async move {
+            match core {
+                Some(c) => load_library_albums(&c, offline).await,
+                None => Vec::new(),
             }
         }
     });
 
-    let tracks_res = use_resource({
-        let core_opt = core_opt.clone();
-        move || {
-            let core = core_opt.clone();
-            let _rev = rev;
-            async move {
-                match core {
-                    Some(c) => load_library_tracks(&c, offline_only).await,
-                    None => Vec::new(),
-                }
+    let tracks_res = use_resource(move || {
+        let core = studio.core.read().clone();
+        let _rev = (studio.library_revision)();
+        let offline = player.offline_only();
+        async move {
+            match core {
+                Some(c) => load_library_tracks(&c, offline).await,
+                None => Vec::new(),
             }
         }
     });
 
-    let playlist_tracks_res = use_resource({
-        let core_opt = core_opt.clone();
-        let pid = selected_playlist.clone();
-        move || {
-            let core = core_opt.clone();
-            let pid = pid.clone();
-            let _rev = rev;
-            async move {
-                match (core, pid) {
-                    (Some(c), Some(id)) => load_tracks_for_playlist(&c, &id).await,
-                    _ => Vec::new(),
-                }
+    let playlist_tracks_res = use_resource(move || {
+        let core = studio.core.read().clone();
+        let pid = studio.selected_playlist_id.read().clone();
+        let _rev = (studio.library_revision)();
+        async move {
+            match (core, pid) {
+                (Some(c), Some(id)) => load_tracks_for_playlist(&c, &id).await,
+                _ => Vec::new(),
             }
         }
     });
@@ -80,6 +71,12 @@ pub fn LibraryView() -> Element {
     let sync_st = studio.sync_status.read().clone();
     let current_id = player.current_track().map(|t| t.id);
     let is_playing = player.is_playing();
+
+    let selected_playlist_name = selected_playlist
+        .as_deref()
+        .and_then(|id| playlists.iter().find(|p| p.playlist.id == id))
+        .map(|p| p.playlist.name.clone())
+        .unwrap_or_else(|| "Playlist".to_string());
 
     let (used_mb, max_mb, pct, cached_count, pinned_count) = if let Some(s) = stats {
         let used = s.total_audio_bytes / (1024 * 1024);
@@ -242,6 +239,7 @@ pub fn LibraryView() -> Element {
                                     }
                                 } else {
                                     let play_all = pl_tracks.clone();
+                                    let pl_label = selected_playlist_name.clone();
                                     rsx! {
                                         div { class: "flex items-center justify-between pb-1",
                                             span { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
@@ -250,7 +248,7 @@ pub fn LibraryView() -> Element {
                                             button {
                                                 r#type: "button",
                                                 class: "inline-flex items-center gap-1.5 h-8 px-3.5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[12px] font-semibold cursor-pointer",
-                                                onclick: move |_| player.play_queue(play_all.clone(), 0),
+                                                onclick: move |_| studio.play_collection(player, play_all.clone(), 0, &pl_label),
                                                 IconPlay { size: 12, filled: true }
                                                 span { "Play Playlist" }
                                             }
@@ -308,6 +306,7 @@ pub fn LibraryView() -> Element {
                                         let aid = album.id.clone();
                                         let aid_pin = album.id.clone();
                                         let aname = album.name.clone();
+                                        let aname_play = album.name.clone();
                                         let pinned = *is_pinned;
                                         let art = desktop_cover_art_url(album.cover_art_id.as_deref());
                                         rsx! {
@@ -319,12 +318,11 @@ pub fn LibraryView() -> Element {
                                                     class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center cursor-pointer",
                                                     onclick: move |_| {
                                                         let id = aid.clone();
+                                                        let label = aname_play.clone();
                                                         if let Some(core) = studio.core.peek().clone() {
                                                             spawn(async move {
                                                                 let tracks = load_tracks_for_album(&core, &id).await;
-                                                                if !tracks.is_empty() {
-                                                                    player.play_queue(tracks, 0);
-                                                                }
+                                                                studio.play_collection(player, tracks, 0, &label);
                                                             });
                                                         }
                                                     },

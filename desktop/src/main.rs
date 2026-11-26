@@ -22,12 +22,16 @@ use ui::{
 };
 
 use crate::assets::StudioAssets;
-use crate::desktop_state::{use_desktop_studio, DesktopStudioProvider};
+use crate::audio_mpv::ensure_c_numeric_locale;
+use crate::desktop_state::{
+    fail_closed_guard_preview, use_desktop_studio, DesktopStudioProvider,
+};
 use crate::views::{
     ActivityView, DiscoverView, HomeView, LibraryView, SearchView, SettingsView, SetupView,
 };
 
 fn main() {
+    ensure_c_numeric_locale();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("desktop=info,client_core=info,warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
@@ -54,15 +58,25 @@ fn App() -> Element {
     }
 }
 
+/// Top-level gate component: strictly obeys Dioxus 0.7 Rules of Hooks by isolating all Studio
+/// hooks inside [`DesktopShell`] rather than after an early return.
 #[component]
 fn DesktopRoot() -> Element {
+    let studio = use_desktop_studio();
+    let is_configured = studio.config.read().is_configured();
+
+    if !is_configured {
+        rsx! { SetupView {} }
+    } else {
+        rsx! { DesktopShell {} }
+    }
+}
+
+#[component]
+fn DesktopShell() -> Element {
     let mut studio = use_desktop_studio();
     let player = use_player();
     let cfg = studio.config.read().clone();
-
-    if !cfg.is_configured() {
-        return rsx! { SetupView {} };
-    }
 
     let active_section = (studio.active_section)();
     let active_drawer = (studio.active_drawer)();
@@ -83,64 +97,72 @@ fn DesktopRoot() -> Element {
 
     let palette_commands = build_palette_commands(offline_only, mini_open, cfg.replaygain);
 
-    // Global desktop keyboard shortcut bridge via window-level listener guarded against inputs/dialogs.
-    let mut shortcut_rx_active = use_signal(|| false);
-    use_effect(move || {
-        if *shortcut_rx_active.peek() {
-            return;
-        }
-        shortcut_rx_active.set(true);
+    // Clean up window keyboard listener when DesktopShell unmounts (e.g. on Disconnect).
+    use_drop(move || {
+        document::eval(
+            r#"
+            if (window.__soulbeetKeyHandler) {
+                window.removeEventListener("keydown", window.__soulbeetKeyHandler);
+                window.__soulbeetKeyHandler = null;
+            }
+            "#,
+        );
+    });
+
+    // Global desktop keyboard shortcut bridge: always replaces any prior listener cleanly so
+    // shortcuts continue working across Disconnect -> Reconnect transitions.
+    use_future(move || {
         let mut st = studio;
-        spawn(async move {
+        async move {
             let mut eval = document::eval(
                 r#"
-                if (!window.__soulbeetKeyInstalled) {
-                    window.__soulbeetKeyInstalled = true;
-                    window.addEventListener("keydown", (evt) => {
-                        const active = document.activeElement;
-                        const tag = active ? active.tagName : "BODY";
-                        const role = active ? active.getAttribute("role") : null;
-                        const editable = !!(active && active.isContentEditable);
-                        const dialogOpen = !!document.querySelector('dialog[open], [role="dialog"]:not([inert])');
-                        const ctrlOrMeta = !!(evt.ctrlKey || evt.metaKey);
-                        const key = evt.key || "";
-
-                        // Only intercept known Studio shortcuts so normal typing / OS bindings stay untouched.
-                        const handled = (ctrlOrMeta && key.toLowerCase() === "k")
-                            || key === "Escape"
-                            || (!ctrlOrMeta && !evt.altKey && (
-                                key === " " || key === "ArrowLeft" || key === "ArrowRight"
-                                || "sSpPxXlLqQiIrRmM12345".includes(key)
-                            ));
-                        if (!handled) return;
-
-                        const upperTag = (tag || "").toUpperCase();
-                        const isEscape = key === "Escape";
-                        const isCmdK = ctrlOrMeta && key.toLowerCase() === "k";
-                        if (!isEscape && !isCmdK) {
-                            if (dialogOpen || editable || upperTag === "INPUT" || upperTag === "TEXTAREA" || upperTag === "SELECT") {
-                                return;
-                            }
-                            if (key === " " && (upperTag === "BUTTON" || upperTag === "A" || (role && role.toLowerCase() === "button"))) {
-                                return;
-                            }
-                        }
-
-                        if (key === " " || key === "ArrowLeft" || key === "ArrowRight" || isCmdK) {
-                            evt.preventDefault();
-                        }
-                        dioxus.send({
-                            key,
-                            ctrl: ctrlOrMeta,
-                            shift: !!evt.shiftKey,
-                            alt: !!evt.altKey,
-                            tag,
-                            role,
-                            editable,
-                            dialog_open: dialogOpen,
-                        });
-                    });
+                if (window.__soulbeetKeyHandler) {
+                    window.removeEventListener("keydown", window.__soulbeetKeyHandler);
                 }
+                window.__soulbeetKeyHandler = (evt) => {
+                    const active = document.activeElement;
+                    const tag = active ? active.tagName : "BODY";
+                    const role = active ? active.getAttribute("role") : null;
+                    const editable = !!(active && active.isContentEditable);
+                    const dialogOpen = !!document.querySelector('dialog[open], [role="dialog"]:not([inert])');
+                    const ctrlOrMeta = !!(evt.ctrlKey || evt.metaKey);
+                    const key = evt.key || "";
+
+                    const handled = (ctrlOrMeta && key.toLowerCase() === "k")
+                        || key === "Escape"
+                        || (!ctrlOrMeta && !evt.altKey && (
+                            key === " " || key === "ArrowLeft" || key === "ArrowRight"
+                            || "sSpPxXlLqQiIrRmM12345".includes(key)
+                        ));
+                    if (!handled) return;
+
+                    const upperTag = (tag || "").toUpperCase();
+                    const isEscape = key === "Escape";
+                    const isCmdK = ctrlOrMeta && key.toLowerCase() === "k";
+                    if (!isEscape && !isCmdK) {
+                        if (dialogOpen || editable || upperTag === "INPUT" || upperTag === "TEXTAREA" || upperTag === "SELECT") {
+                            return;
+                        }
+                        if (key === " " && (upperTag === "BUTTON" || upperTag === "A" || (role && role.toLowerCase() === "button"))) {
+                            return;
+                        }
+                    }
+
+                    if (key === " " || key === "ArrowLeft" || key === "ArrowRight" || isCmdK) {
+                        evt.preventDefault();
+                    }
+                    dioxus.send({
+                        key,
+                        ctrl: ctrlOrMeta,
+                        shift: !!evt.shiftKey,
+                        alt: !!evt.altKey,
+                        tag,
+                        role,
+                        editable,
+                        dialog_open: dialogOpen,
+                    });
+                };
+                window.addEventListener("keydown", window.__soulbeetKeyHandler);
                 "#,
             );
 
@@ -242,7 +264,7 @@ fn DesktopRoot() -> Element {
                     _ => {}
                 }
             }
-        });
+        }
     });
 
     rsx! {
@@ -304,7 +326,7 @@ fn DesktopRoot() -> Element {
                     lyrics_error,
                     on_fetch_lyrics: move |_| {
                         if let Some(track) = player.current_track() {
-                            studio.fetch_lyrics(track.id);
+                            studio.fetch_lyrics(track.id, Some(track.artist), Some(track.title));
                         }
                     },
                     guard_preview: guard_preview.clone(),
@@ -312,6 +334,10 @@ fn DesktopRoot() -> Element {
                     on_refresh_guard: move |song_id| studio.audit_delete_guard(song_id),
                     on_open_guard_modal: move |track: ui::PlayerTrack| {
                         let id = track.id.clone();
+                        studio.guard_preview.set(Some(fail_closed_guard_preview(
+                            id.clone(),
+                            "Inspecting household listener protection…".into(),
+                        )));
                         studio.guard_modal_track.set(Some(track));
                         studio.audit_delete_guard(id);
                     },
@@ -378,29 +404,31 @@ fn DesktopRoot() -> Element {
                 }
             }
 
-            // Multi-Listener Delete Guard Sheet for permanent library removals
+            // Multi-Listener Delete Guard Sheet for permanent library removals (FAIL-CLOSED while loading/error!)
             if let Some(track) = guard_modal_track {
                 {
                     let track_confirm = track.clone();
                     let preview = guard_preview
                         .filter(|p| p.song_id == track.id)
-                        .unwrap_or(shared::client::DeleteGuardPreview {
-                            song_id: track.id.clone(),
-                            is_pending_discovery: false,
-                            discovery_track_id: None,
-                            can_delete: true,
-                            sole_owner: true,
-                            other_listeners: Vec::new(),
-                            own_playlists: Vec::new(),
-                            block_reason: None,
+                        .unwrap_or_else(|| {
+                            fail_closed_guard_preview(
+                                track.id.clone(),
+                                "Verifying household listener protection…".into(),
+                            )
                         });
+                    let preview_confirm = preview.clone();
                     rsx! {
                         MultiListenerGuardModal {
                             preview,
                             track_title: track.title.clone(),
                             track_artist: Some(track.artist.clone()),
+                            busy: guard_loading,
                             on_confirm: move |_| {
-                                studio.confirm_library_remove(player, track_confirm.clone());
+                                studio.confirm_library_remove(
+                                    player,
+                                    track_confirm.clone(),
+                                    preview_confirm.clone(),
+                                );
                             },
                             on_cancel: move |_| studio.guard_modal_track.set(None),
                         }

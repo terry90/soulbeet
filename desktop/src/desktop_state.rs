@@ -1,9 +1,11 @@
-//! In-process `SoulbeetCore` host, persistent desktop configuration, monotonic OpenSubsonic
-//! scrobbler, local SQLite library queries, cover-art asset protocol handler, and bridge between
-//! Dioxus `PlayerContext`, native `libmpv`, `souvlaki` MPRIS2/SMTC, and the floating Mini-Player.
+//! In-process `SoulbeetCore` host, persistent desktop configuration (`0o600` on Unix),
+//! monotonic OpenSubsonic scrobbler, local SQLite library queries, cover-art asset protocol
+//! handler, and bridge between Dioxus `PlayerContext`, native `libmpv`, `souvlaki` MPRIS2/SMTC,
+//! Connect WS, and the floating Mini-Player.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,8 +14,8 @@ use client_core::models::{
     AudioQualityProfile, CachePolicy, CacheStats, ClientConfig, ConnectCommandDto,
     ConnectDeviceDto, ConnectServerEventDto, DevicePlatform as CoreDevicePlatform, LocalAlbum,
     LocalDiscoveryTrack, LocalPlaylist, LocalTrack, NavidromeCredentials, OutboxMutation,
-    PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource, SoulbeetAuth,
-    SyncReport,
+    PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource, RemoteCatalogTrack,
+    SoulbeetAuth, SyncReport,
 };
 use client_core::SoulbeetCore;
 use directories::ProjectDirs;
@@ -22,20 +24,24 @@ use dioxus_desktop::wry::http::{header, Response as HttpResponse, StatusCode};
 use dioxus_desktop::{use_asset_handler, DesktopContext};
 use serde::{Deserialize, Serialize};
 use shared::client::{
-    ConnectDevice, DeleteGuardPreview, DevicePlatform as SharedDevicePlatform, PlaybackSnapshot,
-    TrackLyrics,
+    ClientBootstrap, ConnectDevice, DeleteGuardPreview, DevicePlatform as SharedDevicePlatform,
+    PlaybackSnapshot, TrackLyrics,
 };
-use tokio::sync::{mpsc, watch};
+use shared::download::{
+    AcquireAndPlayInitialStatus, AcquireAndPlayRequest, AcquireAndPlayResponse,
+};
+use shared::recommendation::{ContextualMixSummary, CultureSteering, SteerSeasonalPackRequest};
+use tokio::sync::{broadcast, mpsc, watch};
 use ui::{
-    discovery_days_remaining, percent_encode_param, DrawerTab, PendingDropItem, PendingDropQueue,
-    PlaybackStatus, PlayerCommand, PlayerContext, PlayerState, PlayerTrack, SidebarPlaylistItem,
-    StudioNavSection,
+    classify_guard_mode, discovery_days_remaining, percent_encode_param, AcquireStageBadge,
+    DrawerTab, GuardModalMode, PendingDropItem, PendingDropQueue, PlaybackStatus, PlayerCommand,
+    PlayerContext, PlayerState, PlayerTrack, SidebarPlaylistItem, StudioNavSection,
 };
 use uuid::Uuid;
 
 use crate::audio_mpv::{
-    AudioTelemetry, MpvCommand, MpvEngine, MpvEvent, MpvPlaybackSource, MpvPlaybackState,
-    ReplayGainMode,
+    ensure_c_numeric_locale, AudioTelemetry, MpvCommand, MpvEngine, MpvEvent, MpvPlaybackSource,
+    MpvPlaybackState, ReplayGainMode,
 };
 use crate::media_controls::{
     extract_windows_hwnd, MediaControlsBridge, MediaKeyAction, MediaTrackMeta, OsMediaCommand,
@@ -51,8 +57,197 @@ pub enum DesktopAuthKind {
     SessionCookie,
 }
 
+/// Strips redundant `"Bearer "` / `"auth_token="` prefixes users frequently paste into token fields.
+pub fn normalize_auth_token(raw: &str, kind: DesktopAuthKind) -> String {
+    let trimmed = raw.trim();
+    match kind {
+        DesktopAuthKind::Bearer => trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string(),
+        DesktopAuthKind::SessionCookie => trimmed
+            .strip_prefix("auth_token=")
+            .or_else(|| trimmed.strip_prefix("Cookie: auth_token="))
+            .unwrap_or(trimmed)
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    }
+}
+
+/// Extracts the `auth_token` cookie value from a `Set-Cookie` HTTP response header.
+pub fn extract_auth_cookie_from_header(set_cookie: &str) -> Option<String> {
+    let pair = set_cookie.split(';').next()?.trim();
+    let val = pair.strip_prefix("auth_token=")?.trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+/// Result of authenticating with `POST {base}/api/auth/login`.
+#[derive(Debug, Clone)]
+pub struct PasswordLoginResult {
+    pub session_cookie: String,
+    pub password_change_required: bool,
+}
+
+/// Authenticates against a Soulbeet server with username + password and returns the session cookie.
+pub async fn login_with_password(
+    base_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<PasswordLoginResult, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Enter the Soulbeet server URL first.".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let url = format!("{base}/api/auth/login");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "username": username.trim(),
+            "password": password,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Soulbeet server: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.trim();
+        return Err(if detail.is_empty() {
+            format!("Sign-in failed (HTTP {})", status.as_u16())
+        } else {
+            format!("Sign-in failed (HTTP {}): {detail}", status.as_u16())
+        });
+    }
+
+    let cookie = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(extract_auth_cookie_from_header)
+        .ok_or_else(|| {
+            "Server succeeded but did not issue an auth_token session cookie.".to_string()
+        })?;
+
+    #[derive(Deserialize)]
+    struct LoginBody {
+        #[serde(default)]
+        password_change_required: bool,
+    }
+    let body: LoginBody = resp.json().await.unwrap_or(LoginBody {
+        password_change_required: false,
+    });
+
+    Ok(PasswordLoginResult {
+        session_cookie: cookie,
+        password_change_required: body.password_change_required,
+    })
+}
+
+/// Verifies a candidate [`DesktopConfig`] against Soulbeet (`/api/client/bootstrap`) and/or
+/// Navidrome (`/rest/ping`) BEFORE persisting `config.json`.
+pub async fn verify_desktop_config(
+    cfg: &DesktopConfig,
+) -> Result<Option<ClientBootstrap>, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    if let Some(base) = cfg
+        .soulbeet_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let url = format!("{}/api/client/bootstrap", base.trim_end_matches('/'));
+        let mut req = client.get(&url);
+        if let Some(auth) = cfg.soulbeet_auth() {
+            let (k, v) = auth.header_name_and_value();
+            req = req.header(k, v);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Could not reach Soulbeet server: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "Soulbeet rejected credentials (HTTP {}): {}",
+                status.as_u16(),
+                body.trim()
+            ));
+        }
+        let bootstrap: ClientBootstrap = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid bootstrap response from Soulbeet: {e}"))?;
+        return Ok(Some(bootstrap));
+    }
+
+    if let Some(ref nav) = cfg.navidrome {
+        let mut url = url::Url::parse(&format!("{}/rest/ping", nav.normalized_base_url()))
+            .map_err(|e| format!("Invalid Navidrome URL: {e}"))?;
+        url.query_pairs_mut()
+            .append_pair("u", &nav.username)
+            .append_pair("t", &nav.subsonic_token)
+            .append_pair("s", &nav.subsonic_salt)
+            .append_pair("v", &nav.api_version)
+            .append_pair("c", &nav.client_name)
+            .append_pair("f", "json");
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Could not reach Navidrome: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Navidrome returned HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid Navidrome ping JSON: {e}"))?;
+        let ok = val
+            .pointer("/subsonic-response/status")
+            .and_then(|v| v.as_str())
+            == Some("ok");
+        if !ok {
+            let msg = val
+                .pointer("/subsonic-response/error/message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Navidrome rejected Subsonic credentials");
+            return Err(msg.to_string());
+        }
+        return Ok(None);
+    }
+
+    Err("Enter a Soulbeet server or direct Navidrome credentials.".to_string())
+}
+
 /// Persistent desktop preferences & server credentials stored in platform config dir
-/// (`~/.config/Soulbeet/config.json` on Linux, `%APPDATA%/soulbeet/Soulbeet/config.json` on Windows).
+/// (`~/.config/Soulbeet/config.json` on Linux with `0o600` permissions,
+/// `%APPDATA%/soulbeet/Soulbeet/config.json` on Windows).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesktopConfig {
     #[serde(default)]
@@ -147,13 +342,14 @@ impl DesktopConfig {
     }
 
     pub fn soulbeet_auth(&self) -> Option<SoulbeetAuth> {
-        let token = self.auth_token.as_deref()?.trim();
+        let raw = self.auth_token.as_deref()?;
+        let token = normalize_auth_token(raw, self.auth_kind);
         if token.is_empty() {
             return None;
         }
         Some(match self.auth_kind {
-            DesktopAuthKind::Bearer => SoulbeetAuth::Bearer(token.to_string()),
-            DesktopAuthKind::SessionCookie => SoulbeetAuth::SessionCookie(token.to_string()),
+            DesktopAuthKind::Bearer => SoulbeetAuth::Bearer(token),
+            DesktopAuthKind::SessionCookie => SoulbeetAuth::SessionCookie(token),
         })
     }
 
@@ -238,17 +434,52 @@ impl DesktopConfig {
         Ok(cfg)
     }
 
+    /// Writes config atomically with strict owner-only permissions (`0o700` dir, `0o600` file)
+    /// on Unix so persisted authentication tokens are never world-readable.
     pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("create config dir: {e}"))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
             }
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("serialize config JSON: {e}"))?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("write temp config: {e}"))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| format!("open temp config: {e}"))?;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            file.write_all(json.as_bytes())
+                .map_err(|e| format!("write temp config: {e}"))?;
+            file.flush()
+                .map_err(|e| format!("flush temp config: {e}"))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| format!("create temp config: {e}"))?;
+            file.write_all(json.as_bytes())
+                .map_err(|e| format!("write temp config: {e}"))?;
+            file.flush()
+                .map_err(|e| format!("flush temp config: {e}"))?;
+        }
+
         std::fs::rename(&tmp, path).map_err(|e| format!("commit config: {e}"))?;
         Ok(())
     }
@@ -270,7 +501,7 @@ fn default_app_dirs() -> (PathBuf, PathBuf) {
 
 /// Deterministic monotonic listening-time scrobbler following OpenSubsonic / Last.fm rules:
 /// - Tracks shorter than 30 seconds are never submitted as scrobbles.
-/// - Threshold is `min(duration / 2.0, 240.0).max(30.0)`.
+/// - Threshold is `clamp(duration / 2.0, 30.0, 240.0)`.
 /// - Accumulates ONLY real monotonic wall-clock time elapsed while actively playing
 ///   (seeking forward or pausing never inflates elapsed listening time).
 #[derive(Debug, Clone)]
@@ -356,7 +587,6 @@ impl ScrobbleTracker {
 
         if let Some(prev) = self.last_playing_tick {
             let delta = now.saturating_duration_since(prev).as_secs_f64();
-            // Clamp huge suspend/sleep jumps so a sleeping laptop doesn't instantly scrobble.
             if delta > 0.0 && delta <= 5.0 {
                 self.accumulated_secs += delta;
             }
@@ -398,6 +628,33 @@ impl ScrobbleTracker {
     }
 }
 
+/// Fail-closed DeleteGuardPreview used while auditing or when the guard endpoint is unreachable.
+pub fn fail_closed_guard_preview(song_id: String, reason: String) -> DeleteGuardPreview {
+    DeleteGuardPreview {
+        song_id,
+        is_pending_discovery: false,
+        discovery_track_id: None,
+        can_delete: false,
+        sole_owner: false,
+        other_listeners: Vec::new(),
+        own_playlists: Vec::new(),
+        block_reason: Some(reason),
+    }
+}
+
+/// Filters a track list for playback when `offline_only == true` so album/playlist Play buttons
+/// never attempt to stream uncached remote tracks.
+pub fn filter_tracks_for_offline_play(
+    tracks: Vec<PlayerTrack>,
+    offline_only: bool,
+) -> Vec<PlayerTrack> {
+    if offline_only {
+        tracks.into_iter().filter(|t| t.is_offline_cached).collect()
+    } else {
+        tracks
+    }
+}
+
 /// Live reactive snapshot pushed from the main Studio window to the `360×110` Mini-Player.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MiniPlayerSnapshot {
@@ -420,12 +677,13 @@ pub enum MiniPlayerAction {
     Keep(PlayerTrack),
     Drop(PlayerTrack),
     RestoreStudio,
-    Closed,
+    Closed(u64),
 }
 
 /// Cloneable channel handle passed into the secondary Mini-Player `VirtualDom`.
 #[derive(Clone)]
 pub struct MiniPlayerBridge {
+    pub generation: u64,
     pub snapshot_rx: watch::Receiver<MiniPlayerSnapshot>,
     pub action_tx: mpsc::UnboundedSender<MiniPlayerAction>,
     pub core: Option<Arc<SoulbeetCore>>,
@@ -471,8 +729,6 @@ pub fn desktop_cover_art_url(cover_art_id: Option<&str>) -> Option<String> {
 }
 
 /// Registers the cross-platform `cover-art` asset handler on the current `dioxus-desktop` window.
-/// Serves cached cover art from `core.cache()` with zero network I/O when offline, or fetches
-/// and caches on demand when online.
 pub fn use_cover_art_asset_handler(core_getter: impl Fn() -> Option<Arc<SoulbeetCore>> + 'static) {
     use_asset_handler("cover-art", move |request, responder| {
         let path = request.uri().path().to_string();
@@ -719,6 +975,22 @@ pub async fn load_pending_discovery_map(
         }
     }
     map
+}
+
+pub async fn load_local_top_genres(core: &SoulbeetCore) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT genre
+        FROM tracks
+        WHERE genre IS NOT NULL AND TRIM(genre) != ''
+        GROUP BY LOWER(TRIM(genre))
+        ORDER BY COUNT(1) DESC
+        LIMIT 8
+        "#,
+    )
+    .fetch_all(core.pool())
+    .await
+    .unwrap_or_default()
 }
 
 pub async fn load_home_snapshot(core: &SoulbeetCore, offline_only: bool) -> HomeSnapshot {
@@ -1001,6 +1273,7 @@ pub fn convert_connect_devices(devices: &[ConnectDeviceDto]) -> Vec<ConnectDevic
 #[derive(Clone, Copy)]
 pub struct DesktopStudio {
     pub config: Signal<DesktopConfig>,
+    pub bootstrap: Signal<Option<ClientBootstrap>>,
     pub core: Signal<Option<Arc<SoulbeetCore>>>,
     pub core_error: Signal<Option<String>>,
     pub active_section: Signal<StudioNavSection>,
@@ -1011,11 +1284,13 @@ pub struct DesktopStudio {
     pub cmdk_open: Signal<bool>,
     pub mini_player_open: Signal<bool>,
     pub mini_window: Signal<Option<DesktopContext>>,
+    pub mini_gen: Signal<Arc<AtomicU64>>,
     pub telemetry: Signal<Option<AudioTelemetry>>,
     pub sync_status: Signal<SyncUiStatus>,
     pub cache_stats: Signal<Option<CacheStats>>,
     pub playlists: Signal<Vec<DesktopPlaylist>>,
     pub pending_drops: Signal<PendingDropQueue>,
+    pub acquiring_tracks: Signal<HashMap<String, AcquireStageBadge>>,
     pub connect_devices: Signal<Vec<ConnectDevice>>,
     pub lyrics: Signal<Vec<TrackLyrics>>,
     pub lyrics_loading: Signal<bool>,
@@ -1027,6 +1302,9 @@ pub struct DesktopStudio {
     pub library_revision: Signal<u64>,
     pub mpv_cmd_tx: Signal<Option<mpsc::Sender<MpvCommand>>>,
     pub mpv_error: Signal<Option<String>>,
+    pub load_gen: Signal<Arc<AtomicU64>>,
+    pub connect_gen: Signal<Arc<AtomicU64>>,
+    pub volume_debounce_gen: Signal<Arc<AtomicU64>>,
     pub mini_snapshot_tx: Signal<Arc<watch::Sender<MiniPlayerSnapshot>>>,
     pub mini_action_tx: Signal<mpsc::UnboundedSender<MiniPlayerAction>>,
     pub media_controls: Signal<Arc<Mutex<MediaControlsBridge>>>,
@@ -1041,6 +1319,14 @@ impl DesktopStudio {
     pub fn bump_library(&mut self) {
         let next = self.library_revision.peek().wrapping_add(1);
         self.library_revision.set(next);
+    }
+
+    pub fn promote_threshold(&self) -> u8 {
+        self.bootstrap
+            .peek()
+            .as_ref()
+            .map(|b| b.promote_threshold.clamp(1, 5))
+            .unwrap_or(4)
     }
 
     pub fn sidebar_playlists(&self) -> Vec<SidebarPlaylistItem> {
@@ -1071,6 +1357,29 @@ impl DesktopStudio {
         self.active_drawer.set(Some(DrawerTab::Inspector));
     }
 
+    /// Plays `tracks` respecting `player.offline_only()` so album/playlist Play buttons never
+    /// attempt to stream uncached tracks while offline.
+    pub fn play_collection(
+        &mut self,
+        player: PlayerContext,
+        tracks: Vec<PlayerTrack>,
+        start_index: usize,
+        label: &str,
+    ) {
+        let offline = player.offline_only();
+        let filtered = filter_tracks_for_offline_play(tracks, offline);
+        if filtered.is_empty() {
+            self.status_toast.set(Some(if offline {
+                format!("No tracks in \"{label}\" are cached offline — pin it first")
+            } else {
+                format!("No playable tracks in \"{label}\"")
+            }));
+            return;
+        }
+        let idx = start_index.min(filtered.len() - 1);
+        player.play_queue(filtered, idx);
+    }
+
     pub fn push_mini_snapshot(&self, player: PlayerContext) {
         let st = player.state_signal().peek().clone();
         let pos = *player.position_signal().peek();
@@ -1095,8 +1404,8 @@ impl DesktopStudio {
         }
     }
 
-    /// Resolves the next upcoming track in the queue and preloads it into `libmpv` for
-    /// zero-gap transitions (plus prefetches upcoming tracks into local disk cache).
+    /// Resolves the next upcoming track in the queue (matching `shuffle` and `repeat` identically)
+    /// and preloads it into `libmpv` for zero-gap transitions.
     pub fn schedule_gapless_prefetch(&self, player: PlayerContext) {
         let Some(core) = self.core.peek().clone() else {
             return;
@@ -1106,8 +1415,6 @@ impl DesktopStudio {
             self.send_mpv(MpvCommand::ClearPrefetch);
             return;
         };
-        // Simulate `PlayerCommand::TrackEnded` on a cloned `PlayerState` so gapless prefetch
-        // matches `shuffle`, `RepeatMode::Off/All/One`, and queue boundaries 100% identically.
         let mut probe = st.clone();
         let mut probe_pos = 0.0;
         let mut probe_dur = 0.0;
@@ -1150,19 +1457,25 @@ impl DesktopStudio {
         });
     }
 
-    /// Loads `track` into `libmpv` using `client-core`'s offline-first resolver, updates MPRIS2/SMTC,
-    /// triggers NowPlaying scrobble, and persists the playback session.
+    /// Loads `track` into `libmpv` using `client-core`'s offline-first resolver, guarded by a
+    /// monotonic `load_gen` token so rapid track switching never lets a stale load clobber the
+    /// active track. Supports `start_paused` and `start_position_secs` for session restoration
+    /// and Connect `TransferPlayback`.
     pub fn load_current_track_in_mpv(
         &mut self,
         player: PlayerContext,
         track: PlayerTrack,
         start_paused: bool,
+        start_position_secs: Option<f64>,
     ) {
         let Some(core) = self.core.peek().clone() else {
             let mut st = player.state_signal();
-            st.write().status = PlaybackStatus::Error("Configure Soulbeet or Navidrome first".into());
+            st.write().status =
+                PlaybackStatus::Error("Configure Soulbeet or Navidrome first".into());
             return;
         };
+        let my_gen = self.load_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
+        let load_gen_arc = self.load_gen.peek().clone();
         let studio = *self;
         let mpv_tx = self.mpv_cmd_tx.peek().clone();
         let queue_ids: Vec<String> = player
@@ -1173,16 +1486,25 @@ impl DesktopStudio {
             .map(|t| t.id.clone())
             .collect();
         let cur_idx = player.state_signal().peek().queue_index.unwrap_or(0);
+        let init_pos_ms = start_position_secs
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(|s| (s * 1000.0) as u64)
+            .unwrap_or(0);
 
-        // Start monotonic scrobbler for this track
+        // Start monotonic scrobbler for this track (skip NowPlaying if loading paused on restore)
         let now_playing = {
             let sc_arc = self.scrobbler.peek().clone();
             let mut sc = sc_arc.lock().unwrap_or_else(|e| e.into_inner());
-            sc.start_track(
+            let np = sc.start_track(
                 track.id.clone(),
                 track.duration_secs.map(f64::from).unwrap_or(0.0),
                 Utc::now().timestamp(),
-            )
+            );
+            if start_paused {
+                None
+            } else {
+                np
+            }
         };
 
         spawn(async move {
@@ -1190,12 +1512,11 @@ impl DesktopStudio {
                 let _ = core.enqueue_mutation(np).await;
             }
 
-            // Persist session for resumption
             let _ = core
                 .save_playback_session(&PersistedPlaybackSession {
                     queue_track_ids: queue_ids,
                     current_index: cur_idx,
-                    position_ms: 0,
+                    position_ms: init_pos_ms,
                     is_playing: !start_paused,
                     source_label: track.album.clone(),
                     updated_at: Utc::now().timestamp(),
@@ -1207,14 +1528,17 @@ impl DesktopStudio {
                 .await
             {
                 Ok(source) => {
+                    if load_gen_arc.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
                     let mpv_src = playback_source_to_mpv(source);
                     if let Some(tx) = mpv_tx {
                         let _ = tx.try_send(MpvCommand::LoadTrack {
                             source: mpv_src,
                             start_paused,
+                            start_position_secs,
                         });
                     }
-                    // Update OS MPRIS2 / SMTC metadata with local file:// cover art if cached
                     let local_art = match track.cover_art_id.as_deref() {
                         Some(cid) => core
                             .cache()
@@ -1223,6 +1547,9 @@ impl DesktopStudio {
                             .ok(),
                         None => None,
                     };
+                    if load_gen_arc.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
                     if let Ok(mut mc) = studio.media_controls.peek().lock() {
                         mc.update_metadata(&MediaTrackMeta {
                             title: track.title.clone(),
@@ -1238,13 +1565,16 @@ impl DesktopStudio {
                             } else {
                                 &PlaybackStatus::Playing
                             },
-                            0.0,
+                            start_position_secs.unwrap_or(0.0),
                         );
                     }
                     studio.schedule_gapless_prefetch(player);
                     studio.publish_connect_snapshot(player);
                 }
                 Err(err) => {
+                    if load_gen_arc.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
                     tracing::warn!("Could not resolve playback source for {}: {err}", track.id);
                     let mut st = player.state_signal();
                     st.write().status = PlaybackStatus::Error(err.to_string());
@@ -1277,12 +1607,14 @@ impl DesktopStudio {
         let next_state = player.state_signal().peek().clone();
         let next_track = next_state.current_track.clone();
         let next_track_id = next_track.as_ref().map(|t| t.id.clone());
+        let mut publish_connect_now = true;
 
         match cmd {
             PlayerCommand::PlayTrack(_) | PlayerCommand::PlayQueue { .. } => {
                 if let Some(track) = next_track {
-                    self.load_current_track_in_mpv(player, track, false);
+                    self.load_current_track_in_mpv(player, track, false, None);
                 } else {
+                    self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
                     self.send_mpv(MpvCommand::Stop);
                 }
             }
@@ -1301,7 +1633,7 @@ impl DesktopStudio {
                 }
                 PlaybackStatus::Loading => {
                     if let Some(track) = next_track {
-                        self.load_current_track_in_mpv(player, track, false);
+                        self.load_current_track_in_mpv(player, track, false, None);
                     }
                 }
                 _ => {}
@@ -1313,7 +1645,7 @@ impl DesktopStudio {
                     && next_track.is_some();
                 if track_changed || restarted_same {
                     if let Some(track) = next_track {
-                        self.load_current_track_in_mpv(player, track, false);
+                        self.load_current_track_in_mpv(player, track, false, None);
                     }
                 } else if matches!(next_state.status, PlaybackStatus::Paused)
                     && matches!(prev_status, PlaybackStatus::Playing)
@@ -1327,13 +1659,25 @@ impl DesktopStudio {
                 self.send_mpv(MpvCommand::Seek(secs));
             }
             PlayerCommand::SetVolume(vol) => {
-                self.send_mpv(MpvCommand::SetVolume(vol));
+                publish_connect_now = false;
+                let clamped = vol.clamp(0.0, 1.0);
+                self.send_mpv(MpvCommand::SetVolume(clamped));
                 self.send_mpv(MpvCommand::SetMute(false));
                 if let Ok(mut mc) = self.media_controls.peek().lock() {
-                    mc.update_volume(vol);
+                    mc.update_volume(clamped);
                 }
-                self.config.write().volume = vol.clamp(0.0, 1.0);
-                let _ = self.config.peek().save_to_disk();
+                self.config.write().volume = clamped;
+                // Debounce disk write + Connect WS broadcast (~300ms) while dragging volume slider.
+                let deb_gen = self.volume_debounce_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
+                let deb_arc = self.volume_debounce_gen.peek().clone();
+                let studio = *self;
+                spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if deb_arc.load(Ordering::SeqCst) == deb_gen {
+                        let _ = studio.config.peek().save_to_disk();
+                        studio.publish_connect_snapshot(player);
+                    }
+                });
             }
             PlayerCommand::ToggleMute => {
                 self.send_mpv(MpvCommand::SetMute(next_state.muted));
@@ -1351,8 +1695,10 @@ impl DesktopStudio {
                             player,
                             track,
                             !next_state.status.is_active(),
+                            None,
                         );
                     } else {
+                        self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
                         self.send_mpv(MpvCommand::Stop);
                     }
                 } else {
@@ -1360,6 +1706,7 @@ impl DesktopStudio {
                 }
             }
             PlayerCommand::ClearQueue => {
+                self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
                 self.send_mpv(MpvCommand::Stop);
                 if let Ok(mut sc) = self.scrobbler.peek().lock() {
                     sc.reset();
@@ -1369,12 +1716,14 @@ impl DesktopStudio {
                 }
             }
             PlayerCommand::SetOfflineOnly(enabled) => {
-                self.apply_offline_only(enabled);
+                self.apply_offline_only(enabled, player);
             }
         }
 
         self.push_mini_snapshot(player);
-        self.publish_connect_snapshot(player);
+        if publish_connect_now {
+            self.publish_connect_snapshot(player);
+        }
     }
 
     /// Handles a seamless gapless transition emitted by `libmpv` without re-issuing `LoadTrack`.
@@ -1403,11 +1752,29 @@ impl DesktopStudio {
             };
             let core_opt = self.core.peek().clone();
             let mc_arc = self.media_controls.peek().clone();
+            let queue_ids: Vec<String> = player
+                .state_signal()
+                .peek()
+                .queue
+                .iter()
+                .map(|t| t.id.clone())
+                .collect();
+            let cur_idx = player.state_signal().peek().queue_index.unwrap_or(0);
             spawn(async move {
                 if let Some(core) = core_opt {
                     if let Some(np) = now_playing {
                         let _ = core.enqueue_mutation(np).await;
                     }
+                    let _ = core
+                        .save_playback_session(&PersistedPlaybackSession {
+                            queue_track_ids: queue_ids,
+                            current_index: cur_idx,
+                            position_ms: 0,
+                            is_playing: true,
+                            source_label: track.album.clone(),
+                            updated_at: Utc::now().timestamp(),
+                        })
+                        .await;
                     let local_art = match track.cover_art_id.as_deref() {
                         Some(cid) => core
                             .cache()
@@ -1436,16 +1803,99 @@ impl DesktopStudio {
         self.publish_connect_snapshot(player);
     }
 
-    pub fn apply_offline_only(&mut self, enabled: bool) {
+    pub fn apply_offline_only(&mut self, enabled: bool, player: PlayerContext) {
         self.config.write().offline_only = enabled;
         let _ = self.config.peek().save_to_disk();
-        if let Some(core) = self.core.peek().as_ref() {
+        let core_opt = self.core.peek().clone();
+        if let Some(ref core) = core_opt {
             core.set_offline_only(enabled);
         }
         self.bump_library();
-        if !enabled {
+
+        if enabled {
+            // Immediately sever Connect WS and cancel any reconnect supervisor loop.
+            self.connect_gen.peek().fetch_add(1, Ordering::SeqCst);
+            self.sync_status.write().connect_online = false;
+            self.connect_devices.set(Vec::new());
+            if let Some(core) = core_opt {
+                spawn(async move {
+                    core.connect_client().disconnect().await;
+                });
+            }
+        } else {
             self.drain_outbox_bg();
+            if let Some(core) = core_opt {
+                if self.config.peek().soulbeet_base_url.is_some() {
+                    self.start_supervised_connect(core, player);
+                }
+            }
         }
+    }
+
+    /// Runs a supervised WebSocket reconnect loop for Soulbeet Connect (`WS /api/ws/connect`).
+    /// Handles `RecvError::Lagged` without disconnecting, stops immediately when `offline_only`
+    /// is toggled or superseded by a newer `connect_gen`, and backs off cleanly on network errors.
+    pub fn start_supervised_connect(&mut self, core: Arc<SoulbeetCore>, player: PlayerContext) {
+        let my_gen = self.connect_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_arc = self.connect_gen.peek().clone();
+        let mut studio = *self;
+
+        spawn(async move {
+            let mut backoff_secs = 2u64;
+            while gen_arc.load(Ordering::SeqCst) == my_gen && !core.is_offline_only() {
+                let mut rx = core.connect_client().subscribe();
+                match core.connect_ws(Duration::from_secs(20)).await {
+                    Ok(()) => {
+                        backoff_secs = 2;
+                        studio.sync_status.write().connect_online = true;
+                        loop {
+                            if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
+                                core.connect_client().disconnect().await;
+                                break;
+                            }
+                            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                                Ok(Ok(ev)) => match ev {
+                                    ConnectServerEventDto::DeviceList { devices, .. } => {
+                                        studio
+                                            .connect_devices
+                                            .set(convert_connect_devices(&devices));
+                                    }
+                                    ConnectServerEventDto::Command { command, .. } => {
+                                        apply_connect_command(studio, player, &core, command).await;
+                                    }
+                                    ConnectServerEventDto::PlaybackUpdated { .. } => {}
+                                },
+                                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                                    tracing::debug!("Connect WS lagged {n} events; continuing");
+                                    continue;
+                                }
+                                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                                Err(_) => {
+                                    // Periodic liveness check against ConnectClient state
+                                    if !core.connect_client().state().await.connected {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        studio.sync_status.write().connect_online = false;
+                    }
+                    Err(err) => {
+                        tracing::debug!("Connect WS attempt failed: {err}");
+                        studio.sync_status.write().connect_online = false;
+                    }
+                }
+
+                if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(30);
+            }
+            if gen_arc.load(Ordering::SeqCst) == my_gen {
+                studio.sync_status.write().connect_online = false;
+            }
+        });
     }
 
     pub fn set_replaygain(&mut self, mode: ReplayGainMode) {
@@ -1463,12 +1913,10 @@ impl DesktopStudio {
     // --- Offline-First Outbox Curation Actions ---
 
     pub fn keep_track(&mut self, player: PlayerContext, track: PlayerTrack) {
-        player.state_signal().write().apply_curation_update(
-            &track.id,
-            None,
-            None,
-            true,
-        );
+        player
+            .state_signal()
+            .write()
+            .apply_curation_update(&track.id, None, None, true);
         self.push_mini_snapshot(player);
 
         let Some(core) = self.core.peek().clone() else {
@@ -1523,7 +1971,9 @@ impl DesktopStudio {
                 })
                 .await;
             if let Err(err) = res {
-                studio.status_toast.set(Some(format!("Star update failed: {err}")));
+                studio
+                    .status_toast
+                    .set(Some(format!("Star update failed: {err}")));
                 return;
             }
             studio.bump_library();
@@ -1537,11 +1987,12 @@ impl DesktopStudio {
 
     pub fn rate_track(&mut self, player: PlayerContext, track: PlayerTrack, rating: u8) {
         let clamped = rating.min(5);
+        let promoted = track.is_discovery && clamped >= self.promote_threshold();
         player.state_signal().write().apply_curation_update(
             &track.id,
             None,
             Some(clamped),
-            false,
+            promoted,
         );
         self.push_mini_snapshot(player);
 
@@ -1558,7 +2009,9 @@ impl DesktopStudio {
                 })
                 .await;
             if let Err(err) = res {
-                studio.status_toast.set(Some(format!("Rating update failed: {err}")));
+                studio
+                    .status_toast
+                    .set(Some(format!("Rating update failed: {err}")));
                 return;
             }
             studio.bump_library();
@@ -1571,7 +2024,7 @@ impl DesktopStudio {
     }
 
     /// Pending Discovery drops stage behind the 5-second `UndoSnackbar` and skip immediately;
-    /// Permanent Library removals open the Multi-Listener Delete Guard sheet.
+    /// Permanent Library removals open the Multi-Listener Delete Guard sheet (failing closed while loading).
     pub fn drop_track(&mut self, player: PlayerContext, track: PlayerTrack) {
         if track.is_discovery {
             let displaced = self.pending_drops.write().stage_drop(
@@ -1583,11 +2036,14 @@ impl DesktopStudio {
             if let Some(prev) = displaced {
                 self.commit_pending_drop_item(prev);
             }
-            // Skip immediately if the dropped discovery track is currently playing.
             if player.is_track_current(&track.id) {
                 player.next();
             }
         } else {
+            self.guard_preview.set(Some(fail_closed_guard_preview(
+                track.id.clone(),
+                "Inspecting household listener protection…".into(),
+            )));
             self.guard_modal_track.set(Some(track.clone()));
             self.audit_delete_guard(track.id);
         }
@@ -1641,8 +2097,21 @@ impl DesktopStudio {
         });
     }
 
-    pub fn confirm_library_remove(&mut self, player: PlayerContext, track: PlayerTrack) {
+    /// Commits a library track removal strictly according to [`GuardModalMode`]:
+    /// - `ListenerProtected`: unstars & sets rating=1 (ZERO TOCTOU disk-deletion risk!)
+    /// - `PermanentDelete`: enqueues `OutboxMutation::Drop { confirm_delete: true }`
+    /// - `HardBlocked`: closes cleanly with zero mutation.
+    pub fn confirm_library_remove(
+        &mut self,
+        player: PlayerContext,
+        track: PlayerTrack,
+        preview: DeleteGuardPreview,
+    ) {
         self.guard_modal_track.set(None);
+        let mode = classify_guard_mode(&preview);
+        if mode == GuardModalMode::HardBlocked {
+            return;
+        }
         if player.is_track_current(&track.id) {
             player.next();
         }
@@ -1650,11 +2119,62 @@ impl DesktopStudio {
             return;
         };
         let mut studio = *self;
+
+        if mode == GuardModalMode::ListenerProtected {
+            player
+                .state_signal()
+                .write()
+                .apply_curation_update(&track.id, Some(false), Some(1), false);
+            studio.push_mini_snapshot(player);
+            spawn(async move {
+                let _ = core
+                    .enqueue_mutation(OutboxMutation::Star {
+                        song_id: track.id.clone(),
+                        starred: false,
+                        discovery_track_id: None,
+                    })
+                    .await;
+                let res = core
+                    .enqueue_mutation(OutboxMutation::Rate {
+                        song_id: track.id.clone(),
+                        rating: 1,
+                        discovery_track_id: None,
+                    })
+                    .await;
+                match res {
+                    Ok(_) => {
+                        studio.status_toast.set(Some(format!(
+                            "Kept file for other listeners — unstarred & hidden \"{}\"",
+                            track.title
+                        )));
+                        studio.bump_library();
+                        studio.refresh_outbox_counts().await;
+                        if !core.is_offline_only() {
+                            let _ = core.drain_outbox().await;
+                            studio.refresh_outbox_counts().await;
+                        }
+                    }
+                    Err(err) => {
+                        studio
+                            .status_toast
+                            .set(Some(format!("Failed to hide track: {err}")));
+                    }
+                }
+            });
+            return;
+        }
+
+        let disc_id = if mode == GuardModalMode::PendingDiscovery {
+            preview.discovery_track_id.clone()
+        } else {
+            None
+        };
+
         spawn(async move {
             let res = core
                 .enqueue_mutation(OutboxMutation::Drop {
                     song_id: track.id.clone(),
-                    discovery_track_id: None,
+                    discovery_track_id: disc_id,
                     confirm_delete: true,
                 })
                 .await;
@@ -1688,7 +2208,6 @@ impl DesktopStudio {
         spawn(async move {
             let all_tracks = load_library_tracks(&core, offline_only).await;
             let mut radio = vec![seed.clone()];
-            // Prefer same artist / genre tracks from local SQLite mirror, then library shuffle
             for t in all_tracks {
                 if t.id != seed.id
                     && (t.artist.eq_ignore_ascii_case(&seed.artist) || radio.len() < 25)
@@ -1705,6 +2224,213 @@ impl DesktopStudio {
                 "Started Track Radio from \"{}\" ({count} tracks)",
                 seed.title
             )));
+        });
+    }
+
+    /// Calls `POST {base}/api/acquire-and-play` (`{"req": AcquireAndPlayRequest}`) to acquire
+    /// an unowned MusicBrainz track and immediately play it once ready!
+    pub fn acquire_and_play_remote(
+        &mut self,
+        player: PlayerContext,
+        remote: RemoteCatalogTrack,
+    ) {
+        let cfg = self.config.peek().clone();
+        if cfg.offline_only {
+            self.status_toast
+                .set(Some("Disable Offline Only mode to acquire catalog tracks.".into()));
+            return;
+        }
+        let Some(base) = cfg.soulbeet_base_url.clone() else {
+            self.status_toast.set(Some(
+                "Connect a Soulbeet server in Settings to use Acquire & Play.".into(),
+            ));
+            return;
+        };
+        let row_key = format!("{}:{}", remote.artist, remote.title);
+        self.acquiring_tracks.write().insert(
+            row_key.clone(),
+            AcquireStageBadge::Acquiring {
+                label: Some("Soulbeet".into()),
+            },
+        );
+        let auth = cfg.soulbeet_auth();
+        let core_opt = self.core.peek().clone();
+        let mut studio = *self;
+
+        spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!("{}/api/acquire-and-play", base.trim_end_matches('/'));
+            let payload = AcquireAndPlayRequest {
+                artist: remote.artist.clone(),
+                title: remote.title.clone(),
+                album: remote.album.clone(),
+                recording_mbid: remote.mbid.clone(),
+                release_mbid: None,
+                duration_s: remote.duration_secs.and_then(|d| u32::try_from(d).ok()),
+                folder_id: None,
+                prefer_fast: true,
+            };
+            let mut req = client
+                .post(&url)
+                .json(&serde_json::json!({ "req": payload }));
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<AcquireAndPlayResponse>().await {
+                        Ok(acq) => match acq.status {
+                            AcquireAndPlayInitialStatus::AlreadyOwned {
+                                navidrome_song_id,
+                                codec,
+                                ..
+                            } => {
+                                studio.acquiring_tracks.write().remove(&row_key);
+                                let track = PlayerTrack {
+                                    id: navidrome_song_id,
+                                    title: remote.title.clone(),
+                                    artist: remote.artist.clone(),
+                                    album: remote.album.clone(),
+                                    duration_secs: remote
+                                        .duration_secs
+                                        .and_then(|d| u32::try_from(d).ok()),
+                                    codec_badge: codec,
+                                    ..Default::default()
+                                };
+                                player.play_track(track);
+                                studio.status_toast.set(Some(format!(
+                                    "Already in library — playing \"{}\"",
+                                    remote.title
+                                )));
+                            }
+                            AcquireAndPlayInitialStatus::Started { backend_ids, .. } => {
+                                let label = backend_ids.first().cloned();
+                                studio.acquiring_tracks.write().insert(
+                                    row_key.clone(),
+                                    AcquireStageBadge::Acquiring { label },
+                                );
+                                studio.status_toast.set(Some(format!(
+                                    "Acquiring \"{}\" — will sync when imported",
+                                    remote.title
+                                )));
+                                // Background delta sync check to pick up the acquired track cleanly.
+                                if let Some(core) = core_opt {
+                                    let q_artist = remote.artist.clone();
+                                    let q_title = remote.title.clone();
+                                    for _ in 0..8 {
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                        if core.is_offline_only() {
+                                            break;
+                                        }
+                                        let _ = core.sync_now(false).await;
+                                        if let Ok(found) = core
+                                            .search(&format!("{q_artist} {q_title}"), 5)
+                                            .await
+                                        {
+                                            if let Some(local) = found.local_tracks.into_iter().find(
+                                                |t| {
+                                                    t.title.eq_ignore_ascii_case(&q_title)
+                                                        && t.artist_name
+                                                            .eq_ignore_ascii_case(&q_artist)
+                                                },
+                                            ) {
+                                                let cached = load_cached_track_ids(&core).await;
+                                                let disc = load_pending_discovery_map(&core).await;
+                                                let pt = local_track_to_player_track(
+                                                    &local, &cached, &disc,
+                                                );
+                                                studio.acquiring_tracks.write().remove(&row_key);
+                                                studio.bump_library();
+                                                player.play_track(pt);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    studio.acquiring_tracks.write().remove(&row_key);
+                                }
+                            }
+                        },
+                        Err(err) => {
+                            studio.acquiring_tracks.write().insert(
+                                row_key,
+                                AcquireStageBadge::Failed {
+                                    message: Some(format!("Invalid response: {err}")),
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let code = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    studio.acquiring_tracks.write().insert(
+                        row_key,
+                        AcquireStageBadge::Failed {
+                            message: Some(format!("HTTP {code}: {}", body.trim())),
+                        },
+                    );
+                }
+                Err(err) => {
+                    studio.acquiring_tracks.write().insert(
+                        row_key,
+                        AcquireStageBadge::Failed {
+                            message: Some(err.to_string()),
+                        },
+                    );
+                }
+            }
+        });
+    }
+
+    /// Calls `POST {base}/api/discovery/seasonal/steer` to adjust cultural mix steering on the server.
+    pub fn steer_seasonal_pack(&mut self, slug: String, steering: CultureSteering) {
+        let cfg = self.config.peek().clone();
+        if cfg.offline_only {
+            self.status_toast
+                .set(Some("Steering saved locally (offline mode).".into()));
+            return;
+        }
+        let Some(base) = cfg.soulbeet_base_url.clone() else {
+            return;
+        };
+        let auth = cfg.soulbeet_auth();
+        let mut studio = *self;
+        spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!(
+                "{}/api/discovery/seasonal/steer",
+                base.trim_end_matches('/')
+            );
+            let req_body = SteerSeasonalPackRequest { slug, steering };
+            let mut req = client
+                .post(&url)
+                .json(&serde_json::json!({ "req": req_body }));
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(summary) = resp.json::<ContextualMixSummary>().await {
+                        studio.status_toast.set(Some(format!(
+                            "Updated seasonal mix steering ({} tracks)",
+                            summary.track_count
+                        )));
+                    }
+                    studio.sync_now(false);
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        "seasonal steer returned HTTP {}",
+                        resp.status().as_u16()
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("seasonal steer request failed: {err}");
+                }
+            }
         });
     }
 
@@ -1752,11 +2478,15 @@ impl DesktopStudio {
         }
         self.sync_status.write().syncing = true;
         self.sync_status.write().last_error = None;
+        let cfg = self.config.peek().clone();
         let mut studio = *self;
         spawn(async move {
             let drain = core.drain_outbox().await;
             if let Err(err) = drain {
                 tracing::warn!("outbox drain before sync failed: {err}");
+            }
+            if let Ok(Some(boot)) = verify_desktop_config(&cfg).await {
+                studio.bootstrap.set(Some(boot));
             }
             match core.sync_now(force_full).await {
                 Ok(report) => {
@@ -1858,7 +2588,8 @@ impl DesktopStudio {
         });
     }
 
-    pub fn fetch_lyrics(&mut self, song_id: String) {
+    /// Calls the real Soulbeet lyrics endpoint: `GET {base}/api/client/lyrics?song_id=...&artist=...&title=...`.
+    pub fn fetch_lyrics(&mut self, song_id: String, artist: Option<String>, title: Option<String>) {
         let cfg = self.config.peek().clone();
         if cfg.offline_only {
             self.lyrics_error
@@ -1876,10 +2607,30 @@ impl DesktopStudio {
         let mut studio = *self;
         spawn(async move {
             let client = reqwest::Client::new();
-            let url = format!("{}/api/navidrome/lyrics", base.trim_end_matches('/'));
-            let mut req = client
-                .post(&url)
-                .json(&serde_json::json!({ "song_id": song_id }));
+            let mut url = match url::Url::parse(&format!(
+                "{}/api/client/lyrics",
+                base.trim_end_matches('/')
+            )) {
+                Ok(u) => u,
+                Err(err) => {
+                    studio
+                        .lyrics_error
+                        .set(Some(format!("Invalid Soulbeet URL: {err}")));
+                    studio.lyrics_loading.set(false);
+                    return;
+                }
+            };
+            {
+                let mut qp = url.query_pairs_mut();
+                qp.append_pair("song_id", &song_id);
+                if let Some(a) = artist.as_deref().filter(|s| !s.trim().is_empty()) {
+                    qp.append_pair("artist", a);
+                }
+                if let Some(t) = title.as_deref().filter(|s| !s.trim().is_empty()) {
+                    qp.append_pair("title", t);
+                }
+            }
+            let mut req = client.get(url);
             if let Some(a) = auth {
                 let (k, v) = a.header_name_and_value();
                 req = req.header(k, v);
@@ -1913,56 +2664,69 @@ impl DesktopStudio {
         });
     }
 
+    /// Calls the real Soulbeet delete-guard endpoint: `GET {base}/api/curation/guard-preview/{song_id}`.
+    /// Strictly fails CLOSED on offline mode, missing server URL, or any HTTP/network error.
     pub fn audit_delete_guard(&mut self, song_id: String) {
         let cfg = self.config.peek().clone();
         if cfg.offline_only {
-            self.guard_preview.set(Some(DeleteGuardPreview {
+            self.guard_loading.set(false);
+            self.guard_preview.set(Some(fail_closed_guard_preview(
                 song_id,
-                is_pending_discovery: false,
-                discovery_track_id: None,
-                can_delete: false,
-                sole_owner: false,
-                other_listeners: Vec::new(),
-                own_playlists: Vec::new(),
-                block_reason: Some(
-                    "Multi-listener guard audit requires an online Soulbeet connection.".into(),
-                ),
-            }));
+                "Multi-listener guard audit requires an online Soulbeet connection.".into(),
+            )));
             return;
         }
         let Some(base) = cfg.soulbeet_base_url.clone() else {
-            self.guard_preview.set(Some(DeleteGuardPreview {
+            self.guard_loading.set(false);
+            self.guard_preview.set(Some(fail_closed_guard_preview(
                 song_id,
-                is_pending_discovery: false,
-                discovery_track_id: None,
-                can_delete: false,
-                sole_owner: false,
-                other_listeners: Vec::new(),
-                own_playlists: Vec::new(),
-                block_reason: Some(
-                    "Connect a Soulbeet server to inspect household listener protection.".into(),
-                ),
-            }));
+                "Connect a Soulbeet server to inspect household listener protection.".into(),
+            )));
             return;
         };
         let auth = cfg.soulbeet_auth();
         self.guard_loading.set(true);
+        self.guard_preview.set(Some(fail_closed_guard_preview(
+            song_id.clone(),
+            "Inspecting household listener protection…".into(),
+        )));
         let mut studio = *self;
         spawn(async move {
             let client = reqwest::Client::new();
-            let url = format!("{}/api/curation/delete-guard", base.trim_end_matches('/'));
-            let mut req = client
-                .post(&url)
-                .json(&serde_json::json!({ "song_id": song_id }));
+            let encoded_id = percent_encode_param(&song_id);
+            let url = format!(
+                "{}/api/curation/guard-preview/{encoded_id}",
+                base.trim_end_matches('/')
+            );
+            let mut req = client.get(&url);
             if let Some(a) = auth {
                 let (k, v) = a.header_name_and_value();
                 req = req.header(k, v);
             }
-            if let Ok(resp) = req.send().await {
-                if resp.status().is_success() {
-                    if let Ok(preview) = resp.json::<DeleteGuardPreview>().await {
-                        studio.guard_preview.set(Some(preview));
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<DeleteGuardPreview>().await {
+                        Ok(preview) => studio.guard_preview.set(Some(preview)),
+                        Err(err) => {
+                            studio.guard_preview.set(Some(fail_closed_guard_preview(
+                                song_id,
+                                format!("Could not decode guard preview: {err}"),
+                            )));
+                        }
                     }
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    studio.guard_preview.set(Some(fail_closed_guard_preview(
+                        song_id,
+                        format!("Delete guard audit failed (HTTP {status}); deletion blocked for safety."),
+                    )));
+                }
+                Err(err) => {
+                    studio.guard_preview.set(Some(fail_closed_guard_preview(
+                        song_id,
+                        format!("Could not verify household listener protection: {err}"),
+                    )));
                 }
             }
             studio.guard_loading.set(false);
@@ -2044,14 +2808,23 @@ impl DesktopStudio {
         });
     }
 
-    /// Initializes or reloads `Arc<SoulbeetCore>` from `next_config`, saves config, starts sync
-    /// and Connect WS, and restores saved playback session if queue is empty.
-    pub fn connect_with_config(&mut self, next_config: DesktopConfig, player: PlayerContext) {
+    /// Initializes or reloads `Arc<SoulbeetCore>` from `next_config`, saves config with `0o600`
+    /// permissions, starts supervised Connect WS + sync, and loads any persisted playback session
+    /// paused into `libmpv` at the exact saved position so pressing Play immediately resumes!
+    pub fn connect_with_config(
+        &mut self,
+        next_config: DesktopConfig,
+        initial_bootstrap: Option<ClientBootstrap>,
+        mut player: PlayerContext,
+    ) {
         if let Err(err) = next_config.save_to_disk() {
             self.core_error.set(Some(err));
             return;
         }
         self.config.set(next_config.clone());
+        if initial_bootstrap.is_some() {
+            self.bootstrap.set(initial_bootstrap);
+        }
         self.core_error.set(None);
         let mut studio = *self;
 
@@ -2064,7 +2837,7 @@ impl DesktopStudio {
                     studio.refresh_cache_and_playlists().await;
                     studio.bump_library();
 
-                    // Restore persisted playback queue if currently idle
+                    // Restore persisted playback session AND preload paused into libmpv at exact position
                     if player.state_signal().peek().queue.is_empty() {
                         if let Ok(Some(session)) = core.load_playback_session().await {
                             if !session.queue_track_ids.is_empty() {
@@ -2088,41 +2861,38 @@ impl DesktopStudio {
                                     .collect();
                                 if !restored.is_empty() {
                                     let idx = session.current_index.min(restored.len() - 1);
-                                    let mut st = player.state_signal();
-                                    let mut w = st.write();
-                                    w.queue = restored.clone();
-                                    w.queue_index = Some(idx);
-                                    w.current_track = restored.get(idx).cloned();
-                                    w.status = PlaybackStatus::Paused;
+                                    let current = restored.get(idx).cloned();
+                                    let resume_pos = session.position_ms as f64 / 1000.0;
+                                    let dur = current
+                                        .as_ref()
+                                        .and_then(|t| t.duration_secs)
+                                        .map(f64::from)
+                                        .unwrap_or(0.0);
+                                    {
+                                        let mut st = player.state_signal();
+                                        let mut w = st.write();
+                                        w.queue = restored;
+                                        w.queue_index = Some(idx);
+                                        w.current_track = current.clone();
+                                        w.status = PlaybackStatus::Paused;
+                                    }
+                                    player.set_progress(resume_pos, dur);
+                                    if let Some(track) = current {
+                                        studio.load_current_track_in_mpv(
+                                            player,
+                                            track,
+                                            true,
+                                            (resume_pos > 0.5).then_some(resume_pos),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Start Connect WS & event listener when online and Soulbeet URL configured
+                    // Start supervised Connect WS reconnect loop when online
                     if !core.is_offline_only() && next_config.soulbeet_base_url.is_some() {
-                        let core_ws = core.clone();
-                        let mut studio_ws = studio;
-                        spawn(async move {
-                            let mut rx = core_ws.connect_client().subscribe();
-                            if core_ws.connect_ws(Duration::from_secs(20)).await.is_ok() {
-                                studio_ws.sync_status.write().connect_online = true;
-                                while let Ok(ev) = rx.recv().await {
-                                    match ev {
-                                        ConnectServerEventDto::DeviceList { devices, .. } => {
-                                            studio_ws
-                                                .connect_devices
-                                                .set(convert_connect_devices(&devices));
-                                        }
-                                        ConnectServerEventDto::Command { command, .. } => {
-                                            apply_connect_command(player, &core_ws, command).await;
-                                        }
-                                        ConnectServerEventDto::PlaybackUpdated { .. } => {}
-                                    }
-                                }
-                                studio_ws.sync_status.write().connect_online = false;
-                            }
-                        });
+                        studio.start_supervised_connect(core.clone(), player);
                     }
 
                     // Initial background sync when online
@@ -2140,6 +2910,24 @@ impl DesktopStudio {
     }
 
     pub fn disconnect_server(&mut self, player: PlayerContext) {
+        // Flush any staged Undo drop before detaching core so pending mutations are never lost.
+        let staged = self.pending_drops.write().drain_active();
+        if let Some(item) = staged {
+            if let Some(core) = self.core.peek().clone() {
+                spawn(async move {
+                    let _ = core
+                        .enqueue_mutation(OutboxMutation::Drop {
+                            song_id: item.song_id,
+                            discovery_track_id: item.discovery_track_id,
+                            confirm_delete: true,
+                        })
+                        .await;
+                });
+            }
+        }
+        self.pending_drops.set(PendingDropQueue::new());
+
+        self.connect_gen.peek().fetch_add(1, Ordering::SeqCst);
         if let Some(core) = self.core.peek().clone() {
             spawn(async move {
                 core.connect_client().disconnect().await;
@@ -2153,12 +2941,14 @@ impl DesktopStudio {
         cfg.navidrome = None;
         let _ = cfg.save_to_disk();
         self.config.set(cfg);
+        self.bootstrap.set(None);
         self.core.set(None);
         self.playlists.set(Vec::new());
         self.connect_devices.set(Vec::new());
+        self.sync_status.write().connect_online = false;
     }
 
-    // --- Floating 360×110 Mini-Player Window Lifecycle ---
+    // --- Floating 360×110 Mini-Player Window Lifecycle (Generation-Guarded) ---
 
     pub fn toggle_mini_player(&mut self, player: PlayerContext) {
         if *self.mini_player_open.peek() {
@@ -2175,8 +2965,11 @@ impl DesktopStudio {
             }
             return;
         }
+        let my_gen = self.mini_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_arc = self.mini_gen.peek().clone();
         self.push_mini_snapshot(player);
         let bridge = MiniPlayerBridge {
+            generation: my_gen,
             snapshot_rx: self.mini_snapshot_tx.peek().subscribe(),
             action_tx: self.mini_action_tx.peek().clone(),
             core: self.core.peek().clone(),
@@ -2185,11 +2978,17 @@ impl DesktopStudio {
         let mut studio = *self;
         spawn(async move {
             let ctx = open_mini_player_window(bridge).await;
+            if gen_arc.load(Ordering::SeqCst) != my_gen {
+                // Superseded by close/reopen while creating webview: close immediately!
+                ctx.close();
+                return;
+            }
             studio.mini_window.set(Some(ctx));
         });
     }
 
     pub fn close_mini_player(&mut self) {
+        self.mini_gen.peek().fetch_add(1, Ordering::SeqCst);
         if let Some(win) = self.mini_window.take() {
             win.close();
         }
@@ -2198,7 +2997,8 @@ impl DesktopStudio {
 }
 
 async fn apply_connect_command(
-    player: PlayerContext,
+    mut studio: DesktopStudio,
+    mut player: PlayerContext,
     core: &SoulbeetCore,
     cmd: ConnectCommandDto,
 ) {
@@ -2221,7 +3021,8 @@ async fn apply_connect_command(
         ConnectCommandDto::LoadQueue {
             song_ids,
             start_index,
-            ..
+            start_position_ms,
+            autoplay,
         } => {
             let cached = load_cached_track_ids(core).await;
             let disc = load_pending_discovery_map(core).await;
@@ -2236,7 +3037,35 @@ async fn apply_connect_command(
                 .map(|t| local_track_to_player_track(t, &cached, &disc))
                 .collect();
             if !queue.is_empty() {
-                player.play_queue(queue, start_index);
+                let idx = start_index.min(queue.len() - 1);
+                let current = queue.get(idx).cloned();
+                let start_pos = start_position_ms as f64 / 1000.0;
+                let dur = current
+                    .as_ref()
+                    .and_then(|t| t.duration_secs)
+                    .map(f64::from)
+                    .unwrap_or(0.0);
+                {
+                    let mut st = player.state_signal();
+                    let mut w = st.write();
+                    w.queue = queue;
+                    w.queue_index = Some(idx);
+                    w.current_track = current.clone();
+                    w.status = if autoplay {
+                        PlaybackStatus::Loading
+                    } else {
+                        PlaybackStatus::Paused
+                    };
+                }
+                player.set_progress(start_pos, dur);
+                if let Some(track) = current {
+                    studio.load_current_track_in_mpv(
+                        player,
+                        track,
+                        !autoplay,
+                        (start_pos > 0.0).then_some(start_pos),
+                    );
+                }
             }
         }
         ConnectCommandDto::TransferPlayback { snapshot, .. } => {
@@ -2254,10 +3083,47 @@ async fn apply_connect_command(
                 .map(|t| local_track_to_player_track(t, &cached, &disc))
                 .collect();
             if !queue.is_empty() {
-                player.play_queue(queue, snapshot.queue_index);
-                if snapshot.position_ms > 0 {
-                    player.seek(snapshot.position_ms as f64 / 1000.0);
+                let idx = snapshot.queue_index.min(queue.len() - 1);
+                let current = queue.get(idx).cloned();
+                let start_pos = snapshot.position_ms as f64 / 1000.0;
+                let dur = if snapshot.duration_ms > 0 {
+                    snapshot.duration_ms as f64 / 1000.0
+                } else {
+                    current
+                        .as_ref()
+                        .and_then(|t| t.duration_secs)
+                        .map(f64::from)
+                        .unwrap_or(0.0)
+                };
+                let target_vol = if snapshot.volume.is_finite() {
+                    snapshot.volume.clamp(0.0, 1.0)
+                } else {
+                    player.volume()
+                };
+                {
+                    let mut st = player.state_signal();
+                    let mut w = st.write();
+                    w.queue = queue;
+                    w.queue_index = Some(idx);
+                    w.current_track = current.clone();
+                    w.volume = target_vol;
+                    w.status = if snapshot.is_playing {
+                        PlaybackStatus::Loading
+                    } else {
+                        PlaybackStatus::Paused
+                    };
                 }
+                player.set_progress(start_pos, dur);
+                studio.send_mpv(MpvCommand::SetVolume(target_vol));
+                if let Some(track) = current {
+                    studio.load_current_track_in_mpv(
+                        player,
+                        track,
+                        !snapshot.is_playing,
+                        (start_pos > 0.0).then_some(start_pos),
+                    );
+                }
+                studio.push_mini_snapshot(player);
             }
         }
     }
@@ -2292,6 +3158,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let duration_secs = use_signal(|| 0.0f64);
 
     let config = use_signal(move || initial_config);
+    let bootstrap = use_signal(|| None::<ClientBootstrap>);
     let core = use_signal(|| None::<Arc<SoulbeetCore>>);
     let core_error = use_signal(|| None::<String>);
     let active_section = use_signal(|| StudioNavSection::Home);
@@ -2302,11 +3169,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let cmdk_open = use_signal(|| false);
     let mini_player_open = use_signal(|| false);
     let mini_window = use_signal(|| None::<DesktopContext>);
+    let mini_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
     let telemetry = use_signal(|| None::<AudioTelemetry>);
     let sync_status = use_signal(SyncUiStatus::default);
     let cache_stats = use_signal(|| None::<CacheStats>);
     let playlists = use_signal(Vec::<DesktopPlaylist>::new);
     let pending_drops = use_signal(PendingDropQueue::new);
+    let acquiring_tracks = use_signal(HashMap::<String, AcquireStageBadge>::new);
     let connect_devices = use_signal(Vec::<ConnectDevice>::new);
     let lyrics = use_signal(Vec::<TrackLyrics>::new);
     let lyrics_loading = use_signal(|| false);
@@ -2318,6 +3187,9 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let library_revision = use_signal(|| 0u64);
     let mpv_cmd_tx = use_signal(|| None::<mpsc::Sender<MpvCommand>>);
     let mpv_error = use_signal(|| None::<String>);
+    let load_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
+    let connect_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
+    let volume_debounce_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
 
     let (mini_snap_tx_raw, _) = use_hook(|| watch::channel(MiniPlayerSnapshot::default()));
     let mini_snapshot_tx = use_signal(move || Arc::new(mini_snap_tx_raw));
@@ -2345,8 +3217,9 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let os_media_rx_slot = os_media_pair.1.clone();
     let scrobbler = use_signal(|| Arc::new(Mutex::new(ScrobbleTracker::new())));
 
-    // Keep the MpvEngine alive for the lifetime of the root component so Drop shuts it down cleanly.
+    // Reset LC_NUMERIC=C right after GTK3 initializes the window and before libmpv starts!
     let mpv_events_slot = use_hook(|| {
+        ensure_c_numeric_locale();
         match MpvEngine::new(initial_replaygain, initial_volume) {
             Ok(mut engine) => {
                 let cmd_tx = engine.command_sender();
@@ -2388,6 +3261,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
 
     let studio = DesktopStudio {
         config,
+        bootstrap,
         core,
         core_error,
         active_section,
@@ -2398,11 +3272,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         cmdk_open,
         mini_player_open,
         mini_window,
+        mini_gen,
         telemetry,
         sync_status,
         cache_stats,
         playlists,
         pending_drops,
+        acquiring_tracks,
         connect_devices,
         lyrics,
         lyrics_loading,
@@ -2414,6 +3290,9 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         library_revision,
         mpv_cmd_tx,
         mpv_error,
+        load_gen,
+        connect_gen,
+        volume_debounce_gen,
         mini_snapshot_tx,
         mini_action_tx,
         media_controls,
@@ -2421,7 +3300,12 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     };
     use_context_provider(|| studio);
 
-    // Command dispatcher bridged into `ui::PlayerProvider`
+    // Ensure floating Mini-Player closes cleanly when the main Studio window is torn down.
+    use_drop(move || {
+        let mut st = studio;
+        st.close_mini_player();
+    });
+
     let on_command = use_callback(move |cmd: PlayerCommand| {
         let mut st = studio;
         let player = PlayerContext::new(
@@ -2433,7 +3317,6 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         st.handle_player_command(player, cmd);
     });
 
-    // Fix recursive player handle via a thin context wrapper below
     let player_ctx = PlayerContext::new(player_state, position_secs, duration_secs, on_command);
 
     // 1. Auto-initialize SoulbeetCore if already configured on disk
@@ -2441,7 +3324,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         let cfg = config.peek().clone();
         if cfg.is_configured() {
             let mut st = studio;
-            st.connect_with_config(cfg, player_ctx);
+            st.connect_with_config(cfg, None, player_ctx);
         }
     });
 
@@ -2558,6 +3441,11 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
                     MediaKeyAction::Other(OsMediaCommand::Player(cmd)) => {
                         st.handle_player_command(p_ctx, *cmd);
                     }
+                    MediaKeyAction::Other(OsMediaCommand::SetShuffle(target)) => {
+                        if player_state.peek().shuffle != target {
+                            st.handle_player_command(p_ctx, PlayerCommand::ToggleShuffle);
+                        }
+                    }
                     MediaKeyAction::Other(OsMediaCommand::SeekRelative(delta)) => {
                         let cur = *position_secs.peek();
                         st.handle_player_command(
@@ -2572,6 +3460,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
                         dioxus_desktop::window().set_focus();
                     }
                     MediaKeyAction::Other(OsMediaCommand::Quit) => {
+                        st.close_mini_player();
                         dioxus_desktop::window().close();
                     }
                 }
@@ -2615,9 +3504,11 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
                         st.close_mini_player();
                         dioxus_desktop::window().set_focus();
                     }
-                    MiniPlayerAction::Closed => {
-                        st.mini_window.set(None);
-                        st.mini_player_open.set(false);
+                    MiniPlayerAction::Closed(closed_gen) => {
+                        if st.mini_gen.peek().load(Ordering::SeqCst) == closed_gen {
+                            st.mini_window.set(None);
+                            st.mini_player_open.set(false);
+                        }
                     }
                 }
             }
@@ -2644,7 +3535,6 @@ mod tests {
         let mut tracker = ScrobbleTracker::new();
         let t0 = Instant::now();
 
-        // Short tracks (< 30s) emit NowPlaying but NEVER submit a scrobble
         let np_short = tracker.start_track("short-1".into(), 22.0, 1_700_000_000);
         assert!(matches!(
             np_short,
@@ -2660,7 +3550,6 @@ mod tests {
         }
         assert!(!tracker.is_submitted());
 
-        // 200s track -> threshold = 100s; pausing does not accumulate time
         let _ = tracker.start_track("song-200".into(), 200.0, 1_700_000_100);
         assert_eq!(ScrobbleTracker::scrobble_threshold_secs(200.0), Some(100.0));
         assert_eq!(ScrobbleTracker::scrobble_threshold_secs(900.0), Some(240.0));
@@ -2668,7 +3557,6 @@ mod tests {
 
         let mut cursor = t0;
         assert!(tracker.tick(cursor, true, 200.0).is_none());
-        // Advance 25 * 4s = 100s while playing
         let mut submitted = None;
         for _ in 0..25 {
             cursor += Duration::from_secs(4);
@@ -2686,19 +3574,18 @@ mod tests {
             }) if song_id == "song-200"
         ));
 
-        // Subsequent ticks never double-submit
         cursor += Duration::from_secs(4);
         assert!(tracker.tick(cursor, true, 200.0).is_none());
     }
 
     #[test]
-    fn desktop_config_roundtrips_json_and_builds_client_config() {
+    fn desktop_config_roundtrips_json_sets_0600_permissions_and_normalizes_tokens() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cfg_path = tmp.path().join("config.json");
+        let cfg_path = tmp.path().join("subdir").join("config.json");
 
         let cfg = DesktopConfig {
             soulbeet_base_url: Some("https://music.example.com/".into()),
-            auth_token: Some("secret-tok".into()),
+            auth_token: Some("Bearer secret-tok".into()),
             auth_kind: DesktopAuthKind::Bearer,
             navidrome: Some(NavidromeCredentials {
                 base_url: "https://nav.example.com".into(),
@@ -2718,12 +3605,40 @@ mod tests {
         assert!(cfg.is_configured());
         cfg.save_to_path(&cfg_path).expect("save config");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(&cfg_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600, "config.json must be owner-read/write only");
+            let dir_mode = std::fs::metadata(cfg_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700, "config parent dir must be 0o700");
+        }
+
         let loaded = DesktopConfig::load_from_path(&cfg_path).expect("load config");
         assert_eq!(loaded.replaygain, ReplayGainMode::Album);
         assert!(loaded.oled_mode);
         assert!(loaded.offline_only);
         assert_eq!(loaded.cache_max_gb, 12);
-        assert_eq!(loaded.soulbeet_auth(), Some(SoulbeetAuth::Bearer("secret-tok".into())));
+        assert_eq!(
+            loaded.soulbeet_auth(),
+            Some(SoulbeetAuth::Bearer("secret-tok".into()))
+        );
+        assert_eq!(
+            normalize_auth_token("auth_token=abc123; Path=/", DesktopAuthKind::SessionCookie),
+            "abc123"
+        );
+        assert_eq!(
+            extract_auth_cookie_from_header("auth_token=xyz999; HttpOnly; SameSite=Lax").as_deref(),
+            Some("xyz999")
+        );
 
         let client_cfg = loaded.to_client_config();
         assert_eq!(
@@ -2732,6 +3647,34 @@ mod tests {
         );
         assert_eq!(client_cfg.cache_policy.max_bytes, 12 * 1024 * 1024 * 1024);
         assert_eq!(client_cfg.platform, CoreDevicePlatform::Desktop);
+    }
+
+    #[test]
+    fn fail_closed_guard_preview_always_blocks_permanent_deletion() {
+        let preview = fail_closed_guard_preview("song-1".into(), "Offline".into());
+        assert!(!preview.can_delete);
+        assert!(!preview.sole_owner);
+        assert_eq!(classify_guard_mode(&preview), GuardModalMode::HardBlocked);
+    }
+
+    #[test]
+    fn offline_collection_filter_retains_only_cached_tracks() {
+        let tracks = vec![
+            PlayerTrack {
+                id: "cached".into(),
+                is_offline_cached: true,
+                ..Default::default()
+            },
+            PlayerTrack {
+                id: "uncached".into(),
+                is_offline_cached: false,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(filter_tracks_for_offline_play(tracks.clone(), false).len(), 2);
+        let offline = filter_tracks_for_offline_play(tracks, true);
+        assert_eq!(offline.len(), 1);
+        assert_eq!(offline[0].id, "cached");
     }
 
     #[test]

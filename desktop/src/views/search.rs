@@ -1,5 +1,6 @@
 //! Desktop Studio Search View — 0ms local SQLite FTS5 search + online MusicBrainz catalog
-//! (automatically suppressed when global `Offline Only` mode is active).
+//! with live 1-tap `Acquire & Play` (`POST /api/acquire-and-play`, automatically hidden when
+//! global `Offline Only` mode is active).
 
 use client_core::models::SearchResults;
 use dioxus::prelude::*;
@@ -17,7 +18,6 @@ pub fn SearchView() -> Element {
     let offline_only = player.offline_only();
 
     let mut query = use_signal(move || studio.search_seed_query.read().clone());
-    let core_opt = studio.core.read().clone();
 
     // Sync query if Command Palette seeded a new search term
     use_effect(move || {
@@ -27,10 +27,13 @@ pub fn SearchView() -> Element {
         }
     });
 
+    // All reactive reads happen INSIDE `use_resource` so search re-runs on query, core init,
+    // offline toggle, or sync updates.
     let results_res = use_resource(move || {
         let q = query();
-        let core = core_opt.clone();
-        let _off = offline_only;
+        let core = studio.core.read().clone();
+        let _offline = player.offline_only();
+        let _rev = (studio.library_revision)();
         async move {
             let c = core?;
             if q.trim().is_empty() {
@@ -48,6 +51,7 @@ pub fn SearchView() -> Element {
         }
     });
 
+    let acquiring_map = studio.acquiring_tracks.read().clone();
     let current_id = player.current_track().map(|t| t.id);
     let is_playing = player.is_playing();
 
@@ -165,6 +169,7 @@ pub fn SearchView() -> Element {
                                         for album in res.local_albums.iter() {
                                             {
                                                 let aid = album.id.clone();
+                                                let aname = album.name.clone();
                                                 let art = desktop_cover_art_url(album.cover_art_id.as_deref());
                                                 rsx! {
                                                     button {
@@ -173,12 +178,11 @@ pub fn SearchView() -> Element {
                                                         class: "group rounded-[10px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 text-left space-y-2 cursor-pointer transition-colors",
                                                         onclick: move |_| {
                                                             let id = aid.clone();
+                                                            let label = aname.clone();
                                                             if let Some(core) = studio.core.peek().clone() {
                                                                 spawn(async move {
                                                                     let tracks = load_tracks_for_album(&core, &id).await;
-                                                                    if !tracks.is_empty() {
-                                                                        player.play_queue(tracks, 0);
-                                                                    }
+                                                                    studio.play_collection(player, tracks, 0, &label);
                                                                 });
                                                             }
                                                         },
@@ -202,7 +206,7 @@ pub fn SearchView() -> Element {
                                 }
                             }
 
-                            // Remote MusicBrainz Catalog (automatically hidden when offline_only)
+                            // Remote MusicBrainz Catalog (1-tap Acquire & Play; hidden when offline_only)
                             if !offline_only && !res.remote_tracks.is_empty() {
                                 section { class: "space-y-2",
                                     h3 { class: "text-[16px] font-semibold text-beet-text-primary",
@@ -211,7 +215,9 @@ pub fn SearchView() -> Element {
                                     div { class: "space-y-1", role: "list",
                                         for remote in res.remote_tracks.iter() {
                                             {
-                                                let title_copy = remote.title.clone();
+                                                let remote_clone = remote.clone();
+                                                let row_key = format!("{}:{}", remote.artist, remote.title);
+                                                let stage = acquiring_map.get(&row_key).cloned();
                                                 rsx! {
                                                     TrackRow {
                                                         key: "rem-{remote.artist}-{remote.title}",
@@ -220,11 +226,9 @@ pub fn SearchView() -> Element {
                                                         album: remote.album.clone(),
                                                         duration_secs: remote.duration_secs.and_then(|d| u32::try_from(d).ok()),
                                                         codec_badge: Some("MUSICBRAINZ".to_string()),
-                                                        state: TrackRowState::UnownedCatalog { acquiring_stage: None },
+                                                        state: TrackRowState::UnownedCatalog { acquiring_stage: stage },
                                                         on_acquire: move |_| {
-                                                            studio.status_toast.set(Some(format!(
-                                                                "Acquire & Play for \"{title_copy}\" requires Soulbeet server acquisition endpoint"
-                                                            )));
+                                                            studio.acquire_and_play_remote(player, remote_clone.clone());
                                                         },
                                                     }
                                                 }

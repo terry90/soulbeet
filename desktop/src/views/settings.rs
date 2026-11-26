@@ -13,12 +13,10 @@ pub fn ActivityView() -> Element {
     let player = use_player();
     let offline_only = player.offline_only();
     let sync_st = studio.sync_status.read().clone();
-    let core_opt = studio.core.read().clone();
-    let rev = (studio.library_revision)();
 
     let pending_rows = use_resource(move || {
-        let core = core_opt.clone();
-        let _rev = rev;
+        let core = studio.core.read().clone();
+        let _rev = (studio.library_revision)();
         async move {
             match core {
                 Some(c) => c.outbox().pending().await.unwrap_or_default(),

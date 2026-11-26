@@ -2,7 +2,7 @@
 //! (Linux MPRIS2 over D-Bus & Windows SMTC).
 //!
 //! Gracefully degrades to a no-op with a warning log in headless / D-Bus-free environments
-//! so the desktop app and tests never panic when no session bus is running.
+//! or when no Windows HWND is available so the desktop app and tests never panic.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,6 +19,7 @@ use ui::{PlaybackStatus, PlayerCommand};
 pub enum OsMediaCommand {
     Player(Box<PlayerCommand>),
     SeekRelative(f64),
+    SetShuffle(bool),
     Stop,
     RaiseWindow,
     Quit,
@@ -35,21 +36,37 @@ pub struct MediaTrackMeta {
     pub fallback_cover_url: Option<String>,
 }
 
-/// Converts a local cached artwork path into a standards-compliant `file://` URI
-/// accepted by Linux MPRIS2 (`mpris:artUrl`) and Windows SMTC thumbnails.
-pub fn format_cover_art_uri(
+/// Converts a local cached artwork path into a platform-appropriate `file://` URI accepted by
+/// Linux MPRIS2 (`file:///path/to/art.jpg`) and Windows SMTC (`file://C:\path\to\art.jpg`,
+/// avoiding the leading slash rejected by WinRT `StorageFile::GetFileFromPathAsync`).
+pub fn format_cover_art_uri_for_platform(
     local_path: Option<&Path>,
     fallback_url: Option<&str>,
+    is_windows: bool,
 ) -> Option<String> {
     if let Some(path) = local_path {
-        if let Ok(url) = url::Url::from_file_path(path) {
+        if is_windows {
+            let raw = path.display().to_string();
+            if !raw.trim().is_empty() {
+                return Some(format!("file://{raw}"));
+            }
+        } else if let Ok(url) = url::Url::from_file_path(path) {
             return Some(url.to_string());
         }
     }
     fallback_url
         .map(str::trim)
-        .filter(|u| u.starts_with("http://") || u.starts_with("https://") || u.starts_with("file://"))
+        .filter(|u| {
+            u.starts_with("http://") || u.starts_with("https://") || u.starts_with("file://")
+        })
         .map(ToString::to_string)
+}
+
+pub fn format_cover_art_uri(
+    local_path: Option<&Path>,
+    fallback_url: Option<&str>,
+) -> Option<String> {
+    format_cover_art_uri_for_platform(local_path, fallback_url, cfg!(target_os = "windows"))
 }
 
 /// Translates a [`souvlaki::MediaControlEvent`] into an [`OsMediaCommand`].
@@ -92,9 +109,7 @@ pub fn map_media_control_event(event: MediaControlEvent) -> Option<OsMediaComman
                 None
             }
         }
-        MediaControlEvent::SetShuffle(_) => Some(OsMediaCommand::Player(Box::new(
-            PlayerCommand::ToggleShuffle,
-        ))),
+        MediaControlEvent::SetShuffle(enabled) => Some(OsMediaCommand::SetShuffle(enabled)),
         MediaControlEvent::Raise => Some(OsMediaCommand::RaiseWindow),
         MediaControlEvent::Quit => Some(OsMediaCommand::Quit),
         _ => None,
@@ -126,13 +141,21 @@ pub struct MediaControlsBridge {
 
 impl MediaControlsBridge {
     /// Initializes OS media controls. Pass `hwnd` on Windows (`None` on Linux/macOS).
-    /// Logs a warning and degrades cleanly if D-Bus / SMTC is unavailable.
+    /// Logs a warning and degrades cleanly if D-Bus / SMTC / HWND is unavailable.
     pub fn init(
         hwnd: Option<*mut std::ffi::c_void>,
         tx: mpsc::UnboundedSender<MediaKeyAction>,
     ) -> Self {
         #[cfg(target_os = "windows")]
-        let platform_hwnd = hwnd;
+        let platform_hwnd = {
+            if hwnd.is_none() {
+                tracing::warn!(
+                    "Windows HWND unavailable; disabling SMTC OS media controls gracefully"
+                );
+                return Self { controls: None };
+            }
+            hwnd
+        };
         #[cfg(not(target_os = "windows"))]
         let platform_hwnd = {
             let _ = hwnd;
@@ -252,14 +275,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_local_file_and_remote_cover_art_uris() {
-        let uri = format_cover_art_uri(
+    fn formats_local_file_uris_for_linux_and_windows_smtc() {
+        let linux_uri = format_cover_art_uri_for_platform(
             Some(Path::new("/tmp/soulbeet cache/cover 01.jpg")),
             Some("https://example.com/fallback.jpg"),
+            false,
         );
         assert_eq!(
-            uri.as_deref(),
+            linux_uri.as_deref(),
             Some("file:///tmp/soulbeet%20cache/cover%2001.jpg")
+        );
+
+        let win_uri = format_cover_art_uri_for_platform(
+            Some(Path::new(r"C:\Users\alice\AppData\Local\Soulbeet\art.jpg")),
+            None,
+            true,
+        );
+        assert_eq!(
+            win_uri.as_deref(),
+            Some(r"file://C:\Users\alice\AppData\Local\Soulbeet\art.jpg")
         );
 
         let fallback = format_cover_art_uri(None, Some("https://music.example.com/art.png"));
@@ -273,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_os_media_key_events_accurately() {
+    fn maps_os_media_key_events_including_explicit_shuffle_bool() {
         assert_eq!(
             map_media_key_action(MediaControlEvent::Play),
             Some(MediaKeyAction::Play)
@@ -285,6 +319,14 @@ mod tests {
         assert_eq!(
             map_media_key_action(MediaControlEvent::Toggle),
             Some(MediaKeyAction::Toggle)
+        );
+        assert_eq!(
+            map_media_key_action(MediaControlEvent::SetShuffle(true)),
+            Some(MediaKeyAction::Other(OsMediaCommand::SetShuffle(true)))
+        );
+        assert_eq!(
+            map_media_key_action(MediaControlEvent::SetShuffle(false)),
+            Some(MediaKeyAction::Other(OsMediaCommand::SetShuffle(false)))
         );
         assert_eq!(
             map_media_key_action(MediaControlEvent::Next),
