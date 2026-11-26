@@ -3,8 +3,16 @@ package org.soulbeet.app
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.Constraints
+import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,21 +22,25 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.soulbeet.app.data.AcquireAndPlayOutcome
+import org.soulbeet.app.data.AcquireWsEvent
 import org.soulbeet.app.data.AppPreferencesStore
 import org.soulbeet.app.data.ContextualMixUi
 import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.DeleteGuardPreviewUi
 import org.soulbeet.app.data.PendingDropAction
+import org.soulbeet.app.data.PendingDropMode
 import org.soulbeet.app.data.PendingDropUndoController
 import org.soulbeet.app.data.PersistedAppConfig
 import org.soulbeet.app.data.SoulbeetApiClient
 import org.soulbeet.app.data.StoredAuthKind
 import org.soulbeet.app.data.TrackLyricsData
 import org.soulbeet.app.data.UserCultureProfileUi
+import org.soulbeet.app.data.parseAudioQualityProfile
 import org.soulbeet.core.CoreEventListener
 import org.soulbeet.core.FfiAlbum
 import org.soulbeet.core.FfiArtist
 import org.soulbeet.core.FfiCacheStats
+import org.soulbeet.core.FfiConnectCommand
 import org.soulbeet.core.FfiConnectEvent
 import org.soulbeet.core.FfiConnectState
 import org.soulbeet.core.FfiDiscoveryTrack
@@ -53,6 +65,7 @@ import org.soulbeet.media.MediaPlaybackUiState
 import org.soulbeet.media.OfflineSyncWorker
 import org.soulbeet.media.SoulbeetMediaRepository
 import org.soulbeet.media.SoulbeetWorkScheduler
+import java.io.File
 import java.lang.ref.WeakReference
 import java.time.LocalTime
 
@@ -130,7 +143,7 @@ data class AppUiState(
     val searchFilter: SearchFilter = SearchFilter.ALL,
     val searchResults: FfiSearchResults? = null,
     val isSearching: Boolean = false,
-    val acquiringTrackKeys: Set<String> = emptySet(),
+    val acquiringStages: Map<String, String> = emptyMap(),
     // Library
     val libraryCategory: LibraryCategory = LibraryCategory.PLAYLISTS,
     val playlists: List<FfiPlaylist> = emptyList(),
@@ -161,7 +174,7 @@ data class AppUiState(
     val pendingDrop: PendingDropAction? = null,
     val snackbarMessage: String? = null,
 ) {
-    val activeAcquisitionsCount: Int get() = acquiringTrackKeys.size
+    val activeAcquisitionsCount: Int get() = acquiringStages.size
     val pendingDiscoveryCount: Int get() = triageDeck.size
     val seasonalHeroMix: ContextualMixUi?
         get() = contextualMixes.firstOrNull { it.kind == "seasonal" }
@@ -177,6 +190,9 @@ data class AppUiState(
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appContext = application.applicationContext
+    private val appScope: CoroutineScope =
+        (application as? SoulbeetApplication)?.appScope
+            ?: CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val prefsStore: AppPreferencesStore =
         (application as? SoulbeetApplication)?.preferencesStore ?: AppPreferencesStore(appContext)
     private val apiClient = SoulbeetApiClient()
@@ -192,7 +208,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var eventListenerAttachedCore: WeakReference<CoreClient>? = null
 
     private val undoController = PendingDropUndoController(
-        scope = viewModelScope,
+        timerScope = viewModelScope,
+        commitScope = appScope,
         onCommit = { action -> commitDropMutation(action) },
         onUndo = { action ->
             hiddenTriageIds.update { it - action.trackId - (action.discoveryTrackId ?: "") }
@@ -218,15 +235,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Observe shared playback state from SoulbeetMediaLibraryService.
         viewModelScope.launch {
             SoulbeetMediaRepository.shared.playbackState.collectLatest { pb ->
-                val prevTrackId = _uiState.value.playback.currentTrackId
+                val prev = _uiState.value.playback
+                val trackChanged = pb.currentTrackId != prev.currentTrackId
+                val queueChanged = pb.queueTrackIds != prev.queueTrackIds
+                val playStateChanged = pb.isPlaying != prev.isPlaying
+
                 _uiState.update { state ->
                     state.copy(
                         playback = pb,
                         livePositionMs = if (!pb.isPlaying) pb.positionMs else state.livePositionMs,
                     )
                 }
-                if (pb.currentTrackId != prevTrackId) {
-                    loadActiveTrackDetails(pb.currentTrackId, pb.queueTrackIds)
+                if (trackChanged || queueChanged) {
+                    loadActiveTrackDetails(pb.currentTrackId, pb.queueTrackIds, clearLyrics = trackChanged)
+                }
+                if (trackChanged || playStateChanged) {
+                    pushConnectPlaybackSnapshot(pb)
                 }
             }
         }
@@ -266,26 +290,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        // Flush any in-flight 5s Undo drop so closing the app never silently loses an intent.
-        val pending = undoController.pending.value
-        if (pending != null) {
-            val core = SoulbeetCoreProvider.getOrNull()
-            if (core != null) {
-                kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                    runCatching {
-                        core.enqueueMutation(pending.toMutation())
-                        SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
-                    }
-                }
-            }
-        }
+        // Flush any in-flight 5-second Undo drop on application scope using identical PendingDropMode logic.
+        undoController.flushAsync()
         eventListenerAttachedCore?.get()?.let { runCatching { it.clearEventListener() } }
         mediaBridge.release()
         super.onCleared()
     }
 
     // =========================================================================
-    // Onboarding & Session Connection
+    // Onboarding & Session Connection (Verify BEFORE Persisting!)
     // =========================================================================
 
     fun connectWithPassword(serverUrl: String, username: String, password: String) {
@@ -317,8 +330,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun connectWithToken(serverUrl: String, token: String, isBearer: Boolean) {
-        if (serverUrl.isBlank() || token.isBlank()) {
+    fun connectWithToken(serverUrl: String, rawToken: String, isBearer: Boolean) {
+        val parsed = SoulbeetApiClient.parseTokenInput(rawToken, defaultIsBearer = isBearer)
+        if (serverUrl.isBlank() || parsed.token.isBlank()) {
             _uiState.update { it.copy(connectError = "Server URL and token are required.") }
             return
         }
@@ -331,13 +345,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             completeSessionSetup(
                 serverUrl = normalized,
-                authKind = if (isBearer) StoredAuthKind.BEARER else StoredAuthKind.COOKIE,
-                authToken = token.trim(),
+                authKind = parsed.authKind,
+                authToken = parsed.token,
                 username = "",
             )
         }
     }
 
+    /**
+     * Validates candidate credentials via `fetchBootstrap()` BEFORE persisting to DataStore so an
+     * invalid token or unreachable server never locks the user past OnboardingScreen.
+     */
     private suspend fun completeSessionSetup(
         serverUrl: String,
         authKind: StoredAuthKind,
@@ -345,36 +363,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         username: String,
     ) {
         try {
-            prefsStore.saveSession(
+            val baseSnapshot = prefsStore.getSnapshot()
+            val candidateConfig = baseSnapshot.copy(
                 serverUrl = serverUrl,
                 authKind = authKind,
                 authToken = authToken,
                 username = username,
             )
-            val snapshot = prefsStore.getSnapshot()
 
-            val core = withContext(Dispatchers.IO) {
+            val (core, bootstrap) = withContext(Dispatchers.IO) {
                 SoulbeetCoreProvider.clear(closeExisting = true)
-                val opened = SoulbeetCoreProvider.open(snapshot.toFfiClientConfig(appContext))
-                val bootstrap = opened.fetchBootstrap()
-                if (bootstrap != null) {
-                    val resolvedUser = bootstrap.username.ifBlank { username }
-                    prefsStore.saveSession(
-                        serverUrl = serverUrl,
-                        authKind = authKind,
-                        authToken = authToken,
-                        username = resolvedUser,
-                        navidrome = bootstrap.navidrome,
-                    )
-                    bootstrap.navidrome?.let { opened.setNavidromeCredentials(it) }
+                val opened = SoulbeetCoreProvider.open(candidateConfig.toFfiClientConfig(appContext))
+                val boot = try {
+                    opened.fetchBootstrap()
+                } catch (e: Exception) {
+                    runCatching { opened.shutdown() }
+                    SoulbeetCoreProvider.clear(closeExisting = true)
+                    SoulbeetCoreProvider.markUnconfigured()
+                    throw e
                 }
-                opened
+                if (boot == null) {
+                    runCatching { opened.shutdown() }
+                    SoulbeetCoreProvider.clear(closeExisting = true)
+                    SoulbeetCoreProvider.markUnconfigured()
+                    throw IllegalStateException("Server did not return a valid client bootstrap payload.")
+                }
+                boot.navidrome?.let { opened.setNavidromeCredentials(it) }
+                opened to boot
             }
+
+            // Verified! Persist session + Navidrome credentials only now.
+            val resolvedUser = bootstrap.username.ifBlank { username }
+            prefsStore.saveSession(
+                serverUrl = serverUrl,
+                authKind = authKind,
+                authToken = authToken,
+                username = resolvedUser,
+                navidrome = bootstrap.navidrome,
+            )
 
             attachCoreListener(core)
             SoulbeetWorkScheduler.schedulePeriodicSync(
                 context = appContext,
-                qualityProfile = snapshot.qualityProfileKey,
+                qualityProfile = baseSnapshot.qualityProfileKey,
             )
 
             _uiState.update { it.copy(isConnecting = false, connectError = null, isSyncing = true) }
@@ -398,18 +429,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnectSession() {
+        val currentConfig = _uiState.value.config
         viewModelScope.launch {
-            _uiState.update { it.copy(showSettingsSheet = false) }
+            _uiState.update { it.copy(showSettingsSheet = false, showNowPlayingSheet = false) }
+            undoController.undo()
+            mediaBridge.stopAndClear()
+            SoulbeetMediaRepository.shared.clearActiveTrack()
+
             withContext(Dispatchers.IO) {
+                // 1. Best-effort server logout
+                runCatching { apiClient.logout(currentConfig) }
+
+                // 2. Cancel scheduled background sync & auto-cache jobs
+                runCatching {
+                    val wm = WorkManager.getInstance(appContext)
+                    wm.cancelUniqueWork(SoulbeetWorkScheduler.WORK_PERIODIC_SYNC)
+                    wm.cancelUniqueWork(SoulbeetWorkScheduler.WORK_PERIODIC_AUTO_CACHE)
+                    wm.cancelUniqueWork(SoulbeetWorkScheduler.WORK_IMMEDIATE_OUTBOX_DRAIN)
+                    wm.cancelUniqueWork(WORK_IMMEDIATE_AUTO_CACHE)
+                }
+
+                // 3. Shutdown and release CoreClient
                 SoulbeetCoreProvider.getOrNull()?.let { core ->
+                    runCatching { core.clearEventListener() }
                     runCatching { core.disconnectWs() }
                     runCatching { core.shutdown() }
                 }
                 SoulbeetCoreProvider.clear(closeExisting = true)
                 SoulbeetCoreProvider.markUnconfigured()
+
+                // 4. Wipe local SQLite mirror/outbox so another user never sees previous account data
+                val dbDir = File(appContext.filesDir, "soulbeet_core")
+                listOf("client_core.db", "client_core.db-wal", "client_core.db-shm").forEach { name ->
+                    runCatching { File(dbDir, name).delete() }
+                }
+
+                // 5. Clear stored session credentials
                 prefsStore.clearSession()
             }
-            SoulbeetMediaRepository.shared.clearActiveTrack()
+
+            hiddenTriageIds.value = emptySet()
             _uiState.update {
                 AppUiState(
                     isBooting = false,
@@ -439,17 +498,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val next = !_uiState.value.config.offlineOnly
         viewModelScope.launch {
             prefsStore.setOfflineOnly(next)
-            SoulbeetCoreProvider.getOrNull()?.setOfflineOnly(next)
+            val core = SoulbeetCoreProvider.getOrNull()
+            core?.setOfflineOnly(next)
             SoulbeetMediaRepository.shared.setOfflineOnly(next)
+
+            if (next) {
+                withContext(Dispatchers.IO) {
+                    runCatching { core?.disconnectWs() }
+                }
+                _uiState.update { it.copy(connectState = null) }
+            } else if (core != null) {
+                connectWsIfOnline(core)
+                SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
+            }
+
             refreshLibrarySnapshot()
             if (_uiState.value.searchQuery.isNotBlank()) {
                 runUnifiedSearch(_uiState.value.searchQuery)
-            }
-            if (!next) {
-                SoulbeetCoreProvider.getOrNull()?.let { core ->
-                    connectWsIfOnline(core)
-                    SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
-                }
             }
             showNotice(if (next) "Offline Only mode active" else "Back online")
         }
@@ -469,8 +534,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setAudioQualityProfile(profileKey: String) {
         viewModelScope.launch {
             prefsStore.setQualityProfile(profileKey)
-            val parsed = org.soulbeet.app.data.parseAudioQualityProfile(profileKey)
+            val parsed = parseAudioQualityProfile(profileKey)
             SoulbeetMediaRepository.shared.setAudioQualityProfile(parsed)
+            runCatching {
+                SoulbeetWorkScheduler.schedulePeriodicSync(
+                    context = appContext,
+                    qualityProfile = profileKey,
+                )
+            }
         }
     }
 
@@ -562,7 +633,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // Playback Controls
+    // Playback Controls & Contextual Mix Resolution
     // =========================================================================
 
     fun playTrack(track: FfiTrack, sourceLabel: String? = null) {
@@ -607,6 +678,82 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         mediaBridge.playContainer(mediaId, title)
     }
 
+    /**
+     * Plays a contextual or seasonal mix: uses its synced Navidrome playlist when available,
+     * otherwise fetches the materialized mix playlist via `/api/discovery/contextual-mixes/playlist`
+     * so Moment Mixes (`Drive`, `Morning`, `Focus`, `Late Night`) never fall back to `for_you:triage`.
+     */
+    fun playContextualMix(mix: ContextualMixUi) {
+        val syncedId = mix.navidromePlaylistId
+        if (!syncedId.isNullOrBlank()) {
+            mediaBridge.playContainer("${AutoBrowseTree.PREFIX_PLAYLIST}$syncedId", mix.title)
+            return
+        }
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            // Offline fallback: look for a local playlist matching the slug or title
+            val localMatch = _uiState.value.playlists.firstOrNull { pl ->
+                pl.slug.equals(mix.slug, ignoreCase = true) || pl.name.equals(mix.title, ignoreCase = true)
+            }
+            if (localMatch != null) {
+                mediaBridge.playContainer("${AutoBrowseTree.PREFIX_PLAYLIST}${localMatch.id}", mix.title)
+            } else {
+                showNotice("Go online or pin ${mix.title} to play offline")
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
+            apiClient.fetchContextualMixPlaylist(cfg, mix.slug).fold(
+                onSuccess = { mixTracks ->
+                    if (mixTracks.isEmpty()) {
+                        showNotice("${mix.title} has no playable tracks yet")
+                        return@fold
+                    }
+                    val ids = mixTracks.map { it.songId }
+                    val localById = withContext(Dispatchers.IO) {
+                        runCatching { core.getTracksByIds(ids) }
+                            .getOrDefault(emptyList())
+                            .associateBy { it.id }
+                    }
+                    val resolved = mixTracks.map { mt ->
+                        localById[mt.songId] ?: FfiTrack(
+                            id = mt.songId,
+                            title = mt.title,
+                            artistId = null,
+                            artistName = mt.artist,
+                            albumId = null,
+                            albumName = mt.album.orEmpty(),
+                            trackNumber = null,
+                            discNumber = null,
+                            durationSecs = mt.durationSecs ?: 0L,
+                            year = null,
+                            genre = null,
+                            bitRate = null,
+                            suffix = null,
+                            contentType = null,
+                            sizeBytes = null,
+                            coverArtId = null,
+                            path = null,
+                            starred = false,
+                            userRating = 0L,
+                            playCount = 0L,
+                            lastPlayedAt = null,
+                            musicbrainzId = null,
+                            isDiscovery = !mt.owned,
+                            updatedAt = 0L,
+                        )
+                    }
+                    playQueue(resolved, startIndex = 0, sourceLabel = mix.title)
+                },
+                onFailure = { err ->
+                    showNotice(err.localizedMessage ?: "Failed to load ${mix.title}")
+                },
+            )
+        }
+    }
+
     fun togglePlayPause() = mediaBridge.togglePlayPause()
     fun skipNext() = mediaBridge.skipNext()
     fun skipPrevious() = mediaBridge.skipPrevious()
@@ -615,7 +762,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleShuffle() = mediaBridge.toggleShuffle()
     fun cycleRepeatMode() = mediaBridge.cycleRepeatMode()
     fun startTrackRadio() {
-        mediaBridge.sendCustomAction(AutoCustomActions.ACTION_START_RADIO)
+        viewModelScope.launch {
+            mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_START_RADIO)
+        }
         showNotice("Starting track radio…")
     }
 
@@ -626,9 +775,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun keepDiscoveryTrack(trackId: String, discoveryTrackId: String? = null, title: String = "Track") {
         viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
-            if (_uiState.value.playback.currentTrackId == trackId) {
-                mediaBridge.sendCustomAction(AutoCustomActions.ACTION_KEEP_DISCOVERY)
+            val handledBySession = if (_uiState.value.playback.currentTrackId == trackId) {
+                mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_KEEP_DISCOVERY)
             } else {
+                false
+            }
+            if (!handledBySession) {
                 withContext(Dispatchers.IO) {
                     runCatching {
                         core.enqueueMutation(
@@ -639,6 +791,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             ),
                         )
                         SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
+                    }
+                }
+                if (_uiState.value.playback.currentTrackId == trackId) {
+                    _uiState.value.playback.toTrackActionContext()?.let { ctx ->
+                        SoulbeetMediaRepository.shared.updateTrackContext(
+                            ctx.copy(isPendingDiscovery = false, userRating = maxOf(ctx.userRating, 4)),
+                        )
                     }
                 }
             }
@@ -663,8 +822,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             if (_uiState.value.playback.currentTrackId == trackId) {
-                val ctx = _uiState.value.playback.toTrackActionContext()
-                if (ctx != null) {
+                _uiState.value.playback.toTrackActionContext()?.let { ctx ->
                     SoulbeetMediaRepository.shared.updateTrackContext(
                         ctx.copy(isStarred = true, isPendingDiscovery = false),
                     )
@@ -691,7 +849,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 },
             )
         }
-        // Immediately skip if dropping the active track for frictionless flow.
         if (_uiState.value.playback.currentTrackId == trackId) {
             mediaBridge.skipNext()
         }
@@ -701,7 +858,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 title = title,
                 artist = artist,
                 discoveryTrackId = discoveryTrackId,
-                confirmDelete = false,
+                mode = PendingDropMode.DropDiscovery,
                 sourceLabel = sourceLabel,
                 createdAtMs = System.currentTimeMillis(),
             ),
@@ -714,22 +871,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleStarTrack(trackId: String, currentlyStarred: Boolean, discoveryTrackId: String? = null) {
         viewModelScope.launch {
-            if (_uiState.value.playback.currentTrackId == trackId) {
-                mediaBridge.sendCustomAction(AutoCustomActions.ACTION_STAR_TOGGLE)
-                delay(150L)
-                refreshLibrarySnapshot()
-                return@launch
-            }
-            val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
-            val mutation = if (currentlyStarred) {
-                FfiOutboxMutation.Unstar(songId = trackId, discoveryTrackId = discoveryTrackId)
+            val handledBySession = if (_uiState.value.playback.currentTrackId == trackId) {
+                mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_STAR_TOGGLE)
             } else {
-                FfiOutboxMutation.Star(songId = trackId, discoveryTrackId = discoveryTrackId)
+                false
             }
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    core.enqueueMutation(mutation)
-                    SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
+            if (!handledBySession) {
+                val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
+                val mutation = if (currentlyStarred) {
+                    FfiOutboxMutation.Unstar(songId = trackId, discoveryTrackId = discoveryTrackId)
+                } else {
+                    FfiOutboxMutation.Star(songId = trackId, discoveryTrackId = discoveryTrackId)
+                }
+                withContext(Dispatchers.IO) {
+                    runCatching {
+                        core.enqueueMutation(mutation)
+                        SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
+                    }
+                }
+                if (_uiState.value.playback.currentTrackId == trackId) {
+                    _uiState.value.playback.toTrackActionContext()?.let { ctx ->
+                        SoulbeetMediaRepository.shared.updateTrackContext(
+                            ctx.copy(
+                                isStarred = !currentlyStarred,
+                                isPendingDiscovery = if (!currentlyStarred) false else ctx.isPendingDiscovery,
+                            ),
+                        )
+                    }
                 }
             }
             refreshLibrarySnapshot()
@@ -753,8 +921,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             if (_uiState.value.playback.currentTrackId == trackId) {
-                val ctx = _uiState.value.playback.toTrackActionContext()
-                if (ctx != null) {
+                _uiState.value.playback.toTrackActionContext()?.let { ctx ->
                     SoulbeetMediaRepository.shared.updateTrackContext(
                         ctx.copy(
                             userRating = clamped,
@@ -785,7 +952,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     soleOwner = false,
                     otherListeners = emptyList(),
                     ownPlaylists = emptyList(),
-                    blockReason = "Offline mode active — removal will queue as 1★ & unstar and run Soulbeet's Multi-Listener Guard on reconnect.",
+                    blockReason = "Offline mode active — confirming will unstar and rate 1★ to hide from your mixes without deleting files.",
                     offlineFallback = true,
                 )
             } else {
@@ -800,7 +967,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         soleOwner = false,
                         otherListeners = emptyList(),
                         ownPlaylists = emptyList(),
-                        blockReason = "Could not verify household listeners right now — removal will unstar & hide from your mixes safely.",
+                        blockReason = "Could not verify household listeners right now — confirming will unstar and hide from your mixes safely.",
                         offlineFallback = true,
                     )
                 }
@@ -815,18 +982,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun confirmGuardedRemoval(preview: DeleteGuardPreviewUi) {
         _uiState.update { it.copy(guardSheetPreview = null) }
+        val mode = preview.toPendingDropMode()
         if (_uiState.value.playback.currentTrackId == preview.songId) {
             mediaBridge.skipNext()
         }
-        val confirmDelete = preview.canDelete && preview.soleOwner && !preview.offlineFallback
+        val sourceLabel = when (mode) {
+            PendingDropMode.DropDiscovery -> "Discovery"
+            PendingDropMode.DeleteFromLibrary -> "Library"
+            PendingDropMode.UnstarAndHide -> "your mixes"
+        }
         undoController.scheduleDrop(
             PendingDropAction(
                 trackId = preview.songId,
                 title = preview.trackTitle,
                 artist = preview.trackArtist,
                 discoveryTrackId = preview.discoveryTrackId,
-                confirmDelete = confirmDelete,
-                sourceLabel = if (confirmDelete) "Library" else "Your mixes",
+                mode = mode,
+                sourceLabel = sourceLabel,
                 createdAtMs = System.currentTimeMillis(),
             ),
         )
@@ -836,7 +1008,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val core = SoulbeetCoreProvider.getOrNull() ?: return
         withContext(Dispatchers.IO) {
             runCatching {
-                core.enqueueMutation(action.toMutation())
+                for (mutation in action.toMutations()) {
+                    core.enqueueMutation(mutation)
+                }
                 SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
             }
         }
@@ -893,7 +1067,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // Unified Search & 1-Tap Acquire & Play
+    // Unified Search & 1-Tap Acquire & Play (Live WebSocket Stage Tracking)
     // =========================================================================
 
     fun onSearchQueryChanged(query: String) {
@@ -942,10 +1116,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val key = "${match.artist.lowercase()}::${match.title.lowercase()}"
-        if (_uiState.value.acquiringTrackKeys.contains(key)) return
+        if (_uiState.value.acquiringStages.containsKey(key)) return
 
         viewModelScope.launch {
-            _uiState.update { it.copy(acquiringTrackKeys = it.acquiringTrackKeys + key) }
+            _uiState.update { it.copy(acquiringStages = it.acquiringStages + (key to "ACQUIRING…")) }
             val outcome = apiClient.acquireAndPlay(
                 config = cfg,
                 artist = match.artist,
@@ -956,36 +1130,70 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             when (outcome) {
                 is AcquireAndPlayOutcome.AlreadyOwned -> {
-                    _uiState.update { it.copy(acquiringTrackKeys = it.acquiringTrackKeys - key) }
-                    val core = SoulbeetCoreProvider.getOrNull()
-                    val track = withContext(Dispatchers.IO) {
-                        core?.getTrack(outcome.songId) ?: run {
-                            core?.syncNow(forceFull = false)
-                            core?.getTrack(outcome.songId)
-                        }
-                    }
-                    if (track != null) {
-                        playTrack(track, sourceLabel = "Search")
-                        showNotice("Playing \"${track.title}\" from your library")
-                    } else {
-                        mediaBridge.playContainer("${AutoBrowseTree.PREFIX_TRACK}${outcome.songId}", match.title)
-                    }
+                    _uiState.update { it.copy(acquiringStages = it.acquiringStages - key) }
+                    playAcquiredSongById(outcome.songId, match.title)
                 }
+
                 is AcquireAndPlayOutcome.Queued -> {
                     showNotice("Acquiring \"${match.title}\"…")
-                    // Keep seam-light shimmer visible while acquisition kicks off, then refresh mirror.
-                    delay(4_500L)
-                    withContext(Dispatchers.IO) {
-                        runCatching { SoulbeetCoreProvider.getOrNull()?.syncNow(forceFull = false) }
+                    val terminal = apiClient.observeAcquireAndPlay(
+                        config = cfg,
+                        requestId = outcome.requestId,
+                        onStage = { stageLabel ->
+                            _uiState.update { st ->
+                                st.copy(acquiringStages = st.acquiringStages + (key to stageLabel))
+                            }
+                        },
+                    )
+                    _uiState.update { it.copy(acquiringStages = it.acquiringStages - key) }
+                    when (terminal) {
+                        is AcquireWsEvent.Ready -> {
+                            val songId = terminal.songId
+                            if (!songId.isNullOrBlank()) {
+                                playAcquiredSongById(songId, match.title)
+                            } else {
+                                withContext(Dispatchers.IO) {
+                                    runCatching { SoulbeetCoreProvider.getOrNull()?.syncNow(forceFull = false) }
+                                }
+                                refreshLibrarySnapshot()
+                                showNotice("\"${match.title}\" imported into library")
+                            }
+                        }
+
+                        is AcquireWsEvent.NeedsManualChoice -> {
+                            showNotice("\"${match.title}\" needs manual source selection on web")
+                        }
+
+                        is AcquireWsEvent.Failed -> {
+                            showNotice(terminal.message)
+                        }
+
+                        is AcquireWsEvent.Progress -> Unit
                     }
-                    refreshLibrarySnapshot()
-                    _uiState.update { it.copy(acquiringTrackKeys = it.acquiringTrackKeys - key) }
                 }
+
                 is AcquireAndPlayOutcome.Failed -> {
-                    _uiState.update { it.copy(acquiringTrackKeys = it.acquiringTrackKeys - key) }
+                    _uiState.update { it.copy(acquiringStages = it.acquiringStages - key) }
                     showNotice(outcome.message)
                 }
             }
+        }
+    }
+
+    private suspend fun playAcquiredSongById(songId: String, fallbackTitle: String) {
+        val core = SoulbeetCoreProvider.getOrNull()
+        val track = withContext(Dispatchers.IO) {
+            core?.getTrack(songId) ?: run {
+                runCatching { core?.syncNow(forceFull = false) }
+                core?.getTrack(songId)
+            }
+        }
+        refreshLibrarySnapshot()
+        if (track != null) {
+            playTrack(track, sourceLabel = "Acquire & Play")
+            showNotice("Playing \"${track.title}\"")
+        } else {
+            mediaBridge.playContainer("${AutoBrowseTree.PREFIX_TRACK}$songId", fallbackTitle)
         }
     }
 
@@ -1004,15 +1212,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val currentlyPinned = isPinned(target)
-            withContext(Dispatchers.IO) {
+            val missingCount = withContext(Dispatchers.IO) {
                 runCatching {
                     if (currentlyPinned) {
                         core.unpin(target)
+                        0
                     } else {
                         val missing = core.pin(target)
                         if (!core.isOfflineOnly() && missing.isNotEmpty()) {
                             val profile = _uiState.value.config.toQualityProfile()
-                            for (trackId in missing.take(25)) {
+                            for (trackId in missing.take(IMMEDIATE_PIN_DOWNLOAD_CAP)) {
                                 runCatching {
                                     core.downloadTrack(
                                         trackId = trackId,
@@ -1022,9 +1231,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                     )
                                 }
                             }
+                            if (missing.size > IMMEDIATE_PIN_DOWNLOAD_CAP) {
+                                enqueueImmediateAutoCache(_uiState.value.config.qualityProfileKey)
+                            }
                         }
+                        missing.size
                     }
-                }
+                }.getOrDefault(0)
             }
             refreshLibrarySnapshot()
             _uiState.update { state ->
@@ -1035,7 +1248,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     state
                 }
             }
-            showNotice(if (currentlyPinned) "Unpinned $label" else "Pinned $label for offline")
+            val msg = when {
+                currentlyPinned -> "Unpinned $label"
+                missingCount > IMMEDIATE_PIN_DOWNLOAD_CAP -> "Pinned $label · caching remaining tracks in background"
+                else -> "Pinned $label for offline"
+            }
+            showNotice(msg)
+        }
+    }
+
+    private fun enqueueImmediateAutoCache(qualityProfile: String) {
+        runCatching {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val input = Data.Builder()
+                .putBoolean(OfflineSyncWorker.KEY_DRAIN_OUTBOX, false)
+                .putBoolean(OfflineSyncWorker.KEY_RUN_SYNC, false)
+                .putBoolean(OfflineSyncWorker.KEY_RUN_AUTO_CACHE, true)
+                .putString(OfflineSyncWorker.KEY_QUALITY_PROFILE, qualityProfile)
+                .build()
+            val request = OneTimeWorkRequestBuilder<OfflineSyncWorker>()
+                .setConstraints(constraints)
+                .setInputData(input)
+                .build()
+            WorkManager.getInstance(appContext).enqueueUniqueWork(
+                WORK_IMMEDIATE_AUTO_CACHE,
+                ExistingWorkPolicy.REPLACE,
+                request,
+            )
         }
     }
 
@@ -1174,21 +1415,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val pb = _uiState.value.playback
-            val snap = FfiPlaybackSnapshot(
-                songId = pb.currentTrackId,
-                title = pb.title.takeIf { it.isNotBlank() },
-                artist = pb.artist.takeIf { it.isNotBlank() },
-                album = pb.album.takeIf { it.isNotBlank() },
-                coverArtId = pb.coverArtId,
-                isPlaying = pb.isPlaying,
-                positionMs = _uiState.value.livePositionMs.coerceAtLeast(0L).toULong(),
-                durationMs = pb.durationMs.coerceAtLeast(0L).toULong(),
-                queueSongIds = pb.queueTrackIds,
-                queueIndex = pb.currentIndex.coerceAtLeast(0).toUInt(),
-                volume = 1.0f,
-                isPendingDiscovery = pb.isPendingDiscovery,
-                updatedAtUnix = System.currentTimeMillis() / 1_000L,
-            )
+            val snap = buildPlaybackSnapshot(pb, _uiState.value.livePositionMs)
             runCatching {
                 core.connectTransferPlaybackTo(targetDeviceId, snap)
             }.onSuccess {
@@ -1202,6 +1429,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     showNotice(err.localizedMessage ?: "Transfer failed")
                 }
             }
+        }
+    }
+
+    private fun pushConnectPlaybackSnapshot(pb: MediaPlaybackUiState) {
+        val core = SoulbeetCoreProvider.getOrNull() ?: return
+        if (core.isOfflineOnly() || _uiState.value.connectState?.connected != true) return
+        val snap = buildPlaybackSnapshot(pb, _uiState.value.livePositionMs)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { core.connectUpdateState(snap) }
+        }
+    }
+
+    private fun buildPlaybackSnapshot(pb: MediaPlaybackUiState, positionMs: Long): FfiPlaybackSnapshot =
+        FfiPlaybackSnapshot(
+            songId = pb.currentTrackId,
+            title = pb.title.takeIf { it.isNotBlank() },
+            artist = pb.artist.takeIf { it.isNotBlank() },
+            album = pb.album.takeIf { it.isNotBlank() },
+            coverArtId = pb.coverArtId,
+            isPlaying = pb.isPlaying,
+            positionMs = positionMs.coerceAtLeast(0L).toULong(),
+            durationMs = pb.durationMs.coerceAtLeast(0L).toULong(),
+            queueSongIds = pb.queueTrackIds,
+            queueIndex = pb.currentIndex.coerceAtLeast(0).toUInt(),
+            volume = 1.0f,
+            isPendingDiscovery = pb.isPendingDiscovery,
+            updatedAtUnix = System.currentTimeMillis() / 1_000L,
+        )
+
+    private suspend fun applyIncomingConnectQueue(
+        songIds: List<String>,
+        startIndex: Int,
+        startPositionMs: Long,
+        autoPlay: Boolean,
+        sourceLabel: String,
+    ) {
+        if (songIds.isEmpty()) return
+        val core = SoulbeetCoreProvider.getOrNull() ?: return
+        val tracks = withContext(Dispatchers.IO) {
+            val byId = runCatching { core.getTracksByIds(songIds) }
+                .getOrDefault(emptyList())
+                .associateBy { it.id }
+            songIds.mapNotNull { byId[it] }
+        }
+        if (tracks.isEmpty()) return
+        withContext(Dispatchers.Main) {
+            mediaBridge.playQueueAtPosition(
+                tracks = tracks,
+                startIndex = startIndex.coerceIn(0, tracks.lastIndex),
+                startPositionMs = startPositionMs.coerceAtLeast(0L),
+                autoPlay = autoPlay,
+                offlineIds = _uiState.value.offlineTrackIds,
+                sourceLabel = sourceLabel,
+            )
+            showNotice("Playback handed off to this phone")
         }
     }
 
@@ -1224,17 +1506,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val cmd = event.command
                         vm.viewModelScope.launch {
                             when (cmd) {
-                                is org.soulbeet.core.FfiConnectCommand.Play -> {
+                                is FfiConnectCommand.Play -> {
                                     if (!vm._uiState.value.playback.isPlaying) vm.togglePlayPause()
                                 }
-                                is org.soulbeet.core.FfiConnectCommand.Pause -> {
+                                is FfiConnectCommand.Pause -> {
                                     if (vm._uiState.value.playback.isPlaying) vm.togglePlayPause()
                                 }
-                                is org.soulbeet.core.FfiConnectCommand.TogglePlay -> vm.togglePlayPause()
-                                is org.soulbeet.core.FfiConnectCommand.Next -> vm.skipNext()
-                                is org.soulbeet.core.FfiConnectCommand.Previous -> vm.skipPrevious()
-                                is org.soulbeet.core.FfiConnectCommand.Seek -> {
-                                    vm.seekTo(cmd.positionMs.toLong())
+                                is FfiConnectCommand.TogglePlay -> vm.togglePlayPause()
+                                is FfiConnectCommand.Next -> vm.skipNext()
+                                is FfiConnectCommand.Previous -> vm.skipPrevious()
+                                is FfiConnectCommand.Seek -> vm.seekTo(cmd.positionMs.toLong())
+                                is FfiConnectCommand.LoadQueue -> {
+                                    vm.applyIncomingConnectQueue(
+                                        songIds = cmd.songIds,
+                                        startIndex = cmd.startIndex.toInt(),
+                                        startPositionMs = cmd.startPositionMs.toLong(),
+                                        autoPlay = cmd.autoplay,
+                                        sourceLabel = "Connect",
+                                    )
+                                }
+                                is FfiConnectCommand.TransferPlayback -> {
+                                    val snap = cmd.snapshot
+                                    val ids = snap.queueSongIds.ifEmpty {
+                                        listOfNotNull(snap.songId)
+                                    }
+                                    vm.applyIncomingConnectQueue(
+                                        songIds = ids,
+                                        startIndex = snap.queueIndex.toInt(),
+                                        startPositionMs = snap.positionMs.toLong(),
+                                        autoPlay = snap.isPlaying,
+                                        sourceLabel = "Transferred",
+                                    )
                                 }
                                 else -> Unit
                             }
@@ -1294,7 +1596,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val cacheStats = runCatching { core.cacheStats() }.getOrNull()
             val outboxSummary = runCatching { core.outboxSummary() }.getOrNull()
 
-            // Hydrate triage deck with full FfiTrack metadata.
             val triageSongIds = discovery.mapNotNull { it.songId }
             val triageTrackMap = if (triageSongIds.isNotEmpty()) {
                 runCatching { core.getTracksByIds(triageSongIds) }
@@ -1316,7 +1617,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
-            // Build Quick-Resume 2x3 grid from pinned/top playlists + recent albums.
             val quickItems = buildList {
                 for (pl in playlists.take(4)) {
                     val pinned = pins.any { it.target == FfiPinTarget.Playlist(pl.id) }
@@ -1393,8 +1693,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun loadActiveTrackDetails(trackId: String?, queueIds: List<String>) {
-        _uiState.update { it.copy(lyricsData = null, lyricsError = null) }
+    private fun loadActiveTrackDetails(
+        trackId: String?,
+        queueIds: List<String>,
+        clearLyrics: Boolean,
+    ) {
+        if (clearLyrics) {
+            _uiState.update { it.copy(lyricsData = null, lyricsError = null) }
+        }
         if (trackId.isNullOrBlank()) {
             _uiState.update {
                 it.copy(currentTrackDetails = null, currentDiscoveryInfo = null, queueTracks = emptyList())
@@ -1432,5 +1738,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             delay(3_000L)
             _uiState.update { if (it.snackbarMessage == message) it.copy(snackbarMessage = null) else it }
         }
+    }
+
+    companion object {
+        private const val IMMEDIATE_PIN_DOWNLOAD_CAP = 25
+        private const val WORK_IMMEDIATE_AUTO_CACHE = "soulbeet_immediate_auto_cache"
     }
 }

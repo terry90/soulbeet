@@ -204,11 +204,11 @@ fun LibraryScreen(
                             if (selected) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
                         ),
                         modifier = Modifier
-                            .heightIn(min = 40.dp)
+                            .heightIn(min = 48.dp)
                             .clickable { onSelectCategory(cat) },
                     ) {
                         Box(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
@@ -313,17 +313,18 @@ fun LibraryScreen(
             }
 
             LibraryCategory.DISCOVERY -> {
-                if (state.discoveryTracks.isEmpty()) {
+                if (state.triageDeck.isEmpty()) {
                     item(key = "empty_discovery") { EmptyLibraryNotice("No pending discovery tracks.") }
                 } else {
-                    items(state.discoveryTracks, key = { "disc_${it.id}" }) { disc ->
+                    items(state.triageDeck, key = { "disc_${it.discovery.id}" }) { card ->
+                        val disc = card.discovery
                         val songId = disc.songId
-                        val isCached = songId != null && state.offlineTrackIds.contains(songId)
+                        val isCached = card.isOfflineCached
                         TrackRow(
                             title = disc.title,
                             artist = disc.artist,
-                            durationSecs = null,
-                            coverArtId = null,
+                            durationSecs = card.track?.durationSecs,
+                            coverArtId = card.track?.coverArtId,
                             artAuthority = artAuthority,
                             isPlaying = songId != null && state.playback.currentTrackId == songId,
                             isOfflineCached = isCached,
@@ -331,10 +332,7 @@ fun LibraryScreen(
                             isPendingDiscovery = true,
                             discoveryExpiryLabel = FormattingUtils.formatExpiryCountdown(disc.expiresAt),
                             onClick = {
-                                val matching = state.triageDeck.firstOrNull { it.discovery.id == disc.id }?.track
-                                if (matching != null) {
-                                    onPlayQueue(listOf(matching), 0, "Discovery")
-                                }
+                                card.track?.let { onPlayQueue(listOf(it), 0, "Discovery") }
                             },
                             onKeepClick = { onKeepDiscovery(disc) },
                             onDropClick = { onDropDiscovery(disc) },
@@ -570,7 +568,7 @@ private fun ContainerDetailSheet(
                     .heightIn(max = 420.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                itemsIndexed(detail.tracks, key = { _, t -> "cd_${t.id}" }) { idx, track ->
+                itemsIndexed(detail.tracks, key = { idx, t -> "cd_${idx}_${t.id}" }) { idx, track ->
                     val isCached = state.offlineTrackIds.contains(track.id)
                     TrackRow(
                         title = track.title,

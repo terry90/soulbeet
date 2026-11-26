@@ -1,17 +1,26 @@
 package org.soulbeet.app
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.soulbeet.app.data.AcquireWsEvent
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.SoulbeetApiClient
+import org.soulbeet.app.data.StoredAuthKind
+import org.soulbeet.app.data.optNonNullString
 import org.soulbeet.app.theme.BeetCanvas
 import org.soulbeet.app.theme.BeetCanvasOled
 import org.soulbeet.app.theme.soulbeetPaletteFor
 import org.soulbeet.core.FfiAudioQualityProfile
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class FormattingAndThemeTest {
 
     @Test
@@ -93,7 +102,7 @@ class FormattingAndThemeTest {
     }
 
     @Test
-    fun apiClientExtractsAuthTokenCookieAndNormalizesUrls() {
+    fun apiClientExtractsAuthTokenCookieParsesTokenPrefixesAndNormalizesUrls() {
         val cookies = listOf(
             "other=abc; Path=/",
             "auth_token=tok_secret_123; HttpOnly; SameSite=Lax; Path=/",
@@ -101,7 +110,91 @@ class FormattingAndThemeTest {
         assertEquals("tok_secret_123", SoulbeetApiClient.extractAuthTokenFromCookies(cookies))
         assertNull(SoulbeetApiClient.extractAuthTokenFromCookies(listOf("session=xyz")))
 
+        val parsedBearer = SoulbeetApiClient.parseTokenInput("Bearer my_jwt_99", defaultIsBearer = false)
+        assertEquals(StoredAuthKind.BEARER, parsedBearer.authKind)
+        assertEquals("my_jwt_99", parsedBearer.token)
+
+        val parsedCookie = SoulbeetApiClient.parseTokenInput("auth_token=cook_77; Path=/", defaultIsBearer = true)
+        assertEquals(StoredAuthKind.COOKIE, parsedCookie.authKind)
+        assertEquals("cook_77", parsedCookie.token)
+
+        val rawBearer = SoulbeetApiClient.parseTokenInput("raw_tok", defaultIsBearer = true)
+        assertEquals(StoredAuthKind.BEARER, rawBearer.authKind)
+        assertEquals("raw_tok", rawBearer.token)
+
         assertEquals("https://music.example.com", SoulbeetApiClient.normalizeBaseUrl("music.example.com/"))
         assertEquals("http://192.168.1.5:9765", SoulbeetApiClient.normalizeBaseUrl("http://192.168.1.5:9765/"))
+    }
+
+    @Test
+    fun acquireAndPlayWsFrameParserHandlesAllStagesAndFiltersRequestId() {
+        val reqId = "req-abc"
+
+        // Non-matching request_id is ignored
+        assertNull(
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"other","stage":{"stage":"importing"}}}""",
+                reqId,
+            ),
+        )
+
+        // Progress stages
+        assertEquals(
+            AcquireWsEvent.Progress("ACQUIRING…"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"acquiring","backend_id":"slskd"}}}""",
+                reqId,
+            ),
+        )
+        assertEquals(
+            AcquireWsEvent.Progress("IMPORTING…"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"importing"}}}""",
+                reqId,
+            ),
+        )
+        assertEquals(
+            AcquireWsEvent.Progress("INDEXING…"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"indexing"}}}""",
+                reqId,
+            ),
+        )
+
+        // Ready
+        assertEquals(
+            AcquireWsEvent.Ready(songId = "song-999", codec = "opus"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"ready","navidrome_song_id":"song-999","codec":"opus"}}}""",
+                reqId,
+            ),
+        )
+
+        // NeedsManualChoice
+        assertEquals(
+            AcquireWsEvent.NeedsManualChoice(searchId = "srch-1"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"needs_manual_choice","search_id":"srch-1"}}}""",
+                reqId,
+            ),
+        )
+
+        // Failed
+        assertEquals(
+            AcquireWsEvent.Failed("No peer available"),
+            SoulbeetApiClient.parseAcquireAndPlayWsFrame(
+                """{"AcquireAndPlay":{"request_id":"req-abc","stage":{"stage":"failed","failure":{"message":"No peer available"}}}}""",
+                reqId,
+            ),
+        )
+    }
+
+    @Test
+    fun optNonNullStringReturnsNullForJsonNullAndBlanks() {
+        val obj = JSONObject("""{"present":"hello","nil":null,"blank":"   "}""")
+        assertEquals("hello", obj.optNonNullString("present"))
+        assertNull(obj.optNonNullString("nil"))
+        assertNull(obj.optNonNullString("blank"))
+        assertNull(obj.optNonNullString("missing"))
     }
 }

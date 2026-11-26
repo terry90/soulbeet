@@ -4,15 +4,16 @@ import android.content.ComponentName
 import android.content.Context
 import android.os.Bundle
 import androidx.annotation.OptIn
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
-import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,6 +23,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.soulbeet.core.FfiTrack
@@ -36,7 +38,11 @@ import org.soulbeet.media.SoulbeetMediaRepository
  * [MediaController], ensuring phone playback and Android Auto share one single `ExoPlayer` and
  * queue state.
  *
- * The live position ticker runs ONLY while `isPlaying == true` to guarantee zero idle battery drain.
+ * Threading & lifecycle safety:
+ * - Future listener executes strictly on the main looper via `ContextCompat.getMainExecutor`.
+ * - Tracks [released] so a `release()` racing ahead of `MediaController` connection immediately
+ *   releases the late-arriving controller without mutating state or leaking listeners.
+ * - Live position ticker runs ONLY while `isPlaying == true` (zero idle battery drain).
  */
 @OptIn(UnstableApi::class)
 class MediaControllerBridge(
@@ -45,6 +51,8 @@ class MediaControllerBridge(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val artAuthority: String = CoverArtContentProvider.authorityFor(context)
 
+    @Volatile
+    private var released: Boolean = false
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     private var positionTickerJob: Job? = null
@@ -95,7 +103,7 @@ class MediaControllerBridge(
     }
 
     fun connect() {
-        if (controllerFuture != null) return
+        if (released || controllerFuture != null) return
         val token = SessionToken(
             context,
             ComponentName(context, SoulbeetMediaLibraryService::class.java),
@@ -105,6 +113,10 @@ class MediaControllerBridge(
         future.addListener(
             {
                 val bound = runCatching { future.get() }.getOrNull() ?: return@addListener
+                if (released) {
+                    bound.release()
+                    return@addListener
+                }
                 controller = bound
                 bound.addListener(playerListener)
                 _isConnected.value = true
@@ -115,7 +127,7 @@ class MediaControllerBridge(
                     startPositionTicker()
                 }
             },
-            MoreExecutors.directExecutor(),
+            ContextCompat.getMainExecutor(context),
         )
     }
 
@@ -138,9 +150,28 @@ class MediaControllerBridge(
         offlineIds: Set<String> = emptySet(),
         sourceLabel: String? = null,
     ) {
+        playQueueAtPosition(
+            tracks = tracks,
+            startIndex = startIndex,
+            startPositionMs = 0L,
+            autoPlay = true,
+            offlineIds = offlineIds,
+            sourceLabel = sourceLabel,
+        )
+    }
+
+    fun playQueueAtPosition(
+        tracks: List<FfiTrack>,
+        startIndex: Int = 0,
+        startPositionMs: Long = 0L,
+        autoPlay: Boolean = true,
+        offlineIds: Set<String> = emptySet(),
+        sourceLabel: String? = null,
+    ) {
         if (tracks.isEmpty()) return
         val active = controller ?: return
         val safeIdx = startIndex.coerceIn(0, tracks.lastIndex)
+        val safePos = startPositionMs.coerceAtLeast(0L)
         val mediaItems = tracks.map { track ->
             AutoBrowseTree.mapTrack(
                 track = track,
@@ -150,10 +181,14 @@ class MediaControllerBridge(
                 sourceLabel = sourceLabel,
             )
         }
-        active.setMediaItems(mediaItems, safeIdx, 0L)
+        active.setMediaItems(mediaItems, safeIdx, safePos)
         active.prepare()
-        active.play()
-        _playbackPositionMs.value = 0L
+        if (autoPlay) {
+            active.play()
+        } else {
+            active.pause()
+        }
+        _playbackPositionMs.value = safePos
     }
 
     fun playContainer(mediaId: String, title: String? = null) {
@@ -248,12 +283,34 @@ class MediaControllerBridge(
         _repeatMode.value = next
     }
 
-    fun sendCustomAction(action: String) {
-        val active = controller ?: return
-        active.sendCustomCommand(SessionCommand(action, Bundle.EMPTY), Bundle.EMPTY)
+    fun stopAndClear() {
+        stopPositionTicker()
+        controller?.let { active ->
+            active.stop()
+            active.clearMediaItems()
+        }
+        _playbackPositionMs.value = 0L
+    }
+
+    fun sendCustomAction(action: String): ListenableFuture<SessionResult>? {
+        val active = controller ?: return null
+        return active.sendCustomCommand(SessionCommand(action, Bundle.EMPTY), Bundle.EMPTY)
+    }
+
+    /**
+     * Dispatches a MediaSession custom action and suspends until [SessionResult] completes.
+     * Returns `true` if the session handled the command with `RESULT_SUCCESS`, or `false` if no
+     * controller is connected or the command returned an error.
+     */
+    suspend fun sendCustomActionAndAwait(action: String): Boolean {
+        val future = sendCustomAction(action) ?: return false
+        return runCatching {
+            future.await().resultCode == SessionResult.RESULT_SUCCESS
+        }.getOrDefault(false)
     }
 
     fun release() {
+        released = true
         stopPositionTicker()
         controller?.removeListener(playerListener)
         controller = null

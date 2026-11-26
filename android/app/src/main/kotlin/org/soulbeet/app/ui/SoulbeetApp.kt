@@ -251,6 +251,7 @@ private fun MainStudioShell(
                     artAuthority = viewModel.artAuthority,
                     bottomContentPadding = contentPadding,
                     onPlayContainer = viewModel::playContainer,
+                    onPlayMix = viewModel::playContextualMix,
                     onOpenTriage = { viewModel.selectTab(AppTab.DISCOVER) },
                     onSteerMix = viewModel::steerSeasonalPack,
                     onTogglePin = viewModel::togglePin,
@@ -264,7 +265,7 @@ private fun MainStudioShell(
                     state = state,
                     artAuthority = viewModel.artAuthority,
                     bottomContentPadding = contentPadding,
-                    onPlayContainer = viewModel::playContainer,
+                    onPlayMix = viewModel::playContextualMix,
                     onTogglePin = viewModel::togglePin,
                     onSteerMix = viewModel::steerSeasonalPack,
                     onPreviewTriageCard = { card ->
@@ -390,6 +391,7 @@ private fun MainStudioShell(
             onDismissConnect = { viewModel.setShowConnectSheet(false) },
             onClaimActiveDevice = viewModel::claimActiveConnectDevice,
             onTransferPlayback = viewModel::transferPlaybackToDevice,
+            onUndoPendingDrop = viewModel::undoPendingDrop,
         )
     }
 
@@ -482,34 +484,38 @@ private fun SoulbeetTopAppBar(
                     }
                 }
 
-                // Global Offline Only Pill
-                Surface(
-                    color = if (offlineOnly) colors.leafSurface else colors.surface,
-                    shape = SoulbeetShapes.full,
-                    border = BorderStroke(
-                        1.dp,
-                        if (offlineOnly) colors.leafText.copy(alpha = 0.45f) else colors.borderDefault,
-                    ),
+                // Global Offline Only Pill (>= 48dp touch target)
+                Box(
                     modifier = Modifier
-                        .heightIn(min = 40.dp)
+                        .heightIn(min = 48.dp)
                         .clickable(onClick = onToggleOffline),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    Surface(
+                        color = if (offlineOnly) colors.leafSurface else colors.surface,
+                        shape = SoulbeetShapes.full,
+                        border = BorderStroke(
+                            1.dp,
+                            if (offlineOnly) colors.leafText.copy(alpha = 0.45f) else colors.borderDefault,
+                        ),
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(if (offlineOnly) colors.leafGlow else colors.textMuted),
-                        )
-                        Text(
-                            text = "Offline",
-                            style = type.monoXs,
-                            color = if (offlineOnly) colors.leafText else colors.textSecondary,
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(if (offlineOnly) colors.leafGlow else colors.textMuted),
+                            )
+                            Text(
+                                text = "Offline",
+                                style = type.monoXs,
+                                color = if (offlineOnly) colors.leafText else colors.textSecondary,
+                            )
+                        }
                     }
                 }
 

@@ -33,6 +33,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.QuickResumeItem
+import org.soulbeet.app.data.ContextualMixUi
 import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
@@ -44,7 +45,6 @@ import org.soulbeet.app.ui.components.TrackRow
 import org.soulbeet.core.FfiPinTarget
 import org.soulbeet.core.FfiPlaylist
 import org.soulbeet.core.FfiTrack
-import org.soulbeet.media.AutoBrowseTree
 
 @Composable
 fun HomeScreen(
@@ -52,6 +52,7 @@ fun HomeScreen(
     artAuthority: String,
     bottomContentPadding: PaddingValues,
     onPlayContainer: (mediaId: String, title: String) -> Unit,
+    onPlayMix: (ContextualMixUi) -> Unit,
     onOpenTriage: () -> Unit,
     onSteerMix: (slug: String, option: CultureSteeringOption) -> Unit,
     onTogglePin: (target: FfiPinTarget, label: String) -> Unit,
@@ -121,11 +122,7 @@ fun HomeScreen(
                     mix = hero,
                     isPinned = isPinned,
                     steeringInFlight = state.steeringInFlight,
-                    onPlay = {
-                        val mediaId = hero.navidromePlaylistId?.let { "${AutoBrowseTree.PREFIX_PLAYLIST}$it" }
-                            ?: AutoBrowseTree.FOR_YOU_TRIAGE
-                        onPlayContainer(mediaId, hero.title)
-                    },
+                    onPlay = { onPlayMix(hero) },
                     onTogglePin = { onTogglePin(pinTarget, hero.title) },
                     onSteer = { option -> onSteerMix(hero.slug, option) },
                 )

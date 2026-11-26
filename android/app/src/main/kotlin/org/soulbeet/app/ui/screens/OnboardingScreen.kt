@@ -62,6 +62,7 @@ fun OnboardingScreen(
     var password by rememberSaveable { mutableStateOf("") }
     var token by rememberSaveable { mutableStateOf("") }
     var authMode by rememberSaveable { mutableIntStateOf(0) } // 0 = Password, 1 = Session Token
+    var tokenIsBearer by rememberSaveable { mutableStateOf(false) }
 
     val fieldColors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = colors.leafSolid,
@@ -119,7 +120,7 @@ fun OnboardingScreen(
                     Box(
                         modifier = Modifier
                             .weight(1f)
-                            .heightIn(min = 44.dp)
+                            .heightIn(min = 48.dp)
                             .background(
                                 color = if (selected) colors.surfaceHigh else colors.surfaceLow,
                                 shape = SoulbeetShapes.full,
@@ -192,17 +193,53 @@ fun OnboardingScreen(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        listOf(false to "Cookie (auth_token)", true to "Bearer Token").forEach { (isBearerOpt, label) ->
+                            val selected = tokenIsBearer == isBearerOpt
+                            Surface(
+                                color = if (selected) colors.leafSurface else colors.surfaceLow,
+                                shape = SoulbeetShapes.full,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (selected) colors.leafText.copy(alpha = 0.5f) else colors.borderSubtle,
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .clickable { tokenIsBearer = isBearerOpt },
+                            ) {
+                                Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 10.dp)) {
+                                    Text(
+                                        text = label,
+                                        style = type.monoXs,
+                                        color = if (selected) colors.leafText else colors.textSecondary,
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     OutlinedTextField(
                         value = token,
                         onValueChange = { token = it },
-                        label = { Text("Auth Token (Cookie or Bearer)") },
-                        placeholder = { Text("Paste auth_token value", color = colors.textDisabled) },
+                        label = {
+                            Text(if (tokenIsBearer) "Bearer Token" else "Session Cookie (auth_token)")
+                        },
+                        placeholder = {
+                            Text(
+                                if (tokenIsBearer) "Paste Bearer token" else "Paste auth_token value",
+                                color = colors.textDisabled,
+                            )
+                        },
                         singleLine = true,
                         colors = fieldColors,
                         shape = SoulbeetShapes.sm,
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                         keyboardActions = KeyboardActions(
-                            onDone = { onConnectToken(serverUrl, token, false) },
+                            onDone = { onConnectToken(serverUrl, token, tokenIsBearer) },
                         ),
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -229,7 +266,7 @@ fun OnboardingScreen(
                         if (authMode == 0) {
                             onConnectPassword(serverUrl, username, password)
                         } else {
-                            onConnectToken(serverUrl, token, false)
+                            onConnectToken(serverUrl, token, tokenIsBearer)
                         }
                     },
                     enabled = !isConnecting,

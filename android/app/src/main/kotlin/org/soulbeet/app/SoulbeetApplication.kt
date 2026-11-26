@@ -12,12 +12,16 @@ import org.soulbeet.media.SoulbeetWorkScheduler
 
 /**
  * Application entry point wiring the single shared [SoulbeetCoreProvider] instance, Media3
- * repository preferences, and periodic WorkManager sync across the Compose phone UI, Android Auto,
- * and background sync workers.
+ * repository preferences, application-scoped IO work, and periodic WorkManager sync across the
+ * Compose phone UI, Android Auto, and background sync workers.
  */
 class SoulbeetApplication : Application() {
 
-    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * Process-wide IO scope surviving individual Activity/ViewModel lifecycles so deferred outbox
+     * commits (e.g. 5-second Undo flushes) never leak ad-hoc scopes or cancel mid-write.
+     */
+    val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     lateinit var preferencesStore: AppPreferencesStore
         private set
@@ -30,8 +34,6 @@ class SoulbeetApplication : Application() {
             initializeCoreFromPreferences()
         }
 
-        // Warm up initialization off the main thread so first screen paint is instant and
-        // headless Android Auto / WorkManager wakeups reuse the exact same CoreClient.
         appScope.launch {
             SoulbeetCoreProvider.awaitOrNull()
         }

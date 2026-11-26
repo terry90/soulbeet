@@ -53,6 +53,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,6 +80,7 @@ import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.DeleteGuardPreviewUi
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.PendingDropAction
+import org.soulbeet.app.data.PendingDropMode
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
@@ -223,6 +225,8 @@ fun TrackRow(
     durationSecs: Long?,
     coverArtId: String?,
     artAuthority: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
     isPlaying: Boolean = false,
     isOfflineCached: Boolean = false,
     isUnavailableOffline: Boolean = false,
@@ -231,24 +235,25 @@ fun TrackRow(
     isStarred: Boolean = false,
     isUnownedCatalog: Boolean = false,
     isAcquiring: Boolean = false,
-    onClick: () -> Unit,
+    acquiringLabel: String? = null,
     onStarClick: (() -> Unit)? = null,
     onKeepClick: (() -> Unit)? = null,
     onDropClick: (() -> Unit)? = null,
     onRemoveClick: (() -> Unit)? = null,
-    modifier: Modifier = Modifier,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
-    var dragOffsetX by remember { mutableFloatStateOf(0f) }
+    var dragOffsetX by remember(title, artist) { mutableFloatStateOf(0f) }
+    val currentKeepClick by rememberUpdatedState(onKeepClick)
+    val currentDropClick by rememberUpdatedState(onDropClick)
 
     val swipeModifier = if (isPendingDiscovery && (onKeepClick != null || onDropClick != null)) {
-        Modifier.pointerInput(title, isPendingDiscovery) {
+        Modifier.pointerInput(title, artist, isPendingDiscovery) {
             detectHorizontalDragGestures(
                 onDragEnd = {
                     when {
-                        dragOffsetX > 140f -> onKeepClick?.invoke()
-                        dragOffsetX < -140f -> onDropClick?.invoke()
+                        dragOffsetX > 140f -> currentKeepClick?.invoke()
+                        dragOffsetX < -140f -> currentDropClick?.invoke()
                     }
                     dragOffsetX = 0f
                 },
@@ -389,7 +394,7 @@ fun TrackRow(
                                     modifier = Modifier.size(16.dp),
                                 )
                                 Text(
-                                    text = if (isAcquiring) "ACQUIRING…" else "ACQUIRE",
+                                    text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING…") else "ACQUIRE",
                                     style = type.monoXs,
                                     color = if (isAcquiring) colors.accentText else colors.textPrimary,
                                 )
@@ -541,10 +546,16 @@ fun UndoDropSnackbar(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    val verb = if (pending.confirmDelete) "Removing" else "Dropped"
-                    val origin = pending.sourceLabel?.let { " from $it" }.orEmpty()
+                    val headline = when (pending.mode) {
+                        PendingDropMode.DropDiscovery -> {
+                            val origin = pending.sourceLabel?.let { " from $it" }.orEmpty()
+                            "Dropped \"${pending.title}\"$origin"
+                        }
+                        PendingDropMode.DeleteFromLibrary -> "Deleting \"${pending.title}\" from Library"
+                        PendingDropMode.UnstarAndHide -> "Hiding \"${pending.title}\" from your mixes"
+                    }
                     Text(
-                        text = "$verb \"${pending.title}\"$origin",
+                        text = headline,
                         style = type.body,
                         color = colors.textPrimary,
                         maxLines = 1,
@@ -695,11 +706,11 @@ fun SeasonalHeroCard(
                                     if (selected) colors.accentText.copy(alpha = 0.5f) else colors.borderSubtle,
                                 ),
                                 modifier = Modifier
-                                    .heightIn(min = 40.dp)
+                                    .heightIn(min = 48.dp)
                                     .clickable(enabled = !steeringInFlight) { onSteer(option) },
                             ) {
                                 Box(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
                                     contentAlignment = Alignment.Center,
                                 ) {
                                     Text(
@@ -802,6 +813,12 @@ fun MultiListenerGuardSheet(
                 .padding(bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            val dropMode = preview.toPendingDropMode()
+            val isHardDelete = dropMode == PendingDropMode.DeleteFromLibrary
+            val isDiscoveryDrop = dropMode == PendingDropMode.DropDiscovery
+            val householdListeners = preview.otherListeners.filter { it.isHouseholdListenerProtection }
+            val otherBlocks = preview.otherListeners.filterNot { it.isHouseholdListenerProtection }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -811,7 +828,7 @@ fun MultiListenerGuardSheet(
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(
-                            if (preview.canDelete && preview.soleOwner) {
+                            if (isHardDelete || isDiscoveryDrop) {
                                 colors.crimsonSurface
                             } else {
                                 colors.leafSurface
@@ -822,18 +839,18 @@ fun MultiListenerGuardSheet(
                     Icon(
                         imageVector = Icons.Filled.Shield,
                         contentDescription = null,
-                        tint = if (preview.canDelete && preview.soleOwner) colors.crimsonText else colors.leafText,
+                        tint = if (isHardDelete || isDiscoveryDrop) colors.crimsonText else colors.leafText,
                     )
                 }
                 Column(modifier = Modifier.weight(1f)) {
+                    val sheetTitle = when {
+                        isDiscoveryDrop -> "Drop Discovery Track?"
+                        isHardDelete -> "Remove from Library?"
+                        householdListeners.isNotEmpty() -> "Shared Household Track"
+                        else -> "Protected Library Track"
+                    }
                     Text(
-                        text = if (preview.otherListeners.isNotEmpty()) {
-                            "Shared Household Track"
-                        } else if (preview.canDelete && preview.soleOwner) {
-                            "Remove from Library?"
-                        } else {
-                            "Protected Library Track"
-                        },
+                        text = sheetTitle,
                         style = type.titleMd,
                         color = colors.textPrimary,
                     )
@@ -847,75 +864,116 @@ fun MultiListenerGuardSheet(
                 }
             }
 
-            if (preview.otherListeners.isNotEmpty()) {
-                Surface(
-                    color = colors.surface,
-                    shape = SoulbeetShapes.md,
-                    border = BorderStroke(1.dp, colors.borderSubtle),
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
+            when {
+                isDiscoveryDrop -> {
+                    Text(
+                        text = "This track is still staged in Discovery. Dropping removes it from your triage queue after a 5-second Undo window.",
+                        style = type.bodySm,
+                        color = colors.textSecondary,
+                    )
+                }
+
+                isHardDelete -> {
+                    Text(
+                        text = "You are the sole listener for this track. Confirming will schedule permanent deletion after a 5-second Undo window.",
+                        style = type.bodySm,
+                        color = colors.textSecondary,
+                    )
+                    if (preview.ownPlaylists.isNotEmpty()) {
                         Text(
-                            text = "PROTECTED BY OTHER LISTENERS",
-                            style = type.monoXs,
-                            color = colors.leafText,
+                            text = "Also in your playlists: ${preview.ownPlaylists.joinToString(", ")}",
+                            style = type.monoSm,
+                            color = colors.textMuted,
                         )
-                        preview.otherListeners.forEach { protection ->
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(CircleShape)
-                                        .background(colors.accentSurface),
-                                    contentAlignment = Alignment.Center,
+                    }
+                }
+
+                householdListeners.isNotEmpty() -> {
+                    Surface(
+                        color = colors.surface,
+                        shape = SoulbeetShapes.md,
+                        border = BorderStroke(1.dp, colors.borderSubtle),
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Text(
+                                text = "PROTECTED BY OTHER LISTENERS",
+                                style = type.monoXs,
+                                color = colors.leafText,
+                            )
+                            householdListeners.forEach { protection ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .clip(CircleShape)
+                                            .background(colors.accentSurface),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = protection.summary.trim().firstOrNull()?.uppercase() ?: "?",
+                                            style = type.monoSm,
+                                            color = colors.accentText,
+                                        )
+                                    }
                                     Text(
-                                        text = protection.summary.trim().firstOrNull()?.uppercase() ?: "?",
-                                        style = type.monoSm,
-                                        color = colors.accentText,
+                                        text = protection.summary,
+                                        style = type.bodySm,
+                                        color = colors.textPrimary,
                                     )
                                 }
-                                Text(
-                                    text = protection.summary,
-                                    style = type.bodySm,
-                                    color = colors.textPrimary,
-                                )
                             }
                         }
                     }
-                }
-                Text(
-                    text = "File kept on disk for other listeners — this will unstar and hide the track from your mixes.",
-                    style = type.bodySm,
-                    color = colors.textSecondary,
-                )
-            } else if (preview.canDelete && preview.soleOwner) {
-                Text(
-                    text = "You are the sole listener for this track. Confirming will schedule deletion after a 5-second Undo window.",
-                    style = type.bodySm,
-                    color = colors.textSecondary,
-                )
-                if (preview.ownPlaylists.isNotEmpty()) {
                     Text(
-                        text = "Also in your playlists: ${preview.ownPlaylists.joinToString(", ")}",
-                        style = type.monoSm,
-                        color = colors.textMuted,
+                        text = "File kept on disk for other household listeners — confirming will unstar and rate 1★ to hide it from your mixes.",
+                        style = type.bodySm,
+                        color = colors.textSecondary,
                     )
                 }
-            } else {
-                Text(
-                    text = preview.blockReason
-                        ?: "File is kept safe on disk — confirming will unstar and rate 1★ to hide it from your mixes.",
-                    style = type.bodySm,
-                    color = colors.textSecondary,
-                )
+
+                else -> {
+                    if (otherBlocks.isNotEmpty()) {
+                        Surface(
+                            color = colors.surface,
+                            shape = SoulbeetShapes.md,
+                            border = BorderStroke(1.dp, colors.borderSubtle),
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "DELETION GUARD ACTIVE",
+                                    style = type.monoXs,
+                                    color = colors.leafText,
+                                )
+                                otherBlocks.forEach { protection ->
+                                    Text(
+                                        text = protection.summary,
+                                        style = type.bodySm,
+                                        color = colors.textPrimary,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Text(
+                        text = preview.blockReason
+                            ?: "File is kept safe on disk — confirming will unstar and rate 1★ to hide it from your mixes.",
+                        style = type.bodySm,
+                        color = colors.textSecondary,
+                    )
+                }
             }
 
             HorizontalDivider(color = colors.borderSubtle)
@@ -935,12 +993,20 @@ fun MultiListenerGuardSheet(
                     Text(text = "Cancel", style = type.body, color = colors.textPrimary)
                 }
 
-                val isHardDelete = preview.canDelete && preview.soleOwner && !preview.offlineFallback
+                val confirmLabel = when (dropMode) {
+                    PendingDropMode.DropDiscovery -> "Drop Track"
+                    PendingDropMode.DeleteFromLibrary -> "Delete Track"
+                    PendingDropMode.UnstarAndHide -> "Hide from My Mixes"
+                }
                 Button(
                     onClick = onConfirm,
                     shape = SoulbeetShapes.full,
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isHardDelete) colors.crimsonSolid else colors.accentSolid,
+                        containerColor = if (isHardDelete || isDiscoveryDrop) {
+                            colors.crimsonSolid
+                        } else {
+                            colors.accentSolid
+                        },
                         contentColor = colors.textPrimary,
                     ),
                     modifier = Modifier
@@ -948,7 +1014,7 @@ fun MultiListenerGuardSheet(
                         .heightIn(min = 48.dp),
                 ) {
                     Text(
-                        text = if (isHardDelete) "Delete Track" else "Hide from My Mixes",
+                        text = confirmLabel,
                         style = type.body,
                     )
                 }

@@ -92,8 +92,8 @@ class AppPreferencesStore(private val context: Context) {
     val configFlow: Flow<PersistedAppConfig> = dataStore.data.map { prefs ->
         val naviUrl = prefs[KEY_NAVI_URL].orEmpty()
         val naviUser = prefs[KEY_NAVI_USER].orEmpty()
-        val naviSalt = prefs[KEY_NAVI_SALT].orEmpty()
-        val naviToken = prefs[KEY_NAVI_TOKEN].orEmpty()
+        val naviSalt = SecretCipher.decrypt(prefs[KEY_NAVI_SALT].orEmpty())
+        val naviToken = SecretCipher.decrypt(prefs[KEY_NAVI_TOKEN].orEmpty())
         val naviCreds = if (naviUrl.isNotBlank() && naviUser.isNotBlank() && naviToken.isNotBlank()) {
             FfiNavidromeCredentials(
                 baseUrl = naviUrl,
@@ -112,6 +112,7 @@ class AppPreferencesStore(private val context: Context) {
             "cookie" -> StoredAuthKind.COOKIE
             else -> StoredAuthKind.NONE
         }
+        val authToken = SecretCipher.decrypt(prefs[KEY_AUTH_TOKEN].orEmpty())
         val secondaryAction = when (prefs[KEY_AUTO_SECONDARY_ACTION]) {
             LibrarySecondaryAction.START_RADIO.name -> LibrarySecondaryAction.START_RADIO
             else -> LibrarySecondaryAction.DISLIKE_SKIP
@@ -126,7 +127,7 @@ class AppPreferencesStore(private val context: Context) {
         PersistedAppConfig(
             serverUrl = prefs[KEY_SERVER_URL].orEmpty(),
             authKind = authKind,
-            authToken = prefs[KEY_AUTH_TOKEN].orEmpty(),
+            authToken = authToken,
             username = prefs[KEY_USERNAME].orEmpty(),
             navidrome = naviCreds,
             deviceId = prefs[KEY_DEVICE_ID].orEmpty(),
@@ -169,7 +170,7 @@ class AppPreferencesStore(private val context: Context) {
                 StoredAuthKind.COOKIE -> "cookie"
                 StoredAuthKind.NONE -> "none"
             }
-            prefs[KEY_AUTH_TOKEN] = authToken.trim()
+            prefs[KEY_AUTH_TOKEN] = SecretCipher.encrypt(authToken.trim())
             prefs[KEY_USERNAME] = username.trim()
             if (prefs[KEY_DEVICE_ID].isNullOrBlank()) {
                 prefs[KEY_DEVICE_ID] = existing.deviceId
@@ -180,8 +181,8 @@ class AppPreferencesStore(private val context: Context) {
             if (navidrome != null) {
                 prefs[KEY_NAVI_URL] = navidrome.baseUrl
                 prefs[KEY_NAVI_USER] = navidrome.username
-                prefs[KEY_NAVI_SALT] = navidrome.subsonicSalt
-                prefs[KEY_NAVI_TOKEN] = navidrome.subsonicToken
+                prefs[KEY_NAVI_SALT] = SecretCipher.encrypt(navidrome.subsonicSalt)
+                prefs[KEY_NAVI_TOKEN] = SecretCipher.encrypt(navidrome.subsonicToken)
                 prefs[KEY_NAVI_API_VERSION] = navidrome.apiVersion
                 prefs[KEY_NAVI_CLIENT_NAME] = navidrome.clientName
             }
@@ -192,8 +193,8 @@ class AppPreferencesStore(private val context: Context) {
         dataStore.edit { prefs ->
             prefs[KEY_NAVI_URL] = navidrome.baseUrl
             prefs[KEY_NAVI_USER] = navidrome.username
-            prefs[KEY_NAVI_SALT] = navidrome.subsonicSalt
-            prefs[KEY_NAVI_TOKEN] = navidrome.subsonicToken
+            prefs[KEY_NAVI_SALT] = SecretCipher.encrypt(navidrome.subsonicSalt)
+            prefs[KEY_NAVI_TOKEN] = SecretCipher.encrypt(navidrome.subsonicToken)
             prefs[KEY_NAVI_API_VERSION] = navidrome.apiVersion
             prefs[KEY_NAVI_CLIENT_NAME] = navidrome.clientName
         }

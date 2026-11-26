@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -158,11 +159,11 @@ fun SearchScreen(
                             if (selected) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
                         ),
                         modifier = Modifier
-                            .heightIn(min = 40.dp)
+                            .heightIn(min = 48.dp)
                             .clickable { onSelectFilter(filter) },
                     ) {
                         Box(
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             Text(
@@ -217,11 +218,11 @@ fun SearchScreen(
                                         shape = SoulbeetShapes.full,
                                         border = BorderStroke(1.dp, colors.borderSubtle),
                                         modifier = Modifier
-                                            .heightIn(min = 40.dp)
+                                            .heightIn(min = 48.dp)
                                             .clickable { onSubmitQuery(recent) },
                                     ) {
                                         Row(
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                                         ) {
@@ -261,7 +262,7 @@ fun SearchScreen(
                                     shape = SoulbeetShapes.full,
                                     border = BorderStroke(1.dp, colors.borderDefault),
                                     modifier = Modifier
-                                        .heightIn(min = 44.dp)
+                                        .heightIn(min = 48.dp)
                                         .clickable { onSubmitQuery(mood) },
                                 ) {
                                     Box(
@@ -461,11 +462,12 @@ fun SearchScreen(
                             )
                         }
                     }
-                    items(
+                    itemsIndexed(
                         results.onlineTracks,
-                        key = { "ol_${it.mbid ?: "${it.artist}_${it.title}"}" },
-                    ) { match ->
+                        key = { idx, it -> "ol_${idx}_${it.mbid ?: "${it.artist}_${it.title}"}" },
+                    ) { _, match ->
                         val acqKey = "${match.artist.lowercase()}::${match.title.lowercase()}"
+                        val stageLabel = state.acquiringStages[acqKey]
                         TrackRow(
                             title = match.title,
                             artist = match.artist,
@@ -473,7 +475,8 @@ fun SearchScreen(
                             coverArtId = null,
                             artAuthority = artAuthority,
                             isUnownedCatalog = true,
-                            isAcquiring = state.acquiringTrackKeys.contains(acqKey),
+                            isAcquiring = stageLabel != null,
+                            acquiringLabel = stageLabel,
                             onClick = { onAcquireTrack(match) },
                         )
                     }

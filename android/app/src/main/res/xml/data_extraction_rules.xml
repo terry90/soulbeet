@@ -7,6 +7,10 @@
         <exclude domain="file" path="." />
     </cloud-backup>
     <device-transfer>
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="datastore" />
+        <exclude domain="file" path="soulbeet_core" />
         <exclude domain="file" path="audio_cache" />
     </device-transfer>
 </data-extraction-rules>

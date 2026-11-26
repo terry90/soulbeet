@@ -84,6 +84,7 @@ import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.ui.components.StarStrip
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.TrackRow
+import org.soulbeet.app.ui.components.UndoDropSnackbar
 
 /**
  * Full-Screen Draggable Now Playing Sheet with thumb-zone ergonomics, adaptive radial artwork glow
@@ -118,6 +119,7 @@ fun NowPlayingSheet(
     onDismissConnect: () -> Unit,
     onClaimActiveDevice: () -> Unit,
     onTransferPlayback: (String) -> Unit,
+    onUndoPendingDrop: () -> Unit,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -369,18 +371,24 @@ fun NowPlayingSheet(
                                 style = type.monoSm,
                                 color = colors.textMuted,
                             )
-                            Surface(
-                                color = colors.surfaceHigh,
-                                shape = SoulbeetShapes.full,
-                                border = BorderStroke(1.dp, colors.borderDefault),
-                                modifier = Modifier.clickable { showCodecInfo = !showCodecInfo },
+                            Box(
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .clickable { showCodecInfo = !showCodecInfo },
+                                contentAlignment = Alignment.Center,
                             ) {
-                                Text(
-                                    text = codecBadge,
-                                    style = type.monoXs,
-                                    color = colors.leafText,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                                )
+                                Surface(
+                                    color = colors.surfaceHigh,
+                                    shape = SoulbeetShapes.full,
+                                    border = BorderStroke(1.dp, colors.borderDefault),
+                                ) {
+                                    Text(
+                                        text = codecBadge,
+                                        style = type.monoXs,
+                                        color = colors.leafText,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                    )
+                                }
                             }
                             Text(
                                 text = FormattingUtils.formatDurationMs(pb.durationMs),
@@ -647,6 +655,34 @@ fun NowPlayingSheet(
                             )
                         }
                     }
+                }
+            }
+
+            // Always render 5-second Undo snackbar / status notice ABOVE NowPlayingSheet content
+            if (state.pendingDrop != null) {
+                UndoDropSnackbar(
+                    pending = state.pendingDrop,
+                    onUndo = onUndoPendingDrop,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 16.dp),
+                )
+            } else if (!state.snackbarMessage.isNullOrBlank()) {
+                Surface(
+                    color = colors.surfaceHigh,
+                    shape = SoulbeetShapes.md,
+                    border = BorderStroke(1.dp, colors.borderDefault),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 16.dp),
+                ) {
+                    Text(
+                        text = state.snackbarMessage,
+                        style = type.bodySm,
+                        color = colors.textPrimary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
                 }
             }
         }

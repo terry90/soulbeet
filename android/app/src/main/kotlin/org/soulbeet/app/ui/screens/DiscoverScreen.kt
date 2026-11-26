@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.TriageCardItem
+import org.soulbeet.app.data.ContextualMixUi
 import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.UserCultureProfileUi
@@ -64,7 +65,6 @@ import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.ui.components.SeasonalHeroCard
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.core.FfiPinTarget
-import org.soulbeet.media.AutoBrowseTree
 import kotlin.math.roundToInt
 
 @Composable
@@ -72,7 +72,7 @@ fun DiscoverScreen(
     state: AppUiState,
     artAuthority: String,
     bottomContentPadding: PaddingValues,
-    onPlayContainer: (mediaId: String, title: String) -> Unit,
+    onPlayMix: (ContextualMixUi) -> Unit,
     onTogglePin: (target: FfiPinTarget, label: String) -> Unit,
     onSteerMix: (slug: String, option: CultureSteeringOption) -> Unit,
     onPreviewTriageCard: (TriageCardItem) -> Unit,
@@ -110,11 +110,7 @@ fun DiscoverScreen(
                     mix = hero,
                     isPinned = isPinned,
                     steeringInFlight = state.steeringInFlight,
-                    onPlay = {
-                        val mediaId = hero.navidromePlaylistId?.let { "${AutoBrowseTree.PREFIX_PLAYLIST}$it" }
-                            ?: AutoBrowseTree.FOR_YOU_TRIAGE
-                        onPlayContainer(mediaId, hero.title)
-                    },
+                    onPlay = { onPlayMix(hero) },
                     onTogglePin = { onTogglePin(pinTarget, hero.title) },
                     onSteer = { option -> onSteerMix(hero.slug, option) },
                 )
@@ -138,12 +134,7 @@ fun DiscoverScreen(
                                 border = BorderStroke(1.dp, colors.borderSubtle),
                                 modifier = Modifier
                                     .width(200.dp)
-                                    .clickable {
-                                        val mediaId = mix.navidromePlaylistId?.let {
-                                            "${AutoBrowseTree.PREFIX_PLAYLIST}$it"
-                                        } ?: AutoBrowseTree.FOR_YOU_TRIAGE
-                                        onPlayContainer(mediaId, mix.title)
-                                    },
+                                    .clickable { onPlayMix(mix) },
                             ) {
                                 Column(
                                     modifier = Modifier.padding(16.dp),
@@ -597,8 +588,10 @@ private fun CultureProfileEditorDialog(
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
-    var country by remember { mutableStateOf(initial?.homeCountry ?: "") }
-    var ratio by remember { mutableFloatStateOf(initial?.localCultureRatio ?: 0.45f) }
+    var country by remember(initial?.homeCountry) { mutableStateOf(initial?.homeCountry ?: "") }
+    var ratio by remember(initial?.localCultureRatio) {
+        mutableFloatStateOf(initial?.localCultureRatio ?: 0.45f)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
