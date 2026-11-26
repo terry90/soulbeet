@@ -96,11 +96,13 @@ Run desktop unit tests:
 cargo test -p desktop
 ```
 
-Package a Linux AppImage (builds with `dx bundle --package desktop --platform desktop --release` if `dx` is installed, or falls back to `cargo build --release -p desktop`, assembles `target/AppDir`, and invokes `appimagetool` if available to produce `target/Soulbeet-x86_64.AppImage`):
+Package a Linux AppImage (builds with `dx bundle --package desktop --platform desktop --release` if `dx` is installed, or falls back to `cargo build --release --locked -p desktop`, assembles `target/AppDir`, and invokes `appimagetool` if available to produce `target/Soulbeet-x86_64.AppImage`):
 
 ```bash
 ./desktop/packaging/build-linux-appimage.sh
 ```
+
+Prebuilt Linux (`soulbeet-<tag>-linux-x86_64.AppImage`) and Windows (`soulbeet-<tag>-windows-x86_64.zip`, bundled with `libmpv-2.dll`) binaries are attached to every GitHub Release alongside `SHA256SUMS.txt`. The Linux AppImage expects host `libmpv` (`libmpv.so.2`), `webkit2gtk-4.1`, and `glibc >= 2.39` at runtime.
 
 ## Android & Android Auto
 
@@ -149,3 +151,7 @@ cd android
 ```
 
 The built APK lands in `android/app/build/outputs/apk/debug/`.
+
+### Prebuilt releases and optional release signing
+
+Every GitHub Release attaches an installable Android APK alongside `SHA256SUMS.txt`. To publish release-signed APKs (`soulbeet-<tag>-android.apk`) instead of debug-signed APKs (`soulbeet-<tag>-android-debug.apk`), configure all four repository secrets in GitHub Actions: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Local Gradle builds continue to work without any signing environment variables.
