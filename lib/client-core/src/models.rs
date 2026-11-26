@@ -392,6 +392,30 @@ pub struct DrainReport {
     pub remaining: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutboxSummary {
+    pub pending_count: usize,
+    pub dead_letter_count: usize,
+    pub oldest_pending_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinRecord {
+    pub target: PinTarget,
+    pub pinned_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LibraryStats {
+    pub artist_count: u64,
+    pub album_count: u64,
+    pub track_count: u64,
+    pub playlist_count: u64,
+    pub starred_track_count: u64,
+    pub pending_discovery_count: u64,
+}
+
 // --- Unified Search ---
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

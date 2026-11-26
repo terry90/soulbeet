@@ -14,7 +14,7 @@ use crate::db::now_unix;
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
     AudioQualityProfile, CachePolicy, CacheStats, NavidromeCredentials, OfflineTrackEntry,
-    PinTarget, PlaybackSource,
+    PinRecord, PinTarget, PlaybackSource,
 };
 use crate::subsonic::{
     is_subsonic_error_content_type, parse_subsonic_error_bytes, SubsonicClient,
@@ -390,7 +390,9 @@ impl CacheManager {
             return Ok(Vec::new());
         }
         let start = current_index.saturating_add(1);
-        let end = (start + policy.prefetch_queue_count).min(queue_track_ids.len());
+        let end = start
+            .saturating_add(policy.prefetch_queue_count)
+            .min(queue_track_ids.len());
         if start >= end {
             return Ok(Vec::new());
         }
@@ -465,7 +467,9 @@ impl CacheManager {
         Ok(completed)
     }
 
-    /// Pure local cover-art path lookup with zero network I/O (Android Auto `ContentProvider` safe).
+    /// Pure read-only local cover-art path lookup with zero network I/O and zero SQLite writes
+    /// (safe for Android Auto `ContentProvider` Binder threads even while `sync_now` holds write locks).
+    /// Verifies the file exists as a regular file canonically contained within `cover_art_dir`.
     pub async fn cover_art_local_path(&self, cover_art_id: &str) -> CoreResult<Option<PathBuf>> {
         let path = sqlx::query_scalar::<_, String>(
             "SELECT local_path FROM cover_art_cache WHERE cover_art_id = ?",
@@ -474,24 +478,25 @@ impl CacheManager {
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some(p) = path {
-            let pb = PathBuf::from(&p);
-            if tokio::fs::try_exists(&pb).await.unwrap_or(false) {
-                sqlx::query(
-                    "UPDATE cover_art_cache SET last_accessed_at = ? WHERE cover_art_id = ?",
-                )
-                .bind(now_unix())
-                .bind(cover_art_id)
-                .execute(&self.pool)
-                .await?;
-                return Ok(Some(pb));
-            }
-            sqlx::query("DELETE FROM cover_art_cache WHERE cover_art_id = ?")
-                .bind(cover_art_id)
-                .execute(&self.pool)
-                .await?;
+        let Some(p) = path else {
+            return Ok(None);
+        };
+
+        let pb = PathBuf::from(&p);
+        let is_file = tokio::fs::metadata(&pb)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            return Ok(None);
         }
-        Ok(None)
+
+        let canonical_base = tokio::fs::canonicalize(&self.cover_art_dir).await.ok();
+        let canonical_file = tokio::fs::canonicalize(&pb).await.ok();
+        match (canonical_base, canonical_file) {
+            (Some(base), Some(file)) if file.starts_with(&base) => Ok(Some(pb)),
+            _ => Ok(None),
+        }
     }
 
     /// Returns cached cover-art path, or fetches and persists it on cache miss (unless `offline_only`).
@@ -502,8 +507,22 @@ impl CacheManager {
         size: Option<u32>,
         offline_only: bool,
     ) -> CoreResult<PathBuf> {
+        let (path, _) = self
+            .get_or_fetch_cover_art_with_status(cover_art_id, size, offline_only)
+            .await?;
+        Ok(path)
+    }
+
+    /// Same as [`Self::get_or_fetch_cover_art`], returning `(path, newly_fetched)` so callers can
+    /// avoid emitting cache-change notifications on cache hits.
+    pub async fn get_or_fetch_cover_art_with_status(
+        &self,
+        cover_art_id: &str,
+        size: Option<u32>,
+        offline_only: bool,
+    ) -> CoreResult<(PathBuf, bool)> {
         if let Some(local) = self.cover_art_local_path(cover_art_id).await? {
-            return Ok(local);
+            return Ok((local, false));
         }
         if offline_only {
             return Err(CoreError::Offline(format!(
@@ -589,7 +608,7 @@ impl CacheManager {
 
         self.enforce_cover_art_budget_excluding(Some(cover_art_id))
             .await?;
-        Ok(final_path)
+        Ok((final_path, true))
     }
 
     async fn enforce_cover_art_budget_excluding(
@@ -662,6 +681,30 @@ impl CacheManager {
             cached_cover_art_count: cover_count.max(0) as u64,
             max_audio_bytes,
         })
+    }
+
+    pub async fn list_pinned_targets(&self) -> CoreResult<Vec<PinRecord>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT target_kind, target_id, pinned_at FROM offline_pins ORDER BY pinned_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, id, pinned_at)| {
+                PinTarget::from_db_pair(&kind, &id).map(|target| PinRecord { target, pinned_at })
+            })
+            .collect())
+    }
+
+    pub async fn list_offline_tracks(&self) -> CoreResult<Vec<OfflineTrackEntry>> {
+        let rows = sqlx::query_as::<_, OfflineTrackEntry>(
+            "SELECT * FROM offline_downloads ORDER BY pinned DESC, last_accessed_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     async fn is_track_pinned_by_rules(&self, track_id: &str) -> CoreResult<bool> {

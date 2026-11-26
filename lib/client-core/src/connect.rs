@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use url::Url;
 
 use crate::error::{CoreError, CoreResult};
@@ -33,10 +33,12 @@ pub struct ConnectClient {
     platform: DevicePlatform,
     soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     state: Arc<RwLock<ConnectState>>,
+    state_tx: watch::Sender<ConnectState>,
     events_tx: broadcast::Sender<ConnectServerEventDto>,
     outbound_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ConnectClientMessageDto>>>>,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     conn_gen: Arc<AtomicU64>,
+    connect_op_lock: TokioMutex<()>,
 }
 
 impl ConnectClient {
@@ -47,21 +49,28 @@ impl ConnectClient {
         soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = watch::channel(ConnectState::default());
         Self {
             device_id,
             device_name,
             platform,
             soulbeet_auth,
             state: Arc::new(RwLock::new(ConnectState::default())),
+            state_tx,
             events_tx,
             outbound_tx: Arc::new(RwLock::new(None)),
             tasks: Arc::new(StdMutex::new(Vec::new())),
             conn_gen: Arc::new(AtomicU64::new(0)),
+            connect_op_lock: TokioMutex::new(()),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ConnectServerEventDto> {
         self.events_tx.subscribe()
+    }
+
+    pub fn subscribe_state(&self) -> watch::Receiver<ConnectState> {
+        self.state_tx.subscribe()
     }
 
     pub async fn state(&self) -> ConnectState {
@@ -76,7 +85,8 @@ impl ConnectClient {
         soulbeet_base_url: &str,
         heartbeat_interval: Duration,
     ) -> CoreResult<()> {
-        self.disconnect().await;
+        let _op_guard = self.connect_op_lock.lock().await;
+        self.disconnect_locked().await;
 
         let heartbeat_interval = heartbeat_interval.max(Duration::from_secs(1));
         let ws_base = http_to_ws_url(soulbeet_base_url, "/api/ws/connect")?;
@@ -102,7 +112,17 @@ impl ConnectClient {
 
         let (ws_stream, _) = tokio_tungstenite::connect_async(request)
             .await
-            .map_err(|e| CoreError::WebSocket(e.to_string()))?;
+            .map_err(|e| match e {
+                WsError::Http(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp
+                        .into_body()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    CoreError::ServerHttp { status, body }
+                }
+                other => CoreError::WebSocket(other.to_string()),
+            })?;
 
         let gen = self.conn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let (mut ws_sink, mut ws_source) = ws_stream.split();
@@ -116,10 +136,20 @@ impl ConnectClient {
             platform: self.platform,
         });
 
-        *self.outbound_tx.write().await = Some(out_tx.clone());
-        self.state.write().await.connected = true;
+        let connected_state = {
+            let mut out_guard = self.outbound_tx.write().await;
+            let mut st = self.state.write().await;
+            *out_guard = Some(out_tx.clone());
+            st.devices.clear();
+            st.active_device_id = None;
+            st.snapshots.clear();
+            st.connected = true;
+            st.clone()
+        };
+        let _ = self.state_tx.send(connected_state);
 
         let writer_state = self.state.clone();
+        let writer_state_tx = self.state_tx.clone();
         let writer_outbound = self.outbound_tx.clone();
         let writer_gen = self.conn_gen.clone();
         let writer_shutdown_tx = shutdown_tx.clone();
@@ -145,9 +175,18 @@ impl ConnectClient {
                 }
             }
             let _ = writer_shutdown_tx.send(true);
-            if writer_gen.load(Ordering::SeqCst) == gen {
-                *writer_outbound.write().await = None;
-                writer_state.write().await.connected = false;
+            let disconnected = {
+                let mut out_guard = writer_outbound.write().await;
+                let mut st = writer_state.write().await;
+                if writer_gen.load(Ordering::SeqCst) == gen {
+                    *out_guard = None;
+                    clear_state_on_disconnect(&mut st)
+                } else {
+                    None
+                }
+            };
+            if let Some(st) = disconnected {
+                let _ = writer_state_tx.send(st);
             }
         });
 
@@ -169,6 +208,7 @@ impl ConnectClient {
         });
 
         let reader_state = self.state.clone();
+        let reader_state_tx = self.state_tx.clone();
         let reader_outbound = self.outbound_tx.clone();
         let reader_gen = self.conn_gen.clone();
         let reader_shutdown_tx = shutdown_tx;
@@ -208,51 +248,76 @@ impl ConnectClient {
                 };
 
                 if let Some(event) = decoded {
-                    {
+                    let (still_current, updated_state) = {
                         let mut st = reader_state.write().await;
-                        match &event {
-                            ConnectServerEventDto::DeviceList {
-                                devices,
-                                active_device_id,
-                            } => {
-                                let live_ids: HashSet<&str> =
-                                    devices.iter().map(|d| d.device_id.as_str()).collect();
-                                st.snapshots
-                                    .retain(|dev_id, _| live_ids.contains(dev_id.as_str()));
-                                st.devices = devices.clone();
-                                st.active_device_id = active_device_id.clone();
-                                for dev in devices {
-                                    if let Some(snap) = &dev.snapshot {
-                                        st.snapshots
-                                            .insert(dev.device_id.clone(), snap.clone());
+                        if reader_gen.load(Ordering::SeqCst) != gen {
+                            (false, None)
+                        } else {
+                            let state_snapshot = match &event {
+                                ConnectServerEventDto::DeviceList {
+                                    devices,
+                                    active_device_id,
+                                } => {
+                                    let live_ids: HashSet<&str> =
+                                        devices.iter().map(|d| d.device_id.as_str()).collect();
+                                    st.snapshots
+                                        .retain(|dev_id, _| live_ids.contains(dev_id.as_str()));
+                                    st.devices = devices.clone();
+                                    st.active_device_id = active_device_id.clone();
+                                    for dev in devices {
+                                        if let Some(snap) = &dev.snapshot {
+                                            st.snapshots
+                                                .insert(dev.device_id.clone(), snap.clone());
+                                        }
                                     }
+                                    Some(st.clone())
                                 }
-                            }
-                            ConnectServerEventDto::PlaybackUpdated {
-                                device_id,
-                                snapshot,
-                            } => {
-                                st.snapshots.insert(device_id.clone(), snapshot.clone());
-                                if let Some(dev) =
-                                    st.devices.iter_mut().find(|d| d.device_id == *device_id)
-                                {
-                                    dev.snapshot = Some(snapshot.clone());
+                                ConnectServerEventDto::PlaybackUpdated {
+                                    device_id,
+                                    snapshot,
+                                } => {
+                                    st.snapshots.insert(device_id.clone(), snapshot.clone());
+                                    if let Some(dev) =
+                                        st.devices.iter_mut().find(|d| d.device_id == *device_id)
+                                    {
+                                        dev.snapshot = Some(snapshot.clone());
+                                    }
+                                    Some(st.clone())
                                 }
-                            }
-                            ConnectServerEventDto::Command { .. } => {}
+                                ConnectServerEventDto::Command { .. } => None,
+                            };
+                            (true, state_snapshot)
                         }
+                    };
+                    if !still_current {
+                        break;
+                    }
+                    if let Some(st) = updated_state {
+                        let _ = reader_state_tx.send(st);
                     }
                     let _ = events_tx.send(event);
                 }
             }
             let _ = reader_shutdown_tx.send(true);
-            if reader_gen.load(Ordering::SeqCst) == gen {
-                *reader_outbound.write().await = None;
-                reader_state.write().await.connected = false;
+            let disconnected = {
+                let mut out_guard = reader_outbound.write().await;
+                let mut st = reader_state.write().await;
+                if reader_gen.load(Ordering::SeqCst) == gen {
+                    *out_guard = None;
+                    clear_state_on_disconnect(&mut st)
+                } else {
+                    None
+                }
+            };
+            if let Some(st) = disconnected {
+                let _ = reader_state_tx.send(st);
             }
         });
 
         if let Ok(mut tasks) = self.tasks.lock() {
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
             *tasks = vec![writer_task, hb_task, reader_task];
         }
         Ok(())
@@ -304,15 +369,42 @@ impl ConnectClient {
     }
 
     pub async fn disconnect(&self) {
+        let _op_guard = self.connect_op_lock.lock().await;
+        self.disconnect_locked().await;
+    }
+
+    async fn disconnect_locked(&self) {
         self.conn_gen.fetch_add(1, Ordering::SeqCst);
-        *self.outbound_tx.write().await = None;
         if let Ok(mut tasks) = self.tasks.lock() {
             for handle in tasks.drain(..) {
                 handle.abort();
             }
         }
-        self.state.write().await.connected = false;
+        let disconnected = {
+            let mut out_guard = self.outbound_tx.write().await;
+            let mut st = self.state.write().await;
+            *out_guard = None;
+            clear_state_on_disconnect(&mut st)
+        };
+        if let Some(st) = disconnected {
+            let _ = self.state_tx.send(st);
+        }
     }
+}
+
+fn clear_state_on_disconnect(st: &mut ConnectState) -> Option<ConnectState> {
+    let changed = st.connected
+        || !st.devices.is_empty()
+        || st.active_device_id.is_some()
+        || !st.snapshots.is_empty();
+    if !changed {
+        return None;
+    }
+    st.connected = false;
+    st.devices.clear();
+    st.active_device_id = None;
+    st.snapshots.clear();
+    Some(st.clone())
 }
 
 impl Drop for ConnectClient {
