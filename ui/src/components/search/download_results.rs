@@ -419,7 +419,7 @@ pub fn DownloadResults(props: Props) -> Element {
                     on_track_toggle: handle_track_toggle,
                 }
             }
-            div { class: "fixed bottom-8 right-8",
+            div { class: "fixed bottom-28 md:bottom-24 right-6 z-40",
                 button {
                     class: "bg-beet-accent hover:bg-fuchsia-400 text-white font-bold p-4 rounded-full shadow-[0_0_15px_rgba(255,0,255,0.5)] transition-transform hover:scale-105 disabled:bg-gray-600 disabled:cursor-not-allowed disabled:shadow-none flex items-center justify-center cursor-pointer",
                     aria_label: "Start download",
