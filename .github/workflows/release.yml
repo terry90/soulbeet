@@ -50,11 +50,391 @@ jobs:
           git tag v${{ steps.bump.outputs.new_version }}
           git push origin v${{ steps.bump.outputs.new_version }}
 
-  # After the images, which only push once the tests pass, so a failing
-  # commit gets no release either.
+  build-and-push:
+    needs: bump-version
+    if: "!cancelled() && (needs.bump-version.result == 'success' || github.event_name == 'push')"
+    uses: ./.github/workflows/image-build-push.yml
+    with:
+      ref: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+      tags: |
+        type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
+        type=raw,value=latest,enable=${{ !contains(needs.bump-version.outputs.tag || github.ref_name, '-') }}
+    secrets: inherit
+
+  build-android:
+    needs: bump-version
+    if: "!cancelled() && (needs.bump-version.result == 'success' || github.event_name == 'push')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag || github.ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK 27.2.12479018
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "ERROR: neither ANDROID_HOME nor ANDROID_SDK_ROOT is set" >&2
+            exit 1
+          fi
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;27.2.12479018"
+          NDK_DIR="${SDK_ROOT}/ndk/27.2.12479018"
+          test -d "${NDK_DIR}/toolchains/llvm/prebuilt"
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-core
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@cargo-ndk
+
+      - name: Build client-core JNI libraries and Kotlin bindings
+        run: ./scripts/build-android-core.sh --profile release --abis "arm64-v8a armeabi-v7a x86_64"
+
+      - name: Compute Android version metadata
+        env:
+          RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+        run: |
+          VERSION_NAME="${RELEASE_TAG#v}"
+          WITHOUT_META="${VERSION_NAME%%+*}"
+          CORE_VERSION="${WITHOUT_META%%-*}"
+          IFS='.' read -r MAJOR MINOR PATCH _ <<< "$CORE_VERSION"
+          MAJOR="${MAJOR:-0}"
+          MINOR="${MINOR:-0}"
+          PATCH="${PATCH:-0}"
+          [[ "$MAJOR" =~ ^[0-9]+$ ]] || MAJOR=0
+          [[ "$MINOR" =~ ^[0-9]+$ ]] || MINOR=0
+          [[ "$PATCH" =~ ^[0-9]+$ ]] || PATCH=0
+
+          # Reserve 0..98 for prereleases and 99 for stable so prereleases always
+          # sort strictly below the final release and upgrade cleanly on Android.
+          if [[ "$WITHOUT_META" == *-* ]]; then
+            PRERELEASE="${WITHOUT_META#*-}"
+            if [[ "$PRERELEASE" =~ ([0-9]+)$ ]]; then
+              PRE=$((10#${BASH_REMATCH[1]}))
+              if [[ "$PRE" -lt 1 ]]; then
+                PRE=1
+              elif [[ "$PRE" -gt 98 ]]; then
+                PRE=98
+              fi
+            else
+              PRE=0
+            fi
+          else
+            PRE=99
+          fi
+
+          VERSION_CODE=$((10#$MAJOR * 1000000 + 10#$MINOR * 10000 + 10#$PATCH * 100 + PRE))
+          if [[ "$VERSION_CODE" -lt 1 ]]; then
+            VERSION_CODE=1
+          fi
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "SOULBEET_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "SOULBEET_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "Android versionName=$VERSION_NAME versionCode=$VERSION_CODE"
+
+      - name: Decode release keystore (if configured)
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          present=0
+          missing=()
+          for secret_name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            trimmed="$(printf '%s' "${!secret_name}" | tr -d '[:space:]')"
+            if [[ -n "$trimmed" ]]; then
+              present=$((present + 1))
+            else
+              missing+=("$secret_name")
+            fi
+          done
+
+          if [[ "$present" -eq 4 ]]; then
+            KEYSTORE_PATH="${RUNNER_TEMP}/soulbeet-release.jks"
+            (umask 077; printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 --decode > "$KEYSTORE_PATH")
+            test -s "$KEYSTORE_PATH"
+            echo "ANDROID_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "Release signing configured; building signed release APK."
+          elif [[ "$present" -eq 0 ]]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "Release signing secrets not configured; building installable debug-signed APK."
+          else
+            echo "ERROR: partial Android release signing configuration; missing secret(s): ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Build Android APK
+        working-directory: android
+        env:
+          IS_SIGNED: ${{ steps.signing.outputs.signed }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p ../dist
+          if [[ "$IS_SIGNED" == "true" ]]; then
+            ./gradlew :app:assembleRelease --no-daemon
+            cp app/build/outputs/apk/release/app-release.apk "../dist/soulbeet-${RELEASE_TAG}-android.apk"
+          else
+            unset ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+            ./gradlew :app:assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/app-debug.apk "../dist/soulbeet-${RELEASE_TAG}-android-debug.apk"
+          fi
+          ls -lh ../dist/
+
+      - name: Remove temporary keystore
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/soulbeet-release.jks"
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/*.apk
+          if-no-files-found: error
+
+  build-desktop-linux:
+    needs: bump-version
+    if: "!cancelled() && (needs.bump-version.result == 'success' || github.event_name == 'push')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag || github.ref }}
+
+      - name: Install desktop native dependencies
+        run: >
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          libmpv-dev libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev libxdo-dev
+          pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-linux
+
+      - name: Install appimagetool
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          APPIMAGETOOL="$HOME/.local/bin/appimagetool"
+          EXPECTED_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          curl -fsSL \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage" \
+            -o "$APPIMAGETOOL"
+          echo "${EXPECTED_SHA256}  ${APPIMAGETOOL}" | sha256sum -c -
+          chmod +x "$APPIMAGETOOL"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build Linux AppImage
+        env:
+          RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+        run: |
+          mkdir -p dist
+          OUT_PATH="dist/soulbeet-${RELEASE_TAG}-linux-x86_64.AppImage"
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 OUTPUT_PATH="$OUT_PATH" ./desktop/packaging/build-linux-appimage.sh
+          chmod +x "$OUT_PATH"
+          ls -lh dist/
+
+      - name: Upload Linux AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-linux
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  build-desktop-windows:
+    needs: bump-version
+    if: "!cancelled() && (needs.bump-version.result == 'success' || github.event_name == 'push')"
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump-version.outputs.tag || github.ref }}
+
+      - name: Set up MSVC developer command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91"
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-windows
+
+      # libmpv2-sys (without use-bindgen) emits only `cargo:rustc-link-lib=mpv`, which
+      # links `mpv.lib` via MSVC's LIB search path. Generate `mpv.lib` targeting
+      # `libmpv-2.dll` from the pinned shinchiro mpv-dev archive.
+      - name: Download libmpv-2.dll and generate MSVC import library (mpv.lib)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:LIB)) {
+            throw "MSVC LIB environment variable is empty; msvc-dev-cmd did not initialize."
+          }
+
+          $mpvRoot = Join-Path $env:RUNNER_TEMP "mpv-dev"
+          $mpvLibDir = Join-Path $mpvRoot "msvc-lib"
+          New-Item -ItemType Directory -Force -Path $mpvRoot, $mpvLibDir | Out-Null
+
+          $archive = Join-Path $env:RUNNER_TEMP "mpv-dev-x86_64.7z"
+          $url = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z"
+          $expectedSha256 = "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "SHA256 mismatch for mpv-dev archive: expected $expectedSha256, got $actualSha256"
+          }
+
+          & 7z x $archive "-o$mpvRoot" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed" }
+
+          $dllFile = Get-ChildItem -Path $mpvRoot -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
+          if (-not $dllFile) { throw "libmpv-2.dll not found in extracted mpv-dev archive" }
+
+          $mpvDef = Join-Path $mpvLibDir "mpv.def"
+          $existingDef = Get-ChildItem -Path $mpvRoot -Recurse -File |
+            Where-Object { $_.Name -in @("mpv.def", "libmpv-2.def") } |
+            Select-Object -First 1
+          if ($existingDef) {
+            $defLines = @(Get-Content $existingDef.FullName | Where-Object { $_ -notmatch '^\s*(LIBRARY|NAME)\b' })
+            @('LIBRARY "libmpv-2.dll"') + $defLines | Set-Content -Encoding ASCII $mpvDef
+          } else {
+            $dumpOut = & dumpbin /nologo /exports $dllFile.FullName
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports failed with exit code $LASTEXITCODE" }
+            $inTable = $false
+            $exports = @(
+              foreach ($line in $dumpOut) {
+                if ($line -match '^\s*ordinal\s+hint\s+RVA\s+name\s*$') {
+                  $inTable = $true
+                  continue
+                }
+                if ($inTable -and $line -match '^\s*Summary\s*$') {
+                  break
+                }
+                if (-not $inTable) { continue }
+                if ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s|$)') {
+                  $Matches[1]
+                } elseif ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_]*)\s+\(forwarded\s+to\s+') {
+                  $Matches[1]
+                }
+              }
+            )
+            if ($exports.Count -lt 20) {
+              throw "Failed to extract exports from $($dllFile.FullName) (found $($exports.Count))"
+            }
+            @('LIBRARY "libmpv-2.dll"', "EXPORTS") + $exports | Set-Content -Encoding ASCII $mpvDef
+          }
+
+          $mpvLib = Join-Path $mpvLibDir "mpv.lib"
+          & lib /nologo "/def:$mpvDef" "/name:libmpv-2.dll" "/out:$mpvLib" /machine:x64
+          if ($LASTEXITCODE -ne 0) { throw "lib.exe failed to generate mpv.lib" }
+
+          "LIB=$mpvLibDir;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MPV_DLL_PATH=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MPV_LIB_PATH=$mpvLib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Prepared $mpvLib for $($dllFile.FullName)"
+
+      - name: Build and bundle Windows desktop release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path $env:MPV_LIB_PATH)) { throw "Missing $env:MPV_LIB_PATH" }
+          if (-not (Test-Path "web/assets/tailwind.css")) { throw "Missing web/assets/tailwind.css" }
+
+          cargo build --release --locked -p desktop
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+          $exePath = "target/release/desktop.exe"
+          if (-not (Test-Path $exePath)) { throw "Expected binary not found at $exePath" }
+
+          $deps = & dumpbin /nologo /dependents $exePath
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed with exit code $LASTEXITCODE" }
+          if (-not ($deps | Select-String -SimpleMatch "libmpv-2.dll" -Quiet)) {
+            $deps | Write-Host
+            throw "Compiled binary does not depend on libmpv-2.dll"
+          }
+
+          $tag = $env:RELEASE_TAG
+          $stageDir = "dist/soulbeet-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item $exePath (Join-Path $stageDir "soulbeet-desktop.exe") -Force
+          Copy-Item $env:MPV_DLL_PATH (Join-Path $stageDir "libmpv-2.dll") -Force
+
+          @"
+          Soulbeet Desktop ($tag) for Windows x86_64
+
+          Usage:
+          1. Extract all files from this archive into a folder.
+          2. Keep libmpv-2.dll in the same directory as soulbeet-desktop.exe.
+          3. Run soulbeet-desktop.exe.
+
+          Requirements:
+          - Windows 10/11 (x86_64) with Microsoft Edge WebView2 Runtime (preinstalled on Windows 11 and modern Windows 10).
+          "@ | Set-Content -Encoding UTF8 (Join-Path $stageDir "README.txt")
+
+          $zipPath = "dist/soulbeet-$tag-windows-x86_64.zip"
+          Compress-Archive -Path "$stageDir/*" -DestinationPath $zipPath -Force
+          Get-Item $zipPath | Format-List Name, Length
+
+      - name: Upload Windows desktop zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # After the images and client artifacts all succeed, publish the GitHub Release
+  # with every client binary and SHA256SUMS.txt attached.
   create-release:
-    needs: [bump-version, build-and-push]
-    if: always() && needs.build-and-push.result == 'success'
+    needs: [bump-version, build-and-push, build-android, build-desktop-linux, build-desktop-windows]
+    if: >-
+      !cancelled() &&
+      needs.build-and-push.result == 'success' &&
+      needs.build-android.result == 'success' &&
+      needs.build-desktop-linux.result == 'success' &&
+      needs.build-desktop-windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -64,26 +444,40 @@ jobs:
         with:
           ref: ${{ needs.bump-version.outputs.tag || github.ref }}
 
-      - name: Create GitHub Release
+      - name: Download client release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
         run: |
-          TAG="${{ needs.bump-version.outputs.tag || github.ref_name }}"
-          flags=()
-          # v1.2.3-rc.1 and the like are test builds, not the latest release.
-          [[ "$TAG" == *-* ]] && flags+=(--prerelease)
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            "${flags[@]}"
+          (
+            cd release-assets
+            export LC_ALL=C
+            shopt -s nullglob
+            files=(*.apk *.AppImage *.zip)
+            if [[ "${#files[@]}" -ne 3 ]]; then
+              echo "ERROR: expected 3 release artifacts (.apk, .AppImage, .zip), found ${#files[@]}: ${files[*]}" >&2
+              ls -la
+              exit 1
+            fi
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+          )
+          ls -lh release-assets/
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  build-and-push:
-    needs: bump-version
-    if: always() && (needs.bump-version.result == 'success' || github.event_name == 'push')
-    uses: ./.github/workflows/image-build-push.yml
-    with:
-      ref: ${{ needs.bump-version.outputs.tag || github.ref_name }}
-      tags: |
-        type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
-        type=raw,value=latest,enable=${{ !contains(needs.bump-version.outputs.tag || github.ref_name, '-') }}
-    secrets: inherit
+          RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+        run: |
+          flags=()
+          # v1.2.3-rc.1 and the like are test builds, not the latest release.
+          [[ "$RELEASE_TAG" == *-* ]] && flags+=(--prerelease)
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            "${flags[@]}" \
+            release-assets/*
