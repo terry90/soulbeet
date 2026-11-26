@@ -25,8 +25,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -454,12 +454,12 @@ private fun SwipeableTriageCard(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
-                        .background(colors.goldSurface),
+                        .background(colors.accentSurface),
                 ) {
                     Icon(
-                        imageVector = Icons.Filled.Star,
-                        contentDescription = "Star and Keep",
-                        tint = colors.gold,
+                        imageVector = Icons.Filled.Favorite,
+                        contentDescription = "Favorite and Keep",
+                        tint = colors.accentText,
                     )
                 }
 

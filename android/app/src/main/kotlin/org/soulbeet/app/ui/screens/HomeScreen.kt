@@ -20,8 +20,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -182,20 +184,23 @@ fun HomeScreen(
             }
         }
 
-        // 4. Discovery & Playlists Shelf
-        if (state.playlists.isNotEmpty()) {
+        // 4. Your Playlists Shelf (focused on user playlists; falls back to mixes excluding seasonalHeroMix)
+        val homeShelfPlaylists = state.userPlaylists.ifEmpty { state.homeFallbackMixPlaylists }
+        if (homeShelfPlaylists.isNotEmpty()) {
+            val isMixFallback = state.userPlaylists.isEmpty()
             item(key = "playlists_shelf") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        text = "Your Mixes & Playlists",
+                        text = if (isMixFallback) "Discovery & Mixes" else "Your Playlists",
                         style = type.titleMd,
                         color = colors.textPrimary,
                     )
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        items(state.playlists.take(12), key = { it.id }) { pl ->
+                        items(homeShelfPlaylists.take(12), key = { it.id }) { pl ->
                             val pinned = state.pinnedTargets.any { it.target == FfiPinTarget.Playlist(pl.id) }
+                            val isSmartMix = pl.kind != "user" || pl.isSmart
                             Surface(
                                 color = colors.surface,
                                 shape = SoulbeetShapes.md,
@@ -230,11 +235,45 @@ fun HomeScreen(
                                             )
                                             if (pinned) OfflineDot()
                                         }
-                                        Text(
-                                            text = "${pl.songCount} tracks",
-                                            style = type.monoSm,
-                                            color = colors.textMuted,
-                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        ) {
+                                            Text(
+                                                text = "${pl.songCount} tracks",
+                                                style = type.monoSm,
+                                                color = colors.textMuted,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f, fill = false),
+                                            )
+                                            if (isSmartMix) {
+                                                val (tagLabel, tagIcon, tagColor) = when (pl.kind) {
+                                                    "seasonal" -> Triple("SEASONAL", Icons.Filled.CalendarMonth, colors.gold)
+                                                    "moment" -> Triple("MOMENT", Icons.Filled.Schedule, colors.leafText)
+                                                    "discovery" -> Triple("ROLLING", Icons.Filled.AutoAwesome, colors.accentText)
+                                                    else -> Triple("SMART", Icons.Filled.AutoAwesome, colors.accentText)
+                                                }
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                ) {
+                                                    Icon(
+                                                        imageVector = tagIcon,
+                                                        contentDescription = null,
+                                                        tint = tagColor,
+                                                        modifier = Modifier.size(11.dp),
+                                                    )
+                                                    Text(
+                                                        text = tagLabel,
+                                                        style = type.monoXs,
+                                                        color = tagColor,
+                                                        maxLines = 1,
+                                                        softWrap = false,
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

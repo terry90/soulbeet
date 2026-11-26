@@ -5,8 +5,8 @@ use dioxus::prelude::*;
 use shared::recommendation::{ContextualMixKind, CultureSteering};
 use ui::{
     format_mix_subtitle, format_mix_title, format_mix_window_badge, use_player, IconArrowRight,
-    IconCompass, IconDisc3, IconMusic, IconPlay, IconSparkles, SeasonalHeroCard, TrackRow,
-    TrackRowState,
+    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, PlaylistCategory,
+    SeasonalHeroCard, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -56,7 +56,7 @@ pub fn HomePage() -> Element {
 
     let play_album = use_callback(move |(album_id, album_name): (String, String)| {
         if player.offline_only() {
-            studio.show_toast("Offline Only mode is active — album streaming is unavailable.");
+            studio.show_toast("Offline Only mode is active: album streaming is unavailable.");
             return;
         }
         let Some(info) = studio.navidrome_info() else {
@@ -79,7 +79,7 @@ pub fn HomePage() -> Element {
 
     let play_playlist = use_callback(move |(playlist_id, name): (String, String)| {
         if player.offline_only() {
-            studio.show_toast("Offline Only mode is active — playlist streaming is unavailable.");
+            studio.show_toast("Offline Only mode is active: playlist streaming is unavailable.");
             return;
         }
         let Some(info) = studio.navidrome_info() else {
@@ -87,23 +87,54 @@ pub fn HomePage() -> Element {
         };
         spawn(async move {
             match fetch_playlist_tracks(&info, &playlist_id).await {
-                Ok(mut tracks) if !tracks.is_empty() => {
-                    for t in &mut tracks {
-                        studio.apply_curation_overrides(t);
+                Ok(mut tracks) => {
+                    studio.sync_playlist_count(&playlist_id, tracks.len() as u32);
+                    if tracks.is_empty() {
+                        studio.show_toast(format!("Playlist \"{name}\" has no playable tracks yet"));
+                    } else {
+                        for t in &mut tracks {
+                            studio.apply_curation_overrides(t);
+                        }
+                        player.play_queue(tracks, 0);
                     }
-                    player.play_queue(tracks, 0);
                 }
-                _ => {
+                Err(_) => {
                     studio.show_toast(format!("Playlist \"{name}\" has no playable tracks yet"));
                 }
             }
         });
     });
 
+    // Prefer personal / custom smart playlists for Jump Back In so we don't duplicate
+    // the "Made for Right Now" or Seasonal Hero mixes shown right below.
+    let shown_mix_playlist_ids: Vec<&str> = mixes
+        .iter()
+        .filter_map(|m| m.navidrome_playlist_id.as_deref())
+        .collect();
+    let mut jump_playlists: Vec<_> = playlists
+        .iter()
+        .filter(|pl| !pl.category.is_soulbeet_mix())
+        .take(2)
+        .cloned()
+        .collect();
+    if jump_playlists.len() < 2 {
+        let needed = 2 - jump_playlists.len();
+        jump_playlists.extend(
+            playlists
+                .iter()
+                .filter(|pl| {
+                    pl.category.is_soulbeet_mix()
+                        && !shown_mix_playlist_ids.contains(&pl.id.as_str())
+                })
+                .take(needed)
+                .cloned(),
+        );
+    }
+
     rsx! {
         div { class: "space-y-8",
             // 1. Quick-Resume Bento Grid (Recent Albums + Playlists)
-            if !recent_albums.is_empty() || !playlists.is_empty() {
+            if !recent_albums.is_empty() || !jump_playlists.is_empty() {
                 section { class: "space-y-3",
                     div { class: "flex items-center justify-between",
                         h2 { class: "text-[18px] font-semibold tracking-[-0.015em] text-beet-text-primary",
@@ -154,25 +185,49 @@ pub fn HomePage() -> Element {
                             }
                         }
 
-                        for pl in playlists.iter().take(2) {
+                        for pl in jump_playlists.iter() {
                             {
                                 let pid = pl.id.clone();
                                 let pname = pl.name.clone();
+                                let category = pl.category;
+                                let icon_cls = match category {
+                                    PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
+                                        "bg-beet-accent-surface border-beet-accent/25 text-beet-accent-text"
+                                    }
+                                    PlaylistCategory::MomentMix => {
+                                        "bg-beet-leaf-surface border-beet-leaf-solid/25 text-beet-leaf-text"
+                                    }
+                                    PlaylistCategory::Smart | PlaylistCategory::User => {
+                                        "bg-beet-surface-high border-beet-border-subtle text-beet-text-secondary"
+                                    }
+                                };
                                 rsx! {
                                     button {
                                         key: "home-pl-{pl.id}",
                                         r#type: "button",
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
                                         onclick: move |_| play_playlist.call((pid.clone(), pname.clone())),
-                                        div { class: "w-12 h-12 rounded-[8px] bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text shrink-0 flex items-center justify-center",
-                                            IconMusic { size: 20 }
+                                        div { class: "w-12 h-12 rounded-[8px] border shrink-0 flex items-center justify-center {icon_cls}",
+                                            match category {
+                                                PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 20 } },
+                                                PlaylistCategory::Discovery => rsx! { IconCompass { size: 20 } },
+                                                PlaylistCategory::MomentMix => rsx! { IconRadio { size: 20 } },
+                                                PlaylistCategory::Smart | PlaylistCategory::User => rsx! { IconListMusic { size: 20 } },
+                                            }
                                         }
                                         div { class: "min-w-0 flex-1",
                                             p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
                                                 "{pl.name}"
                                             }
-                                            p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                                "{pl.song_count} TRACKS"
+                                            div { class: "flex items-center gap-1.5 mt-0.5",
+                                                span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                                    "{pl.song_count} TRACKS"
+                                                }
+                                                if let Some(tag) = category.badge_label() {
+                                                    span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[9px] font-semibold tracking-wider text-beet-text-tertiary",
+                                                        "{tag}"
+                                                    }
+                                                }
                                             }
                                         }
                                         span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 group-hover:scale-105 transition-[opacity,transform] shrink-0",

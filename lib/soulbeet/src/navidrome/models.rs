@@ -198,6 +198,21 @@ pub struct PlaylistBody {
     pub playlist: Option<SubsonicPlaylist>,
 }
 
+/// `getPlaylist`'s playlist flattened with its live visible non-missing `entry` list.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubsonicPlaylistWithEntries {
+    #[serde(flatten)]
+    pub playlist: SubsonicPlaylist,
+    #[serde(default)]
+    pub entry: Vec<SubsonicSong>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlaylistWithEntriesBody {
+    pub playlist: Option<SubsonicPlaylistWithEntries>,
+}
+
 /// getSong's body. Option so that an ok answer without its song is reported as such.
 #[derive(Debug, Deserialize)]
 pub struct SongBody {

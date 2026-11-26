@@ -1,16 +1,16 @@
-//! Studio Library view: Global Offline filter, Playlists browser, Albums grid, Starred list,
+//! Studio Library view: Playlists browser, Albums grid, Starred list,
 //! Pending Discovery tracks, and Library Stats overview.
 
 use dioxus::prelude::*;
 use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
-    dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconDisc3,
-    IconListMusic, IconLoader, IconPlay, IconRefreshCw, OfflineTogglePill, PlayerTrack, TrackRow,
-    TrackRowState,
+    dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconCompass,
+    IconDisc3, IconListMusic, IconLoader, IconPlay, IconRadio, IconRefreshCw, IconSparkles,
+    PlayerTrack, PlaylistCategory, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
-use crate::navidrome_web::{fetch_album_tracks, fetch_playlist_tracks};
+use crate::navidrome_web::{fetch_album_tracks, fetch_playlist_tracks, SubsonicPlaylistSummary};
 use crate::web_player::use_studio;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub fn LibraryPage() -> Element {
 
     let load_playlist = use_callback(move |(pid, name): (String, String)| {
         if player.offline_only() {
-            studio.show_toast("Offline Only mode is active — remote playlists cannot be loaded.");
+            studio.show_toast("Offline Only mode is active: remote playlists cannot be loaded.");
             return;
         }
         let Some(info) = studio.navidrome_info() else {
@@ -67,7 +67,10 @@ pub fn LibraryPage() -> Element {
                 return;
             }
             match res {
-                Ok(tracks) => detail_tracks.set(tracks),
+                Ok(tracks) => {
+                    studio.sync_playlist_count(&pid, tracks.len() as u32);
+                    detail_tracks.set(tracks);
+                }
                 Err(e) => {
                     detail_tracks.set(Vec::new());
                     studio.show_toast(format!("Could not load playlist: {e}"));
@@ -79,7 +82,7 @@ pub fn LibraryPage() -> Element {
 
     let load_album = use_callback(move |(aid, name): (String, String)| {
         if player.offline_only() {
-            studio.show_toast("Offline Only mode is active — remote albums cannot be loaded.");
+            studio.show_toast("Offline Only mode is active: remote albums cannot be loaded.");
             return;
         }
         let Some(info) = studio.navidrome_info() else {
@@ -123,7 +126,7 @@ pub fn LibraryPage() -> Element {
 
     rsx! {
         div { class: "space-y-6",
-            // Header + Offline Switch + Category Tabs
+            // Category Tabs
             div { class: "flex flex-wrap items-center justify-between gap-3",
                 div { class: "flex flex-wrap items-center gap-2",
                     for (tab, label, badge) in [
@@ -159,11 +162,6 @@ pub fn LibraryPage() -> Element {
                             }
                         }
                     }
-                }
-
-                OfflineTogglePill {
-                    offline_only,
-                    on_toggle: move |next| player.set_offline_only(next),
                 }
             }
 
@@ -266,31 +264,59 @@ pub fn LibraryPage() -> Element {
                                 "No Navidrome playlists loaded yet. Connect Navidrome in Settings to browse your playlists."
                             }
                         } else {
-                            div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
-                                for pl in playlists.iter() {
-                                    {
-                                        let pid = pl.id.clone();
-                                        let name = pl.name.clone();
-                                        rsx! {
-                                            button {
-                                                key: "lib-pl-{pl.id}",
-                                                r#type: "button",
-                                                class: "group p-4 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer flex items-center justify-between gap-3",
-                                                onclick: move |_| load_playlist.call((pid.clone(), name.clone())),
-                                                div { class: "flex items-center gap-3 min-w-0",
-                                                    div { class: "w-11 h-11 rounded-[8px] bg-beet-accent-surface text-beet-accent-text flex items-center justify-center shrink-0",
-                                                        IconListMusic { size: 19 }
+                            {
+                                let user_playlists: Vec<&SubsonicPlaylistSummary> = playlists
+                                    .iter()
+                                    .filter(|pl| !pl.category.is_soulbeet_mix())
+                                    .collect();
+                                let mut mix_playlists: Vec<&SubsonicPlaylistSummary> = playlists
+                                    .iter()
+                                    .filter(|pl| pl.category.is_soulbeet_mix())
+                                    .collect();
+                                mix_playlists.sort_by_key(|pl| pl.category.sort_rank());
+
+                                rsx! {
+                                    div { class: "space-y-8",
+                                        if !user_playlists.is_empty() {
+                                            section { class: "space-y-3",
+                                                div { class: "flex items-center justify-between gap-2",
+                                                    h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
+                                                        "Your Playlists"
                                                     }
-                                                    div { class: "min-w-0",
-                                                        p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{pl.name}" }
-                                                        p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                                            "{pl.song_count} TRACKS"
-                                                            if pl.is_smart { " · SMART" }
+                                                    span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                                        "{user_playlists.len()}"
+                                                    }
+                                                }
+                                                div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
+                                                    for pl in user_playlists.iter() {
+                                                        PlaylistGridCard {
+                                                            key: "lib-pl-{pl.id}",
+                                                            playlist: (*pl).clone(),
+                                                            on_select: move |pair| load_playlist.call(pair),
                                                         }
                                                     }
                                                 }
-                                                span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0",
-                                                    IconPlay { size: 13, filled: true }
+                                            }
+                                        }
+
+                                        if !mix_playlists.is_empty() {
+                                            section { class: "space-y-3",
+                                                div { class: "flex items-center justify-between gap-2",
+                                                    h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
+                                                        "Discovery & Mixes"
+                                                    }
+                                                    span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                                        "{mix_playlists.len()}"
+                                                    }
+                                                }
+                                                div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
+                                                    for pl in mix_playlists.iter() {
+                                                        PlaylistGridCard {
+                                                            key: "lib-mix-{pl.id}",
+                                                            playlist: (*pl).clone(),
+                                                            on_select: move |pair| load_playlist.call(pair),
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -422,6 +448,74 @@ pub fn LibraryPage() -> Element {
                         LibraryStatsPanel {}
                     },
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn PlaylistGridCard(
+    playlist: SubsonicPlaylistSummary,
+    on_select: EventHandler<(String, String)>,
+) -> Element {
+    let pid = playlist.id.clone();
+    let name = playlist.name.clone();
+    let category = playlist.category;
+
+    let icon_wrap_cls = match category {
+        PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
+            "bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text"
+        }
+        PlaylistCategory::MomentMix => {
+            "bg-beet-leaf-surface border border-beet-leaf-solid/25 text-beet-leaf-text"
+        }
+        PlaylistCategory::Smart | PlaylistCategory::User => {
+            "bg-beet-surface-high border border-beet-border-subtle text-beet-text-secondary"
+        }
+    };
+
+    let tag_cls = match category {
+        PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
+            "bg-beet-accent-surface border-beet-accent/30 text-beet-accent-text"
+        }
+        PlaylistCategory::MomentMix => {
+            "bg-beet-leaf-surface border-beet-leaf-solid/30 text-beet-leaf-text"
+        }
+        PlaylistCategory::Smart | PlaylistCategory::User => {
+            "bg-beet-surface-high border-beet-border-subtle text-beet-text-tertiary"
+        }
+    };
+
+    rsx! {
+        button {
+            r#type: "button",
+            class: "group p-4 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer flex items-center justify-between gap-3",
+            onclick: move |_| on_select.call((pid.clone(), name.clone())),
+            div { class: "flex items-center gap-3 min-w-0",
+                div { class: "w-11 h-11 rounded-[8px] flex items-center justify-center shrink-0 {icon_wrap_cls}",
+                    match category {
+                        PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 19 } },
+                        PlaylistCategory::Discovery => rsx! { IconCompass { size: 19 } },
+                        PlaylistCategory::MomentMix => rsx! { IconRadio { size: 19 } },
+                        PlaylistCategory::Smart | PlaylistCategory::User => rsx! { IconListMusic { size: 19 } },
+                    }
+                }
+                div { class: "min-w-0 space-y-1",
+                    p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{playlist.name}" }
+                    div { class: "flex items-center gap-1.5 flex-wrap",
+                        span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                            "{playlist.song_count} TRACKS"
+                        }
+                        if let Some(tag) = category.badge_label() {
+                            span { class: "px-1.5 py-0.5 rounded border tabular-nums-mono text-[9px] font-semibold tracking-wider {tag_cls}",
+                                "{tag}"
+                            }
+                        }
+                    }
+                }
+            }
+            span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0",
+                IconPlay { size: 13, filled: true }
             }
         }
     }

@@ -29,6 +29,10 @@ pub struct FolderRef {
     pub folder_id: String,
     pub name: String,
     pub shared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_own: Option<bool>,
 }
 
 /// A song as the tools report it, from a native record or a Subsonic child
@@ -153,42 +157,88 @@ impl FolderResolver {
         user_id: &str,
         music_path: Option<&Path>,
     ) -> Self {
-        let folders = crate::models::folder::Folder::get_all_by_user_in(db, user_id)
-            .await
-            .unwrap_or_default();
+        Self::load_for_in(db, user_id, music_path, false).await
+    }
+
+    /// Loads either the caller's own folders (`all_users = false`) or every registered user's
+    /// folders (`all_users = true`, for admin-authorized MCP calls) with `owner` and `is_own`
+    /// metadata populated.
+    pub(crate) async fn load_for_in(
+        db: &SqlitePool,
+        user_id: &str,
+        music_path: Option<&Path>,
+        all_users: bool,
+    ) -> Self {
         let learned = NavidromeLibraryRow::all_in(db)
             .await
             .unwrap_or_default()
             .into_iter()
             .map(|r| (r.library_id, r.navidrome_path, PathBuf::from(r.local_path)))
             .collect();
-        let mut entries: Vec<(PathBuf, FolderRef)> = folders
-            .into_iter()
-            .map(|f| {
-                let path = crate::folder_policy::canonical_folder_path(Path::new(&f.path))
-                    .unwrap_or_else(|_| PathBuf::from(&f.path));
-                (
-                    path,
-                    FolderRef {
-                        folder_id: f.id,
-                        name: f.name,
-                        shared: f.shared,
-                    },
-                )
-            })
-            .collect();
-        entries.sort_by_key(|b| std::cmp::Reverse(b.0.components().count()));
+        let mut entries: Vec<(PathBuf, bool, FolderRef)> = if all_users {
+            crate::models::folder::Folder::get_all_with_owners_in(db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| {
+                    let is_own = row.folder.user_id == user_id;
+                    let path =
+                        crate::folder_policy::canonical_folder_path(Path::new(&row.folder.path))
+                            .unwrap_or_else(|_| PathBuf::from(&row.folder.path));
+                    (
+                        path,
+                        is_own,
+                        FolderRef {
+                            folder_id: row.folder.id,
+                            name: row.folder.name,
+                            shared: row.folder.shared,
+                            owner: Some(row.owner),
+                            is_own: Some(is_own),
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            crate::models::folder::Folder::get_all_by_user_in(db, user_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| {
+                    let path = crate::folder_policy::canonical_folder_path(Path::new(&f.path))
+                        .unwrap_or_else(|_| PathBuf::from(&f.path));
+                    (
+                        path,
+                        true,
+                        FolderRef {
+                            folder_id: f.id,
+                            name: f.name,
+                            shared: f.shared,
+                            owner: None,
+                            is_own: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+        // Deepest folder first; on equal depth (shared folder registered by multiple users),
+        // prefer the caller's own registration first.
+        entries.sort_by(|a, b| {
+            b.0.components()
+                .count()
+                .cmp(&a.0.components().count())
+                .then_with(|| b.1.cmp(&a.1))
+        });
         FolderResolver {
-            folders: entries,
+            folders: entries.into_iter().map(|(p, _, r)| (p, r)).collect(),
             music_path: music_path.map(Path::to_path_buf),
             learned,
         }
     }
 
-    /// Maps `song` (using its library root + library-relative `path`) to the caller's deepest
-    /// folder holding it, or `None` when none does.
-    pub(crate) fn resolve_native(&self, song: &NativeSong) -> Option<FolderRef> {
-        if self.folders.is_empty() || song.path.is_empty() {
+    /// Maps `song` (using its library root + library-relative `path`) to its canonicalized local
+    /// file path, or `None` when the path is empty or unsafe.
+    pub(crate) fn local_path_for(&self, song: &NativeSong) -> Option<PathBuf> {
+        if song.path.is_empty() {
             return None;
         }
         let rel = Path::new(&song.path);
@@ -202,7 +252,32 @@ impl FolderResolver {
         let root = self.root_for(song);
         let root_canonical =
             crate::folder_policy::canonical_folder_path(&root).unwrap_or(root);
-        let full = root_canonical.join(rel);
+        Some(root_canonical.join(rel))
+    }
+
+    /// True when `song`'s deepest matching folder in `self` has the exact same canonical path as
+    /// `target_root` (handling ties where two users registered the same shared directory).
+    pub(crate) fn song_in_folder(&self, song: &NativeSong, target_root: &Path) -> bool {
+        let Some(local) = self.local_path_for(song) else {
+            return false;
+        };
+        let Some((deepest_path, _)) = self
+            .folders
+            .iter()
+            .find(|(folder, _)| local != *folder && local.starts_with(folder))
+        else {
+            return false;
+        };
+        deepest_path == target_root
+    }
+
+    /// Maps `song` (using its library root + library-relative `path`) to the caller's deepest
+    /// folder holding it, or `None` when none does.
+    pub(crate) fn resolve_native(&self, song: &NativeSong) -> Option<FolderRef> {
+        if self.folders.is_empty() {
+            return None;
+        }
+        let full = self.local_path_for(song)?;
         self.resolve_local(&full)
     }
 

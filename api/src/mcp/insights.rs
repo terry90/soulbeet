@@ -212,6 +212,7 @@ mod tests {
             ctx: test_ctx("alice"),
             grant_id: "g1".into(),
             allow_delete: false,
+            allow_admin: false,
             base: BaseUrl::parse("https://music.example.com").unwrap(),
         }
     }

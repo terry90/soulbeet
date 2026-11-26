@@ -91,7 +91,7 @@ enum class LibraryCategory(val label: String) {
     ALBUMS("Albums"),
     STARRED("Starred"),
     DISCOVERY("Discovery"),
-    OFFLINE("Offline"),
+    OFFLINE("Cached"),
 }
 
 data class QuickResumeItem(
@@ -162,6 +162,7 @@ data class AppUiState(
     val showLyricsPanel: Boolean = false,
     val lyricsData: TrackLyricsData? = null,
     val isFetchingLyrics: Boolean = false,
+    val lyricsFetched: Boolean = false,
     val lyricsError: String? = null,
     val showQueueSheet: Boolean = false,
     val showConnectSheet: Boolean = false,
@@ -181,6 +182,28 @@ data class AppUiState(
             ?: contextualMixes.firstOrNull()
     val rollingAndMomentMixes: List<ContextualMixUi>
         get() = contextualMixes.filterNot { it.slug == seasonalHeroMix?.slug }
+    val userPlaylists: List<FfiPlaylist>
+        get() = playlists.filter { it.kind == "user" }
+    val soulbeetMixPlaylists: List<FfiPlaylist>
+        get() {
+            val contextualPlaylistIds = contextualMixes
+                .mapNotNull { it.navidromePlaylistId?.takeIf(String::isNotBlank) }
+                .toSet()
+            return playlists.filter { pl ->
+                pl.kind in SOULBEET_MIX_KINDS && pl.id !in contextualPlaylistIds
+            }
+        }
+    val homeFallbackMixPlaylists: List<FfiPlaylist>
+        get() {
+            val heroPlaylistId = seasonalHeroMix?.navidromePlaylistId?.takeIf(String::isNotBlank)
+            return playlists.filter { pl ->
+                pl.kind in SOULBEET_MIX_KINDS && pl.id != heroPlaylistId
+            }
+        }
+
+    companion object {
+        private val SOULBEET_MIX_KINDS = setOf("discovery", "seasonal", "moment", "smart")
+    }
 }
 
 /**
@@ -205,6 +228,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val hiddenTriageIds = MutableStateFlow<Set<String>>(emptySet())
     private var searchJob: Job? = null
     private var bannerClearJob: Job? = null
+    private var connectWsJob: Job? = null
+    private var lyricsJob: Job? = null
+    private var lyricsFetchSeq: Long = 0L
     private var eventListenerAttachedCore: WeakReference<CoreClient>? = null
 
     private val undoController = PendingDropUndoController(
@@ -228,7 +254,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 SoulbeetMediaRepository.shared.setOfflineOnly(cfg.offlineOnly)
                 SoulbeetMediaRepository.shared.setLibrarySecondaryAction(cfg.librarySecondaryAction)
                 SoulbeetMediaRepository.shared.setAudioQualityProfile(cfg.toQualityProfile())
-                SoulbeetCoreProvider.getOrNull()?.setOfflineOnly(cfg.offlineOnly)
+                val core = SoulbeetCoreProvider.getOrNull()
+                core?.setOfflineOnly(cfg.offlineOnly)
+                if (cfg.isConfigured && !cfg.offlineOnly) {
+                    if (core != null && _uiState.value.connectState?.connected != true) {
+                        connectWsIfOnline(core, cfg)
+                    }
+                    if (_uiState.value.contextualMixes.isEmpty()) {
+                        refreshRemoteDiscoveryData(cfg)
+                    }
+                }
             }
         }
 
@@ -276,15 +311,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Boot core & load initial data.
+        // Boot core & load initial data (await persisted config first to avoid cold-start race).
         viewModelScope.launch {
+            val snapshotCfg = withContext(Dispatchers.IO) { prefsStore.getSnapshot() }
+            _uiState.update { it.copy(config = snapshotCfg) }
             val core = withContext(Dispatchers.IO) { SoulbeetCoreProvider.awaitOrNull() }
             _uiState.update { it.copy(isBooting = false) }
             if (core != null) {
                 attachCoreListener(core)
                 refreshLibrarySnapshot()
-                refreshRemoteDiscoveryData()
-                connectWsIfOnline(core)
+                refreshRemoteDiscoveryData(snapshotCfg)
+                connectWsIfOnline(core, snapshotCfg)
             }
         }
     }
@@ -575,11 +612,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setShowConnectSheet(show: Boolean) {
         _uiState.update { it.copy(showConnectSheet = show) }
         if (show) {
-            viewModelScope.launch(Dispatchers.IO) {
-                val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
-                runCatching { core.connectState() }.getOrNull()?.let { st ->
-                    _uiState.update { it.copy(connectState = st) }
-                }
+            reconnectConnect(force = false)
+        }
+    }
+
+    fun reconnectConnect(force: Boolean = false) {
+        val cfg = _uiState.value.config
+        if (!cfg.isConfigured) return
+        if (cfg.offlineOnly) {
+            if (force) showNotice("Disable Offline Only to reconnect")
+            return
+        }
+        viewModelScope.launch {
+            val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
+            val liveState = withContext(Dispatchers.IO) {
+                runCatching { core.connectState() }.getOrNull()
+            }
+            if (liveState != null) {
+                _uiState.update { it.copy(connectState = liveState) }
+            }
+            if (force || liveState?.connected != true) {
+                connectWsIfOnline(core, cfg, force = force)
             }
         }
     }
@@ -1373,31 +1426,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        viewModelScope.launch {
+        val fetchId = ++lyricsFetchSeq
+        lyricsJob?.cancel()
+        lyricsJob = viewModelScope.launch {
             _uiState.update { it.copy(isFetchingLyrics = true, lyricsError = null) }
-            apiClient.fetchLyrics(cfg, songId, pb.artist, pb.title).fold(
-                onSuccess = { data ->
-                    _uiState.update {
-                        it.copy(
-                            isFetchingLyrics = false,
-                            lyricsData = data,
-                            lyricsError = if (data == null || data.lines.isEmpty()) {
-                                "No synced lyrics saved yet"
-                            } else {
-                                null
-                            },
-                        )
-                    }
-                },
-                onFailure = { err ->
-                    _uiState.update {
-                        it.copy(
-                            isFetchingLyrics = false,
-                            lyricsError = err.localizedMessage ?: "Failed to load lyrics",
-                        )
-                    }
-                },
-            )
+            try {
+                apiClient.fetchLyrics(cfg, songId, pb.artist, pb.title).fold(
+                    onSuccess = { data ->
+                        if (_uiState.value.playback.currentTrackId != songId) return@fold
+                        _uiState.update {
+                            it.copy(
+                                lyricsData = data,
+                                lyricsFetched = true,
+                                lyricsError = if (data == null || data.lines.isEmpty()) {
+                                    "No lyrics found for this track"
+                                } else {
+                                    null
+                                },
+                            )
+                        }
+                    },
+                    onFailure = { err ->
+                        if (_uiState.value.playback.currentTrackId != songId) return@fold
+                        _uiState.update {
+                            it.copy(
+                                lyricsFetched = true,
+                                lyricsError = err.localizedMessage ?: "Failed to load lyrics",
+                            )
+                        }
+                    },
+                )
+            } finally {
+                if (lyricsFetchSeq == fetchId) {
+                    _uiState.update { it.copy(isFetchingLyrics = false) }
+                }
+            }
         }
     }
 
@@ -1563,12 +1626,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    private fun connectWsIfOnline(core: CoreClient) {
-        if (core.isOfflineOnly() || !_uiState.value.config.isConfigured) return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core.connectWs(heartbeatIntervalSecs = 30uL) }
-            runCatching { core.connectState() }.getOrNull()?.let { st ->
-                _uiState.update { it.copy(connectState = st) }
+    private fun connectWsIfOnline(
+        core: CoreClient,
+        cfg: PersistedAppConfig = _uiState.value.config,
+        force: Boolean = false,
+    ) {
+        if (core.isOfflineOnly() || cfg.offlineOnly || !cfg.isConfigured) return
+        if (!force && connectWsJob?.isActive == true) return
+        if (!force && _uiState.value.connectState?.connected == true) return
+        connectWsJob?.cancel()
+        connectWsJob = viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { core.connectWs(heartbeatIntervalSecs = 30uL) }
+            }
+            result.onFailure { err ->
+                android.util.Log.w("SoulbeetConnect", "Failed to connect Soulbeet Connect WebSocket", err)
+                if (force) {
+                    showNotice("Could not reconnect to Soulbeet Connect")
+                }
+            }
+            val liveState = withContext(Dispatchers.IO) {
+                runCatching { core.connectState() }.getOrNull()
+            }
+            if (liveState != null) {
+                _uiState.update { it.copy(connectState = liveState) }
             }
         }
     }
@@ -1617,8 +1698,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
+            val userPlaylists = playlists.filter { it.kind == "user" }
             val quickItems = buildList {
-                for (pl in playlists.take(4)) {
+                for (pl in userPlaylists.take(4)) {
                     val pinned = pins.any { it.target == FfiPinTarget.Playlist(pl.id) }
                     add(
                         QuickResumeItem(
@@ -1679,8 +1761,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun refreshRemoteDiscoveryData() {
-        val cfg = _uiState.value.config
+    private suspend fun refreshRemoteDiscoveryData(
+        cfg: PersistedAppConfig = _uiState.value.config,
+    ) {
         if (!cfg.isConfigured || cfg.offlineOnly) return
         val hour = LocalTime.now().hour
         val mixes = apiClient.fetchContextualMixes(cfg, hour).getOrNull()
@@ -1699,13 +1782,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         clearLyrics: Boolean,
     ) {
         if (clearLyrics) {
-            _uiState.update { it.copy(lyricsData = null, lyricsError = null) }
+            lyricsFetchSeq++
+            lyricsJob?.cancel()
+            _uiState.update {
+                it.copy(
+                    lyricsData = null,
+                    lyricsError = null,
+                    isFetchingLyrics = false,
+                    lyricsFetched = false,
+                )
+            }
         }
         if (trackId.isNullOrBlank()) {
             _uiState.update {
                 it.copy(currentTrackDetails = null, currentDiscoveryInfo = null, queueTracks = emptyList())
             }
             return
+        }
+        if (clearLyrics && _uiState.value.showLyricsPanel) {
+            fetchCurrentTrackLyrics()
         }
         viewModelScope.launch(Dispatchers.IO) {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch

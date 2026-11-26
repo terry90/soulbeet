@@ -60,13 +60,22 @@ pub(crate) fn routes(state: Arc<ConnectionState>) -> Router<Arc<ConnectionState>
 }
 
 /// Who a tool call acts for: the token's user as their row stands, its
-/// grant and deletion switch, and the address the call came to.
+/// grant, file-management and admin-access switches, and the address the call came to.
 #[derive(Clone, Debug)]
 pub(crate) struct McpCaller {
     pub ctx: UserCtx,
     pub grant_id: String,
     pub allow_delete: bool,
+    pub allow_admin: bool,
     pub base: BaseUrl,
+}
+
+impl McpCaller {
+    /// True only when the user holds `Role::Admin` AND this OAuth grant explicitly
+    /// has admin library access enabled.
+    pub(crate) fn has_admin_access(&self) -> bool {
+        self.ctx.role.is_admin() && self.allow_admin
+    }
 }
 
 /// An `Origin` a page that DNS rebinding points at this server cannot send:
@@ -151,6 +160,7 @@ async fn admit(
             ctx: access.ctx,
             grant_id: access.grant_id,
             allow_delete: access.allow_delete,
+            allow_admin: access.allow_admin,
             base,
         }),
     }

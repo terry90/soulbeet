@@ -1,5 +1,5 @@
 use api::connections::ConnectedApp;
-use api::{get_connected_apps, revoke_connected_app, set_app_deletion};
+use api::{get_connected_apps, revoke_connected_app, set_app_deletion, set_grant_allow_admin};
 use dioxus::prelude::*;
 use shared::navidrome::DAILY_APP_DELETIONS;
 
@@ -61,10 +61,15 @@ pub fn ConnectedAppsPanel() -> Element {
                     AppList {
                         apps: list.clone(),
                         origin: origin(),
+                        is_admin: auth.is_admin(),
                         saving: saving(),
                         on_allow_delete: move |(grant_id, allowed): (String, bool)| {
                             saving.set(Some(grant_id.clone()));
                             spawn(async move { finish(auth.call(set_app_deletion(grant_id, allowed)).await) });
+                        },
+                        on_allow_admin: move |(grant_id, allowed): (String, bool)| {
+                            saving.set(Some(grant_id.clone()));
+                            spawn(async move { finish(auth.call(set_grant_allow_admin(grant_id, allowed)).await) });
                         },
                         on_disconnect: move |grant_id: String| {
                             spawn(async move { finish(auth.call(revoke_connected_app(grant_id)).await) });
@@ -99,18 +104,27 @@ fn enable_deletion_message(app_host: &str) -> String {
     )
 }
 
+fn enable_admin_message(app_host: &str) -> String {
+    format!(
+        "Grant {app_host} admin library access across all users' folders? While this is on, it can list and inspect all registered library folders across users (including private and shared folders) and move tracks between any users' folders when file management is also enabled."
+    )
+}
+
 /// One row per app, or how to connect one. `origin` is the page's, empty
 /// until the browser has it. `saving` is the app whose switch is being saved.
 #[component]
 fn AppList(
     apps: Vec<ConnectedApp>,
     origin: String,
+    is_admin: bool,
     saving: Option<String>,
     on_allow_delete: EventHandler<(String, bool)>,
+    on_allow_admin: EventHandler<(String, bool)>,
     on_disconnect: EventHandler<String>,
 ) -> Element {
     let mut pending = use_signal(|| None::<PendingApp>);
     let mut pending_enable = use_signal(|| None::<PendingApp>);
+    let mut pending_enable_admin = use_signal(|| None::<PendingApp>);
 
     rsx! {
         if apps.is_empty() {
@@ -128,6 +142,11 @@ fn AppList(
                                     if let Some(owner) = &app.owner {
                                         span { class: "text-xs text-beet-text-tertiary ml-2", "({owner})" }
                                     }
+                                    if !app.mine && app.allow_admin {
+                                        span { class: "text-[11px] font-medium text-beet-accent-text bg-beet-accent-surface border border-beet-accent-solid/40 rounded px-1.5 py-0.5 ml-2",
+                                            "Admin access"
+                                        }
+                                    }
                                 }
                                 if let Some(name) = &app.client_name {
                                     div { class: "text-xs text-beet-text-secondary", "It calls itself \"{name}\"." }
@@ -139,36 +158,64 @@ fn AppList(
                                     }
                                 }
                                 if app.mine {
-                                    label { class: "flex items-center gap-2 pt-1 text-xs text-beet-text-secondary cursor-pointer",
-                                        input {
-                                            class: "accent-beet-leaf-solid",
-                                            r#type: "checkbox",
-                                            checked: app.allow_delete,
-                                            // A box being saved fires no click, so a second click
-                                            // before the list is read again sends nothing.
-                                            disabled: saving.as_deref() == Some(app.grant_id.as_str()),
-                                            // The click is cancelled so the browser never toggles the
-                                            // box itself: it only changes when `checked` changes, that
-                                            // is when the stored value does. A cancelled confirmation
-                                            // therefore leaves it as stored. (Resource::restart keeps
-                                            // the old value, so a reload would not reset a toggled box.)
-                                            onclick: {
-                                                let asked = PendingApp {
-                                                    grant_id: app.grant_id.clone(),
-                                                    app_host: app.app_host.clone(),
-                                                };
-                                                let was_allowed = app.allow_delete;
-                                                move |evt: MouseEvent| {
-                                                    evt.prevent_default();
-                                                    if needs_confirmation(was_allowed) {
-                                                        pending_enable.set(Some(asked.clone()));
-                                                    } else {
-                                                        on_allow_delete.call((asked.grant_id.clone(), false));
+                                    div { class: "space-y-1.5 pt-1",
+                                        label { class: "flex items-center gap-2 text-xs text-beet-text-secondary cursor-pointer",
+                                            input {
+                                                class: "accent-beet-leaf-solid",
+                                                r#type: "checkbox",
+                                                checked: app.allow_delete,
+                                                // A box being saved fires no click, so a second click
+                                                // before the list is read again sends nothing.
+                                                disabled: saving.as_deref() == Some(app.grant_id.as_str()),
+                                                // The click is cancelled so the browser never toggles the
+                                                // box itself: it only changes when `checked` changes, that
+                                                // is when the stored value does. A cancelled confirmation
+                                                // therefore leaves it as stored. (Resource::restart keeps
+                                                // the old value, so a reload would not reset a toggled box.)
+                                                onclick: {
+                                                    let asked = PendingApp {
+                                                        grant_id: app.grant_id.clone(),
+                                                        app_host: app.app_host.clone(),
+                                                    };
+                                                    let was_allowed = app.allow_delete;
+                                                    move |evt: MouseEvent| {
+                                                        evt.prevent_default();
+                                                        if needs_confirmation(was_allowed) {
+                                                            pending_enable.set(Some(asked.clone()));
+                                                        } else {
+                                                            on_allow_delete.call((asked.grant_id.clone(), false));
+                                                        }
                                                     }
-                                                }
-                                            },
+                                                },
+                                            }
+                                            "Allow managing library files (delete, move, re-tag)"
                                         }
-                                        "Allow managing library files (delete, move, re-tag)"
+                                        if is_admin {
+                                            label { class: "flex items-center gap-2 text-xs text-beet-text-secondary cursor-pointer",
+                                                input {
+                                                    class: "accent-beet-accent-solid",
+                                                    r#type: "checkbox",
+                                                    checked: app.allow_admin,
+                                                    disabled: saving.as_deref() == Some(app.grant_id.as_str()),
+                                                    onclick: {
+                                                        let asked = PendingApp {
+                                                            grant_id: app.grant_id.clone(),
+                                                            app_host: app.app_host.clone(),
+                                                        };
+                                                        let was_allowed = app.allow_admin;
+                                                        move |evt: MouseEvent| {
+                                                            evt.prevent_default();
+                                                            if needs_confirmation(was_allowed) {
+                                                                pending_enable_admin.set(Some(asked.clone()));
+                                                            } else {
+                                                                on_allow_admin.call((asked.grant_id.clone(), false));
+                                                            }
+                                                        }
+                                                    },
+                                                }
+                                                "Admin library access (all users' folders)"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -202,6 +249,20 @@ fn AppList(
                 },
             }
         }
+        if let Some(asked) = pending_enable_admin() {
+            ConfirmModal {
+                message: enable_admin_message(&asked.app_host),
+                confirm_label: "Allow admin access",
+                danger: true,
+                on_confirm: move |_| {
+                    pending_enable_admin.set(None);
+                    on_allow_admin.call((asked.grant_id.clone(), true));
+                },
+                on_cancel: move |_| {
+                    pending_enable_admin.set(None);
+                },
+            }
+        }
         if let Some(asked) = pending() {
             ConfirmModal {
                 message: format!(
@@ -225,18 +286,35 @@ mod tests {
     use super::*;
 
     fn render(apps: Vec<ConnectedApp>, origin: &str) -> String {
-        render_saving(apps, origin, None)
+        render_with(apps, origin, false, None)
     }
 
     /// render, with the switch of grant `saving` being saved.
     fn render_saving(apps: Vec<ConnectedApp>, origin: &str, saving: Option<&str>) -> String {
+        render_with(apps, origin, false, saving)
+    }
+
+    fn render_with(
+        apps: Vec<ConnectedApp>,
+        origin: &str,
+        is_admin: bool,
+        saving: Option<&str>,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(apps, origin, saving): (Vec<ConnectedApp>, String, Option<String>)| {
+            |(apps, origin, is_admin, saving): (Vec<ConnectedApp>, String, bool, Option<String>)| {
                 rsx! {
-                    AppList { apps, origin, saving, on_allow_delete: |_| {}, on_disconnect: |_| {} }
+                    AppList {
+                        apps,
+                        origin,
+                        is_admin,
+                        saving,
+                        on_allow_delete: |_| {},
+                        on_allow_admin: |_| {},
+                        on_disconnect: |_| {},
+                    }
                 }
             },
-            (apps, origin.to_string(), saving.map(str::to_string)),
+            (apps, origin.to_string(), is_admin, saving.map(str::to_string)),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -255,6 +333,7 @@ mod tests {
             owner: owner.map(Into::into),
             last_used_at,
             allow_delete,
+            allow_admin: false,
             mine,
         }
     }
@@ -321,5 +400,19 @@ mod tests {
         assert!(html.contains(
             "No app is connected. Add https://music.example.com/mcp as a remote MCP server in your AI assistant to connect one."
         ));
+    }
+
+    #[test]
+    fn admin_sees_admin_library_access_toggle_on_own_apps_only() {
+        let mut own = app(true, None, false, None);
+        own.allow_admin = true;
+        let html_user = render_with(vec![own.clone()], "https://music.example.com", false, None);
+        assert!(!html_user.contains("Admin library access (all users"));
+        let html_admin = render_with(vec![own], "https://music.example.com", true, None);
+        assert!(html_admin.contains("Admin library access (all users&#39; folders)"));
+
+        let other = app(false, Some("bob"), false, None);
+        let html_other = render_with(vec![other], "https://music.example.com", true, None);
+        assert!(!html_other.contains("Admin library access (all users"));
     }
 }

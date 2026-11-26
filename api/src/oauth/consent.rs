@@ -50,6 +50,7 @@ pub(crate) struct ConsentView<'a> {
     /// The answer goes to a loopback redirect URI: an app on a computer.
     pub returns_to_loopback: bool,
     pub username: &'a str,
+    pub is_admin: bool,
     pub request_id: &'a str,
 }
 
@@ -72,6 +73,12 @@ pub(crate) fn consent_page(view: &ConsentView) -> Response {
          download into your folders, and manage your playlists and ratings. It cannot delete, \
          move or re-tag library files unless you turn that on for it in Settings &gt; Users &gt; Connected apps.</p>\n",
     );
+    if view.is_admin {
+        body.push_str(
+            "<p>Admin library access across other users' folders also starts off until you turn \
+             it on for this app in Settings &gt; Users &gt; Connected apps.</p>\n",
+        );
+    }
     body.push_str(&format!(
         "<p>When you answer, Soulbeet sends you back to {redirect}.</p>\n"
     ));

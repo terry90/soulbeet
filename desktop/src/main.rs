@@ -1,4 +1,4 @@
-//! Soulbeet Desktop Studio — native offline-first Linux & Windows music player.
+//! Soulbeet Desktop Studio: native offline-first Linux & Windows music player.
 //!
 //! Combines `dioxus-desktop`, in-process `client-core` (local SQLite mirror + FTS5 + offline
 //! LRU cache + mutation outbox + Connect WS), native `libmpv` (gapless + ReplayGain + live
@@ -280,6 +280,7 @@ fn DesktopShell() -> Element {
                     on_navigate: move |sec| studio.active_section.set(sec),
                     offline_only,
                     on_toggle_offline: move |next| player.set_offline_only(next),
+                    show_offline_toggle: true,
                     active_transfers_count: sync_st.pending_outbox_count,
                     playlists: sidebar_playlists,
                     on_select_playlist: move |pid| {
@@ -296,6 +297,7 @@ fn DesktopShell() -> Element {
                         active: active_section,
                         offline_only,
                         on_toggle_offline: move |next| player.set_offline_only(next),
+                        show_offline_toggle: true,
                         on_open_palette: move |_| studio.cmdk_open.set(true),
                         on_open_downloads: move |_| studio.active_section.set(StudioNavSection::Activity),
                         on_logout: Some(EventHandler::new(move |_| studio.disconnect_server(player))),

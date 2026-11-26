@@ -42,11 +42,44 @@ fn sanitize_snapshot(mut snapshot: PlaybackSnapshot) -> PlaybackSnapshot {
 }
 
 /// Internal envelope routed over a user's broadcast channel.
-/// When `target_device_id` is `Some(id)`, only that device's WebSocket loop forwards `event`.
+/// When `target_device_id` is `Some(id)`, only that device's WebSocket loop forwards `event`
+/// (and when `target_conn_id` is `Some(cid)`, only that exact connection).
+/// `Superseded` is an internal takeover signal causing older sockets for `device_id` to exit
+/// immediately.
 #[derive(Debug, Clone)]
-pub(crate) struct ConnectEnvelope {
-    pub target_device_id: Option<String>,
-    pub event: ConnectServerEvent,
+pub(crate) enum ConnectEnvelope {
+    Event {
+        target_device_id: Option<String>,
+        target_conn_id: Option<u64>,
+        event: Box<ConnectServerEvent>,
+    },
+    Superseded {
+        device_id: String,
+        before_conn_id: u64,
+    },
+}
+
+/// Result of checking or restoring a live WebSocket connection's registration in the hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnStatus {
+    /// This `conn_id` is still the active registration for `device_id`.
+    Active,
+    /// This `conn_id` had been evicted by `prune_stale` and was automatically re-registered.
+    ReRegistered,
+    /// A newer `conn_id` superseded `device_id`; this stale socket must not overwrite it.
+    Superseded,
+}
+
+/// Result of a periodic server keepalive check for a registered WebSocket handler.
+#[derive(Debug, Clone)]
+pub(crate) enum KeepaliveCheck {
+    /// Connection is active in the room; send this `DeviceList` frame to keep proxies alive.
+    Active(ConnectServerEvent),
+    /// Connection was pruned by `prune_stale` (e.g., throttled background tab) but not superseded;
+    /// send this `DeviceList` frame to keep proxies alive until the client wakes and re-registers.
+    Pruned(ConnectServerEvent),
+    /// A newer connection superseded this `device_id`; close the stale socket cleanly.
+    Superseded,
 }
 
 struct DeviceEntry {
@@ -60,6 +93,9 @@ struct DeviceEntry {
 
 struct UserConnectRoom {
     devices: HashMap<String, DeviceEntry>,
+    /// Highest `conn_id` ever registered for each `device_id` in this room, so a superseded
+    /// older socket can never resurrect even after the newer socket disconnects.
+    latest_conn_id: HashMap<String, u64>,
     active_device_id: Option<String>,
     sender: broadcast::Sender<ConnectEnvelope>,
 }
@@ -69,6 +105,7 @@ impl UserConnectRoom {
         let (sender, _) = broadcast::channel(128);
         Self {
             devices: HashMap::new(),
+            latest_conn_id: HashMap::new(),
             active_device_id: None,
             sender,
         }
@@ -92,17 +129,89 @@ impl UserConnectRoom {
     }
 
     fn broadcast_all(&self, event: ConnectServerEvent) {
-        let _ = self.sender.send(ConnectEnvelope {
+        let _ = self.sender.send(ConnectEnvelope::Event {
             target_device_id: None,
-            event,
+            target_conn_id: None,
+            event: Box::new(event),
         });
     }
 
     fn send_to(&self, device_id: &str, event: ConnectServerEvent) {
-        let _ = self.sender.send(ConnectEnvelope {
+        let target_conn_id = self.devices.get(device_id).map(|e| e.conn_id);
+        let _ = self.sender.send(ConnectEnvelope::Event {
             target_device_id: Some(device_id.to_string()),
-            event,
+            target_conn_id,
+            event: Box::new(event),
         });
+    }
+
+    fn notify_superseded(&self, device_id: &str, before_conn_id: u64) {
+        let _ = self.sender.send(ConnectEnvelope::Superseded {
+            device_id: device_id.to_string(),
+            before_conn_id,
+        });
+    }
+
+    fn is_superseded(&self, device_id: &str, conn_id: u64) -> bool {
+        self.latest_conn_id
+            .get(device_id)
+            .is_some_and(|&latest| conn_id < latest)
+    }
+
+    /// Ensures `(device_id, conn_id)` is present in `self.devices` (touching `last_seen_unix`).
+    /// If the device was evicted by `prune_stale` while its WebSocket stayed open, re-inserts it
+    /// with the same `conn_id` and broadcasts the updated `DeviceList`. If a newer `conn_id`
+    /// superseded `device_id` (even if that newer socket later disconnected), returns
+    /// `ConnStatus::Superseded` without modifying the room.
+    fn ensure_conn(
+        &mut self,
+        device_id: &str,
+        conn_id: u64,
+        name: &str,
+        platform: DevicePlatform,
+        now: i64,
+    ) -> ConnStatus {
+        if self.is_superseded(device_id, conn_id) {
+            return ConnStatus::Superseded;
+        }
+        match self.devices.get_mut(device_id) {
+            Some(entry) if entry.conn_id == conn_id => {
+                entry.device.last_seen_unix = now;
+                ConnStatus::Active
+            }
+            Some(_) => ConnStatus::Superseded,
+            None => {
+                let capped_name = {
+                    let c = cap_chars(name.to_string(), MAX_DEVICE_NAME_CHARS);
+                    if c.is_empty() {
+                        "Soulbeet Client".to_string()
+                    } else {
+                        c
+                    }
+                };
+                if self.active_device_id.is_none() {
+                    self.active_device_id = Some(device_id.to_string());
+                }
+                self.devices.insert(
+                    device_id.to_string(),
+                    DeviceEntry {
+                        device: ConnectDevice {
+                            device_id: device_id.to_string(),
+                            name: capped_name,
+                            platform,
+                            is_active: self.active_device_id.as_deref() == Some(device_id),
+                            last_seen_unix: now,
+                            snapshot: None,
+                        },
+                        conn_id,
+                        awaiting_pause_ack: false,
+                    },
+                );
+                self.refresh_active_flags();
+                self.broadcast_all(self.device_list_event());
+                ConnStatus::ReRegistered
+            }
+        }
     }
 }
 
@@ -210,6 +319,7 @@ impl ConnectHub {
             room.active_device_id = Some(device_id.clone());
         }
 
+        room.latest_conn_id.insert(device_id.clone(), conn_id);
         room.devices.insert(
             device_id.clone(),
             DeviceEntry {
@@ -227,6 +337,8 @@ impl ConnectHub {
         );
         room.refresh_active_flags();
 
+        // Tell any older socket for this `device_id` to exit immediately before subscribing the new one.
+        room.notify_superseded(&device_id, conn_id);
         let list = room.device_list_event();
         room.broadcast_all(list.clone());
         // Subscribe AFTER broadcasting so this connection gets `list` once via direct send.
@@ -264,31 +376,96 @@ impl ConnectHub {
         }
     }
 
-    /// Updates `last_seen_unix` for `device_id`.
-    pub(crate) async fn heartbeat(&self, user: &UserId, device_id: &str) {
+    /// Connection-aware heartbeat: refreshes `last_seen_unix` if `conn_id` is still active,
+    /// automatically re-registers the device if it was evicted by `prune_stale`, and refuses
+    /// to touch the entry if a newer `conn_id` superseded it.
+    pub(crate) async fn heartbeat_conn(
+        &self,
+        user: &UserId,
+        device_id: &str,
+        conn_id: u64,
+        name: &str,
+        platform: DevicePlatform,
+    ) -> ConnStatus {
+        let now = Self::now_unix();
         let mut rooms = self.rooms.write().await;
-        if let Some(room) = rooms.get_mut(user) {
-            if let Some(entry) = room.devices.get_mut(device_id) {
-                entry.device.last_seen_unix = Self::now_unix();
-            }
+        let room = rooms.entry(user.clone()).or_insert_with(UserConnectRoom::new);
+        room.ensure_conn(device_id, conn_id, name, platform, now)
+    }
+
+    /// Returns a `DeviceList` keepalive snapshot for `(device_id, conn_id)`, or `Superseded`
+    /// when a newer connection has taken over `device_id`.
+    pub(crate) async fn keepalive_snapshot(
+        &self,
+        user: &UserId,
+        device_id: &str,
+        conn_id: u64,
+    ) -> KeepaliveCheck {
+        let rooms = self.rooms.read().await;
+        let Some(room) = rooms.get(user) else {
+            return KeepaliveCheck::Pruned(ConnectServerEvent::DeviceList {
+                devices: vec![],
+                active_device_id: None,
+            });
+        };
+        let list = room.device_list_event();
+        if room.is_superseded(device_id, conn_id) {
+            return KeepaliveCheck::Superseded;
+        }
+        match room.devices.get(device_id) {
+            Some(entry) if entry.conn_id == conn_id => KeepaliveCheck::Active(list),
+            Some(_) => KeepaliveCheck::Superseded,
+            None => KeepaliveCheck::Pruned(list),
         }
     }
 
     /// Updates a device's playback snapshot and broadcasts `PlaybackUpdated`.
     /// When `snapshot.is_playing` is true (and the device is not still awaiting pause ack from a
     /// `ClaimActive`), promotes the device to active and pauses the previously active device.
+    /// Returns `true` if the device was registered.
+    #[cfg(test)]
     pub(crate) async fn update_state(
         &self,
         user: &UserId,
         device_id: &str,
         snapshot: PlaybackSnapshot,
-    ) {
+    ) -> bool {
         let snapshot = sanitize_snapshot(snapshot);
         let mut rooms = self.rooms.write().await;
         let Some(room) = rooms.get_mut(user) else {
-            return;
+            return false;
         };
+        Self::apply_state_update(room, device_id, snapshot, Self::now_unix())
+    }
+
+    /// Connection-aware state update: recovers from stale pruning before applying `snapshot`,
+    /// and ignores frames from a superseded `conn_id`.
+    pub(crate) async fn update_state_conn(
+        &self,
+        user: &UserId,
+        device_id: &str,
+        conn_id: u64,
+        name: &str,
+        platform: DevicePlatform,
+        snapshot: PlaybackSnapshot,
+    ) -> ConnStatus {
+        let snapshot = sanitize_snapshot(snapshot);
         let now = Self::now_unix();
+        let mut rooms = self.rooms.write().await;
+        let room = rooms.entry(user.clone()).or_insert_with(UserConnectRoom::new);
+        let status = room.ensure_conn(device_id, conn_id, name, platform, now);
+        if status != ConnStatus::Superseded {
+            Self::apply_state_update(room, device_id, snapshot, now);
+        }
+        status
+    }
+
+    fn apply_state_update(
+        room: &mut UserConnectRoom,
+        device_id: &str,
+        snapshot: PlaybackSnapshot,
+        now: i64,
+    ) -> bool {
         let can_promote = match room.devices.get_mut(device_id) {
             Some(entry) => {
                 entry.device.last_seen_unix = now;
@@ -298,7 +475,7 @@ impl ConnectHub {
                 entry.device.snapshot = Some(snapshot.clone());
                 snapshot.is_playing && !entry.awaiting_pause_ack
             }
-            None => return,
+            None => return false,
         };
 
         let previous_active = if can_promote && room.active_device_id.as_deref() != Some(device_id)
@@ -334,17 +511,47 @@ impl ConnectHub {
             device_id: device_id.to_string(),
             snapshot,
         });
+        true
     }
 
     /// Transfers active playback to `claiming_device_id`.
     /// If another device was active, marks its snapshot paused (and guards against in-flight
     /// `UpdateState` frames reclaiming active), sends `Pause` to it and, when it had a snapshot,
     /// sends `TransferPlayback` to `claiming_device_id`.
+    #[cfg(test)]
     pub(crate) async fn claim_active(&self, user: &UserId, claiming_device_id: &str) -> bool {
         let mut rooms = self.rooms.write().await;
         let Some(room) = rooms.get_mut(user) else {
             return false;
         };
+        Self::apply_claim_active(room, claiming_device_id, Self::now_unix())
+    }
+
+    /// Connection-aware active claim: recovers from stale pruning before claiming active,
+    /// and ignores claims from a superseded `conn_id`.
+    pub(crate) async fn claim_active_conn(
+        &self,
+        user: &UserId,
+        claiming_device_id: &str,
+        conn_id: u64,
+        name: &str,
+        platform: DevicePlatform,
+    ) -> ConnStatus {
+        let now = Self::now_unix();
+        let mut rooms = self.rooms.write().await;
+        let room = rooms.entry(user.clone()).or_insert_with(UserConnectRoom::new);
+        let status = room.ensure_conn(claiming_device_id, conn_id, name, platform, now);
+        if status != ConnStatus::Superseded {
+            Self::apply_claim_active(room, claiming_device_id, now);
+        }
+        status
+    }
+
+    fn apply_claim_active(
+        room: &mut UserConnectRoom,
+        claiming_device_id: &str,
+        now: i64,
+    ) -> bool {
         if !room.devices.contains_key(claiming_device_id) {
             return false;
         }
@@ -386,7 +593,7 @@ impl ConnectHub {
 
         room.active_device_id = Some(claiming_device_id.to_string());
         if let Some(entry) = room.devices.get_mut(claiming_device_id) {
-            entry.device.last_seen_unix = Self::now_unix();
+            entry.device.last_seen_unix = now;
             entry.awaiting_pause_ack = false;
         }
         room.refresh_active_flags();
@@ -396,6 +603,7 @@ impl ConnectHub {
 
     /// Routes a `ConnectCommand` from `from_device_id` to `target_device_id` within `user`'s room.
     /// Touches `from_device_id.last_seen_unix` and returns `true` if `target_device_id` is registered.
+    #[cfg(test)]
     pub(crate) async fn send_command(
         &self,
         user: &UserId,
@@ -403,26 +611,7 @@ impl ConnectHub {
         target_device_id: &str,
         mut command: ConnectCommand,
     ) -> bool {
-        match &mut command {
-            ConnectCommand::LoadQueue {
-                song_ids,
-                start_index,
-                ..
-            } => {
-                if song_ids.len() > MAX_QUEUE_SONG_IDS {
-                    song_ids.truncate(MAX_QUEUE_SONG_IDS);
-                }
-                if song_ids.is_empty() {
-                    *start_index = 0;
-                } else if *start_index >= song_ids.len() {
-                    *start_index = song_ids.len() - 1;
-                }
-            }
-            ConnectCommand::TransferPlayback { snapshot, .. } => {
-                *snapshot = sanitize_snapshot(snapshot.clone());
-            }
-            _ => {}
-        }
+        Self::sanitize_command(&mut command);
 
         let mut rooms = self.rooms.write().await;
         let Some(room) = rooms.get_mut(user) else {
@@ -442,6 +631,63 @@ impl ConnectHub {
             },
         );
         true
+    }
+
+    /// Connection-aware command routing: recovers `from_device_id` from stale pruning before
+    /// routing `command`, and refuses superseded sockets.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_command_conn(
+        &self,
+        user: &UserId,
+        from_device_id: &str,
+        conn_id: u64,
+        name: &str,
+        platform: DevicePlatform,
+        target_device_id: &str,
+        mut command: ConnectCommand,
+    ) -> (ConnStatus, bool) {
+        Self::sanitize_command(&mut command);
+        let now = Self::now_unix();
+        let mut rooms = self.rooms.write().await;
+        let room = rooms.entry(user.clone()).or_insert_with(UserConnectRoom::new);
+        let status = room.ensure_conn(from_device_id, conn_id, name, platform, now);
+        if status == ConnStatus::Superseded {
+            return (status, false);
+        }
+        if !room.devices.contains_key(target_device_id) {
+            return (status, false);
+        }
+        room.send_to(
+            target_device_id,
+            ConnectServerEvent::Command {
+                from_device_id: from_device_id.to_string(),
+                command,
+            },
+        );
+        (status, true)
+    }
+
+    fn sanitize_command(command: &mut ConnectCommand) {
+        match command {
+            ConnectCommand::LoadQueue {
+                song_ids,
+                start_index,
+                ..
+            } => {
+                if song_ids.len() > MAX_QUEUE_SONG_IDS {
+                    song_ids.truncate(MAX_QUEUE_SONG_IDS);
+                }
+                if song_ids.is_empty() {
+                    *start_index = 0;
+                } else if *start_index >= song_ids.len() {
+                    *start_index = song_ids.len() - 1;
+                }
+            }
+            ConnectCommand::TransferPlayback { snapshot, .. } => {
+                *snapshot = sanitize_snapshot(snapshot.clone());
+            }
+            _ => {}
+        }
     }
 
     /// Lists currently registered devices for `user`.
@@ -519,10 +765,15 @@ mod tests {
     ) -> Vec<ConnectServerEvent> {
         let mut out = Vec::new();
         while let Ok(env) = rx.try_recv() {
-            if env.target_device_id.is_none()
-                || env.target_device_id.as_deref() == Some(device_id)
+            if let ConnectEnvelope::Event {
+                target_device_id,
+                event,
+                ..
+            } = env
             {
-                out.push(env.event);
+                if target_device_id.is_none() || target_device_id.as_deref() == Some(device_id) {
+                    out.push(*event);
+                }
             }
         }
         out
@@ -809,5 +1060,252 @@ mod tests {
                 active_device_id: None
             } if devices.is_empty()
         )));
+    }
+
+    #[tokio::test]
+    async fn stale_pruned_live_socket_recovers_on_heartbeat_and_restores_multi_device_visibility() {
+        let hub = ConnectHub::new();
+        let alice = UserId::new("alice");
+
+        let (desk_conn, _, _, mut desk_rx) = hub
+            .register(
+                &alice,
+                "desk-1".into(),
+                "Linux Studio".into(),
+                DevicePlatform::Desktop,
+            )
+            .await;
+        let (_phone_conn, _, _, mut phone_rx) = hub
+            .register(
+                &alice,
+                "phone-1".into(),
+                "Pixel 9".into(),
+                DevicePlatform::Android,
+            )
+            .await;
+        let _ = recv_for(&mut desk_rx, "desk-1");
+        let _ = recv_for(&mut phone_rx, "phone-1");
+
+        // Simulate desk-1 tab sleeping past stale threshold while phone-1 stays fresh.
+        {
+            let mut rooms = hub.rooms.write().await;
+            rooms
+                .get_mut(&alice)
+                .unwrap()
+                .devices
+                .get_mut("desk-1")
+                .unwrap()
+                .device
+                .last_seen_unix = 0;
+        }
+        hub.prune_stale(60).await;
+        let devices = hub.devices_for(&alice).await;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "phone-1");
+        let _ = recv_for(&mut phone_rx, "phone-1");
+        let _ = recv_for(&mut desk_rx, "desk-1");
+
+        // Keepalive check sees desk-1 was pruned (not superseded).
+        assert!(matches!(
+            hub.keepalive_snapshot(&alice, "desk-1", desk_conn).await,
+            KeepaliveCheck::Pruned(_)
+        ));
+
+        // desk-1 wakes up and sends a heartbeat: must auto-re-register and notify phone-1.
+        let status = hub
+            .heartbeat_conn(
+                &alice,
+                "desk-1",
+                desk_conn,
+                "Linux Studio",
+                DevicePlatform::Desktop,
+            )
+            .await;
+        assert_eq!(status, ConnStatus::ReRegistered);
+
+        let devices = hub.devices_for(&alice).await;
+        assert_eq!(devices.len(), 2);
+        let phone_events = recv_for(&mut phone_rx, "phone-1");
+        assert!(phone_events.iter().any(|e| matches!(
+            e,
+            ConnectServerEvent::DeviceList { devices, .. }
+                if devices.len() == 2 && devices.iter().any(|d| d.device_id == "desk-1")
+        )));
+
+        // Subsequent heartbeat from desk-1 is now Active.
+        assert_eq!(
+            hub.heartbeat_conn(
+                &alice,
+                "desk-1",
+                desk_conn,
+                "Linux Studio",
+                DevicePlatform::Desktop,
+            )
+            .await,
+            ConnStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_socket_cannot_hijack_newer_connection() {
+        let hub = ConnectHub::new();
+        let alice = UserId::new("alice");
+
+        let (old_conn, _, _, _old_rx) = hub
+            .register(&alice, "desk-1".into(), "Old".into(), DevicePlatform::Desktop)
+            .await;
+        let (new_conn, _, _, _new_rx) = hub
+            .register(&alice, "desk-1".into(), "New".into(), DevicePlatform::Desktop)
+            .await;
+
+        assert!(matches!(
+            hub.keepalive_snapshot(&alice, "desk-1", old_conn).await,
+            KeepaliveCheck::Superseded
+        ));
+        assert_eq!(
+            hub.heartbeat_conn(&alice, "desk-1", old_conn, "Old", DevicePlatform::Desktop)
+                .await,
+            ConnStatus::Superseded
+        );
+        assert_eq!(
+            hub.update_state_conn(
+                &alice,
+                "desk-1",
+                old_conn,
+                "Old",
+                DevicePlatform::Desktop,
+                sample_snapshot("s-old", true),
+            )
+            .await,
+            ConnStatus::Superseded
+        );
+        assert_eq!(
+            hub.claim_active_conn(&alice, "desk-1", old_conn, "Old", DevicePlatform::Desktop)
+                .await,
+            ConnStatus::Superseded
+        );
+
+        let devices = hub.devices_for(&alice).await;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "New");
+        assert!(devices[0].snapshot.is_none());
+        assert!(matches!(
+            hub.keepalive_snapshot(&alice, "desk-1", new_conn).await,
+            KeepaliveCheck::Active(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn superseded_socket_cannot_resurrect_after_newer_socket_disconnects_and_is_isolated() {
+        let hub = ConnectHub::new();
+        let alice = UserId::new("alice");
+
+        let (old_conn, _, _, mut old_rx) = hub
+            .register(&alice, "desk-1".into(), "Old".into(), DevicePlatform::Desktop)
+            .await;
+        let (new_conn, _, _, mut new_rx) = hub
+            .register(&alice, "desk-1".into(), "New".into(), DevicePlatform::Desktop)
+            .await;
+        let (_phone_conn, _, _, _phone_rx) = hub
+            .register(
+                &alice,
+                "phone-1".into(),
+                "Phone".into(),
+                DevicePlatform::Android,
+            )
+            .await;
+
+        // 1. Old socket must immediately receive the internal Superseded takeover signal.
+        let mut saw_superseded = false;
+        while let Ok(env) = old_rx.try_recv() {
+            if matches!(
+                env,
+                ConnectEnvelope::Superseded { ref device_id, before_conn_id }
+                    if device_id == "desk-1" && before_conn_id == new_conn
+            ) {
+                saw_superseded = true;
+            }
+        }
+        assert!(saw_superseded, "old socket must receive Superseded on takeover");
+        let _ = recv_for(&mut new_rx, "desk-1");
+
+        // 2. Targeted command sent to desk-1 must carry target_conn_id == Some(new_conn).
+        assert!(
+            hub.send_command(
+                &alice,
+                "phone-1",
+                "desk-1",
+                ConnectCommand::Seek { position_ms: 12_345 },
+            )
+            .await
+        );
+        let mut saw_targeted_for_new = false;
+        while let Ok(env) = old_rx.try_recv() {
+            if let ConnectEnvelope::Event {
+                target_device_id: Some(ref dev),
+                target_conn_id,
+                ref event,
+            } = env
+            {
+                if matches!(
+                    event.as_ref(),
+                    ConnectServerEvent::Command {
+                        command: ConnectCommand::Seek { .. },
+                        ..
+                    }
+                ) {
+                    assert_eq!(dev, "desk-1");
+                    assert_eq!(
+                        target_conn_id,
+                        Some(new_conn),
+                        "targeted command must be pinned to new_conn so old_conn drops it"
+                    );
+                    saw_targeted_for_new = true;
+                }
+            }
+        }
+        assert!(saw_targeted_for_new);
+
+        // 3. Even after new_conn disconnects, old_conn must NEVER resurrect desk-1.
+        hub.unregister(&alice, "desk-1", new_conn).await;
+        assert!(
+            hub.devices_for(&alice)
+                .await
+                .iter()
+                .all(|d| d.device_id != "desk-1")
+        );
+        assert!(matches!(
+            hub.keepalive_snapshot(&alice, "desk-1", old_conn).await,
+            KeepaliveCheck::Superseded
+        ));
+        assert_eq!(
+            hub.heartbeat_conn(&alice, "desk-1", old_conn, "Old", DevicePlatform::Desktop)
+                .await,
+            ConnStatus::Superseded
+        );
+        assert_eq!(
+            hub.update_state_conn(
+                &alice,
+                "desk-1",
+                old_conn,
+                "Old",
+                DevicePlatform::Desktop,
+                sample_snapshot("s-ghost", true),
+            )
+            .await,
+            ConnStatus::Superseded
+        );
+        assert_eq!(
+            hub.claim_active_conn(&alice, "desk-1", old_conn, "Old", DevicePlatform::Desktop)
+                .await,
+            ConnStatus::Superseded
+        );
+        assert!(
+            hub.devices_for(&alice)
+                .await
+                .iter()
+                .all(|d| d.device_id != "desk-1"),
+            "superseded socket must not resurrect after newer socket disconnects"
+        );
     }
 }

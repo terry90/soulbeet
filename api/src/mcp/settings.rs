@@ -13,7 +13,7 @@ use super::keys::{keyed, request_key, Keyed};
 use super::paging::{fit, Page};
 use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec};
-use super::status::{chosen_folder, folder_fields, with_free_space};
+use super::status::{chosen_folder, owned_folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
@@ -105,37 +105,94 @@ pub(crate) async fn get_settings(
     )
 }
 
-/// `list_folders`, a page of the caller's folders. Free space is read for
-/// the folders of the page only.
+/// `list_folders`, a page of the caller's folders (or all users' folders when admin library
+/// access is enabled and `scope` is `"all"` or omitted). Free space is read for the folders of
+/// the page only.
 pub(crate) async fn list_folders(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new("list_folders", args, &["limit", "cursor"]);
+    let args = Args::new("list_folders", args, &["scope", "limit", "cursor"]);
     answer(
         async {
-            let page = Page::read(&args, json!({}))?;
+            let scope_arg = args.opt_choice("scope", &["own", "all"])?;
+            let list_key = match scope_arg {
+                Some(s) => json!({"scope": s}),
+                None => json!({}),
+            };
+            let page = Page::read(&args, list_key)?;
             args.finish()?;
-            let ((settings, folders), roots) =
-                tokio::try_join!(read_rows(state, caller, &args), async {
+
+            let has_admin = caller.has_admin_access();
+            let effective_scope = scope_arg.unwrap_or(if has_admin { "all" } else { "own" });
+            if effective_scope == "all" && !has_admin {
+                return Err(upstream_error(
+                    folders::admin_access_required(
+                        &caller.ctx,
+                        caller.allow_delete,
+                        Stage::Input,
+                        false,
+                    ),
+                    Map::new(),
+                    None,
+                ));
+            }
+
+            let (settings, roots) = tokio::try_join!(
+                async {
+                    settings::get_in(&state.db, &caller.ctx)
+                        .await
+                        .map_err(|f| upstream_error(f, Map::new(), args.same_call()))
+                },
+                async {
                     library_roots_in(&state.db, state.navidrome_music_path.as_deref())
                         .await
                         .map_err(|f| upstream_error(f, Map::new(), args.same_call()))
-                },)?;
+                },
+            )?;
             let default = chosen_folder(settings.default_download_folder_id);
-            let more = folders.len() > page.offset.saturating_add(page.limit);
-            let shown: Vec<Folder> = folders
+
+            let owned_list: Vec<(Folder, String, bool)> = if effective_scope == "all" {
+                let all = folders::list_all_with_owners_in(&state.db)
+                    .await
+                    .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+                all.into_iter()
+                    .map(|row| {
+                        let is_own = row.folder.user_id == caller.ctx.user_id;
+                        (row.folder, row.owner, is_own)
+                    })
+                    .collect()
+            } else {
+                let own = folders::list_in(&state.db, &caller.ctx)
+                    .await
+                    .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
+                own.into_iter()
+                    .map(|f| (f, caller.ctx.username.clone(), true))
+                    .collect()
+            };
+
+            let more = owned_list.len() > page.offset.saturating_add(page.limit);
+            let shown: Vec<(Folder, String, bool)> = owned_list
                 .into_iter()
                 .skip(page.offset)
                 .take(page.limit)
                 .collect();
-            let items: Vec<Value> = with_free_space(shown)
+            let meta: Vec<(String, bool)> = shown
+                .iter()
+                .map(|(_, owner, is_own)| (owner.clone(), *is_own))
+                .collect();
+            let raw_folders: Vec<Folder> = shown.into_iter().map(|(f, _, _)| f).collect();
+            let items: Vec<Value> = with_free_space(raw_folders)
                 .await
                 .iter()
-                .map(|f| folder_fields(f, default.as_deref(), &roots))
+                .zip(meta.iter())
+                .map(|(f, (owner, is_own))| {
+                    owned_folder_fields(f, owner, *is_own, default.as_deref(), &roots)
+                })
                 .collect();
             let mut fields = Map::new();
+            fields.insert("scope".into(), json!(effective_scope));
             fields.insert("default_folder_id".into(), json!(default));
             Ok(fit(fields, "folders", items, &page, more))
         }
@@ -838,5 +895,93 @@ mod tests {
             ),
             "Calm"
         );
+    }
+
+    #[tokio::test]
+    async fn list_folders_supports_admin_all_scope_and_refuses_without_admin_access() {
+        use crate::connection::test_util::{access_token, add_user, RESOURCE};
+        use crate::security::SEEDED_ADMIN_ID;
+
+        let (db, app, user_token) = mcp_app().await;
+        add_user(&db, "u2", "wife").await;
+        sqlx::query(
+            "INSERT INTO folders (id, user_id, name, path, shared) VALUES \
+             ('f-alice', 'u1', 'Alice Private', '/music/alice', 0), \
+             ('f-wife', 'u2', 'Wife Private', '/music/wife', 0), \
+             ('f-shared', ?, 'Shared Library', '/music/shared', 1)",
+        )
+        .bind(SEEDED_ADMIN_ID)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Regular user defaults to own and cannot request scope: all.
+        let own = document(&call_tool(app.clone(), &user_token, "list_folders", json!({})).await);
+        assert_eq!(own["ok"], true, "{own}");
+        assert_eq!(own["scope"], "own");
+        assert_eq!(own["folders"].as_array().unwrap().len(), 1);
+        assert_eq!(own["folders"][0]["folder_id"], "f-alice");
+        assert_eq!(own["folders"][0]["is_own"], true);
+
+        let refused_user = document(
+            &call_tool(
+                app.clone(),
+                &user_token,
+                "list_folders",
+                json!({"scope": "all"}),
+            )
+            .await,
+        );
+        assert_eq!(refused_user["error"]["code"], "permission_not_granted");
+        assert!(refused_user["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Admin"));
+
+        // Admin WITHOUT allow_admin still defaults to own and refuses scope: all.
+        let admin_token = access_token(&db, SEEDED_ADMIN_ID, RESOURCE).await;
+        let admin_own =
+            document(&call_tool(app.clone(), &admin_token, "list_folders", json!({})).await);
+        assert_eq!(admin_own["scope"], "own");
+        assert_eq!(admin_own["folders"].as_array().unwrap().len(), 1);
+
+        let refused_admin = document(
+            &call_tool(
+                app.clone(),
+                &admin_token,
+                "list_folders",
+                json!({"scope": "all"}),
+            )
+            .await,
+        );
+        assert_eq!(refused_admin["error"]["code"], "permission_not_granted");
+        assert!(refused_admin["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Admin library access (all users' folders)"));
+
+        // Admin WITH allow_admin defaults to scope: all and sees all users' folders with owners.
+        sqlx::query("UPDATE oauth_grants SET allow_admin = 1 WHERE user_id = ?")
+            .bind(SEEDED_ADMIN_ID)
+            .execute(&db)
+            .await
+            .unwrap();
+        let all = document(&call_tool(app.clone(), &admin_token, "list_folders", json!({})).await);
+        assert_eq!(all["ok"], true, "{all}");
+        assert_eq!(all["scope"], "all");
+        let folders = all["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 3);
+        let wife_folder = folders.iter().find(|f| f["folder_id"] == "f-wife").unwrap();
+        assert_eq!(wife_folder["owner"], "wife");
+        assert_eq!(wife_folder["is_own"], false);
+        assert_eq!(wife_folder["shared"], false);
+
+        // Admin can still filter to scope: own explicitly.
+        let own_only = document(
+            &call_tool(app, &admin_token, "list_folders", json!({"scope": "own"})).await,
+        );
+        assert_eq!(own_only["scope"], "own");
+        assert_eq!(own_only["folders"].as_array().unwrap().len(), 1);
+        assert_eq!(own_only["folders"][0]["folder_id"], "f-shared");
     }
 }

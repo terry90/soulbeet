@@ -197,4 +197,146 @@ class FormattingAndThemeTest {
         assertNull(obj.optNonNullString("blank"))
         assertNull(obj.optNonNullString("missing"))
     }
+
+    @Test
+    fun parseLyricsResponseSkipsEmptySyncedEntryAndParsesMultiLineLrc() {
+        val raw = """
+            [
+                {
+                    "display_artist": "Daft Punk",
+                    "display_title": "Instant Crush",
+                    "lang": "en",
+                    "synced": true,
+                    "offset_ms": 0,
+                    "lines": []
+                },
+                {
+                    "display_artist": "Daft Punk",
+                    "display_title": "Instant Crush",
+                    "lang": "en",
+                    "synced": false,
+                    "offset_ms": 0,
+                    "lines": [
+                        {"start_ms": null, "text": "[00:12.50]First line"},
+                        {"start_ms": null, "text": "[00:18.00]Second line"}
+                    ]
+                }
+            ]
+        """.trimIndent()
+
+        val parsed = SoulbeetApiClient.parseLyricsResponse(raw)
+        assertTrue(parsed != null)
+        assertTrue(parsed!!.synced)
+        assertEquals(2, parsed.lines.size)
+        assertEquals(12_500L, parsed.lines[0].startMs)
+        assertEquals("First line", parsed.lines[0].text)
+        assertEquals(18_000L, parsed.lines[1].startMs)
+        assertEquals("Second line", parsed.lines[1].text)
+    }
+
+    @Test
+    fun libraryCategoryOfflineLabelIsCachedAndPlaylistsPartitionCleanly() {
+        assertEquals("Cached", LibraryCategory.OFFLINE.label)
+
+        val userPl = org.soulbeet.core.FfiPlaylist(
+            id = "pl-user",
+            name = "Gym",
+            comment = null,
+            owner = "alice",
+            songCount = 12L,
+            durationSecs = 2400L,
+            coverArtId = null,
+            isSmart = false,
+            kind = "user",
+            slug = null,
+            changedAt = null,
+            updatedAt = 0L,
+        )
+        val seasonalPl = userPl.copy(
+            id = "pl-seasonal",
+            name = "Winter Holiday",
+            isSmart = true,
+            kind = "seasonal",
+            slug = "winter_holiday",
+        )
+        val discoveryPl = userPl.copy(
+            id = "pl-disc",
+            name = "Balanced",
+            isSmart = true,
+            kind = "discovery",
+            slug = null,
+        )
+        val ctxMix = org.soulbeet.app.data.ContextualMixUi(
+            slug = "winter_holiday",
+            kind = "seasonal",
+            i18nKey = "mix.seasonal.winter_holiday",
+            title = "Winter Holiday",
+            subtitle = "Seasonal",
+            countryCode = "FR",
+            localPct = 50,
+            ownedPct = 75,
+            offlinePriority = false,
+            excludeFromCoreTaste = true,
+            steering = org.soulbeet.app.data.CultureSteeringOption.BALANCED,
+            activeFrom = null,
+            activeUntil = null,
+            expiresAt = null,
+            navidromePlaylistId = "pl-seasonal",
+            trackCount = 9,
+            targetTracks = 25,
+        )
+        val state = AppUiState(
+            playlists = listOf(userPl, seasonalPl, discoveryPl),
+            contextualMixes = listOf(ctxMix),
+        )
+        assertEquals(listOf("pl-user"), state.userPlaylists.map { it.id })
+        assertEquals(listOf("pl-disc"), state.soulbeetMixPlaylists.map { it.id })
+        assertEquals(listOf("pl-disc"), state.homeFallbackMixPlaylists.map { it.id })
+
+        // Verify homeFallbackMixPlaylists deduplicates ONLY against seasonalHeroMix, keeping moment mixes visible
+        val momentPl = userPl.copy(id = "pl-moment", name = "Drive", isSmart = true, kind = "moment", slug = "drive")
+        val momentMix = ctxMix.copy(slug = "drive", kind = "moment", navidromePlaylistId = "pl-moment")
+        val stateWithMoment = AppUiState(
+            playlists = listOf(seasonalPl, momentPl, discoveryPl),
+            contextualMixes = listOf(ctxMix, momentMix),
+        )
+        assertEquals(listOf("pl-moment", "pl-disc"), stateWithMoment.homeFallbackMixPlaylists.map { it.id })
+    }
+
+    @Test
+    fun parseLyricsResponsePreservesInstrumentalBreaksAndLeavesSectionHeadersUntouched() {
+        val syncedInstrumental = """
+            [
+                {
+                    "synced": true,
+                    "lines": [
+                        {"start_ms": 1000, "text": "Intro"},
+                        {"start_ms": 5000, "text": ""},
+                        {"start_ms": 9000, "text": "Verse"}
+                    ]
+                }
+            ]
+        """.trimIndent()
+        val parsedSynced = SoulbeetApiClient.parseLyricsResponse(syncedInstrumental)!!
+        assertEquals(3, parsedSynced.lines.size)
+        assertEquals(5000L, parsedSynced.lines[1].startMs)
+        assertEquals("", parsedSynced.lines[1].text)
+
+        val plainWithBrackets = """
+            [
+                {
+                    "synced": false,
+                    "lines": [
+                        {"start_ms": null, "text": "[Chorus: Solo]"},
+                        {"start_ms": null, "text": "Sing along now"}
+                    ]
+                }
+            ]
+        """.trimIndent()
+        val parsedPlain = SoulbeetApiClient.parseLyricsResponse(plainWithBrackets)!!
+        assertFalse(parsedPlain.synced)
+        assertEquals(2, parsedPlain.lines.size)
+        assertEquals("[Chorus: Solo]", parsedPlain.lines[0].text)
+        assertEquals("Sing along now", parsedPlain.lines[1].text)
+    }
 }

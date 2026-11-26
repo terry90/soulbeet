@@ -190,6 +190,7 @@ pub(crate) async fn show(
         redirect_host: &redirect_host,
         returns_to_loopback: is_loopback_uri(redirect_uri),
         username: &user.username,
+        is_admin: user.role.is_admin(),
         request_id: &request_id,
     })
 }

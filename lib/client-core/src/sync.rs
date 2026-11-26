@@ -228,26 +228,34 @@ impl SyncEngine {
             set_cursor(&self.pool, CURSOR_LAST_ALBUM_CREATED, &newest_created).await?;
         }
 
-        // 3. Playlists (delta via changed_at + song_count) + prune deleted playlists
+        // 3. Playlists (delta via changed_at for static playlists; always refresh smart or 0-count playlists) + prune deleted playlists
         let playlists = subsonic.get_playlists().await?;
         let mut synced_playlist_ids = HashSet::with_capacity(playlists.len());
         for pl in playlists {
             synced_playlist_ids.insert(pl.id.clone());
-            let existing: Option<(Option<String>, i64)> = sqlx::query_as(
-                "SELECT changed_at, song_count FROM playlists WHERE id = ?",
+            let (kind, slug, is_smart) = classify_playlist(&pl.name, pl.comment.as_deref());
+            let existing: Option<(Option<String>, i64, i64)> = sqlx::query_as(
+                "SELECT changed_at, song_count, duration_secs FROM playlists WHERE id = ?",
             )
             .bind(&pl.id)
             .fetch_optional(&self.pool)
             .await?;
 
-            let needs_tracks = match existing {
-                Some((prev_changed, prev_count)) => {
-                    full_sync || prev_changed != pl.changed || prev_count != pl.song_count
+            let needs_tracks = match &existing {
+                Some((prev_changed, _, _)) => {
+                    full_sync
+                        || is_smart
+                        || pl.song_count == 0
+                        || *prev_changed != pl.changed
                 }
                 None => true,
             };
 
-            let (kind, slug, is_smart) = classify_playlist(&pl.name, pl.comment.as_deref());
+            let (initial_song_count, initial_duration_secs) = match &existing {
+                Some((_, prev_count, prev_dur)) => (*prev_count, *prev_dur),
+                None => (pl.song_count, pl.duration),
+            };
+
             upsert_playlist(
                 &self.pool,
                 &LocalPlaylist {
@@ -255,8 +263,8 @@ impl SyncEngine {
                     name: pl.name.clone(),
                     comment: pl.comment.clone(),
                     owner: pl.owner.clone(),
-                    song_count: pl.song_count,
-                    duration_secs: pl.duration,
+                    song_count: initial_song_count,
+                    duration_secs: initial_duration_secs,
                     cover_art_id: pl.cover_art.clone(),
                     is_smart,
                     kind,
@@ -270,13 +278,30 @@ impl SyncEngine {
             if needs_tracks {
                 let detail = subsonic.get_playlist(&pl.id).await?;
                 let mut track_ids = Vec::with_capacity(detail.entry.len());
+                let mut total_duration_secs: i64 = 0;
                 for song in detail.entry {
+                    total_duration_secs += song.duration.max(0);
                     let track_id = song.id.clone();
                     let preserve = pending_songs.contains(&track_id);
                     upsert_track(&self.pool, &song_to_local(song, now), preserve).await?;
                     track_ids.push(track_id);
                 }
                 replace_playlist_tracks(&self.pool, &pl.id, &track_ids).await?;
+                let live_song_count = track_ids.len() as i64;
+                let live_duration_secs = if total_duration_secs > 0 || track_ids.is_empty() {
+                    total_duration_secs
+                } else {
+                    detail.duration
+                };
+                sqlx::query(
+                    "UPDATE playlists SET song_count = ?, duration_secs = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(live_song_count)
+                .bind(live_duration_secs)
+                .bind(now)
+                .bind(&pl.id)
+                .execute(&self.pool)
+                .await?;
             }
             report.playlists_synced += 1;
         }
@@ -620,9 +645,47 @@ fn song_to_local(song: SubsonicSong, now: i64) -> LocalTrack {
     }
 }
 
+fn is_moment_slug(slug: &str) -> bool {
+    matches!(
+        slug,
+        "drive"
+            | "drive-mix"
+            | "drive_mix"
+            | "morning"
+            | "morning-boost"
+            | "morning_boost"
+            | "focus"
+            | "focus-flow"
+            | "focus_flow"
+            | "late_night"
+            | "late-night"
+    )
+}
+
 fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<String>, bool) {
     let lower_name = name.to_ascii_lowercase();
     let lower_comment = comment.unwrap_or_default().to_ascii_lowercase();
+
+    if let Some(rest) = lower_comment.split("soulbeet:contextual:").nth(1) {
+        let slug = rest
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| Some(slugify(&lower_name)));
+        let kind = if slug.as_deref().is_some_and(is_moment_slug) {
+            "moment"
+        } else {
+            "seasonal"
+        };
+        return (kind.to_string(), slug, true);
+    }
+
+    if lower_comment.contains("soulbeet discovery") {
+        return ("discovery".to_string(), None, true);
+    }
+
     if lower_comment.contains("seasonal:") || lower_name.contains("seasonal") {
         let slug = lower_comment
             .split("seasonal:")
@@ -638,10 +701,21 @@ fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<Strin
     if lower_comment.contains("moment:")
         || lower_name.contains("drive mix")
         || lower_name.contains("focus flow")
+        || lower_name.contains("deep focus")
         || lower_name.contains("late night")
         || lower_name.contains("morning boost")
+        || lower_name.contains("morning lift")
     {
-        return ("moment".to_string(), Some(slugify(&lower_name)), false);
+        let slug = lower_comment
+            .split("moment:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .map(ToString::to_string)
+            .or_else(|| Some(slugify(&lower_name)));
+        return ("moment".to_string(), slug, false);
+    }
+    if lower_comment.contains("smart") {
+        return ("smart".to_string(), None, true);
     }
     ("user".to_string(), None, false)
 }

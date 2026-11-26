@@ -337,6 +337,46 @@ impl NavidromeClient {
         Ok(Some(playlist))
     }
 
+    /// getPlaylist including its live visible non-missing `entry` songs.
+    /// Useful for resolving accurate live counts on smart playlists where `getPlaylists` may
+    /// report stale counts that include `missing = true` rows.
+    pub async fn get_playlist_with_entries(
+        &self,
+        id: &str,
+    ) -> Result<Option<(SubsonicPlaylist, Vec<SubsonicSong>)>> {
+        let Some(body) = found(
+            self.get::<PlaylistWithEntriesBody>("getPlaylist", &[("id", id)])
+                .await,
+        )?
+        else {
+            return Ok(None);
+        };
+        let playlist = body.playlist.ok_or_else(|| {
+            NavidromeError::Parse("getPlaylist answered without a playlist".into())
+        })?;
+        if playlist.playlist.id != id {
+            return Err(NavidromeError::Parse(format!(
+                "Navidrome answered another playlist for {id}"
+            )));
+        }
+        Ok(Some((playlist.playlist, playlist.entry)))
+    }
+
+    /// Lists all playlists visible to this user via the native API (`GET /api/playlist`),
+    /// carrying `rules` so callers can tell smart playlists from static ones.
+    pub async fn get_native_playlists(&self) -> Result<Vec<NativePlaylist>> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "playlist"]);
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("List playlists", resp).await);
+        }
+        resp.json().await.map_err(parse)
+    }
+
     /// Every track of playlist `id` with its place, missing files included, from the native API
     /// (server/nativeapi/native_api.go:156-160), which reads the playlist with the same own,
     /// public or admin filter as getPlaylist; Ok(None) on Navidrome's own 404, whose body is

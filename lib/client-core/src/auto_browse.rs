@@ -143,7 +143,23 @@ impl AutoBrowseEngine {
         let playlists = if offline_only {
             sqlx::query_as::<_, LocalPlaylist>(
                 r#"
-                SELECT DISTINCT p.*
+                SELECT DISTINCT
+                    p.id,
+                    p.name,
+                    p.comment,
+                    p.owner,
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                            THEN (SELECT COUNT(1) FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                        ELSE p.song_count
+                    END AS song_count,
+                    p.duration_secs,
+                    p.cover_art_id,
+                    p.is_smart,
+                    p.kind,
+                    p.slug,
+                    p.changed_at,
+                    p.updated_at
                 FROM playlists p
                 INNER JOIN playlist_tracks pt ON pt.playlist_id = p.id
                 INNER JOIN offline_downloads od ON od.track_id = pt.track_id
@@ -160,11 +176,28 @@ impl AutoBrowseEngine {
         } else {
             sqlx::query_as::<_, LocalPlaylist>(
                 r#"
-                SELECT * FROM playlists
-                WHERE kind IN ('seasonal', 'moment', 'discovery')
+                SELECT
+                    p.id,
+                    p.name,
+                    p.comment,
+                    p.owner,
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                            THEN (SELECT COUNT(1) FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                        ELSE p.song_count
+                    END AS song_count,
+                    p.duration_secs,
+                    p.cover_art_id,
+                    p.is_smart,
+                    p.kind,
+                    p.slug,
+                    p.changed_at,
+                    p.updated_at
+                FROM playlists p
+                WHERE p.kind IN ('seasonal', 'moment', 'discovery')
                 ORDER BY
-                    CASE kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
-                    updated_at DESC
+                    CASE p.kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
+                    p.updated_at DESC
                 LIMIT ?
                 "#,
             )
@@ -205,10 +238,27 @@ impl AutoBrowseEngine {
         let playlists = if offline_only {
             sqlx::query_as::<_, LocalPlaylist>(
                 r#"
-                SELECT DISTINCT p.*
+                SELECT DISTINCT
+                    p.id,
+                    p.name,
+                    p.comment,
+                    p.owner,
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                            THEN (SELECT COUNT(1) FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                        ELSE p.song_count
+                    END AS song_count,
+                    p.duration_secs,
+                    p.cover_art_id,
+                    p.is_smart,
+                    p.kind,
+                    p.slug,
+                    p.changed_at,
+                    p.updated_at
                 FROM playlists p
                 INNER JOIN playlist_tracks pt ON pt.playlist_id = p.id
                 INNER JOIN offline_downloads od ON od.track_id = pt.track_id
+                WHERE p.kind = 'user'
                 ORDER BY p.updated_at DESC, p.name COLLATE NOCASE ASC
                 LIMIT ?
                 "#,
@@ -219,14 +269,32 @@ impl AutoBrowseEngine {
         } else {
             sqlx::query_as::<_, LocalPlaylist>(
                 r#"
-                SELECT * FROM playlists
+                SELECT
+                    p.id,
+                    p.name,
+                    p.comment,
+                    p.owner,
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                            THEN (SELECT COUNT(1) FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                        ELSE p.song_count
+                    END AS song_count,
+                    p.duration_secs,
+                    p.cover_art_id,
+                    p.is_smart,
+                    p.kind,
+                    p.slug,
+                    p.changed_at,
+                    p.updated_at
+                FROM playlists p
+                WHERE p.kind = 'user'
                 ORDER BY
                     CASE WHEN EXISTS (
                         SELECT 1 FROM offline_pins op
-                        WHERE op.target_kind = 'playlist' AND op.target_id = playlists.id
+                        WHERE op.target_kind = 'playlist' AND op.target_id = p.id
                     ) THEN 0 ELSE 1 END ASC,
-                    updated_at DESC,
-                    name COLLATE NOCASE ASC
+                    p.updated_at DESC,
+                    p.name COLLATE NOCASE ASC
                 LIMIT ?
                 "#,
             )

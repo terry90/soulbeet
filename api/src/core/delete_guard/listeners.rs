@@ -263,6 +263,104 @@ impl Guard<'_> {
         }
     }
 
+    /// Multi-user veto check for cross-library visibility-shrinking moves.
+    ///
+    /// When `reader == actor`, runs the standard rules 3 & 4 sequence.
+    /// When `reader != actor` (e.g., an admin moving a track from another user's private library
+    /// that the admin's Navidrome account cannot see), still checks `reader` as another listener
+    /// (so `reader`'s ratings > 1, stars, or static playlists veto hiding it from them), excludes
+    /// `reader`'s rating from `others.ratings` so `no_unknown_rater(reader, ...)` never
+    /// double-counts it, and only includes `actor` in `others.names` / checks `own_playlists`
+    /// when `actor` can actually see the song.
+    pub(crate) async fn check_move_veto(
+        &self,
+        actor: &UserId,
+        actor_name: &str,
+        reader: &UserId,
+        song: &NativeSong,
+        path: &Path,
+    ) -> Result<(), Failure> {
+        self.one_song(reader, song, path).await?;
+        if reader == actor {
+            let others = self.others_permit(actor, actor_name, song, path).await?;
+            let _ = self.own_playlists(actor, actor_name, &song.id).await?;
+            let _ = self.no_unknown_rater(actor, song, &others).await?;
+            return Ok(());
+        }
+
+        let users = User::linked_to_navidrome_in(self.db)
+            .await
+            .map_err(|e| database_failure(Stage::Delete, e))?;
+        let actor_str = actor.to_string();
+        let reader_str = reader.to_string();
+        let mut read = Read {
+            ratings: Vec::new(),
+            names: Vec::new(),
+            unseen: Vec::new(),
+        };
+        let mut refusal = None;
+
+        // Check every other linked listener (including `reader`!) for marks/playlists.
+        for user in users.iter().filter(|u| u.id != actor_str) {
+            let listener = UserId::new(&user.id);
+            let marks = self.marks_of(&listener, actor_name, song, path).await;
+            let recorded = match &marks {
+                Err(Keeps::Unreadable(error)) => {
+                    NavidromeReadFailureRow::record_in(self.db, &user.id, error).await
+                }
+                _ => NavidromeReadFailureRow::clear_in(self.db, &user.id).await,
+            };
+            if let Err(e) = recorded {
+                warn!(
+                    "Could not store whether Navidrome account {} can be read: {e}",
+                    user.username
+                );
+            }
+            match marks {
+                Ok(None) => read.unseen.push(user.username.clone()),
+                Ok(Some(rating)) => {
+                    read.names.push(user.username.clone());
+                    // `no_unknown_rater(reader, ...)` chains `reader`'s own rating once, so do
+                    // not also push `reader`'s rating into `read.ratings`.
+                    if user.id != reader_str && rating > 0 {
+                        read.ratings.push(rating);
+                    }
+                }
+                Err(keeps) => {
+                    refusal.get_or_insert(match keeps {
+                        Keeps::Unreadable(_) => veto_unknown(),
+                        Keeps::Refused(f) => f,
+                    });
+                }
+            }
+        }
+        if let Some(f) = refusal {
+            return Err(f);
+        }
+
+        // Check whether `actor` sees the song in Navidrome so rule 4's `names`/`unseen` and
+        // `own_playlists` reflect reality.
+        match self.listeners.song(actor, &song.id).await {
+            Ok(Some(seen)) => {
+                read.names.push(actor_name.to_string());
+                let r = seen.user_rating.unwrap_or(0);
+                if r > 0 {
+                    read.ratings.push(r);
+                }
+                let _ = self.own_playlists(actor, actor_name, &song.id).await?;
+            }
+            Ok(None) => {
+                read.unseen.push(actor_name.to_string());
+            }
+            Err(_) => {
+                return Err(veto_unknown());
+            }
+        }
+
+        let _ = self.no_unknown_rater(reader, song, &read).await?;
+        Ok(())
+    }
+
     /// `listener`'s rating of `song` (0 when unrated), None when they cannot see it, or why they
     /// keep it. Their playlists are read whether or not they see the song: Navidrome lists a
     /// playlist's entries by the playlist's visibility, not by the library's

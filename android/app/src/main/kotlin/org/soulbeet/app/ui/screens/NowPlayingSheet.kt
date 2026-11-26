@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -30,6 +31,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
@@ -40,9 +42,8 @@ import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.ThumbDown
-import androidx.compose.material.icons.outlined.StarOutline
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -117,6 +118,7 @@ fun NowPlayingSheet(
     onPlayQueueIndex: (Int) -> Unit,
     onOpenConnect: () -> Unit,
     onDismissConnect: () -> Unit,
+    onReconnectConnect: () -> Unit,
     onClaimActiveDevice: () -> Unit,
     onTransferPlayback: (String) -> Unit,
     onUndoPendingDrop: () -> Unit,
@@ -322,7 +324,7 @@ fun NowPlayingSheet(
                                     shape = SoulbeetShapes.full,
                                 ) {
                                     Text(
-                                        text = "OFFLINE",
+                                        text = "CACHED",
                                         style = type.monoXs,
                                         color = colors.leafText,
                                         modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
@@ -456,12 +458,12 @@ fun NowPlayingSheet(
                                     modifier = Modifier
                                         .size(48.dp)
                                         .clip(CircleShape)
-                                        .background(colors.goldSurface),
+                                        .background(colors.accentSurface),
                                 ) {
                                     Icon(
-                                        imageVector = if (pb.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
-                                        contentDescription = "Star and promote",
-                                        tint = colors.gold,
+                                        imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                        contentDescription = "Favorite and promote",
+                                        tint = colors.accentText,
                                     )
                                 }
 
@@ -515,9 +517,9 @@ fun NowPlayingSheet(
                                             modifier = Modifier.size(48.dp),
                                         ) {
                                             Icon(
-                                                imageVector = if (pb.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
-                                                contentDescription = if (pb.isStarred) "Unstar" else "Star",
-                                                tint = if (pb.isStarred) colors.gold else colors.textSecondary,
+                                                imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                                contentDescription = if (pb.isStarred) "Remove from favorites" else "Favorite",
+                                                tint = if (pb.isStarred) colors.accentText else colors.textSecondary,
                                             )
                                         }
                                         IconButton(
@@ -704,6 +706,7 @@ fun NowPlayingSheet(
         ConnectDevicesSheet(
             state = state,
             onDismiss = onDismissConnect,
+            onReconnect = onReconnectConnect,
             onClaimActive = onClaimActiveDevice,
             onTransferTo = onTransferPlayback,
         )
@@ -759,7 +762,11 @@ private fun SyncedLyricsPanel(
                     verticalArrangement = Arrangement.Center,
                 ) {
                     Text(
-                        text = state.lyricsError ?: "No synced lyrics saved yet",
+                        text = state.lyricsError ?: if (state.lyricsFetched) {
+                            "No lyrics found for this track"
+                        } else {
+                            "No synced lyrics saved yet"
+                        },
                         style = type.body,
                         color = colors.textSecondary,
                         textAlign = TextAlign.Center,
@@ -771,7 +778,11 @@ private fun SyncedLyricsPanel(
                         border = BorderStroke(1.dp, colors.borderDefault),
                         modifier = Modifier.heightIn(min = 48.dp),
                     ) {
-                        Text("Fetch Lyrics", style = type.body, color = colors.leafText)
+                        Text(
+                            text = if (state.lyricsFetched) "Try Again" else "Fetch Lyrics",
+                            style = type.body,
+                            color = colors.leafText,
+                        )
                     }
                 }
             }
@@ -879,6 +890,7 @@ private fun UpNextQueueSheet(
 private fun ConnectDevicesSheet(
     state: AppUiState,
     onDismiss: () -> Unit,
+    onReconnect: () -> Unit,
     onClaimActive: () -> Unit,
     onTransferTo: (String) -> Unit,
 ) {
@@ -910,7 +922,7 @@ private fun ConnectDevicesSheet(
                     shape = SoulbeetShapes.full,
                 ) {
                     Text(
-                        text = if (connect?.connected == true) "CONNECTED" else "OFFLINE",
+                        text = if (connect?.connected == true) "CONNECTED" else "DISCONNECTED",
                         style = type.monoXs,
                         color = if (connect?.connected == true) colors.leafText else colors.textMuted,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -919,63 +931,115 @@ private fun ConnectDevicesSheet(
             }
 
             val devices = connect?.devices.orEmpty()
-            if (devices.isEmpty()) {
+            if (connect?.connected != true) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Disconnected from Soulbeet Connect",
+                        style = type.bodySm,
+                        color = colors.textSecondary,
+                    )
+                    OutlinedButton(
+                        onClick = onReconnect,
+                        shape = SoulbeetShapes.full,
+                        border = BorderStroke(1.dp, colors.leafText.copy(alpha = 0.45f)),
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Text(
+                            text = "Reconnect",
+                            style = type.bodySm,
+                            color = colors.leafText,
+                        )
+                    }
+                }
+            } else if (devices.isEmpty()) {
                 Text(
                     text = "This Android phone is the only active Soulbeet Connect device right now.",
                     style = type.bodySm,
                     color = colors.textSecondary,
                 )
             } else {
-                devices.forEach { dev ->
-                    val isSelf = dev.deviceId == state.config.deviceId
-                    Surface(
-                        color = if (dev.isActive) colors.leafSurface else colors.surface,
-                        shape = SoulbeetShapes.md,
-                        border = BorderStroke(
-                            1.dp,
-                            if (dev.isActive) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 56.dp)
-                            .clickable {
-                                if (isSelf) onClaimActive() else onTransferTo(dev.deviceId)
-                            },
-                    ) {
-                        Row(
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    items(devices, key = { it.deviceId }) { dev ->
+                        val isSelf = dev.deviceId == state.config.deviceId
+                        Surface(
+                            color = if (dev.isActive) colors.leafSurface else colors.surface,
+                            shape = SoulbeetShapes.md,
+                            border = BorderStroke(
+                                1.dp,
+                                if (dev.isActive) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
+                            ),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                                .heightIn(min = 56.dp)
+                                .clickable {
+                                    if (isSelf) onClaimActive() else onTransferTo(dev.deviceId)
+                                },
                         ) {
                             Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 14.dp, vertical = 12.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Devices,
-                                    contentDescription = null,
-                                    tint = if (dev.isActive) colors.leafText else colors.textMuted,
-                                )
-                                Column {
-                                    Text(
-                                        text = if (isSelf) "${dev.name} (This device)" else dev.name,
-                                        style = type.body,
-                                        color = colors.textPrimary,
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Devices,
+                                        contentDescription = null,
+                                        tint = if (dev.isActive) colors.leafText else colors.textMuted,
                                     )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = dev.name,
+                                            style = type.body,
+                                            color = colors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        Text(
+                                            text = if (isSelf) {
+                                                "${dev.platform.name} · THIS DEVICE"
+                                            } else {
+                                                dev.platform.name
+                                            },
+                                            style = type.monoXs,
+                                            color = colors.textMuted,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    color = if (dev.isActive) colors.leafSurface else colors.accentSurface,
+                                    shape = SoulbeetShapes.full,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (dev.isActive) {
+                                            colors.leafText.copy(alpha = 0.45f)
+                                        } else {
+                                            colors.accentText.copy(alpha = 0.45f)
+                                        },
+                                    ),
+                                ) {
                                     Text(
-                                        text = dev.platform.name,
+                                        text = if (dev.isActive) "ACTIVE" else if (isSelf) "USE HERE" else "TRANSFER",
                                         style = type.monoXs,
-                                        color = colors.textMuted,
+                                        color = if (dev.isActive) colors.leafText else colors.accentText,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
                                     )
                                 }
                             }
-                            Text(
-                                text = if (dev.isActive) "ACTIVE" else if (isSelf) "USE HERE" else "TRANSFER",
-                                style = type.monoXs,
-                                color = if (dev.isActive) colors.leafText else colors.accentText,
-                            )
                         }
                     }
                 }

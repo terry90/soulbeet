@@ -2,8 +2,8 @@ use dioxus::prelude::*;
 use shared::download::AcquireAndPlayStage;
 
 use crate::{
-    IconCheck, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
-    IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
+    IconCheck, IconHeart, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
+    IconSlidersHorizontal, IconSparkles, IconWifiOff, IconX, StarStrip, StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -405,21 +405,21 @@ pub fn TrackRow(
                                     r#type: "button",
                                     aria_pressed: if is_starred { "true" } else { "false" },
                                     aria_label: if is_starred {
-                                        format!("Unstar {title}")
+                                        format!("Remove {title} from favorites")
                                     } else {
-                                        format!("Star {title}")
+                                        format!("Favorite {title}")
                                     },
-                                    title: if is_starred { "Unstar track" } else { "Star track" },
+                                    title: if is_starred { "Remove from favorites" } else { "Favorite track" },
                                     class: if is_starred {
-                                        "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-gold hover:bg-beet-gold-surface transition-colors duration-150 cursor-pointer"
+                                        "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-accent-text hover:bg-beet-accent-surface transition-colors duration-150 cursor-pointer"
                                     } else {
-                                        "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-gold hover:bg-beet-surface-high transition-colors duration-150 cursor-pointer"
+                                        "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-accent-text hover:bg-beet-surface-high transition-colors duration-150 cursor-pointer"
                                     },
                                     onclick: move |evt| {
                                         evt.stop_propagation();
                                         star_cb.call(!is_starred);
                                     },
-                                    IconStar { size: 17, filled: is_starred }
+                                    IconHeart { size: 17, filled: is_starred }
                                 }
                             }
                         }

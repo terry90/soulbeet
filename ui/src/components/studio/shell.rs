@@ -2,11 +2,11 @@
 //! Responsive Mobile Bottom Navigation (`< lg`), and Sticky Top Bar (`Ctrl+K`, Offline Pill).
 
 use dioxus::prelude::*;
-use shared::recommendation::ContextualMixSummary;
+use shared::recommendation::{ContextualMixKind, ContextualMixSummary};
 
 use crate::{
     IconActivity, IconCommand, IconCompass, IconHome, IconLibrary, IconListMusic, IconLogOut,
-    IconSearch, IconSettings, IconSparkles, Logo, OfflineTogglePill,
+    IconRadio, IconSearch, IconSettings, IconSparkles, Logo, OfflineTogglePill,
 };
 
 use super::format_mix_title;
@@ -46,6 +46,100 @@ impl StudioNavSection {
     }
 }
 
+/// Visual classification for playlists across Sidebar, Library, and Home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaylistCategory {
+    Seasonal,
+    Discovery,
+    MomentMix,
+    Smart,
+    #[default]
+    User,
+}
+
+impl PlaylistCategory {
+    /// Returns true for Soulbeet-managed mixes (Seasonal, Rolling Discovery, Moment Mixes).
+    pub const fn is_soulbeet_mix(self) -> bool {
+        matches!(self, Self::Seasonal | Self::Discovery | Self::MomentMix)
+    }
+
+    /// Compact `Commit Mono` category badge label (`None` for plain user playlists).
+    pub const fn badge_label(self) -> Option<&'static str> {
+        match self {
+            Self::Seasonal => Some("SEASONAL"),
+            Self::Discovery => Some("ROLLING"),
+            Self::MomentMix => Some("MOMENT"),
+            Self::Smart => Some("SMART"),
+            Self::User => None,
+        }
+    }
+
+    /// Deterministic ordering inside grouped mix lists.
+    pub const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Seasonal => 0,
+            Self::Discovery => 1,
+            Self::MomentMix => 2,
+            Self::Smart => 3,
+            Self::User => 4,
+        }
+    }
+}
+
+/// Classifies a Navidrome playlist by matching its ID against Soulbeet's active contextual mixes
+/// first, then falling back to exact Soulbeet comment prefixes and smart-playlist metadata.
+pub fn classify_playlist_category(
+    playlist_id: &str,
+    comment: Option<&str>,
+    is_smart: bool,
+    contextual_mixes: &[ContextualMixSummary],
+) -> PlaylistCategory {
+    if !playlist_id.is_empty() {
+        if let Some(mix) = contextual_mixes
+            .iter()
+            .find(|m| m.navidrome_playlist_id.as_deref() == Some(playlist_id))
+        {
+            return match mix.kind {
+                ContextualMixKind::Seasonal => PlaylistCategory::Seasonal,
+                ContextualMixKind::Rolling => PlaylistCategory::Discovery,
+                ContextualMixKind::Moment => PlaylistCategory::MomentMix,
+            };
+        }
+    }
+
+    let comment_lower = comment.unwrap_or("").trim().to_ascii_lowercase();
+    if comment_lower.starts_with("soulbeet:contextual:")
+        || comment_lower.contains("soulbeet:contextual:")
+    {
+        return PlaylistCategory::Seasonal;
+    }
+    if comment_lower.starts_with("soulbeet discovery")
+        || comment_lower.contains("soulbeet discovery")
+    {
+        return PlaylistCategory::Discovery;
+    }
+    if is_smart {
+        PlaylistCategory::Smart
+    } else {
+        PlaylistCategory::User
+    }
+}
+
+/// Classifies a mirrored Desktop `LocalPlaylist` using its stored `kind`, `comment`, and `is_smart`.
+pub fn classify_local_playlist_category(
+    kind: &str,
+    comment: Option<&str>,
+    is_smart: bool,
+) -> PlaylistCategory {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "seasonal" => PlaylistCategory::Seasonal,
+        "discovery" | "rolling" => PlaylistCategory::Discovery,
+        "moment" => PlaylistCategory::MomentMix,
+        "smart" => PlaylistCategory::Smart,
+        _ => classify_playlist_category("", comment, is_smart, &[]),
+    }
+}
+
 /// Lightweight playlist entry displayed in the Left Rail's scrollable Playlists list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarPlaylistItem {
@@ -54,6 +148,7 @@ pub struct SidebarPlaylistItem {
     pub song_count: u32,
     pub is_smart: bool,
     pub is_offline_pinned: bool,
+    pub category: PlaylistCategory,
 }
 
 /// 240px desktop left navigation rail (`surface.sunken` `#0B0312`).
@@ -63,6 +158,7 @@ pub fn StudioSidebar(
     on_navigate: EventHandler<StudioNavSection>,
     offline_only: bool,
     on_toggle_offline: EventHandler<bool>,
+    #[props(default)] show_offline_toggle: bool,
     #[props(default)] active_transfers_count: usize,
     #[props(default)] pinned_seasonal: Option<ContextualMixSummary>,
     #[props(default)] on_open_seasonal: Option<EventHandler<String>>,
@@ -81,12 +177,31 @@ pub fn StudioSidebar(
         StudioNavSection::Settings,
     ];
 
+    let has_pinned_seasonal = pinned_seasonal.is_some();
+    let pinned_seasonal_playlist_id = pinned_seasonal
+        .as_ref()
+        .and_then(|s| s.navidrome_playlist_id.as_deref());
+
+    let mut mix_playlists: Vec<&SidebarPlaylistItem> = playlists
+        .iter()
+        .filter(|pl| {
+            pl.category.is_soulbeet_mix()
+                && pinned_seasonal_playlist_id != Some(pl.id.as_str())
+        })
+        .collect();
+    mix_playlists.sort_by_key(|pl| pl.category.sort_rank());
+
+    let user_playlists: Vec<&SidebarPlaylistItem> = playlists
+        .iter()
+        .filter(|pl| !pl.category.is_soulbeet_mix())
+        .collect();
+
     rsx! {
         aside {
             aria_label: "Primary studio navigation",
             class: "hidden lg:flex flex-col w-[240px] shrink-0 h-full bg-beet-sunken border-r border-beet-border-subtle select-none",
 
-            // Brand Header (32px pixel-art Logo — exact multiple of 16px!)
+            // Brand Header (32px pixel-art Logo: exact multiple of 16px)
             div { class: "h-14 px-4 flex items-center gap-3 border-b border-beet-border-subtle shrink-0",
                 button {
                     r#type: "button",
@@ -151,17 +266,21 @@ pub fn StudioSidebar(
                 }
             }
 
-            // Offline Mode Pill
-            div { class: "px-3 pb-3 border-b border-beet-border-subtle shrink-0",
-                OfflineTogglePill {
-                    offline_only,
-                    on_toggle: move |next| on_toggle_offline.call(next),
-                    compact: true,
-                    class: "w-full justify-center".to_string(),
+            // Offline Mode Pill (Desktop only, where local offline storage exists)
+            if show_offline_toggle {
+                div { class: "px-3 pb-3 border-b border-beet-border-subtle shrink-0",
+                    OfflineTogglePill {
+                        offline_only,
+                        on_toggle: move |next| on_toggle_offline.call(next),
+                        compact: true,
+                        class: "w-full justify-center".to_string(),
+                    }
                 }
+            } else {
+                div { class: "border-b border-beet-border-subtle shrink-0" }
             }
 
-            // Pinned Seasonal Pack + Scrollable Playlists
+            // Pinned Seasonal Pack + Scrollable Mixes & Playlists
             div { class: "flex-1 overflow-y-auto studio-scrollbar px-3 py-3 space-y-4",
                 if let Some(seasonal) = pinned_seasonal {
                     {
@@ -195,22 +314,19 @@ pub fn StudioSidebar(
                     }
                 }
 
-                // Playlists List
-                div { class: "space-y-1",
-                    p { class: "px-2 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                        "Playlists"
-                    }
-                    if playlists.is_empty() {
-                        p { class: "px-2 py-2 text-[12px] text-beet-text-disabled",
-                            "Connect Navidrome to browse playlists."
+                // Soulbeet Mixes (Seasonal, Rolling Discovery, Moment Mixes)
+                if !mix_playlists.is_empty() {
+                    div { class: "space-y-1",
+                        p { class: "px-2 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                            "Soulbeet Mixes"
                         }
-                    } else {
-                        for pl in playlists.iter() {
+                        for pl in mix_playlists.iter() {
                             {
                                 let pid = pl.id.clone();
+                                let category = pl.category;
                                 rsx! {
                                     button {
-                                        key: "{pl.id}",
+                                        key: "mix-{pl.id}",
                                         r#type: "button",
                                         class: "w-full px-2 py-1.5 rounded-[7px] flex items-center justify-between gap-2 text-left text-[13px] text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-low transition-colors cursor-pointer",
                                         onclick: move |_| {
@@ -221,10 +337,77 @@ pub fn StudioSidebar(
                                             }
                                         },
                                         span { class: "flex items-center gap-2 min-w-0",
-                                            IconListMusic { size: 14, class: "text-beet-text-tertiary".to_string() }
+                                            match category {
+                                                PlaylistCategory::Seasonal => rsx! {
+                                                    IconSparkles { size: 14, class: "text-beet-accent-text shrink-0".to_string() }
+                                                },
+                                                PlaylistCategory::Discovery => rsx! {
+                                                    IconCompass { size: 14, class: "text-beet-accent-text shrink-0".to_string() }
+                                                },
+                                                PlaylistCategory::MomentMix => rsx! {
+                                                    IconRadio { size: 14, class: "text-beet-leaf-text shrink-0".to_string() }
+                                                },
+                                                _ => rsx! {
+                                                    IconListMusic { size: 14, class: "text-beet-text-tertiary shrink-0".to_string() }
+                                                },
+                                            }
                                             span { class: "truncate", "{pl.name}" }
                                         }
                                         span { class: "flex items-center gap-1.5 shrink-0",
+                                            if pl.is_offline_pinned {
+                                                span { class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow", title: "Pinned offline" }
+                                            }
+                                            span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                                "{pl.song_count}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Your Playlists (User & Custom Smart Playlists)
+                div { class: "space-y-1",
+                    p { class: "px-2 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Your Playlists"
+                    }
+                    if user_playlists.is_empty() && mix_playlists.is_empty() && !has_pinned_seasonal {
+                        p { class: "px-2 py-2 text-[12px] text-beet-text-disabled",
+                            "Connect Navidrome to browse playlists."
+                        }
+                    } else if user_playlists.is_empty() {
+                        p { class: "px-2 py-2 text-[12px] text-beet-text-disabled",
+                            "No personal playlists yet."
+                        }
+                    } else {
+                        for pl in user_playlists.iter() {
+                            {
+                                let pid = pl.id.clone();
+                                let is_smart_badge = pl.category == PlaylistCategory::Smart;
+                                rsx! {
+                                    button {
+                                        key: "pl-{pl.id}",
+                                        r#type: "button",
+                                        class: "w-full px-2 py-1.5 rounded-[7px] flex items-center justify-between gap-2 text-left text-[13px] text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-low transition-colors cursor-pointer",
+                                        onclick: move |_| {
+                                            if let Some(cb) = &on_select_playlist {
+                                                cb.call(pid.clone());
+                                            } else {
+                                                on_navigate.call(StudioNavSection::Library);
+                                            }
+                                        },
+                                        span { class: "flex items-center gap-2 min-w-0",
+                                            IconListMusic { size: 14, class: "text-beet-text-tertiary shrink-0".to_string() }
+                                            span { class: "truncate", "{pl.name}" }
+                                        }
+                                        span { class: "flex items-center gap-1.5 shrink-0",
+                                            if is_smart_badge {
+                                                span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle text-beet-text-tertiary tabular-nums-mono text-[9px] font-semibold tracking-wider",
+                                                    "SMART"
+                                                }
+                                            }
                                             if pl.is_offline_pinned {
                                                 span { class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow", title: "Pinned offline" }
                                             }
@@ -280,6 +463,7 @@ pub fn StudioTopBar(
     active: StudioNavSection,
     offline_only: bool,
     on_toggle_offline: EventHandler<bool>,
+    #[props(default)] show_offline_toggle: bool,
     on_open_palette: EventHandler<()>,
     on_open_downloads: EventHandler<()>,
     #[props(default)] on_downloads_toggle_mounted: Option<EventHandler<std::rc::Rc<MountedData>>>,
@@ -324,12 +508,14 @@ pub fn StudioTopBar(
                     }
                 }
 
-                div { class: "lg:hidden shrink-0",
-                    OfflineTogglePill {
-                        offline_only,
-                        on_toggle: move |next| on_toggle_offline.call(next),
-                        compact: true,
-                        class: "px-2.5".to_string(),
+                if show_offline_toggle {
+                    div { class: "lg:hidden shrink-0",
+                        OfflineTogglePill {
+                            offline_only,
+                            on_toggle: move |next| on_toggle_offline.call(next),
+                            compact: true,
+                            class: "px-2.5".to_string(),
+                        }
                     }
                 }
 
@@ -424,5 +610,146 @@ pub fn StudioMobileNav(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_mix(id: &str, kind: ContextualMixKind) -> ContextualMixSummary {
+        ContextualMixSummary {
+            slug: format!("slug-{id}"),
+            kind,
+            i18n_key: "mix.rolling.balanced".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            country_code: None,
+            local_pct: None,
+            owned_pct: 50,
+            offline_priority: false,
+            exclude_from_core_taste: false,
+            steering: None,
+            active_from: None,
+            active_until: None,
+            expires_at: None,
+            navidrome_playlist_id: Some(id.into()),
+            track_count: 10,
+            target_tracks: 10,
+        }
+    }
+
+    #[test]
+    fn classifies_playlists_by_mix_id_comment_and_smart_flag() {
+        let mixes = vec![
+            sample_mix("pl-seasonal", ContextualMixKind::Seasonal),
+            sample_mix("pl-rolling", ContextualMixKind::Rolling),
+            sample_mix("pl-moment", ContextualMixKind::Moment),
+        ];
+
+        assert_eq!(
+            classify_playlist_category("pl-seasonal", None, false, &mixes),
+            PlaylistCategory::Seasonal
+        );
+        assert_eq!(
+            classify_playlist_category("pl-rolling", None, false, &mixes),
+            PlaylistCategory::Discovery
+        );
+        assert_eq!(
+            classify_playlist_category("pl-moment", None, false, &mixes),
+            PlaylistCategory::MomentMix
+        );
+        assert_eq!(
+            classify_playlist_category("other", Some("soulbeet:contextual:summer"), true, &mixes),
+            PlaylistCategory::Seasonal
+        );
+        assert_eq!(
+            classify_playlist_category("other", Some("Soulbeet Discovery: Comfort Zone"), true, &mixes),
+            PlaylistCategory::Discovery
+        );
+        assert_eq!(
+            classify_playlist_category("other", Some("Custom smart rule"), true, &mixes),
+            PlaylistCategory::Smart
+        );
+        assert_eq!(
+            classify_playlist_category("other", None, false, &mixes),
+            PlaylistCategory::User
+        );
+    }
+
+    #[test]
+    fn sidebar_splits_mixes_and_hides_offline_toggle_by_default() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                StudioSidebar {
+                    active: StudioNavSection::Home,
+                    on_navigate: |_| {},
+                    offline_only: false,
+                    on_toggle_offline: |_| {},
+                    playlists: vec![
+                        SidebarPlaylistItem {
+                            id: "m1".into(),
+                            name: "Comfort Zone".into(),
+                            song_count: 9,
+                            is_smart: true,
+                            is_offline_pinned: false,
+                            category: PlaylistCategory::Discovery,
+                        },
+                        SidebarPlaylistItem {
+                            id: "u1".into(),
+                            name: "Road Trip".into(),
+                            song_count: 24,
+                            is_smart: false,
+                            is_offline_pinned: false,
+                            category: PlaylistCategory::User,
+                        },
+                        SidebarPlaylistItem {
+                            id: "s1".into(),
+                            name: "Recent 5-Star".into(),
+                            song_count: 15,
+                            is_smart: true,
+                            is_offline_pinned: false,
+                            category: PlaylistCategory::Smart,
+                        },
+                    ],
+                    on_logout: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Soulbeet Mixes"), "{html}");
+        assert!(html.contains("Your Playlists"), "{html}");
+        assert!(html.contains("SMART"), "{html}");
+        assert!(!html.contains("role=\"switch\""), "{html}");
+    }
+
+    #[test]
+    fn sidebar_with_only_pinned_seasonal_does_not_show_connect_navidrome_prompt() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                StudioSidebar {
+                    active: StudioNavSection::Home,
+                    on_navigate: |_| {},
+                    offline_only: false,
+                    on_toggle_offline: |_| {},
+                    pinned_seasonal: Some(sample_mix("pl-seasonal", ContextualMixKind::Seasonal)),
+                    playlists: vec![SidebarPlaylistItem {
+                        id: "pl-seasonal".into(),
+                        name: "Summer".into(),
+                        song_count: 10,
+                        is_smart: true,
+                        is_offline_pinned: false,
+                        category: PlaylistCategory::Seasonal,
+                    }],
+                    on_logout: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(!html.contains("Connect Navidrome to browse playlists."), "{html}");
+        assert!(html.contains("No personal playlists yet."), "{html}");
     }
 }

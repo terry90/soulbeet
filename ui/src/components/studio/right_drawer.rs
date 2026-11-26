@@ -6,7 +6,7 @@ use shared::client::{DeleteGuardPreview, TrackLyrics};
 use crate::{
     classify_guard_mode, format_discovery_badge, format_duration, protection_kind_label,
     use_player, GuardModalMode, IconCheck, IconInfo, IconListMusic, IconLoader, IconMic2,
-    IconMusic, IconRadio, IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown,
+    IconMusic, IconPlay, IconRadio, IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown,
     IconTrash2, IconX, PlayerTrack,
 };
 
@@ -39,6 +39,7 @@ pub fn StudioRightDrawer(
     #[props(default)] inspected_track: Option<PlayerTrack>,
     #[props(default)] lyrics: Vec<TrackLyrics>,
     #[props(default)] lyrics_loading: bool,
+    #[props(default)] lyrics_fetched: bool,
     #[props(default)] lyrics_error: Option<String>,
     on_fetch_lyrics: EventHandler<()>,
     #[props(default)] guard_preview: Option<DeleteGuardPreview>,
@@ -125,6 +126,7 @@ pub fn StudioRightDrawer(
                         LyricsPanel {
                             lyrics,
                             loading: lyrics_loading,
+                            fetched: lyrics_fetched,
                             error: lyrics_error,
                             has_track: state.current_track.is_some(),
                             on_fetch: move |_| on_fetch_lyrics.call(()),
@@ -153,6 +155,7 @@ fn QueueTabBody() -> Element {
     let player = use_player();
     let state = player.snapshot();
     let cur_idx = state.queue_index;
+    let is_playing = state.status.is_playing();
 
     if state.queue.is_empty() {
         return rsx! {
@@ -198,14 +201,32 @@ fn QueueTabBody() -> Element {
                             div {
                                 key: "{idx}-{item.id}",
                                 role: "listitem",
-                                class: "group flex items-center gap-2.5 p-2 rounded-[8px] border transition-colors {row_cls}",
+                                class: "group flex items-center gap-3 px-3 py-2 rounded-[8px] border transition-colors {row_cls}",
                                 button {
                                     r#type: "button",
-                                    class: "flex items-center gap-2.5 flex-1 min-w-0 text-left cursor-pointer",
+                                    class: "flex items-center gap-3 flex-1 min-w-0 text-left cursor-pointer",
                                     onclick: move |_| player.play_queue(q_for_jump.clone(), idx),
-                                    span { class: "w-5 text-right tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
-                                        if is_current {
-                                            "▶"
+                                    span { class: "w-7 shrink-0 inline-flex items-center justify-end tabular-nums-mono text-[12px] text-beet-text-tertiary",
+                                        if is_current && is_playing {
+                                            span {
+                                                class: "inline-flex items-end justify-end gap-[2px] h-3.5",
+                                                aria_hidden: "true",
+                                                span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
+                                                span {
+                                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                                                    style: "animation-delay: 180ms;",
+                                                }
+                                                span {
+                                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                                                    style: "animation-delay: 360ms;",
+                                                }
+                                            }
+                                        } else if is_current {
+                                            IconPlay {
+                                                size: 12,
+                                                filled: true,
+                                                class: "text-beet-leaf-text".to_string(),
+                                            }
                                         } else {
                                             "{idx + 1}"
                                         }
@@ -240,7 +261,7 @@ fn QueueTabBody() -> Element {
                                     r#type: "button",
                                     aria_label: format!("Remove {} from queue", item.title),
                                     title: "Remove from queue",
-                                    class: "w-6 h-6 rounded inline-flex items-center justify-center text-beet-text-disabled hover:text-beet-crimson-text opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer transition-opacity",
+                                    class: "w-6 h-6 rounded inline-flex items-center justify-center text-beet-text-disabled hover:text-beet-crimson-text opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer transition-opacity shrink-0",
                                     onclick: move |_| player.remove_from_queue(idx),
                                     IconX { size: 13 }
                                 }
@@ -437,7 +458,7 @@ fn InspectorTabBody(
                                     },
                                     GuardModalMode::PermanentDelete => rsx! {
                                         p { class: "text-beet-leaf-text",
-                                            "Sole listener — no other household accounts protect this file."
+                                            "Sole listener: no other household accounts protect this file."
                                         }
                                     },
                                     GuardModalMode::ListenerProtected => rsx! {
@@ -484,5 +505,81 @@ fn InspectorTabBody(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PlaybackStatus, PlayerCommand, PlayerProvider, PlayerState};
+
+    fn sample_track(id: &str, title: &str) -> PlayerTrack {
+        PlayerTrack {
+            id: id.into(),
+            title: title.into(),
+            artist: "Artist".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn queue_uses_track_row_rhythm_and_replaces_raw_play_glyph() {
+        let mut playing_dom = VirtualDom::new(|| {
+            let state = use_signal(|| {
+                let mut s = PlayerState::default();
+                s.current_track = Some(sample_track("t1", "First Track"));
+                s.queue = vec![
+                    sample_track("t1", "First Track"),
+                    sample_track("t2", "Second Track"),
+                ];
+                s.queue_index = Some(0);
+                s.status = PlaybackStatus::Playing;
+                s
+            });
+            let pos = use_signal(|| 0.0f64);
+            let dur = use_signal(|| 180.0f64);
+            rsx! {
+                PlayerProvider {
+                    state,
+                    position_secs: pos,
+                    duration_secs: dur,
+                    on_command: move |_: PlayerCommand| {},
+                    QueueTabBody {}
+                }
+            }
+        });
+        playing_dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&playing_dom);
+        assert!(html.contains("gap-3 px-3 py-2"), "{html}");
+        assert!(html.contains("w-7 shrink-0"), "{html}");
+        assert!(html.contains("beet-eq-bar"), "{html}");
+        assert!(!html.contains("▶"), "{html}");
+
+        let mut paused_dom = VirtualDom::new(|| {
+            let state = use_signal(|| {
+                let mut s = PlayerState::default();
+                s.current_track = Some(sample_track("t1", "First Track"));
+                s.queue = vec![sample_track("t1", "First Track")];
+                s.queue_index = Some(0);
+                s.status = PlaybackStatus::Paused;
+                s
+            });
+            let pos = use_signal(|| 0.0f64);
+            let dur = use_signal(|| 180.0f64);
+            rsx! {
+                PlayerProvider {
+                    state,
+                    position_secs: pos,
+                    duration_secs: dur,
+                    on_command: move |_: PlayerCommand| {},
+                    QueueTabBody {}
+                }
+            }
+        });
+        paused_dom.rebuild_in_place();
+        let paused_html = dioxus_ssr::render(&paused_dom);
+        assert!(!paused_html.contains("beet-eq-bar"), "{paused_html}");
+        assert!(!paused_html.contains("▶"), "{paused_html}");
+        assert!(paused_html.contains("<svg"), "{paused_html}");
     }
 }

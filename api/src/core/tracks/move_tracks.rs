@@ -37,12 +37,12 @@ use crate::core::delete_guard::quota::deleting_app_in;
 use crate::core::delete_guard::{
     forget_note, paths, rules, Checked, ForgetVia, Guard, Origin, Verdict,
 };
-use crate::core::folders::owned_in;
+use crate::core::folders::{self, folder_not_found};
 use crate::core::index::{library_songs, NavidromeOf};
 use crate::core::library::{
     album_not_found, known_roots_in, listing, place_in, FolderRef, Listing, SongFacts,
 };
-use crate::folder_policy::{canonical_folder_path, PolicyFolder, PolicyRows};
+use crate::folder_policy::{canonical_folder_path, PolicyRows};
 use crate::import_queue::ImportQueue;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::folder::Folder;
@@ -55,6 +55,8 @@ pub struct MoveRequest {
     pub target_folder_id: String,
     pub dry_run: bool,
     pub replace_existing: bool,
+    pub admin_access: bool,
+    pub allow_delete: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +66,10 @@ pub(crate) struct MoveFolderSummary {
     pub path: String,
     pub shared: bool,
     pub in_navidrome: Listing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_own: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +136,7 @@ pub(crate) struct MoveReport {
 
 struct PlannedMove {
     song: NativeSong,
+    reader_user: UserId,
     source_folder_ref: FolderRef,
     source_folder_root: PathBuf,
     source_file: PathBuf,
@@ -152,7 +159,17 @@ pub(crate) async fn move_tracks(
     req: MoveRequest,
 ) -> Result<MoveReport, Failure> {
     let user = ctx.id();
-    let target_folder = owned_in(guard.db, ctx, &req.target_folder_id).await?;
+    let target_folder = Folder::get_by_id_in(guard.db, &req.target_folder_id)
+        .await
+        .map_err(|e| database_failure(Stage::Move, e))?
+        .ok_or_else(folder_not_found)?;
+    if target_folder.user_id != ctx.user_id && !req.admin_access {
+        return Err(if ctx.role.is_admin() {
+            folders::admin_access_required(ctx, req.allow_delete, Stage::Move, true)
+        } else {
+            folder_not_found()
+        });
+    }
     let target_root = canonical_folder_path(Path::new(&target_folder.path)).map_err(|e| {
         Failure::new(
             FailureCode::InvalidInput,
@@ -165,12 +182,7 @@ pub(crate) async fn move_tracks(
         .await
         .map_err(|e| database_failure(Stage::Move, e))?;
     let (policy_folders, _) = rows.inputs();
-    let user_policy_folders: Vec<PolicyFolder> = policy_folders
-        .iter()
-        .filter(|f| f.user_id == ctx.user_id)
-        .cloned()
-        .collect();
-    if is_inside_discovery(&target_root, &user_policy_folders) {
+    if is_inside_discovery(&target_root, &policy_folders) {
         return Err(Failure::new(
             FailureCode::InvalidInput,
             Stage::Move,
@@ -183,18 +195,37 @@ pub(crate) async fn move_tracks(
     let library_roots: Vec<PathBuf> = known_roots.iter().map(|(_, r)| r.clone()).collect();
     let target_place = place_in(&target_root, &known_roots);
     let target_listing = listing(&target_root, &library_roots);
+    let target_owner_name = rows
+        .folders
+        .iter()
+        .find(|r| r.folder.id == target_folder.id)
+        .map(|r| cut_json(r.owner.clone(), TEXT_MAX_CHARS));
+    let target_is_own = target_folder.user_id == ctx.user_id;
     let target_summary = MoveFolderSummary {
         folder_id: target_folder.id.clone(),
         name: cut_json(target_folder.name.clone(), TEXT_MAX_CHARS),
         path: target_root.to_string_lossy().into_owned(),
         shared: target_folder.shared,
         in_navidrome: target_listing,
+        owner: req.admin_access.then_some(target_owner_name.clone()).flatten(),
+        is_own: req.admin_access.then_some(target_is_own),
     };
     let target_ref = FolderRef {
         folder_id: target_folder.id.clone(),
         name: target_summary.name.clone(),
         shared: target_folder.shared,
+        owner: target_summary.owner.clone(),
+        is_own: target_summary.is_own,
     };
+
+    let linked_users = User::linked_to_navidrome_in(guard.db)
+        .await
+        .map_err(|e| database_failure(Stage::Move, e))?;
+    let other_users: Vec<UserId> = linked_users
+        .into_iter()
+        .filter(|u| u.id != ctx.user_id)
+        .map(|u| UserId::new(&u.id))
+        .collect();
 
     // Resolve selection into song_ids.
     let (song_ids, album_id) = match &req.selection {
@@ -210,12 +241,20 @@ pub(crate) async fn move_tracks(
             (ids.clone(), None)
         }
         TrackSelection::Album(aid) => {
-            let album = guard
+            let mut album = guard
                 .listeners
                 .album(&user, aid)
                 .await
-                .map_err(|e| e.failure(Stage::Move, e.to_string()))?
-                .ok_or_else(|| album_not_found(aid))?;
+                .map_err(|e| e.failure(Stage::Move, e.to_string()))?;
+            if album.is_none() && req.admin_access {
+                for other in &other_users {
+                    if let Ok(Some(found)) = guard.listeners.album(other, aid).await {
+                        album = Some(found);
+                        break;
+                    }
+                }
+            }
+            let album = album.ok_or_else(|| album_not_found(aid))?;
             if album.song.is_empty() {
                 return Err(Failure::new(
                     FailureCode::InvalidInput,
@@ -266,18 +305,14 @@ pub(crate) async fn move_tracks(
     let pending_discovery = DiscoveryTrackRow::pending_for_user_in(guard.db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::Move, e))?;
-    let linked_users = User::linked_to_navidrome_in(guard.db)
-        .await
-        .map_err(|e| database_failure(Stage::Move, e))?;
-    let other_users: Vec<UserId> = linked_users
-        .into_iter()
-        .filter(|u| u.id != ctx.user_id)
-        .map(|u| UserId::new(&u.id))
-        .collect();
+    let mut owner_pending_cache: HashMap<String, Vec<shared::navidrome::DiscoveryTrack>> =
+        HashMap::new();
 
     // Pre-fetch all native songs so we know how many tracks per album are in this batch.
-    let mut fetched: Vec<(String, Result<NativeSong, Failure>)> =
-        Vec::with_capacity(song_ids.len());
+    // When admin_access is enabled and the caller's Navidrome account cannot see a song
+    // in another user's private library, fall back to reading it via other linked accounts.
+    type FetchedSong = (String, Result<(NativeSong, UserId), Failure>);
+    let mut fetched: Vec<FetchedSong> = Vec::with_capacity(song_ids.len());
     let mut batch_count_by_album: HashMap<String, usize> = HashMap::new();
     for song_id in &song_ids {
         match guard.read_song(&user, song_id).await {
@@ -285,7 +320,35 @@ pub(crate) async fn move_tracks(
                 if !song.album_id.is_empty() {
                     *batch_count_by_album.entry(song.album_id.clone()).or_default() += 1;
                 }
-                fetched.push((song_id.clone(), Ok(song)));
+                fetched.push((song_id.clone(), Ok((song, user.clone()))));
+            }
+            Ok(None) if req.admin_access => {
+                let mut found_other = None;
+                for other in &other_users {
+                    if let Ok(Some(song)) = guard.read_song(other, song_id).await {
+                        found_other = Some((song, other.clone()));
+                        break;
+                    }
+                }
+                match found_other {
+                    Some((song, reader)) => {
+                        if !song.album_id.is_empty() {
+                            *batch_count_by_album.entry(song.album_id.clone()).or_default() += 1;
+                        }
+                        fetched.push((song_id.clone(), Ok((song, reader))));
+                    }
+                    None => {
+                        fetched.push((
+                            song_id.clone(),
+                            Err(Failure::new(
+                                FailureCode::UnknownHandle,
+                                Stage::Move,
+                                RetryAdvice::NotRetryable,
+                                "Navidrome has no song with this id that any linked account can see",
+                            )),
+                        ));
+                    }
+                }
             }
             Ok(None) => {
                 fetched.push((
@@ -308,8 +371,8 @@ pub(crate) async fn move_tracks(
     let mut planned_destinations: HashSet<PathBuf> = HashSet::new();
 
     for (idx, (song_id, song_res)) in fetched.into_iter().enumerate() {
-        let song = match song_res {
-            Ok(s) => s,
+        let (song, reader_user) = match song_res {
+            Ok(pair) => pair,
             Err(f) => {
                 entries[idx] = Some(MoveEntry {
                     song_id,
@@ -347,7 +410,8 @@ pub(crate) async fn move_tracks(
         }
 
         let (source_file, _file_id) =
-            match paths::local_file_learning(guard.db, &song, guard.music_path, &user).await {
+            match paths::local_file_learning(guard.db, &song, guard.music_path, &reader_user).await
+            {
                 Ok(found) => found,
                 Err(f) => {
                     entries[idx] = Some(MoveEntry {
@@ -383,21 +447,124 @@ pub(crate) async fn move_tracks(
             continue;
         }
 
-        let source_root = match rules::owning_folders(&source_file, &policy_folders, &user) {
-            Ok(root) => root.to_path_buf(),
-            Err(f) => {
+        let (source_root, source_folder_row, source_owner_name) = if req.admin_access {
+            let (pf, root) = match rules::deepest_registered_folder(&source_file, &policy_folders, &user) {
+                Ok(found) => found,
+                Err(f) => {
+                    entries[idx] = Some(MoveEntry {
+                        song_id,
+                        outcome: Err(MoveItemError {
+                            failure: Failure { stage: Stage::Move, ..f },
+                            song: Some(SongFacts::from(&song)),
+                            existing_in_target: vec![],
+                            discovery_track_id: None,
+                        }),
+                    });
+                    continue;
+                }
+            };
+            let Some(owned) = rows.folders.iter().find(|r| r.folder.id == pf.id) else {
                 entries[idx] = Some(MoveEntry {
                     song_id,
                     outcome: Err(MoveItemError {
-                        failure: Failure { stage: Stage::Move, ..f },
+                        failure: Failure::new(
+                            FailureCode::DeleteOutsideLibrary,
+                            Stage::Move,
+                            RetryAdvice::NotRetryable,
+                            "The file is not inside any registered library folder",
+                        ),
                         song: Some(SongFacts::from(&song)),
                         existing_in_target: vec![],
                         discovery_track_id: None,
                     }),
                 });
                 continue;
-            }
+            };
+            (
+                root.to_path_buf(),
+                &owned.folder,
+                Some(cut_json(owned.owner.clone(), TEXT_MAX_CHARS)),
+            )
+        } else {
+            let source_root = match rules::owning_folders(&source_file, &policy_folders, &user) {
+                Ok(root) => root.to_path_buf(),
+                Err(f) => {
+                    let failure = if ctx.role.is_admin()
+                        && rules::deepest_registered_folder(&source_file, &policy_folders, &user)
+                            .is_ok()
+                    {
+                        folders::admin_access_required(ctx, req.allow_delete, Stage::Move, true)
+                    } else {
+                        Failure { stage: Stage::Move, ..f }
+                    };
+                    entries[idx] = Some(MoveEntry {
+                        song_id,
+                        outcome: Err(MoveItemError {
+                            failure,
+                            song: Some(SongFacts::from(&song)),
+                            existing_in_target: vec![],
+                            discovery_track_id: None,
+                        }),
+                    });
+                    continue;
+                }
+            };
+            let Some(folder_row) = find_user_folder(&rows, &ctx.user_id, &source_root) else {
+                entries[idx] = Some(MoveEntry {
+                    song_id,
+                    outcome: Err(MoveItemError {
+                        failure: Failure::new(
+                            FailureCode::DeleteOutsideLibrary,
+                            Stage::Move,
+                            RetryAdvice::NotRetryable,
+                            "The file is not inside one of your library folders",
+                        ),
+                        song: Some(SongFacts::from(&song)),
+                        existing_in_target: vec![],
+                        discovery_track_id: None,
+                    }),
+                });
+                continue;
+            };
+            (source_root, folder_row, None)
         };
+
+        // Also check pending_discovery for the source folder's owner when moving across users.
+        if source_folder_row.user_id != ctx.user_id {
+            if !owner_pending_cache.contains_key(&source_folder_row.user_id) {
+                let owner_pending =
+                    DiscoveryTrackRow::pending_for_user_in(guard.db, &source_folder_row.user_id)
+                        .await
+                        .map_err(|e| database_failure(Stage::Move, e))?;
+                owner_pending_cache.insert(source_folder_row.user_id.clone(), owner_pending);
+            }
+            if let Some(track) = owner_pending_cache
+                .get(&source_folder_row.user_id)
+                .and_then(|list| {
+                    list.iter().find(|t| {
+                        t.song_id.as_deref() == Some(song.id.as_str())
+                            || std::fs::canonicalize(&t.path)
+                                .is_ok_and(|staged| staged == source_file)
+                    })
+                })
+            {
+                entries[idx] = Some(MoveEntry {
+                    song_id,
+                    outcome: Err(MoveItemError {
+                        failure: Failure::new(
+                            FailureCode::InvalidInput,
+                            Stage::Move,
+                            RetryAdvice::NotRetryable,
+                            "This is a pending discovery track in the source folder owner's staging area; promote or remove it first",
+                        ),
+                        song: Some(SongFacts::from(&song)),
+                        existing_in_target: vec![],
+                        discovery_track_id: Some(track.id.clone()),
+                    }),
+                });
+                continue;
+            }
+        }
 
         if let Err(f) = rules::audio_file(&source_file) {
             entries[idx] = Some(MoveEntry {
@@ -412,27 +579,13 @@ pub(crate) async fn move_tracks(
             continue;
         }
 
-        let Some(source_folder_row) = find_user_folder(&rows, &ctx.user_id, &source_root) else {
-            entries[idx] = Some(MoveEntry {
-                song_id,
-                outcome: Err(MoveItemError {
-                    failure: Failure::new(
-                        FailureCode::DeleteOutsideLibrary,
-                        Stage::Move,
-                        RetryAdvice::NotRetryable,
-                        "The file is not inside one of your library folders",
-                    ),
-                    song: Some(SongFacts::from(&song)),
-                    existing_in_target: vec![],
-                    discovery_track_id: None,
-                }),
-            });
-            continue;
-        };
+        let source_is_own = source_folder_row.user_id == ctx.user_id;
         let source_folder_ref = FolderRef {
             folder_id: source_folder_row.id.clone(),
             name: cut_json(source_folder_row.name.clone(), TEXT_MAX_CHARS),
             shared: source_folder_row.shared,
+            owner: req.admin_access.then_some(source_owner_name).flatten(),
+            is_own: req.admin_access.then_some(source_is_own),
         };
 
         if source_root == target_root {
@@ -515,7 +668,7 @@ pub(crate) async fn move_tracks(
         }
 
         // Check destination file collision and logical duplicates already in target_root.
-        let existing_in_target = find_target_duplicates(
+        let mut existing_in_target = find_target_duplicates(
             guard,
             &user,
             &song,
@@ -523,6 +676,19 @@ pub(crate) async fn move_tracks(
             &target_file,
         )
         .await?;
+        if req.admin_access && target_folder.user_id != ctx.user_id {
+            let target_owner = UserId::new(&target_folder.user_id);
+            if let Ok(extra) =
+                find_target_duplicates(guard, &target_owner, &song, &target_root, &target_file)
+                    .await
+            {
+                for dup in extra {
+                    if !existing_in_target.iter().any(|e| e.id == dup.id) {
+                        existing_in_target.push(dup);
+                    }
+                }
+            }
+        }
         let path_exists = tokio::fs::try_exists(&target_file)
             .await
             .map_err(|e| {
@@ -662,7 +828,16 @@ pub(crate) async fn move_tracks(
                 || other_folder_overlaps_source
                 || another_user_sees_song;
             if may_hide_from_others && !target_folder.shared {
-                if let Err(f) = check_multi_user_veto(guard, &user, &ctx.username, &song, &source_file).await {
+                if let Err(f) = check_multi_user_veto(
+                    guard,
+                    &user,
+                    &ctx.username,
+                    &reader_user,
+                    &song,
+                    &source_file,
+                )
+                .await
+                {
                     let mut sf = SongFacts::from(&song);
                     sf.folder = Some(source_folder_ref);
                     entries[idx] = Some(MoveEntry {
@@ -693,7 +868,7 @@ pub(crate) async fn move_tracks(
             if !album_cache.contains_key(&song.album_id) {
                 let fetched_album = guard
                     .listeners
-                    .album(&user, &song.album_id)
+                    .album(&reader_user, &song.album_id)
                     .await
                     .ok()
                     .flatten();
@@ -731,6 +906,7 @@ pub(crate) async fn move_tracks(
             idx,
             PlannedMove {
                 song,
+                reader_user,
                 source_folder_ref,
                 source_folder_root: source_root,
                 source_file,
@@ -993,12 +1169,32 @@ pub(crate) async fn move_tracks(
 
     // Track which split albums we already checked/restored so we only do it once per album.
     let mut restored_albums: HashMap<String, bool> = HashMap::new();
+    let target_owner_navi = if req.admin_access && target_folder.user_id != ctx.user_id {
+        navidrome
+            .navidrome_of(&UserId::new(&target_folder.user_id))
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     for mut m in moved {
         let (status, new_song_id, song_id_preserved, updated_song) = match &scan_outcome {
             Some(ScanWaitOutcome::Completed) => {
-                match own_navi.get_native_song(&m.plan.song.id).await {
-                    Ok(Some(found)) if !found.missing => {
+                let verify_song = match own_navi.get_native_song(&m.plan.song.id).await {
+                    Ok(Some(found)) if !found.missing => Some(found),
+                    _ => match &target_owner_navi {
+                        Some(other_navi) => other_navi
+                            .get_native_song(&m.plan.song.id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .filter(|f| !f.missing),
+                        None => None,
+                    },
+                };
+                match verify_song {
+                    Some(found) => {
                         let _ = paths::learn_in(guard.db, std::slice::from_ref(&found), &m.plan.target_file).await;
                         let matches_dst = paths::names_file(
                             guard.db,
@@ -1019,7 +1215,7 @@ pub(crate) async fn move_tracks(
                             ("moved_pending_scan".to_string(), Some(found.id.clone()), None, found)
                         }
                     }
-                    _ => {
+                    None => {
                         // Look up by destination path to see if Navidrome assigned a new ID.
                         let rel = m
                             .plan
@@ -1036,10 +1232,20 @@ pub(crate) async fn move_tracks(
                             release_mbid: None,
                             match_per_mille: None,
                         };
-                        let found_new = library_songs(&own_navi, &target_root, &item)
+                        let found_new = match library_songs(&own_navi, &target_root, &item)
                             .await
                             .ok()
-                            .and_then(|v| v.into_iter().next());
+                            .and_then(|v| v.into_iter().next())
+                        {
+                            Some(s) => Some(s),
+                            None => match &target_owner_navi {
+                                Some(other_navi) => library_songs(other_navi, &target_root, &item)
+                                    .await
+                                    .ok()
+                                    .and_then(|v| v.into_iter().next()),
+                                None => None,
+                            },
+                        };
                         if let Some(new_song) = found_new {
                             let _ = paths::learn_in(
                                 guard.db,
@@ -1113,39 +1319,47 @@ pub(crate) async fn move_tracks(
             ),
         };
 
-        // Restore caller's album rating/star on old_album_id if Navidrome's ReassignAnnotation
+        // Restore reader's album rating/star on old_album_id if Navidrome's ReassignAnnotation
         // stole it during a partial-album cross-library move.
         let mut album_annotation_restored = false;
         if matches!(scan_outcome, Some(ScanWaitOutcome::Completed)) {
             if let Some((old_album_id, old_rating, old_starred)) = &m.plan.album_annotation {
-                if let Some(&already) = restored_albums.get(old_album_id) {
+                let restore_key = format!("{}:{old_album_id}", m.plan.reader_user);
+                if let Some(&already) = restored_albums.get(&restore_key) {
                     album_annotation_restored = already;
                 } else {
                     let mut restored = false;
-                    if let Ok(Some(current)) = own_navi.get_album(old_album_id).await {
-                        if *old_rating > 0 && current.user_rating.unwrap_or(0) == 0 {
-                            if let Err(e) = own_navi.set_rating(old_album_id, *old_rating).await {
-                                m.warnings.push(format!(
-                                    "Could not restore your {old_rating}-star rating on the original album: {e}"
-                                ));
-                            } else {
-                                restored = true;
+                    let reader_navi = if m.plan.reader_user == user {
+                        Some(own_navi.clone())
+                    } else {
+                        navidrome.navidrome_of(&m.plan.reader_user).await.ok()
+                    };
+                    if let Some(ref navi_client) = reader_navi {
+                        if let Ok(Some(current)) = navi_client.get_album(old_album_id).await {
+                            if *old_rating > 0 && current.user_rating.unwrap_or(0) == 0 {
+                                if let Err(e) = navi_client.set_rating(old_album_id, *old_rating).await {
+                                    m.warnings.push(format!(
+                                        "Could not restore your {old_rating}-star rating on the original album: {e}"
+                                    ));
+                                } else {
+                                    restored = true;
+                                }
                             }
-                        }
-                        if *old_starred && current.starred.is_none() {
-                            if let Err(e) = own_navi
-                                .set_star(StarTarget::Album(old_album_id), true)
-                                .await
-                            {
-                                m.warnings.push(format!(
-                                    "Could not restore your star on the original album: {e}"
-                                ));
-                            } else {
-                                restored = true;
+                            if *old_starred && current.starred.is_none() {
+                                if let Err(e) = navi_client
+                                    .set_star(StarTarget::Album(old_album_id), true)
+                                    .await
+                                {
+                                    m.warnings.push(format!(
+                                        "Could not restore your star on the original album: {e}"
+                                    ));
+                                } else {
+                                    restored = true;
+                                }
                             }
                         }
                     }
-                    restored_albums.insert(old_album_id.clone(), restored);
+                    restored_albums.insert(restore_key, restored);
                     album_annotation_restored = restored;
                 }
             }
@@ -1221,19 +1435,19 @@ fn find_user_folder<'a>(rows: &'a PolicyRows, user_id: &str, canonical: &Path) -
 }
 
 /// Runs the delete guard's multi-user veto checks (rules 3 & 4) on a move that could hide
-/// `song` from another listener.
+/// `song` from another listener. `reader` is the account that can see `song` in Navidrome
+/// (usually `actor`, or another linked account during an admin cross-user move).
 async fn check_multi_user_veto(
     guard: &Guard<'_>,
     actor: &UserId,
     actor_name: &str,
+    reader: &UserId,
     song: &NativeSong,
     path: &Path,
 ) -> Result<(), Failure> {
-    guard.one_song(actor, song, path).await?;
-    let others = guard.others_permit(actor, actor_name, song, path).await?;
-    let _ = guard.own_playlists(actor, actor_name, &song.id).await?;
-    let _ = guard.no_unknown_rater(actor, song, &others).await?;
-    Ok(())
+    guard
+        .check_move_veto(actor, actor_name, reader, song, path)
+        .await
 }
 
 /// Finds Navidrome songs in `target_root` that either occupy `target_file` or match `song`

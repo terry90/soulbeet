@@ -38,6 +38,17 @@ pub async fn set_app_deletion(grant_id: String, allowed: bool) -> Result<(), Ser
     }
 }
 
+/// Lets an admin's own connected app access all users' library folders (or turns it off).
+/// Only an admin can toggle this, and only grants belonging to an admin user can enable it.
+#[post("/api/connected-apps/admin", auth: AdminSession)]
+pub async fn set_grant_allow_admin(grant_id: String, allowed: bool) -> Result<(), ServerFnError> {
+    match grants::set_allow_admin_in(&DB, &auth.0, &grant_id, allowed).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(app_not_found()),
+        Err(e) => Err(database_error(e)),
+    }
+}
+
 /// Disconnects an app of the caller's, or any user's for an admin.
 #[post("/api/connected-apps/revoke", auth: AuthSession)]
 pub async fn revoke_connected_app(grant_id: String) -> Result<(), ServerFnError> {

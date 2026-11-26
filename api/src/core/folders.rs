@@ -3,7 +3,7 @@
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::db::DB;
-use crate::models::folder::Folder;
+use crate::models::folder::{Folder, OwnedFolder};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use sqlx::SqlitePool;
 
@@ -13,6 +13,33 @@ pub fn folder_not_found() -> Failure {
         Stage::Input,
         RetryAdvice::NotRetryable,
         "Folder not found",
+    )
+}
+
+/// Clear, actionable refusal when a caller tries to access or move tracks involving another
+/// user's folder without effective admin library access.
+pub(crate) fn admin_access_required(
+    ctx: &UserCtx,
+    allow_delete: bool,
+    stage: Stage,
+    for_move: bool,
+) -> Failure {
+    let message = if !ctx.role.is_admin() {
+        if for_move && !allow_delete {
+            "Accessing or moving tracks in another user's folder requires an Admin Soulbeet account (assign Admin role in Settings > Users), plus 'Admin library access (all users' folders)' and 'Allow managing library files (delete, move, re-tag)' enabled for this app in Settings > Users > Connected apps"
+        } else {
+            "Accessing another user's folder requires an Admin Soulbeet account (assign Admin role in Settings > Users) and 'Admin library access (all users' folders)' enabled for this app in Settings > Users > Connected apps"
+        }
+    } else if for_move && !allow_delete {
+        "Moving tracks in another user's folder requires both 'Admin library access (all users' folders)' and 'Allow managing library files (delete, move, re-tag)' enabled for this app in Settings > Users > Connected apps"
+    } else {
+        "Accessing another user's folder requires 'Admin library access (all users' folders)' enabled for this app in Settings > Users > Connected apps"
+    };
+    Failure::new(
+        FailureCode::PermissionNotGranted,
+        stage,
+        RetryAdvice::NeedsUser,
+        message,
     )
 }
 
@@ -32,6 +59,21 @@ pub(crate) async fn list_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<Folder
     Folder::get_all_by_user_in(db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))
+}
+
+/// Every registered library folder across all users, with owner usernames.
+pub(crate) async fn list_all_with_owners_in(db: &SqlitePool) -> Result<Vec<OwnedFolder>, Failure> {
+    Folder::get_all_with_owners_in(db)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))
+}
+
+/// Any registered folder by id, regardless of owner (for admin-authorized flows).
+pub(crate) async fn get_in(db: &SqlitePool, folder_id: &str) -> Result<Folder, Failure> {
+    Folder::get_by_id_in(db, folder_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?
+        .ok_or_else(folder_not_found)
 }
 
 /// The folder `folder_id` names, when `ctx` owns it.

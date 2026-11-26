@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 struct StubState {
     base_url: Mutex<String>,
     playlist_fetch_count: AtomicUsize,
+    static_playlist_fetch_count: AtomicUsize,
     remote_search_hits: AtomicUsize,
     fail_star_409_retryable: AtomicBool,
     fail_drop_409_permanent: AtomicBool,
@@ -47,6 +48,11 @@ struct StubState {
     download_returns_json_error: AtomicBool,
     cover_art_returns_json_error: AtomicBool,
     ws_query_params: Mutex<Option<HashMap<String, String>>>,
+    ws_ping_count: AtomicUsize,
+    ws_pong_count: AtomicUsize,
+    ws_connect_count: AtomicUsize,
+    ws_drop_first_connection: AtomicBool,
+    ws_send_server_ping: AtomicBool,
     accepted_auth_token: Mutex<String>,
 }
 
@@ -486,16 +492,58 @@ async fn handle_get_album(Query(q): Query<HashMap<String, String>>) -> Json<Valu
 }
 
 async fn handle_get_playlists(State(st): State<Arc<StubState>>) -> Json<Value> {
-    let mut pls = vec![json!({
-        "id": "pl1",
-        "name": "Noël à la Française",
-        "comment": "seasonal:winter_holiday",
-        "owner": "alice",
-        "songCount": 1,
-        "duration": 369,
-        "coverArt": "ca-pl1",
-        "changed": "2026-11-15T12:00:00Z"
-    })];
+    let mut pls = vec![
+        json!({
+            "id": "pl1",
+            "name": "Noël à la Française",
+            "comment": "soulbeet:contextual:winter_holiday",
+            "owner": "alice",
+            "songCount": 0,
+            "duration": 369,
+            "coverArt": "ca-pl1",
+            "changed": "2026-11-15T12:00:00Z"
+        }),
+        json!({
+            "id": "pl-static",
+            "name": "Roadtrip Favorites",
+            "comment": null,
+            "owner": "alice",
+            "songCount": 231,
+            "duration": 99999,
+            "coverArt": "ca-pl-static",
+            "changed": "2026-11-15T12:00:00Z"
+        }),
+        json!({
+            "id": "pl-disc",
+            "name": "Balanced",
+            "comment": "Soulbeet Discovery - Balanced",
+            "owner": "alice",
+            "songCount": 1,
+            "duration": 369,
+            "coverArt": null,
+            "changed": "2026-11-15T12:00:00Z"
+        }),
+        json!({
+            "id": "pl-moment",
+            "name": "Soulbeet: Drive",
+            "comment": "soulbeet:contextual:drive",
+            "owner": "alice",
+            "songCount": 1,
+            "duration": 369,
+            "coverArt": null,
+            "changed": "2026-11-15T12:00:00Z"
+        }),
+        json!({
+            "id": "pl-custom-smart",
+            "name": "90s Classics",
+            "comment": "Custom smart playlist",
+            "owner": "alice",
+            "songCount": 1,
+            "duration": 369,
+            "coverArt": null,
+            "changed": "2026-11-15T12:00:00Z"
+        }),
+    ];
     if !st.hide_extra_playlist.load(Ordering::SeqCst) {
         pls.push(json!({
             "id": "pl-ephemeral",
@@ -525,16 +573,27 @@ async fn handle_get_playlist(
     let pl_id = q.get("id").cloned().unwrap_or_else(|| "pl1".to_string());
     if pl_id == "pl1" {
         st.playlist_fetch_count.fetch_add(1, Ordering::SeqCst);
+    } else if pl_id == "pl-static" {
+        st.static_playlist_fetch_count
+            .fetch_add(1, Ordering::SeqCst);
     }
+    let (name, comment) = match pl_id.as_str() {
+        "pl1" => ("Noël à la Française", json!("soulbeet:contextual:winter_holiday")),
+        "pl-static" => ("Roadtrip Favorites", Value::Null),
+        "pl-disc" => ("Balanced", json!("Soulbeet Discovery - Balanced")),
+        "pl-moment" => ("Soulbeet: Drive", json!("soulbeet:contextual:drive")),
+        "pl-custom-smart" => ("90s Classics", json!("Custom smart playlist")),
+        _ => ("Temp Mix", Value::Null),
+    };
     Json(json!({
         "subsonic-response": {
             "status": "ok",
             "playlist": {
                 "id": pl_id,
-                "name": if pl_id == "pl1" { "Noël à la Française" } else { "Temp Mix" },
-                "comment": if pl_id == "pl1" { json!("seasonal:winter_holiday") } else { Value::Null },
+                "name": name,
+                "comment": comment,
                 "owner": "alice",
-                "songCount": 1,
+                "songCount": if pl_id == "pl-static" { 231 } else { 1 },
                 "duration": 369,
                 "coverArt": "ca-pl1",
                 "changed": "2026-11-15T12:00:00Z",
@@ -630,18 +689,84 @@ async fn handle_ws_connect(
     if !check_soulbeet_auth(&st, &headers).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    *st.ws_query_params.lock().await = Some(q);
-    ws.on_upgrade(handle_ws_socket).into_response()
+    *st.ws_query_params.lock().await = Some(q.clone());
+    let conn_num = st.ws_connect_count.fetch_add(1, Ordering::SeqCst) + 1;
+    let st_clone = st.clone();
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, st_clone, q, conn_num))
+        .into_response()
 }
 
-async fn handle_ws_socket(mut socket: WebSocket) {
+async fn handle_ws_socket(
+    mut socket: WebSocket,
+    st: Arc<StubState>,
+    q: HashMap<String, String>,
+    conn_num: usize,
+) {
+    // Register directly from query params and immediately emit DeviceList (just like real Soulbeet server).
+    let device_id = q
+        .get("device_id")
+        .cloned()
+        .unwrap_or_else(|| "desktop-1".to_string());
+    let name = q
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "Linux Studio".to_string());
+    let platform = match q.get("platform").map(String::as_str) {
+        Some("android") => DevicePlatform::Android,
+        Some("android_auto") => DevicePlatform::AndroidAuto,
+        Some("web") => DevicePlatform::Web,
+        _ => DevicePlatform::Desktop,
+    };
+    let initial_event = ConnectServerEventDto::DeviceList {
+        devices: vec![
+            ConnectDeviceDto {
+                device_id: device_id.clone(),
+                name,
+                platform,
+                is_active: true,
+                last_seen_unix: now_unix(),
+                snapshot: None,
+            },
+            ConnectDeviceDto {
+                device_id: "android-1".to_string(),
+                name: "Pixel".to_string(),
+                platform: DevicePlatform::Android,
+                is_active: false,
+                last_seen_unix: now_unix(),
+                snapshot: None,
+            },
+        ],
+        active_device_id: Some(device_id),
+    };
+    let _ = socket
+        .send(Message::Binary(
+            serde_json::to_vec(&initial_event).unwrap().into(),
+        ))
+        .await;
+
+    if conn_num == 1 && st.ws_drop_first_connection.load(Ordering::SeqCst) {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+    if st.ws_send_server_ping.load(Ordering::SeqCst) {
+        let _ = socket.send(Message::Ping(b"srv-ping".to_vec().into())).await;
+    }
+
     // Emit JSON over Message::Binary just like Dioxus 0.7 TypedWebsocket!
     while let Some(Ok(msg)) = socket.recv().await {
         let raw_bytes: Option<Vec<u8>> = match msg {
             Message::Text(text) => Some(text.as_bytes().to_vec()),
             Message::Binary(bytes) => Some(bytes.to_vec()),
+            Message::Ping(payload) => {
+                st.ws_ping_count.fetch_add(1, Ordering::SeqCst);
+                let _ = socket.send(Message::Pong(payload)).await;
+                None
+            }
+            Message::Pong(_) => {
+                st.ws_pong_count.fetch_add(1, Ordering::SeqCst);
+                None
+            }
             Message::Close(_) => break,
-            _ => None,
         };
         let Some(bytes) = raw_bytes else {
             continue;
@@ -763,9 +888,38 @@ async fn full_and_delta_sync_populates_mirror_normalizes_triage_prunes_playlists
     assert_eq!(report.artists_synced, 2);
     assert_eq!(report.albums_synced, 1);
     assert_eq!(report.tracks_synced, 2);
-    assert_eq!(report.playlists_synced, 2);
+    assert_eq!(report.playlists_synced, 6);
     assert_eq!(report.discovery_tracks_synced, 1);
     assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(state.static_playlist_fetch_count.load(Ordering::SeqCst), 1);
+
+    // Verify playlist classification from server comment markers + authoritative live song_count
+    let playlists = core.list_playlists().await.unwrap();
+    let pl1 = playlists.iter().find(|p| p.id == "pl1").unwrap();
+    assert_eq!(pl1.kind, "seasonal");
+    assert_eq!(pl1.slug.as_deref(), Some("winter_holiday"));
+    assert!(pl1.is_smart);
+    assert_eq!(pl1.song_count, 1);
+
+    let pl_static = playlists.iter().find(|p| p.id == "pl-static").unwrap();
+    assert_eq!(pl_static.kind, "user");
+    assert!(!pl_static.is_smart);
+    // Navidrome summary claimed 231 stale rows, but only 1 live entry exists!
+    assert_eq!(pl_static.song_count, 1);
+    assert_eq!(pl_static.duration_secs, 369);
+
+    let pl_disc = playlists.iter().find(|p| p.id == "pl-disc").unwrap();
+    assert_eq!(pl_disc.kind, "discovery");
+    assert!(pl_disc.is_smart);
+
+    let pl_moment = playlists.iter().find(|p| p.id == "pl-moment").unwrap();
+    assert_eq!(pl_moment.kind, "moment");
+    assert_eq!(pl_moment.slug.as_deref(), Some("drive"));
+    assert!(pl_moment.is_smart);
+
+    let pl_smart = playlists.iter().find(|p| p.id == "pl-custom-smart").unwrap();
+    assert_eq!(pl_smart.kind, "smart");
+    assert!(pl_smart.is_smart);
 
     // Bootstrap persisted promote_threshold into sync_cursor
     assert_eq!(
@@ -839,14 +993,24 @@ async fn full_and_delta_sync_populates_mirror_normalizes_triage_prunes_playlists
     let delta = core.sync_now(false).await.unwrap();
     assert!(!delta.full_sync);
     assert_eq!(delta.albums_synced, 1); // only new album al2 fetched
-    assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 1); // unchanged pl1 NOT re-fetched!
+    // Smart playlist pl1 IS re-fetched on delta sync; unchanged static pl-static is NOT re-fetched
+    // even though Navidrome summary still reports stale songCount=231 vs live count=1!
+    assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 2);
+    assert_eq!(state.static_playlist_fetch_count.load(Ordering::SeqCst), 1);
+
+    // Static playlist retains authoritative live count = 1 after delta sync!
+    let refreshed_pls = core.list_playlists().await.unwrap();
+    assert_eq!(
+        refreshed_pls.iter().find(|p| p.id == "pl-static").unwrap().song_count,
+        1
+    );
 
     // Deleted playlist pl-ephemeral was pruned!
     let pl_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM playlists")
         .fetch_one(core.pool())
         .await
         .unwrap();
-    assert_eq!(pl_count, 1);
+    assert_eq!(pl_count, 5);
 
     // Pending outbox mutations were NOT clobbered by sync (neither starred nor is_discovery nor discovery_tracks.status)!
     assert!(get_track(core.pool(), "s1").await.unwrap().unwrap().starred);
@@ -1296,10 +1460,10 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     let now = now_unix();
 
-    // Seed 35 playlists (> AUTO_PLAYLISTS_LIMIT=24) including a Seasonal Noël pack,
+    // Seed 45 playlists (> AUTO_PLAYLISTS_LIMIT=24 user playlists) including a Seasonal Noël pack,
     // a short "Punk" playlist (to ensure it does NOT hijack "Play Daft Punk"!),
     // and 14 discovery/moment playlists where the 14th is offline-cached (beyond AUTO_FOR_YOU_LIMIT=12).
-    for i in 0..35 {
+    for i in 0..45 {
         let pl_id = format!("pl-{i}");
         let (name, kind, slug) = match i {
             0 => (
@@ -1475,13 +1639,16 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
     assert!(for_you_offline.iter().any(|n| n.id == "playlist:pl-0"));
     assert!(for_you_offline.iter().any(|n| n.id == "playlist:pl-15"));
 
-    // 3. Playlists capped strictly <= 24
+    // 3. Playlists capped strictly <= 24 and filtered strictly to kind = 'user' (no smart mixes!)
     let pls = core
         .auto_browse()
         .children(AUTO_TAB_PLAYLISTS, false)
         .await
         .unwrap();
     assert_eq!(pls.len(), AUTO_PLAYLISTS_LIMIT);
+    assert!(pls.iter().all(|n| !n.is_pending_discovery));
+    assert!(!pls.iter().any(|n| n.id == "playlist:pl-0"));
+    assert!(!pls.iter().any(|n| n.id == "playlist:pl-2"));
 
     // 4. Library has Offline, Recent (<=25), and 6 A-Z buckets
     let lib = core
@@ -1653,4 +1820,49 @@ async fn connect_ws_sends_query_params_decodes_binary_frames_prunes_snapshots_an
     assert!(!live_state.snapshots.contains_key("android-1"));
 
     core.connect_client().disconnect().await;
+}
+
+#[tokio::test]
+async fn connect_ws_sends_ping_with_heartbeat_and_auto_reconnects_after_server_drop() {
+    let state = Arc::new(StubState::default());
+    state.ws_drop_first_connection.store(true, Ordering::SeqCst);
+    state.ws_send_server_ping.store(true, Ordering::SeqCst);
+    let base_url = start_stub_server(state.clone()).await;
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
+        .await
+        .unwrap();
+
+    let mut rx = core.connect_client().subscribe();
+    core.connect_ws(Duration::from_secs(1)).await.unwrap();
+
+    // First connection delivers DeviceList then server closes socket.
+    let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(first, ConnectServerEventDto::DeviceList { .. }));
+
+    // Supervisor automatically reconnects with 1s initial backoff and delivers a second DeviceList.
+    let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(second, ConnectServerEventDto::DeviceList { .. }));
+    assert!(state.ws_connect_count.load(Ordering::SeqCst) >= 2);
+    assert!(core.connect_client().state().await.connected);
+
+    // Wait for at least one heartbeat tick (1s) and verify both WS Ping and Pong frames reached server.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(
+        state.ws_ping_count.load(Ordering::SeqCst) >= 1,
+        "expected at least one WS Ping frame alongside Heartbeat"
+    );
+    assert!(
+        state.ws_pong_count.load(Ordering::SeqCst) >= 1,
+        "expected WS Pong frame in reply to server Ping"
+    );
+
+    core.connect_client().disconnect().await;
+    assert!(!core.connect_client().state().await.connected);
 }

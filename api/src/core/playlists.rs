@@ -135,20 +135,84 @@ fn owns(p: &SubsonicPlaylist, username: &str) -> bool {
     p.owner.eq_ignore_ascii_case(username)
 }
 
+/// Whether a playlist comment indicates a Soulbeet-managed smart playlist (discovery or
+/// seasonal/contextual), used as a fallback if the native `/api/playlist` list is unavailable.
+fn is_soulbeet_smart_comment(comment: Option<&str>) -> bool {
+    let Some(c) = comment else {
+        return false;
+    };
+    let lower = c.trim().to_ascii_lowercase();
+    lower.starts_with("soulbeet discovery") || lower.starts_with("soulbeet:contextual:")
+}
+
 /// The caller's own playlists and other users' public ones, in Navidrome's
 /// order, by name (server/subsonic/playlists.go:18-30). Navidrome lists an
 /// admin every playlist (persistence/playlist_repository.go:84-93); another
 /// user's private one is left out.
+///
+/// For smart playlists (detected via native `GET /api/playlist` `rules` or Soulbeet
+/// discovery/contextual comments), resolves accurate live non-missing `song_count` and
+/// `duration_s` from `getPlaylist` (`entry.len()`) so callers never see stale `missing = true`
+/// counts.
 pub async fn list(navi: &NavidromeClient, ctx: &UserCtx) -> Result<Vec<PlaylistFacts>, Failure> {
     let playlists = navi
         .get_playlists()
         .await
         .map_err(|e| navidrome_failure(Stage::Playlist, &e))?;
-    Ok(playlists
+    let mut listed: Vec<PlaylistFacts> = playlists
         .iter()
         .map(|p| facts(p, &ctx.username))
         .filter(|p| p.owned || p.public)
-        .collect())
+        .collect();
+
+    if listed.is_empty() {
+        return Ok(listed);
+    }
+
+    let native_by_id: HashMap<String, NativePlaylist> = match navi.get_native_playlists().await {
+        Ok(list) => list.into_iter().map(|np| (np.id.clone(), np)).collect(),
+        Err(e) => {
+            tracing::debug!("Could not list native playlists for smart detection: {e}");
+            HashMap::new()
+        }
+    };
+
+    let mut smart_indices: Vec<usize> = Vec::new();
+    for (idx, item) in listed.iter_mut().enumerate() {
+        let native = native_by_id.get(&item.playlist_id);
+        let is_smart = match native {
+            Some(n) => n.is_smart(),
+            None => is_soulbeet_smart_comment(item.comment.as_deref()),
+        };
+        if is_smart {
+            item.smart = Some(true);
+            if let Some(rules) = native.and_then(|n| n.rules.clone()) {
+                item.rules = Some(rules);
+            }
+            smart_indices.push(idx);
+        }
+    }
+
+    if !smart_indices.is_empty() {
+        use futures::StreamExt;
+        let refreshed: Vec<_> = futures::stream::iter(smart_indices.into_iter().map(|idx| {
+            let id = listed[idx].playlist_id.clone();
+            async move { (idx, navi.get_playlist_with_entries(&id).await) }
+        }))
+        .buffer_unordered(4)
+        .collect()
+        .await;
+        for (idx, res) in refreshed {
+            if let Ok(Some((_, entries))) = res {
+                listed[idx].song_count = entries.len() as u32;
+                listed[idx].duration_s = entries
+                    .iter()
+                    .fold(0u32, |acc, e| acc.saturating_add(e.duration.unwrap_or(0)));
+            }
+        }
+    }
+
+    Ok(listed)
 }
 
 /// The playlist and every track of it in Navidrome's order, missing files
@@ -2400,5 +2464,99 @@ mod tests {
         assert_eq!(w.song_ids, ids(&[HOLY.0, SILENT.0]));
         assert!(!asked(&navi).contains(&"/rest/updatePlaylist".to_string()));
         assert!(asked(&navi).contains(&format!("/api/playlist/{ADVENT}")));
+    }
+
+    #[tokio::test]
+    async fn list_resolves_live_song_count_for_smart_playlists() {
+        let navi = NavidromeStub::start();
+        let stale_smart = json!({
+            "id": "p-smart",
+            "name": "Fresh Picks",
+            "comment": "Custom smart rules",
+            "songCount": 231,
+            "duration": 50000,
+            "public": false,
+            "owner": "alice",
+            "created": "2026-11-10T18:00:00Z",
+            "changed": "2026-11-10T18:00:00Z"
+        })
+        .to_string();
+        let stale_discovery = json!({
+            "id": "p-disc",
+            "name": "Deep Cuts",
+            "comment": "Soulbeet discovery (Adventurous)",
+            "songCount": 44,
+            "duration": 9000,
+            "public": false,
+            "owner": "alice",
+            "created": "2026-11-10T18:00:00Z",
+            "changed": "2026-11-10T18:00:00Z"
+        })
+        .to_string();
+        let static_pl = pl("p-static", "Christmas", "alice", false);
+
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&playlists(&[&stale_smart, &stale_discovery, &static_pl])],
+        );
+        navi.answer(
+            "/api/playlist",
+            &[&json!([
+                {
+                    "id": "p-smart",
+                    "name": "Fresh Picks",
+                    "ownerName": "alice",
+                    "sync": false,
+                    "songCount": 231,
+                    "rules": {"all": [{"gt": {"rating": 3}}]}
+                },
+                {
+                    "id": "p-static",
+                    "name": "Christmas",
+                    "ownerName": "alice",
+                    "sync": false,
+                    "songCount": 2,
+                    "rules": null
+                }
+            ])
+            .to_string()],
+        );
+        navi.answer_when(
+            "/rest/getPlaylist",
+            "id=p-smart",
+            200,
+            &playlist_answer(
+                &stale_smart,
+                &[
+                    child("s1", "Marrow Choir", "O Holy Night"),
+                    child("s2", "Marrow Choir", "Silent Night"),
+                ],
+            ),
+        );
+        navi.answer_when(
+            "/rest/getPlaylist",
+            "id=p-disc",
+            200,
+            &playlist_answer(&stale_discovery, &[child("s3", "Air", "La Femme d'Argent")]),
+        );
+
+        let listed = list(&navi.client(), &alice(Role::User)).await.unwrap();
+        let smart = listed.iter().find(|p| p.playlist_id == "p-smart").unwrap();
+        assert_eq!(smart.smart, Some(true));
+        assert_eq!(smart.song_count, 2);
+        assert_eq!(smart.duration_s, 526);
+
+        let disc = listed.iter().find(|p| p.playlist_id == "p-disc").unwrap();
+        assert_eq!(disc.smart, Some(true));
+        assert_eq!(disc.song_count, 1);
+
+        let stat = listed.iter().find(|p| p.playlist_id == "p-static").unwrap();
+        assert_eq!(stat.smart, None);
+        assert_eq!(stat.song_count, 0);
+        assert!(
+            !navi.asked().iter().any(|u| u.contains("id=p-static")),
+            "static playlist should not trigger extra getPlaylist call: {:?}",
+            navi.asked()
+        );
     }
 }

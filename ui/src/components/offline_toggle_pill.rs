@@ -20,10 +20,11 @@ pub fn format_offline_telemetry(
     }
 }
 
-/// Compact global toggle pill for Soulbeet's Offline Only mode.
+/// Compact global connectivity toggle pill for Desktop's Online / Offline Only mode.
 ///
-/// When enabled, highlights with `beet-leaf` tonal surface and status indicator dot,
-/// signaling that Library/Home/Search are filtered to locally cached items.
+/// Clearly states the active mode so users never confuse "Online" with "Offline":
+/// - Online (`offline_only == false`): green indicator dot + `"Online"`.
+/// - Offline Only (`offline_only == true`): amber/gold `IconWifiOff` + `"Offline Only"`.
 #[component]
 pub fn OfflineTogglePill(
     offline_only: bool,
@@ -34,23 +35,17 @@ pub fn OfflineTogglePill(
     #[props(default)] class: String,
 ) -> Element {
     let surface_class = if offline_only {
-        "bg-beet-leaf-surface border-beet-leaf-solid/40 text-beet-leaf-text"
+        "bg-amber-500/15 border-amber-400/45 text-amber-300 hover:bg-amber-500/20"
     } else {
-        "bg-beet-surface border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary"
-    };
-
-    let dot_class = if offline_only {
-        "bg-beet-leaf-glow"
-    } else {
-        "bg-beet-text-disabled"
+        "bg-beet-surface border-beet-border-default text-beet-text-primary hover:bg-beet-surface-high"
     };
 
     let telemetry = format_offline_telemetry(cached_tracks, cache_size_label.as_deref(), compact);
 
-    let aria_label = if offline_only {
-        "Offline only mode enabled. Click to go back online."
+    let tooltip = if offline_only {
+        "Offline Only mode active - click to go back Online"
     } else {
-        "Offline only mode disabled. Click to filter to cached tracks."
+        "Online mode - click to switch to Offline Only"
     };
 
     rsx! {
@@ -58,13 +53,17 @@ pub fn OfflineTogglePill(
             r#type: "button",
             role: "switch",
             aria_checked: if offline_only { "true" } else { "false" },
-            aria_label: "{aria_label}",
-            title: "{aria_label}",
+            aria_label: "{tooltip}",
+            title: "{tooltip}",
             class: "inline-flex items-center gap-2 rounded-full border px-3 h-9 text-[13px] font-medium transition-[color,background-color,border-color] duration-150 cursor-pointer shrink-0 {surface_class} {class}",
             onclick: move |_| on_toggle.call(!offline_only),
-            span { class: "w-2 h-2 rounded-full shrink-0 {dot_class}", aria_hidden: "true" }
-            IconWifiOff { size: 15 }
-            span { "Offline" }
+            if offline_only {
+                IconWifiOff { size: 15 }
+                span { "Offline Only" }
+            } else {
+                span { class: "w-2 h-2 rounded-full shrink-0 bg-beet-leaf-glow", aria_hidden: "true" }
+                span { "Online" }
+            }
             if let Some(meta) = telemetry {
                 span { class: "tabular-nums-mono text-[11px] font-semibold tracking-wider opacity-80 pl-1 border-l border-current/20",
                     "{meta}"
@@ -93,5 +92,37 @@ mod tests {
             format_offline_telemetry(Some(42), Some("4.2 GB"), true),
             None
         );
+    }
+
+    #[test]
+    fn renders_clear_online_and_offline_only_states() {
+        let mut online_dom = VirtualDom::new(|| {
+            rsx! {
+                OfflineTogglePill {
+                    offline_only: false,
+                    on_toggle: |_| {},
+                }
+            }
+        });
+        online_dom.rebuild_in_place();
+        let online_html = dioxus_ssr::render(&online_dom);
+        assert!(online_html.contains(">Online</span>"), "{online_html}");
+        assert!(online_html.contains("bg-beet-leaf-glow"), "{online_html}");
+        assert!(!online_html.contains(">Offline</span>"), "{online_html}");
+        assert!(!online_html.contains("Offline Only</span>"), "{online_html}");
+
+        let mut offline_dom = VirtualDom::new(|| {
+            rsx! {
+                OfflineTogglePill {
+                    offline_only: true,
+                    on_toggle: |_| {},
+                }
+            }
+        });
+        offline_dom.rebuild_in_place();
+        let offline_html = dioxus_ssr::render(&offline_dom);
+        assert!(offline_html.contains(">Offline Only</span>"), "{offline_html}");
+        assert!(offline_html.contains("bg-amber-500/15"), "{offline_html}");
+        assert!(offline_html.contains("text-amber-300"), "{offline_html}");
     }
 }

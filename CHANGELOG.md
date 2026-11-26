@@ -2,15 +2,17 @@
 
 ## Unreleased
 
-### Search by artist, a new search bar, and smoother on phones
+### Built-in player, Desktop and Android Auto apps, Discovery 2.0, and five download backends
 
-An artist alone now lists their albums, the search bar is rebuilt as one layout for every screen, and phones get fixes for lag, zoom and sign-in.
+Soulbeet now plays your Navidrome library directly on Web, Linux, Windows, Android, and Android Auto, alongside Discovery 2.0, five download sources, and admin MCP library tools.
 
-- **Search by artist**: Fill in only the artist to list their albums, EPs and singles, studio albums first, with the year and type on each row.
-- **New search bar**: The artist filter opens with a tap on Artist, the download folder can be picked on phones too, and the three service lights are now one status line that opens to the details.
-- **Lighter pages**: The background glows are drawn without a blur filter, which Safari on iOS 26 could stall on for seconds, and the closed downloads drawer is no longer kept on screen.
-- **Typing and sign-in on phones**: Fields no longer make Safari zoom in, and password managers can fill and save the login and password forms.
-- **Faster first load**: The app is sent compressed, at about a third of its size. Its fonts, Space Grotesk and the new Commit Mono for the monospaced text, come with it instead of from Google, so pages look the same offline.
+- **Studio Web player and native clients**: Stream straight from Navidrome with a precision scrubber, synced LRCLIB lyrics, heart favorites separate from 5-star ratings, queue and stats views, Soulbeet Connect device handoff, plus native Linux, Windows, Android, and Android Auto apps with offline caching.
+- **Discovery 2.0 and playlists**: Mix your library with fresh picks using Moment Mixes, Seasonal Packs with cultural steering, Instant Seed Radio, and a fast Triage Deck with undo, plus separated Soulbeet Mixes and accurate smart playlist track counts.
+- **Five download backends and 1-tap Acquire**: Search your library and MusicBrainz together across Soulseek, Internet Archive, YouTube Music, NetEase, and Direct Connect, play unowned tracks with 1-tap Acquire and Play, and auto-upgrade kept lossy tracks to FLAC in the background.
+- **Smarter AI assistant (MCP)**: Browse, inspect, retag, audit, and move tracks across libraries, including multi-account admin access (`allow_admin` in Settings > Users > Connected apps) so your assistant can move tracks between personal and shared folders.
+- **Smoother mobile and faster loading**: Compressed self-hosted fonts (`Space Grotesk` and `Commit Mono`), lighter UI without Safari blur stalls, full artist discographies, and prebuilt client binaries attached to GitHub Releases.
+
+[Clients setup guide](https://github.com/terry90/soulbeet/blob/master/docs/clients.md)
 
 ## 0.10.0 - 2026-11-22
 

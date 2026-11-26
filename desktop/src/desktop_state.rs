@@ -33,9 +33,10 @@ use shared::download::{
 use shared::recommendation::{ContextualMixSummary, CultureSteering, SteerSeasonalPackRequest};
 use tokio::sync::{broadcast, mpsc, watch};
 use ui::{
-    classify_guard_mode, discovery_days_remaining, percent_encode_param, AcquireStageBadge,
-    DrawerTab, GuardModalMode, PendingDropItem, PendingDropQueue, PlaybackStatus, PlayerCommand,
-    PlayerContext, PlayerState, PlayerTrack, SidebarPlaylistItem, StudioNavSection,
+    classify_guard_mode, classify_local_playlist_category, discovery_days_remaining,
+    percent_encode_param, AcquireStageBadge, DrawerTab, GuardModalMode, PendingDropItem,
+    PendingDropQueue, PlaybackStatus, PlayerCommand, PlayerContext, PlayerState, PlayerTrack,
+    SidebarPlaylistItem, StudioNavSection,
 };
 use uuid::Uuid;
 
@@ -1269,6 +1270,36 @@ pub fn convert_connect_devices(devices: &[ConnectDeviceDto]) -> Vec<ConnectDevic
         .collect()
 }
 
+/// Compares two Connect device slices ignoring volatile keepalive timestamps (`last_seen_unix`
+/// and snapshot `updated_at_unix`) so periodic heartbeats do not cause redundant re-renders.
+pub fn connect_devices_visibly_equal(a: &[ConnectDevice], b: &[ConnectDevice]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.device_id == y.device_id
+                && x.name == y.name
+                && x.platform == y.platform
+                && x.is_active == y.is_active
+                && match (x.snapshot.as_ref(), y.snapshot.as_ref()) {
+                    (None, None) => true,
+                    (Some(sx), Some(sy)) => {
+                        sx.song_id == sy.song_id
+                            && sx.title == sy.title
+                            && sx.artist == sy.artist
+                            && sx.album == sy.album
+                            && sx.cover_art_id == sy.cover_art_id
+                            && sx.is_playing == sy.is_playing
+                            && sx.position_ms == sy.position_ms
+                            && sx.duration_ms == sy.duration_ms
+                            && sx.queue_song_ids == sy.queue_song_ids
+                            && sx.queue_index == sy.queue_index
+                            && sx.volume.to_bits() == sy.volume.to_bits()
+                            && sx.is_pending_discovery == sy.is_pending_discovery
+                    }
+                    _ => false,
+                }
+        })
+}
+
 /// Shared Dioxus context controlling the entire Desktop Studio app.
 #[derive(Clone, Copy)]
 pub struct DesktopStudio {
@@ -1339,6 +1370,11 @@ impl DesktopStudio {
                 song_count: u32::try_from(p.playlist.song_count.max(0)).unwrap_or(0),
                 is_smart: p.playlist.is_smart,
                 is_offline_pinned: p.is_pinned,
+                category: classify_local_playlist_category(
+                    &p.playlist.kind,
+                    p.playlist.comment.as_deref(),
+                    p.playlist.is_smart,
+                ),
             })
             .collect()
     }
@@ -1618,6 +1654,14 @@ impl DesktopStudio {
                     self.send_mpv(MpvCommand::Stop);
                 }
             }
+            PlayerCommand::LoadQueue { autoplay, .. } => {
+                if let Some(track) = next_track {
+                    self.load_current_track_in_mpv(player, track, !autoplay, None);
+                } else {
+                    self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
+                    self.send_mpv(MpvCommand::Stop);
+                }
+            }
             PlayerCommand::TogglePlayPause => match next_state.status {
                 PlaybackStatus::Paused => {
                     self.send_mpv(MpvCommand::Pause);
@@ -1832,68 +1876,108 @@ impl DesktopStudio {
         }
     }
 
-    /// Runs a supervised WebSocket reconnect loop for Soulbeet Connect (`WS /api/ws/connect`).
-    /// Handles `RecvError::Lagged` without disconnecting, stops immediately when `offline_only`
-    /// is toggled or superseded by a newer `connect_gen`, and backs off cleanly on network errors.
+    /// Connects once to `client-core`'s internal Connect WS supervisor and drives `connect_online`
+    /// and `connect_devices` reactively from `subscribe_state()` without racing `client-core`'s
+    /// built-in exponential-backoff reconnect loop.
     pub fn start_supervised_connect(&mut self, core: Arc<SoulbeetCore>, player: PlayerContext) {
         let my_gen = self.connect_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
         let gen_arc = self.connect_gen.peek().clone();
         let mut studio = *self;
 
         spawn(async move {
+            let mut event_rx = core.connect_client().subscribe();
+            let mut state_rx = core.connect_client().subscribe_state();
+
+            // Retry ONLY the very first `connect_ws` dial until `client-core`'s own internal
+            // reconnect supervisor starts cleanly.
             let mut backoff_secs = 2u64;
-            while gen_arc.load(Ordering::SeqCst) == my_gen && !core.is_offline_only() {
-                let mut rx = core.connect_client().subscribe();
+            loop {
+                if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
+                    return;
+                }
                 match core.connect_ws(Duration::from_secs(20)).await {
-                    Ok(()) => {
-                        backoff_secs = 2;
-                        studio.sync_status.write().connect_online = true;
-                        loop {
-                            if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
-                                core.connect_client().disconnect().await;
-                                break;
-                            }
-                            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                                Ok(Ok(ev)) => match ev {
-                                    ConnectServerEventDto::DeviceList { devices, .. } => {
-                                        studio
-                                            .connect_devices
-                                            .set(convert_connect_devices(&devices));
-                                    }
-                                    ConnectServerEventDto::Command { command, .. } => {
-                                        apply_connect_command(studio, player, &core, command).await;
-                                    }
-                                    ConnectServerEventDto::PlaybackUpdated { .. } => {}
-                                },
-                                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
-                                    tracing::debug!("Connect WS lagged {n} events; continuing");
-                                    continue;
-                                }
-                                Ok(Err(broadcast::error::RecvError::Closed)) => break,
-                                Err(_) => {
-                                    // Periodic liveness check against ConnectClient state
-                                    if !core.connect_client().state().await.connected {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        studio.sync_status.write().connect_online = false;
-                    }
+                    Ok(()) => break,
                     Err(err) => {
-                        tracing::debug!("Connect WS attempt failed: {err}");
-                        studio.sync_status.write().connect_online = false;
+                        tracing::debug!("Initial Connect WS dial failed: {err}");
+                        if studio.sync_status.peek().connect_online {
+                            studio.sync_status.write().connect_online = false;
+                        }
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(30);
                     }
                 }
+            }
 
+            let apply_state = |studio: &mut DesktopStudio,
+                               player: PlayerContext,
+                               snap: &client_core::connect::ConnectState| {
+                if studio.sync_status.peek().connect_online != snap.connected {
+                    studio.sync_status.write().connect_online = snap.connected;
+                }
+                let next_devices = convert_connect_devices(&snap.devices);
+                let active_name = next_devices
+                    .iter()
+                    .find(|d| d.is_active)
+                    .map(|d| d.name.clone());
+                if player.state_signal().peek().active_device_name != active_name {
+                    player.state_signal().write().active_device_name = active_name;
+                }
+                if !connect_devices_visibly_equal(&studio.connect_devices.peek(), &next_devices) {
+                    studio.connect_devices.set(next_devices);
+                }
+            };
+
+            let initial_state = state_rx.borrow_and_update().clone();
+            apply_state(&mut studio, player, &initial_state);
+
+            loop {
                 if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
+                    if core.is_offline_only() {
+                        core.connect_client().disconnect().await;
+                    }
                     break;
                 }
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(30);
+
+                tokio::select! {
+                    changed = state_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if gen_arc.load(Ordering::SeqCst) != my_gen || core.is_offline_only() {
+                            if core.is_offline_only() {
+                                core.connect_client().disconnect().await;
+                            }
+                            break;
+                        }
+                        let snap = state_rx.borrow_and_update().clone();
+                        apply_state(&mut studio, player, &snap);
+                    }
+                    ev_res = event_rx.recv() => {
+                        match ev_res {
+                            Ok(ConnectServerEventDto::Command { command, .. }) => {
+                                apply_connect_command(studio, player, &core, command).await;
+                            }
+                            Ok(ConnectServerEventDto::DeviceList { .. })
+                            | Ok(ConnectServerEventDto::PlaybackUpdated { .. }) => {
+                                // Driven authoritatively by `state_rx.changed()` above.
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!("Connect WS lagged {n} events; continuing");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
+
             if gen_arc.load(Ordering::SeqCst) == my_gen {
-                studio.sync_status.write().connect_online = false;
+                if studio.sync_status.peek().connect_online {
+                    studio.sync_status.write().connect_online = false;
+                }
+                if !studio.connect_devices.peek().is_empty() {
+                    studio.connect_devices.set(Vec::new());
+                }
             }
         });
     }
@@ -3675,6 +3759,45 @@ mod tests {
         let offline = filter_tracks_for_offline_play(tracks, true);
         assert_eq!(offline.len(), 1);
         assert_eq!(offline[0].id, "cached");
+    }
+
+    #[test]
+    fn connect_device_visible_equality_ignores_keepalive_timestamps() {
+        let base = ConnectDevice {
+            device_id: "desk-1".into(),
+            name: "Soulbeet Desktop".into(),
+            platform: SharedDevicePlatform::Desktop,
+            is_active: true,
+            last_seen_unix: 1_000,
+            snapshot: Some(PlaybackSnapshot {
+                song_id: Some("track-1".into()),
+                title: Some("Track".into()),
+                artist: Some("Artist".into()),
+                album: None,
+                cover_art_id: None,
+                is_playing: true,
+                position_ms: 5_000,
+                duration_ms: 180_000,
+                queue_song_ids: vec!["track-1".into()],
+                queue_index: 0,
+                volume: 0.85,
+                is_pending_discovery: false,
+                updated_at_unix: 1_000,
+            }),
+        };
+        let mut keepalive = base.clone();
+        keepalive.last_seen_unix = 1_025;
+        if let Some(ref mut snap) = keepalive.snapshot {
+            snap.updated_at_unix = 1_025;
+        }
+        assert!(connect_devices_visibly_equal(
+            std::slice::from_ref(&base),
+            &[keepalive]
+        ));
+
+        let mut changed = base.clone();
+        changed.name = "Renamed".into();
+        assert!(!connect_devices_visibly_equal(&[base], &[changed]));
     }
 
     #[test]

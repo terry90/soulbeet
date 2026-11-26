@@ -230,43 +230,7 @@ class SoulbeetApiClient(
                 if (!response.isSuccessful) {
                     throw IOException(extractErrorMessage(raw) ?: "Lyrics HTTP ${response.code}")
                 }
-                val arr = JSONArray(raw)
-                if (arr.length() == 0) return@use null
-
-                var chosen: JSONObject = arr.getJSONObject(0)
-                for (i in 0 until arr.length()) {
-                    val candidate = arr.getJSONObject(i)
-                    if (candidate.optBoolean("synced", false)) {
-                        chosen = candidate
-                        break
-                    }
-                }
-                val linesArr = chosen.optJSONArray("lines") ?: JSONArray()
-                val lines = buildList {
-                    for (i in 0 until linesArr.length()) {
-                        val obj = linesArr.optJSONObject(i) ?: continue
-                        val text = obj.optNonNullString("text") ?: continue
-                        val startMs = if (obj.has("start_ms") && !obj.isNull("start_ms")) {
-                            obj.optLong("start_ms")
-                        } else {
-                            null
-                        }
-                        add(LyricLine(startMs = startMs, text = text))
-                    }
-                }
-                val finalLines = if (lines.size == 1 && lines[0].startMs == null && lines[0].text.contains("[")) {
-                    LyricsSync.parseLrc(lines[0].text)
-                } else {
-                    lines
-                }
-                TrackLyricsData(
-                    displayArtist = chosen.optNonNullString("display_artist"),
-                    displayTitle = chosen.optNonNullString("display_title"),
-                    lang = chosen.optNonNullString("lang").orEmpty(),
-                    synced = chosen.optBoolean("synced", false) || finalLines.any { it.startMs != null },
-                    offsetMs = chosen.optLong("offset_ms", 0L),
-                    lines = finalLines,
-                )
+                parseLyricsResponse(raw)
             }
         }
     }
@@ -696,6 +660,72 @@ class SoulbeetApiClient(
     }
 
     companion object {
+        private val LRC_TIMESTAMP_REGEX = Regex("""\[\d{1,2}:\d{2}(?:[.:]\d{1,3})?]""")
+
+        fun parseLyricsResponse(raw: String): TrackLyricsData? {
+            val arr = JSONArray(raw)
+            if (arr.length() == 0) return null
+
+            var chosen: JSONObject? = null
+            for (i in 0 until arr.length()) {
+                val candidate = arr.optJSONObject(i) ?: continue
+                val lineCount = candidate.optJSONArray("lines")?.length() ?: 0
+                if (candidate.optBoolean("synced", false) && lineCount > 0) {
+                    chosen = candidate
+                    break
+                }
+            }
+            if (chosen == null) {
+                for (i in 0 until arr.length()) {
+                    val candidate = arr.optJSONObject(i) ?: continue
+                    val lineCount = candidate.optJSONArray("lines")?.length() ?: 0
+                    if (lineCount > 0) {
+                        chosen = candidate
+                        break
+                    }
+                }
+            }
+            val selected = chosen ?: arr.optJSONObject(0) ?: return null
+            val linesArr = selected.optJSONArray("lines") ?: JSONArray()
+            val lines = buildList {
+                for (i in 0 until linesArr.length()) {
+                    val obj = linesArr.optJSONObject(i) ?: continue
+                    val startMs = if (obj.has("start_ms") && !obj.isNull("start_ms")) {
+                        obj.optLong("start_ms")
+                    } else {
+                        null
+                    }
+                    val rawText = if (obj.has("text") && !obj.isNull("text")) {
+                        obj.optString("text", "")
+                    } else {
+                        ""
+                    }
+                    val text = rawText.trim()
+                    if (text.isEmpty() && startMs == null) continue
+                    add(LyricLine(startMs = startMs, text = text))
+                }
+            }
+            val isWireSynced = selected.optBoolean("synced", false)
+            val finalLines = if (
+                !isWireSynced &&
+                lines.isNotEmpty() &&
+                lines.all { it.startMs == null } &&
+                lines.any { LRC_TIMESTAMP_REGEX.containsMatchIn(it.text) }
+            ) {
+                LyricsSync.parseLrc(lines.joinToString("\n") { it.text })
+            } else {
+                lines
+            }
+            return TrackLyricsData(
+                displayArtist = selected.optNonNullString("display_artist"),
+                displayTitle = selected.optNonNullString("display_title"),
+                lang = selected.optNonNullString("lang").orEmpty(),
+                synced = isWireSynced || finalLines.any { it.startMs != null },
+                offsetMs = selected.optLong("offset_ms", 0L),
+                lines = finalLines,
+            )
+        }
+
         fun normalizeBaseUrl(raw: String): String {
             val trimmed = raw.trim().trimEnd('/')
             if (trimmed.isEmpty()) throw IOException("Server URL is required")

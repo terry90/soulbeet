@@ -17,7 +17,7 @@ use tower_cookies::Cookies;
 
 #[cfg(feature = "server")]
 use crate::{
-    core::connect::{ConnectEnvelope, CONNECT_HUB},
+    core::connect::{ConnStatus, ConnectEnvelope, KeepaliveCheck, CONNECT_HUB},
     server_fns::{
         download::{origin_allowed, session_still_valid},
         forbidden_error,
@@ -30,9 +30,16 @@ use crate::{
 #[cfg(feature = "server")]
 const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Keepalive interval (< Nginx / Nginx Proxy Manager default 60s `proxy_read_timeout`) so idle
+/// Connect WebSockets stay open across reverse proxies.
+#[cfg(feature = "server")]
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(25);
+
 #[cfg(feature = "server")]
 struct RegisteredDevice {
     device_id: String,
+    name: String,
+    platform: DevicePlatform,
     conn_id: u64,
     rx: broadcast::Receiver<ConnectEnvelope>,
 }
@@ -82,7 +89,7 @@ pub async fn connect_ws(
     Ok(options.on_upgrade(move |mut socket| async move {
         let mut registered: Option<RegisteredDevice> = if let Some(dev_id) = query_device_id {
             let (conn_id, canonical_id, initial_list, rx) = CONNECT_HUB
-                .register(&user, dev_id, initial_name, initial_platform)
+                .register(&user, dev_id, initial_name.clone(), initial_platform)
                 .await;
             info!(
                 "Connect WS connected for user {} (device {})",
@@ -95,6 +102,8 @@ pub async fn connect_ws(
             }
             Some(RegisteredDevice {
                 device_id: canonical_id,
+                name: initial_name,
+                platform: initial_platform,
                 conn_id,
                 rx,
             })
@@ -109,6 +118,10 @@ pub async fn connect_ws(
         let mut recheck = tokio::time::interval_at(
             tokio::time::Instant::now() + SESSION_RECHECK,
             SESSION_RECHECK,
+        );
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+            KEEPALIVE_INTERVAL,
         );
 
         loop {
@@ -126,6 +139,27 @@ pub async fn connect_ws(
                         break;
                     }
                 }
+                _ = keepalive.tick() => {
+                    if let Some(ref reg) = registered {
+                        match CONNECT_HUB
+                            .keepalive_snapshot(&user, &reg.device_id, reg.conn_id)
+                            .await
+                        {
+                            KeepaliveCheck::Active(list) | KeepaliveCheck::Pruned(list) => {
+                                if socket.send(list).await.is_err() {
+                                    break;
+                                }
+                            }
+                            KeepaliveCheck::Superseded => {
+                                info!(
+                                    "Connect WS for user {} (device {}) superseded by newer connection",
+                                    user, reg.device_id
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
                 received = async {
                     match registered.as_mut() {
                         Some(reg) => reg.rx.recv().await,
@@ -136,10 +170,31 @@ pub async fn connect_ws(
                         continue;
                     };
                     match received {
-                        Ok(env) => {
-                            let for_this_device = env.target_device_id.is_none()
-                                || env.target_device_id.as_deref() == Some(reg.device_id.as_str());
-                            if for_this_device && socket.send(env.event).await.is_err() {
+                        Ok(ConnectEnvelope::Superseded {
+                            device_id,
+                            before_conn_id,
+                        }) => {
+                            if device_id == reg.device_id && reg.conn_id < before_conn_id {
+                                info!(
+                                    "Connect WS for user {} (device {}) superseded immediately by conn {}",
+                                    user, reg.device_id, before_conn_id
+                                );
+                                break;
+                            }
+                        }
+                        Ok(ConnectEnvelope::Event {
+                            target_device_id,
+                            target_conn_id,
+                            event,
+                        }) => {
+                            let for_this_device = match target_device_id.as_deref() {
+                                None => true,
+                                Some(id) if id == reg.device_id.as_str() => {
+                                    target_conn_id.is_none_or(|cid| cid == reg.conn_id)
+                                }
+                                Some(_) => false,
+                            };
+                            if for_this_device && socket.send(*event).await.is_err() {
                                 break;
                             }
                         }
@@ -182,10 +237,12 @@ pub async fn connect_ws(
                                 .as_ref()
                                 .map(|r| (r.device_id.as_str(), r.conn_id));
                             let (conn_id, canonical_id, list, new_rx) = CONNECT_HUB
-                                .reregister(&user, previous, target_id, name, platform)
+                                .reregister(&user, previous, target_id, name.clone(), platform)
                                 .await;
                             registered = Some(RegisteredDevice {
                                 device_id: canonical_id,
+                                name,
+                                platform,
                                 conn_id,
                                 rx: new_rx,
                             });
@@ -195,26 +252,69 @@ pub async fn connect_ws(
                         }
                         Ok(ConnectClientMessage::Heartbeat) => {
                             if let Some(ref reg) = registered {
-                                CONNECT_HUB.heartbeat(&user, &reg.device_id).await;
+                                let status = CONNECT_HUB
+                                    .heartbeat_conn(
+                                        &user,
+                                        &reg.device_id,
+                                        reg.conn_id,
+                                        &reg.name,
+                                        reg.platform,
+                                    )
+                                    .await;
+                                if status == ConnStatus::Superseded {
+                                    break;
+                                }
                             }
                         }
                         Ok(ConnectClientMessage::UpdateState { snapshot }) => {
                             if let Some(ref reg) = registered {
-                                CONNECT_HUB
-                                    .update_state(&user, &reg.device_id, snapshot)
+                                let status = CONNECT_HUB
+                                    .update_state_conn(
+                                        &user,
+                                        &reg.device_id,
+                                        reg.conn_id,
+                                        &reg.name,
+                                        reg.platform,
+                                        snapshot,
+                                    )
                                     .await;
+                                if status == ConnStatus::Superseded {
+                                    break;
+                                }
                             }
                         }
                         Ok(ConnectClientMessage::SendCommand { target_device_id, command }) => {
                             if let Some(ref reg) = registered {
-                                CONNECT_HUB
-                                    .send_command(&user, &reg.device_id, &target_device_id, command)
+                                let (status, _) = CONNECT_HUB
+                                    .send_command_conn(
+                                        &user,
+                                        &reg.device_id,
+                                        reg.conn_id,
+                                        &reg.name,
+                                        reg.platform,
+                                        &target_device_id,
+                                        command,
+                                    )
                                     .await;
+                                if status == ConnStatus::Superseded {
+                                    break;
+                                }
                             }
                         }
                         Ok(ConnectClientMessage::ClaimActive) => {
                             if let Some(ref reg) = registered {
-                                CONNECT_HUB.claim_active(&user, &reg.device_id).await;
+                                let status = CONNECT_HUB
+                                    .claim_active_conn(
+                                        &user,
+                                        &reg.device_id,
+                                        reg.conn_id,
+                                        &reg.name,
+                                        reg.platform,
+                                    )
+                                    .await;
+                                if status == ConnStatus::Superseded {
+                                    break;
+                                }
                             }
                         }
                         Err(

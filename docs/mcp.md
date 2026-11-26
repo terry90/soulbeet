@@ -206,7 +206,18 @@ In the phone app: connectors connected on the web work in the mobile app. Turn o
 
 ## Accounts
 
-Every person connects their own Soulbeet account, and an app connected by one person acts as that person. The client sees their folders, downloads, playlists, ratings and settings, and reads Navidrome as their Navidrome account sees it. No tool manages users, folders or the slskd settings, so an admin's client cannot change those either.
+Every person connects their own Soulbeet account, and an app connected by one person acts as that person. By default, the client sees only their own folders, downloads, playlists, ratings and settings, and reads Navidrome as their Navidrome account sees it. No tool manages users, folders or the slskd settings, so an admin's client cannot change those either.
+
+### Multi-account admin library access
+
+When a Soulbeet **Admin** wants an assistant to organize libraries across household accounts (for example, moving tracks from another family member's private folder into a shared folder), they can turn on **Admin library access (all users' folders)** for their own connected app in **Settings > Users > Connected apps**. It starts off for every new connection and is only available on grants owned by an Admin account.
+
+With **Admin library access (all users' folders)** enabled:
+
+- `get_status` reports `"allow_admin": true`.
+- `list_folders` defaults to `scope: "all"` and returns every registered library folder across all users with `owner`, `shared`, and `is_own` fields (pass `scope: "own"` to list only your own folders).
+- `find_in_library`, `browse_library`, `get_playlist`, `find_duplicates`, and `inspect_tracks` resolve track folders across all registered users and include `owner` and `is_own` metadata.
+- `move_tracks` can move tracks from or into any registered user's folder (for example, from a private folder into a shared folder, which expands visibility). Moving requires **Allow managing library files (delete, move, re-tag)** as well, and all safety guards remain enforced (Discovery staging protection, active download checks, and the multi-user visibility-shrinking veto when moving out of a shared or multi-user-visible folder into a non-shared folder). If `target_folder_id` is omitted, `move_tracks` returns `folder_required` with all accessible folders so the assistant can ask which folder to use.
 
 How accounts appear depends on `REGISTRATION` (see [configuration.md](configuration.md)): with Navidrome sign-in (`navidrome`, the default when `NAVIDROME_URL` is set), a Navidrome user's Soulbeet account is created the first time they sign in, which can be the sign-in of the connection itself. With `admin`, an admin creates the accounts; with `open`, anyone can register.
 
@@ -227,8 +238,9 @@ Soulbeet remembers what Navidrome said of each account for 15 minutes, so it doe
   > Let {app host} manage library files (delete, move between folders, and re-tag)? Before deleting, moving or re-tagging tracks it has to ask you first. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. Deletions are limited to at most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored.
 
   with the buttons **Cancel** and **Allow managing files**. Turning it off acts at once.
+- **Admin library access (all users' folders)** is shown on an admin's own apps and starts off for every new connection. Turning it on asks for confirmation before allowing that app to list and inspect all users' registered folders and perform cross-user folder moves (with file management also enabled). Turning it off acts at once.
 - **Disconnect** asks "Disconnect {app host}? It will have to be connected again from the app." and ends the app's access.
-- Admins see every user's apps, with the owner's name, and can disconnect any of them. Only the owner can change an app's deletion switch.
+- Admins see every user's apps, with the owner's name, and can disconnect any of them. Only the owner can turn on an app's file-management or admin-access switches.
 
 A password change, an admin's reset of the password, a Navidrome sign-in that links an account which had no Navidrome link, or linking or unlinking single sign-on disconnects every app of that user. Every new connection starts with deletion off.
 

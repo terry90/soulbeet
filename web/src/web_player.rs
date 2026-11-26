@@ -31,13 +31,11 @@ use shared::recommendation::{
     ContextualMixSummary, ContextualMixTrack, CultureSteering, SeedRadioRequest,
     SteerSeasonalPackRequest, UserCultureProfile,
 };
-#[cfg(feature = "web")]
-use ui::PlaybackStatus;
 use ui::{
     classify_guard_mode, discovery_days_remaining, format_candidate_reason, friendly_error,
     subsonic_cover_art_url, AcquireStageBadge, Auth, AutoDownloadSignal, DrawerTab, GuardModalMode,
-    PendingDropItem, PendingDropQueue, PlayerCommand, PlayerContext, PlayerProvider, PlayerState,
-    PlayerTrack,
+    PendingDropItem, PendingDropQueue, PlaybackStatus, PlayerCommand, PlayerContext,
+    PlayerProvider, PlayerState, PlayerTrack,
 };
 
 use crate::auth::use_auth;
@@ -188,10 +186,14 @@ pub struct WebStudioContext {
     pub lyrics: Signal<Vec<TrackLyrics>>,
     pub lyrics_song_id: Signal<Option<String>>,
     pub lyrics_loading: Signal<bool>,
+    pub lyrics_fetched: Signal<bool>,
+    pub lyrics_req_id: Signal<u64>,
     pub lyrics_error: Signal<Option<String>>,
     pub inspector_guard_preview: Signal<Option<DeleteGuardPreview>>,
     pub inspector_guard_loading: Signal<bool>,
     pub guard_preview_req_id: Signal<u64>,
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub transfer_gen: Signal<u64>,
     pub search_query_override: Signal<Option<String>>,
     pub archival_upgrades: Signal<Vec<ArchivalUpgradeJob>>,
 }
@@ -402,18 +404,47 @@ impl WebStudioContext {
         track
     }
 
+    pub fn sync_playlist_count(&mut self, playlist_id: &str, count: u32) {
+        if playlist_id.is_empty() {
+            return;
+        }
+        let mut list = self.playlists.write();
+        if let Some(pl) = list.iter_mut().find(|p| p.id == playlist_id) {
+            pl.song_count = count;
+        }
+    }
+
+    pub fn reclassify_playlists(&mut self) {
+        let mixes = self.contextual_mixes.peek().clone();
+        let mut list = self.playlists.write();
+        for pl in list.iter_mut() {
+            pl.category = ui::classify_playlist_category(
+                &pl.id,
+                Some(&pl.comment),
+                pl.is_smart,
+                &mixes,
+            );
+        }
+    }
+
     pub fn fetch_lyrics_for(&mut self, auth: Auth, track: PlayerTrack) {
+        let next_req = self.lyrics_req_id.peek().wrapping_add(1);
+        self.lyrics_req_id.set(next_req);
         if track.id.is_empty() {
             self.lyrics.set(Vec::new());
             self.lyrics_song_id.set(None);
+            self.lyrics_loading.set(false);
+            self.lyrics_fetched.set(false);
             self.lyrics_error.set(None);
             return;
         }
         let song_id = track.id.clone();
         let artist = Some(track.artist.clone());
         let title = Some(track.title.clone());
+        self.lyrics.set(Vec::new());
         self.lyrics_song_id.set(Some(song_id.clone()));
         self.lyrics_loading.set(true);
+        self.lyrics_fetched.set(false);
         self.lyrics_error.set(None);
 
         let mut studio = *self;
@@ -423,14 +454,20 @@ impl WebStudioContext {
                 .await
             {
                 Ok(entries) => {
-                    if studio.lyrics_song_id.peek().as_deref() == Some(song_id.as_str()) {
+                    if *studio.lyrics_req_id.peek() == next_req
+                        && studio.lyrics_song_id.peek().as_deref() == Some(song_id.as_str())
+                    {
                         studio.lyrics.set(entries);
+                        studio.lyrics_fetched.set(true);
                         studio.lyrics_loading.set(false);
                     }
                 }
                 Err(e) => {
-                    if studio.lyrics_song_id.peek().as_deref() == Some(song_id.as_str()) {
+                    if *studio.lyrics_req_id.peek() == next_req
+                        && studio.lyrics_song_id.peek().as_deref() == Some(song_id.as_str())
+                    {
                         studio.lyrics_error.set(Some(friendly_error(&e)));
+                        studio.lyrics_fetched.set(true);
                         studio.lyrics_loading.set(false);
                     }
                 }
@@ -895,7 +932,7 @@ impl WebStudioContext {
                                 }
                             }
                             studio.show_toast(
-                                "File kept for other listeners — unstarred & hidden from your mixes",
+                                "File kept for other listeners: unstarred & hidden from your mixes",
                             );
                         }
                         (Err(e), _) | (_, Err(e)) => {
@@ -991,7 +1028,7 @@ impl WebStudioContext {
 
     pub fn start_radio(&mut self, auth: Auth, player: PlayerContext, track: PlayerTrack) {
         if player.offline_only() {
-            self.show_toast("Offline Only mode is active — Seed Radio requires a network connection.");
+            self.show_toast("Offline Only mode is active: Seed Radio requires a network connection.");
             return;
         }
         let mut studio = *self;
@@ -1049,7 +1086,7 @@ impl WebStudioContext {
 
     pub fn play_contextual_mix(&mut self, auth: Auth, player: PlayerContext, slug: String) {
         if player.offline_only() {
-            self.show_toast("Offline Only mode is active — contextual mixes require a network connection.");
+            self.show_toast("Offline Only mode is active: contextual mixes require a network connection.");
             return;
         }
         let mut studio = *self;
@@ -1226,7 +1263,7 @@ pub fn handle_acquire_event(
                 };
                 studio.apply_curation_overrides(&mut pt);
                 player.play_track(pt);
-                studio.show_toast(format!("Ready — playing \"{}\"", ev.title));
+                studio.show_toast(format!("Ready: playing \"{}\"", ev.title));
             } else {
                 studio.show_toast(format!("Acquired \"{}\"", ev.title));
             }
@@ -1239,7 +1276,7 @@ pub fn handle_acquire_event(
         } => {
             let badge = AcquireStageBadge::NeedsManualChoice {
                 message: Some(format!(
-                    "Best match {:.0}% below {:.0}% — pick a source",
+                    "Best match {:.0}% below {:.0}%: pick a source",
                     best_score * 100.0,
                     threshold * 100.0
                 )),
@@ -1384,10 +1421,14 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let lyrics = use_signal(Vec::<TrackLyrics>::new);
     let lyrics_song_id = use_signal(|| None::<String>);
     let lyrics_loading = use_signal(|| false);
+    let lyrics_fetched = use_signal(|| false);
+    let lyrics_req_id = use_signal(|| 0u64);
     let lyrics_error = use_signal(|| None::<String>);
+    let mut seek_revision = use_signal(|| 0u64);
     let inspector_guard_preview = use_signal(|| None::<DeleteGuardPreview>);
     let inspector_guard_loading = use_signal(|| false);
     let guard_preview_req_id = use_signal(|| 0u64);
+    let mut transfer_gen = use_signal(|| 0u64);
     let search_query_override = use_signal(|| None::<String>);
     let archival_upgrades = use_signal(Vec::<ArchivalUpgradeJob>::new);
 
@@ -1424,10 +1465,13 @@ pub fn WebStudioProvider(children: Element) -> Element {
         lyrics,
         lyrics_song_id,
         lyrics_loading,
+        lyrics_fetched,
+        lyrics_req_id,
         lyrics_error,
         inspector_guard_preview,
         inspector_guard_loading,
         guard_preview_req_id,
+        transfer_gen,
         search_query_override,
         archival_upgrades,
     });
@@ -1663,6 +1707,23 @@ pub fn WebStudioProvider(children: Element) -> Element {
         if (dur - prev_dur).abs() > f64::EPSILON {
             duration_secs.set(dur);
         }
+        if matches!(cmd, PlayerCommand::Seek(_)) {
+            let next = seek_revision.peek().wrapping_add(1);
+            seek_revision.set(next);
+        }
+        if matches!(
+            cmd,
+            PlayerCommand::PlayTrack(_)
+                | PlayerCommand::PlayQueue { .. }
+                | PlayerCommand::LoadQueue { .. }
+                | PlayerCommand::ClearQueue
+                | PlayerCommand::RemoveFromQueue(_)
+                | PlayerCommand::EnqueueNext(_)
+                | PlayerCommand::EnqueueLast(_)
+        ) {
+            let next = transfer_gen.peek().wrapping_add(1);
+            transfer_gen.set(next);
+        }
 
         #[cfg(feature = "web")]
         if let Some(engine) = audio_for_cmd.as_ref() {
@@ -1674,6 +1735,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                     cmd,
                     PlayerCommand::PlayTrack(_)
                         | PlayerCommand::PlayQueue { .. }
+                        | PlayerCommand::LoadQueue { .. }
                         | PlayerCommand::TrackEnded
                 );
 
@@ -1694,6 +1756,19 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 }
                 PlayerCommand::ClearQueue => {
                     clear_web_audio(engine);
+                }
+                PlayerCommand::LoadQueue { autoplay, .. } => {
+                    if next_state.current_track.is_none() {
+                        clear_web_audio(engine);
+                    } else if let Some(track) = next_state.current_track.as_ref() {
+                        start_web_audio_track(
+                            engine,
+                            track,
+                            bootstrap.peek().as_ref().and_then(|b| b.navidrome.as_ref()),
+                            &mut player_state,
+                            *autoplay,
+                        );
+                    }
                 }
                 PlayerCommand::TogglePlayPause => {
                     if next_state.status == PlaybackStatus::Paused {
@@ -1866,6 +1941,45 @@ pub fn WebStudioProvider(children: Element) -> Element {
 
             if let Ok(mixes) = mix_res {
                 studio.contextual_mixes.set(mixes);
+                studio.reclassify_playlists();
+
+                // If user has > 25 playlists, also resolve live counts for any matched contextual
+                // mix playlists that weren't resolved during initial `fetch_playlists`.
+                #[cfg(feature = "web")]
+                if studio.playlists.peek().len() > 25 {
+                    if let Some(nav) = studio.navidrome_info() {
+                        let mix_ids: Vec<String> = studio
+                            .playlists
+                            .peek()
+                            .iter()
+                            .filter(|p| p.category.is_soulbeet_mix() && !p.is_smart)
+                            .map(|p| p.id.clone())
+                            .collect();
+                        if !mix_ids.is_empty() {
+                            use futures::stream::{self, StreamExt};
+                            let resolved: Vec<(String, Option<u32>)> =
+                                stream::iter(mix_ids.into_iter().map(|pid| {
+                                    let nav = nav.clone();
+                                    async move {
+                                        let cnt =
+                                            crate::navidrome_web::fetch_playlist_live_count(
+                                                &nav, &pid,
+                                            )
+                                            .await;
+                                        (pid, cnt)
+                                    }
+                                }))
+                                .buffer_unordered(6)
+                                .collect()
+                                .await;
+                            for (pid, cnt) in resolved {
+                                if let Some(count) = cnt {
+                                    studio.sync_playlist_count(&pid, count);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if let Ok(triage) = triage_res {
                 studio.triage_tracks.set(triage);
@@ -1882,11 +1996,27 @@ pub fn WebStudioProvider(children: Element) -> Element {
         }
     });
 
-    // Auto-fetch lyrics when track changes while Lyrics tab is open
+    // Clear stale lyrics immediately on track change (even when Lyrics tab is closed),
+    // and auto-fetch when the Lyrics tab is open.
     use_effect(move || {
         let mut studio = studio;
         let tab = (studio.drawer_tab)();
         let current = player_ctx.current_track();
+        let current_id = current
+            .as_ref()
+            .filter(|t| !t.id.is_empty())
+            .map(|t| t.id.clone());
+
+        if *studio.lyrics_song_id.peek() != current_id {
+            let next_req = studio.lyrics_req_id.peek().wrapping_add(1);
+            studio.lyrics_req_id.set(next_req);
+            studio.lyrics.set(Vec::new());
+            studio.lyrics_error.set(None);
+            studio.lyrics_loading.set(false);
+            studio.lyrics_fetched.set(false);
+            studio.lyrics_song_id.set(None);
+        }
+
         if tab == Some(DrawerTab::Lyrics) {
             if let Some(track) = current {
                 if !track.id.is_empty()
@@ -1898,10 +2028,20 @@ pub fn WebStudioProvider(children: Element) -> Element {
         }
     });
 
-    // Push state snapshots to Soulbeet Connect whenever track or play/pause changes
+    // Push state snapshots to Soulbeet Connect ONLY when track, play/pause status, or seek changes
+    // (memoized so unrelated `PlayerState` updates such as volume/mute/curation/keepalive never
+    // emit redundant `UpdateState` frames).
+    let mut last_pushed_connect_key =
+        use_signal(|| None::<(Option<String>, PlaybackStatus, u64)>);
     use_effect(move || {
-        let _track = player_ctx.current_track();
-        let _status = player_ctx.status();
+        let track_id = player_ctx.current_track().map(|t| t.id);
+        let status = player_ctx.status();
+        let seek_rev = seek_revision();
+        let next_key = (track_id, status, seek_rev);
+        if last_pushed_connect_key.peek().as_ref() == Some(&next_key) {
+            return;
+        }
+        last_pushed_connect_key.set(Some(next_key));
         let snap = build_connect_snapshot(player_ctx);
         studio.send_connect(ConnectClientMessage::UpdateState { snapshot: snap });
     });
@@ -1982,84 +2122,124 @@ pub fn WebStudioProvider(children: Element) -> Element {
 
                     match conn {
                         Ok(socket) => {
-                            retry_count = 0;
                             info!("Connected to Soulbeet Connect WS as {device_id}");
-                            let (tx, mut rx) =
+                            let (tx, rx) =
                                 futures::channel::mpsc::unbounded::<ConnectClientMessage>();
                             studio.connect_outbound.set(Some(tx));
 
                             // Immediately publish our current snapshot on connect / reconnect.
+                            // If this fails, fall through to cleanup + exponential backoff (never spin).
                             let initial_snap = build_connect_snapshot(player_ctx);
                             if socket
                                 .send(ConnectClientMessage::UpdateState {
                                     snapshot: initial_snap,
                                 })
                                 .await
-                                .is_err()
+                                .is_ok()
                             {
-                                studio.connect_outbound.set(None);
-                                continue;
-                            }
+                                // Persistent intervals live OUTSIDE the loop so incoming frames
+                                // never starve heartbeats or active playback position sync.
+                                let mut heartbeat =
+                                    gloo_timers::future::IntervalStream::new(25_000).fuse();
+                                let mut position_sync =
+                                    gloo_timers::future::IntervalStream::new(5_000).fuse();
+                                let mut rx = rx.fuse();
+                                let mut confirmed_exchange = false;
 
-                            loop {
-                                let heartbeat = gloo_timers::future::TimeoutFuture::new(25_000);
-                                futures::pin_mut!(heartbeat);
-                                let recv_fut = socket.recv();
-                                futures::pin_mut!(recv_fut);
-                                let out_fut = rx.next();
-                                futures::pin_mut!(out_fut);
+                                loop {
+                                    let recv_fut = socket.recv();
+                                    futures::pin_mut!(recv_fut);
 
-                                futures::select! {
-                                    _ = futures::FutureExt::fuse(heartbeat) => {
-                                        if socket.send(ConnectClientMessage::Heartbeat).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    outgoing = futures::FutureExt::fuse(out_fut) => {
-                                        if let Some(msg) = outgoing {
-                                            if socket.send(msg).await.is_err() {
+                                    futures::select! {
+                                        _ = heartbeat.select_next_some() => {
+                                            if socket.send(ConnectClientMessage::Heartbeat).await.is_err() {
                                                 break;
                                             }
-                                        } else {
-                                            break;
                                         }
-                                    }
-                                    incoming = futures::FutureExt::fuse(recv_fut) => {
-                                        match incoming {
-                                            Ok(ConnectServerEvent::DeviceList { devices, .. }) => {
-                                                let active_name = devices
-                                                    .iter()
-                                                    .find(|d| d.is_active)
-                                                    .map(|d| d.name.clone());
-                                                player_ctx.state_signal().write().active_device_name = active_name;
-                                                studio.connect_devices.set(devices);
-                                            }
-                                            Ok(ConnectServerEvent::PlaybackUpdated { device_id: dev, snapshot }) => {
-                                                let mut list = studio.connect_devices.write();
-                                                if let Some(item) = list.iter_mut().find(|d| d.device_id == dev) {
-                                                    item.snapshot = Some(snapshot);
+                                        _ = position_sync.select_next_some() => {
+                                            if player_ctx.is_playing() {
+                                                let snap = build_connect_snapshot(player_ctx);
+                                                if socket
+                                                    .send(ConnectClientMessage::UpdateState { snapshot: snap })
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
                                                 }
                                             }
-                                            Ok(ConnectServerEvent::Command { command, .. }) => {
-                                                apply_remote_connect_command(
-                                                    studio,
-                                                    player_ctx,
-                                                    audio_for_connect.as_ref().as_ref(),
-                                                    command,
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!("Connect WS closed: {e:?}");
+                                        }
+                                        outgoing = rx.next() => {
+                                            if let Some(msg) = outgoing {
+                                                if socket.send(msg).await.is_err() {
+                                                    break;
+                                                }
+                                            } else {
                                                 break;
+                                            }
+                                        }
+                                        incoming = futures::FutureExt::fuse(recv_fut) => {
+                                            match incoming {
+                                                Ok(event) => {
+                                                    if !confirmed_exchange {
+                                                        confirmed_exchange = true;
+                                                        retry_count = 0;
+                                                    }
+                                                    match event {
+                                                        ConnectServerEvent::DeviceList { devices, .. } => {
+                                                            let active_name = devices
+                                                                .iter()
+                                                                .find(|d| d.is_active)
+                                                                .map(|d| d.name.clone());
+                                                            if player_ctx.state_signal().peek().active_device_name != active_name {
+                                                                player_ctx.state_signal().write().active_device_name = active_name;
+                                                            }
+                                                            if !connect_devices_visibly_equal(&studio.connect_devices.peek(), &devices) {
+                                                                studio.connect_devices.set(devices);
+                                                            }
+                                                        }
+                                                        ConnectServerEvent::PlaybackUpdated { device_id: dev, snapshot } => {
+                                                            let mut list = studio.connect_devices.write();
+                                                            if let Some(item) = list.iter_mut().find(|d| d.device_id == dev) {
+                                                                item.snapshot = Some(snapshot);
+                                                            }
+                                                        }
+                                                        ConnectServerEvent::Command { command, .. } => {
+                                                            apply_remote_connect_command(
+                                                                studio,
+                                                                player_ctx,
+                                                                audio_for_connect.as_ref().as_ref(),
+                                                                command,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Connect WS closed: {e:?}");
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+
                             studio.connect_outbound.set(None);
+                            if !studio.connect_devices.peek().is_empty() {
+                                studio.connect_devices.set(Vec::new());
+                            }
+                            if player_ctx.state_signal().peek().active_device_name.is_some() {
+                                player_ctx.state_signal().write().active_device_name = None;
+                            }
                         }
                         Err(e) => {
                             warn!("Connect WS failed: {e:?}");
+                            studio.connect_outbound.set(None);
+                            if !studio.connect_devices.peek().is_empty() {
+                                studio.connect_devices.set(Vec::new());
+                            }
+                            if player_ctx.state_signal().peek().active_device_name.is_some() {
+                                player_ctx.state_signal().write().active_device_name = None;
+                            }
                         }
                     }
 
@@ -2106,7 +2286,7 @@ fn start_web_audio_track(
     if state_snap.offline_only && !track.is_offline_cached {
         clear_web_audio(engine);
         player_state.write().status = PlaybackStatus::Error(
-            "Offline Only mode is active — this track is not cached offline.".to_string(),
+            "Offline Only mode is active: this track is not cached offline.".to_string(),
         );
         return;
     }
@@ -2153,9 +2333,45 @@ fn start_web_audio_track(
     }
 }
 
+/// Compares two Connect device slices ignoring volatile keepalive timestamps (`last_seen_unix`
+/// and snapshot `updated_at_unix`) so periodic 25s heartbeats do not cause redundant re-renders.
+#[cfg(any(feature = "web", test))]
+fn connect_devices_visibly_equal(a: &[ConnectDevice], b: &[ConnectDevice]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.device_id == y.device_id
+                && x.name == y.name
+                && x.platform == y.platform
+                && x.is_active == y.is_active
+                && snapshots_visibly_equal(x.snapshot.as_ref(), y.snapshot.as_ref())
+        })
+}
+
+#[cfg(any(feature = "web", test))]
+fn snapshots_visibly_equal(a: Option<&PlaybackSnapshot>, b: Option<&PlaybackSnapshot>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.song_id == y.song_id
+                && x.title == y.title
+                && x.artist == y.artist
+                && x.album == y.album
+                && x.cover_art_id == y.cover_art_id
+                && x.is_playing == y.is_playing
+                && x.position_ms == y.position_ms
+                && x.duration_ms == y.duration_ms
+                && x.queue_song_ids == y.queue_song_ids
+                && x.queue_index == y.queue_index
+                && x.volume.to_bits() == y.volume.to_bits()
+                && x.is_pending_discovery == y.is_pending_discovery
+        }
+        _ => false,
+    }
+}
+
 #[cfg(feature = "web")]
 fn apply_remote_connect_command(
-    studio: WebStudioContext,
+    mut studio: WebStudioContext,
     player: PlayerContext,
     engine: Option<&WebAudioEngine>,
     command: ConnectCommand,
@@ -2177,16 +2393,22 @@ fn apply_remote_connect_command(
         ConnectCommand::Seek { position_ms } => player.seek((position_ms as f64) / 1000.0),
         ConnectCommand::SetVolume { volume } => player.set_volume(volume),
         ConnectCommand::TransferPlayback { snapshot, .. } => {
+            use futures::stream::{self, StreamExt};
+            let target_secs = (snapshot.position_ms as f64) / 1000.0;
+            let queue_ids = snapshot.queue_song_ids;
+            let requested_index = snapshot.queue_index;
+            let should_play = snapshot.is_playing;
+
             if let Some(song_id) = snapshot.song_id {
-                let target_secs = (snapshot.position_ms as f64) / 1000.0;
                 if let Some(eng) = engine {
                     if target_secs > 0.0 {
                         eng.pending_seek_secs.set(Some(target_secs));
                     }
                 }
-                let cover = studio
-                    .navidrome_info()
-                    .map(|info| subsonic_cover_art_url(&info, &song_id, 256));
+                let nav_opt = studio.navidrome_info();
+                let cover = nav_opt
+                    .as_ref()
+                    .map(|info| subsonic_cover_art_url(info, &song_id, 256));
                 let mut pt = PlayerTrack {
                     id: song_id.clone(),
                     title: snapshot
@@ -2197,22 +2419,124 @@ fn apply_remote_connect_command(
                         .unwrap_or_else(|| "Unknown Artist".to_string()),
                     album: snapshot.album,
                     cover_art_url: cover,
-                    cover_art_id: snapshot.cover_art_id.or(Some(song_id)),
+                    cover_art_id: snapshot.cover_art_id.or_else(|| Some(song_id.clone())),
                     duration_secs: Some((snapshot.duration_ms / 1000) as u32),
                     is_discovery: snapshot.is_pending_discovery,
                     ..Default::default()
                 };
                 studio.apply_curation_overrides(&mut pt);
-                player.play_track(pt);
+                // Respect paused handoff natively via `autoplay: should_play` (never triggers audio.play when false).
+                player.play_track_with_autoplay(pt.clone(), should_play);
                 if target_secs > 0.0 {
                     player.seek(target_secs);
                 }
-                // Respect paused handoff: don't force autoplay if source device was paused.
-                if !snapshot.is_playing {
-                    if let Some(eng) = engine {
-                        let _ = eng.audio.pause();
+
+                // Capture monotonic transfer generation AFTER `play_track_with_autoplay` bumped it so
+                // any newer queue command invalidates this async hydration task.
+                let my_gen = *studio.transfer_gen.peek();
+
+                // Hydrate the full transferred queue with bounded concurrency without interrupting playback.
+                if queue_ids.len() > 1 {
+                    if let Some(nav) = nav_opt {
+                        let active_song_id = song_id.clone();
+                        let active_track = pt;
+                        spawn(async move {
+                            let mut indexed: Vec<(usize, PlayerTrack)> = stream::iter(
+                                queue_ids.into_iter().take(50).enumerate().map(|(pos, sid)| {
+                                    let nav = nav.clone();
+                                    let active_id = active_song_id.clone();
+                                    let active_pt = active_track.clone();
+                                    async move {
+                                        if sid == active_id {
+                                            return Some((pos, active_pt));
+                                        }
+                                        match crate::navidrome_web::fetch_song(&nav, &sid).await {
+                                            Ok(Some(mut t)) => {
+                                                studio.apply_curation_overrides(&mut t);
+                                                Some((pos, t))
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                }),
+                            )
+                            .buffer_unordered(6)
+                            .collect::<Vec<_>>()
+                            .await
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                            indexed.sort_by_key(|(pos, _)| *pos);
+                            let tracks: Vec<PlayerTrack> =
+                                indexed.into_iter().map(|(_, t)| t).collect();
+
+                            if *studio.transfer_gen.peek() != my_gen {
+                                return;
+                            }
+                            if tracks.len() > 1 {
+                                let mut state_sig = player.state_signal();
+                                let mut state = state_sig.write();
+                                if state.current_track.as_ref().map(|t| t.id.as_str())
+                                    == Some(active_song_id.as_str())
+                                {
+                                    let resolved_idx = tracks
+                                        .get(requested_index)
+                                        .filter(|t| t.id == active_song_id)
+                                        .map(|_| requested_index)
+                                        .or_else(|| {
+                                            tracks.iter().position(|t| t.id == active_song_id)
+                                        })
+                                        .unwrap_or(0);
+                                    state.queue = tracks;
+                                    state.queue_index = Some(resolved_idx);
+                                }
+                            }
+                        });
                     }
-                    player.state_signal().write().status = PlaybackStatus::Paused;
+                }
+            } else if !queue_ids.is_empty() {
+                if let Some(nav) = studio.navidrome_info() {
+                    let my_gen = studio.transfer_gen.peek().wrapping_add(1);
+                    studio.transfer_gen.set(my_gen);
+                    if let Some(eng) = engine {
+                        if target_secs > 0.0 {
+                            eng.pending_seek_secs.set(Some(target_secs));
+                        }
+                    }
+                    spawn(async move {
+                        let mut indexed: Vec<(usize, PlayerTrack)> = stream::iter(
+                            queue_ids.into_iter().take(50).enumerate().map(|(pos, sid)| {
+                                let nav = nav.clone();
+                                async move {
+                                    match crate::navidrome_web::fetch_song(&nav, &sid).await {
+                                        Ok(Some(mut t)) => {
+                                            studio.apply_curation_overrides(&mut t);
+                                            Some((pos, t))
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            }),
+                        )
+                        .buffer_unordered(6)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        indexed.sort_by_key(|(pos, _)| *pos);
+                        let tracks: Vec<PlayerTrack> =
+                            indexed.into_iter().map(|(_, t)| t).collect();
+
+                        if tracks.is_empty() || *studio.transfer_gen.peek() != my_gen {
+                            return;
+                        }
+                        let idx = requested_index.min(tracks.len() - 1);
+                        player.play_queue_with_autoplay(tracks, idx, should_play);
+                        if target_secs > 0.0 {
+                            player.seek(target_secs);
+                        }
+                    });
                 }
             }
         }
@@ -2222,12 +2546,15 @@ fn apply_remote_connect_command(
             start_position_ms,
             autoplay,
         } => {
+            use futures::stream::{self, StreamExt};
             if song_ids.is_empty() {
                 return;
             }
             let Some(nav) = studio.navidrome_info() else {
                 return;
             };
+            let my_gen = studio.transfer_gen.peek().wrapping_add(1);
+            studio.transfer_gen.set(my_gen);
             let target_secs = (start_position_ms as f64) / 1000.0;
             if let Some(eng) = engine {
                 if target_secs > 0.0 {
@@ -2235,22 +2562,34 @@ fn apply_remote_connect_command(
                 }
             }
             spawn(async move {
-                let mut tracks = Vec::with_capacity(song_ids.len());
-                for sid in song_ids.iter().take(50) {
-                    if let Ok(Some(mut t)) = crate::navidrome_web::fetch_song(&nav, sid).await {
-                        studio.apply_curation_overrides(&mut t);
-                        tracks.push(t);
-                    }
-                }
-                if tracks.is_empty() {
+                let mut indexed: Vec<(usize, PlayerTrack)> = stream::iter(
+                    song_ids.into_iter().take(50).enumerate().map(|(pos, sid)| {
+                        let nav = nav.clone();
+                        async move {
+                            match crate::navidrome_web::fetch_song(&nav, &sid).await {
+                                Ok(Some(mut t)) => {
+                                    studio.apply_curation_overrides(&mut t);
+                                    Some((pos, t))
+                                }
+                                _ => None,
+                            }
+                        }
+                    }),
+                )
+                .buffer_unordered(6)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+                indexed.sort_by_key(|(pos, _)| *pos);
+                let tracks: Vec<PlayerTrack> = indexed.into_iter().map(|(_, t)| t).collect();
+                if tracks.is_empty() || *studio.transfer_gen.peek() != my_gen {
                     return;
                 }
-                player.play_queue(tracks, start_index);
+                player.play_queue_with_autoplay(tracks, start_index, autoplay);
                 if target_secs > 0.0 {
                     player.seek(target_secs);
-                }
-                if !autoplay {
-                    player.toggle_play_pause();
                 }
             });
         }
@@ -2260,7 +2599,9 @@ fn apply_remote_connect_command(
 fn load_or_create_device_id() -> String {
     #[cfg(feature = "web")]
     {
-        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        // Use per-tab sessionStorage so opening/closing a second browser tab never
+        // collides with or unregisters the active tab's Connect device ID.
+        if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
             if let Ok(Some(existing)) = storage.get_item("soulbeet.connect.device_id") {
                 if !existing.trim().is_empty() {
                     return existing;
@@ -2270,8 +2611,13 @@ fn load_or_create_device_id() -> String {
             let _ = storage.set_item("soulbeet.connect.device_id", &generated);
             return generated;
         }
+        // Private browsing or blocked storage: still generate a unique per-tab ID.
+        format!("web-{}", js_sys::Math::random().to_bits())
     }
-    "web-studio".to_string()
+    #[cfg(not(feature = "web"))]
+    {
+        "web-studio".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2317,5 +2663,44 @@ mod tests {
             }
         }
         assert_eq!(scrobble_at, Some(240));
+    }
+
+    #[test]
+    fn connect_device_visible_equality_ignores_keepalive_timestamps() {
+        let base = ConnectDevice {
+            device_id: "d1".into(),
+            name: "Web Studio".into(),
+            platform: shared::client::DevicePlatform::Web,
+            is_active: true,
+            last_seen_unix: 100,
+            snapshot: Some(PlaybackSnapshot {
+                song_id: Some("s1".into()),
+                title: Some("Song".into()),
+                artist: Some("Artist".into()),
+                album: None,
+                cover_art_id: None,
+                is_playing: true,
+                position_ms: 10_000,
+                duration_ms: 180_000,
+                queue_song_ids: vec!["s1".into()],
+                queue_index: 0,
+                volume: 1.0,
+                is_pending_discovery: false,
+                updated_at_unix: 100,
+            }),
+        };
+        let mut heartbeat_update = base.clone();
+        heartbeat_update.last_seen_unix = 125;
+        if let Some(ref mut snap) = heartbeat_update.snapshot {
+            snap.updated_at_unix = 125;
+        }
+        assert!(connect_devices_visibly_equal(
+            std::slice::from_ref(&base),
+            &[heartbeat_update]
+        ));
+
+        let mut active_changed = base.clone();
+        active_changed.is_active = false;
+        assert!(!connect_devices_visibly_equal(&[base], &[active_changed]));
     }
 }

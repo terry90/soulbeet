@@ -21,9 +21,13 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.outlined.OfflinePin
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,6 +45,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
@@ -97,12 +103,15 @@ fun LibraryScreen(
     ) {
         // 1. Pinned Offline Only Switch + Cache Disk Budget Meter
         item(key = "offline_budget_card") {
+            val offlineAmber = Color(0xFFF59E0B)
+            val offlineAmberBorder = Color(0x73F59E0B)
+            val offlineAmberInk = Color(0xFF1A1002)
             Surface(
                 color = colors.surface,
                 shape = SoulbeetShapes.lg,
                 border = BorderStroke(
                     1.dp,
-                    if (state.config.offlineOnly) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
+                    if (state.config.offlineOnly) offlineAmberBorder else colors.borderSubtle,
                 ),
             ) {
                 Column(
@@ -124,7 +133,7 @@ fun LibraryScreen(
                             Icon(
                                 imageVector = Icons.Filled.CloudOff,
                                 contentDescription = null,
-                                tint = if (state.config.offlineOnly) colors.leafText else colors.textMuted,
+                                tint = if (state.config.offlineOnly) offlineAmber else colors.textMuted,
                             )
                             Column {
                                 Text(
@@ -147,8 +156,8 @@ fun LibraryScreen(
                             checked = state.config.offlineOnly,
                             onCheckedChange = { onToggleOfflineOnly() },
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = colors.leafInk,
-                                checkedTrackColor = colors.leafSolid,
+                                checkedThumbColor = offlineAmberInk,
+                                checkedTrackColor = offlineAmber,
                                 uncheckedThumbColor = colors.textMuted,
                                 uncheckedTrackColor = colors.surfaceHigh,
                             ),
@@ -225,21 +234,86 @@ fun LibraryScreen(
         // 3. Category Contents
         when (state.libraryCategory) {
             LibraryCategory.PLAYLISTS -> {
-                if (state.playlists.isEmpty()) {
+                val userPlaylists = state.userPlaylists
+                val discoveryAndMixPlaylists = state.playlists.filter { it.kind != "user" }
+                if (userPlaylists.isEmpty() && discoveryAndMixPlaylists.isEmpty()) {
                     item(key = "empty_playlists") { EmptyLibraryNotice("No playlists synced yet.") }
                 } else {
-                    items(state.playlists, key = { it.id }) { pl ->
-                        val target = FfiPinTarget.Playlist(pl.id)
-                        val isPinned = state.pinnedTargets.any { it.target == target }
-                        PinnableContainerRow(
-                            title = pl.name,
-                            subtitle = "${pl.songCount} tracks" + if (pl.isSmart) " · Smart" else "",
-                            coverArtId = pl.coverArtId,
-                            artAuthority = artAuthority,
-                            isPinned = isPinned,
-                            onClick = { onOpenPlaylist(pl) },
-                            onTogglePin = { onTogglePin(target, pl.name) },
-                        )
+                    if (userPlaylists.isNotEmpty()) {
+                        item(key = "section_user_playlists") {
+                            PlaylistSectionHeader(
+                                icon = Icons.AutoMirrored.Filled.QueueMusic,
+                                iconTint = colors.leafText,
+                                title = "Your Playlists",
+                                count = userPlaylists.size,
+                            )
+                        }
+                        items(userPlaylists, key = { "user_${it.id}" }) { pl ->
+                            val target = FfiPinTarget.Playlist(pl.id)
+                            val isPinned = state.pinnedTargets.any { it.target == target }
+                            PinnableContainerRow(
+                                title = pl.name,
+                                subtitle = "${pl.songCount} tracks",
+                                coverArtId = pl.coverArtId,
+                                artAuthority = artAuthority,
+                                isPinned = isPinned,
+                                onClick = { onOpenPlaylist(pl) },
+                                onTogglePin = { onTogglePin(target, pl.name) },
+                            )
+                        }
+                    }
+                    if (discoveryAndMixPlaylists.isNotEmpty()) {
+                        item(key = "section_discovery_mixes") {
+                            PlaylistSectionHeader(
+                                icon = Icons.Filled.AutoAwesome,
+                                iconTint = colors.accentText,
+                                title = "Discovery & Mixes",
+                                count = discoveryAndMixPlaylists.size,
+                            )
+                        }
+                        items(discoveryAndMixPlaylists, key = { "mix_${it.id}" }) { pl ->
+                            val target = FfiPinTarget.Playlist(pl.id)
+                            val isPinned = state.pinnedTargets.any { it.target == target }
+                            val (tagLabel, tagIcon, tagTint, tagBg) = when (pl.kind) {
+                                "seasonal" -> Quad(
+                                    "SEASONAL",
+                                    Icons.Filled.CalendarMonth,
+                                    colors.gold,
+                                    colors.goldSurface,
+                                )
+                                "moment" -> Quad(
+                                    "MOMENT",
+                                    Icons.Filled.Schedule,
+                                    colors.leafText,
+                                    colors.leafSurface,
+                                )
+                                "discovery" -> Quad(
+                                    "ROLLING",
+                                    Icons.Filled.AutoAwesome,
+                                    colors.accentText,
+                                    colors.accentSurface,
+                                )
+                                else -> Quad(
+                                    "SMART",
+                                    Icons.Filled.AutoAwesome,
+                                    colors.accentText,
+                                    colors.accentSurface,
+                                )
+                            }
+                            PinnableContainerRow(
+                                title = pl.name,
+                                subtitle = "${pl.songCount} tracks",
+                                coverArtId = pl.coverArtId,
+                                artAuthority = artAuthority,
+                                isPinned = isPinned,
+                                badgeLabel = tagLabel,
+                                badgeIcon = tagIcon,
+                                badgeColor = tagTint,
+                                badgeBackground = tagBg,
+                                onClick = { onOpenPlaylist(pl) },
+                                onTogglePin = { onTogglePin(target, pl.name) },
+                            )
+                        }
                     }
                 }
             }
@@ -357,7 +431,7 @@ fun LibraryScreen(
                             isPlaying = state.playback.currentTrackId == track.id,
                             isOfflineCached = true,
                             isStarred = track.starred,
-                            onClick = { onPlayQueue(state.offlineTracks, index, "Offline") },
+                            onClick = { onPlayQueue(state.offlineTracks, index, "Cached") },
                             onStarClick = { onStarTrack(track) },
                             onRemoveClick = { onRemoveTrack(track) },
                         )
@@ -384,6 +458,48 @@ fun LibraryScreen(
     }
 }
 
+private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+@Composable
+private fun PlaylistSectionHeader(
+    icon: ImageVector,
+    iconTint: Color,
+    title: String,
+    count: Int,
+) {
+    val colors = LocalSoulbeetColors.current
+    val type = LocalSoulbeetTypography.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = iconTint,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = title,
+                style = type.titleMd,
+                color = colors.textPrimary,
+            )
+        }
+        Text(
+            text = "$count",
+            style = type.monoXs,
+            color = colors.textMuted,
+        )
+    }
+}
+
 @Composable
 private fun PinnableContainerRow(
     title: String,
@@ -392,6 +508,10 @@ private fun PinnableContainerRow(
     artAuthority: String,
     isPinned: Boolean,
     circularArt: Boolean = false,
+    badgeLabel: String? = null,
+    badgeIcon: ImageVector? = null,
+    badgeColor: Color? = null,
+    badgeBackground: Color? = null,
     onClick: () -> Unit,
     onTogglePin: () -> Unit,
 ) {
@@ -422,13 +542,49 @@ private fun PinnableContainerRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            Text(
-                text = subtitle,
-                style = type.bodySm,
-                color = colors.textSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = subtitle,
+                    style = type.bodySm,
+                    color = colors.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (badgeLabel != null) {
+                    val tint = badgeColor ?: colors.accentText
+                    val bg = badgeBackground ?: colors.accentSurface
+                    Surface(
+                        color = bg,
+                        shape = SoulbeetShapes.full,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            if (badgeIcon != null) {
+                                Icon(
+                                    imageVector = badgeIcon,
+                                    contentDescription = null,
+                                    tint = tint,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                            }
+                            Text(
+                                text = badgeLabel,
+                                style = type.monoXs,
+                                color = tint,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
+                        }
+                    }
+                }
+            }
         }
         IconButton(
             onClick = onTogglePin,

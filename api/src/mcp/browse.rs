@@ -159,12 +159,14 @@ pub(crate) async fn browse_library(
             args.finish()?;
 
             let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
-            let result = browse::browse_library(
+            let result = browse::browse_library_with_admin(
                 &state.db,
                 &navi,
+                Some(state.navidrome.as_ref()),
                 &caller.ctx,
                 state.navidrome_music_path.as_deref(),
                 query,
+                caller.has_admin_access(),
             )
             .await
             .map_err(|f| upstream_error(f, listing_fields(&list), args.same_call()))?;

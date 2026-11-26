@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       bump_type:
-        description: 'Version bump type'
+        description: 'Version bump type (ignored when custom_tag is set)'
         required: true
         default: 'patch'
         type: choice
@@ -14,6 +14,16 @@ on:
           - patch
           - minor
           - major
+      custom_tag:
+        description: 'Optional explicit tag (e.g. v1.0.0-alpha-0) instead of patch/minor/major bump'
+        required: false
+        default: ''
+        type: string
+      promote_latest:
+        description: 'Mark this release as Latest on GitHub and Docker even for prerelease tags'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   bump-version:
@@ -36,19 +46,30 @@ jobs:
 
       - name: Bump Version
         id: bump
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+          CUSTOM_TAG: ${{ inputs.custom_tag }}
         run: |
-          ./scripts/bump_version.sh ${{ inputs.bump_type }}
+          TARGET="$BUMP_TYPE"
+          if [[ -n "$CUSTOM_TAG" ]]; then
+            TARGET="$CUSTOM_TAG"
+          fi
+          ./scripts/bump_version.sh "$TARGET"
 
       - name: Commit and Push
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
           git add .
-          git commit -m "bump version to ${{ steps.bump.outputs.new_version }}"
+          git commit -m "bump version to ${NEW_VERSION}"
           git push
 
       - name: Create and Push Tag
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
-          git tag v${{ steps.bump.outputs.new_version }}
-          git push origin v${{ steps.bump.outputs.new_version }}
+          git tag "v${NEW_VERSION}"
+          git push origin "v${NEW_VERSION}"
 
   build-and-push:
     needs: bump-version
@@ -58,7 +79,7 @@ jobs:
       ref: ${{ needs.bump-version.outputs.tag || github.ref_name }}
       tags: |
         type=raw,value=${{ needs.bump-version.outputs.tag || github.ref_name }}
-        type=raw,value=latest,enable=${{ !contains(needs.bump-version.outputs.tag || github.ref_name, '-') }}
+        type=raw,value=latest,enable=${{ inputs.promote_latest == true || !contains(needs.bump-version.outputs.tag || github.ref_name, '-') }}
     secrets: inherit
 
   build-android:
@@ -472,10 +493,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.bump-version.outputs.tag || github.ref_name }}
+          PROMOTE_LATEST: ${{ inputs.promote_latest == true }}
         run: |
           flags=()
-          # v1.2.3-rc.1 and the like are test builds, not the latest release.
-          [[ "$RELEASE_TAG" == *-* ]] && flags+=(--prerelease)
+          # v1.2.3-rc.1 and the like are test builds, not the latest release,
+          # unless promote_latest was explicitly requested via workflow_dispatch.
+          if [[ "$PROMOTE_LATEST" == "true" ]]; then
+            flags+=(--latest)
+          elif [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_TAG" \
             --generate-notes \

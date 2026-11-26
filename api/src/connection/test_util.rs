@@ -755,6 +755,7 @@ pub(crate) fn alice_caller(allow_delete: bool) -> McpCaller {
         },
         grant_id: "g1".into(),
         allow_delete,
+        allow_admin: false,
         base: BaseUrl::parse("https://music.example.com").unwrap(),
     }
 }

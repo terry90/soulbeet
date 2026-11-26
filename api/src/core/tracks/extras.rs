@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use shared::client::{TrackLyricLine, TrackLyrics};
 use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
+use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::NativeSong;
 use tracing::info;
 
@@ -31,6 +33,34 @@ const USER_AGENT: &str = "Soulbeet/0.10.0";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hard cap on downloaded cover art image size (10 MiB).
 const MAX_ART_BYTES: usize = 10 * 1024 * 1024;
+/// Hard cap on LRCLIB JSON response body size (512 KiB).
+const MAX_LYRICS_BYTES: usize = 512 * 1024;
+
+async fn read_capped_json<T: serde::de::DeserializeOwned>(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<T, String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(format!(
+                "{label} response exceeds {max_bytes} byte limit ({len} bytes)"
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed reading {label} response body: {e}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("{label} response exceeds {max_bytes} byte limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|e| format!("Failed to parse {label} response: {e}"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedArt {
@@ -82,6 +112,14 @@ impl Default for LiveExtrasFetcher {
 
 impl LiveExtrasFetcher {
     pub(crate) fn new() -> Self {
+        Self::with_bases(
+            "https://coverartarchive.org".into(),
+            "https://musicbrainz.org".into(),
+            "https://lrclib.net".into(),
+        )
+    }
+
+    pub(crate) fn with_bases(caa_base: String, mb_base: String, lrclib_base: String) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(FETCH_TIMEOUT)
@@ -89,10 +127,41 @@ impl LiveExtrasFetcher {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             client,
-            caa_base: "https://coverartarchive.org".into(),
-            mb_base: "https://musicbrainz.org".into(),
-            lrclib_base: "https://lrclib.net".into(),
+            caa_base,
+            mb_base,
+            lrclib_base,
         }
+    }
+
+    async fn search_lyrics(
+        &self,
+        artist: &str,
+        title: &str,
+        album: Option<&str>,
+        duration_s: Option<u32>,
+    ) -> Result<Option<FetchedLyrics>, String> {
+        let url = format!("{}/api/search", self.lrclib_base);
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("artist_name", artist.trim()), ("track_name", title.trim())])
+            .send()
+            .await
+            .map_err(|e| format!("LRCLIB search request failed: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "LRCLIB search returned HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        let items: Vec<LrcLibSearchItem> =
+            read_capped_json(resp, MAX_LYRICS_BYTES, "LRCLIB search").await?;
+        Ok(pick_best_lrclib_result(
+            &items, artist, title, album, duration_s,
+        ))
     }
 
     async fn fetch_caa(&self, release_mbid: &str) -> Result<Option<FetchedArt>, String> {
@@ -282,15 +351,12 @@ impl ExtrasFetcher for LiveExtrasFetcher {
             .await
             .map_err(|e| format!("LRCLIB request failed: {e}"))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            return self.search_lyrics(artist, title, album, duration_s).await;
         }
         if !resp.status().is_success() {
             return Err(format!("LRCLIB returned HTTP {}", resp.status().as_u16()));
         }
-        let body: LrcLibResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse LRCLIB response: {e}"))?;
+        let body: LrcLibResponse = read_capped_json(resp, MAX_LYRICS_BYTES, "LRCLIB").await?;
         if body.instrumental {
             return Ok(None);
         }
@@ -314,7 +380,7 @@ impl ExtrasFetcher for LiveExtrasFetcher {
                 source: "lrclib".into(),
             }));
         }
-        Ok(None)
+        self.search_lyrics(artist, title, album, duration_s).await
     }
 }
 
@@ -355,6 +421,277 @@ struct LrcLibResponse {
     synced_lyrics: Option<String>,
     #[serde(default)]
     plain_lyrics: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LrcLibSearchItem {
+    #[serde(default)]
+    track_name: String,
+    #[serde(default)]
+    artist_name: String,
+    #[serde(default)]
+    album_name: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    instrumental: bool,
+    #[serde(default)]
+    synced_lyrics: Option<String>,
+    #[serde(default)]
+    plain_lyrics: Option<String>,
+}
+
+/// Computes token-overlap similarity in `[0.0, 1.0]` between two normalized music strings.
+fn text_similarity(a: &str, b: &str) -> f64 {
+    let na = normalize_for_matching(a);
+    let nb = normalize_for_matching(b);
+    if na.is_empty() || nb.is_empty() {
+        return 0.0;
+    }
+    if na == nb {
+        return 1.0;
+    }
+    let words_a: std::collections::HashSet<&str> = na.split_whitespace().collect();
+    let words_b: std::collections::HashSet<&str> = nb.split_whitespace().collect();
+    let inter = words_a.intersection(&words_b).count();
+    let union = words_a.union(&words_b).count();
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// Picks the best LRCLIB search candidate matching `artist` and `title`, preferring synced lyrics
+/// and closest duration when known.
+fn pick_best_lrclib_result(
+    items: &[LrcLibSearchItem],
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+    duration_s: Option<u32>,
+) -> Option<FetchedLyrics> {
+    let norm_artist = normalize_for_matching(artist);
+    let norm_title = normalize_for_matching(title);
+    let norm_album = album
+        .map(normalize_for_matching)
+        .filter(|s| !s.is_empty());
+
+    let mut best: Option<(f64, FetchedLyrics)> = None;
+    for item in items {
+        if item.instrumental {
+            continue;
+        }
+        let synced = item
+            .synced_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let plain = item
+            .plain_lyrics
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
+        let (content, is_synced) = match (synced, plain) {
+            (Some(s), _) => (s, true),
+            (None, Some(p)) => (p, false),
+            (None, None) => continue,
+        };
+
+        let artist_sim = text_similarity(artist, &item.artist_name);
+        let title_sim = text_similarity(title, &item.track_name);
+        if artist_sim < 0.5 || title_sim < 0.5 {
+            continue;
+        }
+
+        let mut score = artist_sim * 40.0 + title_sim * 40.0;
+        if normalize_for_matching(&item.artist_name) == norm_artist {
+            score += 15.0;
+        }
+        // Exact normalized title match must outweigh the synced bonus so a wrong-title synced
+        // track (e.g. "Part 2") never beats an exact-title plain track ("Part 1").
+        if normalize_for_matching(&item.track_name) == norm_title {
+            score += 30.0;
+        }
+        if is_synced {
+            score += 20.0;
+        }
+        if let (Some(want_dur), Some(cand_dur)) = (duration_s.filter(|d| *d > 0), item.duration) {
+            let diff = (cand_dur - f64::from(want_dur)).abs();
+            if diff > 30.0 {
+                continue;
+            }
+            score += 20.0 * (1.0 - (diff / 30.0).min(1.0));
+        }
+        if let (Some(want_al), Some(cand_al)) = (&norm_album, item.album_name.as_deref()) {
+            if normalize_for_matching(cand_al) == *want_al {
+                score += 5.0;
+            }
+        }
+
+        if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
+            best = Some((
+                score,
+                FetchedLyrics {
+                    content: content.to_string(),
+                    synced: is_synced,
+                    source: "lrclib".into(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, lyrics)| lyrics)
+}
+
+/// Parses an LRC timestamp tag body like `01:23.45`, `01:23.456`, `01:23:45`, or `01:23` into
+/// milliseconds.
+fn parse_lrc_timestamp_ms(tag: &str) -> Option<i64> {
+    let (min_str, rest) = tag.split_once(':')?;
+    if min_str.is_empty() || !min_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let minutes: i64 = min_str.parse().ok()?;
+    let (sec_str, frac_str) = match rest.split_once('.').or_else(|| rest.split_once(':')) {
+        Some((s, f)) => (s, Some(f)),
+        None => (rest, None),
+    };
+    if sec_str.is_empty() || sec_str.len() > 2 || !sec_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds: i64 = sec_str.parse().ok()?;
+    if seconds >= 60 {
+        return None;
+    }
+    let millis: i64 = match frac_str {
+        None => 0,
+        Some(f) if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) => return None,
+        Some(f) => match f.len() {
+            1 => f.parse::<i64>().ok()? * 100,
+            2 => f.parse::<i64>().ok()? * 10,
+            3 => f.parse::<i64>().ok()?,
+            _ => f[..3].parse::<i64>().ok()?,
+        },
+    };
+    minutes
+        .checked_mul(60_000)?
+        .checked_add(seconds.checked_mul(1_000)?)?
+        .checked_add(millis)
+}
+
+/// True if `tag` (the text inside `[...]`) is a known LRC metadata header tag like `ar:...`,
+/// `ti:...`, `al:...`, `offset:...`, etc.
+fn is_lrc_metadata_tag(tag: &str) -> bool {
+    let Some((key, _)) = tag.split_once(':') else {
+        return false;
+    };
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "ar" | "ti" | "al" | "au" | "by" | "length" | "offset" | "re" | "ve" | "tool" | "la" | "#"
+    )
+}
+
+/// Parses synced LRC or plain lyrics text into `TrackLyrics`.
+/// Supports multiple timestamps per line (compressed LRC), centiseconds and milliseconds,
+/// `[offset:...]` tags, strips metadata header tags (`[ar:]`, `[ti:]`, etc.), and falls back to
+/// plain lines when no valid timestamps are found.
+pub(crate) fn parse_lrc(
+    raw: &str,
+    synced: bool,
+    display_artist: Option<String>,
+    display_title: Option<String>,
+) -> TrackLyrics {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let mut offset_ms: Option<i64> = None;
+    let mut timed_lines: Vec<(i64, usize, String)> = Vec::new();
+    let mut plain_lines: Vec<TrackLyricLine> = Vec::new();
+
+    for (line_idx, raw_line) in raw.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        // Check for pure metadata header tag like `[ar:Artist]` or `[offset:500]`
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if !inner.contains(']') && is_lrc_metadata_tag(inner) {
+                if let Some((key, val)) = inner.split_once(':') {
+                    if key.trim().eq_ignore_ascii_case("offset") {
+                        if let Ok(parsed) = val.trim().parse::<i64>() {
+                            offset_ms = Some(parsed);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        if synced {
+            let mut rest = trimmed;
+            let mut timestamps: Vec<i64> = Vec::new();
+            while let Some(after_open) = rest.strip_prefix('[') {
+                let Some(close_idx) = after_open.find(']') else {
+                    break;
+                };
+                let tag = &after_open[..close_idx];
+                if let Some(ms) = parse_lrc_timestamp_ms(tag) {
+                    timestamps.push(ms);
+                    rest = after_open[close_idx + 1..].trim_start();
+                } else if is_lrc_metadata_tag(tag) {
+                    rest = after_open[close_idx + 1..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            if !timestamps.is_empty() {
+                let text = rest.trim().to_string();
+                for ms in timestamps {
+                    timed_lines.push((ms, line_idx, text.clone()));
+                }
+                continue;
+            }
+        }
+
+        plain_lines.push(TrackLyricLine {
+            start_ms: None,
+            text: raw_line.trim_end().to_string(),
+        });
+    }
+
+    if synced && !timed_lines.is_empty() {
+        timed_lines.sort_by_key(|(ms, idx, _)| (*ms, *idx));
+        return TrackLyrics {
+            display_artist,
+            display_title,
+            lang: "und".to_string(),
+            synced: true,
+            offset_ms,
+            lines: timed_lines
+                .into_iter()
+                .map(|(ms, _, text)| TrackLyricLine {
+                    start_ms: Some(ms),
+                    text,
+                })
+                .collect(),
+        };
+    }
+
+    // Trim leading/trailing empty lines for plain lyrics fallback.
+    while plain_lines
+        .first()
+        .is_some_and(|l| l.text.trim().is_empty())
+    {
+        plain_lines.remove(0);
+    }
+    while plain_lines
+        .last()
+        .is_some_and(|l| l.text.trim().is_empty())
+    {
+        plain_lines.pop();
+    }
+
+    TrackLyrics {
+        display_artist,
+        display_title,
+        lang: "und".to_string(),
+        synced: false,
+        offset_ms,
+        lines: plain_lines,
+    }
 }
 
 fn pick_best_release(releases: &[MbRelease]) -> Option<String> {
@@ -955,7 +1292,7 @@ pub(crate) async fn fetch_artwork_and_lyrics(
 
 /// Atomically writes `bytes` to `target` using a hidden `.tmp` sibling in the same directory so
 /// Navidrome's watcher never observes a half-written cover or `.lrc` file.
-fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let Some(parent) = target.parent() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1270,5 +1607,164 @@ mod tests {
         assert_eq!(detect_image_ext(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
         assert_eq!(detect_image_ext(&[0x89, b'P', b'N', b'G', 0x0D]), Some("png"));
         assert_eq!(detect_image_ext(b"GIF89a"), None);
+    }
+
+    #[test]
+    fn parse_lrc_handles_multi_timestamps_centiseconds_milliseconds_and_metadata_tags() {
+        let raw = "\u{feff}[ar:Marrow Choir]\n\
+                   [ti:O Holy Night]\n\
+                   [al:Winter Songs]\n\
+                   [offset:-250]\n\
+                   [00:12.34]First verse line\n\
+                   [00:25.123]Millisecond precision\n\
+                   [00:40.50][01:20.00]Repeated chorus\n\
+                   [01:05:20]Colon fractional line\n";
+        let parsed = parse_lrc(raw, true, Some("Marrow Choir".into()), Some("O Holy Night".into()));
+        assert!(parsed.synced);
+        assert_eq!(parsed.offset_ms, Some(-250));
+        assert_eq!(parsed.display_artist.as_deref(), Some("Marrow Choir"));
+        assert_eq!(parsed.display_title.as_deref(), Some("O Holy Night"));
+        assert_eq!(
+            parsed.lines,
+            vec![
+                TrackLyricLine { start_ms: Some(12_340), text: "First verse line".into() },
+                TrackLyricLine { start_ms: Some(25_123), text: "Millisecond precision".into() },
+                TrackLyricLine { start_ms: Some(40_500), text: "Repeated chorus".into() },
+                TrackLyricLine { start_ms: Some(65_200), text: "Colon fractional line".into() },
+                TrackLyricLine { start_ms: Some(80_000), text: "Repeated chorus".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_lrc_falls_back_to_plain_lines_when_unsynced_or_untagged() {
+        let raw = "[ar:Air]\n[ti:Playground Love]\n\nI'm a high school lover\nAnd you're my favorite flavor\n\n";
+        let parsed = parse_lrc(raw, true, Some("Air".into()), Some("Playground Love".into()));
+        assert!(!parsed.synced);
+        assert_eq!(
+            parsed.lines,
+            vec![
+                TrackLyricLine { start_ms: None, text: "I'm a high school lover".into() },
+                TrackLyricLine { start_ms: None, text: "And you're my favorite flavor".into() },
+            ]
+        );
+
+        let plain = parse_lrc("Line one\nLine two", false, None, None);
+        assert!(!plain.synced);
+        assert_eq!(plain.lines.len(), 2);
+        assert_eq!(plain.lines[0].start_ms, None);
+    }
+
+    #[tokio::test]
+    async fn lrclib_falls_back_to_search_on_404_and_prefers_synced_closest_duration() {
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/api/get",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/api/search",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "artistName": "Totally Different Band",
+                            "trackName": "Unrelated Track",
+                            "duration": 210.0,
+                            "instrumental": false,
+                            "syncedLyrics": "[00:01.00] Wrong song"
+                        },
+                        {
+                            "artistName": "Air",
+                            "trackName": "Playground Love",
+                            "albumName": "The Virgin Suicides",
+                            "duration": 213.0,
+                            "instrumental": false,
+                            "plainLyrics": "Plain version only"
+                        },
+                        {
+                            "artistName": "Air",
+                            "trackName": "Playground Love",
+                            "albumName": "The Virgin Suicides (Live Extended)",
+                            "duration": 280.0,
+                            "instrumental": false,
+                            "syncedLyrics": "[00:01.00] Too far duration"
+                        },
+                        {
+                            "artistName": "Air",
+                            "trackName": "Playground Love",
+                            "albumName": "The Virgin Suicides",
+                            "duration": 212.0,
+                            "instrumental": false,
+                            "syncedLyrics": "[00:10.00] I'm a high school lover"
+                        }
+                    ]))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base = format!("http://{addr}");
+        let fetcher = LiveExtrasFetcher::with_bases(base.clone(), base.clone(), base);
+        let found = fetcher
+            .fetch_lyrics("Air", "Playground Love", Some("The Virgin Suicides"), Some(213))
+            .await
+            .unwrap()
+            .expect("search fallback should find synced lyrics");
+        assert!(found.synced);
+        assert_eq!(found.content, "[00:10.00] I'm a high school lover");
+    }
+
+    #[test]
+    fn parse_lrc_handles_spaces_between_timestamps_and_rejects_overflow() {
+        assert_eq!(parse_lrc_timestamp_ms("99999999999999999999:00.00"), None);
+        assert_eq!(parse_lrc_timestamp_ms("999999999999999:00.00"), None);
+        let parsed = parse_lrc(
+            "[00:10.00] [00:20.00]Hello world",
+            true,
+            None,
+            None,
+        );
+        assert!(parsed.synced);
+        assert_eq!(
+            parsed.lines,
+            vec![
+                TrackLyricLine { start_ms: Some(10_000), text: "Hello world".into() },
+                TrackLyricLine { start_ms: Some(20_000), text: "Hello world".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn lrclib_exact_title_plain_beats_wrong_title_synced() {
+        let items = vec![
+            LrcLibSearchItem {
+                track_name: "Shine On Part 2".into(),
+                artist_name: "Pink Floyd".into(),
+                album_name: None,
+                duration: Some(200.0),
+                instrumental: false,
+                synced_lyrics: Some("[00:01.00] Wrong part".into()),
+                plain_lyrics: None,
+            },
+            LrcLibSearchItem {
+                track_name: "Shine On Part 1".into(),
+                artist_name: "Pink Floyd".into(),
+                album_name: None,
+                duration: Some(200.0),
+                instrumental: false,
+                synced_lyrics: None,
+                plain_lyrics: Some("Exact part 1 lyrics".into()),
+            },
+        ];
+        let picked = pick_best_lrclib_result(&items, "Pink Floyd", "Shine On Part 1", None, Some(200))
+            .expect("should pick exact title");
+        assert!(!picked.synced);
+        assert_eq!(picked.content, "Exact part 1 lyrics");
     }
 }

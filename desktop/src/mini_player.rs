@@ -11,8 +11,8 @@
 use dioxus::prelude::*;
 use dioxus_desktop::{Config, DesktopContext, LogicalSize, WindowBuilder};
 use ui::{
-    IconCheck, IconLoader, IconMusic, IconPause, IconPictureInPicture2, IconPlay, IconSkipBack,
-    IconSkipForward, IconSparkles, IconStar, IconThumbsDown, IconX,
+    IconCheck, IconHeart, IconLoader, IconMusic, IconPause, IconPictureInPicture2, IconPlay,
+    IconSkipBack, IconSkipForward, IconSparkles, IconThumbsDown, IconX,
 };
 
 use crate::assets::StudioAssets;
@@ -286,17 +286,17 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
                                             button {
                                                 r#type: "button",
                                                 aria_pressed: if starred { "true" } else { "false" },
-                                                title: if starred { "Unstar" } else { "Star" },
-                                                aria_label: if starred { "Unstar track" } else { "Star track" },
+                                                title: if starred { "Remove from favorites" } else { "Favorite" },
+                                                aria_label: if starred { "Remove from favorites" } else { "Favorite track" },
                                                 class: if starred {
-                                                    "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-gold hover:bg-beet-gold-surface cursor-pointer transition-colors"
+                                                    "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-accent-text hover:bg-beet-accent-surface cursor-pointer transition-colors"
                                                 } else {
-                                                    "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-gold hover:bg-beet-surface-high cursor-pointer transition-colors"
+                                                    "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-accent-text hover:bg-beet-surface-high cursor-pointer transition-colors"
                                                 },
                                                 onclick: move |_| {
                                                     let _ = tx_star.send(MiniPlayerAction::Star(ts.clone(), !starred));
                                                 },
-                                                IconStar { size: 15, filled: starred }
+                                                IconHeart { size: 15, filled: starred }
                                             }
                                         }
                                     }
