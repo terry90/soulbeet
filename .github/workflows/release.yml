@@ -183,15 +183,15 @@ jobs:
           [[ "$PATCH" =~ ^[0-9]+$ ]] || PATCH=0
 
           # Partition 0..98 by prerelease channel so Play versionCode stays strictly monotonic:
-          # unnumbered -> 0, alpha-0..31 -> 1..32, beta-0..32 -> 33..65, rc-0..32 -> 66..98, stable -> 99.
+          # unnumbered -> 0, alpha-0..30 -> 2..32 (1000001 reserved), beta-0..32 -> 33..65, rc-0..32 -> 66..98, stable -> 99.
           if [[ "$WITHOUT_META" == *-* ]]; then
             PRERELEASE="${WITHOUT_META#*-}"
             PRERELEASE_LOWER="${PRERELEASE,,}"
             if [[ "$PRERELEASE_LOWER" =~ ([0-9]+)$ ]]; then
               NUM=$((10#${BASH_REMATCH[1]}))
               if [[ "$PRERELEASE_LOWER" == alpha* ]]; then
-                BASE=1
-                MAX_NUM=31
+                BASE=2
+                MAX_NUM=30
               elif [[ "$PRERELEASE_LOWER" == beta* ]]; then
                 BASE=33
                 MAX_NUM=32
