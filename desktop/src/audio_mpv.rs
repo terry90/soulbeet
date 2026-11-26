@@ -312,6 +312,7 @@ impl MpvEngine {
     }
 
     /// Sends a command non-blockingly to the `libmpv` worker.
+    #[allow(dead_code)]
     pub fn send_command(&self, cmd: MpvCommand) -> Result<(), String> {
         self.cmd_tx
             .try_send(cmd)
