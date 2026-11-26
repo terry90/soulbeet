@@ -17,11 +17,12 @@ use tracing::warn;
 use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::core::delete_guard::{pending_track_of, song_not_found, ForgetVia, Guard, Origin, Verdict};
-use crate::core::discovery::{promote_to, remove_in, DiscoveryEffects, Replace};
+use crate::core::discovery::{
+    promote_to, remove_in, track_not_pending, DiscoveryEffects, Replace,
+};
 use crate::core::index::ServerNavidrome;
 use crate::core::library::{navidrome_failure, navidrome_for};
 use crate::import_queue::ImportQueue;
-use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::user_settings::UserSettings;
 
@@ -105,6 +106,29 @@ fn preview_from_blocked(song_id: &str, failure: &Failure) -> DeleteGuardPreview 
     }
 }
 
+fn is_delete_failure(code: FailureCode) -> bool {
+    matches!(
+        code,
+        FailureCode::DeletePathUnresolved
+            | FailureCode::DeleteOutsideLibrary
+            | FailureCode::DeleteNotATrack
+            | FailureCode::DeleteBlockedByOtherUser
+            | FailureCode::DeleteVetoUnknown
+            | FailureCode::DeleteInUse
+            | FailureCode::DeleteChangedSincePreview
+            | FailureCode::DeleteFailed
+            | FailureCode::DeleteDailyLimit
+    )
+}
+
+fn effective_song_id(req_song_id: &str, track: &DiscoveryTrack) -> String {
+    if !req_song_id.trim().is_empty() {
+        req_song_id.to_string()
+    } else {
+        track.song_id.clone().unwrap_or_default()
+    }
+}
+
 /// Resolves whether `song_id` (or explicit `discovery_track_id`) corresponds to a Pending
 /// discovery track owned by `ctx`.
 async fn find_pending_discovery(
@@ -121,7 +145,7 @@ async fn find_pending_discovery(
         if let Some(track) = pending.into_iter().find(|t| t.id == track_id) {
             return Ok(Some(track));
         }
-        return Ok(None);
+        return Err(track_not_pending());
     }
 
     if pending.is_empty() || song_id.is_empty() {
@@ -139,10 +163,11 @@ async fn find_pending_discovery(
     let Some(native) = guard.read_song(&user, song_id).await? else {
         return Ok(None);
     };
-    match pending_track_of(guard.db, guard.music_path, &user, &native, &pending).await {
-        Ok(found) => Ok(found.cloned()),
-        Err(_) => Ok(None),
-    }
+    Ok(
+        pending_track_of(guard.db, guard.music_path, &user, &native, &pending)
+            .await?
+            .cloned(),
+    )
 }
 
 /// Evaluates Soulbeet's Multi-Listener Delete Guard for `song_id` without mutating anything.
@@ -174,8 +199,10 @@ pub(crate) async fn guard_preview_in(
             own_playlists: checked.playlists.into_iter().map(|p| p.name).collect(),
             block_reason: None,
         }),
-        Err(failure) if failure.code == FailureCode::UnknownHandle => Err(failure),
-        Err(failure) => Ok(preview_from_blocked(song_id, &failure)),
+        Err(failure) if is_delete_failure(failure.code) => {
+            Ok(preview_from_blocked(song_id, &failure))
+        }
+        Err(failure) => Err(failure),
     }
 }
 
@@ -203,6 +230,7 @@ pub(crate) async fn keep_track_in(
     )
     .await?
     {
+        let song_id = effective_song_id(&req.song_id, &track);
         let (promoted, _) = promote_to(
             guard.db,
             effects,
@@ -216,22 +244,26 @@ pub(crate) async fn keep_track_in(
         .map_err(|e| e.into_failure())?;
 
         let mut applied_rating = None;
-        if !req.song_id.is_empty() {
-            match navi.get_song(ctx, &req.song_id).await {
-                Ok(Some(song)) => {
-                    let current = song.user_rating.unwrap_or(0);
-                    let target = current.max(threshold);
-                    if target > current {
-                        if let Err(e) = navi.set_rating(ctx, &req.song_id, target).await {
+        let mut fetched_starred = None;
+        if !song_id.is_empty() {
+            if let Ok(Some(song)) = navi.get_song(ctx, &song_id).await {
+                fetched_starred = Some(song.starred.is_some());
+                let current = song.user_rating.unwrap_or(0);
+                let target = current.max(threshold);
+                if target > current {
+                    match navi.set_rating(ctx, &song_id, target).await {
+                        Ok(()) => applied_rating = Some(target),
+                        Err(e) => {
                             warn!(
                                 "Promoted '{}' but could not raise Navidrome rating: {}",
                                 promoted.title, e.message
                             );
+                            applied_rating = (current > 0).then_some(current);
                         }
                     }
-                    applied_rating = Some(target);
+                } else {
+                    applied_rating = Some(current);
                 }
-                Ok(None) | Err(_) => {}
             }
         }
 
@@ -240,10 +272,10 @@ pub(crate) async fn keep_track_in(
         let archival_upgrade_queued = false;
 
         return Ok(CurationResult {
-            song_id: req.song_id.clone(),
+            song_id,
             action: CurationAction::Kept,
             promoted_discovery: true,
-            starred: None,
+            starred: fetched_starred,
             rating: applied_rating,
             deleted_from_disk: false,
             archival_upgrade_queued,
@@ -434,7 +466,7 @@ pub(crate) async fn rate_track_in(
                     song_id: req.song_id.clone(),
                     action: CurationAction::DroppedDiscovery,
                     promoted_discovery: false,
-                    starred: Some(false),
+                    starred: Some(song.starred.is_some()),
                     rating: Some(1),
                     deleted_from_disk: true,
                     archival_upgrade_queued: false,
@@ -456,7 +488,7 @@ pub(crate) async fn rate_track_in(
         action: CurationAction::Rated,
         promoted_discovery: false,
         starred: Some(song.starred.is_some()),
-        rating: Some(req.rating),
+        rating: (req.rating > 0).then_some(req.rating),
         deleted_from_disk: false,
         archival_upgrade_queued: false,
         guard_preview,
@@ -471,8 +503,11 @@ pub(crate) async fn rate_track_in(
 /// Drops a Pending Discovery track (deleting its staged file + recording negative taste signal)
 /// or handles removal of a Permanent Library track through Soulbeet's Multi-Listener Delete Guard:
 /// - Sole owner + `confirm_delete == true`: deletes file via `Guard::carry_out`.
-/// - Sole owner + `confirm_delete == false`: returns `ConfirmationRequired` with preview.
-/// - Protected by another listener: never deletes the file; unstars & sets 1★ for the caller.
+/// - Sole owner or protected + `confirm_delete == false`: returns `ConfirmationRequired` preview
+///   without mutating disk or Navidrome.
+/// - Protected by another listener + `confirm_delete == true`: never deletes the file; unstars &
+///   sets 1★ for the caller.
+/// - `DeleteVetoUnknown` and all other guard failures are always propagated as `Err`.
 pub(crate) async fn drop_track_in(
     guard: &Guard<'_>,
     navi: &dyn CurationNavidrome,
@@ -491,12 +526,14 @@ pub(crate) async fn drop_track_in(
     )
     .await?
     {
-        return drop_pending_discovery(guard, navi, queue, ctx, &req.song_id, track).await;
+        let song_id = effective_song_id(&req.song_id, &track);
+        return drop_pending_discovery(guard, navi, queue, ctx, &song_id, track).await;
     }
 
     match guard.check_song(&user, &req.song_id).await {
         Ok(Verdict::Discovery { track, .. }) => {
-            drop_pending_discovery(guard, navi, queue, ctx, &req.song_id, track).await
+            let song_id = effective_song_id(&req.song_id, &track);
+            drop_pending_discovery(guard, navi, queue, ctx, &song_id, track).await
         }
         Ok(Verdict::Library(checked)) => {
             let title = checked.song.title.clone();
@@ -541,42 +578,61 @@ pub(crate) async fn drop_track_in(
                 song_id: req.song_id.clone(),
                 action: CurationAction::DeletedFromLibrary,
                 promoted_discovery: false,
-                starred: Some(false),
-                rating: Some(1),
+                starred: None,
+                rating: None,
                 deleted_from_disk: true,
                 archival_upgrade_queued: false,
                 guard_preview: Some(preview),
                 message: format!("Deleted '{}' from library", title),
             })
         }
-        Err(failure)
-            if matches!(
-                failure.code,
-                FailureCode::DeleteBlockedByOtherUser | FailureCode::DeleteVetoUnknown
-            ) =>
-        {
+        Err(failure) if failure.code == FailureCode::DeleteBlockedByOtherUser => {
             let preview = preview_from_blocked(&req.song_id, &failure);
+            if !req.confirm_delete {
+                return Ok(CurationResult {
+                    song_id: req.song_id.clone(),
+                    action: CurationAction::ConfirmationRequired,
+                    promoted_discovery: false,
+                    starred: None,
+                    rating: None,
+                    deleted_from_disk: false,
+                    archival_upgrade_queued: false,
+                    guard_preview: Some(preview),
+                    message:
+                        "File is shared with another listener; confirm to unstar and hide it from your mixes"
+                            .to_string(),
+                });
+            }
+
             // Protect the shared file: unstar and rate 1★ for this listener only so it drops
             // out of their personal mixes without affecting anyone else.
-            if let Err(e) = navi.set_star(ctx, &req.song_id, false).await {
-                warn!(
-                    "Could not unstar protected song {} during drop: {}",
-                    req.song_id, e.message
-                );
-            }
-            if let Err(e) = navi.set_rating(ctx, &req.song_id, 1).await {
-                warn!(
-                    "Could not set 1★ on protected song {} during drop: {}",
-                    req.song_id, e.message
-                );
-            }
+            let starred = match navi.set_star(ctx, &req.song_id, false).await {
+                Ok(()) => Some(false),
+                Err(e) => {
+                    warn!(
+                        "Could not unstar protected song {} during drop: {}",
+                        req.song_id, e.message
+                    );
+                    None
+                }
+            };
+            let rating = match navi.set_rating(ctx, &req.song_id, 1).await {
+                Ok(()) => Some(1),
+                Err(e) => {
+                    warn!(
+                        "Could not set 1★ on protected song {} during drop: {}",
+                        req.song_id, e.message
+                    );
+                    None
+                }
+            };
 
             Ok(CurationResult {
                 song_id: req.song_id.clone(),
                 action: CurationAction::ProtectedAndUnstarred,
                 promoted_discovery: false,
-                starred: Some(false),
-                rating: Some(1),
+                starred,
+                rating,
                 deleted_from_disk: false,
                 archival_upgrade_queued: false,
                 guard_preview: Some(preview),
@@ -602,32 +658,38 @@ async fn drop_pending_discovery(
         .await
         .map_err(|e| e.into_failure())?;
 
-    if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
-        guard.db,
-        &ctx.user_id,
-        &track.artist,
-        &track.title,
-        "removed",
-    )
-    .await
-    {
-        warn!(
-            "Failed to record rejected discovery outcome for '{}': {e}",
-            track.title
-        );
-    }
-
-    if !song_id.is_empty() {
-        let _ = navi.set_star(ctx, song_id, false).await;
-        let _ = navi.set_rating(ctx, song_id, 1).await;
-    }
+    let (starred, rating) = if !song_id.is_empty() {
+        let s = match navi.set_star(ctx, song_id, false).await {
+            Ok(()) => Some(false),
+            Err(e) => {
+                warn!(
+                    "Dropped discovery track '{}' but could not unstar in Navidrome: {}",
+                    track.title, e.message
+                );
+                None
+            }
+        };
+        let r = match navi.set_rating(ctx, song_id, 1).await {
+            Ok(()) => Some(1),
+            Err(e) => {
+                warn!(
+                    "Dropped discovery track '{}' but could not set 1★ in Navidrome: {}",
+                    track.title, e.message
+                );
+                None
+            }
+        };
+        (s, r)
+    } else {
+        (None, None)
+    };
 
     Ok(CurationResult {
         song_id: song_id.to_string(),
         action: CurationAction::DroppedDiscovery,
         promoted_discovery: false,
-        starred: Some(false),
-        rating: Some(1),
+        starred,
+        rating,
         deleted_from_disk: true,
         archival_upgrade_queued: false,
         guard_preview: None,
@@ -637,7 +699,6 @@ async fn drop_pending_discovery(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex;
 
@@ -649,11 +710,13 @@ mod tests {
     use crate::core::delete_guard::Listeners;
     use crate::core::test_ctx;
     use crate::import_queue::test_support::{RecordingDeps, StubImporter};
+    use crate::services::NavidromeLookupError;
 
     struct FakeCurationNavi {
         fake: Arc<FakeNavidrome>,
         stars_written: Mutex<Vec<(String, String, bool)>>,
         ratings_written: Mutex<Vec<(String, String, u8)>>,
+        fail_set_rating: bool,
     }
 
     impl FakeCurationNavi {
@@ -662,6 +725,7 @@ mod tests {
                 fake,
                 stars_written: Mutex::new(Vec::new()),
                 ratings_written: Mutex::new(Vec::new()),
+                fail_set_rating: false,
             }
         }
     }
@@ -701,6 +765,14 @@ mod tests {
             song_id: &str,
             rating: u8,
         ) -> Result<(), Failure> {
+            if self.fail_set_rating {
+                return Err(Failure::new(
+                    FailureCode::NavidromeUnreachable,
+                    Stage::LibraryCheck,
+                    RetryAdvice::SameSourceLater,
+                    "simulated set_rating failure",
+                ));
+            }
             self.ratings_written
                 .lock()
                 .unwrap()
@@ -865,6 +937,8 @@ mod tests {
         .unwrap();
         assert_eq!(deleted.action, CurationAction::DeletedFromLibrary);
         assert!(deleted.deleted_from_disk);
+        assert_eq!(deleted.starred, None);
+        assert_eq!(deleted.rating, None);
         assert!(!file.exists());
     }
 
@@ -959,8 +1033,167 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, DiscoveryStatus::Removed);
+    }
 
-        // Make sure unused import warning doesn't happen on HashMap if omitted later.
-        let _ = HashMap::<String, String>::new();
+    #[tokio::test]
+    async fn drop_with_delete_veto_unknown_propagates_error_without_mutating_navidrome() {
+        let lib = Library::new().await;
+        // Bob's Navidrome account cannot be read, so Delete Guard returns DeleteVetoUnknown.
+        lib.fake.unreadable("bob", || {
+            NavidromeLookupError::Client(soulbeet::NavidromeError::Transport("offline".into()))
+        });
+
+        let file = lib.root.join("music/alice/A/x.flac");
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        let err = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: None,
+                confirm_delete: true,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, FailureCode::DeleteVetoUnknown);
+        assert!(file.exists(), "file must remain on disk on veto unknown");
+        assert!(navi.stars_written.lock().unwrap().is_empty());
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drop_with_confirm_delete_false_never_mutates_navidrome_on_shared_track() {
+        let lib = Library::new().await;
+        lib.fake.stars("bob", "s1");
+
+        let file = lib.root.join("music/alice/A/x.flac");
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        let res = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: None,
+                confirm_delete: false,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.action, CurationAction::ConfirmationRequired);
+        assert!(!res.deleted_from_disk);
+        assert_eq!(res.starred, None);
+        assert_eq!(res.rating, None);
+        assert!(!res.guard_preview.as_ref().unwrap().can_delete);
+        assert!(file.exists());
+        assert!(navi.stars_written.lock().unwrap().is_empty());
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guard_preview_propagates_non_delete_failures_and_explicit_non_pending_errors() {
+        let lib = Library::new().await;
+        lib.fake.unreadable("alice", || {
+            NavidromeLookupError::Client(soulbeet::NavidromeError::Transport("down".into()))
+        });
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let alice = test_ctx("alice");
+
+        let err = guard_preview_in(&guard, &alice, "s1").await.unwrap_err();
+        assert_eq!(err.code, FailureCode::NavidromeUnreachable);
+
+        // Explicit discovery_track_id that is not pending returns ExpiredHandle (track_not_pending).
+        lib.fake.readable("alice");
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let queue = test_queue();
+        let err = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("missing-dt".into()),
+                confirm_delete: true,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::ExpiredHandle);
+    }
+
+    #[tokio::test]
+    async fn keep_and_rate_report_truthful_navidrome_state() {
+        let lib = Library::new().await;
+        lib.fake.stars("alice", "s1");
+        let _staged = insert_pending_discovery(&lib, "dt-keep", "s1", "Marrow Choir/k.flac").await;
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let mut navi = FakeCurationNavi::new(lib.fake.clone());
+        navi.fail_set_rating = true;
+        let effects: Arc<dyn DiscoveryEffects> = Arc::new(StubDiscoveryEffects::default());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        // Passing empty song_id with explicit discovery_track_id resolves fallback song_id = "s1".
+        // Failing set_rating must NOT falsely report applied rating = threshold (3); it preserves
+        // the existing rating (1 in Library::new).
+        let kept = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: String::new(),
+                discovery_track_id: Some("dt-keep".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept.song_id, "s1");
+        assert!(kept.promoted_discovery);
+        assert_eq!(kept.starred, Some(true));
+        assert_eq!(kept.rating, Some(1));
+
+        // Clearing rating (0) normalizes rating to None.
+        navi.fail_set_rating = false;
+        let cleared = rate_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &RateTrackRequest {
+                song_id: "s1".into(),
+                rating: 0,
+                discovery_track_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.rating, None);
+        assert_eq!(cleared.starred, Some(true));
     }
 }

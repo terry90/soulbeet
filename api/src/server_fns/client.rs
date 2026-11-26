@@ -40,6 +40,9 @@ use crate::AuthSession;
 
 /// Returns client bootstrap coordinates: scoped OpenSubsonic credentials (salt + MD5 token,
 /// never the plaintext password), curation settings, active discovery context, and capabilities.
+///
+/// Uses `NAVIDROME_PUBLIC_URL` when set (falling back to `NAVIDROME_URL`) so containerized
+/// deployments can advertise an externally reachable Navidrome URL to native/browser clients.
 #[get("/api/client/bootstrap", auth: AuthSession)]
 pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
     let settings = UserSettings::get(&auth.0.user_id)
@@ -48,26 +51,64 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
 
     let navidrome = match crate::services::navidrome_client_for_user(&auth.0.user_id).await {
         Ok(client) => {
-            let (subsonic_salt, subsonic_token) = client.subsonic_credentials();
-            let server_version = client.server_version().await.ok().flatten();
-            let base_url = crate::config::CONFIG
-                .navidrome_url()
-                .map(|u| u.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| client.base_url().as_str().trim_end_matches('/').to_string());
-            Some(NavidromeSessionInfo {
-                base_url,
-                username: client.username().to_string(),
-                subsonic_salt,
-                subsonic_token,
-                api_version: SUBSONIC_API_VERSION.to_string(),
-                client_name: SUBSONIC_CLIENT_NAME.to_string(),
-                server_version,
-            })
+            let version_check = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.server_version(),
+            )
+            .await;
+            match version_check {
+                Ok(Err(ref e)) if e.is_wrong_credentials() => {
+                    tracing::warn!(
+                        "Navidrome credentials rejected during client bootstrap for user {}: {}",
+                        auth.0.user_id,
+                        e
+                    );
+                    None
+                }
+                other => {
+                    let server_version = match other {
+                        Ok(Ok(version)) => version,
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "Navidrome server_version probe failed during bootstrap for user {}: {}",
+                                auth.0.user_id,
+                                e
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Navidrome server_version probe timed out during bootstrap for user {}",
+                                auth.0.user_id
+                            );
+                            None
+                        }
+                    };
+                    let (subsonic_salt, subsonic_token) = client.subsonic_credentials();
+                    let base_url = crate::config::CONFIG
+                        .navidrome_public_url()
+                        .or_else(|| crate::config::CONFIG.navidrome_url())
+                        .map(|u| u.trim_end_matches('/').to_string())
+                        .unwrap_or_else(|| {
+                            client.base_url().as_str().trim_end_matches('/').to_string()
+                        });
+                    Some(NavidromeSessionInfo {
+                        base_url,
+                        username: client.username().to_string(),
+                        subsonic_salt,
+                        subsonic_token,
+                        api_version: SUBSONIC_API_VERSION.to_string(),
+                        client_name: SUBSONIC_CLIENT_NAME.to_string(),
+                        server_version,
+                    })
+                }
+            }
         }
         Err(_) => None,
     };
 
     let acquire_and_play = crate::services::is_slskd_configured().await;
+    let lyrics_fetch = navidrome.is_some();
 
     Ok(ClientBootstrap {
         user_id: auth.0.user_id.clone(),
@@ -77,7 +118,7 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
         capabilities: ServerCapabilities {
             acquire_and_play,
             connect_ws: true,
-            lyrics_fetch: true,
+            lyrics_fetch,
             discovery: settings.discovery_enabled,
             multi_listener_guard: true,
         },
@@ -127,6 +168,9 @@ pub async fn get_track_lyrics(
 
 /// Promotes a Pending Discovery track to the permanent library (raising rating >= promote
 /// threshold), or affirms a permanent library track.
+///
+/// Note: `/api/curation/*` endpoints are Dioxus `#[post]` server functions taking a single `req`
+/// parameter, so external HTTP clients must send JSON wrapped as `{"req": { ... }}`.
 #[post("/api/curation/keep", auth: AuthSession)]
 pub async fn curation_keep(req: KeepTrackRequest) -> Result<CurationResult, ServerFnError> {
     let guard = Guard::live();

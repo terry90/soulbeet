@@ -5,6 +5,8 @@ use shared::client::{ConnectClientMessage, ConnectServerEvent};
 #[cfg(feature = "server")]
 use axum::http::{HeaderMap, Uri};
 #[cfg(feature = "server")]
+use dioxus::fullstack::WebsocketError;
+#[cfg(feature = "server")]
 use dioxus::logger::tracing::{info, warn};
 #[cfg(feature = "server")]
 use shared::client::DevicePlatform;
@@ -15,10 +17,12 @@ use tower_cookies::Cookies;
 
 #[cfg(feature = "server")]
 use crate::{
-    core::connect::CONNECT_HUB,
+    core::connect::{ConnectEnvelope, CONNECT_HUB},
     server_fns::{
         download::{origin_allowed, session_still_valid},
-        forbidden_error, refusal_error,
+        forbidden_error,
+        guard::extract_session_token,
+        refusal_error,
     },
     AuthSession,
 };
@@ -26,11 +30,20 @@ use crate::{
 #[cfg(feature = "server")]
 const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 
+#[cfg(feature = "server")]
+struct RegisteredDevice {
+    device_id: String,
+    conn_id: u64,
+    rx: broadcast::Receiver<ConnectEnvelope>,
+}
+
 /// Per-user multi-device Connect WebSocket (`WS /api/ws/connect`).
 ///
-/// Registers the connecting client device (or waits for an explicit `Register` frame when
-/// `device_id` query param is omitted), streams live `DeviceList`, `PlaybackUpdated`, and
-/// targeted `Command` events, and removes the device cleanly on disconnect.
+/// Registers the connecting client device (or defers hub registration until an explicit
+/// `Register` frame arrives when `device_id` query param is omitted), streams live
+/// `DeviceList`, `PlaybackUpdated`, and targeted `Command` events, and removes the device
+/// cleanly on disconnect.
+#[allow(clippy::too_many_arguments)]
 #[get("/api/ws/connect?device_id&name&platform", auth: AuthSession, cookies: Cookies, headers: HeaderMap, uri: Uri)]
 pub async fn connect_ws(
     device_id: Option<String>,
@@ -52,34 +65,46 @@ pub async fn connect_ws(
         ));
     }
 
-    let token = cookies
-        .get(crate::AUTH_COOKIE_NAME)
-        .map(|c| c.value().to_string());
+    let token = extract_session_token(Some(&cookies), &headers);
 
-    let initial_device_id = device_id
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let query_device_id = device_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let initial_name = name
-        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Soulbeet Client".to_string());
     let initial_platform = platform
         .as_deref()
         .map(DevicePlatform::parse)
         .unwrap_or(DevicePlatform::Web);
 
-    let (initial_list, rx) = CONNECT_HUB
-        .register(&user, initial_device_id.clone(), initial_name, initial_platform)
-        .await;
-
     Ok(options.on_upgrade(move |mut socket| async move {
-        let mut current_device_id = initial_device_id;
-        let mut rx = rx;
-        info!(
-            "Connect WS connected for user {} (device {})",
-            user, current_device_id
-        );
-
-        let _ = socket.send(initial_list).await;
+        let mut registered: Option<RegisteredDevice> = if let Some(dev_id) = query_device_id {
+            let (conn_id, canonical_id, initial_list, rx) = CONNECT_HUB
+                .register(&user, dev_id, initial_name, initial_platform)
+                .await;
+            info!(
+                "Connect WS connected for user {} (device {})",
+                user, canonical_id
+            );
+            if socket.send(initial_list).await.is_err() {
+                drop(rx);
+                CONNECT_HUB.unregister(&user, &canonical_id, conn_id).await;
+                return;
+            }
+            Some(RegisteredDevice {
+                device_id: canonical_id,
+                conn_id,
+                rx,
+            })
+        } else {
+            info!(
+                "Connect WS connected for user {} (awaiting Register frame)",
+                user
+            );
+            None
+        };
 
         let mut recheck = tokio::time::interval_at(
             tokio::time::Instant::now() + SESSION_RECHECK,
@@ -101,11 +126,19 @@ pub async fn connect_ws(
                         break;
                     }
                 }
-                received = rx.recv() => {
+                received = async {
+                    match registered.as_mut() {
+                        Some(reg) => reg.rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(reg) = registered.as_ref() else {
+                        continue;
+                    };
                     match received {
                         Ok(env) => {
                             let for_this_device = env.target_device_id.is_none()
-                                || env.target_device_id.as_deref() == Some(current_device_id.as_str());
+                                || env.target_device_id.as_deref() == Some(reg.device_id.as_str());
                             if for_this_device && socket.send(env.event).await.is_err() {
                                 break;
                             }
@@ -113,7 +146,7 @@ pub async fn connect_ws(
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(
                                 "Connect WS for user {} (device {}) lagged by {} events",
-                                user, current_device_id, skipped
+                                user, reg.device_id, skipped
                             );
                             let devices = CONNECT_HUB.devices_for(&user).await;
                             let active_device_id = devices
@@ -137,33 +170,64 @@ pub async fn connect_ws(
                 incoming = socket.recv() => {
                     match incoming {
                         Ok(ConnectClientMessage::Register { device_id, name, platform }) => {
-                            if !device_id.trim().is_empty() && device_id != current_device_id {
-                                CONNECT_HUB.unregister(&user, &current_device_id).await;
-                                current_device_id = device_id;
-                            }
-                            let (list, new_rx) = CONNECT_HUB
-                                .register(&user, current_device_id.clone(), name, platform)
+                            let trimmed = device_id.trim();
+                            let target_id = if !trimmed.is_empty() {
+                                trimmed.to_string()
+                            } else if let Some(ref reg) = registered {
+                                reg.device_id.clone()
+                            } else {
+                                uuid::Uuid::new_v4().to_string()
+                            };
+                            let previous = registered
+                                .as_ref()
+                                .map(|r| (r.device_id.as_str(), r.conn_id));
+                            let (conn_id, canonical_id, list, new_rx) = CONNECT_HUB
+                                .reregister(&user, previous, target_id, name, platform)
                                 .await;
-                            rx = new_rx;
+                            registered = Some(RegisteredDevice {
+                                device_id: canonical_id,
+                                conn_id,
+                                rx: new_rx,
+                            });
                             if socket.send(list).await.is_err() {
                                 break;
                             }
                         }
                         Ok(ConnectClientMessage::Heartbeat) => {
-                            CONNECT_HUB.heartbeat(&user, &current_device_id).await;
+                            if let Some(ref reg) = registered {
+                                CONNECT_HUB.heartbeat(&user, &reg.device_id).await;
+                            }
                         }
                         Ok(ConnectClientMessage::UpdateState { snapshot }) => {
-                            CONNECT_HUB
-                                .update_state(&user, &current_device_id, snapshot)
-                                .await;
+                            if let Some(ref reg) = registered {
+                                CONNECT_HUB
+                                    .update_state(&user, &reg.device_id, snapshot)
+                                    .await;
+                            }
                         }
                         Ok(ConnectClientMessage::SendCommand { target_device_id, command }) => {
-                            CONNECT_HUB
-                                .send_command(&user, &current_device_id, &target_device_id, command)
-                                .await;
+                            if let Some(ref reg) = registered {
+                                CONNECT_HUB
+                                    .send_command(&user, &reg.device_id, &target_device_id, command)
+                                    .await;
+                            }
                         }
                         Ok(ConnectClientMessage::ClaimActive) => {
-                            CONNECT_HUB.claim_active(&user, &current_device_id).await;
+                            if let Some(ref reg) = registered {
+                                CONNECT_HUB.claim_active(&user, &reg.device_id).await;
+                            }
+                        }
+                        Err(
+                            err @ (WebsocketError::Json(_)
+                            | WebsocketError::Deserialization(_)
+                            | WebsocketError::Cbor(_)),
+                        ) => {
+                            warn!(
+                                "Ignoring malformed Connect WS frame for user {} (device {:?}): {}",
+                                user,
+                                registered.as_ref().map(|r| r.device_id.as_str()),
+                                err
+                            );
                         }
                         Err(_) => break,
                     }
@@ -171,10 +235,17 @@ pub async fn connect_ws(
             }
         }
 
-        CONNECT_HUB.unregister(&user, &current_device_id).await;
-        info!(
-            "Connect WS disconnected for user {} (device {})",
-            user, current_device_id
-        );
+        if let Some(reg) = registered.take() {
+            let device_id = reg.device_id;
+            let conn_id = reg.conn_id;
+            drop(reg.rx);
+            CONNECT_HUB.unregister(&user, &device_id, conn_id).await;
+            info!(
+                "Connect WS disconnected for user {} (device {})",
+                user, device_id
+            );
+        } else {
+            info!("Connect WS disconnected for user {} (unregistered)", user);
+        }
     }))
 }

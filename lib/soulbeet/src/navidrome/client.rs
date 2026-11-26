@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::http::{resolve_docker_url, CircuitBreaker};
 
-use super::error::{NavidromeError, Result};
+use super::error::{NavidromeError, Result, NOT_AUTHORIZED};
 use super::models::*;
 
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -574,15 +574,21 @@ impl NavidromeClient {
     }
 
     /// Legacy Subsonic `getLyrics` (`server/subsonic/media_retrieval.go:94-131`).
+    /// Returns `Ok(None)` on `DATA_NOT_FOUND` (Subsonic error 70) or when lyrics are empty.
     pub async fn get_lyrics(&self, artist: &str, title: &str) -> Result<Option<LegacyLyrics>> {
-        let body: LegacyLyricsBody = self
-            .get("getLyrics", &[("artist", artist), ("title", title)])
-            .await?;
+        let Some(body) = found(
+            self.get::<LegacyLyricsBody>("getLyrics", &[("artist", artist), ("title", title)])
+                .await,
+        )?
+        else {
+            return Ok(None);
+        };
         Ok(body.lyrics.filter(|l| !l.value.trim().is_empty()))
     }
 
     /// Reads structured lyrics via `getLyricsBySongId`, falling back to legacy `getLyrics`
     /// when structured lyrics are unavailable and `artist`/`title` are supplied.
+    /// Auth/authorization errors (Subsonic 40/50) are always propagated instead of swallowed.
     pub async fn get_song_lyrics(
         &self,
         id: &str,
@@ -592,6 +598,18 @@ impl NavidromeClient {
         match self.get_lyrics_by_song_id(id).await {
             Ok(list) if !list.is_empty() => return Ok(list),
             Ok(_) => {}
+            Err(e)
+                if e.is_wrong_credentials()
+                    || matches!(
+                        e,
+                        NavidromeError::Subsonic {
+                            code: NOT_AUTHORIZED,
+                            ..
+                        }
+                    ) =>
+            {
+                return Err(e);
+            }
             Err(NavidromeError::Subsonic { .. }) => {}
             Err(e) => return Err(e),
         }
@@ -2924,5 +2942,50 @@ mod tests {
         assert!(seen[0].target.starts_with("/rest/getLyricsBySongId?"));
         assert!(seen[1].target.starts_with("/rest/getLyricsBySongId?"));
         assert!(seen[2].target.starts_with("/rest/getLyrics?"));
+    }
+
+    #[tokio::test]
+    async fn lyrics_propagates_auth_errors_and_handles_null_arrays_and_not_found() {
+        let auth_err_40 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}"#;
+        let auth_err_50 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":50,"message":"User is not authorized"}}}"#;
+        let null_structured = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","openSubsonic":true,"lyricsList":{"structuredLyrics":null}}}"#;
+        let not_found_70 = r#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":70,"message":"data not found"}}}"#;
+
+        let (url, seen) = serve(vec![
+            reply(auth_err_40),
+            reply(auth_err_50),
+            reply(null_structured),
+            reply(not_found_70),
+        ]);
+        let c = client(&url);
+
+        let err40 = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap_err();
+        assert!(err40.is_wrong_credentials(), "{err40:?}");
+
+        let err50 = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err50, NavidromeError::Subsonic { code: 50, .. }),
+            "{err50:?}"
+        );
+
+        let empty = c
+            .get_song_lyrics("song-1", Some("Air"), Some("Track"))
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Auth errors must not trigger the legacy fallback request.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen[0].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[1].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[2].target.starts_with("/rest/getLyricsBySongId?"));
+        assert!(seen[3].target.starts_with("/rest/getLyrics?"));
     }
 }

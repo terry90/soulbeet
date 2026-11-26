@@ -569,7 +569,7 @@ pub struct LyricsListBody {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricsList {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub structured_lyrics: Vec<StructuredLyrics>,
 }
 
@@ -580,13 +580,13 @@ pub struct StructuredLyrics {
     pub display_artist: Option<String>,
     #[serde(default)]
     pub display_title: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub lang: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub line: Vec<LyricLine>,
     #[serde(default)]
     pub offset: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub synced: bool,
 }
 
@@ -596,7 +596,7 @@ pub struct LyricLine {
     /// Line start timestamp in milliseconds when `synced` is true.
     #[serde(default)]
     pub start: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub value: String,
 }
 
@@ -613,7 +613,7 @@ pub struct LegacyLyrics {
     pub artist: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub value: String,
 }
 
@@ -740,5 +740,23 @@ mod tests {
         assert_eq!(song.genre, "");
         assert!(song.genres.is_empty());
         assert_eq!(song.created_at, None);
+    }
+
+    #[test]
+    fn lyrics_models_deserialize_json_null_fields_as_defaults() {
+        let list: LyricsList = serde_json::from_str(r#"{"structuredLyrics":null}"#).unwrap();
+        assert!(list.structured_lyrics.is_empty());
+
+        let structured: StructuredLyrics = serde_json::from_str(
+            r#"{"displayArtist":null,"displayTitle":null,"lang":null,"line":null,"offset":null,"synced":null}"#,
+        )
+        .unwrap();
+        assert_eq!(structured.lang, "");
+        assert!(structured.line.is_empty());
+        assert!(!structured.synced);
+
+        let legacy: LegacyLyrics =
+            serde_json::from_str(r#"{"artist":null,"title":null,"value":null}"#).unwrap();
+        assert_eq!(legacy.value, "");
     }
 }

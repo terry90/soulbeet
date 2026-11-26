@@ -263,6 +263,9 @@ pub struct AppConfig {
     public_url: Option<Result<BaseUrl, BaseUrlError>>,
     /// `NAVIDROME_URL`; `None` when unset or empty
     navidrome_url: Option<String>,
+    /// Optional external `NAVIDROME_PUBLIC_URL` advertised to native/browser clients
+    /// when `NAVIDROME_URL` is a container-internal address
+    navidrome_public_url: Option<String>,
     /// `NAVIDROME_MUSIC_PATH`; `None` when unset or empty
     navidrome_music_path: Option<PathBuf>,
     /// Who can create accounts (`REGISTRATION`)
@@ -293,6 +296,10 @@ impl AppConfig {
 
         let navidrome_url = std::env::var("NAVIDROME_URL")
             .ok()
+            .filter(|v| !v.is_empty());
+        let navidrome_public_url = std::env::var("NAVIDROME_PUBLIC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         let registration = parse_registration(
             std::env::var("REGISTRATION")
@@ -335,6 +342,7 @@ impl AppConfig {
             beets_python,
             public_url,
             navidrome_url,
+            navidrome_public_url,
             navidrome_music_path: std::env::var_os("NAVIDROME_MUSIC_PATH")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -404,6 +412,11 @@ impl AppConfig {
     /// The Navidrome server, when `NAVIDROME_URL` is set.
     pub fn navidrome_url(&self) -> Option<&str> {
         self.navidrome_url.as_deref()
+    }
+
+    /// Optional public Navidrome URL override for clients (`NAVIDROME_PUBLIC_URL`).
+    pub fn navidrome_public_url(&self) -> Option<&str> {
+        self.navidrome_public_url.as_deref()
     }
 
     /// NAVIDROME_MUSIC_PATH: where the root of Navidrome's default library is on this machine.
