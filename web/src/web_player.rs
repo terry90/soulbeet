@@ -1363,7 +1363,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let pending_drops = use_signal(PendingDropQueue::new);
     let guard_modal = use_signal(|| None::<GuardModalState>);
     let inspected_track = use_signal(|| None::<PlayerTrack>);
-    let drawer_tab = use_signal(|| Some(DrawerTab::Queue));
+    let drawer_tab = use_signal(|| None::<DrawerTab>);
     let cmdk_open = use_signal(|| false);
     let toast_notice = use_signal(|| None::<String>);
     let playlists = use_signal(Vec::<SubsonicPlaylistSummary>::new);
