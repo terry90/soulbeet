@@ -64,6 +64,13 @@ impl MutationOutbox {
         mutation: OutboxMutation,
         idempotency_key: String,
     ) -> CoreResult<i64> {
+        if let OutboxMutation::Rate { rating, .. } = &mutation {
+            if *rating > 5 {
+                return Err(CoreError::InvalidInput(format!(
+                    "rating must be between 0 and 5 (got {rating})"
+                )));
+            }
+        }
         let now = now_unix();
         let payload_json = serde_json::to_string(&mutation)?;
         let kind = mutation.kind_name();
@@ -306,7 +313,7 @@ impl MutationOutbox {
 
     pub async fn retry_dead_letters(&self) -> CoreResult<usize> {
         let res = sqlx::query(
-            "UPDATE mutation_outbox SET dead_letter = 0, next_retry_at = 0 WHERE dead_letter = 1",
+            "UPDATE mutation_outbox SET dead_letter = 0, attempts = 0, last_error = NULL, next_retry_at = 0 WHERE dead_letter = 1",
         )
         .execute(&self.pool)
         .await?;

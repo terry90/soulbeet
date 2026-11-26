@@ -1,4 +1,5 @@
 [bindings.kotlin]
 package_name = "org.soulbeet.core"
 cdylib_name = "client_core"
+android = true
 generate_immutable_records = true

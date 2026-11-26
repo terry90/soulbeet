@@ -27,26 +27,39 @@ Options:
 EOF
 }
 
+require_opt_arg() {
+  if [[ "$2" -lt 2 ]]; then
+    echo "Error: option '$1' requires a value" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
-      PROFILE="${2:-}"
+      require_opt_arg "$1" "$#"
+      PROFILE="$2"
       shift 2
       ;;
     --abis)
-      ABIS="${2:-}"
+      require_opt_arg "$1" "$#"
+      ABIS="$2"
       shift 2
       ;;
     --min-sdk)
-      MIN_SDK="${2:-}"
+      require_opt_arg "$1" "$#"
+      MIN_SDK="$2"
       shift 2
       ;;
     --jni-out)
-      JNI_OUT_DIR="${2:-}"
+      require_opt_arg "$1" "$#"
+      JNI_OUT_DIR="$2"
       shift 2
       ;;
     --kotlin-out)
-      KOTLIN_OUT_DIR="${2:-}"
+      require_opt_arg "$1" "$#"
+      KOTLIN_OUT_DIR="$2"
       shift 2
       ;;
     -h|--help)
@@ -71,6 +84,16 @@ if ! command -v cargo-ndk >/dev/null 2>&1; then
   exit 1
 fi
 
+# Sort NDK subdirectories newest-first using portable numeric version sort (no GNU `sort -V`).
+list_ndk_versions_desc() {
+  local root="$1"
+  [[ -d "${root}" ]] || return 0
+  find "${root}" -mindepth 1 -maxdepth 1 -type d -print \
+    | awk -F/ '{ print $NF "\t" $0 }' \
+    | sort -t. -k1,1nr -k2,2nr -k3,3nr \
+    | cut -f2-
+}
+
 # Auto-discover ANDROID_NDK_HOME if not explicitly set.
 discover_ndk() {
   if [[ -n "${ANDROID_NDK_HOME:-}" && -d "${ANDROID_NDK_HOME}" ]]; then
@@ -79,23 +102,24 @@ discover_ndk() {
   fi
 
   local candidates=()
-  if [[ -n "${ANDROID_HOME:-}" && -d "${ANDROID_HOME}/ndk" ]]; then
-    while IFS= read -r dir; do
-      candidates+=("$dir")
-    done < <(find "${ANDROID_HOME}/ndk" -mindepth 1 -maxdepth 1 -type d | sort -rV)
+  local search_roots=()
+  if [[ -n "${ANDROID_HOME:-}" ]]; then
+    search_roots+=("${ANDROID_HOME}/ndk")
   fi
-  if [[ -d "${HOME}/Android/Sdk/ndk" ]]; then
-    while IFS= read -r dir; do
-      candidates+=("$dir")
-    done < <(find "${HOME}/Android/Sdk/ndk" -mindepth 1 -maxdepth 1 -type d | sort -rV)
-  fi
-  if [[ -d "${HOME}/Android/ndk" ]]; then
-    while IFS= read -r dir; do
-      candidates+=("$dir")
-    done < <(find "${HOME}/Android/ndk" -mindepth 1 -maxdepth 1 -type d | sort -rV)
-  fi
+  search_roots+=(
+    "${HOME}/Android/Sdk/ndk"
+    "${HOME}/Library/Android/sdk/ndk"
+    "${HOME}/Android/ndk"
+  )
 
-  for dir in "${candidates[@]}"; do
+  local root dir
+  for root in "${search_roots[@]}"; do
+    while IFS= read -r dir; do
+      [[ -n "${dir}" ]] && candidates+=("${dir}")
+    done < <(list_ndk_versions_desc "${root}")
+  done
+
+  for dir in ${candidates[@]+"${candidates[@]}"}; do
     if [[ -d "${dir}/toolchains/llvm/prebuilt" ]]; then
       echo "${dir}"
       return 0
@@ -108,7 +132,11 @@ discover_ndk() {
 if ! ANDROID_NDK_HOME="$(discover_ndk)"; then
   cat >&2 <<EOF
 Error: Android NDK not found.
-Set ANDROID_NDK_HOME or install the NDK under \$ANDROID_HOME/ndk/, ~/Android/Sdk/ndk/, or ~/Android/ndk/.
+Set ANDROID_NDK_HOME or install the NDK under:
+  \$ANDROID_HOME/ndk/
+  ~/Android/Sdk/ndk/
+  ~/Library/Android/sdk/ndk/
+  ~/Android/ndk/
 Example:
   export ANDROID_NDK_HOME="\${HOME}/Android/Sdk/ndk/27.2.12479018"
 EOF
@@ -134,17 +162,30 @@ for abi in ${ABIS}; do
   NDK_TARGET_FLAGS+=(-t "${abi}")
 done
 
+if [[ "${#NDK_TARGET_FLAGS[@]}" -eq 0 ]]; then
+  echo "Error: --abis must specify at least one Android ABI" >&2
+  exit 1
+fi
+
 cargo ndk \
   --platform "${MIN_SDK}" \
   "${NDK_TARGET_FLAGS[@]}" \
   -o "${JNI_OUT_DIR}" \
-  build -p client-core "${CARGO_PROFILE_FLAG[@]}"
+  build -p client-core ${CARGO_PROFILE_FLAG[@]+"${CARGO_PROFILE_FLAG[@]}"}
+
+LLVM_STRIP=""
+if [[ "${PROFILE}" == "release" ]]; then
+  LLVM_STRIP="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -maxdepth 3 -name llvm-strip -type f 2>/dev/null | head -n 1 || true)"
+fi
 
 for abi in ${ABIS}; do
   so_path="${JNI_OUT_DIR}/${abi}/libclient_core.so"
   if [[ ! -s "${so_path}" ]]; then
     echo "Error: expected JNI library missing or empty: ${so_path}" >&2
     exit 1
+  fi
+  if [[ "${PROFILE}" == "release" && -n "${LLVM_STRIP}" ]]; then
+    "${LLVM_STRIP}" --strip-unneeded "${so_path}"
   fi
   echo "Built ${so_path} ($(du -h "${so_path}" | cut -f1))"
 done
@@ -153,10 +194,11 @@ done
 echo "Building host client-core cdylib for UniFFI metadata extraction..."
 cargo build -p client-core --lib
 
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 case "$(uname -s)" in
-  Darwin) HOST_LIB="${REPO_ROOT}/target/debug/libclient_core.dylib" ;;
-  MINGW*|MSYS*|CYGWIN*) HOST_LIB="${REPO_ROOT}/target/debug/client_core.dll" ;;
-  *) HOST_LIB="${REPO_ROOT}/target/debug/libclient_core.so" ;;
+  Darwin) HOST_LIB="${TARGET_DIR}/debug/libclient_core.dylib" ;;
+  MINGW*|MSYS*|CYGWIN*) HOST_LIB="${TARGET_DIR}/debug/client_core.dll" ;;
+  *) HOST_LIB="${TARGET_DIR}/debug/libclient_core.so" ;;
 esac
 
 if [[ ! -s "${HOST_LIB}" ]]; then

@@ -6,7 +6,7 @@ description = "Offline-first local mirror, cache manager, mutation outbox, FTS5 
 
 [lib]
 name = "client_core"
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib", "cdylib"]
 
 [[bin]]
 name = "uniffi-bindgen"
@@ -19,7 +19,7 @@ bindgen-cli = ["uniffi/cli"]
 
 [dependencies]
 shared = { workspace = true }
-uniffi = { version = "0.29", features = ["tokio"] }
+uniffi = "0.29"
 sqlx = { version = "0.8.6", features = [
   "runtime-tokio-rustls",
   "sqlite",

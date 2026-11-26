@@ -333,6 +333,16 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn get_or_fetch_cover_art_with_status(
+        &self,
+        cover_art_id: &str,
+        size: Option<u32>,
+    ) -> CoreResult<(PathBuf, bool)> {
+        self.cache
+            .get_or_fetch_cover_art_with_status(cover_art_id, size, self.is_offline_only())
+            .await
+    }
+
     // --- Mutation Outbox ---
 
     pub async fn enqueue_mutation(&self, mutation: OutboxMutation) -> CoreResult<i64> {

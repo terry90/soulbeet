@@ -904,3 +904,286 @@ async fn event_listener_callbacks_fire_and_reentrancy_never_deadlocks() {
     handle.clear_event_listener();
     sync_handle.clear_event_listener();
 }
+
+#[tokio::test]
+async fn get_tracks_by_ids_preserves_order_duplicates_and_exceeds_chunk_limit() {
+    let tmp = TempDir::new().unwrap();
+    let handle = SoulbeetCoreHandle::open(test_config(&tmp, None, true))
+        .await
+        .unwrap();
+    let pool = handle.core().pool();
+    let now = now_unix();
+
+    // Seed 550 tracks (> 500 chunk size) in a single transaction for speed.
+    let mut tx = pool.begin().await.unwrap();
+    for i in 0..550usize {
+        sqlx::query(
+            r#"
+            INSERT INTO tracks (
+                id, title, artist_name, album_name, duration_secs,
+                starred, user_rating, play_count, is_discovery, updated_at
+            ) VALUES (?, ?, 'Artist', 'Album', 180, 0, 0, 0, 0, ?)
+            "#,
+        )
+        .bind(format!("t-{i:04}"))
+        .bind(format!("Track {i:04}"))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Request >500 unique IDs + duplicates + reversed order + missing IDs.
+    let mut query_ids: Vec<String> = (0..550usize).rev().map(|i| format!("t-{i:04}")).collect();
+    query_ids.insert(0, "t-0005".to_string());
+    query_ids.insert(1, "missing-track".to_string());
+    query_ids.push("t-0549".to_string());
+    query_ids.push("t-0005".to_string());
+
+    let tracks = handle.get_tracks_by_ids(query_ids.clone()).await.unwrap();
+    let expected: Vec<String> = query_ids
+        .into_iter()
+        .filter(|id| id != "missing-track")
+        .collect();
+    let actual: Vec<String> = tracks.into_iter().map(|t| t.id).collect();
+    assert_eq!(actual.len(), 553);
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn validation_rejects_invalid_rating_and_non_finite_volume_and_resets_dead_letters() {
+    let tmp = TempDir::new().unwrap();
+    let handle = SoulbeetCoreHandle::open(test_config(&tmp, None, true))
+        .await
+        .unwrap();
+
+    // Rating > 5 must be rejected cleanly with FfiError::InvalidInput
+    let err = handle
+        .enqueue_mutation(FfiOutboxMutation::Rate {
+            song_id: "trk-1".into(),
+            rating: 6,
+            discovery_track_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FfiError::InvalidInput { .. }));
+
+    // Non-finite volumes must be rejected with FfiError::InvalidInput
+    for bad_vol in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let err = handle
+            .connect_update_state(FfiPlaybackSnapshot {
+                song_id: None,
+                title: None,
+                artist: None,
+                album: None,
+                cover_art_id: None,
+                is_playing: false,
+                position_ms: 0,
+                duration_ms: 0,
+                queue_song_ids: Vec::new(),
+                queue_index: 0,
+                volume: bad_vol,
+                is_pending_discovery: false,
+                updated_at_unix: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FfiError::InvalidInput { .. }));
+
+        let err2 = handle
+            .connect_send_command(
+                "dev-2".into(),
+                FfiConnectCommand::SetVolume { volume: bad_vol },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, FfiError::InvalidInput { .. }));
+    }
+
+    // Dead-letter retry must reset attempts = 0 and last_error = NULL
+    sqlx::query(
+        r#"
+        INSERT INTO mutation_outbox (
+            idempotency_key, kind, song_id, payload_json, created_at, attempts, last_error, next_retry_at, dead_letter
+        ) VALUES ('dl-1', 'star', 'trk-1', '{"kind":"star","song_id":"trk-1","starred":true,"discovery_track_id":null}', 1000, 4, 'permanent 400', 999999, 1)
+        "#,
+    )
+    .execute(handle.core().pool())
+    .await
+    .unwrap();
+
+    assert_eq!(handle.retry_dead_letters().await.unwrap(), 1);
+    let pending = handle.pending_outbox().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempts, 0);
+    assert_eq!(pending[0].last_error, None);
+    assert_eq!(pending[0].next_retry_at, 0);
+    assert!(!pending[0].dead_letter);
+}
+
+#[tokio::test]
+async fn connect_ws_http_401_maps_to_server_http_and_disconnect_clears_stale_state() {
+    // 1. Auth-rejected WS handshake preserves HTTP 401 as FfiError::ServerHttp
+    let auth_app = Router::new().route(
+        "/api/ws/connect",
+        get(|| async { (StatusCode::UNAUTHORIZED, "token expired") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, auth_app).await;
+    });
+
+    let tmp_auth = TempDir::new().unwrap();
+    let handle_auth = SoulbeetCoreHandle::open(test_config(
+        &tmp_auth,
+        Some(format!("http://{addr}")),
+        false,
+    ))
+    .await
+    .unwrap();
+    let err = handle_auth.connect_ws(5).await.unwrap_err();
+    assert!(
+        matches!(err, FfiError::ServerHttp { status: 401, .. }),
+        "expected ServerHttp 401, got {err:?}"
+    );
+
+    // 2. Disconnect clears stale devices, active_device_id, and snapshots
+    let (base_url, _) = start_mock_server().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = SoulbeetCoreHandle::open(test_config(&tmp, Some(base_url), false))
+        .await
+        .unwrap();
+    handle.connect_ws(5).await.unwrap();
+
+    // Wait until DeviceList populates state
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let st = handle.connect_state().await.unwrap();
+        if !st.devices.is_empty() {
+            assert!(st.connected);
+            assert_eq!(st.active_device_id.as_deref(), Some("android-pixel-1"));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    handle.disconnect_ws().await.unwrap();
+    let after = handle.connect_state().await.unwrap();
+    assert!(!after.connected);
+    assert!(after.devices.is_empty());
+    assert!(after.active_device_id.is_none());
+    assert!(after.snapshots.is_empty());
+}
+
+#[tokio::test]
+async fn cover_art_containment_rejects_escape_and_cache_hit_does_not_re_emit() {
+    let (base_url, _) = start_mock_server().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = SoulbeetCoreHandle::open(test_config(&tmp, Some(base_url), false))
+        .await
+        .unwrap();
+
+    // Insert a DB row pointing OUTSIDE cover_art_dir -> must be rejected by canonical containment check.
+    let outside_file = tmp.path().join("outside-secret.jpg");
+    std::fs::write(&outside_file, b"SECRET").unwrap();
+    std::fs::create_dir_all(tmp.path().join("art")).unwrap();
+    let now = now_unix();
+    sqlx::query(
+        "INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at) VALUES ('escape-art', ?, 'image/jpeg', 6, ?, ?)",
+    )
+    .bind(outside_file.display().to_string())
+    .bind(now)
+    .bind(now)
+    .execute(handle.core().pool())
+    .await
+    .unwrap();
+
+    assert!(handle
+        .cover_art_local_path_sync("escape-art".into())
+        .unwrap()
+        .is_none());
+
+    // Fetch a real cover art twice: only the first fetch should fire `on_cache_changed`.
+    let cache_events = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    handle.set_event_listener(Box::new(ReentrantListener {
+        handle: handle.clone(),
+        sync_count: Arc::new(AtomicUsize::new(0)),
+        outbox_count: Arc::new(AtomicUsize::new(0)),
+        cache_count: cache_events.clone(),
+        connect_state_count: Arc::new(AtomicUsize::new(0)),
+        connect_event_count: Arc::new(AtomicUsize::new(0)),
+        saw_command_play: Arc::new(AtomicBool::new(false)),
+        reentered_ok: Arc::new(AtomicBool::new(false)),
+        notify: notify.clone(),
+    }));
+
+    let p1 = handle
+        .get_or_fetch_cover_art("ca-hit-test".into(), Some(300))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while cache_events.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        let _ = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+    }
+    assert_eq!(cache_events.load(Ordering::SeqCst), 1);
+
+    let p2 = handle
+        .get_or_fetch_cover_art("ca-hit-test".into(), Some(300))
+        .await
+        .unwrap();
+    assert_eq!(p1, p2);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        cache_events.load(Ordering::SeqCst),
+        1,
+        "cache hit must not fire on_cache_changed again"
+    );
+
+    handle.shutdown().await.unwrap();
+}
+
+struct ReentrantDropListener {
+    handle: Arc<SoulbeetCoreHandle>,
+    dropped_cleanly: Arc<AtomicBool>,
+}
+
+impl CoreEventListener for ReentrantDropListener {
+    fn on_connect_state_changed(&self, _state: FfiConnectState) {}
+    fn on_connect_event(&self, _event: FfiConnectEvent) {}
+    fn on_sync_completed(&self, _report: FfiSyncReport) {}
+    fn on_outbox_drained(&self, _report: FfiDrainReport) {}
+    fn on_cache_changed(&self, _stats: FfiCacheStats) {}
+}
+
+impl Drop for ReentrantDropListener {
+    fn drop(&mut self) {
+        // Re-acquiring the listener lock inside Drop proves the old listener is dropped
+        // OUTSIDE the RwLock write guard (otherwise this would self-deadlock!).
+        let _ = self.handle.is_offline_only();
+        self.handle.clear_event_listener();
+        self.dropped_cleanly.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn replacing_listener_drops_previous_outside_lock_without_deadlock() {
+    let tmp = TempDir::new().unwrap();
+    let handle = SoulbeetCoreHandle::open(test_config(&tmp, None, true))
+        .await
+        .unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    handle.set_event_listener(Box::new(ReentrantDropListener {
+        handle: handle.clone(),
+        dropped_cleanly: dropped.clone(),
+    }));
+
+    // Clearing triggers Drop of ReentrantDropListener, which calls clear_event_listener() again.
+    handle.clear_event_listener();
+    assert!(dropped.load(Ordering::SeqCst));
+
+    handle.shutdown().await.unwrap();
+}

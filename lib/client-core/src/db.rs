@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -359,18 +359,44 @@ pub async fn get_track(pool: &SqlitePool, track_id: &str) -> CoreResult<Option<L
     Ok(row)
 }
 
+const TRACK_ID_BATCH_SIZE: usize = 500;
+
+/// Fetches tracks for the given IDs, chunking queries to stay well below SQLite's variable limit.
+/// Preserves the exact input ordering and duplicates while skipping IDs not present in the mirror.
 pub async fn get_tracks_by_ids(pool: &SqlitePool, ids: &[String]) -> CoreResult<Vec<LocalTrack>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM tracks WHERE id IN (");
-    let mut sep = qb.separated(", ");
+
+    let mut unique_ids = Vec::with_capacity(ids.len());
+    let mut seen = HashSet::with_capacity(ids.len());
     for id in ids {
-        sep.push_bind(id);
+        if seen.insert(id.as_str()) {
+            unique_ids.push(id.as_str());
+        }
     }
-    sep.push_unseparated(")");
-    let rows = qb.build_query_as::<LocalTrack>().fetch_all(pool).await?;
-    Ok(rows)
+
+    let mut by_id: HashMap<String, LocalTrack> = HashMap::with_capacity(unique_ids.len());
+    for chunk in unique_ids.chunks(TRACK_ID_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM tracks WHERE id IN (");
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(*id);
+        }
+        sep.push_unseparated(")");
+        let rows = qb.build_query_as::<LocalTrack>().fetch_all(pool).await?;
+        for row in rows {
+            by_id.insert(row.id.clone(), row);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(track) = by_id.get(id) {
+            ordered.push(track.clone());
+        }
+    }
+    Ok(ordered)
 }
 
 pub async fn list_tracks_for_playlist(
@@ -539,8 +565,8 @@ pub async fn save_playback_session(
         "#,
     )
     .bind(queue_json)
-    .bind(session.current_index as i64)
-    .bind(session.position_ms as i64)
+    .bind(i64::try_from(session.current_index).unwrap_or(i64::MAX))
+    .bind(i64::try_from(session.position_ms).unwrap_or(i64::MAX))
     .bind(session.is_playing)
     .bind(&session.source_label)
     .bind(session.updated_at)

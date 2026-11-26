@@ -742,61 +742,70 @@ pub enum FfiOutboxMutation {
     },
 }
 
-impl From<FfiOutboxMutation> for OutboxMutation {
-    fn from(v: FfiOutboxMutation) -> Self {
+impl TryFrom<FfiOutboxMutation> for OutboxMutation {
+    type Error = FfiError;
+
+    fn try_from(v: FfiOutboxMutation) -> Result<Self, Self::Error> {
         match v {
             FfiOutboxMutation::Scrobble {
                 song_id,
                 submission,
                 played_at_unix,
-            } => Self::Scrobble {
+            } => Ok(Self::Scrobble {
                 song_id,
                 submission,
                 played_at_unix,
-            },
+            }),
             FfiOutboxMutation::Keep {
                 song_id,
                 discovery_track_id,
                 target_folder_id,
-            } => Self::Keep {
+            } => Ok(Self::Keep {
                 song_id,
                 discovery_track_id,
                 target_folder_id,
-            },
+            }),
             FfiOutboxMutation::Star {
                 song_id,
                 discovery_track_id,
-            } => Self::Star {
+            } => Ok(Self::Star {
                 song_id,
                 starred: true,
                 discovery_track_id,
-            },
+            }),
             FfiOutboxMutation::Unstar {
                 song_id,
                 discovery_track_id,
-            } => Self::Star {
+            } => Ok(Self::Star {
                 song_id,
                 starred: false,
                 discovery_track_id,
-            },
+            }),
             FfiOutboxMutation::Rate {
                 song_id,
                 rating,
                 discovery_track_id,
-            } => Self::Rate {
-                song_id,
-                rating,
-                discovery_track_id,
-            },
+            } => {
+                if rating > 5 {
+                    return Err(FfiError::InvalidInput {
+                        detail: format!("rating must be between 0 and 5 (got {rating})"),
+                    });
+                }
+                Ok(Self::Rate {
+                    song_id,
+                    rating,
+                    discovery_track_id,
+                })
+            }
             FfiOutboxMutation::Drop {
                 song_id,
                 discovery_track_id,
                 confirm_delete,
-            } => Self::Drop {
+            } => Ok(Self::Drop {
                 song_id,
                 discovery_track_id,
                 confirm_delete,
-            },
+            }),
         }
     }
 }
@@ -1077,9 +1086,21 @@ pub struct FfiPlaybackSnapshot {
     pub updated_at_unix: i64,
 }
 
-impl From<FfiPlaybackSnapshot> for PlaybackSnapshotDto {
-    fn from(v: FfiPlaybackSnapshot) -> Self {
-        Self {
+fn validate_volume(volume: f32) -> Result<f32, FfiError> {
+    if !volume.is_finite() {
+        return Err(FfiError::InvalidInput {
+            detail: format!("volume must be finite (got {volume})"),
+        });
+    }
+    Ok(volume.clamp(0.0, 1.0))
+}
+
+impl TryFrom<FfiPlaybackSnapshot> for PlaybackSnapshotDto {
+    type Error = FfiError;
+
+    fn try_from(v: FfiPlaybackSnapshot) -> Result<Self, Self::Error> {
+        let volume = validate_volume(v.volume)?;
+        Ok(Self {
             song_id: v.song_id,
             title: v.title,
             artist: v.artist,
@@ -1090,10 +1111,10 @@ impl From<FfiPlaybackSnapshot> for PlaybackSnapshotDto {
             duration_ms: v.duration_ms,
             queue_song_ids: v.queue_song_ids,
             queue_index: v.queue_index as usize,
-            volume: v.volume,
+            volume,
             is_pending_discovery: v.is_pending_discovery,
             updated_at_unix: v.updated_at_unix,
-        }
+        })
     }
 }
 
@@ -1188,34 +1209,38 @@ pub enum FfiConnectCommand {
     },
 }
 
-impl From<FfiConnectCommand> for ConnectCommandDto {
-    fn from(v: FfiConnectCommand) -> Self {
+impl TryFrom<FfiConnectCommand> for ConnectCommandDto {
+    type Error = FfiError;
+
+    fn try_from(v: FfiConnectCommand) -> Result<Self, Self::Error> {
         match v {
-            FfiConnectCommand::Play => Self::Play,
-            FfiConnectCommand::Pause => Self::Pause,
-            FfiConnectCommand::TogglePlay => Self::TogglePlay,
-            FfiConnectCommand::Next => Self::Next,
-            FfiConnectCommand::Previous => Self::Previous,
-            FfiConnectCommand::Seek { position_ms } => Self::Seek { position_ms },
-            FfiConnectCommand::SetVolume { volume } => Self::SetVolume { volume },
+            FfiConnectCommand::Play => Ok(Self::Play),
+            FfiConnectCommand::Pause => Ok(Self::Pause),
+            FfiConnectCommand::TogglePlay => Ok(Self::TogglePlay),
+            FfiConnectCommand::Next => Ok(Self::Next),
+            FfiConnectCommand::Previous => Ok(Self::Previous),
+            FfiConnectCommand::Seek { position_ms } => Ok(Self::Seek { position_ms }),
+            FfiConnectCommand::SetVolume { volume } => Ok(Self::SetVolume {
+                volume: validate_volume(volume)?,
+            }),
             FfiConnectCommand::LoadQueue {
                 song_ids,
                 start_index,
                 start_position_ms,
                 autoplay,
-            } => Self::LoadQueue {
+            } => Ok(Self::LoadQueue {
                 song_ids,
                 start_index: start_index as usize,
                 start_position_ms,
                 autoplay,
-            },
+            }),
             FfiConnectCommand::TransferPlayback {
                 from_device_id,
                 snapshot,
-            } => Self::TransferPlayback {
+            } => Ok(Self::TransferPlayback {
                 from_device_id,
-                snapshot: snapshot.into(),
-            },
+                snapshot: snapshot.try_into()?,
+            }),
         }
     }
 }
@@ -1323,6 +1348,20 @@ enum CoreEvent {
     CacheChanged(FfiCacheStats),
 }
 
+/// Bounded capacity for FFI listener event delivery so a slow foreign listener
+/// cannot trigger unbounded memory growth.
+const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Aborts the wrapped Tokio [`JoinHandle`] if the outer future is dropped (e.g.
+/// when Kotlin cancels a `suspend fun` coroutine) instead of detaching a zombie task.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 // ============================================================================
 // Owned Tokio Runtime Wrapper (Safe Drop from Any Context)
 // ============================================================================
@@ -1380,12 +1419,23 @@ pub struct SoulbeetCoreHandle {
     core: Arc<SoulbeetCore>,
     runtime: OwnedRuntime,
     listener: Arc<StdRwLock<Option<Arc<dyn CoreEventListener>>>>,
-    event_tx: mpsc::UnboundedSender<CoreEvent>,
+    event_tx: mpsc::Sender<CoreEvent>,
     background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl Drop for SoulbeetCoreHandle {
     fn drop(&mut self) {
+        // Release any registered foreign listener outside the RwLock guard so its Drop
+        // cannot deadlock if it re-enters or triggers foreign cleanup.
+        let prev = {
+            let mut guard = self
+                .listener
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+        drop(prev);
+
         if let Ok(mut tasks) = self.background_tasks.lock() {
             for handle in tasks.drain(..) {
                 handle.abort();
@@ -1399,7 +1449,7 @@ impl SoulbeetCoreHandle {
         let core = Arc::new(core);
         let listener: Arc<StdRwLock<Option<Arc<dyn CoreEventListener>>>> =
             Arc::new(StdRwLock::new(None));
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<CoreEvent>();
+        let (event_tx, mut event_rx) = mpsc::channel::<CoreEvent>(EVENT_CHANNEL_CAPACITY);
 
         // 1. Dedicated sequential event dispatcher: clones the listener Arc out of the
         //    RwLock (dropping the lock immediately) and runs each callback on Tokio's
@@ -1417,7 +1467,7 @@ impl SoulbeetCoreHandle {
                 let Some(cb) = cb else {
                     continue;
                 };
-                let _ = tokio::task::spawn_blocking(move || match ev {
+                let res = tokio::task::spawn_blocking(move || match ev {
                     CoreEvent::ConnectStateChanged(state) => cb.on_connect_state_changed(state),
                     CoreEvent::ConnectEvent(event) => cb.on_connect_event(event),
                     CoreEvent::SyncCompleted(report) => cb.on_sync_completed(report),
@@ -1425,6 +1475,11 @@ impl SoulbeetCoreHandle {
                     CoreEvent::CacheChanged(stats) => cb.on_cache_changed(stats),
                 })
                 .await;
+                if let Err(err) = res {
+                    if err.is_panic() {
+                        tracing::error!("CoreEventListener callback panicked: {err}");
+                    }
+                }
             }
         });
 
@@ -1439,11 +1494,14 @@ impl SoulbeetCoreHandle {
                         match changed {
                             Ok(()) => {
                                 let state = state_rx.borrow_and_update().clone();
-                                if connect_tx
-                                    .send(CoreEvent::ConnectStateChanged(state.into()))
-                                    .is_err()
-                                {
-                                    break;
+                                match connect_tx.try_send(CoreEvent::ConnectStateChanged(state.into())) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::warn!(
+                                            "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping ConnectStateChanged"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                                 }
                             }
                             Err(_) => break,
@@ -1452,11 +1510,14 @@ impl SoulbeetCoreHandle {
                     ev = connect_ev_rx.recv() => {
                         match ev {
                             Ok(event) => {
-                                if connect_tx
-                                    .send(CoreEvent::ConnectEvent(event.into()))
-                                    .is_err()
-                                {
-                                    break;
+                                match connect_tx.try_send(CoreEvent::ConnectEvent(event.into())) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        tracing::warn!(
+                                            "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping ConnectEvent"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1486,13 +1547,10 @@ impl SoulbeetCoreHandle {
         F: Future<Output = Result<T, FfiError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.runtime
-            .handle()
-            .spawn(fut)
-            .await
-            .map_err(|e| FfiError::Internal {
-                detail: format!("core runtime task failed: {e}"),
-            })?
+        let mut guard = AbortOnDrop(self.runtime.handle().spawn(fut));
+        (&mut guard.0).await.map_err(|e| FfiError::Internal {
+            detail: format!("core runtime task failed: {e}"),
+        })?
     }
 
     fn run_blocking<F, T>(&self, fut: F) -> Result<T, FfiError>
@@ -1513,7 +1571,11 @@ impl SoulbeetCoreHandle {
     }
 
     fn emit_event(&self, event: CoreEvent) {
-        let _ = self.event_tx.send(event);
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.event_tx.try_send(event) {
+            tracing::warn!(
+                "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping event notification"
+            );
+        }
     }
 
     /// Exposes the underlying Rust [`SoulbeetCore`] for in-process Rust tests and callers.
@@ -1522,10 +1584,30 @@ impl SoulbeetCoreHandle {
     }
 }
 
-// --- Synchronous FFI Methods (Zero-Coroutine Safe for Android Auto / ContentProvider) ---
+// ============================================================================
+// Exported FFI Surface (Executor-Agnostic Async + Zero-Coroutine Sync Methods)
+// ============================================================================
 
 #[uniffi::export]
 impl SoulbeetCoreHandle {
+    /// Asynchronously opens and migrates the local SQLite database and initializes the core engine.
+    #[uniffi::constructor]
+    pub async fn open(config: FfiClientConfig) -> Result<Arc<Self>, FfiError> {
+        let runtime = OwnedRuntime::new()?;
+        let core_config: ClientConfig = config.into();
+        let mut init_guard = AbortOnDrop(
+            runtime
+                .handle()
+                .spawn(async move { SoulbeetCore::init(core_config).await.map_err(FfiError::from) }),
+        );
+        let core = (&mut init_guard.0)
+            .await
+            .map_err(|e| FfiError::Internal {
+                detail: format!("core init task failed: {e}"),
+            })??;
+        Ok(Self::build_from_initialized(runtime, core))
+    }
+
     /// Synchronously opens and migrates the local SQLite database and initializes the core engine.
     /// Safe to call from non-Tokio threads (e.g. Android `Application.onCreate` or `ContentProvider`).
     #[uniffi::constructor]
@@ -1557,21 +1639,53 @@ impl SoulbeetCoreHandle {
         self.core.set_offline_only(offline_only);
     }
 
+    /// Registers a reactive [`CoreEventListener`] for state, sync, outbox, and cache notifications.
+    ///
+    /// **Lifecycle note:** Avoid holding a strong reference to `SoulbeetCoreHandle` inside the
+    /// listener implementation (use a weak reference), OR call [`Self::clear_event_listener`] /
+    /// [`Self::shutdown`] during teardown to break any cross-FFI reference cycle.
     pub fn set_event_listener(&self, listener: Box<dyn CoreEventListener>) {
         let arc_listener: Arc<dyn CoreEventListener> = Arc::from(listener);
-        let mut guard = self
-            .listener
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(arc_listener);
+        let prev = {
+            let mut guard = self
+                .listener
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.replace(arc_listener)
+        };
+        // Drop previous listener outside the RwLock write guard to prevent re-entrancy deadlocks.
+        drop(prev);
     }
 
+    /// Clears the registered [`CoreEventListener`], dropping it outside internal locks.
     pub fn clear_event_listener(&self) {
-        let mut guard = self
-            .listener
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
+        let prev = {
+            let mut guard = self
+                .listener
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.take()
+        };
+        drop(prev);
+    }
+
+    /// Gracefully shuts down this handle: clears any registered event listener (breaking
+    /// cross-FFI reference cycles), disconnects the Connect WebSocket, aborts background
+    /// forwarder tasks, and closes the SQLite connection pool.
+    pub async fn shutdown(&self) -> Result<(), FfiError> {
+        self.clear_event_listener();
+        if let Ok(mut tasks) = self.background_tasks.lock() {
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
+        let core = self.core.clone();
+        self.run_async(async move {
+            core.disconnect_ws().await;
+            core.pool().close().await;
+            Ok(())
+        })
+        .await
     }
 
     /// Returns the 4 fixed Android Auto root tabs without touching disk or network.
@@ -1583,8 +1697,9 @@ impl SoulbeetCoreHandle {
             .collect()
     }
 
-    /// Pure local SQLite + filesystem cover-art lookup with zero network I/O.
-    /// Designed for Android Auto's synchronous `ContentProvider.openFile` binder threads.
+    /// Pure read-only local SQLite + filesystem cover-art lookup with zero network I/O and
+    /// zero SQLite writes. Designed for Android Auto's synchronous `ContentProvider.openFile`
+    /// Binder threads.
     pub fn cover_art_local_path_sync(&self, cover_art_id: String) -> Result<Option<String>, FfiError> {
         let core = self.core.clone();
         self.run_blocking(async move {
@@ -1594,26 +1709,6 @@ impl SoulbeetCoreHandle {
                 .map_err(FfiError::from)?;
             Ok(path.map(|p| p.display().to_string()))
         })
-    }
-}
-
-// --- Async FFI Methods (Native Kotlin `suspend fun` Coroutines) ---
-
-#[uniffi::export(async_runtime = "tokio")]
-impl SoulbeetCoreHandle {
-    /// Asynchronously opens and migrates the local SQLite database and initializes the core engine.
-    #[uniffi::constructor]
-    pub async fn open(config: FfiClientConfig) -> Result<Arc<Self>, FfiError> {
-        let runtime = OwnedRuntime::new()?;
-        let core_config: ClientConfig = config.into();
-        let core = runtime
-            .handle()
-            .spawn(async move { SoulbeetCore::init(core_config).await.map_err(FfiError::from) })
-            .await
-            .map_err(|e| FfiError::Internal {
-                detail: format!("core init task failed: {e}"),
-            })??;
-        Ok(Self::build_from_initialized(runtime, core))
     }
 
     // --- Auth & Bootstrap ---
@@ -2021,17 +2116,25 @@ impl SoulbeetCoreHandle {
         size: Option<u32>,
     ) -> Result<String, FfiError> {
         let core = self.core.clone();
-        let (path, stats) = self
+        let (path, maybe_stats) = self
             .run_async(async move {
-                let path = core
-                    .get_or_fetch_cover_art(&cover_art_id, size)
+                let (path, newly_fetched) = core
+                    .get_or_fetch_cover_art_with_status(&cover_art_id, size)
                     .await
                     .map_err(FfiError::from)?;
-                let stats = core.cache_stats().await.map_err(FfiError::from)?;
-                Ok((path.display().to_string(), FfiCacheStats::from(stats)))
+                let stats = if newly_fetched {
+                    Some(FfiCacheStats::from(
+                        core.cache_stats().await.map_err(FfiError::from)?,
+                    ))
+                } else {
+                    None
+                };
+                Ok((path.display().to_string(), stats))
             })
             .await?;
-        self.emit_event(CoreEvent::CacheChanged(stats));
+        if let Some(stats) = maybe_stats {
+            self.emit_event(CoreEvent::CacheChanged(stats));
+        }
         Ok(path)
     }
 
@@ -2039,7 +2142,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn enqueue_mutation(&self, mutation: FfiOutboxMutation) -> Result<i64, FfiError> {
         let core = self.core.clone();
-        let native_mut: OutboxMutation = mutation.into();
+        let native_mut: OutboxMutation = mutation.try_into()?;
         self.run_async(async move { core.enqueue_mutation(native_mut).await.map_err(FfiError::from) })
             .await
     }
@@ -2050,7 +2153,7 @@ impl SoulbeetCoreHandle {
         idempotency_key: String,
     ) -> Result<i64, FfiError> {
         let core = self.core.clone();
-        let native_mut: OutboxMutation = mutation.into();
+        let native_mut: OutboxMutation = mutation.try_into()?;
         self.run_async(async move {
             core.enqueue_mutation_with_key(native_mut, idempotency_key)
                 .await
@@ -2201,7 +2304,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn connect_update_state(&self, snapshot: FfiPlaybackSnapshot) -> Result<(), FfiError> {
         let core = self.core.clone();
-        let native_snap: PlaybackSnapshotDto = snapshot.into();
+        let native_snap: PlaybackSnapshotDto = snapshot.try_into()?;
         self.run_async(async move {
             core.connect_update_state(native_snap)
                 .await
@@ -2216,7 +2319,7 @@ impl SoulbeetCoreHandle {
         command: FfiConnectCommand,
     ) -> Result<(), FfiError> {
         let core = self.core.clone();
-        let native_cmd: ConnectCommandDto = command.into();
+        let native_cmd: ConnectCommandDto = command.try_into()?;
         self.run_async(async move {
             core.connect_send_command(target_device_id, native_cmd)
                 .await
@@ -2239,7 +2342,7 @@ impl SoulbeetCoreHandle {
         snapshot: FfiPlaybackSnapshot,
     ) -> Result<(), FfiError> {
         let core = self.core.clone();
-        let native_snap: PlaybackSnapshotDto = snapshot.into();
+        let native_snap: PlaybackSnapshotDto = snapshot.try_into()?;
         self.run_async(async move {
             core.connect_transfer_playback_to(target_device_id, native_snap)
                 .await
