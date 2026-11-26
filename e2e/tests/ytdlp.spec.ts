@@ -2,22 +2,19 @@
 // on, an album no Soulseek peer has is offered under its own lossy heading and imports once the
 // user picks it, a user who never takes lossy files is not offered it, and a rate limit shows on
 // the status line. It switches a backend for the whole instance and ends with YouTube Music
-// paused for an hour, so the project runs alone, last.
+// paused for an hour, so the project runs alone, after the archive.
 
-import type { Browser, BrowserContext, Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import {
-  admin,
   freshSession,
-  loginViaApi,
   openDownloadsPanel,
   openServiceStatus,
   openSettings,
   performSearch,
   transferRow,
 } from '../helpers/app.js';
-import { disableBackend, enableBackend } from '../helpers/backends.js';
-import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from '../helpers/env.js';
+import { asAdmin, disableBackend, enableBackend } from '../helpers/backends.js';
 import { expectFileAppears, importedTrackPath, libraryItems } from '../helpers/files.js';
 import { morseBloom, semaphoreGardens } from '../fixtures/dataset.js';
 import { landedName, morseBloomAlbum, rateLimitedRelease } from '../fixtures/ytdlp-dataset.js';
@@ -25,32 +22,6 @@ import { landedName, morseBloomAlbum, rateLimitedRelease } from '../fixtures/ytd
 test.describe.configure({ mode: 'serial', timeout: 180_000 });
 
 const YOUTUBE = 'YouTube Music';
-
-/**
- * Signs `context` in as the seeded admin. Once navidrome.spec.ts has signed it in through
- * Navidrome, the account is linked to Navidrome's admin and only Navidrome's password opens it.
- */
-async function signInAdmin(context: BrowserContext): Promise<void> {
-  const local = await context.request.post('/api/auth/login', { data: admin });
-  if (local.ok()) {
-    return;
-  }
-  expect(navidromeEnabled, `admin sign-in: ${local.status()}`).toBe(true);
-  await loginViaApi(context, { username: navidromeAdminUser, password: navidromeAdminPassword });
-}
-
-/** Runs `act` on a page of a new context signed in as the admin. */
-async function asAdmin(browser: Browser, act: (page: Page) => Promise<void>): Promise<void> {
-  const context = await browser.newContext();
-  try {
-    await signInAdmin(context);
-    const page = await context.newPage();
-    await page.goto('/');
-    await act(page);
-  } finally {
-    await context.close();
-  }
-}
 
 /** Starts the auto-download of the album `title` from the search results. */
 async function autoDownload(page: Page, title: string): Promise<void> {

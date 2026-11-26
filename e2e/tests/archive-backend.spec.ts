@@ -4,19 +4,15 @@
 // and turning it off takes it off the status line. It switches a backend for the whole
 // instance, so the project runs alone, after every other one.
 
-import type { Browser, BrowserContext, Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import {
-  admin,
   freshSession,
-  loginViaApi,
   openDownloadsPanel,
   openServiceStatus,
   performSearch,
   transferRow,
 } from '../helpers/app.js';
-import { disableBackend, enableBackend } from '../helpers/backends.js';
-import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from '../helpers/env.js';
+import { asAdmin, disableBackend, enableBackend } from '../helpers/backends.js';
 import { expectFileAppears, importedTrackPath } from '../helpers/files.js';
 import {
   driftwoodCodesItem,
@@ -28,32 +24,6 @@ import { driftwoodCodes, pylonSong, wirelessOrchards } from '../fixtures/dataset
 test.describe.configure({ mode: 'serial', timeout: 180_000 });
 
 const ARCHIVE = 'Internet Archive';
-
-/**
- * Signs `context` in as the seeded admin. Once navidrome.spec.ts has signed it in through
- * Navidrome, the account is linked to Navidrome's admin and only Navidrome's password opens it.
- */
-async function signInAdmin(context: BrowserContext): Promise<void> {
-  const local = await context.request.post('/api/auth/login', { data: admin });
-  if (local.ok()) {
-    return;
-  }
-  expect(navidromeEnabled, `admin sign-in: ${local.status()}`).toBe(true);
-  await loginViaApi(context, { username: navidromeAdminUser, password: navidromeAdminPassword });
-}
-
-/** Runs `act` on a page of a new context signed in as the admin. */
-async function asAdmin(browser: Browser, act: (page: Page) => Promise<void>): Promise<void> {
-  const context = await browser.newContext();
-  try {
-    await signInAdmin(context);
-    const page = await context.newPage();
-    await page.goto('/');
-    await act(page);
-  } finally {
-    await context.close();
-  }
-}
 
 // A failed run must not leave the backend on for the next one.
 test.afterAll(async ({ browser }) => {

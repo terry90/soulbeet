@@ -43,6 +43,10 @@ export const slskdControlUrl = process.env.E2E_SLSKD_CONTROL_URL ?? 'http://127.
 /** MusicBrainz stub control endpoint as seen from the host running the specs. */
 export const mbControlUrl = process.env.E2E_MB_CONTROL_URL ?? 'http://127.0.0.1:5050';
 
+/** The GD Studio double's control endpoint as seen from the host running the specs. */
+export const gdstudioControlUrl =
+  process.env.E2E_GDSTUDIO_CONTROL_URL ?? 'http://127.0.0.1:5063';
+
 /** Music library root as the APP sees it (mount point in compose). */
 export const musicDirForApp = process.env.E2E_MUSIC_DIR ?? join(e2eRoot, '.runtime', 'music');
 

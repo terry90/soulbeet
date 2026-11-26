@@ -42,6 +42,7 @@ export default defineConfig({
         /admin-password\.spec\.ts/,
         /archive-backend\.spec\.ts/,
         /ytdlp\.spec\.ts/,
+        /gdstudio\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -112,6 +113,15 @@ export default defineConfig({
       testMatch: /ytdlp\.spec\.ts/,
       workers: 1,
       retries: 0,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Turns the GD Studio backend on for the whole instance and scripts its double, so it
+      // runs alone, after YouTube Music.
+      name: 'gdstudio',
+      dependencies: ['ytdlp'],
+      testMatch: /gdstudio\.spec\.ts/,
+      workers: 1,
       use: { ...devices['Desktop Chrome'] },
     },
   ],

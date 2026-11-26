@@ -51,6 +51,7 @@ down() {
   free_port 9766
   free_port 5030
   free_port 5050
+  free_port 5063
   free_port 5064
   free_port 5070
   echo "stack stopped"
@@ -79,6 +80,7 @@ up() {
   free_port 9766
   free_port 5030
   free_port 5050
+  free_port 5063
   free_port 5064
   free_port 5070
 
@@ -113,6 +115,7 @@ up() {
     ARCHIVE_HOST="127.0.0.1:5064" \
     YTDLP_SITE_PACKAGES="$E2E_DIR/.fixtures/ytdlp-site-packages" \
     YTDLP_DENO="$E2E_DIR/fixtures/ytdlp-bin/deno" \
+    GDSTUDIO_HOST="127.0.0.1:5063" \
     OIDC_ISSUER_URL="http://127.0.0.1:5070" \
     OIDC_CLIENT_ID="soulbeet-e2e" \
     OIDC_CLIENT_SECRET="e2e-oidc-secret" \
@@ -130,13 +133,14 @@ up() {
     BEETS_CONFIG="$RUNTIME/user90-config/config.yaml" \
     MUSICBRAINZ_HOST="127.0.0.1:5050" \
     ARCHIVE_HOST="127.0.0.1:5064" \
+    GDSTUDIO_HOST="127.0.0.1:5063" \
     PORT=9766 IP=127.0.0.1 \
     setsid ./server >"$LOG_DIR/soulbeet-user90.log" 2>&1 </dev/null &
    echo $! >"$PID_DIR/soulbeet-user90.pid")
   wait_for "http://127.0.0.1:9766/" "soulbeet-user90"
 
   echo "stack up: app http://127.0.0.1:9765, issue #90 app http://127.0.0.1:9766,"
-  echo "slskd stub :5030, mb stub :5050, archive.org stub :5064, oidc stub :5070"
+  echo "slskd stub :5030, mb stub :5050, GD Studio stub :5063, archive.org stub :5064, oidc stub :5070"
   echo "logs: $LOG_DIR"
 }
 

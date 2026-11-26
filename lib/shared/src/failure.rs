@@ -275,6 +275,8 @@ pub enum Service {
     InternetArchive,
     /// YouTube, the YouTube Music download backend's service.
     Youtube,
+    /// GD Studio's API and NetEase's file servers, the GD Studio download backend's service.
+    GdStudio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -379,6 +381,9 @@ failure_codes! {
     TransferSizeMismatch => "transfer_size_mismatch",
     /// The file's bytes do not match the checksum its source gave for it.
     TransferChecksumMismatch => "transfer_checksum_mismatch",
+    /// The source now serves another file under the name a search found, so the file the user
+    /// picked is no longer there to fetch.
+    SourceFileChanged => "source_file_changed",
     TransferRejectedNotShared => "transfer_rejected_not_shared",
     TransferRejectedPeerBusy => "transfer_rejected_peer_busy",
     TransferRejectedFailureLimit => "transfer_rejected_failure_limit",
@@ -466,10 +471,11 @@ mod tests {
     /// `search_already_running`, `search_lost`, `import_disk_full`,
     /// `import_library_locked`, `delete_failed`, `partial` (design 10.1), `wrong_job_state`,
     /// `sources_exhausted`, `result_rejected`, `search_stopped`,
-    /// `no_listening_data`, `transfer_checksum_mismatch` and `download_disk_full`, and
+    /// `no_listening_data`, `transfer_checksum_mismatch`, `source_file_changed` and
+    /// `download_disk_full`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 93] = [
+    const NAMES: [&str; 94] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -505,6 +511,7 @@ mod tests {
         "transfer_connection_failed",
         "transfer_size_mismatch",
         "transfer_checksum_mismatch",
+        "source_file_changed",
         "transfer_rejected_not_shared",
         "transfer_rejected_peer_busy",
         "transfer_rejected_failure_limit",
@@ -664,6 +671,23 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&f).unwrap()["cause"],
             serde_json::json!({"service": "youtube", "status": null, "raw": "try again later"})
+        );
+    }
+
+    #[test]
+    fn gd_studio_is_written_gd_studio() {
+        let f = Failure::new(
+            FailureCode::SourceFileChanged,
+            Stage::Transfer,
+            RetryAdvice::OtherQuery,
+            "NetEase now serves another file for this track",
+        )
+        .with_cause(Service::GdStudio, None, "md5 differs");
+        let wire = serde_json::to_value(&f).unwrap();
+        assert_eq!(wire["code"], "source_file_changed");
+        assert_eq!(
+            wire["cause"],
+            serde_json::json!({"service": "gd_studio", "status": null, "raw": "md5 differs"})
         );
     }
 
