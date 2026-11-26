@@ -65,10 +65,10 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Install desktop native dependencies (libmpv, WebKitGTK, GTK3, D-Bus)
+      - name: Install desktop native dependencies (libmpv, WebKitGTK, GTK3, D-Bus, libxdo)
         run: >
           sudo apt-get update && sudo apt-get install -y --no-install-recommends
-          pkg-config libssl-dev libmpv-dev libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev
+          pkg-config libssl-dev libmpv-dev libwebkit2gtk-4.1-dev libgtk-3-dev libdbus-1-dev libxdo-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
