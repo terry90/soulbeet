@@ -1,0 +1,12 @@
+[application]
+name = "Soulbeet"
+default_platform = "desktop"
+
+[bundle]
+identifier = "org.soulbeet.Desktop"
+publisher = "Soulbeet"
+copyright = "Copyright (c) Soulbeet Contributors"
+short_description = "Refined Midnight Studio music player & discovery workbench"
+long_description = "Native offline-first desktop music player powered by libmpv, OpenSubsonic, and Soulbeet Discovery."
+category = "Music"
+icon = ["../web/assets/favicon.ico"]

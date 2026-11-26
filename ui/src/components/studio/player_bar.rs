@@ -7,10 +7,10 @@ use shared::client::{ConnectDevice, DevicePlatform};
 
 use crate::{
     format_discovery_badge, format_duration, use_player, IconCar, IconCheck, IconInfo, IconLaptop,
-    IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause, IconPlay, IconRadio,
-    IconRepeat, IconRepeatOne, IconShuffle, IconSkipBack, IconSkipForward, IconSmartphone,
-    IconSparkles, IconStar, IconThumbsDown, IconTrash2, IconVolume1, IconVolume2, IconVolumeX,
-    PlayerTrack, RepeatMode, StarStrip, StarStripSize,
+    IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause, IconPictureInPicture2,
+    IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShuffle, IconSkipBack, IconSkipForward,
+    IconSmartphone, IconSparkles, IconStar, IconThumbsDown, IconTrash2, IconVolume1, IconVolume2,
+    IconVolumeX, PlayerTrack, RepeatMode, StarStrip, StarStripSize,
 };
 
 use super::DrawerTab;
@@ -112,6 +112,8 @@ pub fn StudioPlayerBar(
     on_start_radio: EventHandler<PlayerTrack>,
     #[props(default)] on_claim_active_device: Option<EventHandler<()>>,
     #[props(default)] on_transfer_to_device: Option<EventHandler<String>>,
+    #[props(default)] mini_player_open: bool,
+    #[props(default)] on_toggle_mini_player: Option<EventHandler<()>>,
 ) -> Element {
     let player = use_player();
     let state = player.snapshot();
@@ -557,6 +559,23 @@ pub fn StudioPlayerBar(
                                 player.set_volume((v / 100.0).clamp(0.0, 1.0));
                             }
                         },
+                    }
+                }
+
+                // Desktop Pop-Out Floating Mini-Player Toggle
+                if let Some(mini_cb) = on_toggle_mini_player {
+                    button {
+                        r#type: "button",
+                        aria_pressed: if mini_player_open { "true" } else { "false" },
+                        aria_label: if mini_player_open { "Close floating Mini-Player" } else { "Open floating Mini-Player" },
+                        title: if mini_player_open { "Close Mini-Player" } else { "Pop-Out Mini-Player (360×110)" },
+                        class: if mini_player_open {
+                            "w-8 h-8 rounded-lg inline-flex items-center justify-center bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text cursor-pointer transition-colors"
+                        } else {
+                            "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
+                        },
+                        onclick: move |_| mini_cb.call(()),
+                        IconPictureInPicture2 { size: 16 }
                     }
                 }
             }
