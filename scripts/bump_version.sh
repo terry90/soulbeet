@@ -5,7 +5,7 @@ set -e
 BUMP_TYPE=$1
 
 if [ -z "$BUMP_TYPE" ]; then
-    echo "Usage: $0 <patch|minor|major>"
+    echo "Usage: $0 <patch|minor|major|X.Y.Z[-prerelease]>"
     exit 1
 fi
 
@@ -15,23 +15,28 @@ get_version() {
 }
 
 CURRENT_VERSION=$(get_version)
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+CURRENT_CORE="${CURRENT_VERSION%%-*}"
+IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_CORE"
 
 if [ "$BUMP_TYPE" == "major" ]; then
     MAJOR=$((MAJOR + 1))
     MINOR=0
     PATCH=0
+    NEW_VERSION="$MAJOR.$MINOR.$PATCH"
 elif [ "$BUMP_TYPE" == "minor" ]; then
     MINOR=$((MINOR + 1))
     PATCH=0
+    NEW_VERSION="$MAJOR.$MINOR.$PATCH"
 elif [ "$BUMP_TYPE" == "patch" ]; then
     PATCH=$((PATCH + 1))
+    NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+elif [[ "$BUMP_TYPE" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    NEW_VERSION="${BUMP_TYPE#v}"
 else
-    echo "Invalid bump type. Use patch, minor, or major."
+    echo "Invalid bump type. Use patch, minor, major, or an explicit semver version."
     exit 1
 fi
 
-NEW_VERSION="$MAJOR.$MINOR.$PATCH"
 echo "Bumping version from $CURRENT_VERSION to $NEW_VERSION"
 
 # we don't care about atomic versioning, set everything to the same version
