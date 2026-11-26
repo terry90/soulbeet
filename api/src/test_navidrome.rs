@@ -547,6 +547,7 @@ pub(crate) fn subsonic_song(id: &str, title: &str, rating: Option<u8>) -> Subson
         size: None,
         year: None,
         track: None,
+        path: None,
     }
 }
 

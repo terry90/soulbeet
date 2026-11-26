@@ -269,6 +269,8 @@ pub struct SubsonicSong {
     pub year: Option<u32>,
     #[serde(default)]
     pub track: Option<u32>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -547,8 +547,19 @@ async fn promote_detached(
     .map_err(NotDone::Claimed)
 }
 
+/// Derives the staging root directory for `track`: `Discovery/Seasonal/<slug>` when
+/// `track.pack_slug` is set, otherwise `Discovery/<profile>`.
+pub(crate) fn staging_root(folder: &Folder, track: &DiscoveryTrack) -> PathBuf {
+    match track.pack_slug.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(slug) => Path::new(&folder.discovery_path())
+            .join("Seasonal")
+            .join(slug),
+        None => PathBuf::from(folder.discovery_profile_path(&track.profile)),
+    }
+}
+
 /// The promote of `track`, which claim_for_promote_in claimed. Once the import moved the staged
-/// file out of its profile folder, the file's item is dropped from that folder's library
+/// file out of its staging folder, the file's item is dropped from that folder's library
 /// (forget_detached); a file the import left there, as beets' copy does, keeps its item.
 #[allow(clippy::too_many_arguments)]
 async fn promote_claimed(
@@ -571,7 +582,7 @@ async fn promote_claimed(
     };
 
     let src = PathBuf::from(&track.path);
-    // The path beets has the file at: discovery imported it into the canonical profile folder.
+    // The path beets has the file at: discovery imported it into the canonical staging folder.
     let Ok(staged) = tokio::fs::canonicalize(&src).await else {
         // Pending again, so the expiry handles it.
         back_to_pending().await;
@@ -585,7 +596,7 @@ async fn promote_claimed(
         return Err(failure);
     }
 
-    let profile_root = PathBuf::from(source_folder.discovery_profile_path(&track.profile));
+    let profile_root = staging_root(&source_folder, &track);
     if let Some(parent) = src.parent() {
         let _ = crate::server_fns::cleanup_empty_ancestors(parent, &profile_root).await;
     }

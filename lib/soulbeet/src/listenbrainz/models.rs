@@ -153,15 +153,23 @@ pub(crate) struct PlaylistEnvelope<T> {
     pub playlist: T,
 }
 
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// `identifier` is the playlist's URL, its MBID the last segment.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistHeader {
     pub identifier: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub creator: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub date: String,
     #[serde(default)]
     extension: Option<PlaylistHeaderExtension>,
@@ -205,28 +213,32 @@ struct AlgorithmMetadata {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfPlaylist {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub track: Vec<JspfTrack>,
 }
 
 /// A JSPF track: `identifier` lists recording URLs, the extension artist URLs.
-/// ListenBrainz leaves out the names of a recording it has no metadata for.
+/// ListenBrainz leaves out the names of a recording it has no metadata for, and arbitrary
+/// community playlists may omit `identifier`, `extension`, or the MusicBrainz track block.
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfTrack {
     pub title: Option<String>,
     pub creator: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub identifier: Vec<String>,
-    pub extension: JspfTrackExtension,
+    #[serde(default)]
+    pub extension: Option<JspfTrackExtension>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfTrackExtension {
-    #[serde(rename = "https://musicbrainz.org/doc/jspf#track")]
-    pub musicbrainz: MusicBrainzTrackExtension,
+    #[serde(default, rename = "https://musicbrainz.org/doc/jspf#track")]
+    pub musicbrainz: Option<MusicBrainzTrackExtension>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MusicBrainzTrackExtension {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub artist_identifiers: Vec<String>,
 }
 

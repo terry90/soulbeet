@@ -417,6 +417,12 @@ impl CandidateSet {
             if existing.artist_mbid.is_none() {
                 existing.artist_mbid = candidate.artist_mbid;
             }
+            if existing.reason.is_none() {
+                existing.reason = candidate.reason;
+            }
+            if existing.culture_bucket.is_none() {
+                existing.culture_bucket = candidate.culture_bucket;
+            }
         } else {
             self.candidates.insert(key, candidate);
         }
@@ -845,9 +851,26 @@ impl CalendarWindow {
         }
     }
 
+    /// Returns `true` when months are 1..=12 and days are valid for their month (allowing Feb 29).
+    pub fn is_valid(&self) -> bool {
+        let sm = u32::from(self.start_month);
+        let sd = u32::from(self.start_day);
+        let em = u32::from(self.end_month);
+        let ed = u32::from(self.end_day);
+        (1..=12).contains(&sm)
+            && (1..=12).contains(&em)
+            && sd >= 1
+            && sd <= days_in_month(2024, sm)
+            && ed >= 1
+            && ed <= days_in_month(2024, em)
+    }
+
     /// Computes concrete ISO-8601 `YYYY-MM-DD` `(active_from, active_until, expires_at)` dates
     /// for the cycle containing `(year, month, day)`.
     pub fn cycle_dates(&self, year: i32, month: u32, day: u32) -> Option<(String, String, String)> {
+        if !self.is_valid() {
+            return None;
+        }
         let start_md = (u32::from(self.start_month), u32::from(self.start_day));
         let end_md = (u32::from(self.end_month), u32::from(self.end_day));
         let wraps = start_md > end_md;
@@ -863,18 +886,9 @@ impl CalendarWindow {
         };
 
         let sm = u32::from(self.start_month);
-        let sd = u32::from(self.start_day);
+        let sd = u32::from(self.start_day).min(days_in_month(start_year, sm));
         let em = u32::from(self.end_month);
-        let ed = u32::from(self.end_day);
-        if !(1..=12).contains(&sm)
-            || !(1..=12).contains(&em)
-            || sd == 0
-            || sd > days_in_month(start_year, sm)
-            || ed == 0
-            || ed > days_in_month(end_year, em)
-        {
-            return None;
-        }
+        let ed = u32::from(self.end_day).min(days_in_month(end_year, em));
         let (xy, xm, xd) = add_days(end_year, em, ed, u32::from(self.cleanup_grace_days));
         Some((
             format!("{start_year:04}-{sm:02}-{sd:02}"),
@@ -932,6 +946,10 @@ impl HourWindow {
         }
     }
 
+    pub fn is_valid(&self) -> bool {
+        self.start_hour <= 23 && self.end_hour <= 23
+    }
+
     pub fn is_active(&self, hour: u32) -> bool {
         let start = u32::from(self.start_hour);
         let end = u32::from(self.end_hour);
@@ -966,7 +984,7 @@ pub struct ContextualMixDefinition {
     /// Multi-tag theme seeds (ListenBrainz / MusicBrainz folksonomy tags).
     #[serde(default)]
     pub theme_tags: Vec<String>,
-    /// Global playlist search queries for international pools (e.g. Deezer).
+    /// Global playlist search queries for international community consensus pools.
     #[serde(default)]
     pub international_queries: Vec<String>,
     /// Active calendar dates for seasonal mixes.
@@ -1011,6 +1029,20 @@ fn default_target_tracks() -> u32 {
 impl ContextualMixDefinition {
     pub fn primary_tag(&self) -> Option<&str> {
         self.theme_tags.first().map(String::as_str)
+    }
+
+    /// Resolves the base local-culture ratio for this mix given the user's cultural profile.
+    /// Returns `None` when cultural blending is disabled on the mix (`default_local_ratio` is
+    /// `None`). When enabled (`Some(base)`), respects `culture.local_culture_ratio` unless `base`
+    /// is explicitly `0.0`.
+    pub fn effective_base_local_ratio(&self, culture: &UserCultureProfile) -> Option<f32> {
+        self.default_local_ratio.map(|base| {
+            if base > 0.0 {
+                culture.local_culture_ratio.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
     }
 
     pub fn matches_country(&self, effective_country: Option<&str>) -> bool {
@@ -1425,6 +1457,9 @@ pub struct UpsertContextualMixRequest {
     /// When `true` (admin only), creates/updates a global mix shared across all users.
     #[serde(default)]
     pub global: bool,
+    /// Optional explicit enabled flag; when `None`, preserves `existing.enabled` on edit (or `true` on create).
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub theme_tags: Vec<String>,
     #[serde(default)]

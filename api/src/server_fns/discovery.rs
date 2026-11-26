@@ -203,13 +203,15 @@ pub async fn update_culture_profile(
         .map_err(failure_error)
 }
 
-#[get("/api/discovery/contextual-mixes", auth: AuthSession)]
+#[get("/api/discovery/contextual-mixes?local_hour", auth: AuthSession)]
 pub async fn list_active_contextual_mixes(
+    local_hour: Option<u8>,
 ) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
     crate::core::contextual::list_active_contextual_mixes_in(
         &crate::db::DB,
         &auth.0,
         chrono::Utc::now(),
+        local_hour,
     )
     .await
     .map_err(failure_error)
@@ -296,17 +298,14 @@ pub async fn start_seed_radio(
         .map_err(server_error)?;
     let services = crate::core::recommend::DiscoveryServices::live();
     let plan = crate::core::recommend::plan_for(&settings);
-    let lb = soulbeet::listenbrainz::client::ListenBrainzClient::new(
-        &services.hosts.listenbrainz,
-        plan.listenbrainz_token,
-        services.metabrainz_pace,
-    )
-    .map_err(server_error)?;
+    let (lb, _errors) = crate::core::recommend::listenbrainz_for(&services, plan.listenbrainz_token)
+        .await
+        .map_err(server_error)?;
     let labs =
         soulbeet::listenbrainz::labs::LabsClient::new(&services.hosts.labs, services.metabrainz_pace)
             .map_err(server_error)?;
     let knowledge = soulbeet::knowledge::metabrainz::MetaBrainzKnowledge::new(
-        Arc::new(lb),
+        lb,
         labs,
         services.musicbrainz,
         services.cache,
@@ -759,6 +758,16 @@ pub async fn generate_discovery_playlist_internal(
         .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!("Added {} deleted tracks to exclusion set", disliked.len());
     seen.extend(disliked);
+
+    // Explicit discovery rejections (removed staged tracks)
+    let rejected = crate::models::contextual::DiscoveryRejectionRow::keys_for_user_in(
+        &crate::db::DB,
+        user_id,
+    )
+    .await
+    .map_err(|e| run_database_failure(Stage::Input, e))?;
+    info!("Added {} rejected discovery tracks to exclusion set", rejected.len());
+    seen.extend(rejected);
 
     // Tracks whose search kept finding nothing, which the engine would suggest every run
     let kept_out = discovery_search_miss::kept_out_keys(user_id)

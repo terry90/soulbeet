@@ -161,8 +161,20 @@ impl From<ContextualMixDefinitionRow> for ContextualMixDefinition {
 impl ContextualMixDefinitionRow {
     /// Idempotently seeds the built-in global contextual mix presets (`INSERT OR IGNORE`)
     /// so existing admin edits remain preserved while newly added presets appear automatically.
+    /// Fast-paths with a single `COUNT(1)` read so normal requests never trigger SQLite writes.
     pub async fn seed_builtins_in(db: &SqlitePool) -> Result<(), String> {
-        for def in builtin_contextual_mixes() {
+        let builtins = builtin_contextual_mixes();
+        let existing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM contextual_mix_definitions WHERE built_in = 1",
+        )
+        .fetch_one(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        if existing_count >= builtins.len() as i64 {
+            return Ok(());
+        }
+
+        for def in builtins {
             let theme_tags = serde_json::to_string(&def.theme_tags).map_err(|e| e.to_string())?;
             let intl =
                 serde_json::to_string(&def.international_queries).map_err(|e| e.to_string())?;
@@ -291,6 +303,7 @@ impl ContextualMixDefinitionRow {
                  updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
              ON CONFLICT(slug) DO UPDATE SET \
+                owner_user_id = excluded.owner_user_id, \
                 kind = excluded.kind, \
                 i18n_key = excluded.i18n_key, \
                 custom_name = excluded.custom_name, \
@@ -338,13 +351,22 @@ impl ContextualMixDefinitionRow {
     }
 
     pub async fn delete_by_slug_in(db: &SqlitePool, slug: &str) -> Result<bool, String> {
+        let mut tx = db.begin().await.map_err(|e| e.to_string())?;
         let res = sqlx::query(
             "DELETE FROM contextual_mix_definitions WHERE slug = ? AND built_in = 0",
         )
         .bind(slug)
-        .execute(db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+        if res.rows_affected() > 0 {
+            sqlx::query("DELETE FROM contextual_mix_states WHERE slug = ?")
+                .bind(slug)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(res.rows_affected() > 0)
     }
 }

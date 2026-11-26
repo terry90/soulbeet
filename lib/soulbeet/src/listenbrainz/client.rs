@@ -150,7 +150,11 @@ impl ListenBrainzClient {
             .filter_map(|t| {
                 Some(PlaylistTrack {
                     recording_mbid: t.identifier.first().map(|u| last_segment(u).to_string()),
-                    artist_mbid: (t.extension.musicbrainz.artist_identifiers.first())
+                    artist_mbid: t
+                        .extension
+                        .as_ref()
+                        .and_then(|ext| ext.musicbrainz.as_ref())
+                        .and_then(|mb| mb.artist_identifiers.first())
                         .map(|u| last_segment(u).to_string()),
                     title: t.title?,
                     creator: t.creator?,
@@ -864,5 +868,31 @@ mod tests {
         let reqs = seen.lock().unwrap();
         assert_eq!(reqs[0].target, "/1/playlist/search?query=christmas&count=5");
         assert_eq!(reqs[1].target, "/1/popularity/recording");
+    }
+
+    #[tokio::test]
+    async fn community_playlists_tolerate_null_headers_and_minimal_jspf_tracks() {
+        let search_body = r#"{"playlists":[{"playlist":{"identifier":"https://listenbrainz.org/playlist/00403793-6e93-49ae-aed3-4b2e7ba5fb26","title":null,"creator":null,"date":null}}]}"#;
+        let playlist_body = r#"{"playlist":{"track":[
+            {"creator":"Bare Artist","title":"Bare Track"},
+            {"creator":"Empty Ext","title":"Track Two","identifier":null,"extension":{}}
+        ]}}"#;
+        let (base, _) = serve(vec![ok(search_body), ok(playlist_body)]);
+        let lb = ListenBrainzClient::new(&base, None, Pace::immediate()).unwrap();
+
+        let hits = lb.search_playlists("christmas", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "");
+        assert_eq!(hits[0].creator, "");
+
+        let tracks = lb
+            .playlist("00403793-6e93-49ae-aed3-4b2e7ba5fb26")
+            .await
+            .unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "Bare Track");
+        assert_eq!(tracks[0].recording_mbid, None);
+        assert_eq!(tracks[0].artist_mbid, None);
+        assert_eq!(tracks[1].title, "Track Two");
     }
 }

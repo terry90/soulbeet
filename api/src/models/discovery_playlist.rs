@@ -131,6 +131,23 @@ impl DiscoveryTrackRow {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Discovery tracks for `user_id` flagged `exclude_from_core_taste = 1` (e.g. seasonal packs)
+    /// so core recommendation runs keep seasonal listening isolated from the user's taste profile.
+    pub(crate) async fn excluded_from_core_taste_for_user_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT t.* FROM discovery_tracks t JOIN folders f ON f.id = t.folder_id \
+             WHERE f.user_id = ? AND t.exclude_from_core_taste = 1",
+        )
+        .bind(user_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn get_pending_by_folder_and_profile(
         folder_id: &str,
         profile: &str,

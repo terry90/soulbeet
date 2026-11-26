@@ -8,9 +8,10 @@ use super::{
 };
 use crate::auth::UserId;
 use crate::core::database_failure;
-use crate::core::discovery::track_not_pending;
+use crate::core::discovery::{staging_root, track_not_pending};
 use crate::folder_policy::{canonical_folder_path, PolicyRows};
 use crate::import_queue::ImportQueue;
+use crate::models::contextual::DiscoveryRejectionRow;
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::folder::Folder;
@@ -116,6 +117,23 @@ pub(crate) async fn remove_claimed_in(
             track.title
         );
     }
+    if outcome == StagedOutcome::Removed {
+        if let Err(e) = DiscoveryRejectionRow::record_in(
+            db,
+            &folder.user_id,
+            &track.artist,
+            &track.title,
+            None,
+            outcome.as_str(),
+        )
+        .await
+        {
+            warn!(
+                "Failed to record rejection for removed track '{}': {e}",
+                track.title
+            );
+        }
+    }
     info!(
         "Removed discovery track: {} - {} ({})",
         track.artist,
@@ -135,16 +153,22 @@ async fn remove_contained(
     track: &DiscoveryTrack,
     folder: &Folder,
 ) -> Result<(), Failure> {
+    let expected_root = staging_root(folder, track);
     let outside = || {
         info!(
-            "{} is not inside the folder Discovery/{} of {}",
+            "{} is not inside the staging folder {}",
             path.display(),
-            track.profile,
-            folder.path
+            expected_root.display()
         );
         outside_library("The file is not inside its discovery profile's folder")
     };
-    let profile = canonical_folder_path(Path::new(&folder.discovery_profile_path(&track.profile)))
+    if let Some(slug) = track.pack_slug.as_deref().filter(|s| !s.trim().is_empty()) {
+        let safe_slug = !slug.contains('/') && !slug.contains('\\') && slug != "." && slug != "..";
+        if !safe_slug {
+            return Err(outside());
+        }
+    }
+    let profile = canonical_folder_path(&expected_root)
         .map_err(|e| outside().with_cause(Service::Filesystem, None, e.to_string()))?;
     if path == profile || !path.starts_with(&profile) {
         return Err(outside());
@@ -406,5 +430,46 @@ mod tests {
             ),
             ("Pending".into(), "suggested".into())
         );
+    }
+
+    #[tokio::test]
+    async fn seasonal_staged_track_uses_seasonal_root_and_records_rejection_on_remove() {
+        let lib = Library::new().await;
+        let (queue, stub) = stub_queue();
+        let staged = lib
+            .root
+            .join("music/alice/Discovery/Seasonal/winter_holiday/Holiday Artist/01.flac");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"audio").unwrap();
+        let seasonal_root =
+            std::fs::canonicalize(lib.root.join("music/alice/Discovery/Seasonal/winter_holiday"))
+                .unwrap();
+        let canonical = std::fs::canonicalize(&staged).unwrap();
+        let folder = alices_folder(&lib);
+
+        let mut track = lib
+            .pending_track("t-season", "alice-music", "Balanced", &staged, None)
+            .await;
+        sqlx::query("UPDATE discovery_tracks SET pack_slug = 'winter_holiday' WHERE id = 't-season'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        track.pack_slug = Some("winter_holiday".into());
+
+        remove_staged_in(&lib.db, &queue, &track, &folder, StagedOutcome::Removed)
+            .await
+            .unwrap();
+
+        assert!(!staged.exists());
+        assert!(lib.root.join("music/alice/Discovery/Seasonal/winter_holiday").is_dir());
+        assert_eq!(stub.forgets_once(1).await, vec![(seasonal_root, canonical)]);
+
+        let rejected = DiscoveryRejectionRow::keys_for_user_in(&lib.db, "alice")
+            .await
+            .unwrap();
+        assert!(rejected.contains(&shared::recommendation::CandidateSet::key(
+            &track.artist,
+            &track.title
+        )));
     }
 }

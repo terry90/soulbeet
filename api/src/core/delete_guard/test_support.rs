@@ -334,6 +334,7 @@ impl Listeners for FakeNavidrome {
                 size: Some(song.size),
                 year: None,
                 track: None,
+                path: Some(song.path),
             }))
         })
     }
@@ -377,6 +378,7 @@ impl Listeners for FakeNavidrome {
                     size: Some(song.size),
                     year: Some(song.year),
                     track: Some(song.track_number),
+                    path: Some(song.path.clone()),
                 })
                 .collect();
             Ok(Some(SubsonicAlbum {
