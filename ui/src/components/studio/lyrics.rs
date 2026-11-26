@@ -196,14 +196,16 @@ pub fn find_active_lyric_line(lines: &[NormalizedLyricLine], position_ms: i64) -
 /// this panel when visible, never the outer studio shell.
 #[component]
 pub fn LyricsPanel(
-    lyrics: Vec<TrackLyrics>,
+    #[props(into)] lyrics: ReadSignal<Vec<TrackLyrics>>,
     #[props(default)] loading: bool,
     #[props(default)] error: Option<String>,
     #[props(default)] has_track: bool,
     #[props(default)] on_fetch: Option<EventHandler<()>>,
 ) -> Element {
     let player = use_player();
-    let (is_synced, lines) = normalize_track_lyrics(&lyrics);
+    // Memoized so 4–10Hz `position_signal()` ticks never re-parse or re-sort lyrics.
+    let normalized = use_memo(move || normalize_track_lyrics(&lyrics.read()));
+    let (is_synced, lines) = normalized.read().clone();
 
     // Only subscribe to high-frequency position updates when synced lyrics are actually displayed.
     let active_idx = if is_synced && !lines.is_empty() {

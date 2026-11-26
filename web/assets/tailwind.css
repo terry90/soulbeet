@@ -863,8 +863,8 @@
   .min-w-0 {
     min-width: 0px;
   }
-  .min-w-\[56px\] {
-    min-width: 56px;
+  .min-w-\[48px\] {
+    min-width: 48px;
   }
   .min-w-\[92px\] {
     min-width: 92px;
@@ -3099,6 +3099,9 @@
     .sm\:grid-cols-4 {
       grid-template-columns: repeat(4, minmax(0, 1fr));
     }
+    .sm\:gap-1\.5 {
+      gap: calc(var(--spacing) * 1.5);
+    }
     .sm\:gap-3 {
       gap: calc(var(--spacing) * 3);
     }
@@ -3134,9 +3137,6 @@
   @media (width >= 48rem) {
     .md\:block {
       display: block;
-    }
-    .md\:flex {
-      display: flex;
     }
     .md\:hidden {
       display: none;

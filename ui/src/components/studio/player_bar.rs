@@ -349,7 +349,7 @@ pub fn StudioPlayerBar(
             }
 
             // RIGHT (28%): Drawer Toggles, Connect Switcher, Volume
-            div { class: "hidden md:flex items-center justify-end gap-1.5 lg:w-[28%] shrink-0",
+            div { class: "flex items-center justify-end gap-1 sm:gap-1.5 lg:w-[28%] shrink-0",
                 // Lyrics Toggle
                 button {
                     r#type: "button",
@@ -378,7 +378,7 @@ pub fn StudioPlayerBar(
                     aria_pressed: if active_drawer_tab == Some(DrawerTab::Inspector) { "true" } else { "false" },
                     aria_label: "Toggle Track Inspector",
                     title: "Inspector (I)",
-                    class: drawer_toggle_class(active_drawer_tab == Some(DrawerTab::Inspector)),
+                    class: format!("hidden sm:inline-flex {}", drawer_toggle_class(active_drawer_tab == Some(DrawerTab::Inspector))),
                     onclick: move |_| on_toggle_drawer.call(DrawerTab::Inspector),
                     IconInfo { size: 16 }
                 }
@@ -396,6 +396,12 @@ pub fn StudioPlayerBar(
                             "relative w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
                         },
                         onclick: move |_| connect_open.toggle(),
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if evt.key() == Key::Escape && connect_open() {
+                                evt.prevent_default();
+                                connect_open.set(false);
+                            }
+                        },
                         IconLaptop { size: 16 }
                         if other_device_count > 0 {
                             span { class: "absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-beet-leaf-glow" }
@@ -410,6 +416,13 @@ pub fn StudioPlayerBar(
                         div {
                             role: "dialog",
                             aria_label: "Connect devices",
+                            tabindex: "-1",
+                            onkeydown: move |evt: KeyboardEvent| {
+                                if evt.key() == Key::Escape {
+                                    evt.prevent_default();
+                                    connect_open.set(false);
+                                }
+                            },
                             class: "absolute bottom-11 right-0 z-50 w-72 rounded-[12px] bg-beet-surface-high border border-beet-border-default shadow-2xl p-3 space-y-2.5",
                             div { class: "flex items-center justify-between",
                                 span { class: "text-[12px] font-semibold text-beet-text-primary",

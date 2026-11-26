@@ -49,10 +49,25 @@ mod wire {
     }
 
     #[derive(Debug, Deserialize)]
+    pub(super) struct SubsonicErrorBody {
+        pub(super) code: i32,
+        #[serde(default)]
+        pub(super) message: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
     pub(super) struct SubsonicBody<T> {
         pub(super) status: String,
+        #[serde(default)]
+        pub(super) error: Option<SubsonicErrorBody>,
         #[serde(flatten)]
         pub(super) data: T,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct SongDetailData {
+        #[serde(default)]
+        pub(super) song: Option<RawSong>,
     }
 
     #[derive(Debug, Deserialize, Default)]
@@ -299,9 +314,22 @@ async fn fetch_subsonic<T: serde::de::DeserializeOwned>(
     let env: SubsonicEnvelope<T> =
         serde_json::from_str(&text).map_err(|e| format!("Invalid Navidrome JSON: {e}"))?;
     if env.response.status != "ok" {
+        if let Some(err) = env.response.error {
+            let msg = err.message.unwrap_or_else(|| "Unknown error".to_string());
+            return Err(format!("Navidrome error {}: {msg}", err.code));
+        }
         return Err(format!("Navidrome returned status '{}'", env.response.status));
     }
     Ok(env.response.data)
+}
+
+#[cfg(feature = "web")]
+pub async fn fetch_song(
+    info: &NavidromeSessionInfo,
+    song_id: &str,
+) -> Result<Option<PlayerTrack>, String> {
+    let data: SongDetailData = fetch_subsonic(info, "getSong", &[("id", song_id)]).await?;
+    Ok(data.song.map(|s| s.into_player_track(info)))
 }
 
 #[cfg(feature = "web")]

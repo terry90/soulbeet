@@ -249,7 +249,7 @@ pub fn StudioSidebar(
 }
 
 /// Sticky Center-Stage Top Bar with clickable `Ctrl+K` Command Palette trigger,
-/// global `OfflineTogglePill`, live Activity badge, and quick culture/settings access.
+/// global `OfflineTogglePill`, live Activity badge, and mobile Sign Out access.
 #[component]
 pub fn StudioTopBar(
     active: StudioNavSection,
@@ -257,6 +257,8 @@ pub fn StudioTopBar(
     on_toggle_offline: EventHandler<bool>,
     on_open_palette: EventHandler<()>,
     on_open_downloads: EventHandler<()>,
+    #[props(default)] on_downloads_toggle_mounted: Option<EventHandler<std::rc::Rc<MountedData>>>,
+    #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] active_transfers_count: usize,
     #[props(default)] culture_badge: Option<String>,
 ) -> Element {
@@ -288,7 +290,7 @@ pub fn StudioTopBar(
                 }
             }
 
-            // Right: Culture Pill, Offline Toggle, Active Transfers
+            // Right: Culture Pill, Offline Toggle, Active Transfers, Mobile Sign Out
             div { class: "flex items-center gap-2 shrink-0",
                 if let Some(badge) = culture_badge.as_deref().filter(|b| !b.is_empty()) {
                     span { class: "hidden xl:inline-flex items-center px-2.5 h-8 rounded-full bg-beet-surface-low border border-beet-border-subtle tabular-nums-mono text-[11px] font-semibold text-beet-text-secondary",
@@ -308,6 +310,11 @@ pub fn StudioTopBar(
                     r#type: "button",
                     aria_label: "Active transfers drawer",
                     title: "Active transfers & imports",
+                    onmounted: move |evt| {
+                        if let Some(cb) = &on_downloads_toggle_mounted {
+                            cb.call(evt.data());
+                        }
+                    },
                     class: if active_transfers_count > 0 {
                         "inline-flex items-center gap-1.5 h-9 px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 text-beet-accent-text tabular-nums-mono text-[12px] font-semibold cursor-pointer transition-colors"
                     } else {
@@ -323,12 +330,23 @@ pub fn StudioTopBar(
                         }
                     }
                 }
+
+                if let Some(logout_cb) = on_logout {
+                    button {
+                        r#type: "button",
+                        aria_label: "Sign out",
+                        title: "Sign out",
+                        class: "lg:hidden w-9 h-9 rounded-full inline-flex items-center justify-center bg-beet-surface border border-beet-border-default text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer",
+                        onclick: move |_| logout_cb.call(()),
+                        IconLogOut { size: 16 }
+                    }
+                }
             }
         }
     }
 }
 
-/// Compact mobile bottom navigation bar (`< lg` viewports, 4 thumb-zone tabs + Settings).
+/// Compact mobile bottom navigation bar (`< lg` viewports, including Activity & Settings).
 #[component]
 pub fn StudioMobileNav(
     active: StudioNavSection,
@@ -339,13 +357,14 @@ pub fn StudioMobileNav(
         StudioNavSection::Discover,
         StudioNavSection::Search,
         StudioNavSection::Library,
+        StudioNavSection::Activity,
         StudioNavSection::Settings,
     ];
 
     rsx! {
         nav {
             aria_label: "Mobile navigation",
-            class: "lg:hidden h-14 px-2 bg-beet-sunken border-t border-beet-border-subtle flex items-center justify-around shrink-0 z-30",
+            class: "lg:hidden h-14 px-1 bg-beet-sunken border-t border-beet-border-subtle flex items-center justify-around shrink-0 z-30",
             for section in tabs {
                 {
                     let is_active = active == section;
@@ -359,15 +378,15 @@ pub fn StudioMobileNav(
                             key: "mob-{section.label()}",
                             r#type: "button",
                             aria_current: if is_active { Some("page") } else { None },
-                            class: "flex flex-col items-center justify-center gap-0.5 min-w-[56px] h-12 rounded-[8px] transition-colors cursor-pointer {cls}",
+                            class: "flex flex-col items-center justify-center gap-0.5 min-w-[48px] h-12 rounded-[8px] transition-colors cursor-pointer {cls}",
                             onclick: move |_| on_navigate.call(section),
                             match section {
-                                StudioNavSection::Home => rsx! { IconHome { size: 18 } },
-                                StudioNavSection::Discover => rsx! { IconCompass { size: 18 } },
-                                StudioNavSection::Search => rsx! { IconSearch { size: 18 } },
-                                StudioNavSection::Library => rsx! { IconLibrary { size: 18 } },
-                                StudioNavSection::Activity => rsx! { IconActivity { size: 18 } },
-                                StudioNavSection::Settings => rsx! { IconSettings { size: 18 } },
+                                StudioNavSection::Home => rsx! { IconHome { size: 17 } },
+                                StudioNavSection::Discover => rsx! { IconCompass { size: 17 } },
+                                StudioNavSection::Search => rsx! { IconSearch { size: 17 } },
+                                StudioNavSection::Library => rsx! { IconLibrary { size: 17 } },
+                                StudioNavSection::Activity => rsx! { IconActivity { size: 17 } },
+                                StudioNavSection::Settings => rsx! { IconSettings { size: 17 } },
                             }
                             span { class: "text-[10px] font-medium", "{section.label()}" }
                         }

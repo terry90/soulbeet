@@ -32,6 +32,7 @@ pub fn SearchPage() -> Element {
     let mut filter = use_signal(|| SearchFilter::All);
     let mut query = use_signal(String::new);
     let mut searching = use_signal(|| false);
+    let mut search_req_id = use_signal(|| 0u64);
     let mut search_error = use_signal(|| None::<String>);
     let mut local_hits = use_signal(NavidromeSearchHits::default);
     let mut catalog_tracks = use_signal(Vec::<Track>::new);
@@ -41,8 +42,12 @@ pub fn SearchPage() -> Element {
 
     let run_search = use_callback(move |raw: String| {
         let q = raw.trim().to_string();
+        let next_req = search_req_id.peek().wrapping_add(1);
+        search_req_id.set(next_req);
+
         if q.is_empty() {
             has_searched.set(false);
+            searching.set(false);
             local_hits.set(NavidromeSearchHits::default());
             catalog_tracks.set(Vec::new());
             search_error.set(None);
@@ -55,27 +60,44 @@ pub fn SearchPage() -> Element {
         let is_offline = player.offline_only();
 
         spawn(async move {
-            // 1. Local Navidrome search3
-            if let Some(info) = nav_info {
-                if let Ok(hits) = search_navidrome(&info, &q).await {
-                    local_hits.set(hits);
+            // 1. Local Navidrome search3 (strictly skipped when Offline Only is active)
+            if is_offline {
+                local_hits.set(NavidromeSearchHits::default());
+                catalog_tracks.set(Vec::new());
+                if *search_req_id.peek() == next_req {
+                    searching.set(false);
                 }
-            } else {
+                return;
+            }
+
+            if let Some(info) = nav_info {
+                match search_navidrome(&info, &q).await {
+                    Ok(hits) => {
+                        if *search_req_id.peek() == next_req {
+                            local_hits.set(hits);
+                        }
+                    }
+                    Err(e) => {
+                        if *search_req_id.peek() == next_req {
+                            local_hits.set(NavidromeSearchHits::default());
+                            search_error.set(Some(e));
+                        }
+                    }
+                }
+            } else if *search_req_id.peek() == next_req {
                 local_hits.set(NavidromeSearchHits::default());
             }
 
-            // 2. Global MusicBrainz catalog search (strictly skipped when Offline Only is active)
-            if is_offline {
-                catalog_tracks.set(Vec::new());
-            } else {
-                match auth
-                    .call(api::search_track(api::SearchQuery {
-                        artist: None,
-                        query: q.clone(),
-                    }))
-                    .await
-                {
-                    Ok(results) => {
+            // 2. Global MusicBrainz catalog search
+            match auth
+                .call(api::search_track(api::SearchQuery {
+                    artist: None,
+                    query: q.clone(),
+                }))
+                .await
+            {
+                Ok(results) => {
+                    if *search_req_id.peek() == next_req {
                         let tracks: Vec<Track> = results
                             .into_iter()
                             .filter_map(|r| match r {
@@ -85,12 +107,16 @@ pub fn SearchPage() -> Element {
                             .collect();
                         catalog_tracks.set(tracks);
                     }
-                    Err(e) => {
+                }
+                Err(e) => {
+                    if *search_req_id.peek() == next_req {
                         search_error.set(Some(friendly_error(&e)));
                     }
                 }
             }
-            searching.set(false);
+            if *search_req_id.peek() == next_req {
+                searching.set(false);
+            }
         });
     });
 
@@ -109,21 +135,29 @@ pub fn SearchPage() -> Element {
         Vec::new()
     } else {
         studio
-            .triage_tracks
-            .read()
+            .visible_triage_tracks()
             .iter()
             .filter(|t| {
                 t.title.to_ascii_lowercase().contains(&q_lower)
                     || t.artist.to_ascii_lowercase().contains(&q_lower)
                     || t.album.to_ascii_lowercase().contains(&q_lower)
             })
-            .map(|t| studio.track_from_discovery(t, 14))
+            .map(|t| studio.track_from_discovery(t))
             .collect()
     };
 
     let acquire_map = studio.acquire_states.read().clone();
     let mixes = studio.contextual_mixes.read().clone();
-    let starred = studio.starred_tracks.read().clone();
+    let starred: Vec<_> = studio
+        .starred_tracks
+        .read()
+        .iter()
+        .cloned()
+        .map(|mut t| {
+            studio.apply_curation_overrides(&mut t);
+            t
+        })
+        .collect();
 
     rsx! {
         div { class: "space-y-6",
@@ -290,7 +324,10 @@ pub fn SearchPage() -> Element {
                 // 1. In Library & Discovery Matches
                 if matches!(filter(), SearchFilter::All | SearchFilter::InLibrary) {
                     {
-                        let hits = local_hits.read().clone();
+                        let mut hits = local_hits.read().clone();
+                        for s in &mut hits.songs {
+                            studio.apply_curation_overrides(s);
+                        }
                         rsx! {
                             section { class: "space-y-3",
                                 div { class: "flex items-center justify-between",
@@ -313,12 +350,19 @@ pub fn SearchPage() -> Element {
                                                         r#type: "button",
                                                         class: "p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer space-y-2",
                                                         onclick: move |_| {
+                                                            if player.offline_only() {
+                                                                studio.show_toast("Offline Only mode is active — album streaming is unavailable.");
+                                                                return;
+                                                            }
                                                             let Some(info) = studio.navidrome_info() else {
                                                                 return;
                                                             };
                                                             let aid = aid.clone();
                                                             spawn(async move {
-                                                                if let Ok(tracks) = fetch_album_tracks(&info, &aid).await {
+                                                                if let Ok(mut tracks) = fetch_album_tracks(&info, &aid).await {
+                                                                    for t in &mut tracks {
+                                                                        studio.apply_curation_overrides(t);
+                                                                    }
                                                                     if !tracks.is_empty() {
                                                                         player.play_queue(tracks, 0);
                                                                     }
