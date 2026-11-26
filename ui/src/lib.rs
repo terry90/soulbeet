@@ -15,5 +15,8 @@ pub use health_context::*;
 mod settings_context;
 pub use settings_context::*;
 
+mod player_context;
+pub use player_context::*;
+
 mod components;
 pub use components::*;

@@ -5518,6 +5518,7 @@ dependencies = [
  "gloo-timers",
  "serde_json",
  "shared",
+ "tokio",
  "wasm-bindgen",
  "web-sys",
 ]

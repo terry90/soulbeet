@@ -4,7 +4,7 @@ version = "0.10.0"
 edition = "2021"
 
 [dependencies]
-dioxus = { workspace = true, features = ["fullstack"] }
+dioxus = { workspace = true, features = ["router", "fullstack"] }
 api = { workspace = true }
 shared = { workspace = true }
 web-sys = { version = "0.3.91", features = ["Storage", "Window", "Location"] }
@@ -14,10 +14,14 @@ gloo-timers = { version = "0.3.0", features = ["futures"] }
 wasm-bindgen = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.48.0", features = ["time", "rt"] }
+
 [dev-dependencies]
 dioxus-ssr = "0.7.4"
 # Builds click events for component tests.
 dioxus-html = { version = "0.7.4", features = ["serialize"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 default = []
