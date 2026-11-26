@@ -63,7 +63,8 @@ done
 cargo update --workspace
 
 # the app shows CHANGELOG.md in "What's new"; date it in UTC like the release
-"$(dirname "$0")/stamp_changelog.sh" "$NEW_VERSION" "$(date -u +%Y-%m-%d)" CHANGELOG.md
+# CHANGELOG.md headings use plain major.minor.patch (prerelease suffixes are stripped)
+"$(dirname "$0")/stamp_changelog.sh" "${NEW_VERSION%%-*}" "$(date -u +%Y-%m-%d)" CHANGELOG.md
 
 # for GitHub Actions
 if [ -n "$GITHUB_OUTPUT" ]; then

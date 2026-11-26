@@ -61,8 +61,10 @@ jobs:
           NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
           git add .
-          git commit -m "bump version to ${NEW_VERSION}"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "bump version to ${NEW_VERSION}"
+            git push
+          fi
 
       - name: Create and Push Tag
         env:
@@ -128,7 +130,7 @@ jobs:
           key: android-core
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        run: cargo install --locked cargo-ndk
 
       - name: Build client-core JNI libraries and Kotlin bindings
         run: ./scripts/build-android-core.sh --profile release --abis "arm64-v8a armeabi-v7a x86_64"
