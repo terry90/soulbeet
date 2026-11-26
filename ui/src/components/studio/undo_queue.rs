@@ -100,9 +100,18 @@ impl PendingDropQueue {
         Some(item)
     }
 
-    /// Pops the active pending drop when its 5-second timer finishes (or user clicks Dismiss),
-    /// keeping its IDs hidden while the server commit runs.
-    pub fn commit_active(&mut self) -> Option<PendingDropItem> {
+    /// Pops the active pending drop ONLY when its unique `key` matches the expiring toast,
+    /// preventing a stale timer callback from committing a newer drop.
+    pub fn commit_active_if_key(&mut self, key: &str) -> Option<PendingDropItem> {
+        if self.active.as_ref().is_some_and(|item| item.key == key) {
+            self.active.take()
+        } else {
+            None
+        }
+    }
+
+    /// Drains the active pending drop unconditionally (used when flushing on sign-out).
+    pub fn drain_active(&mut self) -> Option<PendingDropItem> {
         self.active.take()
     }
 
@@ -162,7 +171,12 @@ mod tests {
             "Daft Punk".into(),
         );
 
-        let committed = q.commit_active().unwrap();
+        let active_key = q.active().unwrap().key.clone();
+        // Stale timer key must NEVER commit the active drop
+        assert!(q.commit_active_if_key("drop-999-stale").is_none());
+        assert!(q.active().is_some());
+
+        let committed = q.commit_active_if_key(&active_key).unwrap();
         assert!(q.active().is_none());
         // Still hidden while HTTP call is in flight
         assert!(q.is_hidden("song-2"));

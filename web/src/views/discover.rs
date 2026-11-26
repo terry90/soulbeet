@@ -57,20 +57,7 @@ pub fn DiscoverPage() -> Element {
         .unwrap_or("LOCAL")
         .to_ascii_uppercase();
 
-    let pending_drops = studio.pending_drops.read();
-    let visible_triage: Vec<_> = studio
-        .triage_tracks
-        .read()
-        .iter()
-        .filter(|t| {
-            !pending_drops.is_hidden(&t.id)
-                && t.song_id
-                    .as_deref()
-                    .is_none_or(|sid| !pending_drops.is_hidden(sid))
-        })
-        .cloned()
-        .collect();
-    drop(pending_drops);
+    let visible_triage = studio.visible_triage_tracks();
 
     let open_culture_editor = {
         let culture = culture.clone();
@@ -260,7 +247,7 @@ pub fn DiscoverPage() -> Element {
                 } else if triage_layout() == TriageLayout::Deck {
                     {
                         let first_dt = visible_triage[0].clone();
-                        let track = studio.track_from_discovery(&first_dt, 14);
+                        let track = studio.track_from_discovery(&first_dt);
                         let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                         let t_play = track.clone();
                         let t_keep = track.clone();
@@ -355,7 +342,7 @@ pub fn DiscoverPage() -> Element {
                     div { class: "space-y-1", role: "list", aria_label: "Pending discovery triage list",
                         for dt in visible_triage.iter() {
                             {
-                                let track = studio.track_from_discovery(dt, 14);
+                                let track = studio.track_from_discovery(dt);
                                 let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                                 let t_play = track.clone();
                                 let t_keep = track.clone();

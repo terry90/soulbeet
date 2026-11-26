@@ -1,8 +1,8 @@
 //! Global Studio keyboard shortcut listener (`#[cfg(feature = "web")]`).
 //!
 //! Respects [`ui::should_ignore_shortcut_target`] so typing inside `<input>`, `<textarea>`,
-//! `<select>`, `[contenteditable]`, or an open `<dialog>` never triggers playback or curation
-//! shortcuts (except `Escape` and `Ctrl+K` / `Cmd+K`).
+//! `<select>`, `[contenteditable]`, activating `<button>`/`<a>` with `Space`, or interacting
+//! with open dialogs/drawers never triggers global playback or curation shortcuts.
 
 #[cfg(feature = "web")]
 use dioxus::prelude::*;
@@ -33,11 +33,17 @@ pub fn use_studio_shortcuts() {
             let ctrl_or_meta = evt.ctrl_key() || evt.meta_key();
             let shift = evt.shift_key();
 
-            let (tag_name, is_editable, dialog_open) = inspect_dom_focus(&win_for_cb);
+            let cmdk_open = *studio.cmdk_open.peek();
+            let downloads_open = *studio.downloads_drawer_open.peek();
+            let (tag_name, role, is_editable, dom_dialog_open) = inspect_dom_focus(&win_for_cb);
+            let dialog_open = dom_dialog_open || downloads_open;
+
             if ui::should_ignore_shortcut_target(
                 &tag_name,
+                role.as_deref(),
                 is_editable,
                 dialog_open,
+                cmdk_open,
                 &key,
                 ctrl_or_meta,
             ) {
@@ -55,6 +61,9 @@ pub fn use_studio_shortcuts() {
                 if *studio.cmdk_open.peek() {
                     evt.prevent_default();
                     studio.cmdk_open.set(false);
+                } else if *studio.downloads_drawer_open.peek() {
+                    evt.prevent_default();
+                    studio.downloads_drawer_open.set(false);
                 }
                 return;
             }
@@ -164,25 +173,26 @@ impl Drop for ShortcutListenerGuard {
 }
 
 #[cfg(feature = "web")]
-fn inspect_dom_focus(window: &web_sys::Window) -> (String, bool, bool) {
+fn inspect_dom_focus(window: &web_sys::Window) -> (String, Option<String>, bool, bool) {
     use wasm_bindgen::JsCast;
 
     let Some(doc) = window.document() else {
-        return (String::new(), false, false);
+        return (String::new(), None, false, false);
     };
     let dialog_open = doc
-        .query_selector("dialog[open]")
+        .query_selector("dialog[open], [role=\"dialog\"]:not([inert])")
         .ok()
         .flatten()
         .is_some();
     let Some(active) = doc.active_element() else {
-        return (String::new(), false, dialog_open);
+        return (String::new(), None, false, dialog_open);
     };
     let tag = active.tag_name();
+    let role = active.get_attribute("role");
     let is_editable = active
         .dyn_ref::<web_sys::HtmlElement>()
         .is_some_and(|el| el.is_content_editable());
-    (tag, is_editable, dialog_open)
+    (tag, role, is_editable, dialog_open)
 }
 
 #[cfg(not(feature = "web"))]

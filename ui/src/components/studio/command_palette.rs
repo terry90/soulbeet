@@ -46,29 +46,49 @@ pub struct PaletteCommand {
 /// Pure guard deciding whether a global window `keydown` event should be ignored.
 ///
 /// Strictly ignores shortcuts while focus sits inside `<input>`, `<textarea>`, `<select>`,
-/// `[contenteditable]`, or while a `<dialog>` is open — EXCEPT `Escape` and `Ctrl+K`/`Cmd+K`.
+/// `[contenteditable]`, or while a modal/drawer (`dialog_open`) is open — with two safe
+/// exceptions:
+/// - `Escape` always passes through.
+/// - `Ctrl+K` / `Cmd+K` passes through when no other modal/drawer is open, OR when the
+///   Command Palette itself is open (`cmdk_open`) so it can toggle closed.
+/// - `Space` is also ignored when focus is on `<button>`, `<a>`, or `[role="button"]` so
+///   native keyboard activation works cleanly.
 pub fn should_ignore_shortcut_target(
     tag_name: &str,
+    role: Option<&str>,
     is_content_editable: bool,
     dialog_open: bool,
+    cmdk_open: bool,
     key: &str,
     ctrl_or_meta: bool,
 ) -> bool {
-    let is_palette_chord = ctrl_or_meta && key.eq_ignore_ascii_case("k");
     let is_escape = key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc");
-
-    if is_palette_chord || is_escape {
+    if is_escape {
         return false;
+    }
+
+    let is_palette_chord = ctrl_or_meta && key.eq_ignore_ascii_case("k");
+    if is_palette_chord {
+        return dialog_open && !cmdk_open;
     }
 
     if dialog_open || is_content_editable {
         return true;
     }
 
-    matches!(
-        tag_name.trim().to_ascii_uppercase().as_str(),
-        "INPUT" | "TEXTAREA" | "SELECT"
-    )
+    let upper_tag = tag_name.trim().to_ascii_uppercase();
+    if matches!(upper_tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") {
+        return true;
+    }
+
+    if key == " " {
+        let is_button_role = role.is_some_and(|r| r.eq_ignore_ascii_case("button"));
+        if matches!(upper_tag.as_str(), "BUTTON" | "A") || is_button_role {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Filters and ranks [`PaletteCommand`]s by case-insensitive substring & token match
@@ -135,24 +155,13 @@ pub fn CommandPalette(
     #[props(default)] on_search_query: Option<EventHandler<String>>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let mut query = use_signal(String::new);
-    let mut selected_idx = use_signal(|| 0usize);
-
     if !is_open {
-        if !query.peek().is_empty() {
-            query.set(String::new());
-        }
-        if *selected_idx.peek() != 0 {
-            selected_idx.set(0);
-        }
         return rsx! {};
     }
 
     rsx! {
         CommandPaletteDialog {
             commands,
-            query,
-            selected_idx,
             on_select,
             on_search_query,
             on_close,
@@ -163,12 +172,12 @@ pub fn CommandPalette(
 #[component]
 fn CommandPaletteDialog(
     commands: Vec<PaletteCommand>,
-    mut query: Signal<String>,
-    mut selected_idx: Signal<usize>,
     on_select: EventHandler<String>,
     on_search_query: Option<EventHandler<String>>,
     on_close: EventHandler<()>,
 ) -> Element {
+    let mut query = use_signal(String::new);
+    let mut selected_idx = use_signal(|| 0usize);
     let id = use_hook(|| format!("cmdk-{}", NEXT_PALETTE_ID.fetch_add(1, Ordering::Relaxed)));
     let shown = use_hook(|| Rc::new(Cell::new(false)));
 
@@ -411,26 +420,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortcut_guard_blocks_form_inputs_and_open_dialogs_except_palette_and_escape() {
+    fn shortcut_guard_blocks_form_inputs_buttons_and_other_dialogs() {
         // Normal shortcuts blocked inside inputs/textareas/selects/contenteditable
-        assert!(should_ignore_shortcut_target("INPUT", false, false, " ", false));
-        assert!(should_ignore_shortcut_target("textarea", false, false, "s", false));
-        assert!(should_ignore_shortcut_target("SELECT", false, false, "1", false));
-        assert!(should_ignore_shortcut_target("DIV", true, false, "x", false));
+        assert!(should_ignore_shortcut_target("INPUT", None, false, false, false, " ", false));
+        assert!(should_ignore_shortcut_target("textarea", None, false, false, false, "s", false));
+        assert!(should_ignore_shortcut_target("SELECT", None, false, false, false, "1", false));
+        assert!(should_ignore_shortcut_target("DIV", None, true, false, false, "x", false));
 
-        // Normal shortcuts blocked while a modal dialog is open
-        assert!(should_ignore_shortcut_target("BODY", false, true, " ", false));
-        assert!(should_ignore_shortcut_target("BUTTON", false, true, "p", false));
+        // Space does NOT hijack focused buttons, links, or role="button" elements
+        assert!(should_ignore_shortcut_target("BUTTON", None, false, false, false, " ", false));
+        assert!(should_ignore_shortcut_target("A", None, false, false, false, " ", false));
+        assert!(should_ignore_shortcut_target("DIV", Some("button"), false, false, false, " ", false));
+        // Non-Space shortcuts still work when a regular button has focus
+        assert!(!should_ignore_shortcut_target("BUTTON", None, false, false, false, "s", false));
 
-        // Escape and Ctrl/Cmd+K always pass through
-        assert!(!should_ignore_shortcut_target("INPUT", false, true, "Escape", false));
-        assert!(!should_ignore_shortcut_target("INPUT", false, false, "k", true));
-        assert!(!should_ignore_shortcut_target("TEXTAREA", false, true, "K", true));
+        // Normal shortcuts and Ctrl+K blocked while ANOTHER modal/drawer is open
+        assert!(should_ignore_shortcut_target("BODY", None, false, true, false, " ", false));
+        assert!(should_ignore_shortcut_target("BODY", None, false, true, false, "k", true));
+
+        // Ctrl+K passes through when palette itself is open (to close) or no dialog is open
+        assert!(!should_ignore_shortcut_target("INPUT", None, false, true, true, "k", true));
+        assert!(!should_ignore_shortcut_target("INPUT", None, false, false, false, "K", true));
+
+        // Escape always passes through
+        assert!(!should_ignore_shortcut_target("INPUT", None, false, true, false, "Escape", false));
 
         // Normal shortcuts allowed on non-editable page elements when no dialog is open
-        assert!(!should_ignore_shortcut_target("BODY", false, false, " ", false));
-        assert!(!should_ignore_shortcut_target("DIV", false, false, "l", false));
-        assert!(!should_ignore_shortcut_target("BUTTON", false, false, "s", false));
+        assert!(!should_ignore_shortcut_target("BODY", None, false, false, false, " ", false));
+        assert!(!should_ignore_shortcut_target("DIV", None, false, false, false, "l", false));
     }
 
     #[test]

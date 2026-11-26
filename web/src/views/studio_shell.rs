@@ -69,6 +69,8 @@ fn StudioShellContent() -> Element {
     let mut logout_error = use_signal(|| None::<String>);
     let do_logout = move || {
         spawn(async move {
+            // Flush any staged pending-discovery drop before ending the session.
+            studio.flush_pending_drops_now(auth).await;
             let failed = auth.logout().await.err();
             logout_error.set(failed.map(|e| {
                 format!(
@@ -151,6 +153,10 @@ fn StudioShellContent() -> Element {
                         on_toggle_offline: move |next| player.set_offline_only(next),
                         on_open_palette: move |_| studio.cmdk_open.set(true),
                         on_open_downloads: move |_| studio.downloads_drawer_open.toggle(),
+                        on_downloads_toggle_mounted: move |data| {
+                            studio.downloads_toggle_ref.set(Some(data));
+                        },
+                        on_logout: move |_| do_logout(),
                         active_transfers_count: active_transfers,
                         culture_badge,
                     }
@@ -258,14 +264,19 @@ fn StudioShellContent() -> Element {
 
             // Floating 5-Second Undo Snackbar (Discovery Drops)
             if let Some(drop_item) = active_drop {
-                div { class: "fixed bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
-                    UndoSnackbar {
-                        message: drop_item.snackbar_message(),
-                        action_label: "Undo".to_string(),
-                        duration_ms: 5000,
-                        key_id: Some(drop_item.key.clone()),
-                        on_undo: move |_| studio.undo_pending_drop(),
-                        on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth),
+                {
+                    let drop_key = drop_item.key.clone();
+                    rsx! {
+                        div { class: "fixed bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
+                            UndoSnackbar {
+                                message: drop_item.snackbar_message(),
+                                action_label: "Undo".to_string(),
+                                duration_ms: 5000,
+                                key_id: Some(drop_key.clone()),
+                                on_undo: move |_| studio.undo_pending_drop(),
+                                on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth, drop_key.clone()),
+                            }
+                        }
                     }
                 }
             }
@@ -305,7 +316,11 @@ fn StudioShellContent() -> Element {
                 is_open: (studio.cmdk_open)(),
                 commands: palette_commands,
                 on_select: move |cmd_id: String| {
-                    execute_palette_command(&cmd_id, nav, auth, player, studio);
+                    if cmd_id == "auth.logout" {
+                        do_logout();
+                    } else {
+                        execute_palette_command(&cmd_id, nav, auth, player, studio);
+                    }
                 },
                 on_search_query: move |q| {
                     studio.search_query_override.set(Some(q));
@@ -424,6 +439,14 @@ fn build_palette_commands(
             category: PaletteCategory::Navigation,
             shortcut: None,
             keywords: vec!["config".into(), "navidrome".into()],
+        },
+        PaletteCommand {
+            id: "auth.logout".into(),
+            label: "Sign Out".into(),
+            subtitle: Some("Flush pending curation and end session".into()),
+            category: PaletteCategory::Navigation,
+            shortcut: None,
+            keywords: vec!["logout".into(), "account".into(), "exit".into()],
         },
         PaletteCommand {
             id: "play.toggle".into(),
@@ -612,16 +635,24 @@ fn ManualSourceChoiceModal(
     on_close: EventHandler<()>,
 ) -> Element {
     let auth = use_auth();
+    let settings = ui::use_settings();
     let mut studio = use_studio();
     let mut queueing = use_signal(|| false);
     let mut err_msg = use_signal(|| None::<String>);
 
+    let acquire_state_key = crate::web_player::acquire_key(&state.artist, &state.title);
     let queue_item = use_callback(move |(item, search_id): (DownloadableItem, String)| {
         queueing.set(true);
         err_msg.set(None);
+        let preferred_folder_id = settings.get().and_then(|s| s.default_download_folder_id);
+        let acq_key = acquire_state_key.clone();
         spawn(async move {
             let target_folder = match auth.call(api::get_user_folders()).await {
-                Ok(folders) => folders.first().map(|f| f.path.clone()),
+                Ok(folders) => preferred_folder_id
+                    .as_deref()
+                    .and_then(|pref| folders.iter().find(|f| f.id == pref))
+                    .or_else(|| folders.first())
+                    .map(|f| f.path.clone()),
                 Err(_) => None,
             };
             let Some(target_folder) = target_folder else {
@@ -636,6 +667,7 @@ fn ManualSourceChoiceModal(
             };
             match auth.call(api::download(req)).await {
                 Ok(_) => {
+                    studio.acquire_states.write().remove(&acq_key);
                     studio.show_toast(format!("Queued \"{}\" for download", item.title));
                     studio.manual_choice_modal.set(None);
                     studio.downloads_drawer_open.set(true);

@@ -39,32 +39,35 @@ pub fn HomePage() -> Element {
         .unwrap_or("LOCAL")
         .to_ascii_uppercase();
 
-    let pending_drops = studio.pending_drops.read();
-    let visible_triage: Vec<_> = studio
-        .triage_tracks
-        .read()
-        .iter()
-        .filter(|t| {
-            !pending_drops.is_hidden(&t.id)
-                && t.song_id
-                    .as_deref()
-                    .is_none_or(|sid| !pending_drops.is_hidden(sid))
-        })
-        .cloned()
-        .collect();
-    drop(pending_drops);
+    let visible_triage = studio.visible_triage_tracks();
 
     let recent_albums = studio.recent_albums.read().clone();
     let playlists = studio.playlists.read().clone();
-    let starred = studio.starred_tracks.read().clone();
+    let starred: Vec<_> = studio
+        .starred_tracks
+        .read()
+        .iter()
+        .cloned()
+        .map(|mut t| {
+            studio.apply_curation_overrides(&mut t);
+            t
+        })
+        .collect();
 
-    let play_album = move |album_id: String, album_name: String| {
+    let play_album = use_callback(move |(album_id, album_name): (String, String)| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active — album streaming is unavailable.");
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
         spawn(async move {
             match fetch_album_tracks(&info, &album_id).await {
-                Ok(tracks) if !tracks.is_empty() => {
+                Ok(mut tracks) if !tracks.is_empty() => {
+                    for t in &mut tracks {
+                        studio.apply_curation_overrides(t);
+                    }
                     player.play_queue(tracks, 0);
                 }
                 _ => {
@@ -72,15 +75,22 @@ pub fn HomePage() -> Element {
                 }
             }
         });
-    };
+    });
 
-    let play_playlist = move |playlist_id: String, name: String| {
+    let play_playlist = use_callback(move |(playlist_id, name): (String, String)| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active — playlist streaming is unavailable.");
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
         spawn(async move {
             match fetch_playlist_tracks(&info, &playlist_id).await {
-                Ok(tracks) if !tracks.is_empty() => {
+                Ok(mut tracks) if !tracks.is_empty() => {
+                    for t in &mut tracks {
+                        studio.apply_curation_overrides(t);
+                    }
                     player.play_queue(tracks, 0);
                 }
                 _ => {
@@ -88,7 +98,7 @@ pub fn HomePage() -> Element {
                 }
             }
         });
-    };
+    });
 
     rsx! {
         div { class: "space-y-8",
@@ -120,7 +130,7 @@ pub fn HomePage() -> Element {
                                         key: "home-alb-{alb.id}",
                                         r#type: "button",
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer",
-                                        onclick: move |_| play_album(aid.clone(), aname.clone()),
+                                        onclick: move |_| play_album.call((aid.clone(), aname.clone())),
                                         div { class: "w-12 h-12 rounded-[8px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
                                             if let Some(url) = alb.cover_art_url.as_deref() {
                                                 img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
@@ -153,7 +163,7 @@ pub fn HomePage() -> Element {
                                         key: "home-pl-{pl.id}",
                                         r#type: "button",
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer",
-                                        onclick: move |_| play_playlist(pid.clone(), pname.clone()),
+                                        onclick: move |_| play_playlist.call((pid.clone(), pname.clone())),
                                         div { class: "w-12 h-12 rounded-[8px] bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text shrink-0 flex items-center justify-center",
                                             IconMusic { size: 20 }
                                         }
@@ -233,7 +243,7 @@ pub fn HomePage() -> Element {
                     div { class: "space-y-1", role: "list", aria_label: "Pending discovery tracks",
                         for dt in visible_triage.iter().take(4) {
                             {
-                                let track = studio.track_from_discovery(dt, 14);
+                                let track = studio.track_from_discovery(dt);
                                 let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                                 let t_play = track.clone();
                                 let t_keep = track.clone();

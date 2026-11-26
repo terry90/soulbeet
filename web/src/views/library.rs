@@ -30,38 +30,74 @@ pub fn LibraryPage() -> Element {
     let mut detail_title = use_signal(|| None::<String>);
     let mut detail_tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut detail_loading = use_signal(|| false);
+    let mut detail_req_id = use_signal(|| 0u64);
 
     let offline_only = player.offline_only();
     let playlists = studio.playlists.read().clone();
     let albums = studio.recent_albums.read().clone();
-    let starred = studio.starred_tracks.read().clone();
-    let triage = studio.triage_tracks.read().clone();
+    let starred: Vec<_> = studio
+        .starred_tracks
+        .read()
+        .iter()
+        .cloned()
+        .map(|mut t| {
+            studio.apply_curation_overrides(&mut t);
+            t
+        })
+        .collect();
+    let triage = studio.visible_triage_tracks();
 
     let load_playlist = use_callback(move |(pid, name): (String, String)| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active — remote playlists cannot be loaded.");
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
+        let next_req = detail_req_id.peek().wrapping_add(1);
+        detail_req_id.set(next_req);
         detail_title.set(Some(name));
         detail_loading.set(true);
         spawn(async move {
-            match fetch_playlist_tracks(&info, &pid).await {
+            let res = fetch_playlist_tracks(&info, &pid).await;
+            if *detail_req_id.peek() != next_req {
+                return;
+            }
+            match res {
                 Ok(tracks) => detail_tracks.set(tracks),
-                Err(_) => detail_tracks.set(Vec::new()),
+                Err(e) => {
+                    detail_tracks.set(Vec::new());
+                    studio.show_toast(format!("Could not load playlist: {e}"));
+                }
             }
             detail_loading.set(false);
         });
     });
 
     let load_album = use_callback(move |(aid, name): (String, String)| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active — remote albums cannot be loaded.");
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
+        let next_req = detail_req_id.peek().wrapping_add(1);
+        detail_req_id.set(next_req);
         detail_title.set(Some(name));
         detail_loading.set(true);
         spawn(async move {
-            match fetch_album_tracks(&info, &aid).await {
+            let res = fetch_album_tracks(&info, &aid).await;
+            if *detail_req_id.peek() != next_req {
+                return;
+            }
+            match res {
                 Ok(tracks) => detail_tracks.set(tracks),
-                Err(_) => detail_tracks.set(Vec::new()),
+                Err(e) => {
+                    detail_tracks.set(Vec::new());
+                    studio.show_toast(format!("Could not load album: {e}"));
+                }
             }
             detail_loading.set(false);
         });
@@ -164,7 +200,15 @@ pub fn LibraryPage() -> Element {
                         }
                     } else {
                         {
-                            let list = detail_tracks.read().clone();
+                            let list: Vec<_> = detail_tracks
+                                .read()
+                                .iter()
+                                .cloned()
+                                .map(|mut t| {
+                                    studio.apply_curation_overrides(&mut t);
+                                    t
+                                })
+                                .collect();
                             rsx! {
                                 div { class: "space-y-1", role: "list",
                                     for (idx, track) in list.iter().enumerate() {
@@ -339,7 +383,7 @@ pub fn LibraryPage() -> Element {
                             div { class: "space-y-1", role: "list",
                                 for dt in triage.iter() {
                                     {
-                                        let track = studio.track_from_discovery(dt, 14);
+                                        let track = studio.track_from_discovery(dt);
                                         let t_play = track.clone();
                                         let t_keep = track.clone();
                                         let t_drop = track.clone();

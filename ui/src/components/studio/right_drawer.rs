@@ -49,11 +49,14 @@ pub fn StudioRightDrawer(
     on_drop: EventHandler<PlayerTrack>,
     on_start_radio: EventHandler<PlayerTrack>,
 ) -> Element {
+    // Hooks MUST run unconditionally before any early return (Dioxus 0.7 Rules of Hooks).
+    let player = use_player();
+
     let Some(tab) = active_tab else {
         return rsx! {};
     };
 
-    let player = use_player();
+    // Only subscribe to `PlayerState` once the drawer is open.
     let state = player.snapshot();
     let target_track = inspected_track.or_else(|| state.current_track.clone());
 
