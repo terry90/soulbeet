@@ -118,6 +118,15 @@ class SoulbeetMediaRepository {
         }
     }
 
+    fun updateQueue(queueTrackIds: List<String>, currentIndex: Int) {
+        _playbackState.update { prev ->
+            prev.copy(
+                queueTrackIds = queueTrackIds,
+                currentIndex = currentIndex.coerceAtLeast(0),
+            )
+        }
+    }
+
     fun setLibrarySecondaryAction(action: LibrarySecondaryAction) {
         _playbackState.update { it.copy(librarySecondaryAction = action) }
     }

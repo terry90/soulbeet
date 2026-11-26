@@ -896,6 +896,13 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
             handleTrackTransition(currentPlayer, mediaItem)
         }
 
+        override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
+            val currentPlayer = player ?: return
+            val queueIds = extractQueueTrackIds(currentPlayer)
+            val currentIdx = currentPlayer.currentMediaItemIndex.coerceAtLeast(0)
+            repository.updateQueue(queueIds, currentIdx)
+        }
+
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             val currentPlayer = player ?: return
             val durMs = currentPlayer.duration.takeIf { it > 0L }

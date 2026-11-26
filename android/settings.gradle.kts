@@ -24,4 +24,4 @@ rootProject.name = "SoulbeetAndroid"
 
 include(":core-bindings")
 include(":android-media")
-// `:app` (Jetpack Compose mobile client) will be added in PR 4B.
+include(":app")
