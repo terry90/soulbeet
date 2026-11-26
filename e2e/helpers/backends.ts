@@ -44,7 +44,7 @@ function backendSwitch(page: Page, name: string): Locator {
 
 /** The backend's whole block: its name, switch, help lines and, while on, its status. */
 function backendBlock(page: Page, name: string): Locator {
-  return page.locator('div.space-y-2').filter({ has: heading(page, name) }).last();
+  return heading(page, name).locator('xpath=../..');
 }
 
 async function openConnections(page: Page, name: string): Promise<void> {
@@ -53,8 +53,8 @@ async function openConnections(page: Page, name: string): Promise<void> {
   await expect(heading(page, name)).toBeVisible();
 }
 
-const ON = /\bbg-beet-leaf\b/;
-const OFF = /\bbg-gray-600\b/;
+const ON = /\bbg-beet-leaf-solid\b/;
+const OFF = /\bbg-beet-surface-highest\b/;
 
 async function isOn(toggle: Locator): Promise<boolean> {
   return ON.test((await toggle.getAttribute('class')) ?? '');

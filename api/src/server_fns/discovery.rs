@@ -285,6 +285,8 @@ pub async fn steer_seasonal_pack(
 ) -> Result<shared::recommendation::ContextualMixSummary, ServerFnError> {
     crate::core::contextual::steer_seasonal_pack_in(
         &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
         &auth.0,
         &req.slug,
         req.steering,

@@ -127,6 +127,10 @@ pub fn SearchPage() -> Element {
     use_effect(move || {
         if let Some(reset) = search_reset {
             if reset.0() > 0 {
+                let next_req = search_req_id.peek().wrapping_add(1);
+                search_req_id.set(next_req);
+                let next_gen = source_search_gen.peek().wrapping_add(1);
+                source_search_gen.set(next_gen);
                 has_searched.set(false);
                 catalog_results.set(None);
                 local_hits.set(NavidromeSearchHits::default());
@@ -948,7 +952,7 @@ pub fn SearchPage() -> Element {
                                                                 class: "p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer space-y-2",
                                                                 onclick: move |_| {
                                                                     if player.offline_only() {
-                                                                        studio.show_toast("Offline Only mode is active — album streaming is unavailable.");
+                                                                        studio.show_toast("Offline Only mode is active: album streaming is unavailable.");
                                                                         return;
                                                                     }
                                                                     let Some(info) = studio.navidrome_info() else {
@@ -1285,6 +1289,8 @@ pub fn SearchPage() -> Element {
                             key: "{toast_data.id}",
                             toast: toast_data.clone(),
                             on_pick_source: move |choices: SourceChoices| {
+                                let next_gen = source_search_gen.peek().wrapping_add(1);
+                                source_search_gen.set(next_gen);
                                 download_options.set(Some(choices));
                                 source_searching.set(false);
                             },

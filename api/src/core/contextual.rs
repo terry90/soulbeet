@@ -184,12 +184,48 @@ fn discovery_suffix(norm_path: &str) -> Option<&str> {
     None
 }
 
-/// Extracts the filename component of a normalized path when non-empty.
-fn path_filename(norm_path: &str) -> Option<&str> {
-    norm_path
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
+/// Returns true when a normalized Navidrome song path looks like Navidrome's synthetic
+/// `ReportRealPath=false` metadata path (`{Artist}/{Album}/{Title}.{ext}` or
+/// `{Artist}/{Album}/{Track} - {Title}.{ext}`), rather than a real filesystem path.
+fn is_likely_fake_navidrome_path(
+    song: &SubsonicSong,
+    song_norm: &str,
+    known_prefixes: &[String],
+) -> bool {
+    if song_norm.starts_with('/') || song_norm.as_bytes().get(1) == Some(&b':') {
+        return false;
+    }
+    if is_staged_discovery_path(song_norm) {
+        return false;
+    }
+    let norm_lower = song_norm.to_ascii_lowercase();
+    for prefix in known_prefixes {
+        let bare = prefix.trim_end_matches('/');
+        if !prefix.is_empty()
+            && norm_lower.starts_with(prefix.as_str())
+            && song
+                .artist
+                .as_deref()
+                .is_none_or(|a| !a.eq_ignore_ascii_case(bare))
+        {
+            return false;
+        }
+    }
+    let segs: Vec<&str> = song_norm.split('/').filter(|s| !s.is_empty()).collect();
+    // Navidrome's fakePath is `{AlbumArtist}/{Album}/{Track} - {Title}.{ext}` (2-3 segments).
+    if !(2..=3).contains(&segs.len()) {
+        return false;
+    }
+    let filename = segs[segs.len() - 1];
+    let stem = filename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(filename);
+    let title_key = discovery_name(&song.title);
+    if !title_key.is_empty() && !discovery_name(stem).contains(&title_key) {
+        return false;
+    }
+    true
 }
 
 /// Joins a normalized root directory with a normalized relative subpath.
@@ -212,12 +248,13 @@ fn join_norm(root: &str, rel: &str) -> String {
 /// Matching hierarchy:
 /// 1. **Path match (primary):** exact local path mapped via `NAVIDROME_MUSIC_PATH` / learned
 ///    `navidrome_libraries` roots, relative `Discovery/` tail match, then exact and case-insensitive
-///    `Discovery/...` suffix or filename match inside a `Discovery/` folder.
+///    `Discovery/...` directory-scoped suffix match (never bare filename matching).
 /// 2. **Discovery-scoped `(artist, title)` match (secondary):** normalized `(artist, title)`
 ///    restricted to Navidrome songs whose path is inside `Discovery/` so pending tracks never bind
 ///    to owned/promoted library copies.
-/// 3. **Fallback `(artist, title)` match (only when `ReportRealPath` is disabled):** if no song in
-///    `library` carries a `Discovery/` path, matches a unique normalized `(artist, title)` entry.
+/// 3. **Fallback `(artist, title)` match (only when `ReportRealPath` is disabled):** allowed ONLY
+///    when `library` contains no real filesystem paths (neither `Discovery/` paths nor real
+///    non-Discovery paths), matching a unique unused normalized `(artist, title)` entry.
 ///
 /// Fast path: returns `0` immediately when all pending tracks already have a non-empty `song_id`.
 pub(crate) async fn reconcile_discovery_song_ids_in(
@@ -242,14 +279,50 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
         })
         .collect();
 
+    // Known directory prefixes (e.g. "music/", "alice/") that identify real relative paths.
+    let mut known_prefixes: Vec<String> = Vec::new();
+    let mut push_prefix = |seg: &str| {
+        let s = seg.trim_matches('/').to_ascii_lowercase();
+        if !s.is_empty() {
+            let p = format!("{s}/");
+            if !known_prefixes.contains(&p) {
+                known_prefixes.push(p);
+            }
+        }
+    };
+    if let Some(ref mp) = music_root_norm {
+        if let Some(last) = mp.rsplit('/').find(|s| !s.is_empty()) {
+            push_prefix(last);
+        }
+    }
+    for (nav_root, local_root) in &learned_roots {
+        if let Some(last) = nav_root.rsplit('/').find(|s| !s.is_empty()) {
+            push_prefix(last);
+        }
+        if let Some(last) = local_root.rsplit('/').find(|s| !s.is_empty()) {
+            push_prefix(last);
+        }
+    }
+    for track in tracks.iter() {
+        let tnorm = normalize_slash_path(&track.path);
+        for seg in tnorm.split('/') {
+            if seg.eq_ignore_ascii_case("discovery") {
+                break;
+            }
+            if !seg.is_empty() {
+                push_prefix(seg);
+            }
+        }
+    }
+
     let mut exact_local: HashMap<String, &str> = HashMap::new();
     let mut relative_discovery: Vec<(String, &str)> = Vec::new();
     let mut disc_suffix_exact: HashMap<String, Vec<(&str, String)>> = HashMap::new();
     let mut disc_suffix_lower: HashMap<String, Vec<(&str, String)>> = HashMap::new();
-    let mut disc_file_lower: HashMap<String, Vec<(&str, String)>> = HashMap::new();
     let mut disc_by_key: HashMap<String, Vec<(&str, String)>> = HashMap::new();
     let mut all_by_key: HashMap<String, Vec<&str>> = HashMap::new();
     let mut any_discovery_path = false;
+    let mut library_has_real_paths = false;
 
     for song in library {
         let key = CandidateSet::key(song.artist.as_deref().unwrap_or(""), &song.title);
@@ -259,6 +332,9 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
             continue;
         };
         let song_norm = normalize_slash_path(raw_path);
+        if !is_likely_fake_navidrome_path(song, &song_norm, &known_prefixes) {
+            library_has_real_paths = true;
+        }
         exact_local
             .entry(song_norm.clone())
             .or_insert(song.id.as_str());
@@ -302,12 +378,6 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
                 .entry(suffix.to_lowercase())
                 .or_default()
                 .push((song.id.as_str(), song_norm.clone()));
-            if let Some(fname) = path_filename(suffix) {
-                disc_file_lower
-                    .entry(fname.to_lowercase())
-                    .or_default()
-                    .push((song.id.as_str(), song_norm.clone()));
-            }
             disc_by_key
                 .entry(key)
                 .or_default()
@@ -359,20 +429,22 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
         let track_norm = normalize_slash_path(&track.path);
         let track_disc_suffix = discovery_suffix(&track_norm);
 
-        // 1. Primary: path match
+        // 1. Primary: path match (filtered against already-used song_ids)
         let mut matched_id: Option<String> = exact_local
             .get(&track_norm)
+            .filter(|id| !used_song_ids.contains(**id))
             .map(|id| (*id).to_string());
 
         if matched_id.is_none() {
             // Relative Navidrome path suffix (e.g. `alice/Discovery/Balanced/01.flac` inside `/music/alice/...`)
             let rel_hits: Vec<&str> = relative_discovery
                 .iter()
-                .filter(|(rel, _)| {
-                    track_norm == *rel
-                        || track_norm
-                            .strip_suffix(rel.as_str())
-                            .is_some_and(|prefix| prefix.ends_with('/'))
+                .filter(|(rel, id)| {
+                    !used_song_ids.contains(*id)
+                        && (track_norm == *rel
+                            || track_norm
+                                .strip_suffix(rel.as_str())
+                                .is_some_and(|prefix| prefix.ends_with('/')))
                 })
                 .map(|(_, id)| *id)
                 .collect();
@@ -391,13 +463,6 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
                         matched_id = pick_discovery_candidate(cands, track, &used_song_ids);
                     }
                 }
-                if matched_id.is_none() {
-                    if let Some(fname) = path_filename(suffix) {
-                        if let Some(cands) = disc_file_lower.get(&fname.to_lowercase()) {
-                            matched_id = pick_discovery_candidate(cands, track, &used_song_ids);
-                        }
-                    }
-                }
             }
         }
 
@@ -409,8 +474,9 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
             }
         }
 
-        // 3. Fallback: unique (artist, title) across library ONLY if Navidrome paths are absent/fake
-        if matched_id.is_none() && !any_discovery_path {
+        // 3. Fallback: unique (artist, title) across library ONLY when ReportRealPath is disabled
+        // (i.e. library carries no Discovery/ paths AND no real filesystem paths).
+        if matched_id.is_none() && !any_discovery_path && !library_has_real_paths {
             let key = CandidateSet::key(&track.artist, &track.title);
             if let Some(ids) = all_by_key.get(&key) {
                 if ids.len() == 1 && !used_song_ids.contains(ids[0]) {
@@ -918,14 +984,7 @@ fn summarize_definition(
         Some((from, until, exp)) => (Some(from), Some(until), Some(exp)),
         None => (None, None, state.and_then(|s| s.expires_at.clone())),
     };
-    let track_count = if def.kind == ContextualMixKind::Moment || def.owned_ratio > 0.0 {
-        build_contextual_mix_tracks(def, library, pending).len() as u32
-    } else {
-        pending
-            .iter()
-            .filter(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()))
-            .count() as u32
-    };
+    let track_count = build_contextual_mix_tracks(def, library, pending).len() as u32;
 
     ContextualMixSummary {
         slug: def.slug.clone(),
@@ -947,6 +1006,104 @@ fn summarize_definition(
         navidrome_playlist_id: state.and_then(|s| s.navidrome_playlist_id.clone()),
         track_count,
         target_tracks: def.target_tracks,
+    }
+}
+
+fn rolling_profile_for_slug(slug: &str) -> Option<DiscoveryProfile> {
+    match slug {
+        "conservative" => Some(DiscoveryProfile::Conservative),
+        "balanced" => Some(DiscoveryProfile::Balanced),
+        "adventurous" => Some(DiscoveryProfile::Adventurous),
+        _ => None,
+    }
+}
+
+fn build_rolling_mix_tracks(
+    profile: DiscoveryProfile,
+    library: Option<&[SubsonicSong]>,
+    pending: &[DiscoveryTrack],
+) -> Vec<ContextualMixTrack> {
+    let profile_name = profile.name();
+    let duration_by_song_id: HashMap<&str, u32> = library
+        .map(|songs| {
+            songs
+                .iter()
+                .filter_map(|s| s.duration.filter(|&d| d > 0).map(|d| (s.id.as_str(), d)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut seen_keys: HashSet<String> = HashSet::new();
+    let mut tracks: Vec<ContextualMixTrack> = Vec::new();
+    for dt in pending
+        .iter()
+        .filter(|t| t.profile.eq_ignore_ascii_case(profile_name) && t.pack_slug.is_none())
+    {
+        let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let key = CandidateSet::key(&dt.artist, &dt.title);
+        if !seen_keys.insert(key) {
+            continue;
+        }
+        let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
+            "local" => Some(CultureBucket::Local),
+            "international" => Some(CultureBucket::International),
+            "taste_wildcard" => Some(CultureBucket::TasteWildcard),
+            _ => None,
+        });
+        tracks.push(ContextualMixTrack {
+            song_id: song_id.to_string(),
+            discovery_track_id: Some(dt.id.clone()),
+            artist: dt.artist.clone(),
+            title: dt.title.clone(),
+            album: (!dt.album.is_empty()).then(|| dt.album.clone()),
+            duration_s: duration_by_song_id.get(song_id).copied(),
+            owned: false,
+            reason: dt.reason.as_deref().cloned(),
+            culture_bucket: bucket,
+        });
+    }
+    tracks
+}
+
+fn summarize_rolling_profile(
+    profile: DiscoveryProfile,
+    settings: &UserSettings,
+    track_count: u32,
+) -> ContextualMixSummary {
+    let profile_name = profile.name();
+    let slug = profile_name.to_ascii_lowercase();
+    let i18n_key = match profile {
+        DiscoveryProfile::Conservative => "mix.rolling.conservative",
+        DiscoveryProfile::Balanced => "mix.rolling.balanced",
+        DiscoveryProfile::Adventurous => "mix.rolling.adventurous",
+    };
+    let counts = settings.parse_track_counts();
+    let target = counts.get(profile_name).copied().unwrap_or(10);
+    let navidrome_playlist_id = UserSettings::get_playlist_id_for_profile(
+        &settings.discovery_navidrome_playlist_id,
+        profile_name,
+    );
+    ContextualMixSummary {
+        slug,
+        kind: ContextualMixKind::Rolling,
+        i18n_key: i18n_key.to_string(),
+        custom_name: None,
+        custom_description: None,
+        built_in: true,
+        country_code: None,
+        local_pct: None,
+        owned_pct: 0,
+        offline_priority: false,
+        exclude_from_core_taste: false,
+        steering: None,
+        active_from: None,
+        active_until: None,
+        expires_at: None,
+        navidrome_playlist_id,
+        track_count,
+        target_tracks: target,
     }
 }
 
@@ -1071,45 +1228,11 @@ pub(crate) async fn list_active_contextual_mixes_in(
     mixes.extend(seasonal);
     mixes.extend(moments);
 
-    // Rolling Personal Mixes
-    let counts = settings.parse_track_counts();
+    // Rolling Personal Mixes (count ONLY reconciled playable pending tracks matching resolve)
     for profile in parse_profiles(&settings.discovery_profiles) {
-        let profile_name = profile.name();
-        let slug = profile_name.to_ascii_lowercase();
-        let i18n_key = match profile {
-            DiscoveryProfile::Conservative => "mix.rolling.conservative",
-            DiscoveryProfile::Balanced => "mix.rolling.balanced",
-            DiscoveryProfile::Adventurous => "mix.rolling.adventurous",
-        };
-        let pending_count = pending
-            .iter()
-            .filter(|t| t.profile == profile_name && t.pack_slug.is_none())
-            .count() as u32;
-        let target = counts.get(profile_name).copied().unwrap_or(10);
-        let navidrome_playlist_id = UserSettings::get_playlist_id_for_profile(
-            &settings.discovery_navidrome_playlist_id,
-            profile_name,
-        );
-        mixes.push(ContextualMixSummary {
-            slug,
-            kind: ContextualMixKind::Rolling,
-            i18n_key: i18n_key.to_string(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            country_code: None,
-            local_pct: None,
-            owned_pct: 0,
-            offline_priority: false,
-            exclude_from_core_taste: false,
-            steering: None,
-            active_from: None,
-            active_until: None,
-            expires_at: None,
-            navidrome_playlist_id,
-            track_count: pending_count,
-            target_tracks: target,
-        });
+        let playable_count =
+            build_rolling_mix_tracks(profile, library.as_deref(), &pending).len() as u32;
+        mixes.push(summarize_rolling_profile(profile, &settings, playable_count));
     }
 
     Ok(mixes)
@@ -1119,6 +1242,8 @@ pub(crate) async fn list_active_contextual_mixes_in(
 /// any seasonal contextual mix slug (supporting legacy `"noel"` / `"holiday"` / `"nye"` aliases).
 pub(crate) async fn steer_seasonal_pack_in(
     db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
+    music_path: Option<&Path>,
     ctx: &UserCtx,
     slug: &str,
     steering: CultureSteering,
@@ -1160,15 +1285,45 @@ pub(crate) async fn steer_seasonal_pack_in(
     )
     .await
     .map_err(|e| database_failure(Stage::Input, e))?;
-    let pending = DiscoveryTrackRow::pending_for_user_in(db, &ctx.user_id)
+    let mut pending = DiscoveryTrackRow::pending_for_user_in(db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
+    let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
+    let library: Option<Vec<SubsonicSong>> = if def.owned_ratio > 0.0 || needs_reconcile {
+        match navidrome.navidrome_of(&ctx.id()).await {
+            Ok(navi) => match navi.get_all_songs_with_ratings().await {
+                Ok(songs) => Some(songs),
+                Err(e) => {
+                    warn!(
+                        "Could not fetch Navidrome songs while steering seasonal pack '{}' for user {}: {}",
+                        def.slug, ctx.user_id, e
+                    );
+                    None
+                }
+            },
+            Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => None,
+            Err(e) => {
+                warn!(
+                    "Could not resolve Navidrome client while steering seasonal pack '{}' for user {}: {}",
+                    def.slug, ctx.user_id, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ref songs) = library {
+        if needs_reconcile {
+            reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
+        }
+    }
     Ok(summarize_definition(
         &def,
         &culture,
         Some(&state),
         &pending,
-        None,
+        library.as_deref(),
         now,
     ))
 }
@@ -1382,17 +1537,62 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
     now: chrono::DateTime<Utc>,
 ) -> Result<ContextualMixPlaylist, Failure> {
     let canonical = canonical_slug(slug)?;
-    let def = ContextualMixDefinitionRow::get_visible_by_slug_in(db, &ctx.user_id, &canonical)
+    let def_opt = ContextualMixDefinitionRow::get_visible_by_slug_in(db, &ctx.user_id, &canonical)
         .await
-        .map_err(|e| database_failure(Stage::Playlist, e))?
-        .ok_or_else(|| {
-            Failure::new(
+        .map_err(|e| database_failure(Stage::Playlist, e))?;
+
+    let def = match def_opt {
+        Some(def) => def,
+        None => {
+            if let Some(profile) = rolling_profile_for_slug(&canonical) {
+                let settings = UserSettings::get_in(db, &ctx.user_id)
+                    .await
+                    .map_err(|e| database_failure(Stage::Playlist, e))?;
+                let mut pending = DiscoveryTrackRow::pending_for_user_in(db, &ctx.user_id)
+                    .await
+                    .map_err(|e| database_failure(Stage::Playlist, e))?;
+                let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
+                let library: Option<Vec<SubsonicSong>> = if needs_reconcile {
+                    match navidrome.navidrome_of(&ctx.id()).await {
+                        Ok(navi) => match navi.get_all_songs_with_ratings().await {
+                            Ok(songs) => Some(songs),
+                            Err(e) => {
+                                warn!(
+                                    "Could not fetch Navidrome songs to reconcile discovery song_ids for rolling mix '{}' (user {}): {}",
+                                    canonical, ctx.user_id, e
+                                );
+                                None
+                            }
+                        },
+                        Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => {
+                            None
+                        }
+                        Err(e) => return Err(e.failure(Stage::Playlist, e.to_string())),
+                    }
+                } else {
+                    None
+                };
+                if let Some(ref songs) = library {
+                    if needs_reconcile {
+                        reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
+                    }
+                }
+                let tracks = build_rolling_mix_tracks(profile, library.as_deref(), &pending);
+                let summary = summarize_rolling_profile(profile, &settings, tracks.len() as u32);
+                return Ok(ContextualMixPlaylist {
+                    summary,
+                    tracks,
+                    prefetch_candidates: Vec::new(),
+                });
+            }
+            return Err(Failure::new(
                 FailureCode::UnknownHandle,
                 Stage::Playlist,
                 RetryAdvice::NotRetryable,
                 format!("Contextual mix '{slug}' not found"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let culture = get_culture_profile_in(db, &ctx.user_id).await?;
     let mut state = ContextualMixStateRow::get_in(db, &ctx.user_id, &def.slug)
@@ -1777,10 +1977,17 @@ mod tests {
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
 
         // Steer winter_holiday to MoreLocal -> 0.50 + 0.25 = 0.75 (75%)
-        let steered =
-            steer_seasonal_pack_in(&db, &ctx, "winter_holiday", CultureSteering::MoreLocal, dec)
-                .await
-                .unwrap();
+        let steered = steer_seasonal_pack_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            "winter_holiday",
+            CultureSteering::MoreLocal,
+            dec,
+        )
+        .await
+        .unwrap();
         assert_eq!(steered.slug, "winter_holiday");
         assert_eq!(steered.i18n_key, "mix.seasonal.winter_holiday");
         assert_eq!(steered.custom_name, None);
@@ -1811,10 +2018,17 @@ mod tests {
         assert!(!morning_mixes.iter().any(|m| m.slug == "focus"));
 
         // Steering a Moment mix is rejected
-        let steer_moment =
-            steer_seasonal_pack_in(&db, &ctx, "drive", CultureSteering::MoreLocal, dec)
-                .await
-                .unwrap_err();
+        let steer_moment = steer_seasonal_pack_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            "drive",
+            CultureSteering::MoreLocal,
+            dec,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(steer_moment.code, FailureCode::InvalidInput);
     }
 
@@ -2701,5 +2915,225 @@ mod tests {
             .tracks
             .iter()
             .any(|t| !t.owned && t.song_id == "nd-fresh-reconciled" && t.duration_s == Some(205)));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_bare_filename_real_owned_paths_and_duplicate_song_ids() {
+        let db = test_db::migrated().await;
+        let folder_id = folder_of(&db, "alice").await;
+
+        let make_song = |id: &str, title: &str, artist: &str, path: &str| SubsonicSong {
+            id: id.into(),
+            title: title.into(),
+            artist: Some(artist.into()),
+            album: Some("LP".into()),
+            album_id: None,
+            genre: None,
+            duration: Some(200),
+            user_rating: None,
+            play_count: None,
+            starred: None,
+            music_brainz_id: None,
+            suffix: None,
+            bit_rate: None,
+            size: None,
+            year: None,
+            track: None,
+            path: Some(path.into()),
+        };
+
+        // (a) Bare filename `01.flac` in a different Discovery folder must NEVER bind to wrong song
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, song_id, title, artist, album, path, folder_id, profile, status) \
+             VALUES ('dt-bare', NULL, 'Actual Track', 'Actual Artist', 'EP', \
+                     '/music/alice/Discovery/Adventurous/01.flac', ?, 'Adventurous', 'Pending')",
+        )
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let library_other_disc = vec![make_song(
+            "nd-wrong-01",
+            "Totally Different Song",
+            "Other Artist",
+            "alice/Discovery/Balanced/01.flac",
+        )];
+        let mut tracks = DiscoveryTrackRow::pending_for_user_in(&db, "alice")
+            .await
+            .unwrap();
+        let count = reconcile_discovery_song_ids_in(
+            &db,
+            &library_other_disc,
+            Some(Path::new("/music")),
+            &mut tracks,
+        )
+        .await;
+        assert_eq!(count, 0, "bare filename 01.flac mismatch must not bind");
+        assert_eq!(tracks[0].song_id, None);
+
+        // (b) Owned library song with real non-Discovery path must NOT bind when Discovery/ hasn't scanned yet
+        let library_real_abs = vec![make_song(
+            "nd-owned-abs",
+            "Actual Track",
+            "Actual Artist",
+            "/music/alice/Actual Artist/EP/Actual Track.flac",
+        )];
+        let count_abs = reconcile_discovery_song_ids_in(
+            &db,
+            &library_real_abs,
+            Some(Path::new("/music")),
+            &mut tracks,
+        )
+        .await;
+        assert_eq!(
+            count_abs, 0,
+            "absolute non-Discovery real path must block owned-song fallback"
+        );
+        assert_eq!(tracks[0].song_id, None);
+
+        let library_real_rel = vec![make_song(
+            "nd-owned-rel",
+            "Actual Track",
+            "Actual Artist",
+            "music/Actual Artist/EP/01.flac",
+        )];
+        let count_rel =
+            reconcile_discovery_song_ids_in(&db, &library_real_rel, None, &mut tracks).await;
+        assert_eq!(
+            count_rel, 0,
+            "relative non-Discovery real path must block owned-song fallback"
+        );
+        assert_eq!(tracks[0].song_id, None);
+
+        // (c) Duplicate song_id must NEVER be assigned to two pending rows
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, song_id, title, artist, album, path, folder_id, profile, status) \
+             VALUES ('dt-dup-a', NULL, 'Same File', 'Artist A', 'EP', \
+                     '/music/alice/Discovery/Balanced/dup.flac', ?, 'Balanced', 'Pending'), \
+                    ('dt-dup-b', NULL, 'Same File', 'Artist A', 'EP', \
+                     '/music/alice/Discovery/Balanced/dup.flac', ?, 'Balanced', 'Pending')",
+        )
+        .bind(&folder_id)
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let library_single_disc = vec![make_song(
+            "nd-dup-target",
+            "Same File",
+            "Artist A",
+            "alice/Discovery/Balanced/dup.flac",
+        )];
+        let mut all_tracks = DiscoveryTrackRow::pending_for_user_in(&db, "alice")
+            .await
+            .unwrap();
+        let matched = reconcile_discovery_song_ids_in(
+            &db,
+            &library_single_disc,
+            Some(Path::new("/music")),
+            &mut all_tracks,
+        )
+        .await;
+        assert_eq!(matched, 1, "only one pending row may claim a given song_id");
+        let assigned_count = all_tracks
+            .iter()
+            .filter(|t| t.song_id.as_deref() == Some("nd-dup-target"))
+            .count();
+        assert_eq!(assigned_count, 1, "song_id must never be reused across rows");
+    }
+
+    #[tokio::test]
+    async fn seasonal_track_count_matches_resolved_playlist_and_rolling_slug_resolves() {
+        let db = test_db::migrated().await;
+        let folder_id = folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        // Seasonal: 1 playable (song_id set) + 1 unreconciled (song_id NULL)
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, culture_bucket, pack_slug) \
+             VALUES ('dt-seas-ok', 'nd-seas-1', 'Winter Lights', 'Nordic Act', 'Xmas', \
+                     '/music/alice/Discovery/Seasonal/winter_holiday/01.flac', ?, 'Balanced', \
+                     'Pending', 1, 'local', 'winter_holiday'), \
+                    ('dt-seas-null', NULL, 'Unscanned Carol', 'Missing Act', 'Xmas', \
+                     '/music/alice/Discovery/Seasonal/winter_holiday/02.flac', ?, 'Balanced', \
+                     'Pending', 1, 'local', 'winter_holiday')",
+        )
+        .bind(&folder_id)
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Rolling (Balanced): 1 playable + 1 unreconciled
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, culture_bucket, pack_slug) \
+             VALUES ('dt-roll-ok', 'nd-roll-1', 'Balanced Gem', 'Indie Act', 'LP', \
+                     '/music/alice/Discovery/Balanced/01.flac', ?, 'Balanced', \
+                     'Pending', 0, 'taste_wildcard', NULL), \
+                    ('dt-roll-null', NULL, 'Unscanned Gem', 'Ghost Act', 'LP', \
+                     '/music/alice/Discovery/Balanced/02.flac', ?, 'Balanced', \
+                     'Pending', 0, 'taste_wildcard', NULL)",
+        )
+        .bind(&folder_id)
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
+        let mixes = list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, Some(14))
+            .await
+            .unwrap();
+
+        let winter_summary = mixes.iter().find(|m| m.slug == "winter_holiday").unwrap();
+        assert_eq!(
+            winter_summary.track_count, 1,
+            "seasonal summary must count only playable tracks with song_id"
+        );
+        let winter_pl = resolve_contextual_mix_playlist_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            "winter_holiday",
+            false,
+            dec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(winter_summary.track_count, winter_pl.tracks.len() as u32);
+        assert_eq!(winter_pl.tracks[0].song_id, "nd-seas-1");
+
+        let balanced_summary = mixes.iter().find(|m| m.slug == "balanced").unwrap();
+        assert_eq!(balanced_summary.kind, ContextualMixKind::Rolling);
+        assert_eq!(
+            balanced_summary.track_count, 1,
+            "rolling summary must count only playable tracks with song_id"
+        );
+        let balanced_pl = resolve_contextual_mix_playlist_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            "balanced",
+            false,
+            dec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(balanced_pl.summary.slug, "balanced");
+        assert_eq!(balanced_pl.summary.kind, ContextualMixKind::Rolling);
+        assert_eq!(
+            balanced_summary.track_count,
+            balanced_pl.tracks.len() as u32
+        );
+        assert_eq!(balanced_pl.tracks.len(), 1);
+        assert_eq!(balanced_pl.tracks[0].song_id, "nd-roll-1");
     }
 }

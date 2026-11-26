@@ -22,6 +22,8 @@ fn active_backend_badge(backend: Option<&str>) -> &'static str {
         None | Some("slskd") => "SLSK",
         Some("archive") => "ARCHIVE",
         Some("ytdlp") => "YTM",
+        Some("gdstudio") => "NETEASE",
+        Some("airdcpp") => "DC++",
         Some(_) => "DL",
     }
 }

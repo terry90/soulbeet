@@ -241,7 +241,7 @@ pub fn StatsOverview(
                 }
             }
 
-            // 1. Top KPI Strip — Balanced 4 Studio Bento Cards
+            // 1. Top KPI Strip: Balanced 4 Studio Bento Cards
             div { class: "grid grid-cols-2 lg:grid-cols-4 gap-3.5",
                 // Card 1: Library
                 div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-4 flex flex-col justify-between gap-2.5",
@@ -285,7 +285,7 @@ pub fn StatsOverview(
                                 if stats.rated_tracks > 0 {
                                     "{stats.average_rating:.1}"
                                 } else {
-                                    "—"
+                                    "-"
                                 }
                             }
                         }

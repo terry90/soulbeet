@@ -26,10 +26,10 @@ pub fn format_mix_title(summary: &ContextualMixSummary) -> String {
     let base = match summary.i18n_key.as_str() {
         "mix.seasonal.winter_holiday" => match cc.as_deref() {
             Some("FR") => "Noël à la Française",
-            Some("DE") | Some("AT") | Some("CH") => "Winter & Festtage",
-            Some("ES") | Some("MX") => "Navidad & Invierno",
-            Some("IT") => "Natale d'Inverno",
-            _ => "Winter Holiday Mix",
+            Some("DE") | Some("AT") | Some("CH") => "Weihnachten Mix",
+            Some("ES") | Some("MX") => "Navidad Mix",
+            Some("IT") => "Natale Mix",
+            _ => "Christmas Mix",
         },
         "mix.seasonal.new_years_eve" => "New Year's Eve",
         "mix.seasonal.lunar_new_year" => "Lunar New Year",
@@ -78,8 +78,7 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
 
     match summary.i18n_key.as_str() {
         "mix.seasonal.winter_holiday" => {
-            "Festive local favorites and international winter classics, blended to your taste."
-                .to_string()
+            "Christmas favorites and festive classics, blended to your taste.".to_string()
         }
         "mix.seasonal.new_years_eve" => {
             "High-energy dance floor staples and regional party picks to close the year.".to_string()

@@ -456,7 +456,7 @@ fn LibraryStatsPanel() -> Element {
 
     let on_play_track = use_callback(move |clicked: TopPlayedTrack| {
         if player.offline_only() {
-            studio.show_toast("Offline Only mode is active — remote playback is unavailable.");
+            studio.show_toast("Offline Only mode is active: remote playback is unavailable.");
             return;
         }
         let nav = studio.navidrome_info();

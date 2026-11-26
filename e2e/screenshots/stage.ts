@@ -24,6 +24,22 @@ const LIBRARY_STATS = {
   rating_distribution: [18, 47, 166, 241, 140],
   total_albums: 214,
   total_artists: 131,
+  total_plays: 14826,
+  total_duration_secs: 571200,
+  top_played_artists: [
+    ['Hollow Pines', 642],
+    ['Beach House', 518],
+    ['Bonobo', 436],
+    ['Khruangbin', 389],
+    ['Radiohead', 344],
+    ['Vela Norte', 298],
+  ],
+  top_played_tracks: [
+    { song_id: 's1', title: 'Moth Lantern', artist: 'Hollow Pines', album: 'Night Garden', play_count: 148, rating: 5, duration: 252 },
+    { song_id: 's2', title: 'Quiet Antenna', artist: 'Vela Norte', album: 'Senders', play_count: 131, rating: 5, duration: 238 },
+    { song_id: 's3', title: 'Wisteria', artist: 'Hollow Pines', album: 'Night Garden', play_count: 119, rating: 5, duration: 303 },
+    { song_id: 's4', title: 'Paper Lanterns', artist: 'Static Harbor', album: 'Glass Atlas', play_count: 104, rating: 4, duration: 274 },
+  ],
   genres: [
     ['Indie Rock', 412],
     ['Dream Pop', 288],

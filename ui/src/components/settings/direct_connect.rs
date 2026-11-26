@@ -8,7 +8,9 @@ use std::pin::Pin;
 use api::{SidecarReport, SidecarSettings, SidecarSettingsUpdate};
 use dioxus::prelude::*;
 
-use super::panel::{LoadError, Messages, LABEL_CLASS};
+use super::panel::{
+    LoadError, Messages, LABEL_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
+};
 use crate::{friendly_error, submitted_text, use_auth, Autofill, FieldKind, TextInput};
 
 const URL: &str = "airdcpp_url";
@@ -102,8 +104,8 @@ fn DirectConnectForm(stored: SidecarSettings, save: Saver, check: Checker) -> El
     };
 
     rsx! {
-        div { class: "mt-3 pl-3 border-l border-white/10 space-y-3",
-            h4 { class: "text-xs font-mono text-gray-300 uppercase tracking-wider", "AirDC++ sidecar" }
+        div { class: "mt-3 pl-3.5 border-l border-beet-border-subtle space-y-3",
+            h4 { class: "text-[11px] tabular-nums-mono text-beet-text-tertiary uppercase tracking-wider", "AirDC++ sidecar" }
             Messages { error: error(), success: success() }
             for count in [saves()] {
                 // A post, so a submit the app fails to catch never puts the password in the
@@ -137,10 +139,10 @@ fn DirectConnectForm(stored: SidecarSettings, save: Saver, check: Checker) -> El
                             kind: FieldKind::Password,
                         }
                     }
-                    div { class: "flex flex-wrap items-center gap-3",
-                        button { class: "retro-btn rounded", "type": "submit", "Save Direct Connect" }
+                    div { class: "flex flex-wrap items-center gap-2.5",
+                        button { class: PRIMARY_BUTTON_CLASS, "type": "submit", "Save Direct Connect" }
                         button {
-                            class: "text-xs font-mono text-gray-300 hover:text-white underline decoration-dotted cursor-pointer",
+                            class: SECONDARY_BUTTON_CLASS,
                             "type": "button",
                             disabled: checking(),
                             onclick: run_check,
@@ -206,18 +208,18 @@ fn check_lines(report: &SidecarReport) -> Element {
         yes_no(report.admin_user, "an AirDC++ admin", "not an admin"),
     ));
     rsx! {
-        div { class: "space-y-1",
+        div { class: "space-y-1 pt-1",
             match &report.problem {
                 Some(problem) => rsx! {
-                    p { class: "text-xs font-mono text-red-400", "{problem}" }
+                    p { class: "text-xs text-beet-crimson-text", "{problem}" }
                 },
                 None => rsx! {
-                    p { class: "text-xs font-mono text-beet-leaf", "Soulbeet can use this AirDC++" }
+                    p { class: "text-xs text-beet-leaf-text", "Soulbeet can use this AirDC++" }
                 },
             }
             for (label, value) in lines {
-                p { class: "text-xs font-mono text-gray-400",
-                    span { class: "text-gray-300", "{label}: " }
+                p { class: "text-xs tabular-nums-mono text-beet-text-tertiary",
+                    span { class: "text-beet-text-secondary", "{label}: " }
                     "{value}"
                 }
             }

@@ -214,7 +214,6 @@ fn AlbumResultItem(props: AlbumResultItemProps) -> Element {
     rsx! {
         // Keep `rounded-md` on the group card container for stable E2E group selection.
         div {
-            key: "{album.group_id}-{album.source}",
             class: "bg-beet-surface-low border border-beet-border-subtle hover:border-beet-border-default p-3.5 sm:p-4 rounded-md transition-colors",
 
             // Clickable header for expand/collapse
@@ -317,14 +316,37 @@ fn GroupList(
     on_track_toggle: EventHandler<String>,
 ) -> Element {
     let first_lossy = backends.iter().position(|b| is_lossy(*b));
+    let lossy_header_meta = first_lossy.and_then(|idx| backends.get(idx).copied().flatten());
+    let mut head: Vec<(usize, DownloadableGroup, Option<&'static BackendMeta>)> = groups
+        .into_iter()
+        .zip(backends)
+        .enumerate()
+        .map(|(idx, (album, backend))| (idx, album, backend))
+        .collect();
+    let split_at = first_lossy.unwrap_or(head.len());
+    let tail = head.split_off(split_at);
+
     rsx! {
-        for (idx, (album, backend)) in groups.into_iter().zip(backends).enumerate() {
-            if let Some(meta) = backend.filter(|_| Some(idx) == first_lossy) {
-                h4 { class: "pt-2 text-[13px] tabular-nums-mono font-semibold text-beet-gold",
-                    "Lossy, from {meta.name}"
-                }
-            }
+        for (idx, album, backend) in head {
             AlbumResultItem {
+                key: "{album.group_id}-{album.source}",
+                backend,
+                album,
+                selected_tracks,
+                on_album_select_all,
+                on_track_toggle,
+                is_best: idx == 0,
+                starts_expanded: idx == 0,
+            }
+        }
+        if let Some(meta) = lossy_header_meta {
+            h4 { class: "pt-2 text-[13px] tabular-nums-mono font-semibold text-beet-gold",
+                "Lossy, from {meta.name}"
+            }
+        }
+        for (idx, album, backend) in tail {
+            AlbumResultItem {
+                key: "{album.group_id}-{album.source}",
                 backend,
                 album,
                 selected_tracks,

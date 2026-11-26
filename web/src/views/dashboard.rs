@@ -70,7 +70,7 @@ fn OverviewTab() -> Element {
     let on_play_track = if let (Some(player), Some(mut studio)) = (player, studio) {
         Some(EventHandler::new(move |clicked: TopPlayedTrack| {
             if player.offline_only() {
-                studio.show_toast("Offline Only mode is active — remote playback is unavailable.");
+                studio.show_toast("Offline Only mode is active: remote playback is unavailable.");
                 return;
             }
             let nav = studio.navidrome_info();

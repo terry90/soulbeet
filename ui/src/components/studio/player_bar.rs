@@ -64,6 +64,7 @@ fn compute_volume_pct(volume: f32, muted: bool) -> u32 {
 /// player bar or studio shell.
 #[component]
 fn PlayerScrubber(
+    track_id: Option<String>,
     has_track: bool,
     codec_badge: Option<String>,
     #[props(default)] full_width: bool,
@@ -71,8 +72,13 @@ fn PlayerScrubber(
     let player = use_player();
     let mut track_el = use_signal(|| None::<Rc<MountedData>>);
     let mut track_rect = use_signal(|| (0.0f64, 0.0f64));
+    let mut is_hovered = use_signal(|| false);
     let mut hover_pct = use_signal(|| None::<f64>);
     let mut drag_secs = use_signal(|| None::<f64>);
+
+    use_effect(use_reactive(&track_id, move |_| {
+        drag_secs.set(None);
+    }));
 
     let pos = *player.position_signal().read();
     let dur = *player.duration_signal().read();
@@ -147,6 +153,7 @@ fn PlayerScrubber(
                     });
                 },
                 onmouseenter: move |evt: MouseEvent| {
+                    is_hovered.set(true);
                     let client_x = evt.data().client_coordinates().x;
                     if let Some(el) = track_el.read().clone() {
                         spawn(async move {
@@ -154,13 +161,16 @@ fn PlayerScrubber(
                                 let w = rect.size.width;
                                 if w.is_finite() && w > 0.0 {
                                     track_rect.set((rect.origin.x, w));
-                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    if *is_hovered.peek() {
+                                        hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    }
                                 }
                             }
                         });
                     }
                 },
                 onmousemove: move |evt: MouseEvent| {
+                    is_hovered.set(true);
                     let client_x = evt.data().client_coordinates().x;
                     let (left, width) = *track_rect.read();
                     if width > 0.0 {
@@ -171,14 +181,20 @@ fn PlayerScrubber(
                                 let w = rect.size.width;
                                 if w.is_finite() && w > 0.0 {
                                     track_rect.set((rect.origin.x, w));
-                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    if *is_hovered.peek() {
+                                        hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                    }
                                 }
                             }
                         });
                     }
                 },
-                onmouseleave: move |_| {
+                onmouseleave: move |evt: MouseEvent| {
+                    is_hovered.set(false);
                     hover_pct.set(None);
+                    if evt.data().held_buttons().is_empty() {
+                        drag_secs.set(None);
+                    }
                 },
 
                 // Floating Commit Mono timestamp preview tooltip
@@ -223,16 +239,6 @@ fn PlayerScrubber(
                     disabled: !can_seek,
                     aria_label: "Seek playback position",
                     class: "absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-default",
-                    onpointerdown: move |_| {
-                        if can_seek {
-                            drag_secs.set(Some(display_pos));
-                        }
-                    },
-                    onmousedown: move |_| {
-                        if can_seek {
-                            drag_secs.set(Some(display_pos));
-                        }
-                    },
                     oninput: move |evt| {
                         if let Ok(next) = evt.value().parse::<f64>() {
                             let clamped = next.clamp(0.0, max_dur);
@@ -247,15 +253,12 @@ fn PlayerScrubber(
                         drag_secs.set(None);
                     },
                     onpointerup: move |_| {
-                        if let Some(val) = drag_secs() {
-                            player.seek(val.clamp(0.0, max_dur));
-                        }
                         drag_secs.set(None);
                     },
                     onmouseup: move |_| {
-                        if let Some(val) = drag_secs() {
-                            player.seek(val.clamp(0.0, max_dur));
-                        }
+                        drag_secs.set(None);
+                    },
+                    onpointercancel: move |_| {
                         drag_secs.set(None);
                     },
                     onkeyup: move |_| {
@@ -286,6 +289,7 @@ fn PlayerScrubber(
 fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) -> Element {
     let mut track_el = use_signal(|| None::<Rc<MountedData>>);
     let mut track_rect = use_signal(|| (0.0f64, 0.0f64));
+    let mut is_hovered = use_signal(|| false);
     let mut hover_pct = use_signal(|| None::<f64>);
     let mut is_dragging = use_signal(|| false);
 
@@ -339,6 +343,7 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
                 });
             },
             onmouseenter: move |evt: MouseEvent| {
+                is_hovered.set(true);
                 let client_x = evt.data().client_coordinates().x;
                 if let Some(el) = track_el.read().clone() {
                     spawn(async move {
@@ -346,13 +351,16 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
                             let w = rect.size.width;
                             if w.is_finite() && w > 0.0 {
                                 track_rect.set((rect.origin.x, w));
-                                hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                if *is_hovered.peek() {
+                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                }
                             }
                         }
                     });
                 }
             },
             onmousemove: move |evt: MouseEvent| {
+                is_hovered.set(true);
                 let client_x = evt.data().client_coordinates().x;
                 let (left, width) = *track_rect.read();
                 if width > 0.0 {
@@ -363,14 +371,20 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
                             let w = rect.size.width;
                             if w.is_finite() && w > 0.0 {
                                 track_rect.set((rect.origin.x, w));
-                                hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                if *is_hovered.peek() {
+                                    hover_pct.set(compute_hover_pct(client_x - rect.origin.x, w));
+                                }
                             }
                         }
                     });
                 }
             },
-            onmouseleave: move |_| {
+            onmouseleave: move |evt: MouseEvent| {
+                is_hovered.set(false);
                 hover_pct.set(None);
+                if evt.data().held_buttons().is_empty() {
+                    is_dragging.set(false);
+                }
             },
 
             if let Some((anchor_pct, label_pct)) = tooltip {
@@ -407,10 +421,9 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
                 value: "{effective_vol:.2}",
                 aria_label: "Volume",
                 class: "absolute inset-0 w-full h-full opacity-0 cursor-pointer",
-                onpointerdown: move |_| is_dragging.set(true),
-                onmousedown: move |_| is_dragging.set(true),
                 oninput: move |evt| {
                     if let Ok(v) = evt.value().parse::<f32>() {
+                        is_dragging.set(true);
                         on_change.call(v.clamp(0.0, 1.0));
                     }
                 },
@@ -422,6 +435,8 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
                 },
                 onpointerup: move |_| is_dragging.set(false),
                 onmouseup: move |_| is_dragging.set(false),
+                onpointercancel: move |_| is_dragging.set(false),
+                onkeyup: move |_| is_dragging.set(false),
                 onblur: move |_| is_dragging.set(false),
             }
         }
@@ -487,6 +502,7 @@ pub fn StudioPlayerBar(
             // Mobile (< md): Dedicated full-width seek bar above controls so it is clear and easy to scrub
             div { class: "w-full md:hidden",
                 PlayerScrubber {
+                    track_id: current.as_ref().map(|t| t.id.clone()),
                     has_track,
                     codec_badge: None,
                     full_width: true,
@@ -704,6 +720,7 @@ pub fn StudioPlayerBar(
 
                 div { class: "hidden md:flex w-full justify-center",
                     PlayerScrubber {
+                        track_id: current.as_ref().map(|t| t.id.clone()),
                         has_track,
                         codec_badge: current.as_ref().and_then(|t| t.codec_badge.clone()),
                     }

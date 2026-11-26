@@ -496,15 +496,20 @@ pub fn Search() -> Element {
     use_effect(move || {
         if let Some(reset) = search_reset {
             if reset.0() > 0 {
+                let next_gen = source_search_gen.peek().wrapping_add(1);
+                source_search_gen.set(next_gen);
                 search_results.set(None);
                 listed.set(None);
                 search_error.set(String::new());
+                download_error.set(String::new());
+                download_options.set(None);
                 search.set(String::new());
                 artist.set(None);
                 artist_open.set(false);
                 expanded_albums.write().clear();
                 album_cache.write().clear();
                 loading.set(false);
+                source_searching.set(false);
             }
         }
     });
@@ -1139,6 +1144,8 @@ pub fn Search() -> Element {
                 key: "{toast_data.id}",
                 toast: toast_data.clone(),
                 on_pick_source: move |choices: SourceChoices| {
+                    let next_gen = source_search_gen.peek().wrapping_add(1);
+                    source_search_gen.set(next_gen);
                     download_options.set(Some(choices));
                     source_searching.set(false);
                 },
