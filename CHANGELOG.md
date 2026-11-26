@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0-alpha-0 - 2026-11-26
 
 ### Built-in player, Desktop and Android Auto apps, Discovery 2.0, and five download backends
 
