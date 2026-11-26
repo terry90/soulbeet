@@ -123,6 +123,26 @@ def test_auto_records_an_applied_match(beets_env):
     assert len(beets_env.music_files()) == 2
 
 
+@pytest.mark.parametrize("choice", ["auto", "asis"])
+def test_a_file_a_download_client_is_still_writing_is_never_imported(beets_env, choice):
+    beets_env.album(beets_env.src)
+    # AirDC++ writes a file as <name>.dctmp next to where it lands, tags and all.
+    partial = beets_env.mp3(
+        beets_env.src / "03 - Song Number 3.mp3",
+        artist="Zzqx Artist",
+        albumartist="Zzqx Artist",
+        album="Qzz Album",
+        title="Song Number 3",
+        tracknumber="3/3",
+    )
+    partial.rename(partial.with_name(partial.name + ".dctmp"))
+    run = beets_env.driver(choice, env={"FAKESRC_MODE": "strong"})
+
+    assert run.code == 0, run
+    assert len(beets_env.music_files()) == 2, run
+    assert not any("Song Number 3" in f for f in beets_env.music_files())
+
+
 def test_a_replaced_duplicate_is_reported_with_the_file_it_replaced(beets_env):
     beets_env.album(beets_env.src)
     first = beets_env.driver("auto", env={"FAKESRC_MODE": "strong"})

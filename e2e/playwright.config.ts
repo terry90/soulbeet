@@ -43,6 +43,7 @@ export default defineConfig({
         /archive-backend\.spec\.ts/,
         /ytdlp\.spec\.ts/,
         /gdstudio\.spec\.ts/,
+        /direct-connect\.spec\.ts/,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -121,6 +122,15 @@ export default defineConfig({
       name: 'gdstudio',
       dependencies: ['ytdlp'],
       testMatch: /gdstudio\.spec\.ts/,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      // Turns Direct Connect on for the whole instance, as the archive project does its
+      // backend, so it runs alone, after the GD Studio project.
+      name: 'direct-connect',
+      dependencies: ['gdstudio'],
+      testMatch: /direct-connect\.spec\.ts/,
       workers: 1,
       use: { ...devices['Desktop Chrome'] },
     },

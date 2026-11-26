@@ -1,0 +1,756 @@
+{
+ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA": [
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 2,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "1991 – Spiderland",
+   "path": "/music/Slint/1991 – Spiderland/",
+   "size": 0,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "",
+   "type": {
+    "id": "directory",
+    "str": ""
+   },
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 9,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "1991 – Spiderland",
+   "path": "/music/Slint/1991 – Spiderland/",
+   "size": 0,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "",
+   "type": {
+    "id": "directory",
+    "str": ""
+   },
+   "user": {
+    "cid": "SWFFJT5B3AT53V5PPOTRPLHZQPTCEHRAHTDXQEA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 18,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "1991 – Spiderland",
+   "path": "/music/Slint/1991 – Spiderland/",
+   "size": 0,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "",
+   "type": {
+    "id": "directory",
+    "str": ""
+   },
+   "user": {
+    "cid": "2UUULSJAUFFYKVPVVBRMZND6JTR4FFFKZ2QLUAQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ ],
+ "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ": [
+  {
+   "connection": 91750400,
+   "dupe": null,
+   "id": 1,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "size": 44712866,
+   "slots": {
+    "free": 5,
+    "str": "5/5",
+    "total": 5
+   },
+   "time": 0,
+   "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "N6Z3P4HUUUMDPW76OLLMK5ZJMSJCMMGXRJC4NKA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  },
+  {
+   "connection": 91750400,
+   "dupe": null,
+   "id": 8,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "size": 44712866,
+   "slots": {
+    "free": 5,
+    "str": "5/5",
+    "total": 5
+   },
+   "time": 0,
+   "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "IBR3W4LHV4KANLBT4LK5Y3F3SFZI4A4YXSRFBUQ",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  },
+  {
+   "connection": 91750400,
+   "dupe": null,
+   "id": 15,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "size": 44712866,
+   "slots": {
+    "free": 5,
+    "str": "5/5",
+    "total": 5
+   },
+   "time": 0,
+   "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "TFHPEANTTW252C6N6YLXWVEKTGJ6MTW35BIKMTQ",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  },
+  {
+   "connection": 91750400,
+   "dupe": null,
+   "id": 17,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "size": 44712866,
+   "slots": {
+    "free": 5,
+    "str": "5/5",
+    "total": 5
+   },
+   "time": 0,
+   "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "AWBHGCDF4POLN6TRGMIR7VHZP24SAMXQYI4SDAY",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  },
+  {
+   "connection": 91750400,
+   "dupe": null,
+   "id": 24,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+   "size": 44712866,
+   "slots": {
+    "free": 5,
+    "str": "5/5",
+    "total": 5
+   },
+   "time": 0,
+   "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "AFDEKXO6PPFE5N7FLD2RM3SAXV622CPFECJMZEI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ ],
+ "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY": [
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 4,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "02 - Nosferatu Man.flac",
+   "path": "/music/Slint/1991 – Spiderland/02 - Nosferatu Man.flac",
+   "size": 33635690,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 11,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "02 - Nosferatu Man.flac",
+   "path": "/music/Slint/1991 – Spiderland/02 - Nosferatu Man.flac",
+   "size": 33635690,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "SWFFJT5B3AT53V5PPOTRPLHZQPTCEHRAHTDXQEA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 20,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "02 - Nosferatu Man.flac",
+   "path": "/music/Slint/1991 – Spiderland/02 - Nosferatu Man.flac",
+   "size": 33635690,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "2UUULSJAUFFYKVPVVBRMZND6JTR4FFFKZ2QLUAQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ ],
+ "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY": [
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 6,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "04 - Washer.flac",
+   "path": "/music/Slint/1991 – Spiderland/04 - Washer.flac",
+   "size": 43314622,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 13,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "04 - Washer.flac",
+   "path": "/music/Slint/1991 – Spiderland/04 - Washer.flac",
+   "size": 43314622,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "SWFFJT5B3AT53V5PPOTRPLHZQPTCEHRAHTDXQEA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 22,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "04 - Washer.flac",
+   "path": "/music/Slint/1991 – Spiderland/04 - Washer.flac",
+   "size": 43314622,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "2UUULSJAUFFYKVPVVBRMZND6JTR4FFFKZ2QLUAQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ ],
+ "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA": [
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 5,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Don, Aman.flac",
+   "path": "/music/Slint/1991 – Spiderland/03 - Don, Aman.flac",
+   "size": 28132633,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 12,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Don, Aman.flac",
+   "path": "/music/Slint/1991 – Spiderland/03 - Don, Aman.flac",
+   "size": 28132633,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "SWFFJT5B3AT53V5PPOTRPLHZQPTCEHRAHTDXQEA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 21,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Don, Aman.flac",
+   "path": "/music/Slint/1991 – Spiderland/03 - Don, Aman.flac",
+   "size": 28132633,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "2UUULSJAUFFYKVPVVBRMZND6JTR4FFFKZ2QLUAQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ ],
+ "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ": [
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 3,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "01 - Breadcrumb Trail.flac",
+   "path": "/music/Slint/1991 – Spiderland/01 - Breadcrumb Trail.flac",
+   "size": 35628596,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 10,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "01 - Breadcrumb Trail.flac",
+   "path": "/music/Slint/1991 – Spiderland/01 - Breadcrumb Trail.flac",
+   "size": 35628596,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "SWFFJT5B3AT53V5PPOTRPLHZQPTCEHRAHTDXQEA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  },
+  {
+   "connection": 402653184,
+   "dupe": null,
+   "id": 19,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "01 - Breadcrumb Trail.flac",
+   "path": "/music/Slint/1991 – Spiderland/01 - Breadcrumb Trail.flac",
+   "size": 35628596,
+   "slots": {
+    "free": 3,
+    "str": "3/3",
+    "total": 3
+   },
+   "time": 0,
+   "tth": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "2UUULSJAUFFYKVPVVBRMZND6JTR4FFFKZ2QLUAQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ ]
+}

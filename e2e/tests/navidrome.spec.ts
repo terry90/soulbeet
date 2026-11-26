@@ -8,6 +8,7 @@ import {
   changePassword,
   loginViaApi,
   loginViaUi,
+  openConfigTab,
   openSettings,
   registerUser,
   uniqueUser,
@@ -26,7 +27,7 @@ test('authenticates through Navidrome and reports the connection', async ({ cont
     await loginViaUi(page, { username: navidromeAdminUser, password: navidromeAdminPassword });
 
     await openSettings(page);
-    await page.getByRole('button', { name: 'Config' }).click();
+    await openConfigTab(page);
 
     await expect(page.getByText('Connected', { exact: true })).toBeVisible({ timeout: 30_000 });
   } finally {

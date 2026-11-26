@@ -213,6 +213,7 @@ pub(crate) async fn resume_downloads(
             transfer_id: row.id.clone(),
             job: slot.clone(),
             adopted,
+            sent: Vec::new(),
         };
         let destination = (!adopted).then(|| batch.destination.clone());
         match backend.get_download(&row.source, &row.id).await {

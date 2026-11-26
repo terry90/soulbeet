@@ -1,0 +1,171 @@
+{
+ "items": [
+  {
+   "complete": false,
+   "dupe": null,
+   "id": 5,
+   "name": "Scans",
+   "path": "/music/Slint/1991 – Spiderland/Scans/",
+   "size": 0.0,
+   "time": 0.0,
+   "tth": "",
+   "type": {
+    "directories": 0,
+    "files": 0,
+    "id": "directory",
+    "str": "0 files"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 6,
+   "name": "01 - Breadcrumb Trail.flac",
+   "path": "/music/Slint/1991 – Spiderland/01 - Breadcrumb Trail.flac",
+   "size": 35628596.0,
+   "time": 0.0,
+   "tth": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 7,
+   "name": "02 - Nosferatu Man.flac",
+   "path": "/music/Slint/1991 – Spiderland/02 - Nosferatu Man.flac",
+   "size": 33635690.0,
+   "time": 0.0,
+   "tth": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 8,
+   "name": "03 - Don, Aman.flac",
+   "path": "/music/Slint/1991 – Spiderland/03 - Don, Aman.flac",
+   "size": 28132633.0,
+   "time": 0.0,
+   "tth": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 9,
+   "name": "04 - Washer.flac",
+   "path": "/music/Slint/1991 – Spiderland/04 - Washer.flac",
+   "size": 43314622.0,
+   "time": 0.0,
+   "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 10,
+   "name": "05 - For Dinner....flac",
+   "path": "/music/Slint/1991 – Spiderland/05 - For Dinner....flac",
+   "size": 21057449.0,
+   "time": 0.0,
+   "tth": "SMI6QQ2MBNPCZHRKKTYG5QOROQHLEWB66QIPZOI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 11,
+   "name": "06 - Good Morning, Captain.flac",
+   "path": "/music/Slint/1991 – Spiderland/06 - Good Morning, Captain.flac",
+   "size": 44285660.0,
+   "time": 0.0,
+   "tth": "QFEBPAXYV732LZPYWZRCPDPBTFAKU27I5B2AICI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 12,
+   "name": "cover.jpg",
+   "path": "/music/Slint/1991 – Spiderland/cover.jpg",
+   "size": 409240.0,
+   "time": 0.0,
+   "tth": "UXR4D4FS5DJWGUJZOITWFABCUXD5WUCGKFGXGMY",
+   "type": {
+    "content_type": "picture",
+    "id": "file",
+    "str": "jpg"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 13,
+   "name": "Folder.auCDtect.txt",
+   "path": "/music/Slint/1991 – Spiderland/Folder.auCDtect.txt",
+   "size": 3002.0,
+   "time": 0.0,
+   "tth": "6CTYOBY57UFIXI3N3IJQESTQ4NCRAHOKFRAT5VI",
+   "type": {
+    "content_type": "document",
+    "id": "file",
+    "str": "txt"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 14,
+   "name": "Spiderland.cue",
+   "path": "/music/Slint/1991 – Spiderland/Spiderland.cue",
+   "size": 1126.0,
+   "time": 0.0,
+   "tth": "FFYL2KEO36ENBIEL3JW4FZABAOLLFNUVS6GIGAA",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "cue"
+   }
+  },
+  {
+   "complete": true,
+   "dupe": null,
+   "id": 15,
+   "name": "Spiderland.log",
+   "path": "/music/Slint/1991 – Spiderland/Spiderland.log",
+   "size": 6818.0,
+   "time": 0.0,
+   "tth": "NLR3INA7LYYZQXDLM7JOVMKP6XUETFCG45JYJQQ",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "log"
+   }
+  }
+ ],
+ "list_path": "/music/Slint/1991 – Spiderland/"
+}

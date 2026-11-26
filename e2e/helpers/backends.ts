@@ -3,7 +3,7 @@
 
 import type { Browser, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
-import { admin, loginViaApi, openSettings } from './app.js';
+import { admin, loginViaApi, openConfigTab, openSettings } from './app.js';
 import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from './env.js';
 
 /**
@@ -49,7 +49,7 @@ function backendBlock(page: Page, name: string): Locator {
 
 async function openConnections(page: Page, name: string): Promise<void> {
   await openSettings(page);
-  await page.getByRole('button', { name: 'Config' }).click();
+  await openConfigTab(page);
   await expect(heading(page, name)).toBeVisible();
 }
 
@@ -76,7 +76,7 @@ async function saved(page: Page, name: string, click: () => Promise<void>): Prom
 /** Reloads Settings > Config, which reads the switches from the server, and checks `name`'s. */
 async function storedAs(page: Page, name: string, state: RegExp): Promise<void> {
   await page.reload();
-  await page.getByRole('button', { name: 'Config' }).click();
+  await openConfigTab(page);
   await expect(backendSwitch(page, name)).toHaveClass(state);
 }
 

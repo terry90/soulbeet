@@ -8,9 +8,7 @@
 //! moving the file, which strands the file in slskd's incomplete folder.
 
 use dioxus::logger::tracing::{debug, info, warn};
-use shared::download::{
-    DownloadEvent, DownloadProgress, DownloadState, DownloadableItem, JobSlot, QueuedDownload,
-};
+use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::{BackendError, DownloadBackend, ImportMode};
 use std::collections::HashSet;
@@ -23,13 +21,12 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::enqueue::{stopped_rows, transfer_key};
-use super::failover::{SourcePool, MAX_SOURCES_PER_TRACK};
+use super::failover::{Sent, SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{
     album_jobs, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
 use super::utils::{file_id, FileId};
 use crate::config::CONFIG;
-use crate::core::database_failure;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
@@ -298,6 +295,8 @@ pub struct WatchedTransfer {
     /// enqueue, storing its attempt without a candidate: slskd saved it
     /// where its own enqueue said.
     pub adopted: bool,
+    /// Every alternate the slot's failover sent before the monitor took it.
+    pub sent: Vec<Sent>,
 }
 
 impl WatchedTransfer {
@@ -309,6 +308,7 @@ impl WatchedTransfer {
             transfer_id: queued.id.clone(),
             job,
             adopted: false,
+            sent: Vec::new(),
         }
     }
 }
@@ -328,25 +328,6 @@ struct TrackedFile {
     /// Every alternate the slot's failover sent, kept through every rebind:
     /// the only transfers the slot may adopt (`adoptable`).
     sent: Vec<Sent>,
-}
-
-/// An alternate a slot's failover sent, and the backend request it went in.
-/// An answer that refused it, or never came, does not prove the backend made
-/// no transfer of it: one it made is listed with that request.
-#[derive(Clone, Debug)]
-struct Sent {
-    candidate: DownloadableItem,
-    request: String,
-}
-
-impl Sent {
-    /// Whether `dl` is the transfer this send made: the same file from the
-    /// same source, made in its request.
-    fn made(&self, dl: &DownloadProgress) -> bool {
-        dl.source == self.candidate.source
-            && dl.item == self.candidate.id
-            && dl.request.as_deref() == Some(self.request.as_str())
-    }
 }
 
 /// Monitors download progress from slskd and hands finished files to the
@@ -419,7 +400,7 @@ impl DownloadMonitor {
                 transfer_id: t.transfer_id,
                 destination: (!t.adopted).then(|| batch.destination.clone()),
                 job: t.job,
-                sent: Vec::new(),
+                sent: t.sent,
             })
             .collect();
 
@@ -594,10 +575,11 @@ impl DownloadMonitor {
                 transfer_id: slot.transfer_id,
                 destination: Some(self.batch.destination.clone()),
                 job: slot.job,
-                sent: Vec::new(),
+                sent: slot.sent,
             });
             self.track_states.push(TrackState::bound_now());
-            self.pool.push_slot(slot.alternates, slot.max_sources);
+            self.pool
+                .push_slot(slot.alternates, slot.used, slot.max_sources);
         }
         any
     }
@@ -713,56 +695,14 @@ impl DownloadMonitor {
             .as_ref()
             .map_or("Transfer failed", |f| f.message.as_str())
             .to_string();
-        self.ledger.record(JobEvent::Slots {
-            state: JobState::Downloading,
-            rows: vec![self.stamp(slot, left)],
-        });
-        // Each source is stored before it is sent, so a restart knows which
-        // peer may hold the slot's transfer and in which request. A source
-        // the ledger cannot store is not sent. Each refused source is stored
-        // before the next one, so an accepted source is the newest attempt.
         // When every source is refused, the slot ends with `left`, whose
         // attempt is older than the refused ones: a reader finds a row's
         // attempt by its source and file, never by its place.
-        let (ledger, job) = (self.ledger.clone(), self.tracked_files[slot].job.clone());
-        let filename = self.tracked_files[slot].filename.clone();
-        let mut sends = Vec::new();
-        let record = |item: &DownloadableItem, request: &str| {
-            sends.push(Sent {
-                candidate: item.clone(),
-                request: request.to_string(),
-            });
-            let ledger = ledger.clone();
-            let attempt = JobEvent::Attempt {
-                slot: job.clone(),
-                candidate: Some(Box::new(item.clone())),
-                request: Some(request.to_string()),
-            };
-            async move {
-                ledger
-                    .record_stored(attempt)
-                    .await
-                    .map_err(|e| database_failure(Stage::Enqueue, e))
-            }
-        };
-        let refusing = |item: &DownloadableItem, failure: &Failure| {
-            warn!(
-                "Failover source {} refused {} for {}: {}: {}",
-                item.source,
-                item.id,
-                filename,
-                failure.code.as_str(),
-                failure.message
-            );
-            ledger.record(JobEvent::Refused {
-                slot: job.clone(),
-                candidate: Box::new(item.clone()),
-                failure: failure.clone(),
-            });
-        };
-        let next = self
+        let job = self.tracked_files[slot].job.clone();
+        let left = self.stamp(slot, left);
+        let (next, mut sends) = self
             .pool
-            .enqueue_next_noting(slot, backend, &self.batch, record, refusing)
+            .fail_over(slot, backend, &self.batch, &self.ledger, &job, left)
             .await;
         self.tracked_files[slot].sent.append(&mut sends);
         let Some((_, queued)) = next.queued else {
@@ -2054,6 +1994,7 @@ mod tests {
         batch, batch_on, item, key, transfer, Cancel, ScriptedOutcome, StubBackend, StubBackends,
         StubFault,
     };
+    use shared::download::DownloadableItem;
     use shared::failure::{Service, UserActionCode};
     use soulbeet::error::{MissingSetting, SoulseekError};
     use std::path::Path;
@@ -2132,6 +2073,7 @@ mod tests {
             transfer_id: id_of(filename),
             job: slot_of_j1(slot),
             adopted: false,
+            sent: Vec::new(),
         }
     }
 
@@ -3130,7 +3072,9 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                used: 1,
                 max_sources: MAX_SOURCES_PER_TRACK,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -5057,7 +5001,9 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: id_of("02.flac"),
                 alternates: vec![],
+                used: 1,
                 max_sources: MAX_SOURCES_PER_TRACK,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -5097,7 +5043,9 @@ mod tests {
                 filename: "dirA/two.flac".into(),
                 transfer_id: id_of("dirA/two.flac"),
                 alternates: vec![item("peer_b", "Two", "dirB/two.flac")],
+                used: 1,
                 max_sources: MAX_SOURCES_PER_TRACK,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -5144,7 +5092,9 @@ mod tests {
                     item("peer_b", "Two", "dirB/two.flac"),
                     item("peer_c", "Two", "dirC/two.flac"),
                 ],
+                used: 1,
                 max_sources: 2,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -5225,7 +5175,9 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                used: 1,
                 max_sources: MAX_SOURCES_PER_TRACK,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");
@@ -5265,7 +5217,9 @@ mod tests {
                 filename: "02.flac".to_string(),
                 transfer_id: "t-02".to_string(),
                 alternates: vec![],
+                used: 1,
                 max_sources: MAX_SOURCES_PER_TRACK,
+                sent: vec![],
                 job: slot_of_j1(1),
             }])
             .expect("delivered");

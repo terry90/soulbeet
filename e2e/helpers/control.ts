@@ -1,13 +1,13 @@
 // Client for the stubs' /_control APIs: scripts slskd peer behavior and
 // outages, how MusicBrainz answers beets per spec, and how the GD Studio
-// double's API and tracks answer; reads what beets asked MusicBrainz for and
-// the calls GD Studio answered, and resets shared stub state between
-// destructive tests.
+// double's API and tracks answer; reads what beets asked MusicBrainz for, the
+// calls GD Studio answered and the AirDC++ double's state, and resets shared
+// stub state between destructive tests.
 
 import type { PeerBehavior } from '../fixtures/dataset.js';
 import type { ApiMode, TrackBehavior } from '../stubs/src/gdstudio-state.js';
 import type { MbMode } from '../stubs/src/mb-server.js';
-import { gdstudioControlUrl, mbControlUrl, slskdControlUrl } from './env.js';
+import { airdcppControlUrl, gdstudioControlUrl, mbControlUrl, slskdControlUrl } from './env.js';
 
 /** A transfer as the slskd stub's state snapshot reports it. */
 export interface StubTransfer {
@@ -108,4 +108,39 @@ export async function gdstudioCalls(): Promise<{ total: number; maxInWindow: num
 
 export async function resetGdStudio(): Promise<void> {
   await post('/_control/reset', {}, gdstudioControlUrl);
+}
+
+/** A file bundle as the AirDC++ double's state snapshot reports it. */
+export interface AirdcppBundle {
+  id: number;
+  target: string;
+  state: 'queued' | 'running' | 'completed';
+  nick: string;
+  /** The size of the file at its target, null while it is not there. */
+  onDisk: number | null;
+}
+
+export interface AirdcppState {
+  /** The shared downloads folder as the double names it. */
+  root: string;
+  /** Hub searches the double got since it started. */
+  searches: number;
+  bundles: AirdcppBundle[];
+  /** Each bundle removal: its id, the body it came with, and whether it had finished. */
+  removals: { id: number; body: unknown; finished: boolean }[];
+  /** Every file queued since the last reset. */
+  queued: { id: number; nick: string; target: string }[];
+}
+
+export async function airdcppState(): Promise<AirdcppState> {
+  const response = await fetch(`${airdcppControlUrl}/_control/state`);
+  if (!response.ok) {
+    throw new Error(`control airdcpp state failed: ${response.status}`);
+  }
+  return (await response.json()) as AirdcppState;
+}
+
+/** Forgets the AirDC++ double's bundles, lists, removals and queued files; its search count stays. */
+export async function resetAirdcpp(): Promise<void> {
+  await post('/_control/reset', {}, airdcppControlUrl);
 }

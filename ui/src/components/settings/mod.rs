@@ -4,6 +4,7 @@ mod choose_password;
 mod connected_apps;
 mod connection_status_row;
 mod deletion_checks;
+mod direct_connect;
 mod folder_admin;
 mod folder_manager;
 mod panel;

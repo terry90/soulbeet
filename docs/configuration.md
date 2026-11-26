@@ -59,4 +59,8 @@ ffmpeg is the one on `PATH` (`/usr/local/bin/ffmpeg` in `:full`). A relative pat
 
 Downloads NetEase's files through GD Studio's public API, each checked against the size GD Studio gives and the MD5 NetEase names it by, then tagged with the track you asked for; see [gdstudio.md](gdstudio.md). GD Studio's API page forbids downloading; read that page before you turn this on. It needs no account and no address. Soulbeet sends the API at most 45 calls in 5 minutes for every user together. The container needs outbound https to `music-api.gdstudio.xyz` and to NetEase's file servers (`*.music.126.net`). Partial files sit in `DOWNLOAD_PATH/.soulful-partial/`, as for the Internet Archive. `GDSTUDIO_HOST` (`host:port`, reached over http) points it at a test double instead of GD Studio; leave it unset.
 
+### Direct Connect
+
+Searches the Direct Connect hubs an AirDC++ Web Client you run is connected to, and has it download the files, each checked by AirDC++ against its TTH before it is imported; see [direct-connect.md](direct-connect.md) for setting AirDC++ up. Under its switch, give the AirDC++ address (for example `http://airdcpp:5600`, with no user name or password in it; `http://` only on a private container network or the same machine, since the password goes with every request, `https://` to reach another host), the web user Soulbeet signs in as and its password, then **Save Direct Connect**. The password is stored encrypted under `SECRET_KEY` and never shown again; saving with the password field empty keeps it. **Check AirDC++** shows what Soulbeet sees of it. AirDC++ must save into the same folder as `DOWNLOAD_PATH`.
+
 How a download source plugs in is in [download-backends.md](download-backends.md).

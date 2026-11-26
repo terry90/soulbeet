@@ -1,0 +1,13 @@
+{
+ "cid": "AFDEKXO6PPFE5N7FLD2RM3SAXV622CPFECJMZEI",
+ "flags": [
+  "away",
+  "nmdc"
+ ],
+ "hub_names": "Hub Two",
+ "hub_url": "dchub://hub-two.example:411",
+ "hub_urls": [
+  "dchub://hub-two.example:411"
+ ],
+ "nicks": "peer02"
+}

@@ -12,6 +12,7 @@
 
 use crate::auth::UserId;
 use crate::ledger::DuplicateRule;
+use crate::server_fns::download::failover::Sent;
 use shared::download::{batch_folder, DownloadProgress, DownloadableItem, JobSlot};
 use soulbeet::ImportMode;
 use std::collections::{HashMap, HashSet};
@@ -339,11 +340,16 @@ pub struct AddedSlot {
     pub source: String,
     pub filename: String,
     pub transfer_id: String,
-    /// Other sources for the same track, best first; empty when the request
-    /// had none.
+    /// Other sources for the same track not tried yet, best first; empty
+    /// when the request had none.
     pub alternates: Vec<DownloadableItem>,
-    /// The most sources the slot may use, the transfer being its first.
+    /// The sources the slot used, the transfer being the last: more than one
+    /// when the request fell over to it from a source that refused the file.
+    pub used: usize,
+    /// The most sources the slot may use.
     pub max_sources: usize,
+    /// Every alternate the request's failover sent for the slot.
+    pub sent: Vec<Sent>,
     /// The job slot the transfer downloads for.
     pub job: JobSlot,
 }
@@ -551,7 +557,9 @@ mod tests {
             filename: filename.to_string(),
             transfer_id: format!("t-{filename}"),
             alternates: vec![],
+            used: 1,
             max_sources: MAX_SOURCES_PER_TRACK,
+            sent: vec![],
             job: JobSlot {
                 job: "j1".to_string(),
                 slot: 0,

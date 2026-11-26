@@ -11,6 +11,11 @@ pub mod keys {
     /// This install's id, made on first use: what tells two installs sharing a downloads
     /// folder apart.
     pub const INSTANCE_ID: &str = "instance_id";
+    /// The AirDC++ sidecar's Web API address, its web user, and that user's password,
+    /// encrypted under the secret key.
+    pub const AIRDCPP_URL: &str = "airdcpp_url";
+    pub const AIRDCPP_USERNAME: &str = "airdcpp_username";
+    pub const AIRDCPP_PASSWORD: &str = "airdcpp_password";
 
     /// The key that holds `"true"` while an admin has the backend `id` turned on.
     pub fn backend_enabled(id: &str) -> String {

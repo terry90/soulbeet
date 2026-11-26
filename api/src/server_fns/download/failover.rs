@@ -1,21 +1,26 @@
 //! Peer failover for downloads.
 //!
-//! A Soulseek peer can accept an enqueue and then never deliver a byte. The
-//! search that picked it already returned other peers offering the same
-//! track, so a failed transfer should move to the next-best source rather
-//! than fail the track. This module owns those alternates and the per-track
-//! attempt budget; the waiters (`DownloadMonitor`, discovery's poll loop)
-//! decide *when* a transfer has definitively failed.
+//! A peer can refuse a file when it is asked for it, or accept it and then
+//! never deliver a byte. The search that picked it already returned other
+//! peers offering the same track, so the track should move to the next-best
+//! source rather than fail. This module owns those alternates and the
+//! per-track attempt budget; the request that enqueues a file and the waiters
+//! (`DownloadMonitor`, discovery's poll loop) decide *when* a source has
+//! definitively failed.
 
-use shared::download::{DownloadableGroup, DownloadableItem, EnqueueStatus, QueuedDownload};
+use shared::download::{
+    DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
+};
 use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::enqueue::{enqueue_claimed, held_failure, not_enqueued_failure, transfer_key};
+use crate::core::database_failure;
+use crate::ledger::{JobEvent, JobState, Ledger};
 use crate::transfer_registry::{BatchRef, TransferRegistry};
 
 /// Sources tried per track before it is declared failed: the peer picked at
@@ -28,6 +33,25 @@ pub const MAX_SOURCES_PER_TRACK: usize = 4;
 pub struct RefusedAlternate {
     pub candidate: DownloadableItem,
     pub failure: Failure,
+}
+
+/// An alternate a slot's failover sent, and the backend request it went in.
+/// An answer that refused it, or never came, does not prove the backend made
+/// no transfer of it: one it made is listed with that request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sent {
+    pub candidate: DownloadableItem,
+    pub request: String,
+}
+
+impl Sent {
+    /// Whether `dl` is the transfer this send made: the same file from the
+    /// same source, made in its request.
+    pub fn made(&self, dl: &DownloadProgress) -> bool {
+        dl.source == self.candidate.source
+            && dl.item == self.candidate.id
+            && dl.request.as_deref() == Some(self.request.as_str())
+    }
 }
 
 /// What `enqueue_next` did with a slot.
@@ -52,13 +76,10 @@ pub struct SourcePool {
 }
 
 impl SourcePool {
-    /// Alternates for a batch, indexed by the slot the caller will monitor.
-    ///
-    /// Callers pass the tracks in the exact order they were enqueued, which is
-    /// not the order they were searched: slskd groups an enqueue by peer, and
-    /// items whose backend data will not parse are dropped before enqueue. A
-    /// `None` entry keeps a slot aligned when its track cannot be recovered,
-    /// and that slot simply gets no alternates.
+    /// Alternates for `tracks`, slot N being the alternates of `tracks[N]`,
+    /// each slot having used its first of `max_sources` sources. A `None`
+    /// entry keeps a slot aligned when its track cannot be recovered, and
+    /// that slot simply gets no alternates.
     ///
     /// `rest` must already be in descending score order, which is how
     /// `auto_download` sorts it.
@@ -73,19 +94,34 @@ impl SourcePool {
                 Some(track) => alternates_for(track, rest),
                 None => Vec::new(),
             };
-            pool.push_slot(alternates, max_sources);
+            pool.push_slot(alternates, 1, max_sources);
         }
         pool
     }
 
-    /// Adds a slot after the last; its transfer counts as its first of
-    /// `max_sources` sources.
-    pub fn push_slot(&mut self, alternates: Vec<DownloadableItem>, max_sources: usize) {
+    /// Adds a slot after the last, which used `used` of its `max_sources`
+    /// sources, its transfer being the last of them.
+    pub fn push_slot(
+        &mut self,
+        alternates: Vec<DownloadableItem>,
+        used: usize,
+        max_sources: usize,
+    ) {
         self.slots.push(Slot {
             alternates: alternates.into(),
-            used: 1,
+            used,
             max: max_sources,
         });
+    }
+
+    /// This slot's untried alternates, the sources it used and its cap, as
+    /// `resumed` and `push_slot` take them; nothing, of the default cap, for
+    /// a slot that does not exist.
+    pub fn sources_of(&self, slot: usize) -> (Vec<DownloadableItem>, usize, usize) {
+        match self.slots.get(slot) {
+            Some(s) => (s.alternates.iter().cloned().collect(), s.used, s.max),
+            None => (Vec::new(), 0, MAX_SOURCES_PER_TRACK),
+        }
     }
 
     /// A pool resumed after a restart: per slot its untried alternates, the
@@ -235,6 +271,71 @@ impl SourcePool {
             refused,
         }
     }
+
+    /// `enqueue_next` for this slot, which downloads for `job` and whose
+    /// source ended with `left` (its row, marked with the batch and `job`,
+    /// its failure set), with every step stored in `ledger`: `left` first,
+    /// which ends that attempt while the slot is still downloading; then each
+    /// alternate and the backend request it goes in, before it is sent, so a
+    /// restart knows which peer may hold the slot's transfer and in which
+    /// request; then each refused alternate, before the next is tried, so an
+    /// accepted one is the newest attempt. An alternate the ledger cannot
+    /// store is not sent. Returns what `enqueue_next` did, and every
+    /// alternate it sent: the only transfers the slot may adopt besides its
+    /// own (`Sent::made`).
+    pub async fn fail_over(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        batch: &BatchRef,
+        ledger: &Ledger,
+        job: &JobSlot,
+        left: DownloadProgress,
+    ) -> (NextSource, Vec<Sent>) {
+        let filename = left.item.clone();
+        ledger.record(JobEvent::Slots {
+            state: JobState::Downloading,
+            rows: vec![left],
+        });
+        let mut sends = Vec::new();
+        let record = |item: &DownloadableItem, request: &str| {
+            sends.push(Sent {
+                candidate: item.clone(),
+                request: request.to_string(),
+            });
+            let ledger = ledger.clone();
+            let attempt = JobEvent::Attempt {
+                slot: job.clone(),
+                candidate: Some(Box::new(item.clone())),
+                request: Some(request.to_string()),
+            };
+            async move {
+                ledger
+                    .record_stored(attempt)
+                    .await
+                    .map_err(|e| database_failure(Stage::Enqueue, e))
+            }
+        };
+        let refusing = |item: &DownloadableItem, failure: &Failure| {
+            warn!(
+                "Failover source {} refused {} for {}: {}: {}",
+                item.source,
+                item.id,
+                filename,
+                failure.code.as_str(),
+                failure.message
+            );
+            ledger.record(JobEvent::Refused {
+                slot: job.clone(),
+                candidate: Box::new(item.clone()),
+                failure: failure.clone(),
+            });
+        };
+        let next = self
+            .enqueue_next_noting(slot, backend, batch, record, refusing)
+            .await;
+        (next, sends)
+    }
 }
 
 /// The item of each group of `rest` offering `track` (same normalized title)
@@ -273,28 +374,6 @@ pub fn alternates_for(
         .collect()
 }
 
-/// Line the accepted downloads up with the tracks they came from, in the
-/// order the caller will monitor them.
-///
-/// `queued` is neither the order nor the length of `items`: slskd groups an
-/// enqueue by peer, items whose backend data will not parse are dropped
-/// before the request is sent, and rejected enqueues are filtered out by the
-/// caller.
-/// Feeding `items` straight to `from_tracks` would hand slot N the alternates
-/// of a different track.
-///
-/// A download that matches no item (`item_index`) stays `None` so the slots
-/// after it keep their index.
-pub fn align_pool_tracks(
-    queued: &[QueuedDownload],
-    items: &[DownloadableItem],
-) -> Vec<Option<DownloadableItem>> {
-    queued
-        .iter()
-        .map(|d| item_index(d, items).map(|at| items[at].clone()))
-        .collect()
-}
-
 /// The index in `items` of the item `queued` was enqueued from (same id and
 /// source). Matching keys on both: `QueuedDownload::item` is the item's `id`
 /// verbatim, both being the remote filename, and the same filename can be
@@ -330,14 +409,6 @@ mod tests {
             size: 0,
             status: EnqueueStatus::Enqueued,
         }
-    }
-
-    /// The ids `align_pool_tracks` lands in each slot, `None` for a gap.
-    fn aligned_ids(queued: &[QueuedDownload], items: &[DownloadableItem]) -> Vec<Option<String>> {
-        align_pool_tracks(queued, items)
-            .into_iter()
-            .map(|track| track.map(|i| i.id))
-            .collect()
     }
 
     /// Three tracks of one album as the search returned them, `dirA` first.
@@ -400,87 +471,6 @@ mod tests {
         )]);
         assert_eq!(pool.take_next(0).map(|i| i.id), Some("c/01.flac".into()));
         assert!(pool.take_next(0).is_none());
-    }
-
-    #[test]
-    fn align_pool_tracks_follows_the_enqueue_order() {
-        // The enqueue came back with the dirB files first. Returning `items` in search order here would give
-        // slot 0 the alternates for "One" while the monitor watches "Two".
-        let items = searched();
-        let accepted = vec![
-            queued("peer_a", "dirB/02.flac"),
-            queued("peer_a", "dirB/03.flac"),
-            queued("peer_a", "dirA/01.flac"),
-        ];
-
-        assert_eq!(
-            aligned_ids(&accepted, &items),
-            vec![
-                Some("dirB/02.flac".to_string()),
-                Some("dirB/03.flac".to_string()),
-                Some("dirA/01.flac".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn align_pool_tracks_skips_an_item_dropped_before_enqueue() {
-        // "Two" had unparseable backend data, so to_slskd_track dropped it and
-        // slskd was never asked about it. Three items, two slots.
-        let items = searched();
-        let accepted = vec![
-            queued("peer_a", "dirA/01.flac"),
-            queued("peer_a", "dirB/03.flac"),
-        ];
-
-        assert_eq!(
-            aligned_ids(&accepted, &items),
-            vec![
-                Some("dirA/01.flac".to_string()),
-                Some("dirB/03.flac".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn align_pool_tracks_skips_a_rejected_enqueue() {
-        // "Two" came back with an error and the caller partitioned it out, and
-        // the survivors arrived in another order than the search's.
-        let items = searched();
-        let accepted = vec![
-            queued("peer_a", "dirB/03.flac"),
-            queued("peer_a", "dirA/01.flac"),
-        ];
-
-        assert_eq!(
-            aligned_ids(&accepted, &items),
-            vec![
-                Some("dirB/03.flac".to_string()),
-                Some("dirA/01.flac".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn align_pool_tracks_leaves_an_unrecognised_download_as_a_gap() {
-        // Same remote filename, different peer: the source half of the key
-        // must stop it matching, and the slot must stay in place so the
-        // download after it is not shifted down.
-        let items = searched();
-        let accepted = vec![
-            queued("peer_a", "dirA/01.flac"),
-            queued("peer_z", "dirB/02.flac"),
-            queued("peer_a", "dirB/03.flac"),
-        ];
-
-        assert_eq!(
-            aligned_ids(&accepted, &items),
-            vec![
-                Some("dirA/01.flac".to_string()),
-                None,
-                Some("dirB/03.flac".to_string()),
-            ]
-        );
     }
 
     #[test]
@@ -671,6 +661,7 @@ mod tests {
                 item("peer_b", "One", "b/01.flac"),
                 item("peer_c", "One", "c/01.flac"),
             ],
+            1,
             2,
         );
         assert_eq!(pool.max_sources(0), 1);
@@ -692,6 +683,7 @@ mod tests {
         );
         pool.push_slot(
             vec![item("peer_c", "Two", "c/02.flac")],
+            1,
             MAX_SOURCES_PER_TRACK,
         );
         assert_eq!(pool.attempts_used(1), 1);
@@ -703,6 +695,30 @@ mod tests {
             pool.take_next(0).map(|i| i.id),
             Some("b/01.flac".to_string())
         );
+    }
+
+    #[test]
+    fn a_slots_sources_carry_over_to_another_pool_with_its_budget() {
+        let rest = vec![
+            group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.9),
+            group("peer_c", vec![item("peer_c", "One", "c/01.flac")], 0.8),
+            group("peer_d", vec![item("peer_d", "One", "d/01.flac")], 0.7),
+        ];
+        let mut pool = SourcePool::from_tracks(
+            &[Some(item("peer_a", "One", "a/01.flac"))],
+            &rest,
+            MAX_SOURCES_PER_TRACK,
+        );
+        pool.take_next(0);
+        let (alternates, used, max) = pool.sources_of(0);
+        assert_eq!((alternates.len(), used, max), (2, 2, MAX_SOURCES_PER_TRACK));
+
+        let mut moved = SourcePool { slots: vec![] };
+        moved.push_slot(alternates, used, max);
+        assert_eq!(moved.take_next(0).map(|i| i.id), Some("c/01.flac".into()));
+        assert_eq!(moved.take_next(0).map(|i| i.id), Some("d/01.flac".into()));
+        assert!(moved.take_next(0).is_none(), "its budget is spent");
+        assert_eq!(pool.sources_of(9), (vec![], 0, MAX_SOURCES_PER_TRACK));
     }
 
     #[tokio::test]

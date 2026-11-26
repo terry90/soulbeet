@@ -1,0 +1,34 @@
+{
+ "downloaded_bytes": 0.0,
+ "id": 840189712,
+ "name": "Portishead - Glory Box.mp3",
+ "priority": {
+  "auto": true,
+  "id": 3,
+  "str": "Low"
+ },
+ "seconds_left": 0.0,
+ "size": 3441572.0,
+ "sources": {
+  "online": 1,
+  "str": "1/1 online",
+  "total": 1
+ },
+ "speed": 0.0,
+ "status": {
+  "completed": false,
+  "downloaded": false,
+  "failed": false,
+  "hook_error": null,
+  "id": "queued",
+  "str": "Waiting (0.0%)"
+ },
+ "target": "/downloads/100% Hits  2026 [ab12]/Portishead - Glory Box.mp3",
+ "time_added": 1795654272.0,
+ "time_finished": 0.0,
+ "type": {
+  "content_type": "audio",
+  "id": "file",
+  "str": "mp3"
+ }
+}

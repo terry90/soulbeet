@@ -1,0 +1,3071 @@
+{
+ "MRHSPMYNQ6SWGCUNN6CBUJQXIC2R3MJ5DRAFXPY": [
+  {
+   "connection": 655,
+   "dupe": null,
+   "id": 62,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead Glory Box. Cover by the Graystones..mp4",
+   "path": "/music videoes/Portishead Glory Box. Cover by the Graystones..mp4",
+   "size": 67827148,
+   "slots": {
+    "free": 29,
+    "str": "29/30",
+    "total": 30
+   },
+   "time": 0,
+   "tth": "MRHSPMYNQ6SWGCUNN6CBUJQXIC2R3MJ5DRAFXPY",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mp4"
+   },
+   "user": {
+    "cid": "ROTWVE2Y7YY7QHKREQ6Q6RLBUMBZLLKUB7NI3EQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer03"
+   }
+  },
+  {
+   "connection": 655,
+   "dupe": null,
+   "id": 139,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead Glory Box. Cover by the Graystones..mp4",
+   "path": "/music videoes/Portishead Glory Box. Cover by the Graystones..mp4",
+   "size": 67827148,
+   "slots": {
+    "free": 29,
+    "str": "29/30",
+    "total": 30
+   },
+   "time": 0,
+   "tth": "MRHSPMYNQ6SWGCUNN6CBUJQXIC2R3MJ5DRAFXPY",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mp4"
+   },
+   "user": {
+    "cid": "2Q6OVQSM4LAZ7SJ7YTZUY4AICRRCXUERTPEUNLA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer03"
+   }
+  }
+ ],
+ "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 27,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "4JAJHDJW2MSCERSM7IHNEZFA24Z5XLM5WHB6WDA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer04"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 33,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "EZ362O57PVQFQ6GMGRO3YMQGCEREIOCWSIMV77A",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 35,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "L4MGDAZVCOAM6FO3NA6RHH5H4PE4GTMIQ6C6OOY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer29"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 55,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "5TA7JFWVAL7FB5KKHARVDPQD5XPGPX7WCEFMICQ",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 75,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UNN3DP6NA6DIAIDYBBJKLBIJ4S7MPCY32GFCLSA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer30"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 77,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UBOYF2YATJPRLAEXXJ7GWOJFFLT3C6E6PNHF2HY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer31"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 92,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UCDXFXVMRFODGIIGLJ47CDSJDZWVMKAMZ3R7SUY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 100,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "RVYRVTTU57SXFVIYUOOOIYLJAKRLOCBVOWOIZEQ",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer32"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 102,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+   "size": 4521885,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "BXAR4JJZS44FZOYUITJB7XQ3OJGIOPWB5637GTA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  }
+ ],
+ "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 26,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "4JAJHDJW2MSCERSM7IHNEZFA24Z5XLM5WHB6WDA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer04"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 32,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "EZ362O57PVQFQ6GMGRO3YMQGCEREIOCWSIMV77A",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 34,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "L4MGDAZVCOAM6FO3NA6RHH5H4PE4GTMIQ6C6OOY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer29"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 54,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "5TA7JFWVAL7FB5KKHARVDPQD5XPGPX7WCEFMICQ",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 73,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "DFFMGZ326EMYV7LJAD6BBM5G42YLIXDCVELPGIA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer33"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 74,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UNN3DP6NA6DIAIDYBBJKLBIJ4S7MPCY32GFCLSA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer30"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 76,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UBOYF2YATJPRLAEXXJ7GWOJFFLT3C6E6PNHF2HY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer31"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 91,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "UCDXFXVMRFODGIIGLJ47CDSJDZWVMKAMZ3R7SUY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 99,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "RVYRVTTU57SXFVIYUOOOIYLJAKRLOCBVOWOIZEQ",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer32"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 101,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glorybox.mp3",
+   "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+   "size": 5041837,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "BXAR4JJZS44FZOYUITJB7XQ3OJGIOPWB5637GTA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer28"
+   }
+  }
+ ],
+ "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 58,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box (MM).vob",
+   "path": "/Videos/~Portishead/Portishead - Glory Box (MM).vob",
+   "size": 257396736,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "vob"
+   },
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 90,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box (MM).vob",
+   "path": "/Videos/~Portishead/Portishead - Glory Box (MM).vob",
+   "size": 257396736,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "vob"
+   },
+   "user": {
+    "cid": "6A76E4GLBDGA7ULQYFEOEEYSYO6BJMHBWPV24SY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 115,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box (MM).vob",
+   "path": "/Videos/~Portishead/Portishead - Glory Box (MM).vob",
+   "size": 257396736,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "vob"
+   },
+   "user": {
+    "cid": "6ZGZD7QJPJ3PEULVEHTVM4TACVM774WEAULUYGQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ ],
+ "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 57,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp4",
+   "path": "/Videos/~Portishead/Portishead - Glory Box.mp4",
+   "size": 24496730,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mp4"
+   },
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 89,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp4",
+   "path": "/Videos/~Portishead/Portishead - Glory Box.mp4",
+   "size": 24496730,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mp4"
+   },
+   "user": {
+    "cid": "6A76E4GLBDGA7ULQYFEOEEYSYO6BJMHBWPV24SY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 114,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Portishead - Glory Box.mp4",
+   "path": "/Videos/~Portishead/Portishead - Glory Box.mp4",
+   "size": 24496730,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mp4"
+   },
+   "user": {
+    "cid": "6ZGZD7QJPJ3PEULVEHTVM4TACVM774WEAULUYGQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ ],
+ "2HJGCY6X62G5LMW32TAE72YBSCYE2CTXIF6HH7Q": [
+  {
+   "connection": 655360,
+   "dupe": null,
+   "id": 28,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Glory Box.vqf",
+   "path": "/Muz/P/Portishead/Portishead - Dummy/Glory Box.vqf",
+   "size": 3655718,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "2HJGCY6X62G5LMW32TAE72YBSCYE2CTXIF6HH7Q",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "vqf"
+   },
+   "user": {
+    "cid": "5JF3IXKBFUI3IUTJA44LCEKB7OPENVPYHMM2LXI",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer10"
+   }
+  },
+  {
+   "connection": 655360,
+   "dupe": null,
+   "id": 119,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Glory Box.vqf",
+   "path": "/Muz/P/Portishead/Portishead - Dummy/Glory Box.vqf",
+   "size": 3655718,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "2HJGCY6X62G5LMW32TAE72YBSCYE2CTXIF6HH7Q",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "vqf"
+   },
+   "user": {
+    "cid": "3HXUIYEB3MW53DAX6PNVRCO5LMHCBNGW7ZS6LNY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer34"
+   }
+  }
+ ],
+ "T5D2YUKF442P34V32DF5GB5PZPRDGSEC4GVKXFI": [
+  {
+   "connection": 655360,
+   "dupe": null,
+   "id": 29,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Glory Box.vqf",
+   "path": "/Muz/P/Portishead/Portishead - Roseland NYC Live/Glory Box.vqf",
+   "size": 4046322,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T5D2YUKF442P34V32DF5GB5PZPRDGSEC4GVKXFI",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "vqf"
+   },
+   "user": {
+    "cid": "5JF3IXKBFUI3IUTJA44LCEKB7OPENVPYHMM2LXI",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer10"
+   }
+  },
+  {
+   "connection": 655360,
+   "dupe": null,
+   "id": 120,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "Glory Box.vqf",
+   "path": "/Muz/P/Portishead/Portishead - Roseland NYC Live/Glory Box.vqf",
+   "size": 4046322,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "T5D2YUKF442P34V32DF5GB5PZPRDGSEC4GVKXFI",
+   "type": {
+    "content_type": "",
+    "id": "file",
+    "str": "vqf"
+   },
+   "user": {
+    "cid": "3HXUIYEB3MW53DAX6PNVRCO5LMHCBNGW7ZS6LNY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer34"
+   }
+  }
+ ],
+ "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ": [
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 46,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+   "size": 12095488,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 63,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+   "size": 12095488,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "CDE6TZ6S3XWQVAGPITM57RNZ44HOS246DQTS44Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer35"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 68,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+   "size": 12095488,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "WLX2RENBMO67D54SALQXGJK6URKAZNXXMV5SWUY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 103,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+   "size": 12095488,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "Z4OWVLEZLUZEH6EFWTYBLXIM3H7CIX34R6MQXJA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 108,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "03 - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+   "size": 12095488,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "GRNRIVXDNEKOHU46SPFAX5JNL6BCCQKW57KLWYQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer36"
+   }
+  }
+ ],
+ "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ": [
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 50,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Glory Box Edit.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+   "size": 6815744,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 67,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Glory Box Edit.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+   "size": 6815744,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "CDE6TZ6S3XWQVAGPITM57RNZ44HOS246DQTS44Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer35"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 72,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Glory Box Edit.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+   "size": 6815744,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "WLX2RENBMO67D54SALQXGJK6URKAZNXXMV5SWUY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 107,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Glory Box Edit.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+   "size": 6815744,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "Z4OWVLEZLUZEH6EFWTYBLXIM3H7CIX34R6MQXJA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 112,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Glory Box Edit.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+   "size": 6815744,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "GRNRIVXDNEKOHU46SPFAX5JNL6BCCQKW57KLWYQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer36"
+   }
+  }
+ ],
+ "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 30,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11.Glory Box.mp3",
+   "path": "/Shared Music/Portishead/Portishead - Dummy (Go! Beat 828 553-2)/11.Glory Box.mp3",
+   "size": 12333893,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "BO5SGBEICQHNHO7X5PWKBKTJ2IIE74BXEJK7D7I",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 82,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11.Glory Box.mp3",
+   "path": "/Shared Music/Portishead/Portishead - Dummy (Go! Beat 828 553-2)/11.Glory Box.mp3",
+   "size": 12333893,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "MKQ2K2TLHIKK6UJEE4ZO4ZJWBITEJ2Q365VD47Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 121,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11.Glory Box.mp3",
+   "path": "/Shared Music/Portishead/Portishead - Dummy (Go! Beat 828 553-2)/11.Glory Box.mp3",
+   "size": 12333893,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "EW5SX4Y5JMS3K5VEOS2K5BQULM3TE4ABYQMD4YY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  }
+ ],
+ "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 31,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "(portishead)_-08-_glory_box.mp3",
+   "path": "/Shared Music/Portishead/PNYC/(portishead)_-08-_glory_box.mp3",
+   "size": 6772041,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "BO5SGBEICQHNHO7X5PWKBKTJ2IIE74BXEJK7D7I",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 83,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "(portishead)_-08-_glory_box.mp3",
+   "path": "/Shared Music/Portishead/PNYC/(portishead)_-08-_glory_box.mp3",
+   "size": 6772041,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "MKQ2K2TLHIKK6UJEE4ZO4ZJWBITEJ2Q365VD47Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 122,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "(portishead)_-08-_glory_box.mp3",
+   "path": "/Shared Music/Portishead/PNYC/(portishead)_-08-_glory_box.mp3",
+   "size": 6772041,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "EW5SX4Y5JMS3K5VEOS2K5BQULM3TE4ABYQMD4YY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  }
+ ],
+ "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY": [
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 60,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Pearl/08 - Glory Box.MP3",
+   "size": 6042241,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 85,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUSIC/LOUNGE-CHILL/Portishead/Pearl/08 - Glory Box.MP3",
+   "size": 6042241,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "NZG2LPUQ3PPDBYJXWQDRUTFWNLJRKNTAVHZSTFI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer24"
+   }
+  },
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 117,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Pearl/08 - Glory Box.MP3",
+   "size": 6042241,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "DHZ35HV3A5QCJVERXV7WKKGV6CSVHLKXFHLTF2A",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer37"
+   }
+  }
+ ],
+ "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY": [
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 59,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Glory Box.mp3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Dummy/11 - Glory Box.mp3",
+   "size": 4893143,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 84,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Glory Box.mp3",
+   "path": "/MUSIC/LOUNGE-CHILL/Portishead/Dummy/11 - Glory Box.mp3",
+   "size": 4893143,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "NZG2LPUQ3PPDBYJXWQDRUTFWNLJRKNTAVHZSTFI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer24"
+   }
+  },
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 116,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Glory Box.mp3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Dummy/11 - Glory Box.mp3",
+   "size": 4893143,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "DHZ35HV3A5QCJVERXV7WKKGV6CSVHLKXFHLTF2A",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer37"
+   }
+  }
+ ],
+ "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY": [
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 61,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Roseland Nyc Live/08 - Glory Box.MP3",
+   "size": 5383598,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 86,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUSIC/LOUNGE-CHILL/Portishead/Roseland Nyc Live/08 - Glory Box.MP3",
+   "size": 5383598,
+   "slots": {
+    "free": 9,
+    "str": "9/10",
+    "total": 10
+   },
+   "time": 0,
+   "tth": "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "NZG2LPUQ3PPDBYJXWQDRUTFWNLJRKNTAVHZSTFI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer24"
+   }
+  },
+  {
+   "connection": 134217728,
+   "dupe": null,
+   "id": 118,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Glory Box.MP3",
+   "path": "/MUS/Lounge/Lounge/Portishead/Roseland Nyc Live/08 - Glory Box.MP3",
+   "size": 5383598,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "MP3"
+   },
+   "user": {
+    "cid": "DHZ35HV3A5QCJVERXV7WKKGV6CSVHLKXFHLTF2A",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer37"
+   }
+  }
+ ],
+ "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA": [
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 47,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "size": 8274957,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 64,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "size": 8274957,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "CDE6TZ6S3XWQVAGPITM57RNZ44HOS246DQTS44Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer35"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 69,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "size": 8274957,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "WLX2RENBMO67D54SALQXGJK6URKAZNXXMV5SWUY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 104,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "size": 8274957,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "Z4OWVLEZLUZEH6EFWTYBLXIM3H7CIX34R6MQXJA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 109,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+   "size": 8274957,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "GRNRIVXDNEKOHU46SPFAX5JNL6BCCQKW57KLWYQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer36"
+   }
+  }
+ ],
+ "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q": [
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 49,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Portishead - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+   "size": 13490804,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 66,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Portishead - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+   "size": 13490804,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "CDE6TZ6S3XWQVAGPITM57RNZ44HOS246DQTS44Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer35"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 71,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Portishead - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+   "size": 13490804,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "WLX2RENBMO67D54SALQXGJK6URKAZNXXMV5SWUY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 106,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Portishead - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+   "size": 13490804,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "Z4OWVLEZLUZEH6EFWTYBLXIM3H7CIX34R6MQXJA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 111,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "08 - Portishead - Glory Box.mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+   "size": 13490804,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "GRNRIVXDNEKOHU46SPFAX5JNL6BCCQKW57KLWYQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer36"
+   }
+  }
+ ],
+ "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY": [
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 48,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "size": 7233601,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 65,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "size": 7233601,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "CDE6TZ6S3XWQVAGPITM57RNZ44HOS246DQTS44Q",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer35"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 70,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "size": 7233601,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "WLX2RENBMO67D54SALQXGJK6URKAZNXXMV5SWUY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 105,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "size": 7233601,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "Z4OWVLEZLUZEH6EFWTYBLXIM3H7CIX34R6MQXJA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  },
+  {
+   "connection": 131072000,
+   "dupe": null,
+   "id": 110,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+   "size": 7233601,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "GRNRIVXDNEKOHU46SPFAX5JNL6BCCQKW57KLWYQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer36"
+   }
+  }
+ ],
+ "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ": [
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 39,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "24. Portishead - Glory Box.flac",
+   "path": "/G:_/Various Artists - British Songs That Everybody Knows [2026] [FLAC]/24. Portishead - Glory Box.flac",
+   "size": 25202425,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "632QH7JSZ3PX6UA7RGAXR4KJ67PJ43QQRQCQFXA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  },
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 52,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "24. Portishead - Glory Box.flac",
+   "path": "/G:_/Various Artists - British Songs That Everybody Knows [2026] [FLAC]/24. Portishead - Glory Box.flac",
+   "size": 25202425,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "FU47ZCAWPYFIMD3Q6YXL7ETSO73X5MFQGFK3WNI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  },
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 152,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "24. Portishead - Glory Box.flac",
+   "path": "/G:_/Various Artists - British Songs That Everybody Knows [2026] [FLAC]/24. Portishead - Glory Box.flac",
+   "size": 25202425,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "flac"
+   },
+   "user": {
+    "cid": "2VBMJ3KJJWHFH2T6XY3LMT57YHAQXEWTQT5L4BY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer38"
+   }
+  }
+ ],
+ "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y": [
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 38,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "18 - Portishead - Glory Box.mp3",
+   "path": "/F:_/Now That's What I Call Music! - Complete Collection (1 to 87)/Now That's What I Call Music! 30/CD 1/18 - Portishead - Glory Box.mp3",
+   "size": 9091799,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "632QH7JSZ3PX6UA7RGAXR4KJ67PJ43QQRQCQFXA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  },
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 51,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "18 - Portishead - Glory Box.mp3",
+   "path": "/F:_/Now That's What I Call Music! - Complete Collection (1 to 87)/Now That's What I Call Music! 30/CD 1/18 - Portishead - Glory Box.mp3",
+   "size": 9091799,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "FU47ZCAWPYFIMD3Q6YXL7ETSO73X5MFQGFK3WNI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  },
+  {
+   "connection": 2621440,
+   "dupe": null,
+   "id": 151,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "18 - Portishead - Glory Box.mp3",
+   "path": "/F:_/Now That's What I Call Music! - Complete Collection (1 to 87)/Now That's What I Call Music! 30/CD 1/18 - Portishead - Glory Box.mp3",
+   "size": 9091799,
+   "slots": {
+    "free": 6,
+    "str": "6/21",
+    "total": 21
+   },
+   "time": 0,
+   "tth": "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y",
+   "type": {
+    "content_type": "audio",
+    "id": "file",
+    "str": "mp3"
+   },
+   "user": {
+    "cid": "2VBMJ3KJJWHFH2T6XY3LMT57YHAQXEWTQT5L4BY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer38"
+   }
+  }
+ ],
+ "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I": [
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 56,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "{Rage HD} Portishead - Glory Box.mpg",
+   "path": "/Videos/{Rage HD}/{Rage HD} Portishead - Glory Box.mpg",
+   "size": 269944836,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mpg"
+   },
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 88,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "{Rage HD} Portishead - Glory Box.mpg",
+   "path": "/Videos/{Rage HD}/{Rage HD} Portishead - Glory Box.mpg",
+   "size": 269944836,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mpg"
+   },
+   "user": {
+    "cid": "6A76E4GLBDGA7ULQYFEOEEYSYO6BJMHBWPV24SY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  },
+  {
+   "connection": 13107200,
+   "dupe": null,
+   "id": 113,
+   "ip": {
+    "country": "",
+    "ip": "",
+    "str": ""
+   },
+   "name": "{Rage HD} Portishead - Glory Box.mpg",
+   "path": "/Videos/{Rage HD}/{Rage HD} Portishead - Glory Box.mpg",
+   "size": 269944836,
+   "slots": {
+    "free": 0,
+    "str": "0/255",
+    "total": 255
+   },
+   "time": 0,
+   "tth": "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I",
+   "type": {
+    "content_type": "video",
+    "id": "file",
+    "str": "mpg"
+   },
+   "user": {
+    "cid": "6ZGZD7QJPJ3PEULVEHTVM4TACVM774WEAULUYGQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ ]
+}

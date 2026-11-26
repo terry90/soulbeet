@@ -1,0 +1,409 @@
+[
+ {
+  "connection": 1207959552.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "name": "1991 – Spiderland",
+  "path": "/music/Slint/1991 – Spiderland/",
+  "relevance": 0.8936363636363637,
+  "size": 0.0,
+  "slots": {
+   "free": 9,
+   "str": "9/9",
+   "total": 9
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ },
+ {
+  "connection": 91750400.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "QDFQUAIAAAAAAC3H6IAAAAAAABYMFWBJN57QAAA",
+  "name": "(1991) Spiderland (remastered) [TIDAL]",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/",
+  "relevance": 0.8403030303030303,
+  "size": 0.0,
+  "slots": {
+   "free": 5,
+   "str": "5/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "AFDEKXO6PPFE5N7FLD2RM3SAXV622CPFECJMZEI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 91750400.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "QDFQUAIAAAAAAC3H6IAAAAAAABYHWLZJN57QAAA",
+  "name": "(1991) Spiderland (remastered) [TIDAL]",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/",
+  "relevance": 0.8403030303030303,
+  "size": 0.0,
+  "slots": {
+   "free": 5,
+   "str": "5/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "AWBHGCDF4POLN6TRGMIR7VHZP24SAMXQYI4SDAY",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 91750400.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "QDFQUAIAAAAAAC3H6IAAAAAAAAYBYTBHN57QAAA",
+  "name": "(1991) Spiderland (remastered) [TIDAL]",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/",
+  "relevance": 0.8403030303030303,
+  "size": 0.0,
+  "slots": {
+   "free": 5,
+   "str": "5/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "TFHPEANTTW252C6N6YLXWVEKTGJ6MTW35BIKMTQ",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 91750400.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "QDFQUAIAAAAAAC3H6IAAAAAAAAAJGXJIN57QAAA",
+  "name": "(1991) Spiderland (remastered) [TIDAL]",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/",
+  "relevance": 0.8403030303030303,
+  "size": 0.0,
+  "slots": {
+   "free": 5,
+   "str": "5/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "IBR3W4LHV4KANLBT4LK5Y3F3SFZI4A4YXSRFBUQ",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 91750400.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "QDFQUAIAAAAAAC3H6IAAAAAAAAIEYVBHN57QAAA",
+  "name": "(1991) Spiderland (remastered) [TIDAL]",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/",
+  "relevance": 0.8403030303030303,
+  "size": 0.0,
+  "slots": {
+   "free": 5,
+   "str": "5/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "id": "directory",
+   "str": ""
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "N6Z3P4HUUUMDPW76OLLMK5ZJMSJCMMGXRJC4NKA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 458752000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+  "name": "06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+  "path": "/Music/Slint/(1991) Spiderland (remastered) [TIDAL]/06 - Slint - Todd's Song (Post-Spiderland Song in Progress).flac",
+  "relevance": 0.5912745098039216,
+  "size": 44712866.0,
+  "slots": {
+   "free": 25,
+   "str": "25/25",
+   "total": 25
+  },
+  "time": 0.0,
+  "tth": "FRCMQ66QQWH6XPB5U44TZP45HCHYJBZKGNTG6PQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "N6Z3P4HUUUMDPW76OLLMK5ZJMSJCMMGXRJC4NKA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer02"
+   }
+  }
+ },
+ {
+  "connection": 1207959552.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+  "name": "02 - Nosferatu Man.flac",
+  "path": "/music/Slint/1991 – Spiderland/02 - Nosferatu Man.flac",
+  "relevance": 0.16571186440677968,
+  "size": 33635690.0,
+  "slots": {
+   "free": 9,
+   "str": "9/9",
+   "total": 9
+  },
+  "time": 0.0,
+  "tth": "OL3WMDPOXNPHK5MLGA6Y4FOQHAXB36CSFUWRZPY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ },
+ {
+  "connection": 1207959552.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+  "name": "04 - Washer.flac",
+  "path": "/music/Slint/1991 – Spiderland/04 - Washer.flac",
+  "relevance": 0.16571186440677968,
+  "size": 43314622.0,
+  "slots": {
+   "free": 9,
+   "str": "9/9",
+   "total": 9
+  },
+  "time": 0.0,
+  "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ },
+ {
+  "connection": 1207959552.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+  "name": "03 - Don, Aman.flac",
+  "path": "/music/Slint/1991 – Spiderland/03 - Don, Aman.flac",
+  "relevance": 0.16571186440677968,
+  "size": 28132633.0,
+  "slots": {
+   "free": 9,
+   "str": "9/9",
+   "total": 9
+  },
+  "time": 0.0,
+  "tth": "E6LMRWMTKFIYUUAUZJHYN3LWSVYJMV35EY6GVSA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ },
+ {
+  "connection": 1207959552.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+  "name": "01 - Breadcrumb Trail.flac",
+  "path": "/music/Slint/1991 – Spiderland/01 - Breadcrumb Trail.flac",
+  "relevance": 0.16571186440677968,
+  "size": 35628596.0,
+  "slots": {
+   "free": 9,
+   "str": "9/9",
+   "total": 9
+  },
+  "time": 0.0,
+  "tth": "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer01"
+   }
+  }
+ }
+]
