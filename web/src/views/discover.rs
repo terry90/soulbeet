@@ -259,7 +259,7 @@ pub fn DiscoverPage() -> Element {
                                 // Artwork + Play Trigger
                                 button {
                                     r#type: "button",
-                                    class: "relative w-36 h-36 sm:w-44 sm:h-44 rounded-[12px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center group cursor-pointer",
+                                    class: "relative w-36 h-36 sm:w-44 sm:h-44 rounded-[12px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle hover:border-beet-border-default shrink-0 flex items-center justify-center group cursor-pointer transition-colors",
                                     onclick: move |_| player.play_track(t_play.clone()),
                                     if let Some(url) = track.cover_art_url.as_deref() {
                                         img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
@@ -267,7 +267,7 @@ pub fn DiscoverPage() -> Element {
                                         IconMusic { size: 36, class: "text-beet-text-disabled".to_string() }
                                     }
                                     span { class: "absolute inset-0 bg-beet-canvas/55 flex items-center justify-center opacity-90 group-hover:opacity-100 transition-opacity",
-                                        span { class: "w-12 h-12 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shadow-lg",
+                                        span { class: "w-12 h-12 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shadow-lg group-hover:scale-105 transition-transform",
                                             IconPlay { size: 20, filled: true, class: "ml-0.5".to_string() }
                                         }
                                     }
@@ -518,14 +518,14 @@ pub fn DiscoverPage() -> Element {
                                     button {
                                         key: "disc-mix-{mix.slug}",
                                         r#type: "button",
-                                        class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle p-4 text-left transition-colors cursor-pointer flex flex-col justify-between gap-3",
+                                        class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default p-4 text-left transition-colors cursor-pointer flex flex-col justify-between gap-3",
                                         onclick: move |_| studio.play_contextual_mix(auth, player, slug.clone()),
                                         div { class: "space-y-1.5",
                                             div { class: "flex items-center justify-between gap-2",
                                                 span { class: "px-2 py-0.5 rounded-full bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-tertiary",
                                                     "{badge}"
                                                 }
-                                                span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center",
+                                                span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center group-hover:scale-105 transition-transform",
                                                     IconPlay { size: 13, filled: true }
                                                 }
                                             }

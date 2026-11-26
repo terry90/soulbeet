@@ -8,10 +8,10 @@ use crate::{Chevron, FOCUS_RING};
 /// The status dot class and chip text for an importer health level.
 pub fn importer_chip(level: HealthLevel) -> (&'static str, &'static str) {
     let dot = match level {
-        HealthLevel::Ready => "bg-beet-accent",
-        HealthLevel::Degraded => "bg-yellow-500",
-        HealthLevel::Broken => "bg-red-500",
-        HealthLevel::Checking => "bg-gray-500 animate-pulse",
+        HealthLevel::Ready => "bg-beet-leaf-solid",
+        HealthLevel::Degraded => "bg-beet-gold",
+        HealthLevel::Broken => "bg-beet-crimson-text",
+        HealthLevel::Checking => "bg-beet-text-tertiary animate-pulse",
     };
     (dot, level.chip())
 }
@@ -48,10 +48,10 @@ pub fn StatusBanner(
     children: Element,
 ) -> Element {
     rsx! {
-        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3 py-2 bg-beet-panel border border-white/10 rounded flex items-center gap-3 text-xs font-mono",
+        div { class: "mx-4 sm:mx-6 lg:mx-8 mt-2 px-3.5 py-2.5 bg-beet-surface-low border border-beet-border-subtle rounded-[12px] flex items-center gap-3 text-xs",
             span { class: "w-1.5 h-1.5 rounded-full {dot_class} shrink-0" }
-            span { class: "text-gray-500 uppercase tracking-widest shrink-0 hidden sm:inline", "{label}" }
-            span { class: "text-gray-400 flex-1 min-w-0 line-clamp-2 sm:line-clamp-1 break-words", "{message}" }
+            span { class: "tabular-nums-mono text-[11px] font-semibold text-beet-text-tertiary uppercase tracking-wider shrink-0 hidden sm:inline", "{label}" }
+            span { class: "text-beet-text-secondary flex-1 min-w-0 line-clamp-2 sm:line-clamp-1 break-words", "{message}" }
             {children}
         }
     }
@@ -59,7 +59,7 @@ pub fn StatusBanner(
 
 /// How a StatusBanner action looks, for an action that is a link.
 pub const STATUS_ACTION_CLASS: &str =
-    "shrink-0 text-gray-300 hover:text-white underline decoration-dotted cursor-pointer";
+    "shrink-0 text-xs font-medium text-beet-leaf-text hover:text-beet-text-primary underline decoration-dotted underline-offset-4 cursor-pointer transition-colors";
 
 /// A StatusBanner action button.
 #[component]
@@ -81,10 +81,10 @@ enum Severity {
 impl Severity {
     fn dot(self) -> &'static str {
         match self {
-            Severity::Fine => "bg-beet-leaf",
-            Severity::Checking => "bg-gray-500 animate-pulse",
-            Severity::Warning => "bg-yellow-500",
-            Severity::Down => "bg-red-500",
+            Severity::Fine => "bg-beet-leaf-solid",
+            Severity::Checking => "bg-beet-text-tertiary animate-pulse",
+            Severity::Warning => "bg-beet-gold",
+            Severity::Down => "bg-beet-crimson-text",
         }
     }
 }
@@ -115,11 +115,11 @@ fn downloader(health: &DownloaderHealth, meta: Option<&BackendMeta>) -> Service 
         )
     });
     let (severity, dot, state) = if health.online {
-        (Severity::Fine, "bg-beet-leaf animate-pulse", "ONLINE")
+        (Severity::Fine, "bg-beet-leaf-solid animate-pulse", "ONLINE")
     } else if rate_limited {
-        (Severity::Warning, "bg-yellow-500", "RATE-LIMITED")
+        (Severity::Warning, "bg-beet-gold", "RATE-LIMITED")
     } else {
-        (Severity::Down, "bg-red-500", "OFFLINE")
+        (Severity::Down, "bg-beet-crimson-text", "OFFLINE")
     };
     Service {
         name: health.name.clone(),
@@ -169,9 +169,9 @@ fn services(health: &SystemHealth, navidrome_status: NavidromeStatus) -> Vec<Ser
             Severity::Fine
         },
         dot: if health.navidrome_online {
-            "bg-blue-400 animate-pulse"
+            "bg-beet-leaf-solid animate-pulse"
         } else {
-            "bg-red-500"
+            "bg-beet-crimson-text"
         },
         label: if health.navidrome_online {
             "NAVIDROME ONLINE"
@@ -223,23 +223,23 @@ pub fn SystemStatus(health: SystemHealth, navidrome_status: NavidromeStatus) -> 
     let (worst, line) = summary(&services);
 
     rsx! {
-      details { class: "group/status mt-[10px] w-full font-mono text-[11px] text-gray-500",
-        summary { class: "inline-flex items-center gap-2 min-h-[44px] max-w-full rounded cursor-pointer list-none hover:text-gray-300 {FOCUS_RING} [&::-webkit-details-marker]:hidden",
+      details { class: "group/status mt-2.5 w-full text-xs text-beet-text-secondary",
+        summary { class: "inline-flex items-center gap-2 min-h-[36px] px-3 py-1.5 max-w-full rounded-[10px] bg-beet-surface-low border border-beet-border-subtle cursor-pointer list-none hover:bg-beet-surface hover:border-beet-border-default hover:text-beet-text-primary transition-colors {FOCUS_RING} [&::-webkit-details-marker]:hidden",
           span { class: "size-[6px] flex-none rounded-full {worst.dot()}", aria_hidden: "true" }
           span { class: "min-w-0", "{line}" }
-          Chevron { class: "transition-transform duration-200 group-open/status:rotate-180" }
+          Chevron { class: "transition-transform duration-200 group-open/status:rotate-180 text-beet-text-tertiary" }
         }
-        ul { class: "grid gap-2 mb-1 px-3 py-[10px] leading-normal list-none bg-beet-panel/60 border border-white/6 rounded-md",
+        ul { class: "grid gap-2 mt-2 mb-1 px-3.5 py-2.5 leading-normal list-none bg-beet-surface-low border border-beet-border-subtle rounded-[12px]",
           for service in services {
-            li { key: "{service.name}", class: "flex items-baseline gap-[10px]",
+            li { key: "{service.name}", class: "flex items-baseline gap-2.5",
               span {
                 class: "size-[6px] flex-none rounded-full -translate-y-px {service.dot}",
                 aria_hidden: "true",
               }
               span { class: "min-w-0",
-                span { class: "block text-gray-300", "{service.label}" }
+                span { class: "block tabular-nums-mono text-[11px] font-semibold tracking-wider text-beet-text-primary", "{service.label}" }
                 if let Some(reason) = service.reason {
-                  span { class: "block break-words", "{reason}" }
+                  span { class: "block text-xs text-beet-text-secondary break-words mt-0.5", "{reason}" }
                 }
               }
             }
@@ -373,7 +373,7 @@ mod tests {
         };
         let html = render_status(health, NavidromeStatus::Connected);
         assert_eq!(line(&html), "Beets needs attention");
-        assert!(html.contains("bg-yellow-500"), "{html}");
+        assert!(html.contains("bg-beet-gold"), "{html}");
     }
 
     #[test]
@@ -489,7 +489,7 @@ mod tests {
                 (row.severity, row.dot, row.reason.as_deref()),
                 (
                     Severity::Warning,
-                    "bg-yellow-500",
+                    "bg-beet-gold",
                     Some("YouTube asks to slow down")
                 )
             );
@@ -509,16 +509,19 @@ mod tests {
     fn importer_chip_texts() {
         assert_eq!(
             importer_chip(HealthLevel::Ready),
-            ("bg-beet-accent", "READY")
+            ("bg-beet-leaf-solid", "READY")
         );
         assert_eq!(
             importer_chip(HealthLevel::Degraded),
-            ("bg-yellow-500", "WARN")
+            ("bg-beet-gold", "WARN")
         );
-        assert_eq!(importer_chip(HealthLevel::Broken), ("bg-red-500", "BROKEN"));
+        assert_eq!(
+            importer_chip(HealthLevel::Broken),
+            ("bg-beet-crimson-text", "BROKEN")
+        );
         assert_eq!(
             importer_chip(HealthLevel::Checking),
-            ("bg-gray-500 animate-pulse", "CHECKING")
+            ("bg-beet-text-tertiary animate-pulse", "CHECKING")
         );
     }
 

@@ -5,7 +5,8 @@ use api::{
 use dioxus::prelude::*;
 
 use super::panel::{
-    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, REMOVE_BUTTON_CLASS,
+    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, PRIMARY_BUTTON_CLASS,
+    REMOVE_BUTTON_CLASS,
 };
 use crate::auth::use_auth;
 use crate::{friendly_error, ConfirmModal, FieldLook, TextInput};
@@ -71,17 +72,17 @@ pub fn FolderAdminPanel() -> Element {
                 },
                 Some(Ok(data)) => rsx! {
                     SectionTitle { title: "Approved Folder Roots" }
-                    p { class: "text-xs font-mono text-gray-400 mb-2",
+                    p { class: "text-xs text-beet-text-secondary mb-3 leading-relaxed",
                         "Users who are not admins can add folders inside these roots."
                     }
                     if data.roots.is_empty() {
-                        p { class: "text-gray-500 font-mono italic mb-4", "No approved roots yet." }
+                        p { class: "text-xs text-beet-text-tertiary italic mb-4", "No approved roots yet." }
                     } else {
                         ul { class: "space-y-2 mb-4",
                             for root in data.roots.clone() {
                                 ListRow {
-                                    div { class: "flex justify-between items-center",
-                                        span { class: "text-gray-300 text-xs font-mono", "{root}" }
+                                    div { class: "flex justify-between items-center gap-3",
+                                        span { class: "text-beet-text-primary text-xs tabular-nums-mono break-all", "{root}" }
                                         button {
                                             class: REMOVE_BUTTON_CLASS,
                                             onclick: move |_| {
@@ -95,17 +96,18 @@ pub fn FolderAdminPanel() -> Element {
                             }
                         }
                     }
-                    div { class: "flex gap-2 items-center mb-6",
+                    div { class: "flex gap-2.5 items-center mb-6",
                         div { class: "flex-1",
                             TextInput {
                                 look: FieldLook::Compact,
                                 value: new_root(),
                                 oninput: move |v| new_root.set(v),
                                 placeholder: "/music",
+                                class: "tabular-nums-mono",
                             }
                         }
                         button {
-                            class: "retro-btn rounded",
+                            class: "{PRIMARY_BUTTON_CLASS} h-9",
                             onclick: move |_| async move {
                                 let result = auth.call(add_folder_root(new_root())).await;
                                 if result.is_ok() {
@@ -119,20 +121,21 @@ pub fn FolderAdminPanel() -> Element {
 
                     SectionTitle { title: "All Folders" }
                     if data.folders.is_empty() {
-                        p { class: "text-gray-500 font-mono italic mb-6", "No folders yet." }
+                        p { class: "text-xs text-beet-text-tertiary italic mb-6", "No folders yet." }
                     } else {
                         ul { class: "space-y-2 mb-6",
                             for entry in data.folders.clone() {
                                 ListRow {
                                     div { class: "flex justify-between items-center gap-3",
-                                        div {
-                                            span { class: "font-bold text-white block font-display", "{entry.folder.name}" }
-                                            span { class: "text-gray-500 text-xs font-mono block", "{entry.folder.path}" }
-                                            span { class: "text-gray-400 text-xs font-mono", "Owner: {entry.owner}" }
+                                        div { class: "min-w-0",
+                                            span { class: "font-semibold text-beet-text-primary block font-display text-sm", "{entry.folder.name}" }
+                                            span { class: "text-beet-text-tertiary text-xs tabular-nums-mono block break-all", "{entry.folder.path}" }
+                                            span { class: "text-beet-text-secondary text-xs", "Owner: {entry.owner}" }
                                         }
-                                        div { class: "flex items-center gap-3",
-                                            label { class: "flex items-center gap-2 text-xs font-mono text-gray-300 cursor-pointer",
+                                        div { class: "flex items-center gap-3 shrink-0",
+                                            label { class: "flex items-center gap-2 text-xs text-beet-text-secondary cursor-pointer",
                                                 input {
+                                                    class: "accent-beet-leaf-solid",
                                                     r#type: "checkbox",
                                                     checked: entry.folder.shared,
                                                     onchange: {
@@ -168,14 +171,14 @@ pub fn FolderAdminPanel() -> Element {
 
                     SectionTitle { title: "Folder Conflicts" }
                     if data.conflicts.is_empty() {
-                        p { class: "text-sm font-mono text-gray-300", "No folder conflicts." }
+                        p { class: "text-sm text-beet-text-secondary", "No folder conflicts." }
                     } else {
-                        ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400 mb-3",
+                        ul { class: "list-disc pl-5 space-y-1.5 text-sm text-beet-gold mb-3",
                             for conflict in data.conflicts.iter() {
                                 li { "{conflict_text(conflict)}" }
                             }
                         }
-                        p { class: "text-xs font-mono text-gray-400",
+                        p { class: "text-xs text-beet-text-tertiary leading-relaxed",
                             "Mark a folder shared or delete it in the list above. Deleting removes only the folder entry, not its files. Its owner can also move it to another path."
                         }
                     }

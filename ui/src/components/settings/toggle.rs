@@ -8,13 +8,13 @@ pub fn Toggle(on: bool, on_class: &'static str, onclick: EventHandler<MouseEvent
     rsx! {
         button {
             class: format!(
-                "relative w-11 h-6 rounded-full cursor-pointer transition-colors {}",
-                if on { on_class } else { "bg-gray-600" }
+                "relative w-11 h-6 rounded-full cursor-pointer transition-colors shrink-0 {}",
+                if on { on_class } else { "bg-beet-surface-highest border border-beet-border-default" }
             ),
             onclick: move |e| onclick.call(e),
             span {
                 class: format!(
-                    "absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform {}",
+                    "absolute top-0.5 left-0.5 w-5 h-5 bg-beet-text-primary rounded-full transition-transform {}",
                     if on { "translate-x-5" } else { "" }
                 ),
             }
@@ -55,10 +55,14 @@ mod tests {
 
     #[test]
     fn a_toggle_shows_its_state() {
-        let on = render(|| rsx! { Toggle { on: true, on_class: "bg-red-500", onclick: |_| {} } });
-        assert!(on.contains("bg-red-500") && on.contains("translate-x-5"));
-        let off = render(|| rsx! { Toggle { on: false, on_class: "bg-red-500", onclick: |_| {} } });
-        assert!(off.contains("bg-gray-600") && !off.contains("translate-x-5"));
+        let on = render(|| {
+            rsx! { Toggle { on: true, on_class: "bg-beet-crimson-solid", onclick: |_| {} } }
+        });
+        assert!(on.contains("bg-beet-crimson-solid") && on.contains("translate-x-5"));
+        let off = render(|| {
+            rsx! { Toggle { on: false, on_class: "bg-beet-crimson-solid", onclick: |_| {} } }
+        });
+        assert!(off.contains("bg-beet-surface-highest") && !off.contains("translate-x-5"));
     }
 
     /// A switch that starts on, saved by a save that fails when `fails` says so.
@@ -70,7 +74,7 @@ mod tests {
                 rsx! {
                     Toggle {
                         on: on(),
-                        on_class: "bg-red-500",
+                        on_class: "bg-beet-crimson-solid",
                         onclick: move |_| save_switch(on, error, move |_| async move {
                             if fails {
                                 Err(ServerFnError::ServerError {
@@ -95,7 +99,7 @@ mod tests {
         let mut switch = saved_switch(true);
         switch.click();
         let html = switch.html();
-        assert!(html.contains("bg-red-500"), "{html}");
+        assert!(html.contains("bg-beet-crimson-solid"), "{html}");
         assert!(
             html.contains("Session expired. Please log in again."),
             "{html}"
@@ -107,7 +111,7 @@ mod tests {
         let mut switch = saved_switch(false);
         switch.click();
         let html = switch.html();
-        assert!(html.contains("bg-gray-600"), "{html}");
+        assert!(html.contains("bg-beet-surface-highest"), "{html}");
         assert!(!html.contains("an old error"), "{html}");
     }
 }

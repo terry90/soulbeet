@@ -708,7 +708,7 @@ fn ManualSourceChoiceModal(
                 }
                 if state.groups.is_empty() {
                     p { class: "text-[13px] text-beet-text-secondary py-4 text-center",
-                        "No candidate sources were returned. Try Advanced Soulseek Search."
+                        "No candidate sources were returned. Try searching sources manually in Search."
                     }
                 } else {
                     for group in state.groups.iter() {

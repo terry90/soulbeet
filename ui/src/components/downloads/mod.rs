@@ -14,7 +14,7 @@ mod picker;
 use api::CancelDownloadRequest;
 use item::DownloadItem;
 
-use crate::friendly_error;
+use crate::{friendly_error, IconDownload, IconX};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct DownloadsProps {
@@ -49,6 +49,13 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         .iter()
         .filter(|f| matches!(f.state, DownloadState::Failed(_) | DownloadState::Cancelled))
         .count();
+
+    let imported_count = active_downloads
+        .iter()
+        .filter(|f| matches!(f.state, DownloadState::Imported))
+        .count();
+
+    let finished_count = active_downloads.len().saturating_sub(processing_count);
 
     let clear_finished = move |_| {
         let mut cleared = Vec::new();
@@ -159,47 +166,64 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
         "inert": (!open).then_some(true),
         // Backdrop
         div {
-          class: "absolute inset-0 bg-black/60 backdrop-blur-sm cursor-pointer",
+          class: "absolute inset-0 bg-beet-sunken/75 backdrop-blur-xs cursor-pointer",
           onclick: close_modal,
         }
 
-        // Panel
-        div { class: "relative w-full max-w-md bg-beet-panel border-l border-white/10 h-full shadow-2xl transform transition-transform duration-200 ease-out flex flex-col {panel_translate}",
-          //Header
-          div { class: "p-6 border-b border-white/10 flex justify-between items-center bg-black/20",
-            div {
-              h3 { class: "text-xl font-bold text-white font-display",
+        // Panel (keeps `bg-beet-panel` class for E2E drawer locator while using stepped Studio low surface)
+        div {
+          class: "relative w-full max-w-md bg-beet-panel border-l border-beet-border-subtle h-full transform transition-transform duration-200 ease-out flex flex-col {panel_translate}",
+          style: "background-color: var(--beet-surface-low);",
+          // Header
+          div { class: "px-5 py-4 border-b border-beet-border-subtle flex justify-between items-start gap-3 shrink-0",
+            div { class: "min-w-0",
+              h3 { class: "text-[17px] font-semibold tracking-tight text-beet-text-primary leading-snug",
                 "Active Transfers"
               }
-              p { class: "text-xs text-beet-leaf font-mono mt-1",
-                ":: {processing_count} PROCESSING // {errored_count} ERRORED"
+              div { class: "flex flex-wrap items-center gap-1.5 mt-2",
+                span {
+                  class: if processing_count > 0 {
+                      "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full tabular-nums-mono text-[11px] font-medium bg-beet-leaf-surface text-beet-leaf-glow border border-beet-leaf-solid/25"
+                  } else {
+                      "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full tabular-nums-mono text-[11px] font-medium bg-beet-surface text-beet-text-tertiary border border-beet-border-subtle"
+                  },
+                  if processing_count > 0 {
+                    span { class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow shrink-0" }
+                  }
+                  "{processing_count} ACTIVE"
+                }
+                if errored_count > 0 {
+                  span { class: "inline-flex items-center gap-1 px-2 py-0.5 rounded-full tabular-nums-mono text-[11px] font-medium bg-beet-crimson-surface text-beet-crimson-text border border-beet-crimson-text/25",
+                    "{errored_count} FAILED"
+                  }
+                }
+                if imported_count > 0 {
+                  span { class: "inline-flex items-center gap-1 px-2 py-0.5 rounded-full tabular-nums-mono text-[11px] font-medium bg-beet-surface text-beet-text-secondary border border-beet-border-subtle",
+                    "{imported_count} IMPORTED"
+                  }
+                }
               }
             }
             button {
-              class: "text-gray-400 hover:text-white transition-colors cursor-pointer",
+              r#type: "button",
+              class: "w-8 h-8 rounded-[10px] inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors cursor-pointer shrink-0",
               aria_label: "Close downloads",
               onmounted: move |e| close_button.set(Some(e.data())),
               onclick: close_modal,
-              svg {
-                class: "w-6 h-6",
-                fill: "none",
-                stroke: "currentColor",
-                view_box: "0 0 24 24",
-                path {
-                  stroke_linecap: "round",
-                  stroke_linejoin: "round",
-                  stroke_width: "2",
-                  d: "M6 18L18 6M6 6l12 12",
-                }
-              }
+              IconX { size: 16 }
             }
           }
 
           // Content
-          div { class: "flex-1 overflow-y-auto p-6 no-scrollbar space-y-4",
+          div { class: "flex-1 overflow-y-auto studio-scrollbar px-4 py-4 space-y-3",
             if active_downloads.is_empty() {
-              div { class: "text-center text-gray-500 py-10 font-mono text-sm",
-                "No active transfers in the queue."
+              div { class: "flex flex-col items-center justify-center text-center py-14 px-6 rounded-[12px] bg-beet-surface border border-beet-border-subtle",
+                div { class: "w-11 h-11 rounded-full bg-beet-surface-high border border-beet-border-subtle flex items-center justify-center text-beet-text-tertiary mb-3",
+                  IconDownload { size: 18 }
+                }
+                p { class: "text-[13px] font-medium text-beet-text-secondary",
+                  "No active transfers in the queue."
+                }
               }
             }
 
@@ -213,12 +237,15 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
               }
             }
           }
+
           // Footer
-          div { class: "p-4 border-t border-white/10 bg-black/20",
+          div { class: "px-4 py-3 border-t border-beet-border-subtle shrink-0",
             button {
-              class: "w-full py-2 text-xs font-mono uppercase tracking-widest text-center border border-white/10 hover:bg-white/5 text-gray-400 hover:text-white transition-colors cursor-pointer hover:border-red-500/30",
+              r#type: "button",
+              disabled: finished_count == 0,
+              class: "w-full h-9 px-3 rounded-[10px] bg-beet-surface border border-beet-border-subtle text-beet-text-secondary text-[12px] font-medium transition-colors cursor-pointer enabled:hover:bg-beet-surface-high enabled:hover:border-beet-border-default enabled:hover:text-beet-text-primary disabled:opacity-40 disabled:cursor-not-allowed",
               onclick: clear_finished,
-              "CLEAR COMPLETED"
+              "Clear completed"
             }
           }
         }

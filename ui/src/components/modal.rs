@@ -3,6 +3,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::IconX;
+
 /// Gives each open modal its own element ids.
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,7 +64,7 @@ pub fn Modal(props: Props) -> Element {
     rsx! {
       dialog {
         id: "{id}",
-        class: "m-0 h-full w-full max-h-none max-w-none bg-transparent text-inherit backdrop:bg-black/60 backdrop:backdrop-blur-sm",
+        class: "m-0 h-full w-full max-h-none max-w-none bg-transparent text-beet-text-primary backdrop:bg-beet-sunken/75 backdrop:backdrop-blur-md",
         role: "dialog",
         aria_modal: "true",
         aria_labelledby: "{id}-title",
@@ -80,39 +82,27 @@ pub fn Modal(props: Props) -> Element {
 
           // Content
           div {
-            class: "bg-beet-panel border border-white/10 max-h-[85vh] overflow-hidden flex flex-col rounded-lg shadow-2xl max-w-lg w-full",
+            class: "bg-beet-surface-low border border-beet-border-subtle max-h-[85vh] overflow-hidden flex flex-col rounded-[16px] shadow-2xl max-w-lg w-full",
             onclick: move |event| event.stop_propagation(),
             // Header Container
-            div { class: "flex items-center justify-between p-4 border-b border-white/10 bg-black/20",
+            div { class: "flex items-center justify-between px-5 py-4 border-b border-beet-border-subtle bg-beet-sunken/40",
               div { id: "{id}-title", class: "flex-1 min-w-0", {props.header} }
               button {
-                class: "text-gray-400 hover:text-white transition-colors ml-4 cursor-pointer",
+                class: "w-8 h-8 rounded-[8px] flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors ml-3 cursor-pointer",
                 aria_label: "Close",
                 onclick: move |_| props.on_close.call(()),
-                // Close icon SVG
-                svg {
-                  class: "w-6 h-6",
-                  fill: "none",
-                  view_box: "0 0 24 24",
-                  stroke: "currentColor",
-                  path {
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    stroke_width: "2",
-                    d: "M6 18L18 6M6 6l12 12",
-                  }
-                }
+                IconX { size: 18 }
               }
             }
             // Scrollable Body. Focus starts here, so the keys scroll it.
             div {
               id: "{id}-body",
-              class: "overflow-y-auto p-4 pb-10 fade-bottom outline-none scrollbar-thin scrollbar-thumb-beet-accent/50 scrollbar-track-transparent",
+              class: "overflow-y-auto p-5 pb-10 fade-bottom outline-none studio-scrollbar",
               tabindex: "-1",
               {props.children}
             }
             if let Some(footer) = props.footer {
-              div { class: "p-4 border-t border-white/10 bg-black/20", {footer} }
+              div { class: "p-4 border-t border-beet-border-subtle bg-beet-sunken/40", {footer} }
             }
           }
         }

@@ -46,10 +46,14 @@ pub fn AlbumResult(props: Props) -> Element {
 
     rsx! {
         div { class: "space-y-0",
-            // Album row
+            // Album row (keep overflow visible so DownloadIcon's FolderDropdown is never clipped)
             div {
-                class: "bg-white/5 border rounded-lg transition-all duration-200 flex items-center gap-3 p-3 group cursor-pointer",
-                class: if props.is_expanded { "border-beet-accent/30" } else { "border-white/5 hover:border-white/10" },
+                class: "bg-beet-surface hover:bg-beet-surface-high border transition-colors duration-150 flex items-center gap-3 p-3 group cursor-pointer",
+                class: if props.is_expanded {
+                    "rounded-t-[12px] border-beet-accent/40"
+                } else {
+                    "rounded-[12px] border-beet-border-subtle hover:border-beet-border-default"
+                },
                 onclick: move |_| props.on_toggle.call(()),
 
                 // Cover art
@@ -60,19 +64,23 @@ pub fn AlbumResult(props: Props) -> Element {
 
                 // Album info
                 div { class: "flex-grow min-w-0",
-                    p { class: "text-sm font-bold text-white truncate group-hover:text-beet-accent transition-colors",
+                    p { class: "text-[15px] font-semibold text-beet-text-primary truncate group-hover:text-beet-leaf-text transition-colors",
                         "{album.title}"
                     }
-                    p { class: "text-xs text-gray-400 font-mono truncate", "{album.artist}" }
+                    p { class: "text-[13px] text-beet-text-secondary truncate", "{album.artist}" }
                     if let Some(facts) = album_facts(album) {
-                        p { class: "text-xs text-gray-500 font-mono", "{facts}" }
+                        p { class: "text-[12px] text-beet-text-tertiary tabular-nums-mono mt-0.5", "{facts}" }
                     }
                 }
 
-                // Chevron indicator (D-02)
+                // Chevron indicator
                 svg {
                     class: "w-4 h-4 transition-transform duration-200 shrink-0",
-                    class: if props.is_expanded { "rotate-90 text-beet-accent" } else { "text-gray-500 group-hover:text-white" },
+                    class: if props.is_expanded {
+                        "rotate-90 text-beet-accent-text"
+                    } else {
+                        "text-beet-text-tertiary group-hover:text-beet-text-primary"
+                    },
                     fill: "none",
                     stroke: "currentColor",
                     stroke_width: "2",
@@ -88,17 +96,19 @@ pub fn AlbumResult(props: Props) -> Element {
                 div { class: "flex items-center gap-1 shrink-0",
                     // Search sources button
                     button {
-                        class: "p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer group/src",
+                        r#type: "button",
+                        class: "p-2 rounded-full hover:bg-beet-surface-highest transition-colors cursor-pointer group/src",
+                        aria_label: "Search sources",
                         title: "Search sources",
                         onclick: move |evt: MouseEvent| {
                             evt.stop_propagation();
                             props.on_search_sources.call(());
                         },
                         svg {
-                            class: "w-4 h-4 text-gray-500 group-hover/src:text-white transition-colors",
+                            class: "w-4 h-4 text-beet-text-secondary group-hover/src:text-beet-text-primary transition-colors",
                             fill: "none",
                             stroke: "currentColor",
-                            stroke_width: "2",
+                            stroke_width: "1.75",
                             view_box: "0 0 24 24",
                             path {
                                 stroke_linecap: "round",
@@ -126,7 +136,8 @@ pub fn AlbumResult(props: Props) -> Element {
                 class: "grid transition-[grid-template-rows] duration-300 ease-in-out",
                 class: if props.is_expanded { "grid-rows-[1fr]" } else { "grid-rows-[0fr]" },
                 div {
-                    class: "overflow-hidden",
+                    class: "overflow-hidden border-x border-b rounded-b-[12px]",
+                    class: if props.is_expanded { "border-beet-accent/40" } else { "border-transparent" },
                     InlineTrackPanel {
                         tracks: if props.is_expanded { props.tracks.clone() } else { Some(vec![]) },
                         download_states: props.download_states,

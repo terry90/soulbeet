@@ -6,12 +6,12 @@ use api::{change_password, connect_navidrome, start_sso_link, unlink_sso};
 use dioxus::prelude::*;
 use shared::system::NavidromeStatus;
 
-use super::panel::{Messages, LABEL_CLASS};
+use super::panel::{Messages, LABEL_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS};
 use crate::auth::use_auth;
 use crate::components::friendly_error;
 use crate::{submitted_text, Autofill, FieldKind, TextInput};
 
-const NOTE_CLASS: &str = "text-xs text-gray-500 font-mono";
+const NOTE_CLASS: &str = "text-xs text-beet-text-tertiary leading-relaxed";
 
 /// The keys the password forms submit their fields under.
 const CURRENT_PASSWORD: &str = "current-password";
@@ -114,7 +114,7 @@ pub(super) fn PasswordSection(proof: PasswordProof, on_change: EventHandler<()>)
                 kind: FieldKind::Password,
                 class: "mt-2",
               }
-              button { class: "retro-btn mt-2 rounded", "type": "submit", "Change Password" }
+              button { class: "{PRIMARY_BUTTON_CLASS} mt-3", "type": "submit", "Change Password" }
             }
           }
         } else {
@@ -193,12 +193,12 @@ pub(super) fn SingleSignOnSection(
         if let Some(name) = methods.sso_name.clone() {
           p { class: NOTE_CLASS, "Linked to {name} at {provider}." }
           if methods.password_proof != PasswordProof::NoPassword {
-            button { class: "retro-btn mt-2 rounded", onclick: unlink, "Unlink" }
+            button { class: "{SECONDARY_BUTTON_CLASS} mt-3", onclick: unlink, "Unlink" }
           } else {
             p { class: "{NOTE_CLASS} mt-2", "{sso_unlink_advice(methods.navidrome)}" }
           }
         } else if let Some(placeholder) = password_placeholder(methods.password_proof) {
-          p { class: "{NOTE_CLASS} mb-2",
+          p { class: "{NOTE_CLASS} mb-2.5",
             "Link this account to {provider} to sign in with it. Enter your password first."
           }
           form { method: "post", onsubmit: link,
@@ -211,7 +211,7 @@ pub(super) fn SingleSignOnSection(
               kind: FieldKind::Password,
             }
             button {
-              class: "retro-btn mt-2 rounded",
+              class: "{PRIMARY_BUTTON_CLASS} mt-3",
               "type": "submit",
               disabled: leaving(),
               "Link single sign-on"
@@ -273,7 +273,7 @@ pub(super) fn NavidromeSection(on_change: EventHandler<()>) -> Element {
           kind: FieldKind::Password,
         }
         button {
-          class: "retro-btn mt-2 rounded",
+          class: "{PRIMARY_BUTTON_CLASS} mt-3",
           disabled: connecting(),
           onclick: connect,
           "Connect Navidrome"

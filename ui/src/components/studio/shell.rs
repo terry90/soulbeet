@@ -343,7 +343,7 @@ pub fn StudioTopBar(
                         }
                     },
                     class: if active_transfers_count > 0 {
-                        "inline-flex items-center justify-center gap-1.5 h-9 w-9 sm:w-auto sm:px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 text-beet-accent-text tabular-nums-mono text-[12px] font-semibold cursor-pointer transition-colors shrink-0"
+                        "inline-flex items-center justify-center gap-1.5 h-9 w-9 sm:w-auto sm:px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 hover:border-beet-accent/50 hover:brightness-110 text-beet-accent-text tabular-nums-mono text-[12px] font-semibold cursor-pointer transition-[color,background-color,border-color,filter] shrink-0"
                     } else {
                         "inline-flex items-center justify-center gap-1.5 h-9 w-9 sm:w-auto sm:px-3 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high text-[12px] font-medium cursor-pointer transition-colors shrink-0"
                     },

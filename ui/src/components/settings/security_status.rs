@@ -34,28 +34,28 @@ fn SecurityChecks(status: SecurityStatus) -> Element {
         && status.mcp_blocked_by.is_empty()
     {
         return rsx! {
-            p { class: "text-sm font-mono text-gray-300", "All security checks pass." }
+            p { class: "text-sm text-beet-leaf-text", "All security checks pass." }
         };
     }
     rsx! {
         if let Some(problem) = status.sign_in_problem {
-            p { class: "text-sm font-mono text-red-400 mb-3", "{problem}" }
+            p { class: "px-3.5 py-2.5 rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-solid/40 text-sm text-beet-crimson-text mb-3", "{problem}" }
         }
         if let Some(why) = status.sso_off {
-            p { class: "text-sm font-mono text-yellow-400 mb-3",
+            p { class: "px-3.5 py-2.5 rounded-[10px] bg-beet-gold-surface border border-beet-gold/25 text-sm text-beet-gold mb-3",
                 "Single sign-on is off: {why}."
             }
         }
         if let Some(why) = status.mcp_off {
-            p { class: "text-sm font-mono text-gray-300 mb-3",
+            p { class: "text-sm text-beet-text-secondary mb-3",
                 "MCP access is turned off: {why}."
             }
         }
         if !status.mcp_blocked_by.is_empty() {
-            p { class: "text-sm font-mono text-gray-300 mb-3",
+            p { class: "text-sm text-beet-text-secondary mb-2.5",
                 "MCP access stays off until these are fixed:"
             }
-            ul { class: "list-disc pl-5 space-y-1 text-sm font-mono text-yellow-400",
+            ul { class: "list-disc pl-5 space-y-1.5 text-sm text-beet-gold",
                 for reason in status.mcp_blocked_by {
                     li { "{reason.message}" }
                 }

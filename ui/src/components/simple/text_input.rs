@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 /// The look of the app's form fields, text inputs and selects alike.
-pub const FIELD_CLASS: &str = "w-full p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent focus:outline-none text-white font-mono";
+pub const FIELD_CLASS: &str = "w-full h-10 px-3.5 rounded-[10px] bg-beet-surface border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-sm text-beet-text-primary placeholder:text-beet-text-tertiary transition-colors";
 
 /// How a text field looks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -11,7 +11,7 @@ pub enum FieldLook {
     Form,
     /// A smaller field in a list item being edited.
     Compact,
-    /// The login form's larger field that glows on focus.
+    /// The login form's field.
     Login,
     /// A borderless field that fills a row of the search bar. Its text
     /// colour comes from the added classes.
@@ -22,9 +22,9 @@ impl FieldLook {
     fn class(self) -> &'static str {
         match self {
             FieldLook::Form => FIELD_CLASS,
-            FieldLook::Compact => "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
-            FieldLook::Login => "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
-            FieldLook::Bar => "flex-1 min-w-0 h-[44px] p-0 bg-transparent border-0 rounded-none outline-none appearance-none font-mono text-base placeholder:text-gray-600 [&::-webkit-search-cancel-button]:hidden",
+            FieldLook::Compact => "w-full h-9 px-3 rounded-[10px] bg-beet-surface border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-sm text-beet-text-primary placeholder:text-beet-text-tertiary transition-colors",
+            FieldLook::Login => "w-full h-10 px-3.5 rounded-[10px] bg-beet-surface border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-[14px] text-beet-text-primary placeholder:text-beet-text-tertiary transition-colors",
+            FieldLook::Bar => "flex-1 min-w-0 h-[44px] p-0 bg-transparent border-0 rounded-none outline-none appearance-none text-sm text-beet-text-primary placeholder:text-beet-text-tertiary [&::-webkit-search-cancel-button]:hidden",
         }
     }
 }
@@ -273,11 +273,11 @@ mod tests {
             (FieldLook::Form, FIELD_CLASS),
             (
                 FieldLook::Compact,
-                "p-2 rounded bg-beet-dark border border-white/10 focus:border-beet-accent text-white font-mono text-sm",
+                "w-full h-9 px-3 rounded-[10px] bg-beet-surface border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-sm text-beet-text-primary placeholder:text-beet-text-tertiary transition-colors",
             ),
             (
                 FieldLook::Login,
-                "w-full bg-beet-dark border border-white/10 rounded p-3 text-white focus:outline-none focus:border-beet-accent focus:shadow-[0_0_10px_rgba(217,70,239,0.3)] transition-all font-mono",
+                "w-full h-10 px-3.5 rounded-[10px] bg-beet-surface border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-[14px] text-beet-text-primary placeholder:text-beet-text-tertiary transition-colors",
             ),
         ] {
             let html = render_look(look);

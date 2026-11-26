@@ -62,7 +62,8 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
     rsx! {
         div { class: "{wrapper_class}",
             button {
-                class: "p-2 rounded-full hover:bg-white/10 transition-colors cursor-pointer group/dl",
+                r#type: "button",
+                class: "p-2 rounded-full hover:bg-beet-surface-highest transition-colors cursor-pointer group/dl disabled:cursor-not-allowed",
                 aria_label: "Download",
                 disabled: !is_interactive,
                 onpointerdown: move |evt: PointerEvent| {
@@ -125,10 +126,10 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                 match state {
                     DownloadRowState::Idle => rsx! {
                         svg {
-                            class: "w-5 h-5 text-gray-400 group-hover/dl:text-beet-accent transition-colors",
+                            class: "w-4 h-4 text-beet-text-secondary group-hover/dl:text-beet-leaf-text transition-colors",
                             fill: "none",
                             stroke: "currentColor",
-                            stroke_width: "2",
+                            stroke_width: "1.75",
                             view_box: "0 0 24 24",
                             path {
                                 stroke_linecap: "round",
@@ -139,12 +140,12 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     },
                     DownloadRowState::Searching | DownloadRowState::Downloading => rsx! {
                         div {
-                            class: "w-5 h-5 animate-spin rounded-full border-2 border-transparent border-t-beet-accent border-b-beet-accent",
+                            class: "w-4 h-4 animate-spin rounded-full border-2 border-beet-border-subtle border-t-beet-accent-text border-b-beet-leaf-text",
                         }
                     },
                     DownloadRowState::Done => rsx! {
                         svg {
-                            class: "w-5 h-5 text-beet-leaf transition-opacity duration-500",
+                            class: "w-4 h-4 text-beet-leaf-text transition-opacity duration-500",
                             fill: "none",
                             stroke: "currentColor",
                             stroke_width: "2",
@@ -158,10 +159,10 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     },
                     DownloadRowState::Failed(_msg) => rsx! {
                         svg {
-                            class: "w-5 h-5 text-red-400",
+                            class: "w-4 h-4 text-beet-crimson-text",
                             fill: "none",
                             stroke: "currentColor",
-                            stroke_width: "2",
+                            stroke_width: "1.75",
                             view_box: "0 0 24 24",
                             path {
                                 stroke_linecap: "round",
@@ -172,10 +173,10 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     },
                     DownloadRowState::Disabled => rsx! {
                         svg {
-                            class: "w-5 h-5 text-gray-700 cursor-not-allowed",
+                            class: "w-4 h-4 text-beet-text-disabled cursor-not-allowed",
                             fill: "none",
                             stroke: "currentColor",
-                            stroke_width: "2",
+                            stroke_width: "1.75",
                             view_box: "0 0 24 24",
                             path {
                                 stroke_linecap: "round",

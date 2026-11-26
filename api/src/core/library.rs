@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, TEXT_MAX_CHARS};
-use shared::navidrome::LibraryStats;
+use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use shared::recommendation::normalize_for_matching;
 use soulbeet::navidrome::models::{NativeSong, SubsonicAlbum, SubsonicArtist, SubsonicSong};
 use soulbeet::navidrome::{LibraryKind, NavidromeClient};
@@ -337,22 +337,56 @@ pub async fn stats(navi: &NavidromeClient) -> Result<LibraryStats, Failure> {
     let mut rating_distribution = [0u32; 5];
     let mut genres: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut artists: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total_plays = 0u64;
+    let mut total_duration_secs = 0u64;
+    // key -> (total_plays, canonical_display_name, best_song_plays)
+    let mut artist_plays: std::collections::HashMap<String, (u64, String, u64)> =
+        std::collections::HashMap::new();
+    let mut played_tracks: Vec<TopPlayedTrack> = Vec::new();
 
     for song in &songs {
+        let plays = u64::from(song.play_count.unwrap_or(0));
+        total_plays += plays;
+        total_duration_secs += u64::from(song.duration.unwrap_or(0));
+
         if let Some(artist) = &song.artist {
+            let trimmed = artist.trim();
             artists.insert(artist.to_lowercase());
+            if plays > 0 && !trimmed.is_empty() {
+                let key = trimmed.to_lowercase();
+                artist_plays
+                    .entry(key)
+                    .and_modify(|(sum, display, best)| {
+                        *sum += plays;
+                        if plays > *best {
+                            *best = plays;
+                            *display = trimmed.to_string();
+                        }
+                    })
+                    .or_insert_with(|| (plays, trimmed.to_string(), plays));
+            }
         }
         if let Some(genre) = &song.genre {
             if !genre.is_empty() {
                 *genres.entry(genre.clone()).or_default() += 1;
             }
         }
-        if let Some(rating) = song.user_rating {
-            if (1..=5).contains(&rating) {
-                rated_tracks += 1;
-                rating_sum += rating as f64;
-                rating_distribution[(rating - 1) as usize] += 1;
-            }
+        let valid_rating = song.user_rating.filter(|r| (1..=5).contains(r));
+        if let Some(rating) = valid_rating {
+            rated_tracks += 1;
+            rating_sum += rating as f64;
+            rating_distribution[(rating - 1) as usize] += 1;
+        }
+        if plays > 0 {
+            played_tracks.push(TopPlayedTrack {
+                song_id: song.id.clone(),
+                title: song.title.clone(),
+                artist: song.artist.clone().unwrap_or_default(),
+                album: song.album.clone().unwrap_or_default(),
+                play_count: plays,
+                rating: valid_rating,
+                duration: song.duration.filter(|&d| d > 0),
+            });
         }
     }
 
@@ -366,6 +400,21 @@ pub async fn stats(navi: &NavidromeClient) -> Result<LibraryStats, Failure> {
     genre_vec.sort_by_key(|a| std::cmp::Reverse(a.1));
     genre_vec.truncate(20);
 
+    let mut top_played_artists: Vec<(String, u64)> = artist_plays
+        .into_values()
+        .map(|(sum, display, _)| (display, sum))
+        .collect();
+    top_played_artists.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_played_artists.truncate(8);
+
+    played_tracks.sort_by(|a, b| {
+        b.play_count
+            .cmp(&a.play_count)
+            .then_with(|| b.rating.unwrap_or(0).cmp(&a.rating.unwrap_or(0)))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    played_tracks.truncate(8);
+
     Ok(LibraryStats {
         total_tracks,
         rated_tracks,
@@ -375,6 +424,10 @@ pub async fn stats(navi: &NavidromeClient) -> Result<LibraryStats, Failure> {
         total_albums: albums.len() as u32,
         total_artists: artists.len() as u32,
         genres: genre_vec,
+        total_plays,
+        total_duration_secs,
+        top_played_artists,
+        top_played_tracks: played_tracks,
     })
 }
 
@@ -1068,6 +1121,59 @@ mod tests {
             ),
             (2, 1, 1, 4.0, [0, 0, 0, 1, 0], 1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn stats_aggregates_listening_insights_and_caps_top_lists_at_eight() {
+        let navi = NavidromeStub::start();
+        // 10 artists: 1 with 0 plays, 1 with empty name, 9 played artists (plus capitalization merge)
+        let songs_json = r#""searchResult3":{"song":[
+            {"id":"s1","title":"Alpha Low","artist":"daft punk","album":"HW","duration":200,"playCount":3,"userRating":3},
+            {"id":"s2","title":"Alpha High","artist":"Daft Punk","album":"RAM","duration":300,"playCount":12,"userRating":5},
+            {"id":"s3","title":"Tie High Rating","artist":"Boards of Canada","album":"MHTRTC","duration":250,"playCount":10,"userRating":5},
+            {"id":"s4","title":"Tie Low Rating","artist":"Aphex Twin","album":"SAW","duration":240,"playCount":10,"userRating":2},
+            {"id":"s5","title":"Zero Plays","artist":"Unplayed Act","album":"None","duration":180,"playCount":0,"userRating":4},
+            {"id":"s6","title":"Blank Artist","artist":"   ","album":"Mystery","duration":120,"playCount":50},
+            {"id":"s7","title":"Track 4","artist":"Artist 4","album":"A4","duration":100,"playCount":9},
+            {"id":"s8","title":"Track 5","artist":"Artist 5","album":"A5","duration":100,"playCount":8},
+            {"id":"s9","title":"Track 6","artist":"Artist 6","album":"A6","duration":100,"playCount":7},
+            {"id":"s10","title":"Track 7","artist":"Artist 7","album":"A7","duration":100,"playCount":6},
+            {"id":"s11","title":"Track 8","artist":"Artist 8","album":"A8","duration":100,"playCount":5},
+            {"id":"s12","title":"Track 9","artist":"Artist 9","album":"A9","duration":100,"playCount":4},
+            {"id":"s13","title":"Track 10","artist":"Artist 10","album":"A10","duration":100,"playCount":2}
+        ]}"#;
+        navi.answer("/rest/search3", &[&subsonic_ok(songs_json)]);
+        navi.answer("/rest/getAlbumList2", &[&subsonic_ok(r#""albumList2":{}"#)]);
+
+        let s = stats(&navi.client()).await.unwrap();
+        // Total plays: 3+12+10+10+0+50+9+8+7+6+5+4+2 = 126
+        assert_eq!(s.total_plays, 126);
+        // Total duration: 200+300+250+240+180+120 + 7*100 = 1990
+        assert_eq!(s.total_duration_secs, 1990);
+
+        // Top 8 artists excludes blank artist & unplayed artist, merges case preserving highest-play capitalization ("Daft Punk" = 15)
+        assert_eq!(s.top_played_artists.len(), 8);
+        assert_eq!(s.top_played_artists[0], ("Daft Punk".to_string(), 15));
+        assert_eq!(s.top_played_artists[1], ("Aphex Twin".to_string(), 10));
+        assert_eq!(
+            s.top_played_artists[2],
+            ("Boards of Canada".to_string(), 10)
+        );
+        assert!(!s.top_played_artists.iter().any(|(a, _)| a.trim().is_empty()));
+        assert!(!s.top_played_artists.iter().any(|(a, _)| a == "Unplayed Act"));
+        assert!(!s.top_played_artists.iter().any(|(a, _)| a == "Artist 10"));
+
+        // Top 8 tracks sorted by play_count desc, then rating desc; excludes 0-play track
+        assert_eq!(s.top_played_tracks.len(), 8);
+        assert_eq!(s.top_played_tracks[0].song_id, "s6");
+        assert_eq!(s.top_played_tracks[0].play_count, 50);
+        assert_eq!(s.top_played_tracks[1].song_id, "s2");
+        assert_eq!(s.top_played_tracks[1].rating, Some(5));
+        assert_eq!(s.top_played_tracks[1].duration, Some(300));
+        // Tie at 10 plays: 5-star track beats 2-star track
+        assert_eq!(s.top_played_tracks[2].song_id, "s3");
+        assert_eq!(s.top_played_tracks[3].song_id, "s4");
+        assert!(!s.top_played_tracks.iter().any(|t| t.song_id == "s5"));
     }
 
     #[tokio::test]

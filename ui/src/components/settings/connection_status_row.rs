@@ -20,16 +20,16 @@ pub(crate) struct ConnectionStatusRowProps {
 #[component]
 pub(crate) fn ConnectionStatusRow(props: ConnectionStatusRowProps) -> Element {
     rsx! {
-        div {
-            h3 { class: "text-sm font-semibold text-white mb-3", "{props.label}" }
+        div { class: "p-4 rounded-[12px] bg-beet-surface border border-beet-border-subtle",
+            h3 { class: "text-sm font-semibold text-beet-text-primary mb-2", "{props.label}" }
             div { class: "mb-2",
                 StatusLine { dot_class: props.dot_class, summary: props.summary }
             }
             if let Some(note) = &props.note {
-                p { class: "text-xs text-gray-400 font-mono", "{note}" }
+                p { class: "text-xs text-beet-text-secondary leading-relaxed", "{note}" }
             }
             if let Some(details) = props.details {
-                Disclosure { class: "mt-2", label: "details", {details} }
+                Disclosure { class: "mt-2.5", label: "details", {details} }
             }
         }
     }
@@ -41,7 +41,7 @@ pub(crate) fn StatusLine(dot_class: &'static str, summary: String) -> Element {
     rsx! {
         div { class: "flex items-center gap-2",
             span { class: "w-2 h-2 rounded-full shrink-0 {dot_class}" }
-            span { class: "text-xs font-mono text-gray-300", "{summary}" }
+            span { class: "text-xs font-medium text-beet-text-primary", "{summary}" }
         }
     }
 }
@@ -84,27 +84,27 @@ pub(crate) fn beets_row(h: &ImporterHealth) -> BeetsRow {
 #[component]
 pub(crate) fn ImporterDetails(health: ImporterHealth) -> Element {
     rsx! {
-        div { class: "mt-2 space-y-3 text-xs font-mono",
+        div { class: "mt-3 p-3 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle space-y-3 text-xs",
             if !health.issues.is_empty() {
                 ul { class: "space-y-2",
                     for issue in health.issues.iter() {
                         li {
                             div { class: "flex items-baseline gap-2",
-                                span { class: issue_class(issue.severity), "{issue.severity.chip()}" }
-                                span { class: "text-gray-300", "{issue.title}" }
+                                span { class: "tabular-nums-mono text-[11px] font-semibold {issue_class(issue.severity)}", "{issue.severity.chip()}" }
+                                span { class: "text-beet-text-primary", "{issue.title}" }
                             }
                             if !issue.detail.is_empty() {
-                                p { class: "text-gray-500 mt-0.5 whitespace-pre-wrap break-words", "{issue.detail}" }
+                                p { class: "text-beet-text-secondary mt-0.5 whitespace-pre-wrap break-words leading-relaxed", "{issue.detail}" }
                             }
                         }
                     }
                 }
             }
             if !health.facts.is_empty() {
-                dl { class: "grid grid-cols-[auto_1fr] gap-x-3 gap-y-1",
+                dl { class: "grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 tabular-nums-mono",
                     for (name, value) in health.facts.iter() {
-                        dt { class: "text-gray-500", "{name}" }
-                        dd { class: "text-gray-300 break-all", "{value}" }
+                        dt { class: "text-beet-text-tertiary", "{name}" }
+                        dd { class: "text-beet-text-secondary break-all", "{value}" }
                     }
                 }
             }
@@ -114,9 +114,9 @@ pub(crate) fn ImporterDetails(health: ImporterHealth) -> Element {
 
 fn issue_class(severity: HealthLevel) -> &'static str {
     match severity {
-        HealthLevel::Broken => "text-red-400 shrink-0",
-        HealthLevel::Degraded => "text-yellow-400 shrink-0",
-        HealthLevel::Ready | HealthLevel::Checking => "text-gray-500 shrink-0",
+        HealthLevel::Broken => "text-beet-crimson-text shrink-0",
+        HealthLevel::Degraded => "text-beet-gold shrink-0",
+        HealthLevel::Ready | HealthLevel::Checking => "text-beet-text-tertiary shrink-0",
     }
 }
 
@@ -142,11 +142,11 @@ mod tests {
         };
         assert_eq!(
             beets_row(&health(HealthLevel::Checking, vec![])),
-            row("bg-gray-500 animate-pulse", "Checking...", None)
+            row("bg-beet-text-tertiary animate-pulse", "Checking...", None)
         );
         assert_eq!(
             beets_row(&health(HealthLevel::Ready, vec![])),
-            row("bg-beet-accent", "Ready", None)
+            row("bg-beet-leaf-solid", "Ready", None)
         );
         let warning = HealthIssue {
             severity: HealthLevel::Degraded,
@@ -155,7 +155,7 @@ mod tests {
         };
         assert_eq!(
             beets_row(&health(HealthLevel::Degraded, vec![warning.clone()])),
-            row("bg-yellow-500", "Ready with warnings", None)
+            row("bg-beet-gold", "Ready with warnings", None)
         );
         let blocking = HealthIssue {
             severity: HealthLevel::Broken,
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(
             beets_row(&health(HealthLevel::Broken, vec![warning, blocking])),
             row(
-                "bg-red-500",
+                "bg-beet-crimson-text",
                 "No metadata source plugin loaded",
                 Some("Add musicbrainz to plugins:.")
             )

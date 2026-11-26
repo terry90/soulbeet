@@ -70,6 +70,17 @@ impl DeletionReason {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TopPlayedTrack {
+    pub song_id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub play_count: u64,
+    pub rating: Option<u8>,
+    pub duration: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct LibraryStats {
     pub total_tracks: u32,
@@ -80,6 +91,14 @@ pub struct LibraryStats {
     pub total_albums: u32,
     pub total_artists: u32,
     pub genres: Vec<(String, u32)>,
+    #[serde(default)]
+    pub total_plays: u64,
+    #[serde(default)]
+    pub total_duration_secs: u64,
+    #[serde(default)]
+    pub top_played_artists: Vec<(String, u64)>,
+    #[serde(default)]
+    pub top_played_tracks: Vec<TopPlayedTrack>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

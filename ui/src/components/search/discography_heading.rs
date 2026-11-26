@@ -68,20 +68,20 @@ pub fn DiscographyHeading(props: DiscographyHeadingProps) -> Element {
         .collect();
 
     rsx! {
-      div { class: "mb-4 border-b border-white/10 pb-2 space-y-2",
-        h5 { class: "text-xl font-display font-bold text-white",
+      div { class: "mb-4 border-b border-beet-border-subtle pb-3 space-y-2",
+        h5 { class: "text-[18px] font-display font-semibold text-beet-text-primary",
           "Albums by {artist.name}"
           if let Some(disambiguation) = &artist.disambiguation {
-            span { class: "ml-2 text-sm font-mono font-normal text-gray-500", "{disambiguation}" }
+            span { class: "ml-2 text-[13px] tabular-nums-mono font-normal text-beet-text-tertiary", "{disambiguation}" }
           }
         }
         if !picks.is_empty() {
-          div { class: "flex flex-wrap items-center gap-2 text-xs font-mono text-gray-400",
+          div { class: "flex flex-wrap items-center gap-2 text-[12px] text-beet-text-secondary",
             span { "Other artists known as {name}:" }
             for (mbid, label, aria) in picks {
               button {
                 key: "{mbid}",
-                class: "min-h-[44px] px-[10px] rounded border border-white/10 hover:border-white/20 hover:text-white cursor-pointer {FOCUS_RING}",
+                class: "min-h-[44px] px-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default hover:text-beet-text-primary text-beet-text-secondary cursor-pointer transition-colors {FOCUS_RING}",
                 r#type: "button",
                 aria_label: aria,
                 onclick: move |_| on_pick.call(mbid.clone()),
@@ -91,7 +91,7 @@ pub fn DiscographyHeading(props: DiscographyHeadingProps) -> Element {
           }
         }
         if let Some(note) = left_out_note(shown, albums_complete, singles_complete) {
-          p { class: "text-xs font-mono text-gray-500", "{note}" }
+          p { class: "text-[12px] tabular-nums-mono text-beet-text-tertiary", "{note}" }
         }
       }
     }

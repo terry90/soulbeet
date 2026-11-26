@@ -13,12 +13,12 @@ const ARTIST: &str = "artist";
 const QUERY_ID: &str = "search-query";
 const ARTIST_ID: &str = "search-artist";
 
-/// A row of the bar, edged in magenta while a field in it has focus.
+/// A row of the bar, edged cleanly in Studio leaf green while a field in it has focus.
 const ROW_CLASS: &str =
-    "flex items-center focus-within:shadow-[inset_2px_0_0_var(--color-beet-accent)]";
+    "flex items-center focus-within:shadow-[inset_2px_0_0_var(--color-beet-leaf-solid)]";
 
-/// The icon or word before a row's field, which turns magenta with it.
-const LEAD_CLASS: &str = "flex-none w-[48px] self-stretch flex items-center justify-center text-gray-500 cursor-text group-focus-within/row:text-beet-accent";
+/// The icon or word before a row's field.
+const LEAD_CLASS: &str = "flex-none w-[44px] self-stretch flex items-center justify-center text-beet-text-tertiary cursor-text group-focus-within/row:text-beet-leaf-text transition-colors";
 
 /// Whether the form has something to search for: a title, or an artist
 /// whose albums to list.
@@ -41,11 +41,17 @@ pub struct SearchBarProps {
     pub active_menu: Signal<Option<String>>,
     /// Runs on every submit, once the fields' text is in `search` and `artist`.
     pub on_search: EventHandler,
+    /// Optional placeholder override (e.g. when Offline Only mode is active).
+    #[props(default)]
+    pub placeholder_override: Option<String>,
+    /// Whether to show the `ALBUM` / `TRACK` entity toggle in the bar controls strip.
+    #[props(default = true)]
+    pub show_type_toggle: bool,
 }
 
-/// The search form: the query and its button, an artist row when one is
-/// wanted, and a strip with album or track, the artist filter and the
-/// download folder.
+/// The unified Studio search form: query input, optional artist row for
+/// discography & filtered searches, `ALBUM` / `TRACK` segmented radios, and
+/// destination download folder selector.
 #[component]
 pub fn SearchBar(props: SearchBarProps) -> Element {
     let SearchBarProps {
@@ -55,6 +61,8 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
         search_type,
         loading,
         on_search,
+        placeholder_override,
+        show_type_toggle,
         ..
     } = props;
 
@@ -74,12 +82,15 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
 
     let artist_shown = artist_open() || artist.read().is_some();
     // With an artist, the title may be left out to list the artist's albums.
-    let placeholder = match (search_type(), artist_shown) {
-        (SearchType::Album, false) => "Search albums",
-        (SearchType::Track, false) => "Search tracks",
-        (SearchType::Album, true) => "Album title (optional)",
-        (SearchType::Track, true) => "Track title (optional)",
-    };
+    let placeholder = placeholder_override.unwrap_or_else(|| {
+        match (search_type(), artist_shown) {
+            (SearchType::Album, false) => "Search albums",
+            (SearchType::Track, false) => "Search tracks",
+            (SearchType::Album, true) => "Album title (optional)",
+            (SearchType::Track, true) => "Track title (optional)",
+        }
+        .to_string()
+    });
 
     rsx! {
       form {
@@ -96,19 +107,15 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             on_search.call(());
         },
 
-        div {
-          class: "absolute -inset-1 rounded-xl bg-gradient-to-r from-beet-accent to-beet-leaf blur opacity-25 transition duration-1000 group-hover:opacity-50 group-hover:duration-200 group-focus-within:opacity-50 group-focus-within:duration-200",
-          aria_hidden: "true",
-        }
-        div { class: "relative bg-beet-dark border border-white/10 rounded-lg shadow-2xl",
+        div { class: "relative bg-beet-surface border border-beet-border-default focus-within:border-beet-border-strong rounded-[12px] transition-colors",
 
-          div { class: "{ROW_CLASS} group/row relative min-h-[56px] pr-[6px] rounded-t-[7px]",
+          div { class: "{ROW_CLASS} group/row relative min-h-[54px] pr-[6px] rounded-t-[11px]",
             label { class: LEAD_CLASS, r#for: QUERY_ID,
               svg {
-                class: "size-[20px]",
+                class: "size-[18px]",
                 fill: "none",
                 stroke: "currentColor",
-                stroke_width: "2",
+                stroke_width: "1.75",
                 view_box: "0 0 24 24",
                 "aria-hidden": "true",
                 path {
@@ -121,23 +128,23 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             }
             TextInput {
               look: FieldLook::Bar,
-              class: "text-white",
+              class: "text-beet-text-primary placeholder:text-beet-text-tertiary",
               kind: FieldKind::Search,
               enterkeyhint: "search",
               id: QUERY_ID,
               name: QUERY,
               value: search(),
               oninput: move |text| search.set(text),
-              placeholder,
+              placeholder: placeholder.clone(),
             }
             Button {
-              class: "flex-none inline-flex items-center justify-center min-h-[44px] min-w-[92px] md:min-w-[104px] ml-[8px] whitespace-nowrap {FOCUS_RING}",
+              class: "flex-none inline-flex items-center justify-center min-h-[42px] min-w-[92px] md:min-w-[104px] ml-[8px] rounded-[8px] whitespace-nowrap {FOCUS_RING}",
               submit: true,
               disabled: !can_search(&search.read(), artist.read().as_deref()),
               busy: loading,
               if loading {
                 span {
-                  class: "size-[14px] rounded-full border-2 border-beet-leaf/20 border-t-beet-leaf animate-spin motion-reduce:animate-none",
+                  class: "size-[14px] rounded-full border-2 border-beet-leaf/20 border-t-beet-leaf-text animate-spin motion-reduce:animate-none",
                   aria_hidden: "true",
                 }
                 span { class: "sr-only", "Searching" }
@@ -148,21 +155,21 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             // The light along the seam under the query while a search runs.
             if loading {
               span {
-                class: "seam-light absolute inset-x-0 -bottom-px h-px",
+                class: "seam-light absolute inset-x-0 -bottom-px h-[2px]",
                 aria_hidden: "true",
               }
             }
           }
 
           if artist_shown {
-            div { class: "{ROW_CLASS} group/row min-h-[48px] border-t border-white/6",
-              label { class: "{LEAD_CLASS} font-mono text-[13px] italic", r#for: ARTIST_ID,
+            div { class: "{ROW_CLASS} group/row min-h-[46px] border-t border-beet-border-subtle",
+              label { class: "{LEAD_CLASS} tabular-nums-mono text-[12px] italic", r#for: ARTIST_ID,
                 span { aria_hidden: "true", "by" }
                 span { class: "sr-only", "Artist" }
               }
               TextInput {
                 look: FieldLook::Bar,
-                class: "text-gray-300",
+                class: "text-beet-text-secondary placeholder:text-beet-text-tertiary",
                 enterkeyhint: "search",
                 id: ARTIST_ID,
                 name: ARTIST,
@@ -178,7 +185,7 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
                 placeholder: "Artist name",
               }
               button {
-                class: "flex-none size-[44px] flex items-center justify-center rounded text-gray-500 hover:text-white cursor-pointer {FOCUS_RING}",
+                class: "flex-none size-[44px] flex items-center justify-center rounded-[8px] text-beet-text-tertiary hover:text-beet-text-primary cursor-pointer transition-colors {FOCUS_RING}",
                 r#type: "button",
                 aria_label: "Remove artist filter",
                 onclick: move |_| {
@@ -190,7 +197,7 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
                   class: "size-[16px]",
                   fill: "none",
                   stroke: "currentColor",
-                  stroke_width: "2",
+                  stroke_width: "1.75",
                   view_box: "0 0 24 24",
                   "aria-hidden": "true",
                   path { stroke_linecap: "round", d: "M6 6l12 12M18 6L6 18" }
@@ -199,11 +206,13 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
             }
           }
 
-          div { class: "flex items-center gap-[2px] min-h-[44px] px-[4px] border-t border-white/6 bg-black/20 rounded-b-[7px]",
-            SearchTypeToggle { search_type }
+          div { class: "flex items-center gap-1.5 min-h-[44px] px-2 border-t border-beet-border-subtle bg-beet-surface-low rounded-b-[11px]",
+            if show_type_toggle {
+              SearchTypeToggle { search_type }
+            }
             if !artist_shown {
               button {
-                class: "flex-none inline-flex items-center gap-[6px] h-[44px] px-[10px] max-[399px]:px-[8px] rounded font-mono text-[11px] font-bold tracking-[0.08em] uppercase text-gray-500 hover:text-gray-300 cursor-pointer {FOCUS_RING}",
+                class: "flex-none inline-flex items-center gap-1.5 h-[36px] px-2.5 max-[399px]:px-2 rounded-[8px] tabular-nums-mono text-[11px] font-semibold tracking-[0.06em] uppercase text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors {FOCUS_RING}",
                 r#type: "button",
                 aria_label: "Add artist filter",
                 onmounted: focus_if_moved,

@@ -2,7 +2,9 @@ pub mod album;
 pub mod context;
 pub mod track;
 
+pub use album::AlbumResult;
 pub use context::{AutoDownloadSignal, SearchPrefill, SearchReset};
+pub use track::TrackResult;
 
 mod download_icon;
 pub use download_icon::{DownloadIcon, DownloadRowState};
@@ -13,16 +15,29 @@ mod inline_track_panel;
 mod inline_track_row;
 
 mod folder_chip;
+pub use folder_chip::FolderChip;
 
 mod search_bar;
-use search_bar::SearchBar;
+pub use search_bar::SearchBar;
 
 mod discography_heading;
-use discography_heading::DiscographyHeading;
+pub use discography_heading::DiscographyHeading;
+
+mod download_results;
+pub use download_results::{
+    group_backend_id, sort_merged_groups, BackendPollState, BackendSearchStatus, DownloadResults,
+};
+
+mod toast;
+pub use toast::{FallbackToast, FallbackToastData};
+
+mod search_type_toggle;
+pub use search_type_toggle::{SearchType, SearchTypeToggle};
 
 use api::models::folder::Folder;
 use dioxus::logger::tracing::{info, warn};
 use dioxus::prelude::*;
+use shared::backends::{BackendMeta, SLSKD};
 use shared::download::{
     AutoDownloadEvent, DownloadQuery, DownloadableGroup, DownloadableItem,
     SearchState as DownloadSearchState,
@@ -32,58 +47,335 @@ use shared::metadata::{
 };
 use std::collections::{HashMap, HashSet};
 
-use track::TrackResult;
-
-use crate::search::album::AlbumResult;
 use crate::settings_context::use_settings;
-use crate::{use_auth, use_system_health, BackgroundGlows, GlowColor, GlowSpread, SystemStatus};
+use crate::{friendly_error, use_auth, use_system_health, Auth, SystemStatus};
 
-mod download_results;
-use download_results::DownloadResults;
-
-mod toast;
-use toast::{FallbackToast, FallbackToastData};
-
-mod search_type_toggle;
-use search_type_toggle::SearchType;
-
-/// The sources a search found, to pick files from, and the search a pick
-/// names.
+/// The sources a search found, to pick files from, and the search IDs a pick
+/// names (one fallback `search_id` plus per-backend IDs for multi-backend searches).
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceChoices {
-    /// Empty while the search is starting, when there is nothing to pick.
+    /// Fallback search_id (e.g. from `FallbackToast` or single-backend search).
     pub search_id: String,
+    /// Per-backend search IDs (`backend_id -> search_id`) for multi-backend manual searches.
+    pub search_ids_by_backend: HashMap<String, String>,
     pub groups: Vec<DownloadableGroup>,
     /// Why the search may have found nothing, as the backend says it (`SearchStats`).
     pub unanswered_note: Option<String>,
+    /// Live per-backend polling status (populated for multi-backend searches).
+    pub backend_statuses: Vec<BackendSearchStatus>,
+}
+
+impl SourceChoices {
+    /// Wraps a single stored search (such as `AutoDownloadEvent::FallbackToManual`).
+    pub fn single(
+        search_id: String,
+        mut groups: Vec<DownloadableGroup>,
+        unanswered_note: Option<String>,
+    ) -> Self {
+        sort_merged_groups(&mut groups);
+        Self {
+            search_id,
+            search_ids_by_backend: HashMap::new(),
+            groups,
+            unanswered_note,
+            backend_statuses: Vec::new(),
+        }
+    }
+
+    /// Resolves the stored `search_id` that owns items from `backend_id`.
+    pub fn search_id_for_backend(&self, backend_id: &str) -> String {
+        self.search_ids_by_backend
+            .get(backend_id)
+            .cloned()
+            .unwrap_or_else(|| self.search_id.clone())
+    }
+
+    /// Merges a backend's poll results into `self.groups`, ensuring every item carries
+    /// its backend ID, deduplicating per `(backend, source, group_id)`, and keeping
+    /// `Delivery::AsFound` groups sorted ahead of `Delivery::LossyOnly` by score desc.
+    pub fn merge_backend_groups(
+        &mut self,
+        backend_id: &str,
+        incoming: Vec<DownloadableGroup>,
+        unanswered_note: Option<String>,
+    ) {
+        if self.unanswered_note.is_none() {
+            self.unanswered_note = unanswered_note;
+        }
+        for mut new_group in incoming {
+            for item in &mut new_group.items {
+                if item.backend.is_empty() {
+                    item.backend = backend_id.to_string();
+                }
+            }
+            if let Some(pos) = self.groups.iter().position(|x| {
+                group_backend_id(x) == Some(backend_id)
+                    && x.source == new_group.source
+                    && x.group_id == new_group.group_id
+            }) {
+                self.groups[pos] = new_group;
+            } else {
+                self.groups.push(new_group);
+            }
+        }
+        sort_merged_groups(&mut self.groups);
+        let count = self
+            .groups
+            .iter()
+            .filter(|g| group_backend_id(g) == Some(backend_id))
+            .count();
+        if let Some(st) = self
+            .backend_statuses
+            .iter_mut()
+            .find(|s| s.id == backend_id)
+        {
+            st.group_count = count;
+        }
+    }
+}
+
+/// Starts parallel manual source searches across every enabled download backend,
+/// polling concurrently and streaming merged groups into `download_options`.
+///
+/// Falls back to a single default-backend search (`backend: None`) when the
+/// enabled backend list is empty or cannot be fetched.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_multi_backend_source_search(
+    auth: Auth,
+    query: DownloadQuery,
+    enabled_backends: Vec<BackendMeta>,
+    mut download_options: Signal<Option<SourceChoices>>,
+    mut source_searching: Signal<bool>,
+    mut download_error: Signal<String>,
+    gen_signal: Signal<u64>,
+    expected_gen: u64,
+) {
+    source_searching.set(true);
+    download_error.set(String::new());
+
+    let resolved_backends = if !enabled_backends.is_empty() {
+        enabled_backends
+    } else {
+        auth.call(api::get_enabled_download_backends())
+            .await
+            .ok()
+            .unwrap_or_default()
+    };
+
+    if *gen_signal.peek() != expected_gen {
+        return;
+    }
+
+    // (explicit backend field for DownloadQuery, metadata for display/tracking)
+    let targets: Vec<(Option<String>, BackendMeta)> = if resolved_backends.is_empty() {
+        vec![(None, SLSKD)]
+    } else {
+        resolved_backends
+            .into_iter()
+            .map(|m| (Some(m.id.to_string()), m))
+            .collect()
+    };
+
+    download_options.set(Some(SourceChoices {
+        search_id: String::new(),
+        search_ids_by_backend: HashMap::new(),
+        groups: vec![],
+        unanswered_note: None,
+        backend_statuses: targets
+            .iter()
+            .map(|(_, meta)| BackendSearchStatus {
+                id: meta.id.to_string(),
+                name: meta.name.to_string(),
+                delivery: meta.delivery,
+                state: BackendPollState::Searching,
+                group_count: 0,
+                warning: None,
+            })
+            .collect(),
+    }));
+
+    let tasks = targets.into_iter().map(|(explicit_backend, meta)| {
+        let q = DownloadQuery {
+            backend: explicit_backend,
+            ..query.clone()
+        };
+        async move {
+            let search_id = match auth.call(api::start_download_search(q)).await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("Failed to start {} download search: {:?}", meta.id, e);
+                    if *gen_signal.peek() == expected_gen {
+                        let msg = friendly_error(&e);
+                        download_options.with_mut(|current| {
+                            if let Some(choices) = current.as_mut() {
+                                if let Some(st) =
+                                    choices.backend_statuses.iter_mut().find(|s| s.id == meta.id)
+                                {
+                                    st.state = BackendPollState::Failed;
+                                    st.warning = Some(msg);
+                                }
+                            }
+                        });
+                    }
+                    return;
+                }
+            };
+
+            if *gen_signal.peek() != expected_gen {
+                return;
+            }
+
+            download_options.with_mut(|current| {
+                if let Some(choices) = current.as_mut() {
+                    if choices.search_id.is_empty() {
+                        choices.search_id = search_id.clone();
+                    }
+                    choices
+                        .search_ids_by_backend
+                        .insert(meta.id.to_string(), search_id.clone());
+                }
+            });
+
+            loop {
+                if *gen_signal.peek() != expected_gen {
+                    break;
+                }
+                match auth
+                    .call(api::poll_download_search(api::PollQuery {
+                        search_id: search_id.clone(),
+                    }))
+                    .await
+                {
+                    Ok(response) => {
+                        if *gen_signal.peek() != expected_gen {
+                            break;
+                        }
+                        let done = response.state != DownloadSearchState::InProgress;
+                        download_options.with_mut(|current| {
+                            if let Some(choices) = current.as_mut() {
+                                choices.merge_backend_groups(
+                                    meta.id,
+                                    response.groups,
+                                    response.stats.unanswered_note,
+                                );
+                                if done {
+                                    if let Some(st) = choices
+                                        .backend_statuses
+                                        .iter_mut()
+                                        .find(|s| s.id == meta.id)
+                                    {
+                                        st.state = BackendPollState::Done;
+                                    }
+                                }
+                            }
+                        });
+                        if done {
+                            break;
+                        }
+                        gloo_timers::future::TimeoutFuture::new(350).await;
+                    }
+                    Err(e) => {
+                        info!("Failed to poll {} search: {:?}", meta.id, e);
+                        if *gen_signal.peek() == expected_gen {
+                            let msg = friendly_error(&e);
+                            download_options.with_mut(|current| {
+                                if let Some(choices) = current.as_mut() {
+                                    if let Some(st) = choices
+                                        .backend_statuses
+                                        .iter_mut()
+                                        .find(|s| s.id == meta.id)
+                                    {
+                                        st.state = BackendPollState::Failed;
+                                        st.warning = Some(msg);
+                                    }
+                                }
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    futures::future::join_all(tasks).await;
+
+    if *gen_signal.peek() == expected_gen {
+        source_searching.set(false);
+    }
+}
+
+/// Submits hand-picked `items` to `api::download`, grouping by `item.backend` so
+/// each request honors the server's single-backend-per-request contract and passes
+/// the matching backend `search_id`.
+pub async fn submit_multi_backend_download(
+    auth: Auth,
+    choices: &SourceChoices,
+    items: Vec<DownloadableItem>,
+    target_folder: String,
+) -> Result<(), String> {
+    let mut by_backend: Vec<(String, Vec<DownloadableItem>)> = Vec::new();
+    for item in items {
+        let key = item.backend.clone();
+        if let Some((_, bucket)) = by_backend.iter_mut().find(|(b, _)| *b == key) {
+            bucket.push(item);
+        } else {
+            by_backend.push((key, vec![item]));
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (backend_id, batch) in by_backend {
+        let search_id = choices.search_id_for_backend(&backend_id);
+        match auth
+            .call(api::download(api::DownloadRequest {
+                items: batch,
+                target_folder: target_folder.clone(),
+                search_id,
+            }))
+            .await
+        {
+            Ok(_) => info!("Downloads started on backend {}", backend_id),
+            Err(e) => {
+                warn!("Failed to start downloads on {}: {:?}", backend_id, e);
+                errors.push(friendly_error(&e));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" · "))
+    }
 }
 
 /// A download query for `album`.
-fn album_query(album: &Album) -> DownloadQuery {
+pub fn album_query(album: &Album) -> DownloadQuery {
     DownloadQuery::new(vec![]).album(album.clone())
 }
 
 /// The artist whose albums a search lists: one given with no title.
-fn discography_artist(artist: Option<String>, query: &str) -> Option<String> {
+pub fn discography_artist(artist: Option<String>, query: &str) -> Option<String> {
     artist.filter(|_| asks_no_title(query))
 }
 
 /// What an artist-only search listed.
 #[derive(Clone, PartialEq, Debug)]
-struct Listed {
+pub struct Listed {
     /// The name searched for.
-    name: String,
+    pub name: String,
     /// The artist whose albums are listed; None when no artist carries the name.
-    artist: Option<ArtistSummary>,
+    pub artist: Option<ArtistSummary>,
     /// The other artists carrying the name.
-    others: Vec<ArtistSummary>,
-    albums_complete: bool,
-    singles_complete: bool,
-    shown: usize,
+    pub others: Vec<ArtistSummary>,
+    pub albums_complete: bool,
+    pub singles_complete: bool,
+    pub shown: usize,
 }
 
 /// The listing of the search for `name` and its rows, from what it found.
-fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchResult>) {
+pub fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchResult>) {
     let Some(found) = found else {
         let listed = Listed {
             name,
@@ -108,7 +400,7 @@ fn listed_from(name: String, found: Option<Discography>) -> (Listed, Vec<SearchR
 }
 
 /// What a search that found nothing says.
-fn empty_message(listed: Option<&Listed>) -> String {
+pub fn empty_message(listed: Option<&Listed>) -> String {
     match listed {
         Some(Listed {
             artist: Some(artist),
@@ -122,6 +414,7 @@ fn empty_message(listed: Option<&Listed>) -> String {
     }
 }
 
+/// Standalone Studio multi-backend search component (reusable outside the web shell).
 #[component]
 pub fn Search() -> Element {
     let auth = use_auth();
@@ -134,13 +427,15 @@ pub fn Search() -> Element {
     let mut artist_open = use_signal(|| false);
     let mut search_type = use_signal(|| settings.last_search_type());
     let mut loading = use_signal(|| false);
+    let mut source_searching = use_signal(|| false);
+    let mut source_search_gen = use_signal(|| 0u64);
     let mut expanded_albums = use_signal::<HashSet<String>>(HashSet::new);
     let mut album_cache = use_signal::<HashMap<String, AlbumWithTracks>>(HashMap::new);
     let mut download_options = use_signal::<Option<SourceChoices>>(|| None);
     let mut is_downloading = use_signal(|| false);
     let mut download_error = use_signal(String::new);
-    // Why the last search failed.
     let mut search_error = use_signal(String::new);
+    let mut enabled_backends = use_signal::<Vec<BackendMeta>>(Vec::new);
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
 
@@ -155,10 +450,8 @@ pub fn Search() -> Element {
     let mut batch_to_name = use_signal::<HashMap<String, String>>(HashMap::new);
     let mut active_menu = use_signal::<Option<String>>(|| None);
 
-    // Track if we've synced search_type from settings (to avoid saving on initial load)
     let mut synced = use_signal(|| false);
 
-    // Sync search type from settings once loaded
     use_effect(move || {
         if settings.is_loaded() && !synced() {
             search_type.set(settings.last_search_type());
@@ -166,7 +459,6 @@ pub fn Search() -> Element {
         }
     });
 
-    // Persist search type changes to settings
     use_effect(move || {
         let current_type = search_type();
         if synced() {
@@ -176,7 +468,6 @@ pub fn Search() -> Element {
         }
     });
 
-    // Sync selected_folder_id from settings
     use_effect(move || {
         if settings.is_loaded() {
             if let Some(us) = settings.get() {
@@ -187,13 +478,18 @@ pub fn Search() -> Element {
         }
     });
 
-    // Fetch user folders
     use_future(move || async move {
         if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
             if user_folders.len() == 1 {
                 selected_folder_id.set(Some(user_folders[0].id.clone()));
             }
             folders.set(user_folders);
+        }
+    });
+
+    use_future(move || async move {
+        if let Ok(list) = auth.call(api::get_enabled_download_backends()).await {
+            enabled_backends.set(list);
         }
     });
 
@@ -213,38 +509,29 @@ pub fn Search() -> Element {
         }
     });
 
-    // Buffer for events that arrive before batch_to_item is populated (race condition)
     let mut pending_events = use_signal::<Vec<AutoDownloadEvent>>(Vec::new);
-
-    // Route AutoDownloadEvents from WebSocket to per-row download states
     let auto_dl = try_use_context::<AutoDownloadSignal>();
     use_effect(move || {
         let Some(mut ctx) = auto_dl else { return };
-        // Subscribe only to ctx.0 (WS event slot). Reading other signals with
-        // .read() would subscribe to them too, and writing the same signal
-        // later in this effect would self-retrigger because Dioxus 0.7
-        // Signal::set has no PartialEq dedupe (dioxus-signals/src/write.rs:345).
         let Some(event) = (ctx.0)() else { return };
         (ctx.0).set(None);
 
-        // Collect the new event plus any buffered ones — peek, no subscribe
         let mut events_to_process = pending_events.peek().clone();
         events_to_process.push(event);
         let mut still_pending = Vec::new();
 
         for event in events_to_process {
             let batch_id = match &event {
-                AutoDownloadEvent::Searching { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::ScoringResults { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::PickedSource { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::Downloading { batch_id } => batch_id.clone(),
-                AutoDownloadEvent::FallbackToManual { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Searching { batch_id, .. }
+                | AutoDownloadEvent::ScoringResults { batch_id, .. }
+                | AutoDownloadEvent::PickedSource { batch_id, .. }
+                | AutoDownloadEvent::Downloading { batch_id }
+                | AutoDownloadEvent::FallbackToManual { batch_id, .. }
+                | AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
             };
 
             let item_id = batch_to_item.peek().get(&batch_id).cloned();
             let Some(item_id) = item_id else {
-                // batch_id not yet registered, buffer for retry
                 still_pending.push(event);
                 continue;
             };
@@ -254,7 +541,6 @@ pub fn Search() -> Element {
                     download_states
                         .write()
                         .insert(item_id.clone(), DownloadRowState::Searching);
-                    // D-09: propagate to expanded track rows
                     if let Some(cached) = album_cache.peek().get(&item_id) {
                         let mut states = download_states.write();
                         for track in &cached.tracks {
@@ -267,14 +553,12 @@ pub fn Search() -> Element {
                     download_states
                         .write()
                         .insert(item_id.clone(), DownloadRowState::Done);
-                    // D-09: propagate to expanded track rows
                     if let Some(cached) = album_cache.peek().get(&item_id) {
                         let mut states = download_states.write();
                         for track in &cached.tracks {
                             states.insert(track.id.clone(), DownloadRowState::Done);
                         }
                     }
-
                     spawn(async move {
                         gloo_timers::future::TimeoutFuture::new(5000).await;
                         let current = download_states.peek().get(&item_id_timer).cloned();
@@ -295,13 +579,11 @@ pub fn Search() -> Element {
                     download_states
                         .write()
                         .insert(item_id.clone(), DownloadRowState::Idle);
-
                     let track_name = batch_to_name
                         .peek()
                         .get(&batch_id)
                         .cloned()
                         .unwrap_or(item_id.clone());
-
                     let toast_id = batch_id.clone();
                     fallback_toasts.write().push(FallbackToastData {
                         id: batch_id,
@@ -310,7 +592,6 @@ pub fn Search() -> Element {
                         results,
                         reason,
                     });
-
                     spawn(async move {
                         gloo_timers::future::TimeoutFuture::new(8000).await;
                         fallback_toasts.write().retain(|t| t.id != toast_id);
@@ -323,50 +604,35 @@ pub fn Search() -> Element {
                 }
             }
         }
-
-        // Safe to always set: neither this effect nor the drain effect
-        // below subscribe to `pending_events` (peek throughout), and the
-        // render does not read it either, so this is a leaf write.
         pending_events.set(still_pending);
     });
 
-    // Drain pending events when batch_to_item changes (new batch registered).
-    // Subscribe ONLY to batch_to_item via the `_trigger` read; every other
-    // signal is peeked. Without this, `pending_events.set(...)` below would
-    // self-retrigger the effect with the same value (Dioxus 0.7 Signal::set
-    // has no PartialEq dedupe) and the race between the WS Searching event
-    // and the auto_download HTTP response would freeze the browser.
     use_effect(move || {
         let _trigger = batch_to_item.read().len();
         if pending_events.peek().is_empty() {
             return;
         }
-
         let events = pending_events.peek().clone();
         let mut still_pending = Vec::new();
-
         for event in events {
             let batch_id = match &event {
-                AutoDownloadEvent::Searching { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::ScoringResults { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::PickedSource { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::Downloading { batch_id } => batch_id.clone(),
-                AutoDownloadEvent::FallbackToManual { batch_id, .. } => batch_id.clone(),
-                AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
+                AutoDownloadEvent::Searching { batch_id, .. }
+                | AutoDownloadEvent::ScoringResults { batch_id, .. }
+                | AutoDownloadEvent::PickedSource { batch_id, .. }
+                | AutoDownloadEvent::Downloading { batch_id }
+                | AutoDownloadEvent::FallbackToManual { batch_id, .. }
+                | AutoDownloadEvent::Failed { batch_id, .. } => batch_id.clone(),
             };
-
             let item_id = batch_to_item.peek().get(&batch_id).cloned();
             let Some(item_id) = item_id else {
                 still_pending.push(event);
                 continue;
             };
-
             match event {
                 AutoDownloadEvent::Searching { .. } | AutoDownloadEvent::ScoringResults { .. } => {
                     download_states
                         .write()
                         .insert(item_id.clone(), DownloadRowState::Searching);
-                    // D-09: propagate to expanded track rows
                     if let Some(cached) = album_cache.peek().get(&item_id) {
                         let mut states = download_states.write();
                         for track in &cached.tracks {
@@ -379,7 +645,6 @@ pub fn Search() -> Element {
                     download_states
                         .write()
                         .insert(item_id.clone(), DownloadRowState::Done);
-                    // D-09: propagate to expanded track rows
                     if let Some(cached) = album_cache.peek().get(&item_id) {
                         let mut states = download_states.write();
                         for track in &cached.tracks {
@@ -431,7 +696,6 @@ pub fn Search() -> Element {
                 }
             }
         }
-
         pending_events.set(still_pending);
     });
 
@@ -440,13 +704,11 @@ pub fn Search() -> Element {
         return rsx! {};
     }
 
-    // Start an auto_download for a specific folder
     let mut start_auto_download = move |item_id: String, query: DownloadQuery, folder: Folder| {
         download_states
             .write()
             .insert(item_id.clone(), DownloadRowState::Searching);
 
-        // Propagate to expanded track rows (D-09)
         if expanded_albums.read().contains(&item_id) {
             if let Some(cached) = album_cache.read().get(&item_id) {
                 let mut states = download_states.write();
@@ -456,7 +718,6 @@ pub fn Search() -> Element {
             }
         }
 
-        // Extract display name before query is moved into the request
         let display_name = query
             .album
             .as_ref()
@@ -497,27 +758,22 @@ pub fn Search() -> Element {
         });
     };
 
-    // Auto-download with default folder resolution
     let mut handle_auto_download = move |item_id: String, query: DownloadQuery| {
         let folder_id = selected_folder_id();
         let folder = folder_id
             .as_ref()
             .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
-
         let Some(folder) = folder else {
             return;
         };
-
         start_auto_download(item_id, query, folder);
     };
 
-    // Override download to a specific folder (D-02, does not change default)
     let mut handle_override_download =
         move |item_id: String, query: DownloadQuery, folder: Folder| {
             start_auto_download(item_id, query, folder);
         };
 
-    // Handle folder change from FolderChip
     let handle_folder_change = move |folder: Folder| {
         selected_folder_id.set(Some(folder.id.clone()));
         spawn(async move {
@@ -530,109 +786,32 @@ pub fn Search() -> Element {
         });
     };
 
-    let download = move |query: DownloadQuery| async move {
-        loading.set(true);
-        download_error.set(String::new());
-        download_options.set(Some(SourceChoices {
-            search_id: String::new(),
-            groups: vec![],
-            unanswered_note: None,
-        }));
-
-        let search_id = match auth.call(api::start_download_search(query)).await {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("Failed to start download search: {:?}", e);
-                loading.set(false);
-                return;
-            }
-        };
-        // Unless the panel was closed or shows other choices meanwhile.
-        download_options.with_mut(|current| {
-            if let Some(choices) = current.as_mut().filter(|c| c.search_id.is_empty()) {
-                choices.search_id = search_id.clone();
-            }
-        });
-
-        loop {
-            match auth
-                .call(api::poll_download_search(api::PollQuery {
-                    search_id: search_id.clone(),
-                }))
-                .await
-            {
-                Ok(response) => {
-                    download_options.with_mut(|current| {
-                        if let Some(SourceChoices {
-                            groups: list,
-                            unanswered_note,
-                            ..
-                        }) = current.as_mut().filter(|c| c.search_id == search_id)
-                        {
-                            *unanswered_note = response.stats.unanswered_note;
-                            for new_group in response.groups {
-                                if let Some(pos) = list.iter().position(|x| {
-                                    x.source == new_group.source && x.group_id == new_group.group_id
-                                }) {
-                                    // Safeguard against incomplete albums
-                                    list[pos] = new_group;
-                                } else {
-                                    list.push(new_group);
-                                }
-                            }
-
-                            // Resort new results by score
-                            list.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                        }
-                    });
-
-                    if response.state != DownloadSearchState::InProgress {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    info!("Failed to poll search: {:?}", e);
-                    break;
-                }
-            }
-        }
-        loading.set(false);
+    let mut open_source_picker = move |query: DownloadQuery| {
+        let next_gen = source_search_gen.peek().wrapping_add(1);
+        source_search_gen.set(next_gen);
+        let backends = enabled_backends.peek().clone();
+        spawn(run_multi_backend_source_search(
+            auth,
+            query,
+            backends,
+            download_options,
+            source_searching,
+            download_error,
+            source_search_gen,
+            next_gen,
+        ));
     };
 
-    let download_tracks =
-        move |search_id: String, (items, folder): (Vec<DownloadableItem>, String)| async move {
-            download_error.set(String::new());
-            match auth
-                .call(api::download(api::DownloadRequest {
-                    items,
-                    target_folder: folder,
-                    search_id,
-                }))
-                .await
-            {
-                Ok(_res) => info!("Downloads started"),
-                Err(e) => {
-                    warn!("Failed to start downloads: {:?}", e);
-                    download_error.set(crate::friendly_error(&e));
-                }
-            }
-            is_downloading.set(false);
-        };
-
-    // Clears what the last search and its downloads left on screen.
     let mut start_search = move || {
         download_error.set(String::new());
+        let next_gen = source_search_gen.peek().wrapping_add(1);
+        source_search_gen.set(next_gen);
         download_options.set(None);
+        source_searching.set(false);
         search_error.set(String::new());
         loading.set(true);
     };
 
-    // Lists the albums of the artist named `name`, or of the one of that name
-    // whose MBID is `chosen`.
     let list_discography = move |name: String, chosen: Option<String>| async move {
         start_search();
         let found = auth
@@ -647,13 +826,12 @@ pub fn Search() -> Element {
                 listed.set(Some(listing));
                 search_results.set(Some(rows));
             }
-            Err(e) => search_error.set(crate::friendly_error(&e)),
+            Err(e) => search_error.set(friendly_error(&e)),
         }
         loading.set(false);
     };
 
     let perform_search = move || async move {
-        // Album or track alike: an artist's tracks are in its albums' rows.
         if let Some(name) = discography_artist(artist(), &search()) {
             return list_discography(name, None).await;
         }
@@ -674,7 +852,7 @@ pub fn Search() -> Element {
                 listed.set(None);
                 search_results.set(Some(data));
             }
-            Err(e) => search_error.set(crate::friendly_error(&e)),
+            Err(e) => search_error.set(friendly_error(&e)),
         }
         loading.set(false);
     };
@@ -722,11 +900,9 @@ pub fn Search() -> Element {
         let folder = folder_id
             .as_ref()
             .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
-
         let Some(folder) = folder else {
             return;
         };
-
         start_auto_download(track.id.clone(), DownloadQuery::from(track), folder);
     };
 
@@ -735,231 +911,236 @@ pub fn Search() -> Element {
     };
 
     rsx! {
-      // bg decorations
-      BackgroundGlows { left: GlowColor::Accent, spread: GlowSpread::Wide }
-
       div {
-        class: "w-full max-w-3xl space-y-8 z-10 mx-auto flex flex-col items-center mt-20",
+        class: "w-full max-w-4xl space-y-6 mx-auto",
         onclick: move |_| {
             if active_menu().is_some() {
                 active_menu.set(None);
             }
         },
 
-        // Title Area
-        div { class: "text-center space-y-2",
-          h2 { class: "text-4xl md:text-6xl font-bold tracking-tight",
-            span { class: "text-white", "Harvest" }
-            " "
-            span { class: "text-beet-leaf font-light italic", "Music." }
-          }
-          p { class: "text-gray-400 font-mono text-sm",
-            "Search & Download // Manage Your Library"
-          }
-        }
-
-        div { class: "w-full",
-          SearchBar {
-            search,
-            artist,
-            artist_open,
-            search_type,
-            loading: loading(),
-            folders: folders.read().clone(),
-            selected_folder_id,
-            on_folder_change: handle_folder_change,
-            active_menu,
-            on_search: move |_| {
-                spawn(perform_search());
-            },
-          }
-
-          SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
-        }
-
-        if !search_error().is_empty() {
-          p { class: "text-sm font-mono text-red-400 mt-4", "{search_error}" }
-        }
-        if !download_error().is_empty() {
-          p { class: "text-sm font-mono text-red-400 mt-4", "{download_error}" }
-        }
-
-        // Results
         if let Some(choices) = download_options.read().clone() {
+          if !download_error().is_empty() {
+            p { class: "text-[13px] text-beet-crimson-text bg-beet-crimson-surface border border-beet-crimson-text/30 rounded-[10px] px-4 py-2.5",
+              "{download_error}"
+            }
+          }
           DownloadResults {
-            results: choices.groups,
-            unanswered_note: choices.unanswered_note,
-            is_searching: loading(),
+            results: choices.groups.clone(),
+            backend_statuses: choices.backend_statuses.clone(),
+            unanswered_note: choices.unanswered_note.clone(),
+            is_searching: source_searching(),
             is_downloading,
-            on_download: move |data| {
-                spawn(download_tracks(choices.search_id.clone(), data));
+            on_download: move |(items, folder)| {
+                let choices_c = choices.clone();
+                spawn(async move {
+                    download_error.set(String::new());
+                    if let Err(err) = submit_multi_backend_download(auth, &choices_c, items, folder).await {
+                        download_error.set(err);
+                    }
+                    is_downloading.set(false);
+                });
             },
             on_back: move |_| {
+                let next_gen = source_search_gen.peek().wrapping_add(1);
+                source_search_gen.set(next_gen);
                 download_options.set(None);
                 download_error.set(String::new());
-                loading.set(false);
+                source_searching.set(false);
             },
           }
-        } else if loading() {
-          div { class: "flex flex-col justify-center items-center py-10",
-            div { class: "animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-beet-accent" }
-          }
         } else {
-          match (&*search_results.read(), listed()) {
-              (Some(ref data), listing) if !data.is_empty() || listing.as_ref().is_some_and(|l| l.artist.is_some()) => {
-                rsx! {
-                  div { class: "w-full bg-beet-panel/50 border border-white/5 p-6 backdrop-blur-sm mt-8 rounded-lg",
-                    if let Some(Listed { name, artist: Some(found), others, albums_complete, singles_complete, shown }) = listing.clone() {
-                      DiscographyHeading {
-                        name: name.clone(),
-                        artist: found,
-                        others,
-                        albums_complete,
-                        singles_complete,
-                        shown,
-                        on_pick: move |mbid: String| {
-                            spawn(list_discography(name.clone(), Some(mbid)));
-                        },
+          div { class: "w-full space-y-2",
+            SearchBar {
+              search,
+              artist,
+              artist_open,
+              search_type,
+              loading: loading(),
+              folders: folders.read().clone(),
+              selected_folder_id,
+              on_folder_change: handle_folder_change,
+              active_menu,
+              on_search: move |_| {
+                  spawn(perform_search());
+              },
+            }
+
+            SystemStatus { health: system_health.get(), navidrome_status: auth.navidrome_status() }
+          }
+
+          if !search_error().is_empty() {
+            p { class: "text-[13px] text-beet-crimson-text bg-beet-crimson-surface border border-beet-crimson-text/30 rounded-[10px] px-4 py-2.5",
+              "{search_error}"
+            }
+          }
+          if !download_error().is_empty() {
+            p { class: "text-[13px] text-beet-crimson-text bg-beet-crimson-surface border border-beet-crimson-text/30 rounded-[10px] px-4 py-2.5",
+              "{download_error}"
+            }
+          }
+
+          if loading() {
+            div { class: "flex flex-col justify-center items-center py-10 gap-3",
+              div { class: "animate-spin rounded-full h-10 w-10 border-2 border-beet-border-default border-t-beet-leaf-text" }
+            }
+          } else {
+            match (&*search_results.read(), listed()) {
+                (Some(ref data), listing) if !data.is_empty() || listing.as_ref().is_some_and(|l| l.artist.is_some()) => {
+                  rsx! {
+                    div { class: "w-full bg-beet-surface-low border border-beet-border-subtle p-4 sm:p-5 rounded-[16px]",
+                      if let Some(Listed { name, artist: Some(found), others, albums_complete, singles_complete, shown }) = listing.clone() {
+                        DiscographyHeading {
+                          name: name.clone(),
+                          artist: found,
+                          others,
+                          albums_complete,
+                          singles_complete,
+                          shown,
+                          on_pick: move |mbid: String| {
+                              spawn(list_discography(name.clone(), Some(mbid)));
+                          },
+                        }
+                      } else {
+                        h5 { class: "text-[17px] font-display font-semibold mb-4 border-b border-beet-border-subtle pb-2.5 text-beet-text-primary",
+                          "Search Results"
+                        }
                       }
-                    } else {
-                      h5 { class: "text-xl font-display font-bold mb-4 border-b border-white/10 pb-2 text-white",
-                        "Search Results"
-                      }
-                    }
-                    if data.is_empty() {
-                      p { class: "text-center text-gray-500 py-10 font-mono", "{empty_message(listing.as_ref())}" }
-                    } else {
-                      ul { class: "list-none p-0 space-y-4",
-                        for item in data.iter() {
-                          match item {
-                              SearchResult::Track(ref track) => {
-                                  let track_clone = track.clone();
-                                  let track_clone_2 = track.clone();
-                                  let track_for_dl = track.clone();
-                                  let track_for_override = track.clone();
-                                  let track_id = track.id.clone();
-                                  let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
-                                  let has_folders = !folders.read().is_empty();
-                                  let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                  let current_folders = folders.read().clone();
-                                  let current_folder_id = selected_folder_id();
-                                  rsx! {
-                                    li { key: "{track.id}",
-                                      TrackResult {
-                                        on_search_sources: move || {
-                                            spawn(download(DownloadQuery::from(track_clone.clone())));
-                                        },
-                                        on_album_click: {
-                                            let album_id_for_expand = track_clone_2.album_id.clone();
-                                            move || {
-                                                if let Some(ref aid) = album_id_for_expand {
-                                                    toggle_expand(aid.clone());
-                                                }
-                                            }
-                                        },
-                                        track: track.clone(),
-                                        download_state: effective_state,
-                                        folders: current_folders,
-                                        selected_folder_id: current_folder_id.clone(),
-                                        active_menu,
-                                        on_download: move |_| {
-                                            handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
-                                        },
-                                        on_override_download: move |folder: Folder| {
-                                            handle_override_download(
-                                                track_for_override.id.clone(),
-                                                DownloadQuery::from(track_for_override.clone()),
-                                                folder,
-                                            );
-                                        },
+                      if data.is_empty() {
+                        p { class: "text-center text-beet-text-tertiary py-8 text-[13px]", "{empty_message(listing.as_ref())}" }
+                      } else {
+                        ul { class: "list-none p-0 space-y-2.5",
+                          for item in data.iter() {
+                            match item {
+                                SearchResult::Track(ref track) => {
+                                    let track_clone = track.clone();
+                                    let track_clone_2 = track.clone();
+                                    let track_for_dl = track.clone();
+                                    let track_for_override = track.clone();
+                                    let track_id = track.id.clone();
+                                    let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
+                                    let has_folders = !folders.read().is_empty();
+                                    let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                    let current_folders = folders.read().clone();
+                                    let current_folder_id = selected_folder_id();
+                                    rsx! {
+                                      li { key: "{track.id}",
+                                        TrackResult {
+                                          on_search_sources: move || {
+                                              open_source_picker(DownloadQuery::from(track_clone.clone()));
+                                          },
+                                          on_album_click: {
+                                              let album_id_for_expand = track_clone_2.album_id.clone();
+                                              move || {
+                                                  if let Some(ref aid) = album_id_for_expand {
+                                                      toggle_expand(aid.clone());
+                                                  }
+                                              }
+                                          },
+                                          track: track.clone(),
+                                          download_state: effective_state,
+                                          folders: current_folders,
+                                          selected_folder_id: current_folder_id.clone(),
+                                          active_menu,
+                                          on_download: move |_| {
+                                              handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
+                                          },
+                                          on_override_download: move |folder: Folder| {
+                                              handle_override_download(
+                                                  track_for_override.id.clone(),
+                                                  DownloadQuery::from(track_for_override.clone()),
+                                                  folder,
+                                              );
+                                          },
+                                        }
                                       }
                                     }
-                                  }
-                              }
-                              SearchResult::Album(ref album) => {
-                                  let album_clone = album.clone();
-                                  let album_for_dl = album.clone();
-                                  let album_for_override = album.clone();
-                                  let album_id = album.id.clone();
-                                  let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
-                                  let has_folders = !folders.read().is_empty();
-                                  let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                  let current_folders = folders.read().clone();
-                                  let current_folder_id = selected_folder_id();
+                                }
+                                SearchResult::Album(ref album) => {
+                                    let album_clone = album.clone();
+                                    let album_for_dl = album.clone();
+                                    let album_for_override = album.clone();
+                                    let album_id = album.id.clone();
+                                    let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
+                                    let has_folders = !folders.read().is_empty();
+                                    let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                    let current_folders = folders.read().clone();
+                                    let current_folder_id = selected_folder_id();
 
-                                  let is_expanded = expanded_albums.read().contains(&album_id);
-                                  let cached = album_cache.read().get(&album_id).cloned();
-                                  let tracks_for_panel: Option<Vec<Track>> = if is_expanded {
-                                      cached.map(|awt| awt.tracks)
-                                  } else {
-                                      Some(vec![])
-                                  };
+                                    let is_expanded = expanded_albums.read().contains(&album_id);
+                                    let cached = album_cache.read().get(&album_id).cloned();
+                                    let tracks_for_panel: Option<Vec<Track>> = if is_expanded {
+                                        cached.map(|awt| awt.tracks)
+                                    } else {
+                                        Some(vec![])
+                                    };
 
-                                  rsx! {
-                                    li { key: "{album.id}",
-                                      AlbumResult {
-                                        is_expanded,
-                                        on_toggle: {
-                                            let id = album_clone.id.clone();
-                                            move || {
-                                                toggle_expand(id.clone());
-                                            }
-                                        },
-                                        on_search_sources: {
-                                            let album_for_search = album.clone();
-                                            move || {
-                                                let query = album_query(&album_for_search);
-                                                spawn(download(query));
-                                            }
-                                        },
-                                        album: album.clone(),
-                                        download_state: effective_state,
-                                        folders: current_folders,
-                                        selected_folder_id: current_folder_id.clone(),
-                                        active_menu,
-                                        on_download: move |_| {
-                                            let query = album_query(&album_for_dl);
-                                            handle_auto_download(album_for_dl.id.clone(), query);
-                                        },
-                                        on_override_download: move |folder: Folder| {
-                                            let query = album_query(&album_for_override);
-                                            handle_override_download(album_for_override.id.clone(), query, folder);
-                                        },
-                                        tracks: tracks_for_panel,
-                                        download_states,
-                                        on_track_download: move |track: Track| {
-                                            handle_track_download(track);
-                                        },
-                                        on_track_override_download: move |(track, folder): (Track, Folder)| {
-                                            handle_track_override_download((track, folder));
-                                        },
+                                    rsx! {
+                                      li { key: "{album.id}",
+                                        AlbumResult {
+                                          is_expanded,
+                                          on_toggle: {
+                                              let id = album_clone.id.clone();
+                                              move || {
+                                                  toggle_expand(id.clone());
+                                              }
+                                          },
+                                          on_search_sources: {
+                                              let album_for_search = album.clone();
+                                              move || {
+                                                  open_source_picker(album_query(&album_for_search));
+                                              }
+                                          },
+                                          album: album.clone(),
+                                          download_state: effective_state,
+                                          folders: current_folders,
+                                          selected_folder_id: current_folder_id.clone(),
+                                          active_menu,
+                                          on_download: move |_| {
+                                              let query = album_query(&album_for_dl);
+                                              handle_auto_download(album_for_dl.id.clone(), query);
+                                          },
+                                          on_override_download: move |folder: Folder| {
+                                              let query = album_query(&album_for_override);
+                                              handle_override_download(album_for_override.id.clone(), query, folder);
+                                          },
+                                          tracks: tracks_for_panel,
+                                          download_states,
+                                          on_track_download: move |track: Track| {
+                                              handle_track_download(track);
+                                          },
+                                          on_track_override_download: move |(track, folder): (Track, Folder)| {
+                                              handle_track_override_download((track, folder));
+                                          },
+                                        }
                                       }
                                     }
-                                  }
-                              }
+                                }
+                            }
                           }
                         }
                       }
                     }
                   }
-                }
-              },
-              (Some(_), listing) => rsx! {
-                div { class: "text-center text-gray-500 py-10 font-mono", "{empty_message(listing.as_ref())}" }
-              },
-              (None, _) => rsx! {},
+                },
+                (Some(_), listing) => rsx! {
+                  div { class: "text-center text-beet-text-tertiary py-10 text-[13px]", "{empty_message(listing.as_ref())}" }
+                },
+                (None, _) => rsx! {},
+            }
           }
         }
 
-        // Fallback toasts (D-14 through D-17)
+        // Fallback toasts lifted cleanly above the 84px Studio player bar
         if !fallback_toasts.read().is_empty() {
-          div { class: "fixed bottom-4 right-4 flex flex-col-reverse gap-2 z-40 w-80 md:w-96",
+          div { class: "fixed bottom-24 right-5 flex flex-col-reverse gap-2 z-40 w-80 md:w-96",
             for toast_data in fallback_toasts.read().iter() {
               FallbackToast {
                 key: "{toast_data.id}",
                 toast: toast_data.clone(),
                 on_pick_source: move |choices: SourceChoices| {
                     download_options.set(Some(choices));
+                    source_searching.set(false);
                 },
                 on_dismiss: move |id: String| {
                     fallback_toasts.write().retain(|t| t.id != id);

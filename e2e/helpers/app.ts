@@ -199,19 +199,15 @@ export async function openConfigTab(page: Page): Promise<void> {
 }
 
 /**
- * Opens the Advanced Soulseek search view (/search -> Advanced Soulseek tab),
- * which hosts the MusicBrainz album/track search and the service status line.
+ * Opens the unified Studio search view (/search), which hosts the MusicBrainz
+ * album/track search, multi-backend source picker, and the service status line.
  */
 export async function openSoulseekSearch(page: Page): Promise<void> {
   if (new URL(page.url()).pathname !== '/search') {
     await page.getByRole('link', { name: 'Search' }).click();
   }
   await expect(page).toHaveURL(/\/search$/);
-  const albumRadio = page.getByRole('radio', { name: 'ALBUM' });
-  if (!(await albumRadio.isVisible())) {
-    await page.getByRole('button', { name: 'Advanced Soulseek' }).click();
-    await expect(albumRadio).toBeVisible();
-  }
+  await expect(page.getByRole('radio', { name: 'ALBUM' })).toBeVisible();
 }
 
 /**

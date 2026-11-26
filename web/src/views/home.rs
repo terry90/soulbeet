@@ -129,7 +129,7 @@ pub fn HomePage() -> Element {
                                     button {
                                         key: "home-alb-{alb.id}",
                                         r#type: "button",
-                                        class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer",
+                                        class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
                                         onclick: move |_| play_album.call((aid.clone(), aname.clone())),
                                         div { class: "w-12 h-12 rounded-[8px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
                                             if let Some(url) = alb.cover_art_url.as_deref() {
@@ -146,7 +146,7 @@ pub fn HomePage() -> Element {
                                                 "{alb.artist}"
                                             }
                                         }
-                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0",
+                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 group-hover:scale-105 transition-[opacity,transform] shrink-0",
                                             IconPlay { size: 13, filled: true }
                                         }
                                     }
@@ -162,7 +162,7 @@ pub fn HomePage() -> Element {
                                     button {
                                         key: "home-pl-{pl.id}",
                                         r#type: "button",
-                                        class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-left transition-colors cursor-pointer",
+                                        class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
                                         onclick: move |_| play_playlist.call((pid.clone(), pname.clone())),
                                         div { class: "w-12 h-12 rounded-[8px] bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text shrink-0 flex items-center justify-center",
                                             IconMusic { size: 20 }
@@ -175,7 +175,7 @@ pub fn HomePage() -> Element {
                                                 "{pl.song_count} TRACKS"
                                             }
                                         }
-                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shrink-0",
+                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 group-hover:scale-105 transition-[opacity,transform] shrink-0",
                                             IconPlay { size: 13, filled: true }
                                         }
                                     }

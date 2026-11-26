@@ -16,20 +16,24 @@ pub fn TrackItem(props: Props) -> Element {
 
     rsx! {
       li {
-        class: "flex items-center gap-3 p-2 rounded-md cursor-pointer transition-colors border border-transparent",
-        class: if props.is_selected { "bg-beet-leaf/10 border-beet-leaf/30" } else { "hover:bg-white/5 border-white/5" },
+        class: "flex items-center gap-3 px-3 py-2 rounded-[8px] cursor-pointer transition-colors border",
+        class: if props.is_selected {
+          "bg-beet-leaf-surface border-beet-leaf/30"
+        } else {
+          "bg-transparent hover:bg-beet-surface-high border-beet-border-subtle"
+        },
         onclick: move |_| props.on_toggle.call(track_id.clone()),
         Checkbox { is_selected: props.is_selected }
 
         span {
-          class: "flex-grow font-mono text-sm",
-          class: if props.is_selected { "text-beet-leaf" } else { "text-gray-300" },
+          class: "flex-grow text-[14px] truncate",
+          class: if props.is_selected { "text-beet-leaf-text font-medium" } else { "text-beet-text-primary" },
           "{props.track.title}"
         }
         if let Some(duration) = &props.track.duration {
           span {
-            class: "font-mono text-xs",
-            class: if props.is_selected { "text-beet-leaf/70" } else { "text-gray-500" },
+            class: "tabular-nums-mono text-[12px] shrink-0",
+            class: if props.is_selected { "text-beet-leaf-text/80" } else { "text-beet-text-tertiary" },
             "{duration}"
           }
         }

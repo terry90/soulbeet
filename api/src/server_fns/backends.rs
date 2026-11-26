@@ -1,10 +1,18 @@
 use dioxus::prelude::*;
-use shared::backends::BackendSwitch;
+use shared::backends::{BackendMeta, BackendSwitch};
 
 #[cfg(feature = "server")]
 use super::failure_error;
 #[cfg(feature = "server")]
-use crate::AdminSession;
+use crate::{AdminSession, AuthSession};
+
+/// Every download backend currently enabled (always-on or turned on by an admin).
+#[get("/api/backends/enabled", _: AuthSession)]
+pub async fn get_enabled_download_backends() -> Result<Vec<BackendMeta>, ServerFnError> {
+    crate::core::backends::enabled()
+        .await
+        .map_err(failure_error)
+}
 
 /// Every download backend an admin can turn on, and whether it is on.
 #[get("/api/backends/switches", _: AdminSession)]

@@ -35,17 +35,17 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
     };
 
     let pill_class = if is_open {
-        "bg-white/10 border-white/10 text-white"
+        "bg-beet-surface-highest border-beet-border-strong text-beet-text-primary"
     } else if needs_attention {
-        "bg-white/5 border-yellow-500/30 text-yellow-400 group-hover/chip:bg-white/10 group-hover/chip:text-yellow-300"
+        "bg-beet-gold-surface border-beet-gold/40 text-beet-gold group-hover/chip:border-beet-gold/60"
     } else {
-        "bg-white/5 border-white/5 text-gray-300 group-hover/chip:bg-white/10 group-hover/chip:text-white"
+        "bg-beet-surface-high border-beet-border-subtle text-beet-text-secondary group-hover/chip:bg-beet-surface-highest group-hover/chip:border-beet-border-default group-hover/chip:text-beet-text-primary"
     };
 
     rsx! {
         div { class: "relative ml-auto flex min-w-0",
             button {
-                class: "group/chip flex items-center min-w-0 max-w-full h-[44px] px-[2px] font-mono text-[12px] cursor-pointer focus-visible:outline-none",
+                class: "group/chip flex items-center min-w-0 max-w-full h-[44px] px-[2px] tabular-nums-mono text-[12px] cursor-pointer focus-visible:outline-none",
                 r#type: "button",
                 title: "{chip_text}",
                 aria_expanded: is_open,
@@ -57,12 +57,12 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                         active_menu.set(Some(MENU_ID.to_string()));
                     }
                 },
-                span { class: "flex items-center gap-[6px] min-w-0 px-[8px] py-[5px] rounded-md border transition-colors duration-200 group-focus-visible/chip:outline-2 group-focus-visible/chip:outline-offset-1 group-focus-visible/chip:outline-beet-leaf {pill_class}",
+                span { class: "flex items-center gap-[6px] min-w-0 px-2.5 py-1.5 rounded-[8px] border transition-colors duration-150 group-focus-visible/chip:outline-2 group-focus-visible/chip:outline-offset-1 group-focus-visible/chip:outline-beet-leaf {pill_class}",
                     svg {
-                        class: "size-[14px] flex-none opacity-70",
+                        class: "size-[14px] flex-none opacity-80",
                         fill: "none",
                         stroke: "currentColor",
-                        stroke_width: "1.5",
+                        stroke_width: "1.75",
                         view_box: "0 0 24 24",
                         "aria-hidden": "true",
                         path {
@@ -74,7 +74,7 @@ pub fn FolderChip(props: FolderChipProps) -> Element {
                     span { class: "sr-only", "Download folder: " }
                     span { class: "min-w-0 truncate", "{chip_text}" }
                     // The narrowest phones give its room to the name.
-                    Chevron { class: "opacity-60 max-[399px]:hidden" }
+                    Chevron { class: "opacity-70 max-[399px]:hidden" }
                 }
             }
 

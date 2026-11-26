@@ -5,14 +5,16 @@ pub use crate::settings_context::SearchType;
 /// The key the search form submits the chosen type under.
 const NAME: &str = "search_type";
 
-/// Album or track, as a radio group.
+/// Album or track, as a segmented Midnight Studio radio group.
 #[component]
 pub fn SearchTypeToggle(search_type: Signal<SearchType>) -> Element {
     rsx! {
-      fieldset { class: "flex flex-none min-w-0 m-0 p-0 border-0",
+      fieldset { class: "flex flex-none items-center gap-1 min-w-0 m-0 p-0 border-0",
         legend { class: "sr-only", "Search for" }
-        for (kind , label) in [(SearchType::Album, "Album"), (SearchType::Track, "Track")] {
-          label { key: "{kind.as_str()}", class: "relative flex items-center h-[44px] px-[2px] cursor-pointer",
+        for (kind, label) in [(SearchType::Album, "Album"), (SearchType::Track, "Track")] {
+          label {
+            key: "{kind.as_str()}",
+            class: "relative flex items-center h-[40px] cursor-pointer",
             input {
               class: "peer absolute inset-0 m-0 opacity-0 cursor-pointer",
               r#type: "radio",
@@ -22,8 +24,12 @@ pub fn SearchTypeToggle(search_type: Signal<SearchType>) -> Element {
               onchange: move |_| search_type.set(kind),
             }
             span {
-              class: if search_type() == kind { "text-white bg-white/10" } else { "text-gray-500 peer-hover:text-gray-300" },
-              class: "block px-[10px] max-[399px]:px-[8px] py-[6px] rounded font-mono text-[11px] font-bold tracking-[0.08em] uppercase transition-colors duration-200 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-1 peer-focus-visible:outline-beet-leaf",
+              class: if search_type() == kind {
+                "text-beet-text-primary bg-beet-surface-highest border-beet-border-default"
+              } else {
+                "text-beet-text-tertiary border-transparent peer-hover:text-beet-text-primary peer-hover:bg-beet-surface-high"
+              },
+              class: "block px-3 max-[399px]:px-2 py-1.5 rounded-[8px] border tabular-nums-mono text-[11px] font-semibold tracking-[0.06em] uppercase transition-colors duration-150 peer-focus-visible:outline-2 peer-focus-visible:outline-offset-1 peer-focus-visible:outline-beet-leaf",
               "{label}"
             }
           }

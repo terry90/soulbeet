@@ -1059,6 +1059,12 @@ impl WebStudioContext {
                 .await
             {
                 Ok(pl) => {
+                    {
+                        let mut mixes = studio.contextual_mixes.write();
+                        if let Some(slot) = mixes.iter_mut().find(|m| m.slug == slug) {
+                            *slot = pl.summary.clone();
+                        }
+                    }
                     let tracks: Vec<PlayerTrack> = pl
                         .tracks
                         .iter()

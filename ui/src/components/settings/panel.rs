@@ -2,10 +2,13 @@
 
 use dioxus::prelude::*;
 
-pub(super) const LABEL_CLASS: &str =
-    "block text-xs font-mono text-gray-400 mb-1 uppercase tracking-wider";
+pub(super) const LABEL_CLASS: &str = "block text-xs font-medium text-beet-text-secondary mb-1.5";
+/// A primary positive action button inside settings panels.
+pub(super) const PRIMARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
+/// A secondary action button inside settings panels.
+pub(super) const SECONDARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-3.5 h-9 text-xs font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
 /// A small text button that removes something.
-pub(super) const REMOVE_BUTTON_CLASS: &str = "text-xs font-mono text-gray-400 hover:text-red-400 transition-colors underline decoration-dotted cursor-pointer";
+pub(super) const REMOVE_BUTTON_CLASS: &str = "text-xs font-medium text-beet-text-tertiary hover:text-beet-crimson-text transition-colors underline decoration-dotted underline-offset-4 cursor-pointer";
 
 /// The unix time `at` in UTC, written with the chrono `format`; the bare
 /// number when chrono cannot represent it.
@@ -20,8 +23,8 @@ pub(super) fn utc_time(at: i64, format: &str) -> String {
 #[component]
 pub(super) fn Panel(title: String, children: Element) -> Element {
     rsx! {
-        div { class: "bg-beet-panel border border-white/10 p-6 rounded-lg shadow-2xl relative z-10",
-            h2 { class: "text-xl font-bold mb-4 text-beet-accent font-display", "{title}" }
+        div { class: "bg-beet-surface-low border border-beet-border-subtle p-6 rounded-[14px]",
+            h2 { class: "text-lg font-semibold mb-4 text-beet-text-primary font-display tracking-tight", "{title}" }
             {children}
         }
     }
@@ -31,7 +34,7 @@ pub(super) fn Panel(title: String, children: Element) -> Element {
 #[component]
 pub(super) fn SectionTitle(title: String) -> Element {
     rsx! {
-        h3 { class: "text-lg font-bold mb-2 text-white font-display border-b border-white/10 pb-2",
+        h3 { class: "text-sm font-semibold mb-3 text-beet-text-primary font-display border-b border-beet-border-subtle pb-2",
             "{title}"
         }
     }
@@ -42,12 +45,12 @@ pub(super) fn SectionTitle(title: String) -> Element {
 pub(super) fn Messages(error: String, #[props(default)] success: String) -> Element {
     rsx! {
         if !error.is_empty() {
-            div { class: "mb-4 p-4 bg-red-900/20 border border-red-500/50 rounded text-red-400 font-mono text-sm",
+            div { class: "mb-4 px-3.5 py-3 bg-beet-crimson-surface border border-beet-crimson-solid/40 rounded-[10px] text-beet-crimson-text text-sm",
                 "{error}"
             }
         }
         if !success.is_empty() {
-            div { class: "mb-4 p-4 bg-green-900/20 border border-green-500/50 rounded text-green-400 font-mono text-sm",
+            div { class: "mb-4 px-3.5 py-3 bg-beet-leaf-surface border border-beet-leaf-solid/30 rounded-[10px] text-beet-leaf-text text-sm",
                 "{success}"
             }
         }
@@ -58,7 +61,7 @@ pub(super) fn Messages(error: String, #[props(default)] success: String) -> Elem
 #[component]
 pub(super) fn Loading() -> Element {
     rsx! {
-        div { class: "animate-pulse text-gray-400 font-mono", "Loading..." }
+        div { class: "animate-pulse text-sm text-beet-text-tertiary", "Loading..." }
     }
 }
 
@@ -66,9 +69,9 @@ pub(super) fn Loading() -> Element {
 #[component]
 pub(super) fn LoadError(message: String, on_retry: EventHandler<MouseEvent>) -> Element {
     rsx! {
-        div { class: "text-red-400 text-sm font-mono mb-3", "{message}" }
+        div { class: "text-beet-crimson-text text-sm mb-3", "{message}" }
         button {
-            class: "text-xs font-mono text-gray-400 hover:text-white underline decoration-dotted cursor-pointer",
+            class: SECONDARY_BUTTON_CLASS,
             onclick: move |e| on_retry.call(e),
             "Retry"
         }
@@ -79,7 +82,7 @@ pub(super) fn LoadError(message: String, on_retry: EventHandler<MouseEvent>) -> 
 #[component]
 pub(super) fn ListRow(children: Element) -> Element {
     rsx! {
-        li { class: "bg-white/5 border border-white/5 p-3 rounded hover:border-beet-accent/30 transition-colors",
+        li { class: "bg-beet-surface border border-beet-border-subtle p-3.5 rounded-[12px] hover:border-beet-border-default transition-colors",
             {children}
         }
     }
