@@ -34,6 +34,20 @@ pub(crate) struct ArtistMbids<'a> {
     pub artist_mbids: &'a [String],
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RecordingMbids<'a> {
+    pub recording_mbids: &'a [String],
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingPopularityEntry {
+    pub recording_mbid: String,
+    #[serde(default)]
+    pub total_listen_count: Option<u64>,
+    #[serde(default)]
+    pub total_user_count: Option<u64>,
+}
+
 /// Field order is the order ListenBrainz documents the body in.
 #[derive(Debug, Serialize)]
 pub(crate) struct RecordingMetadataQuery<'a> {
@@ -122,6 +136,13 @@ pub struct PlaylistTrack {
     pub artist_mbid: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistSearchHit {
+    pub mbid: String,
+    pub title: String,
+    pub creator: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistListing {
     pub playlists: Vec<PlaylistEnvelope<PlaylistHeader>>,
@@ -132,10 +153,23 @@ pub(crate) struct PlaylistEnvelope<T> {
     pub playlist: T,
 }
 
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// `identifier` is the playlist's URL, its MBID the last segment.
 #[derive(Debug, Deserialize)]
 pub(crate) struct PlaylistHeader {
     pub identifier: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub title: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub creator: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub date: String,
     #[serde(default)]
     extension: Option<PlaylistHeaderExtension>,
@@ -179,28 +213,32 @@ struct AlgorithmMetadata {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfPlaylist {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub track: Vec<JspfTrack>,
 }
 
 /// A JSPF track: `identifier` lists recording URLs, the extension artist URLs.
-/// ListenBrainz leaves out the names of a recording it has no metadata for.
+/// ListenBrainz leaves out the names of a recording it has no metadata for, and arbitrary
+/// community playlists may omit `identifier`, `extension`, or the MusicBrainz track block.
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfTrack {
     pub title: Option<String>,
     pub creator: Option<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub identifier: Vec<String>,
-    pub extension: JspfTrackExtension,
+    #[serde(default)]
+    pub extension: Option<JspfTrackExtension>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfTrackExtension {
-    #[serde(rename = "https://musicbrainz.org/doc/jspf#track")]
-    pub musicbrainz: MusicBrainzTrackExtension,
+    #[serde(default, rename = "https://musicbrainz.org/doc/jspf#track")]
+    pub musicbrainz: Option<MusicBrainzTrackExtension>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MusicBrainzTrackExtension {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub artist_identifiers: Vec<String>,
 }
 
@@ -250,6 +288,8 @@ pub struct TopRecordingForArtist {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtistMetadataEntry {
     pub artist_mbid: String,
+    #[serde(default)]
+    pub area: Option<String>,
     pub tag: Option<ArtistTags>,
 }
 

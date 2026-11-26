@@ -170,6 +170,12 @@ pub struct Candidate {
     pub release_year: Option<u16>,
     #[serde(default)]
     pub artist_mbid: Option<String>,
+    /// Structured provenance rendered/localized by clients (no hardcoded prose on the wire).
+    #[serde(default)]
+    pub reason: Option<CandidateReason>,
+    /// Which cultural/contextual bucket produced this candidate.
+    #[serde(default)]
+    pub culture_bucket: Option<CultureBucket>,
 }
 
 /// A set of candidates from a single pipeline
@@ -411,6 +417,12 @@ impl CandidateSet {
             if existing.artist_mbid.is_none() {
                 existing.artist_mbid = candidate.artist_mbid;
             }
+            if existing.reason.is_none() {
+                existing.reason = candidate.reason;
+            }
+            if existing.culture_bucket.is_none() {
+                existing.culture_bucket = candidate.culture_bucket;
+            }
         } else {
             self.candidates.insert(key, candidate);
         }
@@ -649,6 +661,919 @@ impl EngineReport {
 
         out
     }
+}
+
+// --- Discovery 2.0: Contextual, Cultural & Seasonal Types ---
+
+/// Which cultural/contextual bucket produced a recommendation candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CultureBucket {
+    Local,
+    International,
+    TasteWildcard,
+    OwnedLibrary,
+}
+
+impl CultureBucket {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CultureBucket::Local => "local",
+            CultureBucket::International => "international",
+            CultureBucket::TasteWildcard => "taste_wildcard",
+            CultureBucket::OwnedLibrary => "owned_library",
+        }
+    }
+}
+
+/// User cultural & linguistic listening profile combining zero-config inference with explicit
+/// preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserCultureProfile {
+    #[serde(default)]
+    pub home_country: Option<String>,
+    #[serde(default)]
+    pub preferred_languages: Vec<String>,
+    /// Target share of local-culture tracks in seasonal/contextual packs (0.0..=1.0).
+    #[serde(default = "default_local_culture_ratio")]
+    pub local_culture_ratio: f32,
+    /// Auto-inferred ISO-3166 country weights from Navidrome history + MusicBrainz artist areas.
+    #[serde(default)]
+    pub inferred_area_weights: Vec<(String, f32)>,
+    /// Auto-inferred local sub-genres (e.g. "french electro", "chanson").
+    #[serde(default)]
+    pub inferred_local_tags: Vec<String>,
+}
+
+fn default_local_culture_ratio() -> f32 {
+    0.45
+}
+
+impl Default for UserCultureProfile {
+    fn default() -> Self {
+        Self {
+            home_country: None,
+            preferred_languages: Vec::new(),
+            local_culture_ratio: default_local_culture_ratio(),
+            inferred_area_weights: Vec::new(),
+            inferred_local_tags: Vec::new(),
+        }
+    }
+}
+
+impl UserCultureProfile {
+    /// Effective ISO country code: explicit `home_country` first, else highest inferred area.
+    pub fn effective_country(&self) -> Option<&str> {
+        self.home_country
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.inferred_area_weights.first().map(|(c, _)| c.as_str()))
+    }
+}
+
+/// Live ratio steering for seasonal/contextual packs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CultureSteering {
+    MoreLocal,
+    #[default]
+    Balanced,
+    MoreInternational,
+}
+
+impl CultureSteering {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CultureSteering::MoreLocal => "more_local",
+            CultureSteering::Balanced => "balanced",
+            CultureSteering::MoreInternational => "more_international",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "more_local" | "local" => CultureSteering::MoreLocal,
+            "more_international" | "international" | "intl" => CultureSteering::MoreInternational,
+            _ => CultureSteering::Balanced,
+        }
+    }
+
+    /// Computes the effective local-culture track share given a base ratio (0.0..=1.0).
+    pub fn effective_ratio(self, base: f32) -> f32 {
+        let base = base.clamp(0.0, 1.0);
+        match self {
+            CultureSteering::MoreLocal => (base + 0.25).clamp(0.15, 0.85),
+            CultureSteering::Balanced => base,
+            CultureSteering::MoreInternational => (base - 0.25).clamp(0.10, 0.85),
+        }
+    }
+}
+
+/// Structured, client-localizable explanation for why a track was recommended or included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CandidateReason {
+    /// Regional cultural pick for a contextual mix (client formats with mix + country code).
+    RegionalContextual {
+        mix_slug: String,
+        #[serde(default)]
+        country_code: Option<String>,
+    },
+    /// International classic for a contextual mix.
+    InternationalContextual { mix_slug: String },
+    /// Crossover between a contextual mix and one of the user's top genres.
+    TasteWildcard { mix_slug: String, genre: String },
+    /// Track matched a moment/mood mix's tags and/or user genre.
+    MomentMatch {
+        mix_slug: String,
+        #[serde(default)]
+        mood_tag: Option<String>,
+        #[serde(default)]
+        genre: Option<String>,
+    },
+    /// Owned library track matching a contextual mix's mood/genre criteria.
+    LibraryMatch {
+        mix_slug: String,
+        #[serde(default)]
+        matched_genre: Option<String>,
+    },
+    /// Seed track that started a radio session.
+    RadioSeed { seed_artist: String },
+    /// Track from the same artist as the radio seed.
+    MoreFromArtist { artist: String },
+    /// Track from an artist similar to the radio seed.
+    SimilarArtist { seed_artist: String, artist: String },
+}
+
+/// Annual calendar window (inclusive) for a seasonal contextual mix, supporting year-wrap
+/// windows such as Dec 28 – Jan 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarWindow {
+    pub start_month: u8,
+    pub start_day: u8,
+    pub end_month: u8,
+    pub end_day: u8,
+    /// Days after `end_month/end_day` before unkept seasonal tracks and playlists auto-clean.
+    #[serde(default = "default_cleanup_grace_days")]
+    pub cleanup_grace_days: u16,
+}
+
+fn default_cleanup_grace_days() -> u16 {
+    7
+}
+
+impl CalendarWindow {
+    pub const fn new(
+        start_month: u8,
+        start_day: u8,
+        end_month: u8,
+        end_day: u8,
+        cleanup_grace_days: u16,
+    ) -> Self {
+        Self {
+            start_month,
+            start_day,
+            end_month,
+            end_day,
+            cleanup_grace_days,
+        }
+    }
+
+    /// Returns `true` when `(month, day)` (1-based) falls inside this window.
+    pub fn is_active(&self, month: u32, day: u32) -> bool {
+        let cur = (month, day);
+        let start = (u32::from(self.start_month), u32::from(self.start_day));
+        let end = (u32::from(self.end_month), u32::from(self.end_day));
+        if start <= end {
+            cur >= start && cur <= end
+        } else {
+            cur >= start || cur <= end
+        }
+    }
+
+    /// Returns `true` when months are 1..=12 and days are valid for their month (allowing Feb 29).
+    pub fn is_valid(&self) -> bool {
+        let sm = u32::from(self.start_month);
+        let sd = u32::from(self.start_day);
+        let em = u32::from(self.end_month);
+        let ed = u32::from(self.end_day);
+        (1..=12).contains(&sm)
+            && (1..=12).contains(&em)
+            && sd >= 1
+            && sd <= days_in_month(2024, sm)
+            && ed >= 1
+            && ed <= days_in_month(2024, em)
+    }
+
+    /// Computes concrete ISO-8601 `YYYY-MM-DD` `(active_from, active_until, expires_at)` dates
+    /// for the cycle containing `(year, month, day)`.
+    pub fn cycle_dates(&self, year: i32, month: u32, day: u32) -> Option<(String, String, String)> {
+        if !self.is_valid() {
+            return None;
+        }
+        let start_md = (u32::from(self.start_month), u32::from(self.start_day));
+        let end_md = (u32::from(self.end_month), u32::from(self.end_day));
+        let wraps = start_md > end_md;
+
+        let (start_year, end_year) = if wraps {
+            if (month, day) <= end_md {
+                (year - 1, year)
+            } else {
+                (year, year + 1)
+            }
+        } else {
+            (year, year)
+        };
+
+        let sm = u32::from(self.start_month);
+        let sd = u32::from(self.start_day).min(days_in_month(start_year, sm));
+        let em = u32::from(self.end_month);
+        let ed = u32::from(self.end_day).min(days_in_month(end_year, em));
+        let (xy, xm, xd) = add_days(end_year, em, ed, u32::from(self.cleanup_grace_days));
+        Some((
+            format!("{start_year:04}-{sm:02}-{sd:02}"),
+            format!("{end_year:04}-{em:02}-{ed:02}"),
+            format!("{xy:04}-{xm:02}-{xd:02}"),
+        ))
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn add_days(mut year: i32, mut month: u32, mut day: u32, mut extra: u32) -> (i32, u32, u32) {
+    while extra > 0 {
+        let dim = days_in_month(year, month);
+        if day + extra <= dim {
+            day += extra;
+            break;
+        }
+        extra -= dim - day + 1;
+        day = 1;
+        if month == 12 {
+            month = 1;
+            year += 1;
+        } else {
+            month += 1;
+        }
+    }
+    (year, month, day)
+}
+
+/// Time-of-day window (24h, inclusive, supports midnight wrap such as 22..=4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HourWindow {
+    pub start_hour: u8,
+    pub end_hour: u8,
+}
+
+impl HourWindow {
+    pub const fn new(start_hour: u8, end_hour: u8) -> Self {
+        Self {
+            start_hour,
+            end_hour,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.start_hour <= 23 && self.end_hour <= 23
+    }
+
+    pub fn is_active(&self, hour: u32) -> bool {
+        let start = u32::from(self.start_hour);
+        let end = u32::from(self.end_hour);
+        if start <= end {
+            hour >= start && hour <= end
+        } else {
+            hour >= start || hour <= end
+        }
+    }
+}
+
+/// Extensible, data-driven contextual mix definition (seasonal pack or moment/mood mix).
+/// Built-in definitions leave `custom_name` / `custom_description` as `None` so every client
+/// localizes labels cleanly from `i18n_key` + typed metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextualMixDefinition {
+    pub slug: String,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    pub kind: ContextualMixKind,
+    /// Client localization key (e.g. `"mix.seasonal.winter_holiday"`, `"mix.moment.drive"`).
+    pub i18n_key: String,
+    /// Optional explicit user/admin-chosen name (overrides `i18n_key` on clients when set).
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub custom_description: Option<String>,
+    #[serde(default)]
+    pub built_in: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Multi-tag theme seeds (ListenBrainz / MusicBrainz folksonomy tags).
+    #[serde(default)]
+    pub theme_tags: Vec<String>,
+    /// Global playlist search queries for international community consensus pools.
+    #[serde(default)]
+    pub international_queries: Vec<String>,
+    /// Active calendar dates for seasonal mixes.
+    #[serde(default)]
+    pub calendar_window: Option<CalendarWindow>,
+    /// Active hour range for time-of-day moment mixes.
+    #[serde(default)]
+    pub hour_window: Option<HourWindow>,
+    /// Always surface this mix regardless of time-of-day (e.g. Drive Mix).
+    #[serde(default)]
+    pub always_surfaced: bool,
+    /// Empty = active globally; non-empty = auto-prioritized for matching ISO-3166 country codes.
+    #[serde(default)]
+    pub countries: Vec<String>,
+    /// Target fraction of owned library tracks (0.0 for pure discovery, ~0.75 for moment mixes).
+    #[serde(default)]
+    pub owned_ratio: f32,
+    /// Base local-culture track share when cultural blending is enabled (e.g. `Some(0.45)`).
+    #[serde(default)]
+    pub default_local_ratio: Option<f32>,
+    /// Keep listening/staging isolated from core taste profile (true for seasonal packs).
+    #[serde(default)]
+    pub exclude_from_core_taste: bool,
+    /// Prioritize locally cached offline tracks (e.g. Drive Mix / Android Auto).
+    #[serde(default)]
+    pub offline_priority: bool,
+    #[serde(default = "default_target_tracks")]
+    pub target_tracks: u32,
+    /// Whether to materialize/sync this mix as a Navidrome playlist.
+    #[serde(default = "default_true")]
+    pub sync_to_navidrome: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_target_tracks() -> u32 {
+    25
+}
+
+impl ContextualMixDefinition {
+    pub fn primary_tag(&self) -> Option<&str> {
+        self.theme_tags.first().map(String::as_str)
+    }
+
+    /// Resolves the base local-culture ratio for this mix given the user's cultural profile.
+    /// Returns `None` when cultural blending is disabled on the mix (`default_local_ratio` is
+    /// `None`). When enabled (`Some(base)`), respects `culture.local_culture_ratio` unless `base`
+    /// is explicitly `0.0`.
+    pub fn effective_base_local_ratio(&self, culture: &UserCultureProfile) -> Option<f32> {
+        self.default_local_ratio.map(|base| {
+            if base > 0.0 {
+                culture.local_culture_ratio.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+    }
+
+    pub fn matches_country(&self, effective_country: Option<&str>) -> bool {
+        if self.countries.is_empty() {
+            return true;
+        }
+        let Some(code) = effective_country else {
+            return false;
+        };
+        self.countries
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(code))
+    }
+
+    pub fn is_active_at(
+        &self,
+        month: u32,
+        day: u32,
+        hour: u32,
+        effective_country: Option<&str>,
+        explicitly_enabled_by_user: bool,
+    ) -> bool {
+        if !self.enabled && !explicitly_enabled_by_user {
+            return false;
+        }
+        match self.kind {
+            ContextualMixKind::Seasonal => {
+                let in_window = self
+                    .calendar_window
+                    .as_ref()
+                    .is_none_or(|w| w.is_active(month, day));
+                in_window && (explicitly_enabled_by_user || self.matches_country(effective_country))
+            }
+            ContextualMixKind::Moment => {
+                self.always_surfaced
+                    || self
+                        .hour_window
+                        .as_ref()
+                        .is_none_or(|w| w.is_active(hour))
+            }
+            ContextualMixKind::Rolling => true,
+        }
+    }
+}
+
+/// Canonical global catalog of built-in contextual mixes seeded into SQLite on first access.
+/// Admins and users can add, edit, or disable mixes at runtime without recompiling.
+pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
+    let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+    vec![
+        ContextualMixDefinition {
+            slug: "winter_holiday".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.winter_holiday".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["christmas", "holiday", "winter"]),
+            international_queries: s(&["Christmas Hits", "Winter Holiday Classics"]),
+            calendar_window: Some(CalendarWindow::new(11, 20, 12, 27, 9)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.45),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "new_years_eve".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.new_years_eve".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["dance", "party", "disco", "funk", "electronic"]),
+            international_queries: s(&["Party Hits", "Dance Floor Classics"]),
+            calendar_window: Some(CalendarWindow::new(12, 28, 1, 2, 6)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.45),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "lunar_new_year".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.lunar_new_year".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["mandopop", "cantopop", "k-pop", "c-pop", "festive"]),
+            international_queries: s(&["Lunar New Year", "Asian Pop Hits"]),
+            calendar_window: Some(CalendarWindow::new(1, 20, 2, 20, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: s(&["CN", "TW", "HK", "SG", "VN", "KR", "MY"]),
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.55),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "carnival".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.carnival".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["samba", "salsa", "cumbia", "afrobeats", "dance"]),
+            international_queries: s(&["Carnival Hits", "Samba Party"]),
+            calendar_window: Some(CalendarWindow::new(2, 1, 3, 5, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: s(&["BR", "CO", "TT", "DE", "IT"]),
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.55),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "spring".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.spring".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["spring", "indie pop", "dream pop", "soul", "bossa nova"]),
+            international_queries: s(&["Fresh Indie", "Spring Acoustic"]),
+            calendar_window: Some(CalendarWindow::new(3, 20, 5, 31, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.45),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "summer".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.summer".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["summer", "tropical", "reggae", "indie", "pop"]),
+            international_queries: s(&["Summer Anthems", "Sun-Soaked Indie"]),
+            calendar_window: Some(CalendarWindow::new(6, 1, 8, 31, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.45),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "autumn".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.autumn".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["autumn", "acoustic", "folk", "jazz", "chill"]),
+            international_queries: s(&["Autumn Chill", "Cozy Acoustic"]),
+            calendar_window: Some(CalendarWindow::new(9, 22, 11, 19, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.45),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "halloween".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.halloween".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["halloween", "darkwave", "post-punk", "synthwave"]),
+            international_queries: s(&["Halloween Classics", "Darkwave Night"]),
+            calendar_window: Some(CalendarWindow::new(10, 15, 11, 1, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.40),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "diwali".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Seasonal,
+            i18n_key: "mix.seasonal.diwali".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["indian", "bollywood", "bhangra", "indie", "festive"]),
+            international_queries: s(&["Diwali Celebration", "Indian Festive Hits"]),
+            calendar_window: Some(CalendarWindow::new(10, 15, 11, 15, 7)),
+            hour_window: None,
+            always_surfaced: false,
+            countries: s(&["IN", "SG", "MY", "GB", "CA"]),
+            owned_ratio: 0.0,
+            default_local_ratio: Some(0.55),
+            exclude_from_core_taste: true,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: true,
+        },
+        ContextualMixDefinition {
+            slug: "drive".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.drive".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["indie rock", "electronic", "synthpop", "funk", "hip hop"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: true,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+        },
+        ContextualMixDefinition {
+            slug: "morning".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.morning".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["pop", "indie pop", "funk", "soul", "bossa nova"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(6, 10)),
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+        },
+        ContextualMixDefinition {
+            slug: "focus".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.focus".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["ambient", "downtempo", "instrumental", "jazz", "lo-fi"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(11, 17)),
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+        },
+        ContextualMixDefinition {
+            slug: "late_night".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.late_night".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["trip hop", "dream pop", "chillout", "jazz", "r&b"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(22, 4)),
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+        },
+    ]
+}
+
+/// Pure structured i18n mix card returned by `GET /api/discovery/contextual-mixes`.
+/// Clients render all localized titles, subtitles, ratio badges, and expiry text using
+/// `i18n_key` + typed metadata (or `custom_name` / `custom_description` for custom mixes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextualMixSummary {
+    pub slug: String,
+    pub kind: ContextualMixKind,
+    pub i18n_key: String,
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub custom_description: Option<String>,
+    #[serde(default)]
+    pub built_in: bool,
+    #[serde(default)]
+    pub country_code: Option<String>,
+    #[serde(default)]
+    pub local_pct: Option<u8>,
+    pub owned_pct: u8,
+    #[serde(default)]
+    pub offline_priority: bool,
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub steering: Option<CultureSteering>,
+    #[serde(default)]
+    pub active_from: Option<String>,
+    #[serde(default)]
+    pub active_until: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub navidrome_playlist_id: Option<String>,
+    pub track_count: u32,
+    pub target_tracks: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextualMixKind {
+    Seasonal,
+    Moment,
+    Rolling,
+}
+
+impl ContextualMixKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ContextualMixKind::Seasonal => "seasonal",
+            ContextualMixKind::Moment => "moment",
+            ContextualMixKind::Rolling => "rolling",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "seasonal" => Some(ContextualMixKind::Seasonal),
+            "moment" => Some(ContextualMixKind::Moment),
+            "rolling" => Some(ContextualMixKind::Rolling),
+            _ => None,
+        }
+    }
+}
+
+/// Request to create or update a custom contextual mix definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertContextualMixRequest {
+    pub slug: String,
+    pub kind: ContextualMixKind,
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub custom_description: Option<String>,
+    /// When `true` (admin only), creates/updates a global mix shared across all users.
+    #[serde(default)]
+    pub global: bool,
+    /// Optional explicit enabled flag; when `None`, preserves `existing.enabled` on edit (or `true` on create).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub theme_tags: Vec<String>,
+    #[serde(default)]
+    pub international_queries: Vec<String>,
+    #[serde(default)]
+    pub calendar_window: Option<CalendarWindow>,
+    #[serde(default)]
+    pub hour_window: Option<HourWindow>,
+    #[serde(default)]
+    pub always_surfaced: bool,
+    #[serde(default)]
+    pub countries: Vec<String>,
+    #[serde(default)]
+    pub owned_ratio: f32,
+    #[serde(default)]
+    pub default_local_ratio: Option<f32>,
+    #[serde(default)]
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub offline_priority: bool,
+    #[serde(default = "default_target_tracks")]
+    pub target_tracks: u32,
+    #[serde(default = "default_true")]
+    pub sync_to_navidrome: bool,
+}
+
+/// Per-user toggle to enable or disable any mix definition without modifying global state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetMixEnabledRequest {
+    pub slug: String,
+    pub enabled: bool,
+}
+
+/// One playable track inside a materialized contextual mix playlist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextualMixTrack {
+    pub song_id: String,
+    #[serde(default)]
+    pub discovery_track_id: Option<String>,
+    pub artist: String,
+    pub title: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub duration_s: Option<u32>,
+    pub owned: bool,
+    #[serde(default)]
+    pub reason: Option<CandidateReason>,
+    #[serde(default)]
+    pub culture_bucket: Option<CultureBucket>,
+}
+
+/// Materialized playable playlist for a contextual mix (owned library + staged fresh tracks),
+/// plus optional unowned prefetch candidates when fresh slots need filling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextualMixPlaylist {
+    pub summary: ContextualMixSummary,
+    pub tracks: Vec<ContextualMixTrack>,
+    #[serde(default)]
+    pub prefetch_candidates: Vec<Candidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateCultureProfileRequest {
+    #[serde(default)]
+    pub home_country: Option<String>,
+    #[serde(default)]
+    pub preferred_languages: Option<Vec<String>>,
+    #[serde(default)]
+    pub local_culture_ratio: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerSeasonalPackRequest {
+    pub slug: String,
+    pub steering: CultureSteering,
+}
+
+/// Request to start an on-demand Seed Radio from a track or artist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedRadioRequest {
+    #[serde(default)]
+    pub seed_song_id: Option<String>,
+    #[serde(default)]
+    pub seed_artist: Option<String>,
+    #[serde(default)]
+    pub seed_track: Option<String>,
+    #[serde(default)]
+    pub seed_artist_mbid: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Owned library track returned immediately by Seed Radio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedRadioTrack {
+    pub song_id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u32>,
+    pub reason: CandidateReason,
+}
+
+/// Response from `POST /api/radio/start`: owned matches play immediately while unowned
+/// `prefetch_candidates` can be fast-acquired seamlessly in the background.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedRadioResponse {
+    pub radio_id: String,
+    pub seed_label: String,
+    pub owned_tracks: Vec<SeedRadioTrack>,
+    pub prefetch_candidates: Vec<Candidate>,
 }
 
 #[cfg(test)]

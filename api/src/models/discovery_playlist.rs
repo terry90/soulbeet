@@ -20,10 +20,23 @@ pub struct DiscoveryTrackRow {
     pub rating: Option<i32>,
     pub status: String,
     pub created_at: String,
+    #[serde(default)]
+    pub exclude_from_core_taste: bool,
+    #[serde(default)]
+    pub reason_json: Option<String>,
+    #[serde(default)]
+    pub culture_bucket: Option<String>,
+    #[serde(default)]
+    pub pack_slug: Option<String>,
 }
 
 impl From<DiscoveryTrackRow> for DiscoveryTrack {
     fn from(row: DiscoveryTrackRow) -> Self {
+        let reason = row
+            .reason_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .map(Box::new);
         DiscoveryTrack {
             id: row.id,
             song_id: row.song_id,
@@ -36,6 +49,10 @@ impl From<DiscoveryTrackRow> for DiscoveryTrack {
             rating: row.rating.map(|r| r as u8),
             status: row.status.parse().unwrap_or(DiscoveryStatus::Pending),
             created_at: row.created_at,
+            exclude_from_core_taste: row.exclude_from_core_taste,
+            reason,
+            culture_bucket: row.culture_bucket,
+            pack_slug: row.pack_slug,
         }
     }
 }
@@ -108,6 +125,23 @@ impl DiscoveryTrackRow {
         )
         .bind(user_id)
         .bind(DiscoveryStatus::Pending.to_string())
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Discovery tracks for `user_id` flagged `exclude_from_core_taste = 1` (e.g. seasonal packs)
+    /// so core recommendation runs keep seasonal listening isolated from the user's taste profile.
+    pub(crate) async fn excluded_from_core_taste_for_user_in(
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT t.* FROM discovery_tracks t JOIN folders f ON f.id = t.folder_id \
+             WHERE f.user_id = ? AND t.exclude_from_core_taste = 1",
+        )
+        .bind(user_id)
         .fetch_all(db)
         .await
         .map_err(|e| e.to_string())?;

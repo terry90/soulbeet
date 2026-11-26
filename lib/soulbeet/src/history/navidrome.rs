@@ -18,6 +18,9 @@ use crate::traits::ListeningHistory;
 /// The library's songs with this user's annotations, read once.
 pub struct NavidromeHistory {
     songs: Vec<NativeSong>,
+    /// Songs excluded from core taste profile building (e.g. seasonal packs) but still owned
+    /// in the library so `known()` keeps them out of future recommendations.
+    excluded_from_taste: Vec<NativeSong>,
     /// The MusicBrainz id of each artist row that has one, by Navidrome artist id.
     artist_mbids: HashMap<String, String>,
     now: DateTime<Utc>,
@@ -70,9 +73,27 @@ impl NavidromeHistory {
             .collect();
         Self {
             songs,
+            excluded_from_taste: Vec::new(),
             artist_mbids,
             now,
         }
+    }
+
+    /// Excludes songs matching `is_excluded` (such as seasonal discovery tracks with
+    /// `exclude_from_core_taste = true`) from core taste seed queries (`top_artists`,
+    /// `top_tracks`, `listens`, `favourites`), while retaining them in `known()` so owned
+    /// seasonal files are still recognized as already in the library.
+    pub fn exclude_from_core_taste<F>(mut self, is_excluded: F) -> Self
+    where
+        F: Fn(&NativeSong) -> bool,
+    {
+        for song in &self.songs {
+            if is_excluded(song) {
+                self.excluded_from_taste.push(song.clone());
+            }
+        }
+        self.songs = crate::engine::contextual::filter_core_taste_tracks(self.songs, is_excluded);
+        self
     }
 
     fn mbid_of(&self, participant: &Participant) -> Option<String> {
@@ -219,7 +240,7 @@ impl ListeningHistory for NavidromeHistory {
 
     async fn known(&self) -> Result<KnownMusic, HistoryError> {
         let mut known = KnownMusic::default();
-        for song in &self.songs {
+        for song in self.songs.iter().chain(&self.excluded_from_taste) {
             // A recommended track carries its credited artist string, which names every artist.
             let mut credited = self.track_ref(song);
             credited.artist.name = song.artist.clone();

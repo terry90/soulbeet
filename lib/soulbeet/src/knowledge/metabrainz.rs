@@ -21,7 +21,7 @@ use crate::listenbrainz::labs::LabsClient;
 use crate::listenbrainz::models::{ArtistTags, RecordingMetadata};
 use crate::musicbrainz::exact_artist;
 use crate::polite::RemoteError;
-use crate::traits::{KnowledgeCache, MusicBrainzLookup, MusicKnowledge};
+use crate::traits::{KnowledgeCache, MusicBrainzLookup, MusicKnowledge, TagOp};
 
 pub const SIMILAR_ARTISTS_ALGORITHM: &str =
     "session_based_days_7500_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30";
@@ -111,6 +111,51 @@ impl MetaBrainzKnowledge {
                 })
             })
             .collect())
+    }
+
+    /// Fetches `/1/metadata/artist/` in batches for `misses` and populates BOTH
+    /// `kc1:lb:artist-tags:{mbid}` and `kc1:lb:artist-area:{mbid}` in a single HTTP round-trip
+    /// so sequential `artist_areas` + `artist_tags` calls never double-fetch.
+    async fn populate_artist_metadata_cache(
+        &self,
+        misses: &[String],
+    ) -> Result<(HashMap<String, Vec<WeightedTag>>, HashMap<String, Option<String>>), KnowledgeError>
+    {
+        let mut tags_out = HashMap::new();
+        let mut areas_out = HashMap::new();
+        for chunk in misses.chunks(ARTIST_METADATA_BATCH) {
+            let fetched = self.listenbrainz.artist_metadata(chunk).await?;
+            let mut by_mbid: HashMap<String, _> = fetched
+                .into_iter()
+                .map(|e| (e.artist_mbid.clone(), e))
+                .collect();
+            for id in chunk {
+                let (tags, area) = match by_mbid.remove(id) {
+                    Some(e) => (
+                        scaled_tags(e.tag),
+                        e.area.as_deref().and_then(normalize_area_code),
+                    ),
+                    None => (Vec::new(), None),
+                };
+                store(
+                    self.cache.as_ref(),
+                    &format!("kc1:lb:artist-tags:{id}"),
+                    &tags,
+                    TTL_ARTIST_TAGS,
+                )
+                .await?;
+                store(
+                    self.cache.as_ref(),
+                    &format!("kc1:lb:artist-area:{id}"),
+                    &area,
+                    TTL_ARTIST_TAGS,
+                )
+                .await?;
+                tags_out.insert(id.clone(), tags);
+                areas_out.insert(id.clone(), area);
+            }
+        }
+        Ok((tags_out, areas_out))
     }
 }
 
@@ -218,23 +263,50 @@ impl MusicKnowledge for MetaBrainzKnowledge {
         &self,
         artist_mbids: &[String],
     ) -> Result<HashMap<String, Vec<WeightedTag>>, KnowledgeError> {
-        let lb = &self.listenbrainz;
-        cached_each(
-            self.cache.as_ref(),
-            "kc1:lb:artist-tags:",
-            artist_mbids,
-            TTL_ARTIST_TAGS,
-            ARTIST_METADATA_BATCH,
-            |batch| async move {
-                Ok(lb
-                    .artist_metadata(&batch)
-                    .await?
-                    .into_iter()
-                    .map(|e| (e.artist_mbid, scaled_tags(e.tag)))
-                    .collect())
-            },
-        )
-        .await
+        let mut found = HashMap::new();
+        let mut asked = HashSet::new();
+        let mut misses = Vec::new();
+        for id in artist_mbids {
+            if !asked.insert(id) {
+                continue;
+            }
+            match read(self.cache.as_ref(), &format!("kc1:lb:artist-tags:{id}")).await? {
+                Some(value) => {
+                    found.insert(id.clone(), value);
+                }
+                None => misses.push(id.clone()),
+            }
+        }
+        if !misses.is_empty() {
+            let (fetched_tags, _) = self.populate_artist_metadata_cache(&misses).await?;
+            found.extend(fetched_tags);
+        }
+        Ok(found)
+    }
+
+    async fn artist_areas(
+        &self,
+        artist_mbids: &[String],
+    ) -> Result<HashMap<String, Option<String>>, KnowledgeError> {
+        let mut found = HashMap::new();
+        let mut asked = HashSet::new();
+        let mut misses = Vec::new();
+        for id in artist_mbids {
+            if !asked.insert(id) {
+                continue;
+            }
+            match read(self.cache.as_ref(), &format!("kc1:lb:artist-area:{id}")).await? {
+                Some(value) => {
+                    found.insert(id.clone(), value);
+                }
+                None => misses.push(id.clone()),
+            }
+        }
+        if !misses.is_empty() {
+            let (_, fetched_areas) = self.populate_artist_metadata_cache(&misses).await?;
+            found.extend(fetched_areas);
+        }
+        Ok(found)
     }
 
     async fn artist_popularity(
@@ -344,6 +416,58 @@ impl MusicKnowledge for MetaBrainzKnowledge {
         .await
     }
 
+    async fn multi_tag_tracks(
+        &self,
+        tags: &[&str],
+        operator: TagOp,
+        pop_range: Option<(u8, u8)>,
+        count: usize,
+    ) -> Result<Vec<TrackRef>, KnowledgeError> {
+        if tags.is_empty() || count == 0 {
+            return Ok(Vec::new());
+        }
+        let (pop_begin, pop_end) = pop_range.unwrap_or((0, 100));
+        let normalized_tags: Vec<String> = tags
+            .iter()
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if normalized_tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = format!(
+            "kc1:lb:multi-tag:{}:{}-{}:{}:{}",
+            operator.as_str(),
+            pop_begin,
+            pop_end,
+            normalized_tags.join("+"),
+            count
+        );
+        cached(self.cache.as_ref(), &key, TTL_TAG_TRACKS, async {
+            let refs: Vec<&str> = normalized_tags.iter().map(String::as_str).collect();
+            let ids: Vec<String> = self
+                .listenbrainz
+                .multi_tag_radio(&refs, operator.as_str(), pop_begin, pop_end, count)
+                .await?
+                .into_iter()
+                .map(|r| r.recording_mbid)
+                .collect();
+            let mut facts = self.recordings(&ids).await?;
+            Ok(ids
+                .into_iter()
+                .filter_map(|id| {
+                    let f = facts.remove(&id)?;
+                    Some(TrackRef {
+                        artist: f.artist,
+                        title: f.title,
+                        mbid: Some(id),
+                    })
+                })
+                .collect())
+        })
+        .await
+    }
+
     async fn recordings(
         &self,
         recording_mbids: &[String],
@@ -370,6 +494,107 @@ impl MusicKnowledge for MetaBrainzKnowledge {
             .filter_map(|(mbid, f)| Some((mbid, f?)))
             .collect())
     }
+}
+
+/// Normalizes a MusicBrainz / ListenBrainz artist `area` string into a 2-letter ISO-3166
+/// country code (e.g. `"France"` -> `"FR"`, `"fr"` -> `"FR"`).
+pub(crate) fn normalize_area_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() == 2 && trimmed.bytes().all(|b| b.is_ascii_alphabetic()) {
+        let upper = trimmed.to_ascii_uppercase();
+        return Some(if upper == "UK" {
+            "GB".to_string()
+        } else {
+            upper
+        });
+    }
+    let code = match trimmed.to_ascii_lowercase().as_str() {
+        "france" => "FR",
+        "belgium" => "BE",
+        "switzerland" => "CH",
+        "germany" => "DE",
+        "austria" => "AT",
+        "united kingdom" | "england" | "scotland" | "wales" | "northern ireland" | "great britain" => "GB",
+        "ireland" | "republic of ireland" => "IE",
+        "spain" => "ES",
+        "portugal" => "PT",
+        "italy" => "IT",
+        "netherlands" | "the netherlands" => "NL",
+        "sweden" => "SE",
+        "norway" => "NO",
+        "denmark" => "DK",
+        "finland" => "FI",
+        "iceland" => "IS",
+        "poland" => "PL",
+        "czech republic" | "czechia" => "CZ",
+        "slovakia" => "SK",
+        "hungary" => "HU",
+        "romania" => "RO",
+        "bulgaria" => "BG",
+        "greece" => "GR",
+        "turkey" | "türkiye" | "turkiye" => "TR",
+        "ukraine" => "UA",
+        "russia" | "russian federation" => "RU",
+        "serbia" => "RS",
+        "croatia" => "HR",
+        "bosnia and herzegovina" => "BA",
+        "slovenia" => "SI",
+        "estonia" => "EE",
+        "latvia" => "LV",
+        "lithuania" => "LT",
+        "luxembourg" => "LU",
+        "united states" | "united states of america" | "usa" => "US",
+        "canada" => "CA",
+        "mexico" => "MX",
+        "brazil" => "BR",
+        "argentina" => "AR",
+        "colombia" => "CO",
+        "chile" => "CL",
+        "peru" => "PE",
+        "uruguay" => "UY",
+        "venezuela" => "VE",
+        "ecuador" => "EC",
+        "cuba" => "CU",
+        "puerto rico" => "PR",
+        "jamaica" => "JM",
+        "trinidad and tobago" => "TT",
+        "dominican republic" => "DO",
+        "japan" => "JP",
+        "south korea" | "korea, republic of" | "republic of korea" => "KR",
+        "china" | "people's republic of china" => "CN",
+        "taiwan" | "taiwan, province of china" => "TW",
+        "hong kong" => "HK",
+        "india" => "IN",
+        "pakistan" => "PK",
+        "bangladesh" => "BD",
+        "indonesia" => "ID",
+        "thailand" => "TH",
+        "vietnam" | "viet nam" => "VN",
+        "philippines" => "PH",
+        "singapore" => "SG",
+        "malaysia" => "MY",
+        "australia" => "AU",
+        "new zealand" => "NZ",
+        "nigeria" => "NG",
+        "ghana" => "GH",
+        "south africa" => "ZA",
+        "senegal" => "SN",
+        "mali" => "ML",
+        "ethiopia" => "ET",
+        "kenya" => "KE",
+        "egypt" => "EG",
+        "morocco" => "MA",
+        "algeria" => "DZ",
+        "tunisia" => "TN",
+        "lebanon" => "LB",
+        "israel" => "IL",
+        "iran" | "iran, islamic republic of" => "IR",
+        _ => return None,
+    };
+    Some(code.to_string())
 }
 
 /// True when the seed's folded name sits in the neighbour's as a whole word,
@@ -907,5 +1132,55 @@ mod tests {
                 Duration::from_secs(30 * 86_400)
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn artist_areas_and_tags_share_one_metadata_fetch() {
+        let (api, seen) = serve(vec![ok(include_str!(
+            "../listenbrainz/fixtures/artist_metadata.json"
+        ))]);
+        let (k, _) = knowledge(&api, UNUSED, FakeMusicBrainz::default(), None);
+        let ids = vec![TINARIWEN.to_string(), FISHMANS.to_string()];
+
+        let _areas = k.artist_areas(&ids).await.unwrap();
+        let tags = k.artist_tags(&ids).await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "should not double-fetch artist metadata");
+        assert!(!tags[TINARIWEN].is_empty());
+    }
+
+    #[test]
+    fn normalize_area_code_covers_global_countries() {
+        for (raw, expected) in [
+            ("China", "CN"),
+            ("Taiwan", "TW"),
+            ("Hong Kong", "HK"),
+            ("Singapore", "SG"),
+            ("Vietnam", "VN"),
+            ("Malaysia", "MY"),
+            ("Colombia", "CO"),
+            ("Trinidad and Tobago", "TT"),
+            ("Nigeria", "NG"),
+            ("South Africa", "ZA"),
+            ("Türkiye", "TR"),
+            ("Greece", "GR"),
+            ("Egypt", "EG"),
+            ("Morocco", "MA"),
+            ("Indonesia", "ID"),
+            ("Philippines", "PH"),
+            ("Thailand", "TH"),
+            ("Pakistan", "PK"),
+            ("Bangladesh", "BD"),
+            ("Czechia", "CZ"),
+            ("Hungary", "HU"),
+            ("Romania", "RO"),
+            ("Ukraine", "UA"),
+            ("uk", "GB"),
+        ] {
+            assert_eq!(
+                normalize_area_code(raw).as_deref(),
+                Some(expected),
+                "area {raw}"
+            );
+        }
     }
 }

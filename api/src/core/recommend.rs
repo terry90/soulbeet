@@ -2,13 +2,14 @@
 //! library and, when saved, their ListenBrainz account, then each discovery
 //! profile's candidates from the generators the user's settings turn on.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::LastRun;
 use shared::recommendation::{
-    Candidate, DiscoveryProfile, EngineReport, EngineState, ProfileConfig, SourceError,
-    SourceErrors, NO_LISTENING_DATA,
+    Candidate, CandidateSet, DiscoveryProfile, EngineReport, EngineState, ProfileConfig,
+    SourceError, SourceErrors, NO_LISTENING_DATA,
 };
 use soulbeet::deezer::DeezerClient;
 use soulbeet::engine::catalog::CatalogGenerator;
@@ -33,7 +34,9 @@ use crate::core::database_failure;
 use crate::core::discovery::parse_profiles;
 use crate::core::index::NavidromeOf;
 use crate::db::DB;
+use crate::models::contextual::DiscoveryRejectionRow;
 use crate::models::discovery_candidate::DiscoveryCandidateRow;
+use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::engine_report::EngineReportRow;
 use crate::models::knowledge_cache::SqliteKnowledgeCache;
 use crate::models::user::User;
@@ -110,6 +113,58 @@ pub(crate) async fn due_in(db: &SqlitePool) -> Result<Vec<(User, Vec<DiscoveryPr
     Ok(due)
 }
 
+/// Tracks excluded from core taste profile building (e.g. seasonal packs with
+/// `exclude_from_core_taste = 1` or staged under `Discovery/Seasonal/`).
+#[derive(Default)]
+struct CoreTasteExclusions {
+    song_ids: HashSet<String>,
+    track_keys: HashSet<String>,
+}
+
+impl CoreTasteExclusions {
+    fn from_tracks(tracks: &[shared::navidrome::DiscoveryTrack]) -> Self {
+        let mut song_ids = HashSet::new();
+        let mut track_keys = HashSet::new();
+        for t in tracks {
+            if let Some(ref sid) = t.song_id {
+                if !sid.is_empty() {
+                    song_ids.insert(sid.clone());
+                }
+            }
+            track_keys.insert(CandidateSet::key(&t.artist, &t.title));
+        }
+        Self {
+            song_ids,
+            track_keys,
+        }
+    }
+
+    fn matches(&self, song: &soulbeet::navidrome::models::NativeSong) -> bool {
+        if is_seasonal_discovery_path(&song.path) {
+            return true;
+        }
+        if self.song_ids.contains(&song.id) {
+            return true;
+        }
+        self.track_keys
+            .contains(&CandidateSet::key(&song.artist, &song.title))
+    }
+}
+
+fn is_seasonal_discovery_path(path: &str) -> bool {
+    let mut segs = path.split(['/', '\\']).filter(|s| !s.is_empty()).peekable();
+    while let Some(seg) = segs.next() {
+        if seg.eq_ignore_ascii_case("discovery")
+            && segs
+                .peek()
+                .is_some_and(|next| next.eq_ignore_ascii_case("seasonal"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Builds the user's profile once, then stores each of `profiles`' candidates and report.
 /// Returns how many candidates were stored in all. Fails when the Navidrome library cannot
 /// be read, since without it the user's own music could be recommended back to them, when a
@@ -126,12 +181,22 @@ pub(crate) async fn generate_in(
     let settings = UserSettings::get_in(db, &user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
+    let excluded_tracks = DiscoveryTrackRow::excluded_from_core_taste_for_user_in(db, &user_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
+    let exclusions = CoreTasteExclusions::from_tracks(&excluded_tracks);
+    let rejected_keys = DiscoveryRejectionRow::keys_for_user_in(db, &user_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
+
     let RunSources {
         histories,
         generators,
         knowledge,
         errors,
-    } = match sources_of(navidrome, services, user, plan_for(&settings)).await {
+    } = match sources_of_with_exclusions(navidrome, services, user, plan_for(&settings), &exclusions)
+        .await
+    {
         Ok(sources) => sources,
         Err((source, failure)) => {
             store_failure_in(db, &user_id, profiles, source, &failure).await;
@@ -144,7 +209,7 @@ pub(crate) async fn generate_in(
     let mut total = 0u32;
     for profile in profiles {
         let config = ProfileConfig::from_profile(*profile);
-        let (candidates, mut report) = recommend(
+        let (mut candidates, mut report) = recommend(
             &build,
             &generators,
             knowledge.as_ref(),
@@ -152,6 +217,11 @@ pub(crate) async fn generate_in(
             CANDIDATES_PER_PROFILE,
         )
         .await;
+        if !rejected_keys.is_empty() {
+            candidates
+                .retain(|c| !rejected_keys.contains(&CandidateSet::key(&c.artist, &c.track)));
+            report.final_count = candidates.len();
+        }
         // The setup's errors first, so a refused token is the message its source shows.
         let mut all = errors.clone();
         all.extend(report.source_errors.into());
@@ -186,6 +256,23 @@ pub(crate) async fn sources_of(
     user: &UserId,
     plan: SourcePlan,
 ) -> Result<RunSources, (&'static str, Failure)> {
+    sources_of_with_exclusions(
+        navidrome,
+        services,
+        user,
+        plan,
+        &CoreTasteExclusions::default(),
+    )
+    .await
+}
+
+async fn sources_of_with_exclusions(
+    navidrome: &dyn NavidromeOf,
+    services: &DiscoveryServices,
+    user: &UserId,
+    plan: SourcePlan,
+    exclusions: &CoreTasteExclusions,
+) -> Result<RunSources, (&'static str, Failure)> {
     let navi = navidrome.navidrome_of(user).await.map_err(|e| {
         let failure = e.failure(
             Stage::Input,
@@ -195,7 +282,8 @@ pub(crate) async fn sources_of(
     })?;
     let library = soulbeet::history::navidrome::read(&navi)
         .await
-        .map_err(library_failure)?;
+        .map_err(library_failure)?
+        .exclude_from_core_taste(|song| exclusions.matches(song));
 
     let (listenbrainz, errors) = listenbrainz_for(services, plan.listenbrainz_token)
         .await
@@ -446,6 +534,8 @@ mod tests {
             primary_genre: None,
             release_year: None,
             artist_mbid: None,
+            reason: None,
+            culture_bucket: None,
         }
     }
 
@@ -938,5 +1028,177 @@ mod tests {
                 vec![DiscoveryProfile::Balanced, DiscoveryProfile::Adventurous]
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn seasonal_excluded_tracks_do_not_pollute_core_taste_profile() {
+        let db = test_db::migrated().await;
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+
+        // Mark song "s-holiday-db" as exclude_from_core_taste = 1 in discovery_tracks.
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, pack_slug) \
+             VALUES ('dt-hol', 's-holiday-db', 'Jingle Bells', 'Holiday Singer', 'Xmas', \
+                     '/music/alice/Holiday Singer/01.flac', ?, 'Balanced', 'Pending', 1, 'winter_holiday')",
+        )
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let navi = NavidromeStub::start();
+        let songs = serde_json::json!([
+            {
+                "id": "s-holiday-db",
+                "path": "alice/Holiday Singer/01.flac",
+                "title": "Jingle Bells",
+                "size": 1000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "updatedAt": "2026-12-10T10:00:00Z",
+                "artist": "Holiday Singer",
+                "album": "Xmas",
+                "albumArtist": "Holiday Singer",
+                "playCount": 25,
+                "playDate": "2026-12-10T10:00:00Z",
+                "rating": 5,
+                "starred": true
+            },
+            {
+                "id": "s-holiday-path",
+                "path": "alice/Discovery/Seasonal/winter_holiday/Carolers/02.flac",
+                "title": "Silent Night",
+                "size": 1000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "updatedAt": "2026-12-10T10:00:00Z",
+                "artist": "Carolers",
+                "album": "Xmas",
+                "albumArtist": "Carolers",
+                "playCount": 15,
+                "playDate": "2026-12-10T10:00:00Z",
+                "rating": 5,
+                "starred": true
+            }
+        ]);
+        navi.answer("/api/song", &[&songs.to_string()]);
+        navi.header("/api/song", "X-Total-Count", "2");
+        navi.answer("/api/artist", &["[]"]);
+
+        // Both seasonal tracks must be excluded from core taste, leaving zero core seeds.
+        let err = generate_in(
+            &db,
+            &NavidromeFor(Ok(navi.client())),
+            &services_at(&db, UNREACHED),
+            &UserId::new("alice"),
+            &[DiscoveryProfile::Balanced],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, no_listening_data());
+    }
+
+    #[tokio::test]
+    async fn discovery_rejections_are_filtered_out_of_core_candidates() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+
+        let seed_mbid = "11111111-1111-4111-8111-111111111111";
+        let neighbour_mbid = "22222222-2222-4222-8222-222222222222";
+        let rec_keep = "33333333-3333-4333-8333-333333333333";
+        let rec_drop = "44444444-4444-4444-8444-444444444444";
+
+        // Reject "Vela Norte" - "Foglight" in discovery_rejections.
+        DiscoveryRejectionRow::record_in(&db, "alice", "Vela Norte", "Foglight", None, "removed")
+            .await
+            .unwrap();
+
+        let navi = NavidromeStub::start();
+        let songs = serde_json::json!([
+            {
+                "id": "s-core-1",
+                "path": "alice/Static Harbor/Northern Line.flac",
+                "title": "Northern Line",
+                "size": 1000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "updatedAt": "2026-11-10T10:00:00Z",
+                "artist": "Static Harbor",
+                "album": "Harbor",
+                "albumArtist": "Static Harbor",
+                "mbzArtistId": seed_mbid,
+                "playCount": 12,
+                "playDate": "2026-11-18T10:00:00Z",
+                "rating": 5,
+                "starred": true
+            }
+        ]);
+        navi.answer("/api/song", &[&songs.to_string()]);
+        navi.header("/api/song", "X-Total-Count", "1");
+        navi.answer("/api/artist", &["[]"]);
+
+        let meta = NavidromeStub::start();
+        // Labs similar artists for seed_mbid -> Vela Norte
+        meta.answer(
+            "/similar-artists/json",
+            &[&serde_json::json!([
+                {"artist_mbid": neighbour_mbid, "name": "Vela Norte", "score": 100}
+            ])
+            .to_string()],
+        );
+        // ListenBrainz artist radio for neighbour -> 2 recordings (Foglight + Maritime)
+        meta.answer(
+            &format!("/1/lb-radio/artist/{neighbour_mbid}"),
+            &[&serde_json::json!({
+                neighbour_mbid: [
+                    {"recording_mbid": rec_drop, "total_listen_count": 500},
+                    {"recording_mbid": rec_keep, "total_listen_count": 400}
+                ]
+            })
+            .to_string()],
+        );
+        // Recording metadata for both recordings
+        meta.answer(
+            "/1/metadata/recording/",
+            &[&serde_json::json!({
+                rec_drop: {
+                    "artist": {"name": "Vela Norte", "artists": [{"artist_mbid": neighbour_mbid}]},
+                    "recording": {"name": "Foglight", "first_release_date": "2024-01-01"}
+                },
+                rec_keep: {
+                    "artist": {"name": "Vela Norte", "artists": [{"artist_mbid": neighbour_mbid}]},
+                    "recording": {"name": "Maritime", "first_release_date": "2024-01-01"}
+                }
+            })
+            .to_string()],
+        );
+        // Artist metadata + popularity + sitewide
+        meta.answer("/1/metadata/artist/", &["[]"]);
+        meta.answer("/1/popularity/artist", &["[]"]);
+        meta.answer("/1/stats/sitewide/artists", &[r#"{"payload":{"artists":[]}}"#]);
+
+        let mut services = services_at(&db, &meta.url);
+        services.hosts.labs = meta.url.clone();
+
+        let count = generate_in(
+            &db,
+            &NavidromeFor(Ok(navi.client())),
+            &services,
+            &UserId::new("alice"),
+            &[DiscoveryProfile::Balanced],
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        let stored = DiscoveryCandidateRow::get_unused_in(&db, "alice", "Balanced", 10)
+            .await
+            .unwrap();
+        assert_eq!(tracks(stored), ["Maritime"]);
     }
 }

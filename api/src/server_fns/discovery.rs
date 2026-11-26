@@ -186,6 +186,140 @@ pub async fn get_discovery_progress(
     Ok(progress.and_then(|p| current_progress(&p, chrono::Utc::now())))
 }
 
+#[get("/api/discovery/culture-profile", auth: AuthSession)]
+pub async fn get_culture_profile(
+) -> Result<shared::recommendation::UserCultureProfile, ServerFnError> {
+    crate::core::contextual::get_culture_profile_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/culture-profile", auth: AuthSession)]
+pub async fn update_culture_profile(
+    req: shared::recommendation::UpdateCultureProfileRequest,
+) -> Result<shared::recommendation::UserCultureProfile, ServerFnError> {
+    crate::core::contextual::update_culture_profile_in(&crate::db::DB, &auth.0.user_id, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[get("/api/discovery/contextual-mixes?local_hour", auth: AuthSession)]
+pub async fn list_active_contextual_mixes(
+    local_hour: Option<u8>,
+) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
+    crate::core::contextual::list_active_contextual_mixes_in(
+        &crate::db::DB,
+        &auth.0,
+        chrono::Utc::now(),
+        local_hour,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[get("/api/discovery/mix-definitions", auth: AuthSession)]
+pub async fn list_contextual_mix_definitions(
+) -> Result<Vec<shared::recommendation::ContextualMixDefinition>, ServerFnError> {
+    crate::core::contextual::list_mix_definitions_in(&crate::db::DB, &auth.0)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions", auth: AuthSession)]
+pub async fn upsert_contextual_mix_definition(
+    req: shared::recommendation::UpsertContextualMixRequest,
+) -> Result<shared::recommendation::ContextualMixDefinition, ServerFnError> {
+    crate::core::contextual::upsert_mix_definition_in(&crate::db::DB, &auth.0, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions/delete", auth: AuthSession)]
+pub async fn delete_contextual_mix_definition(slug: String) -> Result<(), ServerFnError> {
+    crate::core::contextual::delete_mix_definition_in(&crate::db::DB, &auth.0, &slug)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/discovery/mix-definitions/enabled", auth: AuthSession)]
+pub async fn set_contextual_mix_enabled(
+    req: shared::recommendation::SetMixEnabledRequest,
+) -> Result<shared::recommendation::ContextualMixDefinition, ServerFnError> {
+    crate::core::contextual::set_mix_enabled_in(&crate::db::DB, &auth.0, req)
+        .await
+        .map_err(failure_error)
+}
+
+#[get("/api/discovery/contextual-mixes/playlist?slug&sync", auth: AuthSession)]
+pub async fn get_contextual_mix_playlist(
+    slug: String,
+    sync: Option<bool>,
+) -> Result<shared::recommendation::ContextualMixPlaylist, ServerFnError> {
+    crate::core::contextual::resolve_contextual_mix_playlist_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        &auth.0,
+        &slug,
+        sync.unwrap_or(false),
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[post("/api/discovery/seasonal/steer", auth: AuthSession)]
+pub async fn steer_seasonal_pack(
+    req: shared::recommendation::SteerSeasonalPackRequest,
+) -> Result<shared::recommendation::ContextualMixSummary, ServerFnError> {
+    crate::core::contextual::steer_seasonal_pack_in(
+        &crate::db::DB,
+        &auth.0,
+        &req.slug,
+        req.steering,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[get("/api/discovery/triage", auth: AuthSession)]
+pub async fn list_triage_queue() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
+    crate::core::contextual::list_triage_queue_in(&crate::db::DB, &auth.0.user_id)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/radio/start", auth: AuthSession)]
+pub async fn start_seed_radio(
+    req: shared::recommendation::SeedRadioRequest,
+) -> Result<shared::recommendation::SeedRadioResponse, ServerFnError> {
+    let settings = UserSettings::get(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
+    let services = crate::core::recommend::DiscoveryServices::live();
+    let plan = crate::core::recommend::plan_for(&settings);
+    let (lb, _errors) = crate::core::recommend::listenbrainz_for(&services, plan.listenbrainz_token)
+        .await
+        .map_err(server_error)?;
+    let labs =
+        soulbeet::listenbrainz::labs::LabsClient::new(&services.hosts.labs, services.metabrainz_pace)
+            .map_err(server_error)?;
+    let knowledge = soulbeet::knowledge::metabrainz::MetaBrainzKnowledge::new(
+        lb,
+        labs,
+        services.musicbrainz,
+        services.cache,
+    );
+    crate::core::contextual::start_seed_radio_in(
+        &crate::core::index::ServerNavidrome,
+        &knowledge,
+        &auth.0,
+        &req,
+    )
+    .await
+    .map_err(failure_error)
+}
+
 /// Discovery as the running server does it: runs in `DISCOVERY_PROGRESS`, the generation in
 /// its own task, imports through the library's import queue.
 #[cfg(feature = "server")]
@@ -624,6 +758,16 @@ pub async fn generate_discovery_playlist_internal(
         .map_err(|e| run_database_failure(Stage::Input, e))?;
     info!("Added {} deleted tracks to exclusion set", disliked.len());
     seen.extend(disliked);
+
+    // Explicit discovery rejections (removed staged tracks)
+    let rejected = crate::models::contextual::DiscoveryRejectionRow::keys_for_user_in(
+        &crate::db::DB,
+        user_id,
+    )
+    .await
+    .map_err(|e| run_database_failure(Stage::Input, e))?;
+    info!("Added {} rejected discovery tracks to exclusion set", rejected.len());
+    seen.extend(rejected);
 
     // Tracks whose search kept finding nothing, which the engine would suggest every run
     let kept_out = discovery_search_miss::kept_out_keys(user_id)
@@ -1299,13 +1443,53 @@ async fn scan_imports(
 /// auto-updates as Navidrome scans new files. Owned by the authenticated user.
 #[cfg(feature = "server")]
 pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> {
+    let user = UserId::new(user_id);
+    let music_path = crate::config::CONFIG.navidrome_music_path();
     reconcile_in(
         &crate::db::DB,
         &crate::core::index::ServerNavidrome,
-        crate::config::CONFIG.navidrome_music_path(),
-        &UserId::new(user_id),
+        music_path,
+        &user,
     )
-    .await
+    .await?;
+
+    // Also reconcile active seasonal packs as Navidrome smart playlists (`Discovery/Seasonal/<slug>/`)
+    // and clean up expired seasonal playlists.
+    if let Ok(settings) = UserSettings::get_in(&crate::db::DB, user_id).await {
+        if settings.discovery_enabled {
+            if let Some(ref folder_id) = settings.discovery_folder_id {
+                if let Ok(Some(folder)) = Folder::get_by_id_in(&crate::db::DB, folder_id).await {
+                    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
+                        if let Ok(Some(discovery)) = crate::core::discovery::discovery_place_in(
+                            &crate::db::DB,
+                            &navi,
+                            music_path,
+                            &folder,
+                        )
+                        .await
+                        {
+                            if let Err(e) = crate::core::contextual::reconcile_seasonal_playlists_in(
+                                &crate::db::DB,
+                                &navi,
+                                user_id,
+                                &discovery,
+                                chrono::Utc::now(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "Failed to reconcile seasonal playlists for user {}: {}",
+                                    user_id, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// reconcile_discovery_playlists on `db` and `navidrome`, `music_path` the root of Navidrome's
