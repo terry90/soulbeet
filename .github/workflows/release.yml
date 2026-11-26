@@ -103,20 +103,28 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK 27.2.12479018
+      - name: Configure Android SDK and NDK 27.2.12479018
         run: |
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          if [[ -z "$SDK_ROOT" ]]; then
-            echo "ERROR: neither ANDROID_HOME nor ANDROID_SDK_ROOT is set" >&2
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "ERROR: Android SDK not found at ${SDK_ROOT}" >&2
             exit 1
           fi
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "ndk;27.2.12479018"
+          SDKMANAGER="$(command -v sdkmanager || find "${SDK_ROOT}/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "ERROR: sdkmanager not found under ${SDK_ROOT}/cmdline-tools" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
           NDK_DIR="${SDK_ROOT}/ndk/27.2.12479018"
           test -d "${NDK_DIR}/toolchains/llvm/prebuilt"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
