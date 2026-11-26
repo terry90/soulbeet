@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- UniFFI 0.29 generates optional java.lang.ref.Cleaner / AndroidCleaner code with runtime SDK checks -->
+    <issue id="NewApi">
+        <ignore path="**/org/soulbeet/core/client_core.kt" />
+    </issue>
+</lint>

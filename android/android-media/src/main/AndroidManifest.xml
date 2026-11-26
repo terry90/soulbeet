@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application>
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!--
+            Exported without a custom permission so Android Auto and system media controllers can
+            bind to the MediaLibraryService / MediaBrowserService.
+        -->
+        <service
+            android:name="org.soulbeet.media.SoulbeetMediaLibraryService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaLibraryService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!--
+            Standard Media3 media-button receiver required for Bluetooth/steering-wheel/ignition
+            playback resumption intents (`ACTION_MEDIA_BUTTON`).
+        -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+            Read-only local cover-art provider required by Android Auto head units to load
+            cached artwork URIs across process boundaries without blocking on network I/O.
+            All write operations throw UnsupportedOperationException.
+        -->
+        <provider
+            android:name="org.soulbeet.media.CoverArtContentProvider"
+            android:authorities="${applicationId}.art"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            tools:ignore="ExportedContentProvider" />
+    </application>
+
+</manifest>
