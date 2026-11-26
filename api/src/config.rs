@@ -280,6 +280,9 @@ pub struct AppConfig {
     oidc: Option<OidcConfig>,
     /// Why single sign-on is off although `OIDC_ISSUER_URL` is set
     oidc_off: Option<String>,
+    /// What the YouTube Music backend's helper runs with (`YTDLP_PYTHON`, `YTDLP_SITE_PACKAGES`,
+    /// `YTDLP_DENO`, ffmpeg on PATH)
+    ytdlp: soulbeet::ytdlp::Tools,
 }
 
 #[cfg(feature = "server")]
@@ -361,7 +364,13 @@ impl AppConfig {
             ip: std::env::var("IP").unwrap_or_else(|_| "0.0.0.0".to_string()),
             oidc,
             oidc_off,
+            ytdlp: ytdlp_tools(|key| std::env::var_os(key)),
         }
+    }
+
+    /// What the YouTube Music backend's helper runs with.
+    pub fn ytdlp_tools(&self) -> &soulbeet::ytdlp::Tools {
+        &self.ytdlp
     }
 
     /// OpenID Connect sign-in settings, when configured.
@@ -448,6 +457,27 @@ impl AppConfig {
     }
 }
 
+/// The YouTube Music helper's programs: the paths `lookup` gives, else where the :full image
+/// installs them, and the ffmpeg on PATH. An image without them runs, and the backend's health
+/// says what is missing.
+#[cfg(feature = "server")]
+fn ytdlp_tools(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> soulbeet::ytdlp::Tools {
+    let path = |key: &str, default: &str| {
+        lookup(key)
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| PathBuf::from(default), PathBuf::from)
+    };
+    soulbeet::ytdlp::Tools {
+        python: path("YTDLP_PYTHON", "/usr/bin/python3"),
+        site_packages: path(
+            "YTDLP_SITE_PACKAGES",
+            "/opt/ytdlp/lib/python3.11/site-packages",
+        ),
+        deno: path("YTDLP_DENO", "/opt/ytdlp/bin/deno"),
+        ffmpeg: soulbeet::beets::resolve_on_path("ffmpeg"),
+    }
+}
+
 /// Why `path`, the NAVIDROME_MUSIC_PATH set, cannot be used: it is no folder here. Earlier
 /// versions read it as Navidrome's own path of its library, which is often not one here.
 #[cfg(feature = "server")]
@@ -473,6 +503,28 @@ pub static CONFIG: LazyLock<AppConfig> = LazyLock::new(AppConfig::from_env);
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_youtube_helper_runs_from_the_full_image_unless_told_otherwise() {
+        let tools = ytdlp_tools(|_| None);
+        assert_eq!(tools.python, PathBuf::from("/usr/bin/python3"));
+        assert_eq!(
+            tools.site_packages,
+            PathBuf::from("/opt/ytdlp/lib/python3.11/site-packages")
+        );
+        assert_eq!(tools.deno, PathBuf::from("/opt/ytdlp/bin/deno"));
+        let set = |key: &str| match key {
+            "YTDLP_PYTHON" => Some("/venv/bin/python".into()),
+            "YTDLP_SITE_PACKAGES" => Some("/fakes".into()),
+            // An empty value is no value.
+            "YTDLP_DENO" => Some("".into()),
+            _ => None,
+        };
+        let tools = ytdlp_tools(set);
+        assert_eq!(tools.python, PathBuf::from("/venv/bin/python"));
+        assert_eq!(tools.site_packages, PathBuf::from("/fakes"));
+        assert_eq!(tools.deno, PathBuf::from("/opt/ytdlp/bin/deno"));
+    }
 
     #[test]
     fn an_unusable_public_url_is_reported() {

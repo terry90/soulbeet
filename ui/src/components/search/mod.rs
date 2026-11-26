@@ -289,6 +289,7 @@ pub fn Search() -> Element {
                     batch_id,
                     search_id,
                     results,
+                    reason,
                     ..
                 } => {
                     download_states
@@ -307,6 +308,7 @@ pub fn Search() -> Element {
                         track_name,
                         search_id,
                         results,
+                        reason,
                     });
 
                     spawn(async move {
@@ -398,6 +400,7 @@ pub fn Search() -> Element {
                     batch_id,
                     search_id,
                     results,
+                    reason,
                     ..
                 } => {
                     download_states
@@ -414,6 +417,7 @@ pub fn Search() -> Element {
                         track_name,
                         search_id,
                         results,
+                        reason,
                     });
                     spawn(async move {
                         gloo_timers::future::TimeoutFuture::new(8000).await;

@@ -20,6 +20,8 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
 
+use crate::process::ProcessGroup;
+
 const LINE_CAP: usize = 8 * 1024;
 const TRUNCATED_MARKER: &str = " [truncated]";
 const TAIL_LINES: usize = 20;
@@ -114,18 +116,16 @@ pub async fn run_beet(
     spec: RunSpec<'_>,
     on_line: &mut (dyn FnMut(Stream, &str) + Send),
 ) -> RunOutcome {
-    let mut child = match Command::new(spec.program)
-        .args(&spec.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("NO_COLOR", "1")
-        .env("PYTHONUNBUFFERED", "1")
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
+    let (mut child, mut group) = match ProcessGroup::spawn(
+        Command::new(spec.program)
+            .args(&spec.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("NO_COLOR", "1")
+            .env("PYTHONUNBUFFERED", "1"),
+    ) {
+        Ok(spawned) => spawned,
         Err(e) => {
             return RunOutcome {
                 end: RunEnd::SpawnFailed(e),
@@ -133,10 +133,6 @@ pub async fn run_beet(
                 drain_timed_out: false,
             }
         }
-    };
-    let mut group = GroupGuard {
-        pgid: child.id().map_or(0, |id| id as libc::pid_t),
-        armed: true,
     };
 
     let (tx, mut rx) = mpsc::channel::<(Stream, String)>(256);
@@ -187,7 +183,7 @@ pub async fn run_beet(
     .await
     .is_err();
     readers.abort_all();
-    group.armed = false;
+    group.disarm();
 
     if drain_timed_out && matches!(end, RunEnd::Exited(_)) {
         tracing::warn!("beets exited but a child process kept its output open");
@@ -322,32 +318,6 @@ impl TailBuffer {
 
     fn render(&self) -> String {
         self.lines.iter().join("\n")
-    }
-}
-
-/// Kills the process group on drop unless the run finished and drained.
-/// `kill_on_drop` alone only signals beets' own pid.
-struct GroupGuard {
-    pgid: libc::pid_t,
-    armed: bool,
-}
-
-impl GroupGuard {
-    fn kill(&self) {
-        if self.pgid > 1 {
-            // SAFETY: killpg has no memory-safety preconditions.
-            unsafe {
-                libc::killpg(self.pgid, libc::SIGKILL);
-            }
-        }
-    }
-}
-
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.kill();
-        }
     }
 }
 

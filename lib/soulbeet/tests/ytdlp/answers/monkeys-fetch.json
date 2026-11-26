@@ -1,0 +1,55 @@
+{
+ "seconds": 7.74,
+ "info": {
+  "id": "MdzF0rFOC9Y",
+  "format_id": "251",
+  "acodec": "opus",
+  "abr": 136.374,
+  "asr": 48000,
+  "ext": "webm",
+  "duration": 125,
+  "channel": "Kevin MacLeod",
+  "track": "Monkeys Spinning Monkeys",
+  "artists": [
+   "Kevin MacLeod"
+  ],
+  "album": "25 Years (Volume 2)"
+ },
+ "events": [
+  {
+   "status": "downloading",
+   "downloaded_bytes": 1024,
+   "total_bytes": 2131214,
+   "speed": null,
+   "elapsed": 0.0526425838470459
+  },
+  {
+   "status": "downloading",
+   "downloaded_bytes": 3072,
+   "total_bytes": 2131214,
+   "speed": null,
+   "elapsed": 0.053092241287231445
+  },
+  {
+   "status": "downloading",
+   "downloaded_bytes": 7168,
+   "total_bytes": 2131214,
+   "speed": null,
+   "elapsed": 0.053214073181152344
+  },
+  {
+   "status": "downloading",
+   "downloaded_bytes": 10241,
+   "total_bytes": 2131214,
+   "speed": 9847287.314076113,
+   "elapsed": 0.05342984199523926
+  },
+  {
+   "status": "finished",
+   "downloaded_bytes": 10241,
+   "total_bytes": 10241,
+   "speed": 191056.3744100915,
+   "elapsed": 0.053601980209350586
+  }
+ ]
+}

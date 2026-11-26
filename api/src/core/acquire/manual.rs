@@ -9,6 +9,7 @@ use crate::ledger::{DuplicateRule, JobKind, JobState, Ledger, NewJob, LEDGER};
 use crate::models::folder::Folder;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{Backends, Registry};
+use shared::backends::delivery;
 use shared::download::{DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, Stage};
 use soulbeet::DownloadBackend;
@@ -142,13 +143,14 @@ async fn start_manual(
     };
 
     let alternates = alternates_from(search.candidates.as_deref().unwrap_or_default(), &items);
+    let duplicates = DuplicateRule::Guarded.for_delivery(delivery(&routed));
     let fresh = NewBatch {
         batch_id: uuid::Uuid::new_v4().to_string(),
         label: manual_batch_label(&items),
         backend: routed,
         target,
         import_mode,
-        duplicates: DuplicateRule::Guarded,
+        duplicates,
     };
     let acquisition = Acquisition {
         job,

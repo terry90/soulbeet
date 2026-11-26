@@ -684,6 +684,8 @@ impl Runner<'_> {
             .await
             .map_err(|e| backend_unavailable_at(Stage::Enqueue, &e))?;
         let target = prepare_target(&self.job.folder).await?;
+        let duplicates = DuplicateRule::for_job(BatchOrigin::Mcp, Some(self.options))
+            .for_delivery(shared::backends::delivery(&routed));
         let fresh = NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
             label: manual_batch_label(&picked),
@@ -693,7 +695,7 @@ impl Runner<'_> {
                 JobKind::Track => ImportMode::Singleton,
                 JobKind::Album => ImportMode::Album,
             },
-            duplicates: DuplicateRule::for_job(BatchOrigin::Mcp, Some(self.options)),
+            duplicates,
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),

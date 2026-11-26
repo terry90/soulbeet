@@ -1,5 +1,5 @@
 # E2E stack: the production soulbeet image wired to a fake slskd, a fake
-# MusicBrainz, a fake archive.org and a real Navidrome. Downloads and the music library are
+# MusicBrainz, a fake archive.org, fake yt-dlp and ytmusicapi packages and a real Navidrome. Downloads and the music library are
 # bind-mounted so the specs can assert on delivered and imported files.
 #
 # Build the app image first (from the repo root):
@@ -35,6 +35,12 @@ services:
       # The beets library databases, which the specs read on the host.
       - ./.runtime/data/beets-libraries:/data/beets-libraries
       - ./.fixtures/beets-e2e.yaml:/app/beets-e2e.yaml:ro
+      # Where the :full image has the YouTube Music helper's packages: fakes that answer from
+      # the catalogue fixtures/generate.ts writes beside them, and stand-ins for deno and
+      # ffmpeg, which the light image lacks.
+      - ./.fixtures/ytdlp-site-packages:/opt/ytdlp/lib/python3.11/site-packages:ro
+      - ./fixtures/ytdlp-bin/deno:/opt/ytdlp/bin/deno:ro
+      - ./fixtures/ytdlp-bin/ffmpeg:/usr/local/bin/ffmpeg:ro
     depends_on:
       - stubs
       - navidrome

@@ -1,0 +1,754 @@
+[
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "luther",
+  "album": {
+   "name": "GNX",
+   "id": "MPREb_XGvjZBLVuzr"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "XVveECQmiAk",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:58",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   },
+   {
+    "name": "SZA",
+    "id": "UCeKDV9JgivrXehVluw5bKFA"
+   }
+  ],
+  "duration_seconds": 178,
+  "views": "581M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "All The Stars (From \"Black Panther: The Album\")",
+  "album": {
+   "name": "Black Panther The Album Music From And Inspired By",
+   "id": "MPREb_kvF2OjEx8UG"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "vdXsLt0o_9g",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "3:53",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   },
+   {
+    "name": "SZA",
+    "id": "UCeKDV9JgivrXehVluw5bKFA"
+   }
+  ],
+  "duration_seconds": 233,
+  "views": "1.3B",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/7WL2nSAzkdfNf9o9MJzGv8zXYqT46XSEnhHWAPr7UPMKT3INypOyAT-m2fo0qlTBRG2C47BBZz5oAqHvNQ=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/7WL2nSAzkdfNf9o9MJzGv8zXYqT46XSEnhHWAPr7UPMKT3INypOyAT-m2fo0qlTBRG2C47BBZz5oAqHvNQ=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "LESSGUI",
+  "album": {
+   "name": "LESSGUI",
+   "id": "MPREb_QFuCBr1weou"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "IP2dIU490kM",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:34",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther",
+    "id": "UCHhZ5Qq1scvCQAqIU1-MQkg"
+   }
+  ],
+  "duration_seconds": 154,
+  "views": "2.5M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/zMmMZ31FkMCGPWkqgMQ49l9yRDP82idao4IlmbVKJBD9eWDbnSK_aYznu47pNd9M6QeDqi6ZPL_S8n4=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/zMmMZ31FkMCGPWkqgMQ49l9yRDP82idao4IlmbVKJBD9eWDbnSK_aYznu47pNd9M6QeDqi6ZPL_S8n4=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Not Like Us",
+  "album": {
+   "name": "Not Like Us",
+   "id": "MPREb_KTxpHsPdd8z"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "phLb_SoPBlA",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:35",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 275,
+  "views": "1.3B",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/8qk3C_zpd2FXHVN8BpMBFL6h9J5BlKlbcKOlvDMvIgBWBsAblDoTjU98RGbFH9DxtnN1X5zRzc9sSvWr=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/8qk3C_zpd2FXHVN8BpMBFL6h9J5BlKlbcKOlvDMvIgBWBsAblDoTjU98RGbFH9DxtnN1X5zRzc9sSvWr=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Swimming Pools (Drank)",
+  "album": {
+   "name": "Swimming Pools (Drank)",
+   "id": "MPREb_BFhyWYWoup5"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "T_OWvLDIyno",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:08",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 248,
+  "views": "786M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/huhwBm9DlWWpNM0UV0qyRFvNnrCn2qW1Mhp-Etc6PJ9t3W7SRN5FzRNqxKtq17Z577Do3GdYZbUBFtQ=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/huhwBm9DlWWpNM0UV0qyRFvNnrCn2qW1Mhp-Etc6PJ9t3W7SRN5FzRNqxKtq17Z577Do3GdYZbUBFtQ=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "reincarnated",
+  "album": {
+   "name": "GNX",
+   "id": "MPREb_wCND3crJyDP"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "rGqcIf-RFt4",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:36",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 276,
+  "views": "48M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "What The World Needs Now",
+  "album": {
+   "name": "Songs",
+   "id": "MPREb_AbOxw04J522"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "F738WmKey_A",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:19",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther Vandross",
+    "id": "UCtvW9Gxu_fu4nFGSjLmVjMw"
+   }
+  ],
+  "duration_seconds": 319,
+  "views": "993K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/jRxFoxmN0LvMtI3pWzKANc7qtHsQTqXtANuA4iCLYSWE936UkvOSLRAuJVEC7IP_vfN-A3KzMXf6zR-z=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/jRxFoxmN0LvMtI3pWzKANc7qtHsQTqXtANuA4iCLYSWE936UkvOSLRAuJVEC7IP_vfN-A3KzMXf6zR-z=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "boredom anthem (hein ?)",
+  "album": {
+   "name": "shelf",
+   "id": "MPREb_T8LBeVuxDg3"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "KOvb4upvDNo",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:52",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther",
+    "id": "UCHhZ5Qq1scvCQAqIU1-MQkg"
+   }
+  ],
+  "duration_seconds": 172,
+  "views": "92K",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "The Closer I Get to You (feat. Beyoncé Knowles)",
+  "album": {
+   "name": "Dance With My Father",
+   "id": "MPREb_mRpbv22wKaV"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "hvaVfqTIxe4",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "6:26",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther Vandross",
+    "id": "UCtvW9Gxu_fu4nFGSjLmVjMw"
+   }
+  ],
+  "duration_seconds": 386,
+  "views": "43M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/XNdx2b1KMYu-goXH__r69Bg06BMRXm_cYzJS8klcO9UwDMeUTtRn24ILWXXbunb5UT7mQYZfUHvjdv8=w60-h60-s-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/XNdx2b1KMYu-goXH__r69Bg06BMRXm_cYzJS8klcO9UwDMeUTtRn24ILWXXbunb5UT7mQYZfUHvjdv8=w120-h120-s-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "dog",
+  "album": {
+   "name": "shelf",
+   "id": "MPREb_T8LBeVuxDg3"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "GnTbLMQgTHs",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:19",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther",
+    "id": "UCHhZ5Qq1scvCQAqIU1-MQkg"
+   }
+  ],
+  "duration_seconds": 139,
+  "views": "182K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Luther (Slowed)",
+  "album": {
+   "name": "Luther",
+   "id": "MPREb_QMPVx7vv17y"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "SLwdL760RGM",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:18",
+  "year": null,
+  "artists": [
+   {
+    "name": "CJ MAR",
+    "id": "UCdFCADI5Mk9gyTf9cLM7THw"
+   }
+  ],
+  "duration_seconds": 138,
+  "views": "511",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/Ti2ova50VX-kdfnPeUDNqQK-aObdJ5N5gYmbRANtP5HdU6JkbnMGkXnu38_BiFYw0DEUoqd9jgCWsN_nng=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/Ti2ova50VX-kdfnPeUDNqQK-aObdJ5N5gYmbRANtP5HdU6JkbnMGkXnu38_BiFYw0DEUoqd9jgCWsN_nng=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "ALED",
+  "album": {
+   "name": "EXIT",
+   "id": "MPREb_QcurNydrIyG"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "Bn_LZWfIz3Q",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "3:21",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther",
+    "id": "UCHhZ5Qq1scvCQAqIU1-MQkg"
+   }
+  ],
+  "duration_seconds": 201,
+  "views": "2.1M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/jZg32-2EYS0DXM_lezskkRwIyJV6M2QiaegZ12-UyUwFHkPiXRxCgY9l6d8xoK_CQyFhqlbE07_tDJ6jpQ=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/jZg32-2EYS0DXM_lezskkRwIyJV6M2QiaegZ12-UyUwFHkPiXRxCgY9l6d8xoK_CQyFhqlbE07_tDJ6jpQ=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Luther",
+  "album": {
+   "name": "OMA Kendrick Lamar Instrumentals",
+   "id": "MPREb_i8lyuFVxNY6"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "V6TQsurqoYI",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:15",
+  "year": null,
+  "artists": [
+   {
+    "name": "OMA",
+    "id": "UC87upiqtAWVsV3GMfWpfcnQ"
+   }
+  ],
+  "duration_seconds": 135,
+  "views": "5.3K",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/mB81tZ7mRC7XvztRfha8VQxd3hm73bTzv7mLys87wGZnqUtJSbY37VwCzmqzjB9rN65BSyFOj1QgBkfWZg=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/mB81tZ7mRC7XvztRfha8VQxd3hm73bTzv7mLys87wGZnqUtJSbY37VwCzmqzjB9rN65BSyFOj1QgBkfWZg=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "heart pt. 6",
+  "album": {
+   "name": "GNX",
+   "id": "MPREb_wCND3crJyDP"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "HFwqHVxBXao",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:53",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 293,
+  "views": "39M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/nUcE0cU6y5BsIa_fpzqSMSc4qCpHoLxeWb6Co2xfMQOLO3ZTctzNopp8d35VyCPSWb0Z1I_1bxTTyyo=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "I Know (feat. Stevie Wonder)",
+  "album": {
+   "name": "I Know",
+   "id": "MPREb_zQK2FdZnXJr"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "KttpCo1EXLs",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "5:23",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther Vandross",
+    "id": "UCtvW9Gxu_fu4nFGSjLmVjMw"
+   }
+  ],
+  "duration_seconds": 323,
+  "views": "13M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/9AgGDvq0IlzbYFfiqF0torlmCcY0sNhwuWmfkyWSLtqIM0HBVbMIbzdrqX73cXw_jrZPtBNJ3FzD1q3GoA=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/9AgGDvq0IlzbYFfiqF0torlmCcY0sNhwuWmfkyWSLtqIM0HBVbMIbzdrqX73cXw_jrZPtBNJ3FzD1q3GoA=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "LOVE. (feat. Zacari)",
+  "album": {
+   "name": "DAMN. COLLECTORS EDITION.",
+   "id": "MPREb_FQT8RhNisCl"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "XKkV2j9DbIQ",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "3:34",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 214,
+  "views": "517M",
+  "isExplicit": false,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/B1bVbj-AbBIJxL7RHJ2B7F9fLCv2reqD-9hPQAQf77cbWpf_a0KQM-d2zHoKCXBbjtKYBlc3-18zK4I=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/B1bVbj-AbBIJxL7RHJ2B7F9fLCv2reqD-9hPQAQf77cbWpf_a0KQM-d2zHoKCXBbjtKYBlc3-18zK4I=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Haemolacria",
+  "album": {
+   "name": "shelf",
+   "id": "MPREb_T8LBeVuxDg3"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "bG8Ed3w2Xx0",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "2:18",
+  "year": null,
+  "artists": [
+   {
+    "name": "Luther",
+    "id": "UCHhZ5Qq1scvCQAqIU1-MQkg"
+   }
+  ],
+  "duration_seconds": 138,
+  "views": "79K",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/1KEOolFaH4zQ-1-sv6QA8m3MfD8MJzybWtHVB9BQe81ug-5vssyV7ULnHhqDvrojBsUfYOa69aUXnE1H=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "Doves In The Wind (feat. Kendrick Lamar)",
+  "album": {
+   "name": "Ctrl",
+   "id": "MPREb_hij2TtkPGUq"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "VpymZzZ8Opg",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:27",
+  "year": null,
+  "artists": [
+   {
+    "name": "SZA",
+    "id": "UCeKDV9JgivrXehVluw5bKFA"
+   }
+  ],
+  "duration_seconds": 267,
+  "views": "42M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/s7E4gqyaVGBCYoyJoF_pHm4LSbCkjd97DWlvOiZTqvECnaCyvi3-rArFcEdjvLriTBlh07Diu_bjLy4=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/s7E4gqyaVGBCYoyJoF_pHm4LSbCkjd97DWlvOiZTqvECnaCyvi3-rArFcEdjvLriTBlh07Diu_bjLy4=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "All The Stars (From \"Black Panther: The Album\")",
+  "album": {
+   "name": "All the Stars",
+   "id": "MPREb_GS8Kl4QRzI2"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "9jdLnFYQh4s",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "3:56",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   },
+   {
+    "name": "SZA",
+    "id": "UCeKDV9JgivrXehVluw5bKFA"
+   }
+  ],
+  "duration_seconds": 236,
+  "views": "1.3B",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/vJiUJUmTcE5r7l4kKyDzW8ma9PcSNuJzkY3CDeiXZfFBGq2ka5DYH4_l9gKB0yxgROoAE0W6c7GoxYg=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/vJiUJUmTcE5r7l4kKyDzW8ma9PcSNuJzkY3CDeiXZfFBGq2ka5DYH4_l9gKB0yxgROoAE0W6c7GoxYg=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ },
+ {
+  "category": "Songs",
+  "resultType": "song",
+  "title": "HiiiPower",
+  "album": {
+   "name": "Section.80",
+   "id": "MPREb_eN4Fsj0UXGZ"
+  },
+  "inLibrary": false,
+  "pinnedToListenAgain": false,
+  "videoId": "WL9ahHAlPKU",
+  "videoType": "MUSIC_VIDEO_TYPE_ATV",
+  "isAvailable": true,
+  "duration": "4:40",
+  "year": null,
+  "artists": [
+   {
+    "name": "Kendrick Lamar",
+    "id": "UCprAFmT0C6O4X0ToEXpeFTQ"
+   }
+  ],
+  "duration_seconds": 280,
+  "views": "39M",
+  "isExplicit": true,
+  "thumbnails": [
+   {
+    "url": "https://yt3.googleusercontent.com/-8bbb81AmJwKBuehhGiLQF8_g8T09K6cwJBm0iakfR3CAlgQnFZ5RC75w5vSXnz0a3G9zMInPIy-3jga=w60-h60-l90-rj",
+    "width": 60,
+    "height": 60
+   },
+   {
+    "url": "https://yt3.googleusercontent.com/-8bbb81AmJwKBuehhGiLQF8_g8T09K6cwJBm0iakfR3CAlgQnFZ5RC75w5vSXnz0a3G9zMInPIy-3jga=w120-h120-l90-rj",
+    "width": 120,
+    "height": 120
+   }
+  ]
+ }
+]

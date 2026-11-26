@@ -15,12 +15,14 @@ pub mod musicbrainz;
 pub mod navidrome;
 pub mod partial;
 pub mod polite;
+pub mod process;
 pub mod slskd;
 pub mod tags;
 #[cfg(test)]
 pub(crate) mod test_http;
 pub mod traits;
 pub mod transfer_book;
+pub mod ytdlp;
 
 pub use backend_error::{BackendError, BackendFault, BackendResult, PeerAsk};
 pub use beets::{duplicate_note, DuplicateNote};

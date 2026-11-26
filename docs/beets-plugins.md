@@ -12,7 +12,9 @@ Soulbeet ships three image tiers. They are strictly additive: `full` is a supers
 | --- | --- | --- | --- |
 | light | `musicbrainz`, `mbtwopass` | baseline | You want the smallest image. Tagging via MusicBrainz only. |
 | medium | light + `chroma` | +~40-60 MB | You want fingerprint matching (AcoustID) to catch files MusicBrainz alone can't match by length. |
-| full | medium + `fetchart`, `embedart`, `lyrics`, `lastgenre`, `scrub`, `replaygain`[^rg], plus several zero-cost convenience plugins | +~150-200 MB on top of medium | You want a complete tagging pipeline: cover art, lyrics, genres, normalization. |
+| full | medium + `fetchart`, `embedart`, `lyrics`, `lastgenre`, `scrub`, `replaygain`[^rg], plus several zero-cost convenience plugins, and the tools of the YouTube Music download source[^yt] | +~150-200 MB on top of medium, plus ~120 MB (~47 MB compressed) for the YouTube Music tools | You want a complete tagging pipeline: cover art, lyrics, genres, normalization. |
+
+[^yt]: yt-dlp, ytmusicapi and the deno JS runtime, in `/opt/ytdlp`, apart from beets. They do nothing until an admin turns YouTube Music on; see [ytdlp.md](ytdlp.md). The light and medium images do not have them.
 
 [^rg]: The full tier wires `replaygain: { backend: ffmpeg, overwrite: yes }` in its baked `beets_config.yaml`. Override with care. See "Per-plugin configuration" below.
 
@@ -76,6 +78,8 @@ Active by default in `:full`:
 | `info` | Dumps tag values |
 | `smartplaylist` | Auto-generates m3u files |
 | `inline`, `types`, `ftintitle` | Path/format helpers |
+
+Not a beets plugin, also in `:full` only: the YouTube Music download source's yt-dlp, ytmusicapi and deno (`/opt/ytdlp`), which `build/requirements-ytdlp.txt` pins by hash. The tier files set `YTDLP=true` for full only.
 
 Available in `:full` but **not** enabled by default (need user config to be useful):
 

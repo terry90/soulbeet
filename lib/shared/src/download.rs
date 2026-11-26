@@ -732,7 +732,7 @@ pub enum AutoDownloadEvent {
     },
     /// Download queued with the picked source
     Downloading { batch_id: String },
-    /// Best score below threshold, client should show manual source picker
+    /// No source was picked on its own, client should show manual source picker
     FallbackToManual {
         batch_id: String,
         /// The stored search `results` came from, which a pick names.
@@ -741,15 +741,49 @@ pub enum AutoDownloadEvent {
         results: Vec<DownloadableGroup>,
         best_score: f64,
         threshold: f64,
+        #[serde(default)]
+        reason: ManualReason,
     },
     /// Auto-download pipeline failed
     Failed { batch_id: String, failure: Failure },
+}
+
+/// Why an auto download left the pick to the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualReason {
+    /// No source scores at the pick floor.
+    #[default]
+    NoConfidentMatch,
+    /// Only groups of the lossy-only `backend` score at the floor, and the user is asked before
+    /// lossy files are taken.
+    LossyOnly { backend: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::failure::{FailureCode, RetryAdvice, Stage};
+
+    #[test]
+    fn a_fallback_says_why_and_one_sent_before_it_did_reads_as_no_confident_match() {
+        let old = r#"{"FallbackToManual": {"batch_id": "b1", "results": [], "best_score": 0.4, "threshold": 0.7}}"#;
+        let AutoDownloadEvent::FallbackToManual { reason, .. } = serde_json::from_str(old).unwrap()
+        else {
+            panic!("not a fallback");
+        };
+        assert_eq!(reason, ManualReason::NoConfidentMatch);
+        assert_eq!(
+            serde_json::to_value(ManualReason::NoConfidentMatch).unwrap(),
+            serde_json::json!("no_confident_match")
+        );
+        let lossy = ManualReason::LossyOnly {
+            backend: "ytdlp".into(),
+        };
+        let wire = serde_json::json!({"lossy_only": {"backend": "ytdlp"}});
+        assert_eq!(serde_json::to_value(&lossy).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<ManualReason>(wire).unwrap(), lossy);
+    }
 
     /// Stats and file facts stored before a field was added still read.
     #[test]

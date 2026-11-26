@@ -9,13 +9,14 @@ use crate::ledger::store::{self, StoredSearch};
 use crate::ledger::{
     Ledger, NewSearch, SearchOutcome, SourceFilters, StoredSpec, LEDGER, SEARCH_KEPT_SECS,
 };
+use crate::models::user_settings::LossyFallback;
 use crate::services::{
     download_backend, enabled_download_backends, BackendLookupError, Backends, Registry,
     DEFAULT_DOWNLOAD_BACKEND,
 };
 use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
-use shared::backends::BackendMeta;
+use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
     DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchResult, SearchSpec,
     SearchState, SearchStats,
@@ -173,7 +174,8 @@ async fn start_backend_search(
 }
 
 /// Polls the backend's search `search_id` until it ends: the groups it found
-/// and how it ended.
+/// and how it ended. A search still running at SEARCH_TIMEOUT is stopped at
+/// the backend, so it spends no more requests on results nobody reads.
 async fn poll_backend_search(
     id: &str,
     backend: &Arc<dyn DownloadBackend>,
@@ -188,6 +190,7 @@ async fn poll_backend_search(
     loop {
         if tokio::time::Instant::now() >= deadline {
             warn!("Backend {} search timed out", id);
+            stop_at_backend(backend, search_id).await;
             return (latest_groups, SearchStop::TimedOut);
         }
         tokio::time::sleep(SEARCH_POLL_INTERVAL).await;
@@ -276,72 +279,134 @@ fn no_backends(e: &BackendLookupError) -> Failure {
     e.failure(Stage::SourceSearch, "No download backends available")
 }
 
-/// The backends to search, the default one first when it is available, or
-/// the default one's lookup error as `no_backends` when none is.
-pub async fn usable_backends() -> Result<(Searched, Vec<Searched>), Failure> {
-    usable_from(&Registry, &enabled_download_backends().await).await
+/// The backends an auto-download searches, by tier.
+pub struct Usable {
+    /// The backends that deliver files as found, the default one first: searched first.
+    pub primary: Vec<Searched>,
+    /// The backends whose files are lossy only: searched only when no primary group would be
+    /// picked. Empty for a user who never takes lossy files.
+    pub last_resort: Vec<Searched>,
+    /// What the user takes from the last resort.
+    pub lossy: LossyFallback,
 }
 
-/// `usable_backends` of the backends `enabled` lists, looked up in `backends`. One turned off
-/// since the list was read is left out quietly: being off is no fault.
+/// The backends to search for a user who takes lossy files as `lossy` says, the default one
+/// first when it is available, or the default one's lookup error as `no_backends` when none is.
+pub async fn usable_backends(lossy: LossyFallback) -> Result<Usable, Failure> {
+    usable_from(&Registry, &enabled_download_backends().await, lossy).await
+}
+
+/// `usable_backends` of the backends `enabled` lists, looked up in `backends`, each in the tier
+/// its delivery puts it in. One turned off since the list was read is left out quietly: being
+/// off is no fault. A lossy-only backend is not looked up for a user who never takes its files.
 pub(crate) async fn usable_from(
     backends: &dyn Backends,
     enabled: &[&BackendMeta],
-) -> Result<(Searched, Vec<Searched>), Failure> {
-    let mut others = Vec::new();
+    lossy: LossyFallback,
+) -> Result<Usable, Failure> {
+    let mut usable = Usable {
+        primary: Vec::new(),
+        last_resort: Vec::new(),
+        lossy,
+    };
+    let default = backends.get(DEFAULT_DOWNLOAD_BACKEND).await;
+    let default_failed = match default {
+        Ok(b) => {
+            if let Some(tier) = usable.tier(delivery(DEFAULT_DOWNLOAD_BACKEND)) {
+                tier.push((DEFAULT_DOWNLOAD_BACKEND.to_string(), b));
+            }
+            None
+        }
+        Err(e) => {
+            warn!(
+                "Backend {} unavailable for auto-download: {}",
+                DEFAULT_DOWNLOAD_BACKEND, e
+            );
+            Some(e)
+        }
+    };
     for meta in enabled.iter().filter(|m| m.id != DEFAULT_DOWNLOAD_BACKEND) {
+        if usable.tier(meta.delivery).is_none() {
+            continue;
+        }
         match backends.get(meta.id).await {
-            Ok(b) => others.push((meta.id.to_string(), b)),
+            Ok(b) => {
+                if let Some(tier) = usable.tier(meta.delivery) {
+                    tier.push((meta.id.to_string(), b));
+                }
+            }
             Err(e @ BackendLookupError::Disabled(_)) => {
                 debug!("Backend {} skipped: {}", meta.id, e)
             }
             Err(e) => warn!("Backend {} unavailable for auto-download: {}", meta.id, e),
         }
     }
-    match backends.get(DEFAULT_DOWNLOAD_BACKEND).await {
-        Ok(b) => Ok(((DEFAULT_DOWNLOAD_BACKEND.to_string(), b), others)),
-        Err(e) => {
-            warn!(
-                "Backend {} unavailable for auto-download: {}",
-                DEFAULT_DOWNLOAD_BACKEND, e
-            );
-            let mut others = others.into_iter();
-            match others.next() {
-                Some(first) => Ok((first, others.collect())),
-                None => Err(no_backends(&e)),
-            }
+    match default_failed {
+        Some(e) if usable.primary.is_empty() && usable.last_resort.is_empty() => {
+            Err(no_backends(&e))
+        }
+        _ => Ok(usable),
+    }
+}
+
+impl Usable {
+    /// The tier of backends that deliver `delivery`; None for lossy-only backends when the user
+    /// never takes their files.
+    fn tier(&mut self, delivery: Delivery) -> Option<&mut Vec<Searched>> {
+        match delivery {
+            Delivery::AsFound => Some(&mut self.primary),
+            Delivery::LossyOnly if self.lossy == LossyFallback::Never => None,
+            Delivery::LossyOnly => Some(&mut self.last_resort),
         }
     }
 }
 
-/// Searches every backend at once: all groups found, best score first, or
-/// the failure of the stops when none was found.
-pub async fn search_ranked(
-    first: &Searched,
-    rest: &[Searched],
+/// What a search of some backends found, and how each backend's search ended.
+#[derive(Default)]
+pub(crate) struct Found {
+    /// Each tier best first, a later tier after every group of an earlier one.
+    pub groups: Vec<DownloadableGroup>,
+    stops: Vec<SearchStop>,
+}
+
+impl Found {
+    /// `later`'s groups after every one found so far.
+    pub(crate) fn then(mut self, later: Found) -> Found {
+        self.groups.extend(later.groups);
+        self.stops.extend(later.stops);
+        self
+    }
+
+    /// Why nothing was found: the failure the stops give, the first backend's first.
+    pub(crate) fn failure(&self) -> Failure {
+        match self.stops.split_first() {
+            Some((first, rest)) => no_results_failure(first, rest),
+            None => Failure::new(
+                FailureCode::SearchNoResults,
+                Stage::SourceSearch,
+                RetryAdvice::OtherQuery,
+                "No results found",
+            ),
+        }
+    }
+}
+
+/// Searches every backend of `tier` at once: all groups found, best score first.
+pub(crate) async fn search_tier(
+    tier: &[Searched],
     album: Option<&Album>,
     tracks: &[Track],
-) -> Result<Vec<DownloadableGroup>, Failure> {
+) -> Found {
     let spec = SearchSpec::of(album.cloned(), tracks.to_vec());
-    let ((first_groups, first_stop), results) = futures::future::join(
-        search_backend(&first.0, &first.1, &spec),
-        futures::future::join_all(
-            rest.iter()
-                .map(|(id, backend)| search_backend(id, backend, &spec)),
-        ),
+    let results = futures::future::join_all(
+        tier.iter()
+            .map(|(id, backend)| search_backend(id, backend, &spec)),
     )
     .await;
-
     let (groups, stops): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-    let mut all_groups: Vec<DownloadableGroup> = first_groups
-        .into_iter()
-        .chain(groups.into_iter().flatten())
-        .collect();
-    if all_groups.is_empty() {
-        return Err(no_results_failure(&first_stop, &stops));
-    }
-    best_first(&mut all_groups);
-    Ok(all_groups)
+    let mut groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
+    best_first(&mut groups);
+    Found { groups, stops }
 }
 
 /// Sorts `groups` by score, best first, keeping the order of equal ones.
@@ -1067,11 +1132,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_search_still_running_at_the_deadline_is_a_timeout() {
+    async fn a_search_still_running_at_the_deadline_is_a_timeout_and_stopped() {
         let stub = StubBackend::new(vec![]);
 
-        let (_, f) = searched(stub).await;
+        let (_, f) = searched(stub.clone()).await;
 
+        assert_eq!(stub.stopped_searches(), ["search"]);
         assert_eq!(
             advice(&f),
             (
@@ -1335,7 +1401,7 @@ mod tests {
 
     // Paused: every poll waits SEARCH_POLL_INTERVAL first.
     #[tokio::test(start_paused = true)]
-    async fn search_ranked_puts_the_best_group_of_every_backend_first() {
+    async fn a_tier_search_puts_the_best_group_of_every_backend_first() {
         // Each backend stamps its own id on the files it finds.
         let found = |backend: &str, peer: &str, score| {
             let items = vec![item_on(backend, peer, "Wake Up", "a.flac")];
@@ -1352,9 +1418,11 @@ mod tests {
             SearchState::Completed,
             found("b", "peer_b", 0.9),
         ))]);
-        let first: Searched = ("a".into(), a as Arc<dyn DownloadBackend>);
-        let rest: Vec<Searched> = vec![("b".into(), b as Arc<dyn DownloadBackend>)];
-        let groups = search_ranked(&first, &rest, None, &[]).await.unwrap();
+        let tier: Vec<Searched> = vec![
+            ("a".into(), a as Arc<dyn DownloadBackend>),
+            ("b".into(), b as Arc<dyn DownloadBackend>),
+        ];
+        let groups = search_tier(&tier, None, &[]).await.groups;
         let ranked: Vec<(&str, f64, &str)> = groups
             .iter()
             .map(|g| (g.source.as_str(), g.score, g.items[0].backend.as_str()))
@@ -1363,15 +1431,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn search_ranked_with_nothing_found_fails_as_no_results() {
+    async fn a_search_with_nothing_found_fails_as_no_results() {
         let a = StubBackend::new(vec![]);
         a.script_polls(vec![Ok(search_result(
             "search",
             SearchState::Completed,
             Vec::new(),
         ))]);
-        let first: Searched = ("a".into(), a as Arc<dyn DownloadBackend>);
-        let f = search_ranked(&first, &[], None, &[]).await.unwrap_err();
+        let tier: Vec<Searched> = vec![("a".into(), a as Arc<dyn DownloadBackend>)];
+        let found = search_tier(&tier, None, &[]).await;
+        assert!(found.groups.is_empty());
+        let f = found.failure();
         assert_eq!(
             (f.code, f.message.as_str()),
             (FailureCode::SearchNoResults, "No results found")
@@ -2093,18 +2163,29 @@ mod tests {
             "broken",
             BackendLookupError::Settings("database is locked".into()),
         );
+        backends.fail(
+            "ytdlp",
+            BackendLookupError::Disabled("YouTube Music".into()),
+        );
         let log = crate::test_log::LogCapture::start();
 
-        let (first, others) = usable_from(&backends, &[&SLSKD, &ARCHIVE, &BROKEN])
-            .await
-            .unwrap();
+        let usable = usable_from(
+            &backends,
+            &[&SLSKD, &ARCHIVE, &BROKEN, &shared::backends::YTDLP],
+            LossyFallback::Ask,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(first.0, DEFAULT_DOWNLOAD_BACKEND);
-        assert_eq!(first.1.id(), slskd.id());
-        assert!(others.is_empty());
+        assert_eq!(usable.primary.len(), 1);
+        assert_eq!(usable.primary[0].0, DEFAULT_DOWNLOAD_BACKEND);
+        assert_eq!(usable.primary[0].1.id(), slskd.id());
+        assert!(usable.last_resort.is_empty());
         let lines = log.lines();
         assert!(
-            !lines.iter().any(|l| l.contains("archive unavailable")),
+            !lines
+                .iter()
+                .any(|l| l.contains("archive unavailable") || l.contains("ytdlp unavailable")),
             "{lines:?}"
         );
         assert!(
@@ -2113,6 +2194,45 @@ mod tests {
                 .any(|l| l == "Backend broken unavailable for auto-download: database is locked"),
             "{lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_lossy_only_backend_is_a_last_resort_and_left_out_for_a_user_who_never_takes_it() {
+        use crate::server_fns::download::test_support::StubBackends;
+        use shared::backends::{SLSKD, YTDLP};
+        let (slskd, youtube) = (StubBackend::new(vec![]), StubBackend::new(vec![]));
+        let backends = StubBackends::default()
+            .with(DEFAULT_DOWNLOAD_BACKEND, slskd)
+            .with("ytdlp", youtube.clone());
+        let usable = usable_from(&backends, &[&SLSKD, &YTDLP], LossyFallback::Ask)
+            .await
+            .unwrap();
+        assert_eq!(usable.primary.len(), 1);
+        let last: Vec<&str> = usable
+            .last_resort
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(last, ["ytdlp"]);
+
+        let never = StubBackends::default().with("ytdlp", youtube);
+        never.fail(
+            DEFAULT_DOWNLOAD_BACKEND,
+            BackendLookupError::Settings("database is locked".into()),
+        );
+        // Without slskd and without lossy files there is nothing to search.
+        let none = usable_from(&never, &[&SLSKD, &YTDLP], LossyFallback::Never).await;
+        assert_eq!(
+            none.err().map(|f| f.message),
+            Some("No download backends available".to_string())
+        );
+        assert_eq!(never.asked(), [DEFAULT_DOWNLOAD_BACKEND]);
+        // With them, YouTube Music alone is searched.
+        let alone = usable_from(&never, &[&SLSKD, &YTDLP], LossyFallback::Auto)
+            .await
+            .unwrap();
+        assert!(alone.primary.is_empty());
+        assert_eq!(alone.last_resort.len(), 1);
     }
 
     #[test]

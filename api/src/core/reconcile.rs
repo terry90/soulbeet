@@ -354,7 +354,11 @@ impl Resume for Live {
     }
 
     async fn search(&self, ctx: UserCtx, folder: Folder, query: DownloadQuery, run: AutoRun) {
-        match sources::usable_backends().await {
+        let usable = async {
+            let lossy = crate::core::settings::get(&ctx).await?.lossy_fallback;
+            sources::usable_backends(lossy).await
+        };
+        match usable.await {
             Ok(backends) => {
                 tokio::spawn(run_search(
                     LEDGER.clone(),
@@ -472,8 +476,8 @@ impl Downloads {
 }
 
 /// The monitor batch `batch_id` of `job`'s user on `backend` among
-/// `downloads`, added with `label` when it is not there yet: an MCP job's
-/// skips what the library has.
+/// `downloads`, added with `label` when it is not there yet: an MCP job's,
+/// and a lossy-only backend's, skips what the library has.
 fn batch_of<'a>(
     downloads: &'a mut Vec<Downloads>,
     job: &UnfinishedJob,
@@ -502,8 +506,10 @@ fn batch_of<'a>(
             downloads.push(Downloads {
                 ctx: job.ctx.clone(),
                 queued: Vec::new(),
-                batch: batch
-                    .with_duplicates(DuplicateRule::for_job(job.origin, job.options.as_ref())),
+                batch: batch.with_duplicates(
+                    DuplicateRule::for_job(job.origin, job.options.as_ref())
+                        .for_delivery(shared::backends::delivery(backend)),
+                ),
                 slots: Vec::new(),
                 pools: HashMap::new(),
             });
@@ -1145,13 +1151,15 @@ async fn enqueue_anew(resume: &dyn Resume, backend: Arc<dyn DownloadBackend>, qu
         .iter()
         .map(|(_, item)| item.clone())
         .collect();
+    let duplicates = DuplicateRule::for_job(job.origin, job.options.as_ref())
+        .for_delivery(shared::backends::delivery(&id));
     let fresh = NewBatch {
         batch_id: uuid::Uuid::new_v4().to_string(),
         label: manual_batch_label(&picked),
         backend: id,
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
-        duplicates: DuplicateRule::for_job(job.origin, job.options.as_ref()),
+        duplicates,
     };
     resume
         .enqueue(&job.ctx, backend, fresh.into(), acquisition)

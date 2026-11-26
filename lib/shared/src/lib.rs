@@ -10,3 +10,4 @@ pub mod oauth;
 pub mod recommendation;
 pub mod slskd;
 pub mod system;
+pub mod ytdlp;

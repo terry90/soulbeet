@@ -1,6 +1,6 @@
 use super::SourceChoices;
 use dioxus::prelude::*;
-use shared::download::DownloadableGroup;
+use shared::download::{DownloadableGroup, ManualReason};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct FallbackToastData {
@@ -9,6 +9,19 @@ pub struct FallbackToastData {
     /// The stored search `results` came from.
     pub search_id: String,
     pub results: Vec<DownloadableGroup>,
+    /// Why no source was picked on its own.
+    pub reason: ManualReason,
+}
+
+/// What the toast says of `track_name` for `reason`.
+fn fallback_message(track_name: &str, reason: &ManualReason) -> String {
+    match reason {
+        ManualReason::NoConfidentMatch => format!("No confident match for {track_name}."),
+        ManualReason::LossyOnly { backend } => format!(
+            "Only {} has {track_name}, and its files are lossy.",
+            shared::backends::name(backend)
+        ),
+    }
 }
 
 #[derive(Props, PartialEq, Clone)]
@@ -27,7 +40,7 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
     let on_dismiss = props.on_dismiss;
     let toast_id = toast.id.clone();
     let toast_id_pick = toast.id.clone();
-    let track_name = toast.track_name.clone();
+    let message = fallback_message(&toast.track_name, &toast.reason);
     let choices = SourceChoices {
         search_id: toast.search_id.clone(),
         groups: toast.results.clone(),
@@ -58,7 +71,7 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
 
             // Line 1: fallback message
             p { class: "text-sm text-gray-300 font-mono pr-6",
-                "No confident match for {track_name}."
+                "{message}"
             }
 
             // Line 2: pick source link
@@ -71,5 +84,55 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
                 "Pick a source manually"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::backends::YTDLP;
+
+    fn render(reason: ManualReason) -> String {
+        let toast = FallbackToastData {
+            id: "b1".into(),
+            track_name: "Morse Bloom".into(),
+            search_id: "s1".into(),
+            results: vec![],
+            reason,
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |toast: FallbackToastData| {
+                rsx! {
+                    FallbackToast { toast, on_pick_source: |_| {}, on_dismiss: |_| {} }
+                }
+            },
+            toast,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_toast_says_no_confident_match_when_nothing_scored_well_enough() {
+        let html = render(ManualReason::NoConfidentMatch);
+        assert!(
+            html.contains(">No confident match for Morse Bloom.</p>"),
+            "{html}"
+        );
+        assert!(html.contains(">Pick a source manually</p>"), "{html}");
+    }
+
+    #[test]
+    fn the_toast_names_the_lossy_backend_when_only_it_has_a_confident_match() {
+        let html = render(ManualReason::LossyOnly {
+            backend: YTDLP.id.into(),
+        });
+        let said = format!(
+            ">Only {} has Morse Bloom, and its files are lossy.</p>",
+            YTDLP.name
+        );
+        assert!(html.contains(&said), "{html}");
+        assert!(!html.contains("No confident match"), "{html}");
+        assert!(html.contains(">Pick a source manually</p>"), "{html}");
     }
 }

@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+"""Stands in for deno in the e2e stack: the helper asks its version; the fake yt-dlp runs none."""
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print("deno 2.9.8 (stable, release, x86_64-unknown-linux-gnu)")
+    sys.exit(0)
+sys.exit(1)

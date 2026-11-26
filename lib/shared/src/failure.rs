@@ -273,6 +273,8 @@ pub enum Service {
     Soulful,
     /// archive.org, the Internet Archive download backend's service.
     InternetArchive,
+    /// YouTube, the YouTube Music download backend's service.
+    Youtube,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -647,6 +649,21 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&f).unwrap()["cause"],
             serde_json::json!({"service": "internet_archive", "status": 200, "raw": "md5 differs"})
+        );
+    }
+
+    #[test]
+    fn youtube_is_written_youtube() {
+        let f = Failure::new(
+            FailureCode::RateLimited,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "YouTube rate-limited this server",
+        )
+        .with_cause(Service::Youtube, None, "try again later");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap()["cause"],
+            serde_json::json!({"service": "youtube", "status": null, "raw": "try again later"})
         );
     }
 

@@ -77,6 +77,28 @@ jobs:
       - name: Test the beets config probe and import driver
         run: python -m pytest -q lib/soulbeet/tests/probe lib/soulbeet/tests/import
 
+  # The YouTube Music helper, on fake yt-dlp and ytmusicapi packages that answer with saved
+  # YouTube Music answers: never the real service.
+  ytdlp-helper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The image interpreter is 3.11, which yt-dlp needs at least.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        run: python -m pip install pytest==8.3.5
+
+      - name: Test the YouTube Music helper
+        run: python -m pytest -q lib/soulbeet/tests/ytdlp
+
   # The oldest beets the import hook check accepts must run the driver.
   driver-floor:
     runs-on: ubuntu-latest

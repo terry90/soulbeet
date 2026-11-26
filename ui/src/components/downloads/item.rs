@@ -480,6 +480,14 @@ mod tests {
     }
 
     #[test]
+    fn a_ytdlp_row_shows_lossy_youtube_music_through_its_import() {
+        for state in [DownloadState::InProgress, DownloadState::Imported] {
+            let html = render(row(state, None).with_backend("ytdlp"));
+            assert!(html.contains("LOSSY · YOUTUBE MUSIC"), "{html}");
+        }
+    }
+
+    #[test]
     fn a_kept_row_offers_every_import_action() {
         for state in [
             DownloadState::ImportSkipped,

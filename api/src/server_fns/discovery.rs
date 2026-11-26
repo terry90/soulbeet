@@ -656,23 +656,21 @@ async fn search_candidate(
         mbid: None,
         release_mbid: None,
     }];
-    match crate::core::sources::search_ranked(searched, &[], None, &wanted).await {
-        Ok(groups) => {
-            clear_in(db, user_id, artist, track).await?;
-            Ok(CandidateSearch::Found(
-                groups.into_iter().flat_map(|g| g.items).collect(),
-            ))
-        }
-        Err(failure)
-            if matches!(
-                failure.code,
-                FailureCode::SearchNoResults | FailureCode::SearchAllFiltered
-            ) =>
-        {
+    let found =
+        crate::core::sources::search_tier(std::slice::from_ref(searched), None, &wanted).await;
+    if !found.groups.is_empty() {
+        clear_in(db, user_id, artist, track).await?;
+        return Ok(CandidateSearch::Found(
+            found.groups.into_iter().flat_map(|g| g.items).collect(),
+        ));
+    }
+    let failure = found.failure();
+    match failure.code {
+        FailureCode::SearchNoResults | FailureCode::SearchAllFiltered => {
             record_in(db, user_id, artist, track).await?;
             Ok(CandidateSearch::Missed(failure))
         }
-        Err(failure) => Ok(CandidateSearch::Failed(failure)),
+        _ => Ok(CandidateSearch::Failed(failure)),
     }
 }
 
