@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::db::now_unix;
 use crate::error::{CoreError, CoreResult};
@@ -14,7 +16,9 @@ use crate::models::{
     AudioQualityProfile, CachePolicy, CacheStats, NavidromeCredentials, OfflineTrackEntry,
     PinTarget, PlaybackSource,
 };
-use crate::subsonic::SubsonicClient;
+use crate::subsonic::{
+    is_subsonic_error_content_type, parse_subsonic_error_bytes, SubsonicClient,
+};
 
 /// Manages offline audio downloads, profile-aware streaming URLs, explicit pinning,
 /// disk-budget LRU eviction (never evicting pinned tracks), and local cover-art caching.
@@ -73,7 +77,10 @@ impl CacheManager {
         .await?;
 
         if let Some(entry) = cached {
-            if Path::new(&entry.local_path).exists() {
+            if tokio::fs::try_exists(&entry.local_path)
+                .await
+                .unwrap_or(false)
+            {
                 sqlx::query("UPDATE offline_downloads SET last_accessed_at = ? WHERE track_id = ?")
                     .bind(now_unix())
                     .bind(track_id)
@@ -158,6 +165,8 @@ impl CacheManager {
     }
 
     /// Downloads a track according to the active audio quality profile (`FLAC Direct` or `Opus 160`).
+    /// Rejects HTTP 200 Subsonic JSON/XML/plain-text error envelopes and empty payloads so error
+    /// responses are never persisted as audio files.
     pub async fn download_track(
         &self,
         track_id: &str,
@@ -174,13 +183,6 @@ impl CacheManager {
         let subsonic = SubsonicClient::new(self.http.clone(), creds);
         let url = subsonic.download_url(track_id, profile)?;
 
-        tokio::fs::create_dir_all(&self.cache_dir).await?;
-        let safe_id = sanitize_filename(track_id);
-        let final_path = self
-            .cache_dir
-            .join(format!("{safe_id}.{}", profile.file_extension()));
-        let part_path = self.cache_dir.join(format!("{safe_id}.part"));
-
         let resp = self.http.get(&url).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -191,18 +193,50 @@ impl CacheManager {
             });
         }
 
-        let mut file = tokio::fs::File::create(&part_path).await?;
-        let mut stream = resp.bytes_stream();
-        let mut size_bytes: u64 = 0;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            file.write_all(&bytes).await?;
-            size_bytes += bytes.len() as u64;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        if is_subsonic_error_content_type(content_type.as_deref()) {
+            let bytes = resp.bytes().await?;
+            return Err(parse_subsonic_error_bytes(&bytes, content_type.as_deref()));
         }
-        file.flush().await?;
-        drop(file);
 
-        tokio::fs::rename(&part_path, &final_path).await?;
+        tokio::fs::create_dir_all(&self.cache_dir).await?;
+        let safe_id = encode_filename_key(track_id);
+        let safe_ext = sanitize_extension(profile.file_extension());
+        let final_path = self.cache_dir.join(format!("{safe_id}.{safe_ext}"));
+        let part_path = self
+            .cache_dir
+            .join(format!("{safe_id}.{}.part", Uuid::new_v4()));
+
+        let write_result: CoreResult<u64> = async {
+            let mut file = tokio::fs::File::create(&part_path).await?;
+            let mut stream = resp.bytes_stream();
+            let mut size_bytes: u64 = 0;
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk?;
+                file.write_all(&bytes).await?;
+                size_bytes = size_bytes.saturating_add(bytes.len() as u64);
+            }
+            file.flush().await?;
+            drop(file);
+            if size_bytes == 0 {
+                return Err(parse_subsonic_error_bytes(&[], content_type.as_deref()));
+            }
+            tokio::fs::rename(&part_path, &final_path).await?;
+            Ok(size_bytes)
+        }
+        .await;
+
+        let size_bytes = match write_result {
+            Ok(n) => n,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&part_path).await;
+                return Err(err);
+            }
+        };
 
         self.register_cached_file(
             track_id,
@@ -217,7 +251,8 @@ impl CacheManager {
         .await
     }
 
-    /// Registers a locally written audio file in `offline_downloads` and enforces the LRU budget.
+    /// Registers a locally written audio file in `offline_downloads` and enforces the LRU budget
+    /// (excluding the newly registered `track_id` from eviction in this call).
     #[allow(clippy::too_many_arguments)]
     pub async fn register_cached_file(
         &self,
@@ -230,13 +265,23 @@ impl CacheManager {
         pin_source: Option<&str>,
         accessed_at: i64,
     ) -> CoreResult<OfflineTrackEntry> {
+        let prev_path: Option<String> =
+            sqlx::query_scalar("SELECT local_path FROM offline_downloads WHERE track_id = ?")
+                .bind(track_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let effective_pinned = pinned || self.is_track_pinned_by_rules(track_id).await?;
+        let new_path_str = local_path.display().to_string();
+        let size_i64 = i64::try_from(size_bytes).unwrap_or(i64::MAX);
+
         let entry = OfflineTrackEntry {
             track_id: track_id.to_string(),
-            local_path: local_path.display().to_string(),
+            local_path: new_path_str.clone(),
             format: format.to_string(),
             bit_rate: bit_rate.map(i64::from),
-            size_bytes: size_bytes as i64,
-            pinned,
+            size_bytes: size_i64,
+            pinned: effective_pinned,
             pin_source: pin_source.map(ToString::to_string),
             downloaded_at: accessed_at,
             last_accessed_at: accessed_at,
@@ -271,14 +316,27 @@ impl CacheManager {
         .execute(&self.pool)
         .await?;
 
-        self.enforce_budget().await?;
+        if let Some(old_path) = prev_path {
+            if old_path != new_path_str {
+                let _ = tokio::fs::remove_file(&old_path).await;
+            }
+        }
+
+        self.enforce_budget_excluding(Some(track_id)).await?;
         Ok(entry)
     }
 
     /// Evicts unpinned audio entries in strict LRU order (`last_accessed_at ASC`) until total
     /// audio cache bytes are within `policy.max_bytes`. Pinned items are never evicted.
     pub async fn enforce_budget(&self) -> CoreResult<usize> {
-        let max_bytes = self.policy.read().await.max_bytes as i64;
+        self.enforce_budget_excluding(None).await
+    }
+
+    async fn enforce_budget_excluding(
+        &self,
+        protected_track_id: Option<&str>,
+    ) -> CoreResult<usize> {
+        let max_bytes = i64::try_from(self.policy.read().await.max_bytes).unwrap_or(i64::MAX);
         let mut total: i64 =
             sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM offline_downloads")
                 .fetch_one(&self.pool)
@@ -303,6 +361,9 @@ impl CacheManager {
         for (track_id, local_path, size_bytes) in candidates {
             if total <= max_bytes {
                 break;
+            }
+            if protected_track_id == Some(track_id.as_str()) {
+                continue;
             }
             let _ = tokio::fs::remove_file(&local_path).await;
             sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
@@ -415,7 +476,7 @@ impl CacheManager {
 
         if let Some(p) = path {
             let pb = PathBuf::from(&p);
-            if pb.exists() {
+            if tokio::fs::try_exists(&pb).await.unwrap_or(false) {
                 sqlx::query(
                     "UPDATE cover_art_cache SET last_accessed_at = ? WHERE cover_art_id = ?",
                 )
@@ -434,6 +495,7 @@ impl CacheManager {
     }
 
     /// Returns cached cover-art path, or fetches and persists it on cache miss (unless `offline_only`).
+    /// Rejects Subsonic HTTP 200 JSON/XML/plain-text error envelopes and empty bodies.
     pub async fn get_or_fetch_cover_art(
         &self,
         cover_art_id: &str,
@@ -458,6 +520,10 @@ impl CacheManager {
         let url = subsonic.cover_art_url(cover_art_id, size)?;
         let (bytes, content_type) = subsonic.fetch_bytes(&url).await?;
 
+        if bytes.is_empty() || is_subsonic_error_content_type(content_type.as_deref()) {
+            return Err(parse_subsonic_error_bytes(&bytes, content_type.as_deref()));
+        }
+
         let content_type = content_type.unwrap_or_else(|| "image/jpeg".to_string());
         let ext = if content_type.contains("png") {
             "png"
@@ -467,14 +533,34 @@ impl CacheManager {
             "jpg"
         };
 
+        let prev_path: Option<String> = sqlx::query_scalar(
+            "SELECT local_path FROM cover_art_cache WHERE cover_art_id = ?",
+        )
+        .bind(cover_art_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
         tokio::fs::create_dir_all(&self.cover_art_dir).await?;
-        let safe_id = sanitize_filename(cover_art_id);
+        let safe_id = encode_filename_key(cover_art_id);
         let final_path = self.cover_art_dir.join(format!("{safe_id}.{ext}"));
-        let part_path = self.cover_art_dir.join(format!("{safe_id}.part"));
-        tokio::fs::write(&part_path, &bytes).await?;
-        tokio::fs::rename(&part_path, &final_path).await?;
+        let part_path = self
+            .cover_art_dir
+            .join(format!("{safe_id}.{}.part", Uuid::new_v4()));
+
+        let write_res: CoreResult<()> = async {
+            tokio::fs::write(&part_path, &bytes).await?;
+            tokio::fs::rename(&part_path, &final_path).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = write_res {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(err);
+        }
 
         let now = now_unix();
+        let new_path_str = final_path.display().to_string();
+        let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
         sqlx::query(
             r#"
             INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at)
@@ -487,20 +573,31 @@ impl CacheManager {
             "#,
         )
         .bind(cover_art_id)
-        .bind(final_path.display().to_string())
+        .bind(&new_path_str)
         .bind(&content_type)
-        .bind(bytes.len() as i64)
+        .bind(size_i64)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
         .await?;
 
-        self.enforce_cover_art_budget().await?;
+        if let Some(old_path) = prev_path {
+            if old_path != new_path_str {
+                let _ = tokio::fs::remove_file(&old_path).await;
+            }
+        }
+
+        self.enforce_cover_art_budget_excluding(Some(cover_art_id))
+            .await?;
         Ok(final_path)
     }
 
-    async fn enforce_cover_art_budget(&self) -> CoreResult<usize> {
-        let max_bytes = self.policy.read().await.cover_art_max_bytes as i64;
+    async fn enforce_cover_art_budget_excluding(
+        &self,
+        protected_art_id: Option<&str>,
+    ) -> CoreResult<usize> {
+        let max_bytes =
+            i64::try_from(self.policy.read().await.cover_art_max_bytes).unwrap_or(i64::MAX);
         let mut total: i64 =
             sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cover_art_cache")
                 .fetch_one(&self.pool)
@@ -518,6 +615,9 @@ impl CacheManager {
         for (id, path, size) in rows {
             if total <= max_bytes {
                 break;
+            }
+            if protected_art_id == Some(id.as_str()) {
+                continue;
             }
             let _ = tokio::fs::remove_file(&path).await;
             sqlx::query("DELETE FROM cover_art_cache WHERE cover_art_id = ?")
@@ -562,6 +662,26 @@ impl CacheManager {
             cached_cover_art_count: cover_count.max(0) as u64,
             max_audio_bytes,
         })
+    }
+
+    async fn is_track_pinned_by_rules(&self, track_id: &str) -> CoreResult<bool> {
+        let pins: Vec<(String, String)> =
+            sqlx::query_as("SELECT target_kind, target_id FROM offline_pins")
+                .fetch_all(&self.pool)
+                .await?;
+        for (kind, id) in pins {
+            if let Some(target) = PinTarget::from_db_pair(&kind, &id) {
+                if self
+                    .resolve_pin_target_tracks(&target)
+                    .await?
+                    .iter()
+                    .any(|tid| tid == track_id)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn recompute_pin_flags(&self) -> CoreResult<()> {
@@ -651,14 +771,35 @@ impl CacheManager {
     }
 }
 
-fn sanitize_filename(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// Collision-free, path-traversal-proof filename encoder.
+/// Keeps `[A-Za-z0-9-]` literal and escapes every other byte (including `_`, `.`, `/`, `\`)
+/// as `_{hex:02x}` so distinct IDs never collide and traversal sequences are impossible.
+fn encode_filename_key(raw: &str) -> String {
+    if raw.is_empty() {
+        return "_empty".to_string();
+    }
+    let mut out = String::with_capacity(raw.len() + 8);
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(&mut out, "_{byte:02x}");
+        }
+    }
+    out
+}
+
+/// Strips all non-alphanumeric characters from a file extension to prevent path traversal
+/// (e.g. from `AudioQualityProfile::CustomTranscode`).
+fn sanitize_extension(raw: &str) -> String {
+    let ext: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if ext.is_empty() {
+        "bin".to_string()
+    } else {
+        ext
+    }
 }

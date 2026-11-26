@@ -83,7 +83,7 @@ CREATE TRIGGER IF NOT EXISTS tracks_ad AFTER DELETE ON tracks BEGIN
     VALUES ('delete', old.rowid, old.title, old.artist_name, old.album_name, COALESCE(old.genre, ''));
 END;
 
-CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE ON tracks BEGIN
+CREATE TRIGGER IF NOT EXISTS tracks_au AFTER UPDATE OF title, artist_name, album_name, genre ON tracks BEGIN
     INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_name, genre)
     VALUES ('delete', old.rowid, old.title, old.artist_name, old.album_name, COALESCE(old.genre, ''));
     INSERT INTO tracks_fts(rowid, title, artist_name, album_name, genre)
@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS discovery_tracks (
     profile_slug TEXT,
     mix_slug TEXT,
     status TEXT NOT NULL,
+    created_at TEXT,
     expires_at TEXT,
     reason_json TEXT,
     exclude_from_core_taste INTEGER NOT NULL DEFAULT 0,
@@ -177,10 +178,11 @@ CREATE TABLE IF NOT EXISTS mutation_outbox (
     created_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    next_retry_at INTEGER NOT NULL DEFAULT 0
+    next_retry_at INTEGER NOT NULL DEFAULT 0,
+    dead_letter INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_mutation_outbox_retry ON mutation_outbox(next_retry_at, seq);
+CREATE INDEX IF NOT EXISTS idx_mutation_outbox_retry ON mutation_outbox(dead_letter, next_retry_at, seq);
 
 CREATE TABLE IF NOT EXISTS playback_session (
     id INTEGER PRIMARY KEY CHECK (id = 1),

@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -17,25 +16,26 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Opens (and migrates) the local client SQLite database in WAL mode.
 pub async fn open_pool(db_path: &Path) -> CoreResult<SqlitePool> {
-    if let Some(parent) = db_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await?;
+    let is_memory = db_path == Path::new(":memory:");
+    if !is_memory {
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
         }
     }
 
-    let url = if db_path == Path::new(":memory:") {
-        "sqlite::memory:".to_string()
+    let opts = if is_memory {
+        SqliteConnectOptions::new().in_memory(true)
     } else {
-        format!("sqlite://{}", db_path.display())
-    };
+        SqliteConnectOptions::new().filename(db_path)
+    }
+    .create_if_missing(true)
+    .journal_mode(SqliteJournalMode::Wal)
+    .synchronous(SqliteSynchronous::Normal)
+    .busy_timeout(Duration::from_secs(5));
 
-    let opts = SqliteConnectOptions::from_str(&url)?
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_secs(5));
-
-    let max_conns = if db_path == Path::new(":memory:") { 1 } else { 8 };
+    let max_conns = if is_memory { 1 } else { 8 };
     let pool = SqlitePoolOptions::new()
         .max_connections(max_conns)
         .connect_with(opts)
@@ -180,7 +180,7 @@ pub async fn upsert_track(
             play_count = MAX(tracks.play_count, excluded.play_count),
             last_played_at = COALESCE(excluded.last_played_at, tracks.last_played_at),
             musicbrainz_id = COALESCE(excluded.musicbrainz_id, tracks.musicbrainz_id),
-            is_discovery = excluded.is_discovery,
+            is_discovery = CASE WHEN ? THEN tracks.is_discovery ELSE excluded.is_discovery END,
             updated_at = excluded.updated_at
         "#,
     )
@@ -208,6 +208,7 @@ pub async fn upsert_track(
     .bind(&track.musicbrainz_id)
     .bind(track.is_discovery)
     .bind(track.updated_at)
+    .bind(preserve_pending_curation)
     .bind(preserve_pending_curation)
     .bind(preserve_pending_curation)
     .execute(pool)
@@ -283,15 +284,17 @@ pub async fn replace_playlist_tracks(
 pub async fn upsert_discovery_track(
     pool: &SqlitePool,
     track: &LocalDiscoveryTrack,
+    preserve_pending_curation: bool,
 ) -> CoreResult<()> {
+    let normalized_status = track.status.trim().to_ascii_lowercase();
     sqlx::query(
         r#"
         INSERT INTO discovery_tracks (
             id, song_id, artist, title, album, folder_path,
-            profile_slug, mix_slug, status, expires_at, reason_json,
+            profile_slug, mix_slug, status, created_at, expires_at, reason_json,
             exclude_from_core_taste, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             song_id = COALESCE(excluded.song_id, discovery_tracks.song_id),
             artist = excluded.artist,
@@ -300,7 +303,8 @@ pub async fn upsert_discovery_track(
             folder_path = excluded.folder_path,
             profile_slug = excluded.profile_slug,
             mix_slug = excluded.mix_slug,
-            status = excluded.status,
+            status = CASE WHEN ? THEN discovery_tracks.status ELSE excluded.status END,
+            created_at = COALESCE(excluded.created_at, discovery_tracks.created_at),
             expires_at = excluded.expires_at,
             reason_json = COALESCE(excluded.reason_json, discovery_tracks.reason_json),
             exclude_from_core_taste = excluded.exclude_from_core_taste,
@@ -315,29 +319,35 @@ pub async fn upsert_discovery_track(
     .bind(&track.folder_path)
     .bind(&track.profile_slug)
     .bind(&track.mix_slug)
-    .bind(&track.status)
+    .bind(&normalized_status)
+    .bind(&track.created_at)
     .bind(&track.expires_at)
     .bind(&track.reason_json)
     .bind(track.exclude_from_core_taste)
     .bind(track.updated_at)
+    .bind(preserve_pending_curation)
     .execute(pool)
     .await?;
 
-    if let Some(song_id) = &track.song_id {
-        let is_pending = track.status.eq_ignore_ascii_case("pending");
-        sqlx::query("UPDATE tracks SET is_discovery = ? WHERE id = ?")
-            .bind(is_pending)
-            .bind(song_id)
-            .execute(pool)
-            .await?;
+    if !preserve_pending_curation {
+        if let Some(song_id) = &track.song_id {
+            let is_pending = normalized_status == "pending";
+            sqlx::query("UPDATE tracks SET is_discovery = ? WHERE id = ?")
+                .bind(is_pending)
+                .bind(song_id)
+                .execute(pool)
+                .await?;
+        }
     }
     Ok(())
 }
 
 pub async fn pending_outbox_song_ids(pool: &SqlitePool) -> CoreResult<HashSet<String>> {
-    let ids = sqlx::query_scalar::<_, String>("SELECT DISTINCT song_id FROM mutation_outbox")
-        .fetch_all(pool)
-        .await?;
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT song_id FROM mutation_outbox WHERE dead_letter = 0",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(ids.into_iter().collect())
 }
 

@@ -19,6 +19,26 @@ impl NavidromeCredentials {
     }
 }
 
+/// Typed authentication credential for Soulbeet HTTP and WebSocket requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "token", rename_all = "snake_case")]
+pub enum SoulbeetAuth {
+    /// Sends `Authorization: Bearer <token>`.
+    Bearer(String),
+    /// Sends `Cookie: auth_token=<token>`.
+    SessionCookie(String),
+}
+
+impl SoulbeetAuth {
+    /// Returns the lowercase HTTP header name and formatted header value.
+    pub fn header_name_and_value(&self) -> (&'static str, String) {
+        match self {
+            Self::Bearer(token) => ("authorization", format!("Bearer {token}")),
+            Self::SessionCookie(token) => ("cookie", format!("auth_token={token}")),
+        }
+    }
+}
+
 /// Device platform identifier for Connect & quality profile defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +47,17 @@ pub enum DevicePlatform {
     Desktop,
     Android,
     AndroidAuto,
+}
+
+impl DevicePlatform {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Desktop => "desktop",
+            Self::Android => "android",
+            Self::AndroidAuto => "android_auto",
+        }
+    }
 }
 
 /// Profile-aware streaming & offline download quality policy.
@@ -105,8 +136,8 @@ pub struct ClientConfig {
     pub cover_art_dir: PathBuf,
     /// Optional Soulbeet server URL (e.g. `https://music.example.com`).
     pub soulbeet_base_url: Option<String>,
-    /// Optional auth header value (e.g. session cookie or bearer token) for Soulbeet API calls.
-    pub soulbeet_auth_header: Option<String>,
+    /// Optional typed authentication credential (Bearer token or session cookie) for Soulbeet API calls.
+    pub soulbeet_auth: Option<SoulbeetAuth>,
     pub navidrome: Option<NavidromeCredentials>,
     pub device_id: String,
     pub device_name: String,
@@ -199,6 +230,7 @@ pub struct LocalDiscoveryTrack {
     pub profile_slug: Option<String>,
     pub mix_slug: Option<String>,
     pub status: String,
+    pub created_at: Option<String>,
     pub expires_at: Option<String>,
     pub reason_json: Option<String>,
     pub exclude_from_core_taste: bool,
@@ -349,6 +381,8 @@ pub struct OutboxRow {
     pub attempts: i64,
     pub last_error: Option<String>,
     pub next_retry_at: i64,
+    #[serde(default)]
+    pub dead_letter: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

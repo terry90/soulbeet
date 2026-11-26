@@ -23,8 +23,8 @@ use crate::connect::ConnectClient;
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
     AudioQualityProfile, CacheStats, ClientConfig, DrainReport, NavidromeCredentials,
-    OutboxMutation, PersistedPlaybackSession, PinTarget, PlaybackSource, SearchResults, SyncReport,
-    VoiceMatchResult,
+    OutboxMutation, PersistedPlaybackSession, PinTarget, PlaybackSource, SearchResults,
+    SoulbeetAuth, SyncReport, VoiceMatchResult,
 };
 use crate::outbox::MutationOutbox;
 use crate::search::SearchEngine;
@@ -34,6 +34,7 @@ use crate::sync::SyncEngine;
 pub struct SoulbeetCore {
     pool: SqlitePool,
     config: ClientConfig,
+    soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
     offline_only: AtomicBool,
     sync: SyncEngine,
@@ -48,15 +49,17 @@ impl SoulbeetCore {
     pub async fn init(config: ClientConfig) -> CoreResult<Self> {
         let pool = db::open_pool(&config.db_path).await?;
         let http = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(30))
             .build()?;
 
+        let soulbeet_auth = Arc::new(RwLock::new(config.soulbeet_auth.clone()));
         let navidrome = Arc::new(RwLock::new(config.navidrome.clone()));
         let sync = SyncEngine::new(
             pool.clone(),
             http.clone(),
             config.soulbeet_base_url.clone(),
-            config.soulbeet_auth_header.clone(),
+            soulbeet_auth.clone(),
             navidrome.clone(),
         );
         let cache = CacheManager::new(
@@ -71,26 +74,28 @@ impl SoulbeetCore {
             pool.clone(),
             http.clone(),
             config.soulbeet_base_url.clone(),
-            config.soulbeet_auth_header.clone(),
+            soulbeet_auth.clone(),
             navidrome.clone(),
         );
         let search = SearchEngine::new(
             pool.clone(),
             http,
             config.soulbeet_base_url.clone(),
-            config.soulbeet_auth_header.clone(),
+            soulbeet_auth.clone(),
         );
         let auto_browse = AutoBrowseEngine::new(pool.clone());
         let connect = ConnectClient::new(
             config.device_id.clone(),
             config.device_name.clone(),
             config.platform,
+            soulbeet_auth.clone(),
         );
         let offline_only = AtomicBool::new(config.offline_only);
 
         Ok(Self {
             pool,
             config,
+            soulbeet_auth,
             navidrome,
             offline_only,
             sync,
@@ -136,6 +141,10 @@ impl SoulbeetCore {
 
     pub fn set_offline_only(&self, offline_only: bool) {
         self.offline_only.store(offline_only, Ordering::Relaxed);
+    }
+
+    pub async fn set_soulbeet_auth(&self, auth: Option<SoulbeetAuth>) {
+        *self.soulbeet_auth.write().await = auth;
     }
 
     pub async fn set_navidrome_credentials(&self, creds: NavidromeCredentials) {
@@ -221,12 +230,6 @@ impl SoulbeetCore {
             .soulbeet_base_url
             .as_deref()
             .ok_or(CoreError::NotConfigured("soulbeet_base_url"))?;
-        self.connect
-            .connect(
-                base,
-                self.config.soulbeet_auth_header.as_deref(),
-                heartbeat_interval,
-            )
-            .await
+        self.connect.connect(base, heartbeat_interval).await
     }
 }

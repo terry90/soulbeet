@@ -239,6 +239,81 @@ impl SubsonicClient {
     }
 }
 
+/// Returns true if an HTTP 200 media response `Content-Type` indicates a Subsonic JSON/XML/text
+/// error envelope rather than binary audio or image bytes.
+pub fn is_subsonic_error_content_type(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let mime = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        mime.as_str(),
+        "application/json" | "text/xml" | "application/xml" | "text/plain" | "text/html"
+    )
+}
+
+/// Parses a Subsonic HTTP 200 error payload (JSON envelope, XML `<error code="..." message="..."/>`,
+/// or empty/plain-text body) into [`CoreError::Subsonic`].
+pub fn parse_subsonic_error_bytes(bytes: &[u8], content_type: Option<&str>) -> CoreError {
+    if bytes.is_empty() {
+        return CoreError::Subsonic {
+            code: 0,
+            message: "empty media response from Subsonic server".to_string(),
+        };
+    }
+    if let Ok(envelope) = serde_json::from_slice::<SubsonicEnvelope<EmptyPayload>>(bytes) {
+        if let Some(err) = envelope.subsonic_response.error {
+            return CoreError::Subsonic {
+                code: err.code,
+                message: err.message,
+            };
+        }
+        return CoreError::Subsonic {
+            code: 0,
+            message: format!(
+                "unexpected Subsonic JSON response (status={})",
+                envelope.subsonic_response.status
+            ),
+        };
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    if let Some(code) = extract_xml_attr(&text, "code").and_then(|c| c.parse::<i64>().ok()) {
+        let message = extract_xml_attr(&text, "message")
+            .unwrap_or_else(|| text.trim().to_string());
+        return CoreError::Subsonic { code, message };
+    }
+
+    let snippet: String = text.trim().chars().take(200).collect();
+    let ct = content_type.unwrap_or("unknown");
+    CoreError::Subsonic {
+        code: 0,
+        message: if snippet.is_empty() {
+            format!("unexpected {ct} response instead of media bytes")
+        } else {
+            format!("unexpected {ct} response: {snippet}")
+        },
+    }
+}
+
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{attr}={quote}");
+        if let Some(start) = xml.find(&needle) {
+            let rest = &xml[start + needle.len()..];
+            if let Some(end) = rest.find(quote) {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
 // --- OpenSubsonic Wire Deserialization ---
 
 #[derive(Debug, Deserialize)]

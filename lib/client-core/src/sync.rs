@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use chrono::DateTime;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -13,14 +14,16 @@ use crate::db::{
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
     ClientBootstrapDto, LocalAlbum, LocalArtist, LocalDiscoveryTrack, LocalPlaylist, LocalTrack,
-    NavidromeCredentials, SyncReport,
+    NavidromeCredentials, SoulbeetAuth, SyncReport,
 };
 use crate::subsonic::{SubsonicAlbumDetail, SubsonicClient, SubsonicSong};
 
 const CURSOR_LAST_FULL_SYNC: &str = "last_full_sync_unix";
 const CURSOR_LAST_ALBUM_CREATED: &str = "last_album_created_at";
 const CURSOR_GENRES_JSON: &str = "genres_json";
+pub const CURSOR_PROMOTE_THRESHOLD: &str = "promote_threshold";
 const ALBUM_PAGE_SIZE: usize = 250;
+const DELTA_PAGE_SIZE: usize = 50;
 
 /// Synchronizes local SQLite mirror from Soulbeet (`/api/client/bootstrap`, Discovery)
 /// and Navidrome OpenSubsonic (`getArtists`, `getAlbumList2`, `getPlaylists`, `getStarred2`, `getGenres`).
@@ -29,7 +32,7 @@ pub struct SyncEngine {
     pool: SqlitePool,
     http: Client,
     soulbeet_base_url: Option<String>,
-    soulbeet_auth_header: Option<String>,
+    soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
 }
 
@@ -38,27 +41,29 @@ impl SyncEngine {
         pool: SqlitePool,
         http: Client,
         soulbeet_base_url: Option<String>,
-        soulbeet_auth_header: Option<String>,
+        soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
         navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
     ) -> Self {
         Self {
             pool,
             http,
             soulbeet_base_url,
-            soulbeet_auth_header,
+            soulbeet_auth,
             navidrome,
         }
     }
 
-    /// Calls `GET /api/client/bootstrap` on Soulbeet to refresh scoped OpenSubsonic credentials.
+    /// Calls `GET /api/client/bootstrap` on Soulbeet to refresh scoped OpenSubsonic credentials
+    /// and persist server curation settings (e.g. `promote_threshold`).
     pub async fn fetch_bootstrap(&self) -> CoreResult<Option<ClientBootstrapDto>> {
         let Some(base) = self.soulbeet_base_url.as_deref() else {
             return Ok(None);
         };
         let url = format!("{}/api/client/bootstrap", base.trim_end_matches('/'));
         let mut req = self.http.get(&url);
-        if let Some(auth) = &self.soulbeet_auth_header {
-            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
+            let (name, val) = auth.header_name_and_value();
+            req = req.header(name, val);
         }
         let resp = req.send().await?;
         let status = resp.status();
@@ -70,9 +75,13 @@ impl SyncEngine {
             });
         }
         let dto: ClientBootstrapDto = resp.json().await?;
-        if let Some(creds) = dto.navidrome.clone() {
-            *self.navidrome.write().await = Some(creds);
-        }
+        *self.navidrome.write().await = dto.navidrome.clone();
+        set_cursor(
+            &self.pool,
+            CURSOR_PROMOTE_THRESHOLD,
+            &dto.promote_threshold.to_string(),
+        )
+        .await?;
         Ok(Some(dto))
     }
 
@@ -135,7 +144,7 @@ impl SyncEngine {
                 let count = page.len();
                 for summary in page {
                     if let Some(c) = &summary.created {
-                        if c > &newest_created {
+                        if is_timestamp_newer(c, &newest_created) {
                             newest_created = c.clone();
                         }
                     }
@@ -152,8 +161,15 @@ impl SyncEngine {
             set_cursor(&self.pool, CURSOR_LAST_FULL_SYNC, &now.to_string()).await?;
         } else {
             let mut seen_album_ids = HashSet::new();
-            for list_type in ["newest", "recent"] {
-                let page = subsonic.get_album_list2(list_type, 50, 0).await?;
+
+            // Paginate `newest` until a page is shorter than DELTA_PAGE_SIZE or yields no new albums.
+            let mut offset = 0usize;
+            loop {
+                let page = subsonic
+                    .get_album_list2("newest", DELTA_PAGE_SIZE, offset)
+                    .await?;
+                let count = page.len();
+                let mut page_had_new = false;
                 for summary in page {
                     if !seen_album_ids.insert(summary.id.clone()) {
                         continue;
@@ -161,7 +177,7 @@ impl SyncEngine {
                     let created_newer = summary
                         .created
                         .as_deref()
-                        .is_some_and(|c| c > previous_created.as_str());
+                        .is_some_and(|c| is_timestamp_newer(c, &previous_created));
                     let exists = sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(1) FROM albums WHERE id = ?",
                     )
@@ -170,11 +186,12 @@ impl SyncEngine {
                     .await?
                         > 0;
 
-                    if list_type == "newest" && !created_newer && exists {
+                    if !created_newer && exists {
                         continue;
                     }
+                    page_had_new = true;
                     if let Some(c) = &summary.created {
-                        if c > &newest_created {
+                        if is_timestamp_newer(c, &newest_created) {
                             newest_created = c.clone();
                         }
                     }
@@ -183,6 +200,27 @@ impl SyncEngine {
                         self.store_album_detail(&detail, &pending_songs, now).await?;
                     report.albums_synced += 1;
                 }
+                if count < DELTA_PAGE_SIZE || !page_had_new {
+                    break;
+                }
+                offset += count;
+            }
+
+            // Refresh recently played albums (single page) for updated play counts / metadata.
+            let recent_page = subsonic.get_album_list2("recent", DELTA_PAGE_SIZE, 0).await?;
+            for summary in recent_page {
+                if !seen_album_ids.insert(summary.id.clone()) {
+                    continue;
+                }
+                if let Some(c) = &summary.created {
+                    if is_timestamp_newer(c, &newest_created) {
+                        newest_created = c.clone();
+                    }
+                }
+                let detail = subsonic.get_album(&summary.id).await?;
+                report.tracks_synced +=
+                    self.store_album_detail(&detail, &pending_songs, now).await?;
+                report.albums_synced += 1;
             }
         }
 
@@ -190,9 +228,11 @@ impl SyncEngine {
             set_cursor(&self.pool, CURSOR_LAST_ALBUM_CREATED, &newest_created).await?;
         }
 
-        // 3. Playlists (delta via changed_at + song_count)
+        // 3. Playlists (delta via changed_at + song_count) + prune deleted playlists
         let playlists = subsonic.get_playlists().await?;
+        let mut synced_playlist_ids = HashSet::with_capacity(playlists.len());
         for pl in playlists {
+            synced_playlist_ids.insert(pl.id.clone());
             let existing: Option<(Option<String>, i64)> = sqlx::query_as(
                 "SELECT changed_at, song_count FROM playlists WHERE id = ?",
             )
@@ -241,7 +281,30 @@ impl SyncEngine {
             report.playlists_synced += 1;
         }
 
-        // 4. Starred reconciliation (protecting pending outbox edits)
+        // Prune playlists that were deleted on Navidrome.
+        let local_playlist_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM playlists")
+            .fetch_all(&self.pool)
+            .await?;
+        let deleted_playlist_ids: Vec<String> = local_playlist_ids
+            .into_iter()
+            .filter(|id| !synced_playlist_ids.contains(id))
+            .collect();
+        if !deleted_playlist_ids.is_empty() {
+            let mut tx = self.pool.begin().await?;
+            for pl_id in deleted_playlist_ids {
+                sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?")
+                    .bind(&pl_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM playlists WHERE id = ?")
+                    .bind(&pl_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+        }
+
+        // 4. Starred reconciliation for songs, albums, and artists (protecting pending outbox edits)
         let starred = subsonic.get_starred2().await?;
         let starred_song_ids: HashSet<String> =
             starred.song.iter().map(|s| s.id.clone()).collect();
@@ -252,14 +315,61 @@ impl SyncEngine {
             upsert_track(&self.pool, &local, preserve).await?;
             report.starred_reconciled += 1;
         }
-        // Clear stale stars on tracks that are neither currently starred nor pending in outbox
-        let locally_starred: Vec<String> =
+        let locally_starred_songs: Vec<String> =
             sqlx::query_scalar("SELECT id FROM tracks WHERE starred = 1")
                 .fetch_all(&self.pool)
                 .await?;
-        for id in locally_starred {
+        for id in locally_starred_songs {
             if !starred_song_ids.contains(&id) && !pending_songs.contains(&id) {
                 sqlx::query("UPDATE tracks SET starred = 0, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        let starred_album_ids: HashSet<String> =
+            starred.album.iter().map(|a| a.id.clone()).collect();
+        for album_id in &starred_album_ids {
+            sqlx::query("UPDATE albums SET starred = 1, updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(album_id)
+                .execute(&self.pool)
+                .await?;
+            report.starred_reconciled += 1;
+        }
+        let locally_starred_albums: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM albums WHERE starred = 1")
+                .fetch_all(&self.pool)
+                .await?;
+        for id in locally_starred_albums {
+            if !starred_album_ids.contains(&id) {
+                sqlx::query("UPDATE albums SET starred = 0, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
+        let starred_artist_ids: HashSet<String> =
+            starred.artist.iter().map(|a| a.id.clone()).collect();
+        for artist_id in &starred_artist_ids {
+            sqlx::query("UPDATE artists SET starred = 1, updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(artist_id)
+                .execute(&self.pool)
+                .await?;
+            report.starred_reconciled += 1;
+        }
+        let locally_starred_artists: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM artists WHERE starred = 1")
+                .fetch_all(&self.pool)
+                .await?;
+        for id in locally_starred_artists {
+            if !starred_artist_ids.contains(&id) {
+                sqlx::query("UPDATE artists SET starred = 0, updated_at = ? WHERE id = ?")
                     .bind(now)
                     .bind(id)
                     .execute(&self.pool)
@@ -278,7 +388,10 @@ impl SyncEngine {
 
         // 6. Optional Soulbeet Discovery triage queue sync
         if let Some(base) = self.soulbeet_base_url.as_deref() {
-            match self.sync_discovery_triage(base, now).await {
+            match self
+                .sync_discovery_triage(base, &pending_songs, now)
+                .await
+            {
                 Ok(n) => report.discovery_tracks_synced = n,
                 Err(err) => report.warnings.push(format!("discovery sync failed: {err}")),
             }
@@ -321,11 +434,17 @@ impl SyncEngine {
         Ok(synced)
     }
 
-    async fn sync_discovery_triage(&self, base: &str, now: i64) -> CoreResult<usize> {
+    async fn sync_discovery_triage(
+        &self,
+        base: &str,
+        pending_songs: &HashSet<String>,
+        now: i64,
+    ) -> CoreResult<usize> {
         let url = format!("{}/api/discovery/triage", base.trim_end_matches('/'));
         let mut req = self.http.get(&url);
-        if let Some(auth) = &self.soulbeet_auth_header {
-            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
+            let (name, val) = auth.header_name_and_value();
+            req = req.header(name, val);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
@@ -335,6 +454,7 @@ impl SyncEngine {
             });
         }
 
+        /// Matches PR #129's `GET /api/discovery/triage` (`Vec<shared::navidrome::DiscoveryTrack>`).
         #[derive(Deserialize)]
         struct TriageItem {
             id: String,
@@ -344,14 +464,16 @@ impl SyncEngine {
             title: String,
             #[serde(default)]
             album: Option<String>,
-            #[serde(default)]
-            folder_path: Option<String>,
-            #[serde(default)]
-            profile_slug: Option<String>,
-            #[serde(default)]
-            mix_slug: Option<String>,
+            #[serde(default, alias = "folder_path")]
+            path: Option<String>,
+            #[serde(default, alias = "profile_slug")]
+            profile: Option<String>,
+            #[serde(default, alias = "mix_slug")]
+            pack_slug: Option<String>,
             #[serde(default = "default_pending")]
             status: String,
+            #[serde(default)]
+            created_at: Option<String>,
             #[serde(default)]
             expires_at: Option<String>,
             #[serde(default)]
@@ -366,12 +488,24 @@ impl SyncEngine {
 
         let items: Vec<TriageItem> = resp.json().await?;
         let count = items.len();
+        let mut synced_ids = HashSet::with_capacity(count);
+
         for item in items {
+            synced_ids.insert(item.id.clone());
+            let preserve = item
+                .song_id
+                .as_deref()
+                .is_some_and(|sid| pending_songs.contains(sid));
             let reason_json = item
                 .reason
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
+            let normalized_status = item.status.trim().to_ascii_lowercase();
+            let album = item.album.filter(|a| !a.is_empty());
+            let folder_path = item.path.filter(|p| !p.is_empty());
+            let profile_slug = item.profile.filter(|p| !p.is_empty());
+
             upsert_discovery_track(
                 &self.pool,
                 &LocalDiscoveryTrack {
@@ -379,28 +513,85 @@ impl SyncEngine {
                     song_id: item.song_id,
                     artist: item.artist,
                     title: item.title,
-                    album: item.album,
-                    folder_path: item.folder_path,
-                    profile_slug: item.profile_slug,
-                    mix_slug: item.mix_slug,
-                    status: item.status,
+                    album,
+                    folder_path,
+                    profile_slug,
+                    mix_slug: item.pack_slug,
+                    status: normalized_status,
+                    created_at: item.created_at,
                     expires_at: item.expires_at,
                     reason_json,
                     exclude_from_core_taste: item.exclude_from_core_taste,
                     updated_at: now,
                 },
+                preserve,
             )
             .await?;
         }
+
+        // Prune stale discovery tracks no longer in server triage queue (protecting pending outbox edits).
+        let local_rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, song_id FROM discovery_tracks")
+                .fetch_all(&self.pool)
+                .await?;
+        for (id, song_id) in local_rows {
+            if synced_ids.contains(&id) {
+                continue;
+            }
+            if song_id
+                .as_deref()
+                .is_some_and(|sid| pending_songs.contains(sid))
+            {
+                continue;
+            }
+            sqlx::query("DELETE FROM discovery_tracks WHERE id = ?")
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+            if let Some(sid) = song_id {
+                let still_pending: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(1) FROM discovery_tracks WHERE song_id = ? AND status = 'pending'",
+                )
+                .bind(&sid)
+                .fetch_one(&self.pool)
+                .await?;
+                if still_pending == 0 {
+                    sqlx::query("UPDATE tracks SET is_discovery = 0, updated_at = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(&sid)
+                        .execute(&self.pool)
+                        .await?;
+                }
+            }
+        }
+
         Ok(count)
     }
 }
 
+fn is_timestamp_newer(candidate: &str, baseline: &str) -> bool {
+    if baseline.is_empty() {
+        return !candidate.is_empty();
+    }
+    match (
+        DateTime::parse_from_rfc3339(candidate),
+        DateTime::parse_from_rfc3339(baseline),
+    ) {
+        (Ok(c), Ok(b)) => c > b,
+        _ => candidate > baseline,
+    }
+}
+
+fn is_discovery_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches('/');
+    trimmed
+        .get(.."discovery/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("discovery/"))
+}
+
 fn song_to_local(song: SubsonicSong, now: i64) -> LocalTrack {
-    let is_discovery = song
-        .path
-        .as_deref()
-        .is_some_and(|p| p.contains("Discovery/") || p.contains("Discovery\\"));
+    let is_discovery = song.path.as_deref().is_some_and(is_discovery_path);
     LocalTrack {
         id: song.id,
         title: song.title,

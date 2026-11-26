@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use sqlx::SqlitePool;
@@ -106,16 +106,24 @@ impl AutoBrowseEngine {
                 r#"
                 SELECT COUNT(1)
                 FROM discovery_tracks dt
-                INNER JOIN offline_downloads od ON od.track_id = dt.song_id
+                INNER JOIN tracks t ON t.id = dt.song_id
+                INNER JOIN offline_downloads od ON od.track_id = t.id
                 WHERE dt.status = 'pending'
                 "#,
             )
             .fetch_one(&self.pool)
             .await?
         } else {
-            sqlx::query_scalar("SELECT COUNT(1) FROM discovery_tracks WHERE status = 'pending'")
-                .fetch_one(&self.pool)
-                .await?
+            sqlx::query_scalar(
+                r#"
+                SELECT COUNT(1)
+                FROM discovery_tracks dt
+                INNER JOIN tracks t ON t.id = dt.song_id
+                WHERE dt.status = 'pending'
+                "#,
+            )
+            .fetch_one(&self.pool)
+            .await?
         };
         if pending_count > 0 {
             nodes.push(folder_node(
@@ -126,26 +134,48 @@ impl AutoBrowseEngine {
             ));
         }
 
-        // Seasonal Packs, Moment Mixes, and Discovery playlists first
-        let playlists = sqlx::query_as::<_, LocalPlaylist>(
-            r#"
-            SELECT * FROM playlists
-            WHERE kind IN ('seasonal', 'moment', 'discovery')
-            ORDER BY
-                CASE kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
-                updated_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind((AUTO_FOR_YOU_LIMIT.saturating_sub(nodes.len())) as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let remaining_limit = AUTO_FOR_YOU_LIMIT.saturating_sub(nodes.len()) as i64;
+        if remaining_limit <= 0 {
+            return Ok(nodes);
+        }
 
+        // Seasonal Packs, Moment Mixes, and Discovery playlists (filter offline_only BEFORE LIMIT!)
+        let playlists = if offline_only {
+            sqlx::query_as::<_, LocalPlaylist>(
+                r#"
+                SELECT DISTINCT p.*
+                FROM playlists p
+                INNER JOIN playlist_tracks pt ON pt.playlist_id = p.id
+                INNER JOIN offline_downloads od ON od.track_id = pt.track_id
+                WHERE p.kind IN ('seasonal', 'moment', 'discovery')
+                ORDER BY
+                    CASE p.kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
+                    p.updated_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(remaining_limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, LocalPlaylist>(
+                r#"
+                SELECT * FROM playlists
+                WHERE kind IN ('seasonal', 'moment', 'discovery')
+                ORDER BY
+                    CASE kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
+                    updated_at DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(remaining_limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        let offline_playlists = self.offline_playlist_set().await?;
         for pl in playlists {
-            if offline_only && !self.playlist_has_offline_tracks(&pl.id).await? {
-                continue;
-            }
-            let offline_ready = self.playlist_has_offline_tracks(&pl.id).await?;
+            let offline_ready = offline_only || offline_playlists.contains(&pl.id);
             nodes.push(AutoBrowseNode {
                 id: format!("playlist:{}", pl.id),
                 title: pl.name,
@@ -162,9 +192,6 @@ impl AutoBrowseEngine {
                 is_offline_ready: offline_ready,
                 is_pending_discovery: pl.kind == "discovery" || pl.kind == "seasonal",
             });
-            if nodes.len() >= AUTO_FOR_YOU_LIMIT {
-                break;
-            }
         }
 
         Ok(nodes)
@@ -208,9 +235,10 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let offline_playlists = self.offline_playlist_set().await?;
         let mut nodes = Vec::with_capacity(playlists.len());
         for pl in playlists {
-            let offline_ready = self.playlist_has_offline_tracks(&pl.id).await?;
+            let offline_ready = offline_only || offline_playlists.contains(&pl.id);
             nodes.push(AutoBrowseNode {
                 id: format!("playlist:{}", pl.id),
                 title: pl.name,
@@ -232,9 +260,15 @@ impl AutoBrowseEngine {
     }
 
     async fn library_root_nodes(&self) -> CoreResult<Vec<AutoBrowseNode>> {
-        let offline_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM offline_downloads")
-            .fetch_one(&self.pool)
-            .await?;
+        let offline_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(1)
+            FROM offline_downloads od
+            INNER JOIN tracks t ON t.id = od.track_id
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
 
         let mut nodes = Vec::with_capacity(2 + AZ_BUCKETS.len());
         nodes.push(AutoBrowseNode {
@@ -246,7 +280,7 @@ impl AutoBrowseEngine {
             browsable: true,
             cover_art_id: None,
             cover_art_local_path: None,
-            is_offline_ready: true,
+            is_offline_ready: offline_count > 0,
             is_pending_discovery: false,
         });
         nodes.push(folder_node(
@@ -320,23 +354,27 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let offline_albums = self.offline_album_set().await?;
         Ok(albums
             .into_iter()
-            .map(|a| AutoBrowseNode {
-                id: format!("album:{}", a.id),
-                title: a.name,
-                subtitle: Some(a.artist_name),
-                kind: AutoBrowseKind::Album,
-                playable: true,
-                browsable: true,
-                cover_art_local_path: a
-                    .cover_art_id
-                    .as_deref()
-                    .and_then(|cid| art_map.get(cid))
-                    .cloned(),
-                cover_art_id: a.cover_art_id,
-                is_offline_ready: offline_only,
-                is_pending_discovery: false,
+            .map(|a| {
+                let is_off = offline_only || offline_albums.contains(&a.id);
+                AutoBrowseNode {
+                    id: format!("album:{}", a.id),
+                    title: a.name,
+                    subtitle: Some(a.artist_name),
+                    kind: AutoBrowseKind::Album,
+                    playable: true,
+                    browsable: true,
+                    cover_art_local_path: a
+                        .cover_art_id
+                        .as_deref()
+                        .and_then(|cid| art_map.get(cid))
+                        .cloned(),
+                    cover_art_id: a.cover_art_id,
+                    is_offline_ready: is_off,
+                    is_pending_discovery: false,
+                }
             })
             .collect())
     }
@@ -371,6 +409,7 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let offline_artists = self.offline_artist_set().await?;
         let is_last_bucket = bucket_id == "az:u-z";
         let mut nodes = Vec::new();
         for artist in artists {
@@ -383,6 +422,7 @@ impl AutoBrowseEngine {
             if !matches {
                 continue;
             }
+            let is_off = offline_only || offline_artists.contains(&artist.id);
             nodes.push(AutoBrowseNode {
                 id: format!("artist:{}", artist.id),
                 title: artist.name,
@@ -396,7 +436,7 @@ impl AutoBrowseEngine {
                     .and_then(|cid| art_map.get(cid))
                     .cloned(),
                 cover_art_id: artist.cover_art_id,
-                is_offline_ready: offline_only,
+                is_offline_ready: is_off,
                 is_pending_discovery: false,
             });
             if nodes.len() >= AUTO_BUCKET_ARTISTS_LIMIT {
@@ -438,23 +478,27 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let offline_artists = self.offline_artist_set().await?;
         Ok(artists
             .into_iter()
-            .map(|ar| AutoBrowseNode {
-                id: format!("radio:artist:{}", ar.id),
-                title: format!("{} Radio", ar.name),
-                subtitle: Some("Instant station".to_string()),
-                kind: AutoBrowseKind::RadioSeed,
-                playable: true,
-                browsable: false,
-                cover_art_local_path: ar
-                    .cover_art_id
-                    .as_deref()
-                    .and_then(|cid| art_map.get(cid))
-                    .cloned(),
-                cover_art_id: ar.cover_art_id,
-                is_offline_ready: offline_only,
-                is_pending_discovery: false,
+            .map(|ar| {
+                let is_off = offline_only || offline_artists.contains(&ar.id);
+                AutoBrowseNode {
+                    id: format!("radio:artist:{}", ar.id),
+                    title: format!("{} Radio", ar.name),
+                    subtitle: Some("Instant station".to_string()),
+                    kind: AutoBrowseKind::RadioSeed,
+                    playable: true,
+                    browsable: false,
+                    cover_art_local_path: ar
+                        .cover_art_id
+                        .as_deref()
+                        .and_then(|cid| art_map.get(cid))
+                        .cloned(),
+                    cover_art_id: ar.cover_art_id,
+                    is_offline_ready: is_off,
+                    is_pending_discovery: false,
+                }
             })
             .collect())
     }
@@ -583,23 +627,27 @@ impl AutoBrowseEngine {
             .fetch_all(&self.pool)
             .await?
         };
+        let offline_albums = self.offline_album_set().await?;
         Ok(albums
             .into_iter()
-            .map(|a| AutoBrowseNode {
-                id: format!("album:{}", a.id),
-                title: a.name,
-                subtitle: a.year.map(|y| y.to_string()).or(Some(a.artist_name)),
-                kind: AutoBrowseKind::Album,
-                playable: true,
-                browsable: true,
-                cover_art_local_path: a
-                    .cover_art_id
-                    .as_deref()
-                    .and_then(|cid| art_map.get(cid))
-                    .cloned(),
-                cover_art_id: a.cover_art_id,
-                is_offline_ready: offline_only,
-                is_pending_discovery: false,
+            .map(|a| {
+                let is_off = offline_only || offline_albums.contains(&a.id);
+                AutoBrowseNode {
+                    id: format!("album:{}", a.id),
+                    title: a.name,
+                    subtitle: a.year.map(|y| y.to_string()).or(Some(a.artist_name)),
+                    kind: AutoBrowseKind::Album,
+                    playable: true,
+                    browsable: true,
+                    cover_art_local_path: a
+                        .cover_art_id
+                        .as_deref()
+                        .and_then(|cid| art_map.get(cid))
+                        .cloned(),
+                    cover_art_id: a.cover_art_id,
+                    is_offline_ready: is_off,
+                    is_pending_discovery: false,
+                }
             })
             .collect())
     }
@@ -618,6 +666,7 @@ impl AutoBrowseEngine {
                 INNER JOIN offline_downloads od ON od.track_id = t.id
                 WHERE t.album_id = ?
                 ORDER BY COALESCE(t.disc_number, 1) ASC, COALESCE(t.track_number, 0) ASC
+                LIMIT 100
                 "#,
             )
             .bind(album_id)
@@ -629,6 +678,7 @@ impl AutoBrowseEngine {
                 SELECT * FROM tracks
                 WHERE album_id = ?
                 ORDER BY COALESCE(disc_number, 1) ASC, COALESCE(track_number, 0) ASC
+                LIMIT 100
                 "#,
             )
             .bind(album_id)
@@ -653,133 +703,188 @@ impl AutoBrowseEngine {
         offline_only: bool,
     ) -> CoreResult<Option<VoiceMatchResult>> {
         let start = Instant::now();
-        let cleaned = strip_voice_prefix(raw_query);
-        if cleaned.is_empty() {
+        let (prefix_stripped, suffix_stripped) = strip_voice_affixes(raw_query);
+        let q_raw = normalize_match_text(&prefix_stripped);
+        let q_stripped = normalize_match_text(&suffix_stripped);
+        if q_raw.is_empty() && q_stripped.is_empty() {
             return Ok(None);
         }
-        let folded_query = fold_diacritics_ascii(&cleaned);
 
-        // 1. Playlists / Seasonal Packs / Moment Mixes (diacritic-insensitive match)
-        let playlists = sqlx::query_as::<_, LocalPlaylist>(
-            "SELECT * FROM playlists ORDER BY CASE kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let mut query_variants = Vec::with_capacity(2);
+        if !q_raw.is_empty() {
+            query_variants.push(q_raw.as_str());
+        }
+        if !q_stripped.is_empty() && q_stripped != q_raw {
+            query_variants.push(q_stripped.as_str());
+        }
 
+        // Rank candidate matches across Playlists, Artists, and Albums using exact & word-boundary
+        // scoring so short playlist names (e.g. "Punk") never hijack longer queries ("Play Daft Punk").
+        // Score tuple: (match_tier, kind_priority, sub_priority, coverage_bps)
+        struct RankedCandidate {
+            score: (u8, u8, u8, u32),
+            kind: VoiceMatchKind,
+            target_id: String,
+            label: String,
+            track_ids: Vec<String>,
+        }
+
+        let mut best: Option<RankedCandidate> = None;
+        let consider = |best: &mut Option<RankedCandidate>, cand: RankedCandidate| {
+            let replace = match best {
+                Some(prev) => cand.score > prev.score,
+                None => true,
+            };
+            if replace {
+                *best = Some(cand);
+            }
+        };
+
+        // 1. Playlists / Seasonal Packs / Moment Mixes
+        let playlists = sqlx::query_as::<_, LocalPlaylist>("SELECT * FROM playlists")
+            .fetch_all(&self.pool)
+            .await?;
         for pl in playlists {
-            let name_folded = fold_diacritics_ascii(&pl.name);
-            let slug_folded = pl
+            let name_norm = normalize_match_text(&pl.name);
+            let slug_norm = pl
                 .slug
                 .as_deref()
-                .map(fold_diacritics_ascii)
+                .map(normalize_match_text)
                 .unwrap_or_default();
-            if name_folded.contains(&folded_query)
-                || folded_query.contains(&name_folded)
-                || (!slug_folded.is_empty() && folded_query.contains(&slug_folded))
-            {
-                let track_ids = self.playlist_track_ids(&pl.id, offline_only).await?;
-                if !track_ids.is_empty() {
-                    return Ok(Some(VoiceMatchResult {
-                        kind: VoiceMatchKind::Playlist,
-                        target_id: pl.id,
-                        label: pl.name,
-                        track_ids,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }));
+
+            let mut best_match: Option<(u8, u32)> = None;
+            for q in &query_variants {
+                for target in [name_norm.as_str(), slug_norm.as_str()] {
+                    if let Some(m) = score_voice_match(target, q) {
+                        if best_match.is_none_or(|prev| m > prev) {
+                            best_match = Some(m);
+                        }
+                    }
+                }
+            }
+
+            if let Some((tier, coverage)) = best_match {
+                let pl_sub_prio = match pl.kind.as_str() {
+                    "seasonal" => 3,
+                    "moment" => 2,
+                    "discovery" => 1,
+                    _ => 0,
+                };
+                // Playlists take slight priority on equal tier (e.g. seasonal mixes).
+                let score = (tier, 3, pl_sub_prio, coverage);
+                if best.as_ref().is_none_or(|b| score > b.score) {
+                    let track_ids = self.playlist_track_ids(&pl.id, offline_only).await?;
+                    if !track_ids.is_empty() {
+                        consider(
+                            &mut best,
+                            RankedCandidate {
+                                score,
+                                kind: VoiceMatchKind::Playlist,
+                                target_id: pl.id,
+                                label: pl.name,
+                                track_ids,
+                            },
+                        );
+                    }
                 }
             }
         }
 
-        // 2. Artists
-        let artists = sqlx::query_as::<_, LocalArtist>("SELECT * FROM artists")
-            .fetch_all(&self.pool)
-            .await?;
-        for artist in artists {
-            let artist_folded = fold_diacritics_ascii(&artist.name);
-            if artist_folded == folded_query || artist_folded.contains(&folded_query) {
-                let track_ids: Vec<String> = if offline_only {
-                    sqlx::query_scalar(
-                        r#"
-                        SELECT t.id FROM tracks t
-                        INNER JOIN offline_downloads od ON od.track_id = t.id
-                        WHERE t.artist_id = ?
-                        ORDER BY t.starred DESC, t.play_count DESC
-                        LIMIT 50
-                        "#,
-                    )
-                    .bind(&artist.id)
+        // Only scan Artists & Albums if we don't already have an unbeatable Tier-4 exact Playlist match.
+        let have_exact_playlist = best
+            .as_ref()
+            .is_some_and(|b| b.kind == VoiceMatchKind::Playlist && b.score.0 == 4);
+
+        if !have_exact_playlist {
+            // 2. Artists
+            let artists = sqlx::query_as::<_, LocalArtist>("SELECT * FROM artists")
+                .fetch_all(&self.pool)
+                .await?;
+            for artist in artists {
+                let artist_norm = normalize_match_text(&artist.name);
+                let mut best_match: Option<(u8, u32)> = None;
+                for q in &query_variants {
+                    if let Some(m) = score_voice_match(&artist_norm, q) {
+                        if best_match.is_none_or(|prev| m > prev) {
+                            best_match = Some(m);
+                        }
+                    }
+                }
+                if let Some((tier, coverage)) = best_match {
+                    let score = (tier, 2, 0, coverage);
+                    if best.as_ref().is_none_or(|b| score > b.score) {
+                        let track_ids = self.artist_track_ids(&artist.id, offline_only).await?;
+                        if !track_ids.is_empty() {
+                            consider(
+                                &mut best,
+                                RankedCandidate {
+                                    score,
+                                    kind: VoiceMatchKind::Artist,
+                                    target_id: artist.id,
+                                    label: artist.name,
+                                    track_ids,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 3. Albums
+            let have_exact_artist = best.as_ref().is_some_and(|b| b.score.0 == 4);
+            if !have_exact_artist {
+                let albums = sqlx::query_as::<_, LocalAlbum>("SELECT * FROM albums")
                     .fetch_all(&self.pool)
-                    .await?
-                } else {
-                    sqlx::query_scalar(
-                        r#"
-                        SELECT id FROM tracks
-                        WHERE artist_id = ?
-                        ORDER BY starred DESC, play_count DESC
-                        LIMIT 50
-                        "#,
-                    )
-                    .bind(&artist.id)
-                    .fetch_all(&self.pool)
-                    .await?
-                };
-                if !track_ids.is_empty() {
-                    return Ok(Some(VoiceMatchResult {
-                        kind: VoiceMatchKind::Artist,
-                        target_id: artist.id,
-                        label: artist.name,
-                        track_ids,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }));
+                    .await?;
+                for album in albums {
+                    let album_norm = normalize_match_text(&album.name);
+                    let mut best_match: Option<(u8, u32)> = None;
+                    for q in &query_variants {
+                        if let Some(m) = score_voice_match(&album_norm, q) {
+                            if best_match.is_none_or(|prev| m > prev) {
+                                best_match = Some(m);
+                            }
+                        }
+                    }
+                    if let Some((tier, coverage)) = best_match {
+                        let score = (tier, 1, 0, coverage);
+                        if best.as_ref().is_none_or(|b| score > b.score) {
+                            let track_ids = self.album_track_ids(&album.id, offline_only).await?;
+                            if !track_ids.is_empty() {
+                                consider(
+                                    &mut best,
+                                    RankedCandidate {
+                                        score,
+                                        kind: VoiceMatchKind::Album,
+                                        target_id: album.id,
+                                        label: album.name,
+                                        track_ids,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // 3. Albums
-        let albums = sqlx::query_as::<_, LocalAlbum>("SELECT * FROM albums")
-            .fetch_all(&self.pool)
-            .await?;
-        for album in albums {
-            let album_folded = fold_diacritics_ascii(&album.name);
-            if album_folded == folded_query || album_folded.contains(&folded_query) {
-                let track_ids: Vec<String> = if offline_only {
-                    sqlx::query_scalar(
-                        r#"
-                        SELECT t.id FROM tracks t
-                        INNER JOIN offline_downloads od ON od.track_id = t.id
-                        WHERE t.album_id = ?
-                        ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0)
-                        "#,
-                    )
-                    .bind(&album.id)
-                    .fetch_all(&self.pool)
-                    .await?
-                } else {
-                    sqlx::query_scalar(
-                        r#"
-                        SELECT id FROM tracks
-                        WHERE album_id = ?
-                        ORDER BY COALESCE(disc_number, 1), COALESCE(track_number, 0)
-                        "#,
-                    )
-                    .bind(&album.id)
-                    .fetch_all(&self.pool)
-                    .await?
-                };
-                if !track_ids.is_empty() {
-                    return Ok(Some(VoiceMatchResult {
-                        kind: VoiceMatchKind::Album,
-                        target_id: album.id,
-                        label: album.name,
-                        track_ids,
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }));
-                }
-            }
+        if let Some(winner) = best {
+            return Ok(Some(VoiceMatchResult {
+                kind: winner.kind,
+                target_id: winner.target_id,
+                label: winner.label,
+                track_ids: winner.track_ids,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }));
         }
 
         // 4. FTS5 Track lookup
-        if let Some(fts) = build_fts5_query(&cleaned) {
+        let fts_source = if !suffix_stripped.is_empty() {
+            suffix_stripped.as_str()
+        } else {
+            prefix_stripped.as_str()
+        };
+        if let Some(fts) = build_fts5_query(fts_source) {
             let tracks = if offline_only {
                 sqlx::query_as::<_, LocalTrack>(
                     r#"
@@ -865,19 +970,72 @@ impl AutoBrowseEngine {
         Ok(ids)
     }
 
-    async fn playlist_has_offline_tracks(&self, playlist_id: &str) -> CoreResult<bool> {
-        let count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(1)
-            FROM playlist_tracks pt
-            INNER JOIN offline_downloads od ON od.track_id = pt.track_id
-            WHERE pt.playlist_id = ?
-            "#,
-        )
-        .bind(playlist_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count > 0)
+    async fn artist_track_ids(
+        &self,
+        artist_id: &str,
+        offline_only: bool,
+    ) -> CoreResult<Vec<String>> {
+        let ids = if offline_only {
+            sqlx::query_scalar(
+                r#"
+                SELECT t.id FROM tracks t
+                INNER JOIN offline_downloads od ON od.track_id = t.id
+                WHERE t.artist_id = ?
+                ORDER BY t.starred DESC, t.play_count DESC
+                LIMIT 50
+                "#,
+            )
+            .bind(artist_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT id FROM tracks
+                WHERE artist_id = ?
+                ORDER BY starred DESC, play_count DESC
+                LIMIT 50
+                "#,
+            )
+            .bind(artist_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(ids)
+    }
+
+    async fn album_track_ids(
+        &self,
+        album_id: &str,
+        offline_only: bool,
+    ) -> CoreResult<Vec<String>> {
+        let ids = if offline_only {
+            sqlx::query_scalar(
+                r#"
+                SELECT t.id FROM tracks t
+                INNER JOIN offline_downloads od ON od.track_id = t.id
+                WHERE t.album_id = ?
+                ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0)
+                LIMIT 100
+                "#,
+            )
+            .bind(album_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                SELECT id FROM tracks
+                WHERE album_id = ?
+                ORDER BY COALESCE(disc_number, 1), COALESCE(track_number, 0)
+                LIMIT 100
+                "#,
+            )
+            .bind(album_id)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(ids)
     }
 
     async fn cover_art_map(&self) -> CoreResult<HashMap<String, String>> {
@@ -888,10 +1046,51 @@ impl AutoBrowseEngine {
         Ok(rows.into_iter().collect())
     }
 
-    async fn offline_track_set(&self) -> CoreResult<std::collections::HashSet<String>> {
+    async fn offline_track_set(&self) -> CoreResult<HashSet<String>> {
         let ids: Vec<String> = sqlx::query_scalar("SELECT track_id FROM offline_downloads")
             .fetch_all(&self.pool)
             .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn offline_playlist_set(&self) -> CoreResult<HashSet<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT pt.playlist_id
+            FROM playlist_tracks pt
+            INNER JOIN offline_downloads od ON od.track_id = pt.track_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn offline_album_set(&self) -> CoreResult<HashSet<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT t.album_id
+            FROM tracks t
+            INNER JOIN offline_downloads od ON od.track_id = t.id
+            WHERE t.album_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn offline_artist_set(&self) -> CoreResult<HashSet<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT t.artist_id
+            FROM tracks t
+            INNER JOIN offline_downloads od ON od.track_id = t.id
+            WHERE t.artist_id IS NOT NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(ids.into_iter().collect())
     }
 }
@@ -941,18 +1140,25 @@ fn track_to_node(
 
 fn first_sort_char(name: &str) -> char {
     let trimmed = name.trim();
-    let stripped = trimmed
-        .strip_prefix("The ")
-        .or_else(|| trimmed.strip_prefix("the "))
-        .unwrap_or(trimmed);
-    stripped
+    let stripped = if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("the "))
+    {
+        trimmed[4..].trim_start()
+    } else {
+        trimmed
+    };
+    let folded = fold_diacritics_ascii(stripped);
+    folded
         .chars()
         .next()
         .map(|c| c.to_ascii_uppercase())
         .unwrap_or('#')
 }
 
-fn strip_voice_prefix(raw: &str) -> String {
+/// Returns `(prefix_stripped, prefix_and_suffix_stripped)` so both exact names like `"Drive Mix"`
+/// and spoken intents like `"Play Noël mix"` rank accurately.
+fn strip_voice_affixes(raw: &str) -> (String, String) {
     let mut s = raw.trim().to_string();
     let lower = s.to_ascii_lowercase();
     for prefix in [
@@ -971,30 +1177,141 @@ fn strip_voice_prefix(raw: &str) -> String {
             break;
         }
     }
-    let lower2 = s.to_ascii_lowercase();
-    for suffix in [" playlist", " radio"] {
+
+    let mut stripped = s.clone();
+    let lower2 = stripped.to_ascii_lowercase();
+    for suffix in [" playlist", " radio", " mix"] {
         if lower2.ends_with(suffix) {
-            s = s[..s.len() - suffix.len()].trim().to_string();
+            stripped = stripped[..stripped.len() - suffix.len()].trim().to_string();
             break;
         }
     }
-    s
+
+    (s, stripped)
 }
 
-/// Lightweight diacritic folder for Latin characters so `"Noel mix"` matches `"Noël à la Française"`.
+/// Scores how well `candidate` matches `query` (both already normalized via `normalize_match_text`).
+/// Returns `Some((tier, coverage_bps))` where higher tiers represent stronger matches:
+/// - Tier 4: exact normalized match
+/// - Tier 3: candidate starts with query on a word boundary
+/// - Tier 2: candidate contains query as a contiguous word-bounded phrase, or contains every query word
+/// - Tier 1: every query token is a word-prefix of some word in candidate (query length >= 3)
+fn score_voice_match(candidate: &str, query: &str) -> Option<(u8, u32)> {
+    if candidate.is_empty() || query.is_empty() {
+        return None;
+    }
+
+    let coverage = ((query.len() as u64 * 10_000) / candidate.len().max(1) as u64).min(10_000) as u32;
+
+    if candidate == query {
+        return Some((4, 10_000));
+    }
+
+    if let Some(rest) = candidate.strip_prefix(query) {
+        if rest.is_empty() || rest.starts_with(' ') {
+            return Some((3, coverage));
+        }
+    }
+
+    let cand_words: Vec<&str> = candidate.split_whitespace().collect();
+    let query_words: Vec<&str> = query.split_whitespace().collect();
+    if query_words.is_empty() {
+        return None;
+    }
+
+    // Contiguous whole-word sequence match inside candidate
+    if cand_words.len() >= query_words.len()
+        && cand_words
+            .windows(query_words.len())
+            .any(|w| w == query_words.as_slice())
+    {
+        return Some((2, coverage));
+    }
+
+    // All query words appear as whole words in candidate (in any order)
+    if query_words
+        .iter()
+        .all(|qw| cand_words.iter().any(|cw| cw == qw))
+    {
+        return Some((2, coverage.saturating_sub(1)));
+    }
+
+    // Prefix match on words (require at least 3 chars in query to avoid noisy 1-2 char matches)
+    if query.len() >= 3
+        && query_words
+            .iter()
+            .all(|qw| cand_words.iter().any(|cw| cw.starts_with(qw)))
+    {
+        return Some((1, coverage));
+    }
+
+    None
+}
+
+/// Normalizes text for voice & slug matching: folds diacritics/ligatures, converts `_`, `-`, and
+/// punctuation into spaces, and collapses consecutive whitespace.
+fn normalize_match_text(input: &str) -> String {
+    let folded = fold_diacritics_ascii(input);
+    let mut out = String::with_capacity(folded.len());
+    let mut prev_space = true;
+    for ch in folded.chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Unicode-aware Latin diacritic & ligature folder (handles precomposed characters, `œ/æ/ß`,
+/// and strips NFD combining diacritical marks so `"Noël"`, `"Noe\u{0308}l"`, and `"Édith"` all fold cleanly).
 fn fold_diacritics_ascii(input: &str) -> String {
-    input
-        .chars()
-        .map(|ch| match ch {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'a',
-            'ç' | 'Ç' => 'c',
-            'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => 'e',
-            'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => 'i',
-            'ñ' | 'Ñ' => 'n',
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' => 'o',
-            'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => 'u',
-            'ý' | 'ÿ' | 'Ý' | 'Ÿ' => 'y',
-            other => other.to_ascii_lowercase(),
-        })
-        .collect()
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        // Skip Unicode combining diacritical marks (NFD decomposition).
+        if matches!(
+            ch,
+            '\u{0300}'..='\u{036F}'
+                | '\u{1AB0}'..='\u{1AFF}'
+                | '\u{1DC0}'..='\u{1DFF}'
+                | '\u{20D0}'..='\u{20FF}'
+                | '\u{FE20}'..='\u{FE2F}'
+        ) {
+            continue;
+        }
+        match ch {
+            'œ' | 'Œ' => out.push_str("oe"),
+            'æ' | 'Æ' => out.push_str("ae"),
+            'ß' | 'ẞ' => out.push_str("ss"),
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą'
+            | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' | 'Ā' | 'Ă' | 'Ą' => out.push('a'),
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' | 'Ç' | 'Ć' | 'Ĉ' | 'Ċ' | 'Č' => out.push('c'),
+            'ď' | 'đ' | 'Ď' | 'Đ' => out.push('d'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě'
+            | 'È' | 'É' | 'Ê' | 'Ë' | 'Ē' | 'Ĕ' | 'Ė' | 'Ę' | 'Ě' => out.push('e'),
+            'ğ' | 'ĝ' | 'ġ' | 'ģ' | 'Ğ' | 'Ĝ' | 'Ġ' | 'Ģ' => out.push('g'),
+            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı'
+            | 'Ì' | 'Í' | 'Î' | 'Ï' | 'Ĩ' | 'Ī' | 'Ĭ' | 'Į' | 'İ' => out.push('i'),
+            'ł' | 'ĺ' | 'ļ' | 'ľ' | 'Ł' | 'Ĺ' | 'Ļ' | 'Ľ' => out.push('l'),
+            'ñ' | 'ń' | 'ņ' | 'ň' | 'Ñ' | 'Ń' | 'Ņ' | 'Ň' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő'
+            | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' | 'Ø' | 'Ō' | 'Ŏ' | 'Ő' => out.push('o'),
+            'ŕ' | 'ŗ' | 'ř' | 'Ŕ' | 'Ŗ' | 'Ř' => out.push('r'),
+            'ś' | 'ŝ' | 'ş' | 'š' | 'Ś' | 'Ŝ' | 'Ş' | 'Š' => out.push('s'),
+            'ţ' | 'ť' | 'ŧ' | 'Ţ' | 'Ť' | 'Ŧ' => out.push('t'),
+            'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų'
+            | 'Ù' | 'Ú' | 'Û' | 'Ü' | 'Ũ' | 'Ū' | 'Ŭ' | 'Ů' | 'Ű' | 'Ų' => out.push('u'),
+            'ý' | 'ÿ' | 'ŷ' | 'Ý' | 'Ÿ' | 'Ŷ' => out.push('y'),
+            'ź' | 'ż' | 'ž' | 'Ź' | 'Ż' | 'Ž' => out.push('z'),
+            other => {
+                for lc in other.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+        }
+    }
+    out
 }

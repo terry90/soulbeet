@@ -1,12 +1,17 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde_json::json;
+use shared::metadata::SearchResult;
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 
 use crate::error::CoreResult;
-use crate::models::{LocalAlbum, LocalArtist, LocalTrack, RemoteCatalogTrack, SearchResults};
+use crate::models::{
+    LocalAlbum, LocalArtist, LocalTrack, RemoteCatalogTrack, SearchResults, SoulbeetAuth,
+};
 
 /// Sub-millisecond local FTS5 search engine merged with online Soulbeet MusicBrainz catalog results.
 /// Completely suppresses remote queries when `offline_only == true`.
@@ -15,7 +20,7 @@ pub struct SearchEngine {
     pool: SqlitePool,
     http: Client,
     soulbeet_base_url: Option<String>,
-    soulbeet_auth_header: Option<String>,
+    soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
 }
 
 impl SearchEngine {
@@ -23,13 +28,13 @@ impl SearchEngine {
         pool: SqlitePool,
         http: Client,
         soulbeet_base_url: Option<String>,
-        soulbeet_auth_header: Option<String>,
+        soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     ) -> Self {
         Self {
             pool,
             http,
             soulbeet_base_url,
-            soulbeet_auth_header,
+            soulbeet_auth,
         }
     }
 
@@ -128,7 +133,10 @@ impl SearchEngine {
         let remote_tracks = if !offline_only {
             match self.fetch_remote_catalog(trimmed, limit).await {
                 Ok(remote) => deduplicate_remote(&local_tracks, remote),
-                Err(_) => Vec::new(),
+                Err(err) => {
+                    tracing::warn!(query = %trimmed, "remote catalog search failed: {err}");
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -198,46 +206,61 @@ impl SearchEngine {
         let Some(base) = self.soulbeet_base_url.as_deref() else {
             return Ok(Vec::new());
         };
-        let url = format!("{}/api/search/catalog", base.trim_end_matches('/'));
-        let mut req = self.http.get(&url).query(&[
-            ("q", query.to_string()),
-            ("limit", limit.to_string()),
-        ]);
-        if let Some(auth) = &self.soulbeet_auth_header {
-            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        let url = format!("{}/api/metadata/search/track", base.trim_end_matches('/'));
+        let mut req = self.http.post(&url).json(&json!({
+            "input": {
+                "artist": null,
+                "query": query,
+            }
+        }));
+        if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
+            let (name, val) = auth.header_name_and_value();
+            req = req.header(name, val);
         }
         let resp = req.send().await?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = status.as_u16(),
+                query = %query,
+                body = %body,
+                "POST /api/metadata/search/track returned non-2xx"
+            );
             return Ok(Vec::new());
         }
 
-        #[derive(Deserialize)]
-        struct WireCatalogItem {
-            #[serde(default)]
-            mbid: Option<String>,
-            title: String,
-            artist: String,
-            #[serde(default)]
-            album: Option<String>,
-            #[serde(default)]
-            duration_secs: Option<u64>,
-            #[serde(default)]
-            year: Option<i32>,
-        }
+        let items: Vec<SearchResult> = match resp.json().await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    query = %query,
+                    "failed to decode POST /api/metadata/search/track response: {err}"
+                );
+                return Ok(Vec::new());
+            }
+        };
 
-        let items: Vec<WireCatalogItem> = resp.json().await.unwrap_or_default();
         Ok(items
             .into_iter()
-            .map(|i| RemoteCatalogTrack {
-                mbid: i.mbid,
-                title: i.title,
-                artist: i.artist,
-                album: i.album,
-                duration_secs: i.duration_secs,
-                year: i.year,
+            .filter_map(|item| match item {
+                SearchResult::Track(t) => Some(RemoteCatalogTrack {
+                    duration_secs: t.duration_secs().map(u64::from),
+                    year: parse_release_year(t.release_date.as_deref()),
+                    mbid: t.mbid,
+                    title: t.title,
+                    artist: t.artist,
+                    album: t.album_title,
+                }),
+                SearchResult::Album(_) => None,
             })
+            .take(limit.clamp(1, 100))
             .collect())
     }
+}
+
+fn parse_release_year(release_date: Option<&str>) -> Option<i32> {
+    release_date?.get(..4)?.parse::<i32>().ok()
 }
 
 /// Converts arbitrary user input into a safe FTS5 prefix-matching query string.

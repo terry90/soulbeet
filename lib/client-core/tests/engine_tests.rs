@@ -5,45 +5,81 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use client_core::auto_browse::{
-    AUTO_LIB_OFFLINE, AUTO_LIB_RECENT, AUTO_PLAYLISTS_LIMIT, AUTO_RECENT_LIMIT, AUTO_ROOT_ID,
-    AUTO_TAB_FOR_YOU, AUTO_TAB_LIBRARY, AUTO_TAB_PLAYLISTS, AUTO_TAB_RADIO,
+    AUTO_FOR_YOU_LIMIT, AUTO_LIB_OFFLINE, AUTO_LIB_RECENT, AUTO_PLAYLISTS_LIMIT,
+    AUTO_RECENT_LIMIT, AUTO_ROOT_ID, AUTO_TAB_FOR_YOU, AUTO_TAB_LIBRARY, AUTO_TAB_PLAYLISTS,
+    AUTO_TAB_RADIO,
 };
 use client_core::db::{
-    get_track, now_unix, replace_playlist_tracks, upsert_album, upsert_artist, upsert_playlist,
-    upsert_track,
+    get_cursor, get_track, now_unix, replace_playlist_tracks, upsert_album, upsert_artist,
+    upsert_playlist, upsert_track,
 };
 use client_core::error::CoreError;
 use client_core::models::{
     AudioQualityProfile, CachePolicy, ClientConfig, ConnectClientMessageDto, ConnectCommandDto,
     ConnectDeviceDto, ConnectServerEventDto, DevicePlatform, LocalAlbum, LocalArtist,
     LocalPlaylist, LocalTrack, NavidromeCredentials, OutboxMutation, PersistedPlaybackSession,
-    PinTarget, PlaybackSnapshotDto, PlaybackSource, VoiceMatchKind,
+    PinTarget, PlaybackSnapshotDto, PlaybackSource, SoulbeetAuth, VoiceMatchKind,
 };
+use client_core::sync::CURSOR_PROMOTE_THRESHOLD;
 use client_core::SoulbeetCore;
 use serde_json::{json, Value};
+use shared::metadata::{SearchResult as MetadataSearchResult, Track as MetadataTrack};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct StubState {
+    base_url: Mutex<String>,
     playlist_fetch_count: AtomicUsize,
     remote_search_hits: AtomicUsize,
-    fail_star: AtomicBool,
+    fail_star_409_retryable: AtomicBool,
+    fail_drop_409_permanent: AtomicBool,
     curation_log: Mutex<Vec<String>>,
     new_album_enabled: AtomicBool,
+    bootstrap_returns_no_navidrome: AtomicBool,
+    hide_extra_playlist: AtomicBool,
+    download_returns_json_error: AtomicBool,
+    cover_art_returns_json_error: AtomicBool,
+    ws_query_params: Mutex<Option<HashMap<String, String>>>,
+    accepted_auth_token: Mutex<String>,
+}
+
+async fn check_soulbeet_auth(st: &StubState, headers: &HeaderMap) -> bool {
+    let expected = st.accepted_auth_token.lock().await.clone();
+    if let Some(auth) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if auth == format!("Bearer {expected}") {
+            return true;
+        }
+    }
+    if let Some(cookie) = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if cookie
+            .split(';')
+            .any(|part| part.trim() == format!("auth_token={expected}"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn start_stub_server(state: Arc<StubState>) -> String {
+    *state.accepted_auth_token.lock().await = "test-token".to_string();
     let app = Router::new()
         .route("/api/client/bootstrap", get(handle_bootstrap))
         .route("/api/discovery/triage", get(handle_triage))
-        .route("/api/search/catalog", get(handle_remote_search))
+        .route("/api/metadata/search/track", post(handle_remote_search))
         .route("/api/curation/star", post(handle_curation_star))
         .route("/api/curation/rate", post(handle_curation_rate))
         .route("/api/curation/keep", post(handle_curation_keep))
@@ -60,110 +96,242 @@ async fn start_stub_server(state: Arc<StubState>) -> String {
         .route("/rest/download", get(handle_download))
         .route("/rest/stream", get(handle_stream))
         .route("/rest/getCoverArt", get(handle_cover_art))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    *state.base_url.lock().await = url.clone();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    url
 }
 
-async fn handle_bootstrap() -> Json<Value> {
-    Json(json!({
-        "user_id": "u1",
-        "username": "alice",
-        "is_admin": false,
-        "navidrome": null,
-        "promote_threshold": 4,
-        "auto_delete_enabled": true,
-        "discovery_enabled": true
-    }))
+async fn handle_bootstrap(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    let navidrome = if st.bootstrap_returns_no_navidrome.load(Ordering::SeqCst) {
+        Value::Null
+    } else {
+        let base_url = st.base_url.lock().await.clone();
+        json!({
+            "base_url": base_url,
+            "username": "alice",
+            "subsonic_salt": "salt",
+            "subsonic_token": "token",
+            "api_version": "1.16.1",
+            "client_name": "Soulbeet"
+        })
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "user_id": "u1",
+            "username": "alice",
+            "is_admin": false,
+            "navidrome": navidrome,
+            "promote_threshold": 4,
+            "auto_delete_enabled": true,
+            "discovery_enabled": true
+        })),
+    )
 }
 
-async fn handle_triage() -> Json<Value> {
-    Json(json!([
-        {
-            "id": "disc-1",
-            "song_id": "s2",
-            "artist": "Justice",
-            "title": "D.A.N.C.E.",
-            "album": "Cross",
-            "profile_slug": "weekly_radar",
-            "status": "pending",
-            "exclude_from_core_taste": false
-        }
-    ]))
+async fn handle_triage(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    // Real PR #129 DiscoveryTrack wire shape with PascalCase status, path, profile, pack_slug, created_at
+    (
+        StatusCode::OK,
+        Json(json!([
+            {
+                "id": "disc-1",
+                "song_id": "s2",
+                "artist": "Justice",
+                "title": "D.A.N.C.E.",
+                "album": "Cross",
+                "path": "Discovery/Balanced/Justice - DANCE.flac",
+                "folder_id": "f-disc",
+                "profile": "weekly_radar",
+                "rating": null,
+                "status": "Pending",
+                "created_at": "2026-11-20T09:00:00Z",
+                "exclude_from_core_taste": false,
+                "reason": { "summary": "Matches your French electro plays" },
+                "culture_bucket": "local",
+                "pack_slug": "winter_holiday"
+            }
+        ])),
+    )
 }
 
-async fn handle_remote_search(State(st): State<Arc<StubState>>) -> Json<Value> {
+async fn handle_remote_search(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    // Enforce Dioxus 0.7 #[post("/api/metadata/search/track")] `{ "input": { "artist": null, "query": ... } }`
+    if body.get("input").and_then(|i| i.get("query")).and_then(Value::as_str).is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "expected { input: { artist, query } }" })),
+        );
+    }
     st.remote_search_hits.fetch_add(1, Ordering::SeqCst);
-    Json(json!([
-        {
-            "mbid": "mb-owned",
-            "title": "Get Lucky",
-            "artist": "Daft Punk",
-            "album": "Random Access Memories",
-            "duration_secs": 369,
-            "year": 2013
-        },
-        {
-            "mbid": "mb-unowned",
-            "title": "Instant Crush",
-            "artist": "Daft Punk",
-            "album": "Random Access Memories",
-            "duration_secs": 337,
-            "year": 2013
-        }
-    ]))
+    let results = vec![
+        MetadataSearchResult::Track(MetadataTrack {
+            id: "mb-owned".to_string(),
+            title: "Get Lucky".to_string(),
+            artist: "Daft Punk".to_string(),
+            album_id: Some("al-mb-1".to_string()),
+            album_title: Some("Random Access Memories".to_string()),
+            release_date: Some("2013-05-17".to_string()),
+            duration: Some("06:09".to_string()),
+            mbid: Some("mb-owned".to_string()),
+            release_mbid: None,
+        }),
+        MetadataSearchResult::Track(MetadataTrack {
+            id: "mb-unowned".to_string(),
+            title: "Instant Crush".to_string(),
+            artist: "Daft Punk".to_string(),
+            album_id: Some("al-mb-1".to_string()),
+            album_title: Some("Random Access Memories".to_string()),
+            release_date: Some("2013-05-17".to_string()),
+            duration: Some("05:37".to_string()),
+            mbid: Some("mb-unowned".to_string()),
+            release_mbid: None,
+        }),
+    ];
+    (StatusCode::OK, Json(serde_json::to_value(results).unwrap()))
 }
 
 async fn handle_curation_star(
     State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if st.fail_star.load(Ordering::SeqCst) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "transient error");
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
     }
-    let id = body["song_id"].as_str().unwrap_or_default();
-    let starred = body["starred"].as_bool().unwrap_or(false);
+    let Some(req) = body.get("req") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing Dioxus req wrapper" })),
+        );
+    };
+    if st.fail_star_409_retryable.load(Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "message": "Navidrome temporarily unreachable",
+                "code": 409,
+                "details": {
+                    "code": "navidrome_unreachable",
+                    "stage": "library_check",
+                    "message": "Navidrome temporarily unreachable",
+                    "retry": "same_source_later",
+                    "retry_advice": "retryable",
+                    "retry_after_seconds": 30
+                }
+            })),
+        );
+    }
+    let id = req["song_id"].as_str().unwrap_or_default();
+    let starred = req["starred"].as_bool().unwrap_or(false);
     st.curation_log
         .lock()
         .await
         .push(format!("star:{id}:{starred}"));
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn handle_curation_rate(
     State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let id = body["song_id"].as_str().unwrap_or_default();
-    let rating = body["rating"].as_u64().unwrap_or(0);
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    let Some(req) = body.get("req") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing Dioxus req wrapper" })),
+        );
+    };
+    let id = req["song_id"].as_str().unwrap_or_default();
+    let rating = req["rating"].as_u64().unwrap_or(0);
     st.curation_log
         .lock()
         .await
         .push(format!("rate:{id}:{rating}"));
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn handle_curation_keep(
     State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let id = body["song_id"].as_str().unwrap_or_default();
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    let Some(req) = body.get("req") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing Dioxus req wrapper" })),
+        );
+    };
+    let id = req["song_id"].as_str().unwrap_or_default();
     st.curation_log.lock().await.push(format!("keep:{id}"));
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn handle_curation_drop(
     State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let id = body["song_id"].as_str().unwrap_or_default();
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
+    }
+    let Some(req) = body.get("req") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing Dioxus req wrapper" })),
+        );
+    };
+    if st.fail_drop_409_permanent.load(Ordering::SeqCst) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "message": "Track protected by another listener",
+                "code": 409,
+                "details": {
+                    "code": "delete_blocked_by_other_user",
+                    "stage": "delete",
+                    "message": "Track protected by another listener",
+                    "retry": "not_retryable",
+                    "retry_advice": "not_retryable"
+                }
+            })),
+        );
+    }
+    let id = req["song_id"].as_str().unwrap_or_default();
     st.curation_log.lock().await.push(format!("drop:{id}"));
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn handle_scrobble(
@@ -308,6 +476,7 @@ async fn handle_get_album(Query(q): Query<HashMap<String, String>>) -> Json<Valu
                     "track": 1,
                     "duration": 320,
                     "genre": "French House",
+                    "path": "Daft Punk/Discovery/01 One More Time.flac",
                     "coverArt": "ca-al2"
                 }
             ]
@@ -316,37 +485,54 @@ async fn handle_get_album(Query(q): Query<HashMap<String, String>>) -> Json<Valu
     Json(json!({ "subsonic-response": { "status": "ok", "album": album } }))
 }
 
-async fn handle_get_playlists() -> Json<Value> {
+async fn handle_get_playlists(State(st): State<Arc<StubState>>) -> Json<Value> {
+    let mut pls = vec![json!({
+        "id": "pl1",
+        "name": "Noël à la Française",
+        "comment": "seasonal:winter_holiday",
+        "owner": "alice",
+        "songCount": 1,
+        "duration": 369,
+        "coverArt": "ca-pl1",
+        "changed": "2026-11-15T12:00:00Z"
+    })];
+    if !st.hide_extra_playlist.load(Ordering::SeqCst) {
+        pls.push(json!({
+            "id": "pl-ephemeral",
+            "name": "Temp Mix",
+            "comment": null,
+            "owner": "alice",
+            "songCount": 1,
+            "duration": 369,
+            "coverArt": null,
+            "changed": "2026-11-15T12:00:00Z"
+        }));
+    }
     Json(json!({
         "subsonic-response": {
             "status": "ok",
             "playlists": {
-                "playlist": [
-                    {
-                        "id": "pl1",
-                        "name": "Noël à la Française",
-                        "comment": "seasonal:winter_holiday",
-                        "owner": "alice",
-                        "songCount": 1,
-                        "duration": 369,
-                        "coverArt": "ca-pl1",
-                        "changed": "2026-11-15T12:00:00Z"
-                    }
-                ]
+                "playlist": pls
             }
         }
     }))
 }
 
-async fn handle_get_playlist(State(st): State<Arc<StubState>>) -> Json<Value> {
-    st.playlist_fetch_count.fetch_add(1, Ordering::SeqCst);
+async fn handle_get_playlist(
+    State(st): State<Arc<StubState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let pl_id = q.get("id").cloned().unwrap_or_else(|| "pl1".to_string());
+    if pl_id == "pl1" {
+        st.playlist_fetch_count.fetch_add(1, Ordering::SeqCst);
+    }
     Json(json!({
         "subsonic-response": {
             "status": "ok",
             "playlist": {
-                "id": "pl1",
-                "name": "Noël à la Française",
-                "comment": "seasonal:winter_holiday",
+                "id": pl_id,
+                "name": if pl_id == "pl1" { "Noël à la Française" } else { "Temp Mix" },
+                "comment": if pl_id == "pl1" { json!("seasonal:winter_holiday") } else { Value::Null },
                 "owner": "alice",
                 "songCount": 1,
                 "duration": 369,
@@ -373,8 +559,8 @@ async fn handle_get_starred2() -> Json<Value> {
         "subsonic-response": {
             "status": "ok",
             "starred2": {
-                "artist": [],
-                "album": [],
+                "artist": [{ "id": "ar1", "name": "Daft Punk", "albumCount": 2 }],
+                "album": [{ "id": "al1", "name": "Random Access Memories", "artist": "Daft Punk" }],
                 "song": []
             }
         }
@@ -392,7 +578,18 @@ async fn handle_get_genres() -> Json<Value> {
     }))
 }
 
-async fn handle_download() -> impl IntoResponse {
+async fn handle_download(State(st): State<Arc<StubState>>) -> impl IntoResponse {
+    if st.download_returns_json_error.load(Ordering::SeqCst) {
+        let body = serde_json::to_vec(&json!({
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": { "code": 70, "message": "Requested data was not found" }
+            }
+        }))
+        .unwrap();
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], body);
+    }
     (
         [(axum::http::header::CONTENT_TYPE, "audio/flac")],
         vec![0x42u8; 4096],
@@ -406,64 +603,119 @@ async fn handle_stream() -> impl IntoResponse {
     )
 }
 
-async fn handle_cover_art() -> impl IntoResponse {
+async fn handle_cover_art(State(st): State<Arc<StubState>>) -> impl IntoResponse {
+    if st.cover_art_returns_json_error.load(Ordering::SeqCst) {
+        let body = serde_json::to_vec(&json!({
+            "subsonic-response": {
+                "status": "failed",
+                "version": "1.16.1",
+                "error": { "code": 70, "message": "Cover art not found" }
+            }
+        }))
+        .unwrap();
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], body);
+    }
     (
         [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
         vec![0xFFu8, 0xD8, 0xFF, 0xD9],
     )
 }
 
-async fn handle_ws_connect(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_ws_socket)
+async fn handle_ws_connect(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    *st.ws_query_params.lock().await = Some(q);
+    ws.on_upgrade(handle_ws_socket).into_response()
 }
 
 async fn handle_ws_socket(mut socket: WebSocket) {
+    // Emit JSON over Message::Binary just like Dioxus 0.7 TypedWebsocket!
     while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            let Ok(client_msg) = serde_json::from_str::<ConnectClientMessageDto>(&text) else {
-                continue;
-            };
-            match client_msg {
-                ConnectClientMessageDto::Register {
-                    device_id,
-                    name,
-                    platform,
-                } => {
-                    let event = ConnectServerEventDto::DeviceList {
-                        devices: vec![ConnectDeviceDto {
+        let raw_bytes: Option<Vec<u8>> = match msg {
+            Message::Text(text) => Some(text.as_bytes().to_vec()),
+            Message::Binary(bytes) => Some(bytes.to_vec()),
+            Message::Close(_) => break,
+            _ => None,
+        };
+        let Some(bytes) = raw_bytes else {
+            continue;
+        };
+        let Ok(client_msg) = serde_json::from_slice::<ConnectClientMessageDto>(&bytes) else {
+            continue;
+        };
+        match client_msg {
+            ConnectClientMessageDto::Register {
+                device_id,
+                name,
+                platform,
+            } => {
+                let event = ConnectServerEventDto::DeviceList {
+                    devices: vec![
+                        ConnectDeviceDto {
                             device_id: device_id.clone(),
                             name,
                             platform,
                             is_active: true,
                             last_seen_unix: now_unix(),
                             snapshot: None,
-                        }],
-                        active_device_id: Some(device_id),
-                    };
-                    let _ = socket
-                        .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
-                        .await;
-                }
-                ConnectClientMessageDto::UpdateState { snapshot } => {
-                    let event = ConnectServerEventDto::PlaybackUpdated {
-                        device_id: "desktop-1".to_string(),
-                        snapshot,
-                    };
-                    let _ = socket
-                        .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
-                        .await;
-                }
-                ConnectClientMessageDto::SendCommand { command, .. } => {
-                    let event = ConnectServerEventDto::Command {
-                        from_device_id: "desktop-1".to_string(),
-                        command,
-                    };
-                    let _ = socket
-                        .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
-                        .await;
-                }
-                ConnectClientMessageDto::Heartbeat | ConnectClientMessageDto::ClaimActive => {}
+                        },
+                        ConnectDeviceDto {
+                            device_id: "android-1".to_string(),
+                            name: "Pixel".to_string(),
+                            platform: DevicePlatform::Android,
+                            is_active: false,
+                            last_seen_unix: now_unix(),
+                            snapshot: None,
+                        },
+                    ],
+                    active_device_id: Some(device_id),
+                };
+                let _ = socket
+                    .send(Message::Binary(serde_json::to_vec(&event).unwrap().into()))
+                    .await;
             }
+            ConnectClientMessageDto::UpdateState { snapshot } => {
+                let event = ConnectServerEventDto::PlaybackUpdated {
+                    device_id: "android-1".to_string(),
+                    snapshot,
+                };
+                let _ = socket
+                    .send(Message::Binary(serde_json::to_vec(&event).unwrap().into()))
+                    .await;
+            }
+            ConnectClientMessageDto::SendCommand { command, .. } => {
+                let event = ConnectServerEventDto::Command {
+                    from_device_id: "desktop-1".to_string(),
+                    command,
+                };
+                let _ = socket
+                    .send(Message::Binary(serde_json::to_vec(&event).unwrap().into()))
+                    .await;
+            }
+            ConnectClientMessageDto::ClaimActive => {
+                // Simulate android-1 disconnecting: DeviceList now only contains desktop-1
+                let event = ConnectServerEventDto::DeviceList {
+                    devices: vec![ConnectDeviceDto {
+                        device_id: "desktop-1".to_string(),
+                        name: "Linux Studio".to_string(),
+                        platform: DevicePlatform::Desktop,
+                        is_active: true,
+                        last_seen_unix: now_unix(),
+                        snapshot: None,
+                    }],
+                    active_device_id: Some("desktop-1".to_string()),
+                };
+                let _ = socket
+                    .send(Message::Binary(serde_json::to_vec(&event).unwrap().into()))
+                    .await;
+            }
+            ConnectClientMessageDto::Heartbeat => {}
         }
     }
 }
@@ -482,7 +734,7 @@ fn test_config(dir: &TempDir, base_url: Option<String>, max_bytes: u64) -> Clien
         cache_dir: dir.path().join("audio_cache"),
         cover_art_dir: dir.path().join("cover_art"),
         soulbeet_base_url: base_url,
-        soulbeet_auth_header: Some("Bearer test-token".to_string()),
+        soulbeet_auth: Some(SoulbeetAuth::SessionCookie("test-token".to_string())),
         navidrome,
         device_id: "desktop-1".to_string(),
         device_name: "Linux Studio".to_string(),
@@ -496,7 +748,7 @@ fn test_config(dir: &TempDir, base_url: Option<String>, max_bytes: u64) -> Clien
 }
 
 #[tokio::test]
-async fn full_and_delta_sync_populates_mirror_skips_unchanged_playlists_and_preserves_pending_outbox()
+async fn full_and_delta_sync_populates_mirror_normalizes_triage_prunes_playlists_and_preserves_outbox()
 {
     let state = Arc::new(StubState::default());
     let base_url = start_stub_server(state.clone()).await;
@@ -505,17 +757,58 @@ async fn full_and_delta_sync_populates_mirror_skips_unchanged_playlists_and_pres
         .await
         .unwrap();
 
-    // 1. Initial full sync
+    // 1. Initial full sync using SessionCookie auth
     let report = core.sync_now(false).await.unwrap();
     assert!(report.full_sync);
     assert_eq!(report.artists_synced, 2);
     assert_eq!(report.albums_synced, 1);
     assert_eq!(report.tracks_synced, 2);
-    assert_eq!(report.playlists_synced, 1);
+    assert_eq!(report.playlists_synced, 2);
     assert_eq!(report.discovery_tracks_synced, 1);
     assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 1);
 
-    // 2. Optimistic offline star on s1 before next sync
+    // Bootstrap persisted promote_threshold into sync_cursor
+    assert_eq!(
+        get_cursor(core.pool(), CURSOR_PROMOTE_THRESHOLD)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("4")
+    );
+
+    // Discovery triage DTO fields mapped & status normalized to lowercase "pending"
+    let (status, folder_path, profile_slug, mix_slug): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT status, folder_path, profile_slug, mix_slug FROM discovery_tracks WHERE id = 'disc-1'",
+    )
+    .fetch_one(core.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(
+        folder_path.as_deref(),
+        Some("Discovery/Balanced/Justice - DANCE.flac")
+    );
+    assert_eq!(profile_slug.as_deref(), Some("weekly_radar"));
+    assert_eq!(mix_slug.as_deref(), Some("winter_holiday"));
+
+    // Starred reconciliation applied to artists and albums too
+    let ar1_starred: bool = sqlx::query_scalar("SELECT starred FROM artists WHERE id = 'ar1'")
+        .fetch_one(core.pool())
+        .await
+        .unwrap();
+    let al1_starred: bool = sqlx::query_scalar("SELECT starred FROM albums WHERE id = 'al1'")
+        .fetch_one(core.pool())
+        .await
+        .unwrap();
+    assert!(ar1_starred);
+    assert!(al1_starred);
+
+    // 2. Optimistic offline star on s1 + Keep on discovery track s2 before next sync
     core.enqueue_mutation(OutboxMutation::Star {
         song_id: "s1".to_string(),
         starred: true,
@@ -523,24 +816,64 @@ async fn full_and_delta_sync_populates_mirror_skips_unchanged_playlists_and_pres
     })
     .await
     .unwrap();
+    core.enqueue_mutation(OutboxMutation::Keep {
+        song_id: "s2".to_string(),
+        discovery_track_id: Some("disc-1".to_string()),
+        target_folder_id: None,
+    })
+    .await
+    .unwrap();
     assert!(get_track(core.pool(), "s1").await.unwrap().unwrap().starred);
+    assert!(!get_track(core.pool(), "s2").await.unwrap().unwrap().is_discovery);
 
-    // 3. Delta sync: enable new album al2, playlist pl1 unchanged
+    // 3. Rotate auth token at runtime to Bearer & verify sync works with rotated token!
+    *state.accepted_auth_token.lock().await = "rotated-bearer-token".to_string();
+    core.set_soulbeet_auth(Some(SoulbeetAuth::Bearer(
+        "rotated-bearer-token".to_string(),
+    )))
+    .await;
+
+    // 4. Delta sync: enable new album al2 (whose path is "Daft Punk/Discovery/..."!), hide pl-ephemeral
     state.new_album_enabled.store(true, Ordering::SeqCst);
+    state.hide_extra_playlist.store(true, Ordering::SeqCst);
     let delta = core.sync_now(false).await.unwrap();
     assert!(!delta.full_sync);
     assert_eq!(delta.albums_synced, 1); // only new album al2 fetched
-    assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 1); // unchanged playlist NOT re-fetched!
+    assert_eq!(state.playlist_fetch_count.load(Ordering::SeqCst), 1); // unchanged pl1 NOT re-fetched!
 
-    // Pending outbox star was NOT clobbered by server's empty getStarred2!
+    // Deleted playlist pl-ephemeral was pruned!
+    let pl_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM playlists")
+        .fetch_one(core.pool())
+        .await
+        .unwrap();
+    assert_eq!(pl_count, 1);
+
+    // Pending outbox mutations were NOT clobbered by sync (neither starred nor is_discovery nor discovery_tracks.status)!
     assert!(get_track(core.pool(), "s1").await.unwrap().unwrap().starred);
-    assert!(get_track(core.pool(), "s3").await.unwrap().is_some());
+    assert!(!get_track(core.pool(), "s2").await.unwrap().unwrap().is_discovery);
+    let disc_status: String =
+        sqlx::query_scalar("SELECT status FROM discovery_tracks WHERE id = 'disc-1'")
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert_eq!(disc_status, "promoted");
+
+    // "Daft Punk/Discovery/01 One More Time.flac" is NOT falsely flagged as discovery!
+    let s3 = get_track(core.pool(), "s3").await.unwrap().unwrap();
+    assert!(!s3.is_discovery);
+
+    // 5. Bootstrap returning navidrome: None clears cached credentials
+    state
+        .bootstrap_returns_no_navidrome
+        .store(true, Ordering::SeqCst);
+    let err = core.sync_now(false).await.unwrap_err();
+    assert!(matches!(err, CoreError::NotConfigured("navidrome credentials")));
 }
 
 #[tokio::test]
-async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
+async fn lru_cache_eviction_subsonic_error_guard_and_path_safety() {
     let state = Arc::new(StubState::default());
-    let base_url = start_stub_server(state).await;
+    let base_url = start_stub_server(state.clone()).await;
     let dir = TempDir::new().unwrap();
     // Budget fits 2 tracks of 2048 bytes (4096 max), forcing eviction when a 3rd arrives.
     let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 4096))
@@ -548,7 +881,11 @@ async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
         .unwrap();
     let now = now_unix();
 
-    for (tid, album_id) in [("t-pinned", "al1"), ("t-old-unpinned", "al1"), ("t-new-unpinned", "al2")] {
+    for (tid, album_id) in [
+        ("t-pinned", "al1"),
+        ("t-old-unpinned", "al1"),
+        ("t-new-unpinned", "al2"),
+    ] {
         upsert_track(
             core.pool(),
             &LocalTrack {
@@ -583,7 +920,6 @@ async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
         .unwrap();
     }
 
-    // Create playlist containing t-pinned so we can test overlapping Album + Playlist pins.
     upsert_playlist(
         core.pool(),
         &LocalPlaylist {
@@ -644,6 +980,75 @@ async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
     assert_eq!(stats.total_audio_bytes, 4096);
     assert_eq!(stats.pinned_track_count, 1);
 
+    // Subsonic HTTP 200 JSON error rejection in download_track & get_or_fetch_cover_art
+    state
+        .download_returns_json_error
+        .store(true, Ordering::SeqCst);
+    let dl_err = core
+        .cache()
+        .download_track("missing-song", &AudioQualityProfile::LosslessFlac, false, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(dl_err, CoreError::Subsonic { code: 70, .. }));
+    assert!(!dir.path().join("audio_cache/missing-song.flac").exists());
+    state
+        .download_returns_json_error
+        .store(false, Ordering::SeqCst);
+
+    state
+        .cover_art_returns_json_error
+        .store(true, Ordering::SeqCst);
+    let art_err = core
+        .cache()
+        .get_or_fetch_cover_art("missing-art", Some(512), false)
+        .await
+        .unwrap_err();
+    assert!(matches!(art_err, CoreError::Subsonic { code: 70, .. }));
+    assert!(core
+        .cache()
+        .cover_art_local_path("missing-art")
+        .await
+        .unwrap()
+        .is_none());
+    state
+        .cover_art_returns_json_error
+        .store(false, Ordering::SeqCst);
+
+    // CustomTranscode path traversal sanitization: file stays strictly inside cache_dir!
+    core.cache()
+        .set_policy(CachePolicy {
+            max_bytes: 1_000_000,
+            ..CachePolicy::default()
+        })
+        .await
+        .unwrap();
+    let entry = core
+        .cache()
+        .download_track(
+            "../evil/id",
+            &AudioQualityProfile::CustomTranscode {
+                format: "../../mp3".to_string(),
+                max_bit_rate: 192,
+            },
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let entry_path = std::path::PathBuf::from(&entry.local_path);
+    assert_eq!(entry_path.parent(), Some(dir.path().join("audio_cache").as_path()));
+    assert!(entry_path.exists());
+
+    // Re-downloading same track under a different format deletes the previous file!
+    let entry2 = core
+        .cache()
+        .download_track("../evil/id", &AudioQualityProfile::LosslessFlac, false, None)
+        .await
+        .unwrap();
+    assert_ne!(entry.local_path, entry2.local_path);
+    assert!(!entry_path.exists());
+    assert!(std::path::Path::new(&entry2.local_path).exists());
+
     // Verify profile-aware playback source resolution & offline_only gating
     let local = core
         .resolve_playback_source("t-pinned", &AudioQualityProfile::CellularOpus160)
@@ -656,7 +1061,11 @@ async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
         .await
         .unwrap();
     match remote_opus {
-        PlaybackSource::RemoteStream { url, format, bit_rate } => {
+        PlaybackSource::RemoteStream {
+            url,
+            format,
+            bit_rate,
+        } => {
             assert!(url.contains("format=opus"));
             assert!(url.contains("maxBitRate=160"));
             assert_eq!(format, "opus");
@@ -687,9 +1096,11 @@ async fn lru_cache_eviction_respects_pinned_tracks_and_overlapping_pins() {
 }
 
 #[tokio::test]
-async fn outbox_replays_strictly_chronologically_and_blocks_dependent_song_on_failure() {
+async fn outbox_enforces_409_retryable_fifo_backoff_dead_letters_permanent_and_survives_corrupt_json()
+{
     let state = Arc::new(StubState::default());
-    state.fail_star.store(true, Ordering::SeqCst);
+    state.fail_star_409_retryable.store(true, Ordering::SeqCst);
+    state.fail_drop_409_permanent.store(true, Ordering::SeqCst);
     let base_url = start_stub_server(state.clone()).await;
     let dir = TempDir::new().unwrap();
     let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
@@ -697,7 +1108,7 @@ async fn outbox_replays_strictly_chronologically_and_blocks_dependent_song_on_fa
         .unwrap();
     core.sync_now(true).await.unwrap();
 
-    // Enqueue 3 sequential mutations for s1 + 1 independent Keep for s2
+    // Enqueue 3 sequential mutations for s1 + 1 permanent-failing drop for s3 + 1 independent keep for s2
     core.enqueue_mutation(OutboxMutation::Star {
         song_id: "s1".to_string(),
         starred: true,
@@ -719,11 +1130,30 @@ async fn outbox_replays_strictly_chronologically_and_blocks_dependent_song_on_fa
     })
     .await
     .unwrap();
+    core.enqueue_mutation(OutboxMutation::Drop {
+        song_id: "s3".to_string(),
+        discovery_track_id: None,
+        confirm_delete: true,
+    })
+    .await
+    .unwrap();
     core.enqueue_mutation(OutboxMutation::Keep {
         song_id: "s2".to_string(),
         discovery_track_id: Some("disc-1".to_string()),
         target_folder_id: None,
     })
+    .await
+    .unwrap();
+
+    // Inject a corrupt JSON row to ensure drain() dead-letters it without aborting!
+    sqlx::query(
+        r#"
+        INSERT INTO mutation_outbox (idempotency_key, kind, song_id, payload_json, created_at, attempts, next_retry_at, dead_letter)
+        VALUES ('corrupt-1', 'star', 's-corrupt', '{not valid json', ?, 0, 0, 0)
+        "#,
+    )
+    .bind(now_unix())
+    .execute(core.pool())
     .await
     .unwrap();
 
@@ -733,20 +1163,33 @@ async fn outbox_replays_strictly_chronologically_and_blocks_dependent_song_on_fa
     assert_eq!(s1.user_rating, 5);
     assert_eq!(s1.play_count, 1);
 
-    // First drain: star:s1 fails (500), so rate:s1 and scrobble:s1 MUST stay blocked behind it,
-    // while independent keep:s2 succeeds!
+    // First drain:
+    // - star:s1 returns HTTP 409 retryable -> MUST NOT be deleted, enters backoff, blocks rate:s1 & scrobble:s1
+    // - drop:s3 returns HTTP 409 not_retryable -> dead-lettered (does NOT block s2)
+    // - keep:s2 succeeds!
+    // - corrupt-1 is dead-lettered without aborting drain!
     let first = core.drain_outbox().await.unwrap();
     assert_eq!(first.replayed, 1);
-    assert_eq!(first.failed, 1);
-    assert_eq!(first.remaining, 3);
+    assert_eq!(first.failed, 3); // star:s1 (retryable) + drop:s3 (permanent) + corrupt-1
+    assert_eq!(first.remaining, 3); // star:s1, rate:s1, scrobble:s1
+    assert_eq!(*state.curation_log.lock().await, vec!["keep:s2".to_string()]);
+    assert_eq!(core.outbox().dead_lettered().await.unwrap().len(), 2);
+
+    // CRITICAL FIFO BACKOFF CHECK: Drain AGAIN immediately while star:s1 is still in retry backoff
+    // (next_retry_at > now). Even though rate:s1 and scrobble:s1 have next_retry_at == 0,
+    // they MUST remain blocked behind star:s1 and NEVER overtake it!
+    state.fail_star_409_retryable.store(false, Ordering::SeqCst);
+    let while_backed_off = core.drain_outbox().await.unwrap();
+    assert_eq!(while_backed_off.replayed, 0);
+    assert_eq!(while_backed_off.failed, 0);
+    assert_eq!(while_backed_off.remaining, 3);
     assert_eq!(*state.curation_log.lock().await, vec!["keep:s2".to_string()]);
 
-    // Clear retry backoff timestamp to simulate backoff expiry and restore server health.
-    sqlx::query("UPDATE mutation_outbox SET next_retry_at = 0")
+    // Clear retry backoff timestamp to simulate backoff expiry.
+    sqlx::query("UPDATE mutation_outbox SET next_retry_at = 0 WHERE dead_letter = 0")
         .execute(core.pool())
         .await
         .unwrap();
-    state.fail_star.store(false, Ordering::SeqCst);
 
     let second = core.drain_outbox().await.unwrap();
     assert_eq!(second.replayed, 3);
@@ -766,7 +1209,8 @@ async fn outbox_replays_strictly_chronologically_and_blocks_dependent_song_on_fa
 }
 
 #[tokio::test]
-async fn fts5_search_is_sub_20ms_handles_diacritics_and_suppresses_remote_when_offline_only() {
+async fn fts5_search_is_sub_20ms_handles_diacritics_uses_real_metadata_endpoint_and_suppresses_remote_offline()
+{
     let state = Arc::new(StubState::default());
     let base_url = start_stub_server(state.clone()).await;
     let dir = TempDir::new().unwrap();
@@ -809,11 +1253,14 @@ async fn fts5_search_is_sub_20ms_handles_diacritics_and_suppresses_remote_when_o
         .await
         .unwrap();
 
-    // Online search: merges local + deduplicated remote (Instant Crush kept, owned Get Lucky deduplicated!)
+    // Online search: hits POST /api/metadata/search/track returning Vec<shared::metadata::SearchResult>
+    // Merges local + deduplicated remote (Instant Crush kept, owned Get Lucky deduplicated!)
     let online = core.search("Daft Punk", 20).await.unwrap();
     assert_eq!(online.local_tracks.len(), 1);
     assert_eq!(online.remote_tracks.len(), 1);
     assert_eq!(online.remote_tracks[0].title, "Instant Crush");
+    assert_eq!(online.remote_tracks[0].duration_secs, Some(337));
+    assert_eq!(online.remote_tracks[0].year, Some(2013));
     assert_eq!(state.remote_search_hits.load(Ordering::SeqCst), 1);
 
     // Diacritic folding + punctuation safety
@@ -849,38 +1296,53 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     let now = now_unix();
 
-    // Seed 35 playlists (> AUTO_PLAYLISTS_LIMIT=24) including a Seasonal Noël pack
+    // Seed 35 playlists (> AUTO_PLAYLISTS_LIMIT=24) including a Seasonal Noël pack,
+    // a short "Punk" playlist (to ensure it does NOT hijack "Play Daft Punk"!),
+    // and 14 discovery/moment playlists where the 14th is offline-cached (beyond AUTO_FOR_YOU_LIMIT=12).
     for i in 0..35 {
-        let is_noel = i == 0;
         let pl_id = format!("pl-{i}");
+        let (name, kind, slug) = match i {
+            0 => (
+                "Noël à la Française".to_string(),
+                "seasonal".to_string(),
+                Some("winter_holiday".to_string()),
+            ),
+            1 => ("Punk".to_string(), "user".to_string(), None),
+            2..=15 => (
+                format!("Discovery Mix #{i:02}"),
+                "discovery".to_string(),
+                Some(format!("discovery_mix_{i:02}")),
+            ),
+            _ => (format!("Mix #{i:02}"), "user".to_string(), None),
+        };
         upsert_playlist(
             core.pool(),
             &LocalPlaylist {
                 id: pl_id.clone(),
-                name: if is_noel {
-                    "Noël à la Française".to_string()
-                } else {
-                    format!("Mix #{i:02}")
-                },
+                name,
                 comment: None,
                 owner: Some("alice".to_string()),
                 song_count: 1,
                 duration_secs: 200,
                 cover_art_id: None,
-                is_smart: is_noel,
-                kind: if is_noel { "seasonal" } else { "user" }.to_string(),
-                slug: if is_noel {
-                    Some("winter_holiday".to_string())
-                } else {
-                    None
-                },
+                is_smart: kind != "user",
+                kind,
+                slug,
                 changed_at: None,
                 updated_at: now - i,
             },
         )
         .await
         .unwrap();
-        if is_noel {
+        if i == 0 {
+            replace_playlist_tracks(core.pool(), &pl_id, &["tr-noel".to_string()])
+                .await
+                .unwrap();
+        } else if i == 1 {
+            replace_playlist_tracks(core.pool(), &pl_id, &["tr-punk".to_string()])
+                .await
+                .unwrap();
+        } else if i == 15 {
             replace_playlist_tracks(core.pool(), &pl_id, &["tr-noel".to_string()])
                 .await
                 .unwrap();
@@ -910,10 +1372,13 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     }
 
-    // Seed artists covering A-D ("The Beatles" -> B!), U-Z ("U2", "2Pac" -> #)
+    // Seed artists covering A-D ("THE BEATLES" -> B!, "Daft Punk" -> D!), E-H ("Édith Piaf" -> E!),
+    // U-Z ("U2", "2Pac" -> #)
     for (id, name) in [
         ("ar-a", "Alpha"),
-        ("ar-b", "The Beatles"),
+        ("ar-b", "THE BEATLES"),
+        ("ar-dp", "Daft Punk"),
+        ("ar-e", "Édith Piaf"),
         ("ar-u", "U2"),
         ("ar-num", "2Pac"),
     ] {
@@ -933,38 +1398,54 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     }
 
-    upsert_track(
-        core.pool(),
-        &LocalTrack {
-            id: "tr-noel".to_string(),
-            title: "Petit Papa Noël".to_string(),
-            artist_id: Some("ar-a".to_string()),
-            artist_name: "Tino Rossi".to_string(),
-            album_id: Some("al-0".to_string()),
-            album_name: "Noël".to_string(),
-            track_number: Some(1),
-            disc_number: Some(1),
-            duration_secs: 185,
-            year: Some(1946),
-            genre: Some("Holiday".to_string()),
-            bit_rate: Some(320),
-            suffix: Some("flac".to_string()),
-            content_type: None,
-            size_bytes: Some(1024),
-            cover_art_id: None,
-            path: None,
-            starred: true,
-            user_rating: 5,
-            play_count: 3,
-            last_played_at: None,
-            musicbrainz_id: None,
-            is_discovery: false,
-            updated_at: now,
-        },
-        false,
-    )
-    .await
-    .unwrap();
+    for (id, title, artist_id, artist_name, album_id, album_name) in [
+        ("tr-noel", "Petit Papa Noël", "ar-a", "Tino Rossi", "al-27", "Noël"),
+        ("tr-punk", "Blitzkrieg Bop", "ar-a", "Ramones", "al-1", "Ramones"),
+        ("tr-dp", "Get Lucky", "ar-dp", "Daft Punk", "al-2", "Random Access Memories"),
+    ] {
+        upsert_track(
+            core.pool(),
+            &LocalTrack {
+                id: id.to_string(),
+                title: title.to_string(),
+                artist_id: Some(artist_id.to_string()),
+                artist_name: artist_name.to_string(),
+                album_id: Some(album_id.to_string()),
+                album_name: album_name.to_string(),
+                track_number: Some(1),
+                disc_number: Some(1),
+                duration_secs: 185,
+                year: Some(1946),
+                genre: Some("Holiday".to_string()),
+                bit_rate: Some(320),
+                suffix: Some("flac".to_string()),
+                content_type: None,
+                size_bytes: Some(1024),
+                cover_art_id: None,
+                path: None,
+                starred: true,
+                user_rating: 5,
+                play_count: 3,
+                last_played_at: None,
+                musicbrainz_id: None,
+                is_discovery: false,
+                updated_at: now,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Cache tr-noel locally so pl-15 (ranked past AUTO_FOR_YOU_LIMIT=12!) is offline-ready
+    let p = dir.path().join("audio_cache");
+    tokio::fs::create_dir_all(&p).await.unwrap();
+    let f = p.join("tr-noel.flac");
+    tokio::fs::write(&f, vec![0u8; 512]).await.unwrap();
+    core.cache()
+        .register_cached_file("tr-noel", &f, "flac", None, 512, true, None, now)
+        .await
+        .unwrap();
 
     // 1. Exact 4 root tabs
     let tabs = core.auto_browse().children(AUTO_ROOT_ID, false).await.unwrap();
@@ -979,7 +1460,22 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         ]
     );
 
-    // 2. Playlists capped strictly <= 24
+    // 2. For You offline_only filters in SQL BEFORE LIMIT, so pl-15 is returned!
+    let for_you_all = core
+        .auto_browse()
+        .children(AUTO_TAB_FOR_YOU, false)
+        .await
+        .unwrap();
+    assert_eq!(for_you_all.len(), AUTO_FOR_YOU_LIMIT);
+    let for_you_offline = core
+        .auto_browse()
+        .children(AUTO_TAB_FOR_YOU, true)
+        .await
+        .unwrap();
+    assert!(for_you_offline.iter().any(|n| n.id == "playlist:pl-0"));
+    assert!(for_you_offline.iter().any(|n| n.id == "playlist:pl-15"));
+
+    // 3. Playlists capped strictly <= 24
     let pls = core
         .auto_browse()
         .children(AUTO_TAB_PLAYLISTS, false)
@@ -987,7 +1483,7 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     assert_eq!(pls.len(), AUTO_PLAYLISTS_LIMIT);
 
-    // 3. Library has Offline, Recent (<=25), and 6 A-Z buckets
+    // 4. Library has Offline, Recent (<=25), and 6 A-Z buckets
     let lib = core
         .auto_browse()
         .children(AUTO_TAB_LIBRARY, false)
@@ -995,6 +1491,7 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .unwrap();
     assert_eq!(lib.len(), 8);
     assert_eq!(lib[0].id, AUTO_LIB_OFFLINE);
+    assert_eq!(lib[0].subtitle.as_deref(), Some("1 tracks ready"));
     assert_eq!(lib[1].id, AUTO_LIB_RECENT);
 
     let recent = core
@@ -1003,23 +1500,44 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
         .await
         .unwrap();
     assert_eq!(recent.len(), AUTO_RECENT_LIMIT);
+    // al-27 (newest) has offline track tr-noel so is_offline_ready MUST be true even when offline_only=false!
+    assert!(recent.iter().find(|n| n.id == "album:al-27").unwrap().is_offline_ready);
 
+    // Case-insensitive "THE " stripping and diacritic folding ("Édith Piaf" -> E-H!)
     let ad = core.auto_browse().children("az:a-d", false).await.unwrap();
-    assert!(ad.iter().any(|n| n.title == "The Beatles"));
+    assert!(ad.iter().any(|n| n.title == "THE BEATLES"));
+    let eh = core.auto_browse().children("az:e-h", false).await.unwrap();
+    assert!(eh.iter().any(|n| n.title == "Édith Piaf"));
     let uz = core.auto_browse().children("az:u-z", false).await.unwrap();
     assert!(uz.iter().any(|n| n.title == "U2"));
     assert!(uz.iter().any(|n| n.title == "2Pac"));
 
-    // 4. Local voice search ("Play Noel") matches Noël playlist fast!
-    let voice = core.voice_search("Play Noel").await.unwrap().unwrap();
-    assert_eq!(voice.kind, VoiceMatchKind::Playlist);
-    assert_eq!(voice.target_id, "pl-0");
-    assert_eq!(voice.track_ids, vec!["tr-noel".to_string()]);
-    assert!(voice.elapsed_ms < 25);
+    // 5. Local voice search:
+    // - "Play Noël mix" strips " mix" & folds diacritics -> matches Noël playlist!
+    let voice_noel = core.voice_search("Play Noël mix").await.unwrap().unwrap();
+    assert_eq!(voice_noel.kind, VoiceMatchKind::Playlist);
+    assert_eq!(voice_noel.target_id, "pl-0");
+    assert_eq!(voice_noel.track_ids, vec!["tr-noel".to_string()]);
+    assert!(
+        voice_noel.elapsed_ms < 100,
+        "voice search took {}ms",
+        voice_noel.elapsed_ms
+    );
 
-    // 5. Ignition resumption persists exact queue across session save/load
+    // - "Play Winter Holiday" matches underscore slug "winter_holiday"!
+    let voice_slug = core.voice_search("Play Winter Holiday").await.unwrap().unwrap();
+    assert_eq!(voice_slug.kind, VoiceMatchKind::Playlist);
+    assert_eq!(voice_slug.target_id, "pl-0");
+
+    // - "Play Daft Punk" MUST match Artist "Daft Punk" and MUST NOT be hijacked by playlist "Punk"!
+    let voice_dp = core.voice_search("Play Daft Punk").await.unwrap().unwrap();
+    assert_eq!(voice_dp.kind, VoiceMatchKind::Artist);
+    assert_eq!(voice_dp.target_id, "ar-dp");
+    assert_eq!(voice_dp.track_ids, vec!["tr-dp".to_string()]);
+
+    // 6. Ignition resumption persists exact queue across session save/load
     let session = PersistedPlaybackSession {
-        queue_track_ids: vec!["tr-noel".to_string(), "s1".to_string()],
+        queue_track_ids: vec!["tr-noel".to_string(), "tr-dp".to_string()],
         current_index: 1,
         position_ms: 42_500,
         is_playing: true,
@@ -1032,17 +1550,30 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
 }
 
 #[tokio::test]
-async fn connect_ws_registers_tracks_devices_and_relays_handoff_commands() {
+async fn connect_ws_sends_query_params_decodes_binary_frames_prunes_snapshots_and_relays_handoff() {
     let state = Arc::new(StubState::default());
-    let base_url = start_stub_server(state).await;
+    let base_url = start_stub_server(state.clone()).await;
     let dir = TempDir::new().unwrap();
     let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
         .await
         .unwrap();
 
     let mut rx = core.connect_client().subscribe();
-    core.connect_ws(Duration::from_secs(60)).await.unwrap();
+    // Pass Duration::ZERO to verify heartbeat_interval clamping does not panic!
+    core.connect_ws(Duration::ZERO).await.unwrap();
 
+    // Verify URL-encoded query params were sent on WS handshake
+    let q = state
+        .ws_query_params
+        .lock()
+        .await
+        .clone()
+        .expect("WS query params captured");
+    assert_eq!(q.get("device_id").map(String::as_str), Some("desktop-1"));
+    assert_eq!(q.get("name").map(String::as_str), Some("Linux Studio"));
+    assert_eq!(q.get("platform").map(String::as_str), Some("desktop"));
+
+    // Stub sends JSON inside Message::Binary (Dioxus 0.7 TypedWebsocket wire behavior)
     let first_event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
         .await
         .unwrap()
@@ -1052,7 +1583,7 @@ async fn connect_ws_registers_tracks_devices_and_relays_handoff_commands() {
             devices,
             active_device_id,
         } => {
-            assert_eq!(devices.len(), 1);
+            assert_eq!(devices.len(), 2);
             assert_eq!(devices[0].device_id, "desktop-1");
             assert_eq!(active_device_id.as_deref(), Some("desktop-1"));
         }
@@ -1074,11 +1605,28 @@ async fn connect_ws_registers_tracks_devices_and_relays_handoff_commands() {
         is_pending_discovery: false,
         updated_at_unix: now_unix(),
     };
+
+    // Populate snapshot for android-1 via UpdateState -> PlaybackUpdated
     core.connect_client()
-        .transfer_playback_to("android-1".to_string(), snapshot.clone())
+        .update_state(snapshot.clone())
         .await
         .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(core
+        .connect_client()
+        .state()
+        .await
+        .snapshots
+        .contains_key("android-1"));
 
+    // Handoff command over Binary frame
+    core.connect_client()
+        .transfer_playback_to("android-1".to_string(), snapshot)
+        .await
+        .unwrap();
     let handoff = tokio::time::timeout(Duration::from_secs(3), rx.recv())
         .await
         .unwrap()
@@ -1093,8 +1641,16 @@ async fn connect_ws_registers_tracks_devices_and_relays_handoff_commands() {
         other => panic!("expected TransferPlayback command, got {other:?}"),
     }
 
+    // ClaimActive triggers DeviceList without android-1 -> android-1 MUST be pruned from state.snapshots!
+    core.connect_client().claim_active().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let live_state = core.connect_client().state().await;
     assert!(live_state.connected);
     assert_eq!(live_state.devices.len(), 1);
+    assert!(!live_state.snapshots.contains_key("android-1"));
+
     core.connect_client().disconnect().await;
 }
