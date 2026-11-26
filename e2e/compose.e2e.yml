@@ -1,5 +1,5 @@
 # E2E stack: the production soulbeet image wired to a fake slskd, a fake
-# MusicBrainz, a fake archive.org, fake yt-dlp and ytmusicapi packages and a real Navidrome. Downloads and the music library are
+# MusicBrainz, a fake archive.org, fake yt-dlp and ytmusicapi packages, a fake GD Studio and a real Navidrome. Downloads and the music library are
 # bind-mounted so the specs can assert on delivered and imported files.
 #
 # Build the app image first (from the repo root):
@@ -24,6 +24,7 @@ services:
       - LISTENBRAINZ_LABS_HOST=stubs:5061
       - DEEZER_HOST=stubs:5062
       - ARCHIVE_HOST=stubs:5064
+      - GDSTUDIO_HOST=stubs:5063
       - NAVIDROME_URL=http://navidrome:4533
       - OIDC_ISSUER_URL=http://stubs:5070
       - OIDC_CLIENT_ID=soulbeet-e2e
@@ -63,6 +64,7 @@ services:
       - LISTENBRAINZ_LABS_HOST=stubs:5061
       - DEEZER_HOST=stubs:5062
       - ARCHIVE_HOST=stubs:5064
+      - GDSTUDIO_HOST=stubs:5063
     volumes:
       - ./.runtime/downloads:/downloads
       - ./.runtime/music-user90:/music
@@ -77,6 +79,8 @@ services:
     ports:
       - "5030:5030"
       - "5050:5050"
+      # The GD Studio double's /_control, which gdstudio.spec.ts sets and reads.
+      - "5063:5063"
       - "5070:5070"
     environment:
       - SLSKD_API_KEY=e2e-slskd-api-key

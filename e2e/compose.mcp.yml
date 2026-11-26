@@ -19,6 +19,7 @@ services:
       - LISTENBRAINZ_LABS_HOST=stubs:5061
       - DEEZER_HOST=stubs:5062
       - ARCHIVE_HOST=stubs:5064
+      - GDSTUDIO_HOST=stubs:5063
       - NAVIDROME_URL=http://stubs:4534
     volumes:
       - mcp-data:/data

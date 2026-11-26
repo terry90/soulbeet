@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use reqwest::header::HeaderMap;
+use reqwest::redirect::Policy;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -201,6 +202,24 @@ impl PoliteClient {
         service: &'static str,
         pace: Pace,
     ) -> Result<PoliteClient, RemoteError> {
+        Self::build(base_url, service, pace, Policy::default())
+    }
+
+    /// A client that follows no redirect: a 3xx answer is a `RemoteError::Status`.
+    pub fn without_redirects(
+        base_url: &str,
+        service: &'static str,
+        pace: Pace,
+    ) -> Result<PoliteClient, RemoteError> {
+        Self::build(base_url, service, pace, Policy::none())
+    }
+
+    fn build(
+        base_url: &str,
+        service: &'static str,
+        pace: Pace,
+        redirects: Policy,
+    ) -> Result<PoliteClient, RemoteError> {
         let unavailable = |detail: String| RemoteError::Unavailable { service, detail };
         let base = base_url.trim_end_matches('/').to_string();
         let gate = HostGate::of(&base).map_err(unavailable)?;
@@ -208,6 +227,7 @@ impl PoliteClient {
             .user_agent(USER_AGENT)
             .timeout(pace.timeout)
             .connect_timeout(Duration::from_secs(5))
+            .redirect(redirects)
             .build()
             .map_err(|e| unavailable(e.without_url().to_string()))?;
         Ok(PoliteClient {

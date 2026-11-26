@@ -89,8 +89,25 @@ pub const YTDLP: BackendMeta = BackendMeta {
     blocked: None,
 };
 
+pub const GDSTUDIO: BackendMeta = BackendMeta {
+    id: crate::gdstudio::BACKEND_ID,
+    name: "NetEase (GD Studio)",
+    service: "GD Studio",
+    delivery: Delivery::AsFound,
+    switch: Switch::AdminToggle,
+    about: &[
+        "Off until an admin turns it on. Auto-download then searches NetEase's catalogue through GD Studio's public API next to Soulseek.",
+        "GD Studio's API page forbids downloading: \"仅限本人学习参考，严禁下载、传播或商用\" (for personal study only; downloading, spreading and commercial use are strictly forbidden), and it says continued use counts as agreeing.",
+        "The API allows 50 requests in 5 minutes. Soulbeet sends at most 45 in 5 minutes for every user together, so a search can end before it has checked every track.",
+        "Each file is checked against the MD5 NetEase names it by before it is imported. Bit depth and sample rate are read from the file header, which can name an upsampled master.",
+    ],
+    link: Some(("GD Studio's API page", "https://music-api.gdstudio.xyz/api.php")),
+    attribution: Some("NetEase via GD音乐台 (music.gdstudio.xyz)"),
+    blocked: None,
+};
+
 /// Every backend this build has, the default one first.
-pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE, YTDLP];
+pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE, YTDLP, GDSTUDIO];
 
 /// The backend a search or a send uses when none is named.
 pub const DEFAULT_ID: &str = SLSKD.id;
@@ -147,7 +164,29 @@ mod tests {
         assert_eq!(meta("slskd"), Some(&SLSKD));
         assert_eq!(meta("archive"), Some(&ARCHIVE));
         assert_eq!(meta("ytdlp"), Some(&YTDLP));
+        assert_eq!(meta("gdstudio"), Some(&GDSTUDIO));
         assert_eq!(meta("nicotine"), None);
+    }
+
+    #[test]
+    fn gd_studio_is_off_until_an_admin_turns_it_on_and_says_its_operator_forbids_downloading() {
+        assert_eq!(GDSTUDIO.switch, Switch::AdminToggle);
+        assert_eq!(GDSTUDIO.delivery, Delivery::AsFound);
+        assert!(GDSTUDIO
+            .about
+            .iter()
+            .any(|l| l.contains("forbids downloading")));
+        assert_eq!(
+            GDSTUDIO.attribution,
+            Some("NetEase via GD音乐台 (music.gdstudio.xyz)")
+        );
+        assert!(GDSTUDIO
+            .link
+            .is_some_and(|(_, url)| url.starts_with("https://")));
+        assert_eq!(
+            blocked("gdstudio"),
+            "GD Studio will not give files from this source"
+        );
     }
 
     #[test]

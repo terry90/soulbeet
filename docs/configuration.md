@@ -55,4 +55,8 @@ The paths of its tools, which the `:full` image sets up; change them only to run
 
 ffmpeg is the one on `PATH` (`/usr/local/bin/ffmpeg` in `:full`). A relative path in one of these variables, or in `DOWNLOAD_PATH`, is read from the folder Soulbeet was started in.
 
+### NetEase (GD Studio)
+
+Downloads NetEase's files through GD Studio's public API, each checked against the size GD Studio gives and the MD5 NetEase names it by, then tagged with the track you asked for; see [gdstudio.md](gdstudio.md). GD Studio's API page forbids downloading; read that page before you turn this on. It needs no account and no address. Soulbeet sends the API at most 45 calls in 5 minutes for every user together. The container needs outbound https to `music-api.gdstudio.xyz` and to NetEase's file servers (`*.music.126.net`). Partial files sit in `DOWNLOAD_PATH/.soulful-partial/`, as for the Internet Archive. `GDSTUDIO_HOST` (`host:port`, reached over http) points it at a test double instead of GD Studio; leave it unset.
+
 How a download source plugs in is in [download-backends.md](download-backends.md).

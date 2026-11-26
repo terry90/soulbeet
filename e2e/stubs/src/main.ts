@@ -1,10 +1,12 @@
-// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer, archive.org and
-// OpenID Connect doubles.
+// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer, archive.org, GD Studio
+// and OpenID Connect doubles.
 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createArchiveServer } from './archive-server.js';
 import { createDeezerServer } from './deezer-server.js';
+import { createGdStudioServer } from './gdstudio-server.js';
+import { GdStudioState } from './gdstudio-state.js';
 import { createLabsServer, createListenBrainzServer } from './listenbrainz-server.js';
 import { MbControl, createMusicBrainzServer } from './mb-server.js';
 import { createOidcServer } from './oidc-server.js';
@@ -20,6 +22,7 @@ const lbPort = Number(process.env.LB_PORT ?? 5060);
 const labsPort = Number(process.env.LABS_PORT ?? 5061);
 const deezerPort = Number(process.env.DEEZER_PORT ?? 5062);
 const archivePort = Number(process.env.ARCHIVE_PORT ?? 5064);
+const gdstudioPort = Number(process.env.GDSTUDIO_PORT ?? 5063);
 const apiKey = process.env.SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 const audioDir = resolve(process.env.AUDIO_DIR ?? join(e2eRoot, '.fixtures', 'audio'));
 const downloadsDir = resolve(process.env.DOWNLOADS_DIR ?? join(e2eRoot, '.runtime', 'downloads'));
@@ -75,6 +78,11 @@ archive.listen(archivePort, '0.0.0.0', () => {
   console.log(`[archive] listening on :${archivePort}`);
 });
 
+const gdstudio = createGdStudioServer(audioDir, new GdStudioState());
+gdstudio.listen(gdstudioPort, '0.0.0.0', () => {
+  console.log(`[gdstudio] listening on :${gdstudioPort}`);
+});
+
 const oidc = createOidcServer({
   issuer: oidcIssuer,
   browserUrl: oidcBrowserUrl,
@@ -95,6 +103,7 @@ process.on('SIGTERM', () => {
   labs.close();
   deezer.close();
   archive.close();
+  gdstudio.close();
   oidc.close();
   process.exit(0);
 });

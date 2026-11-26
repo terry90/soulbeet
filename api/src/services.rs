@@ -15,6 +15,7 @@ use shared::failure::{
 use soulbeet::{
     archive::{ArchiveBackend, EngineCell, EngineSettings},
     beets::{BeetsImporter, BeetsSettings},
+    gdstudio::GdStudioBackend,
     navidrome::NavidromeClientBuilder,
     slskd::{DownloadConfig, SoulseekClientBuilder},
     ytdlp::YtDlpBackend,
@@ -34,6 +35,7 @@ pub mod downloaders {
     pub const SLSKD: &str = shared::slskd::BACKEND_ID;
     pub const ARCHIVE: &str = shared::archive::BACKEND_ID;
     pub const YTDLP: &str = shared::ytdlp::BACKEND_ID;
+    pub const GDSTUDIO: &str = shared::gdstudio::BACKEND_ID;
 }
 
 pub mod importers {
@@ -210,6 +212,9 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
         downloaders::YTDLP => {
             ytdlp_backend(&soulbeet::ytdlp::ENGINE, ytdlp_settings().await?).await
         }
+        downloaders::GDSTUDIO => {
+            gdstudio_backend(&soulbeet::gdstudio::ENGINE, gdstudio_settings().await?).await
+        }
         _ => Err(BackendLookupError::Unknown(id.to_string())),
     }
 }
@@ -259,6 +264,29 @@ async fn ytdlp_backend(
     let engine =
         (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
     Ok(Arc::new(YtDlpBackend::new(engine)))
+}
+
+/// What the GD Studio engine runs on: this install's downloads folder and its id, and the test
+/// double `GDSTUDIO_HOST` names, if any.
+#[cfg(feature = "server")]
+async fn gdstudio_settings() -> Result<soulbeet::gdstudio::EngineSettings, BackendLookupError> {
+    Ok(soulbeet::gdstudio::EngineSettings {
+        download_path: crate::config::CONFIG.download_path().clone(),
+        instance: instance_id().await.map_err(BackendLookupError::Settings)?,
+        test_host: soulbeet::gdstudio::test_host_from_env(),
+    })
+}
+
+/// A handle on the GD Studio engine of `cell`, started on the first build: a rebuilt handle
+/// shares the transfers, searches and call budget the engine keeps.
+#[cfg(feature = "server")]
+async fn gdstudio_backend(
+    cell: &soulbeet::gdstudio::EngineCell,
+    settings: soulbeet::gdstudio::EngineSettings,
+) -> Result<Arc<dyn DownloadBackend>, BackendLookupError> {
+    let engine =
+        (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
+    Ok(Arc::new(GdStudioBackend::new(engine)))
 }
 
 /// The backend `download_backend(None)` gives.
@@ -378,6 +406,19 @@ pub(crate) async fn stop_backend(id: &str) {
             };
             if let Err(e) = forgotten {
                 tracing::warn!("Could not delete what YouTube Music left unfinished: {e}");
+            }
+        }
+        downloaders::GDSTUDIO => {
+            let engine = &soulbeet::gdstudio::ENGINE;
+            if engine.stop().await {
+                return;
+            }
+            let cleared = match gdstudio_settings().await {
+                Ok(settings) => (engine.clear_left(settings).await).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = cleared {
+                tracing::warn!("Could not delete the partial files GD Studio left: {e}");
             }
         }
         _ => {}
@@ -1654,5 +1695,285 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), title.as_bytes());
             assert_eq!(path.file_name().unwrap().to_string_lossy(), id);
         }
+    }
+
+    /// GD Studio and NetEase's servers as a test answers them: the n-th URL call names the
+    /// n-th of `files` on this server, as an MP3 named by its MD5; a file request gets the
+    /// file, or with `hold`, half of it and then nothing, its connection held open.
+    fn gdstudio_double(files: Vec<Vec<u8>>, hold: bool) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let here = base.clone();
+        std::thread::spawn(move || {
+            let by_md5: HashMap<String, Vec<u8>> = (files.iter())
+                .map(|f| (format!("{:x}", md5::compute(f)), f.clone()))
+                .collect();
+            let mut named = files.into_iter();
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let target = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap() > 2 {
+                    header.clear();
+                }
+                let reply = |stream: &mut std::net::TcpStream, length: usize, body: &[u8]| {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                };
+                if let Some(name) = target.strip_prefix("/cdn/") {
+                    let md5 = name.split('.').next().unwrap_or_default();
+                    let file = by_md5.get(md5).cloned().unwrap_or_default();
+                    if hold {
+                        reply(&mut stream, file.len(), &file[..file.len() / 2]);
+                        held.push(stream);
+                    } else {
+                        reply(&mut stream, file.len(), &file);
+                    }
+                } else if let Some(file) = named.next() {
+                    let md5 = format!("{:x}", md5::compute(&file));
+                    let body = serde_json::json!({
+                        "url": format!("{here}/cdn/{md5}.mp3"), "br": 128, "size": file.len()
+                    })
+                    .to_string();
+                    reply(&mut stream, body.len(), body.as_bytes());
+                }
+            }
+        });
+        base
+    }
+
+    /// Silent MPEG-1 Layer III frames, `seed` in the last byte so each file differs.
+    fn silent_mp3(frames: usize, seed: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let mut frame = vec![0u8; 417];
+            frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+            out.extend(frame);
+        }
+        *out.last_mut().unwrap() = seed;
+        out
+    }
+
+    /// The search item of NetEase track `track`, the wanted `title`, whose file is `bytes`.
+    fn gdstudio_item(track: &str, title: &str, bytes: &[u8]) -> shared::download::DownloadableItem {
+        let data = shared::gdstudio::GdTrack {
+            track_id: track.into(),
+            ext: "mp3".into(),
+            size: bytes.len() as u64,
+            md5: format!("{:x}", md5::compute(bytes)),
+            tags: shared::gdstudio::GdTags {
+                title: title.into(),
+                artist: "Duster".into(),
+                album: "Stratosphere".into(),
+                album_artist: "Duster".into(),
+                ..Default::default()
+            },
+        };
+        let name = shared::download::sanitize_filename(&format!("01 - {title} [{track}].mp3"));
+        shared::download::DownloadableItem {
+            id: format!("{track}/{name}"),
+            backend: downloaders::GDSTUDIO.into(),
+            source: shared::gdstudio::SOURCE.into(),
+            title: title.into(),
+            artist: "Duster".into(),
+            album: "Stratosphere".into(),
+            size: Some(bytes.len() as u64),
+            duration: Some(1),
+            quality: "mp3".into(),
+            quality_score: 0.55,
+            backend_data: Some(serde_json::to_string(&data).unwrap()),
+            match_score: 1.0,
+            below_floor: false,
+            facts: Default::default(),
+        }
+    }
+
+    /// A downloads folder and this install's id on a test database, GD Studio at `base`.
+    async fn gdstudio_settings_at(
+        base: &str,
+    ) -> (tempfile::TempDir, soulbeet::gdstudio::EngineSettings) {
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db::migrated().await;
+        let settings = soulbeet::gdstudio::EngineSettings {
+            download_path: root.path().to_path_buf(),
+            instance: instance_id_in(&db).await.unwrap(),
+            test_host: Some(base.trim_start_matches("http://").to_string()),
+        };
+        (root, settings)
+    }
+
+    fn gdstudio_parts(settings: &soulbeet::gdstudio::EngineSettings) -> Vec<PathBuf> {
+        let dir = settings
+            .download_path
+            .join(soulbeet::partial::PARTIAL_FOLDER)
+            .join(&settings.instance)
+            .join(downloaders::GDSTUDIO);
+        std::fs::read_dir(dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn transferring(
+        backend: &Arc<dyn DownloadBackend>,
+        queued: &shared::download::QueuedDownload,
+    ) {
+        for _ in 0..500 {
+            let row = backend
+                .get_download(&queued.source, &queued.id)
+                .await
+                .unwrap();
+            if row.is_some_and(|r| r.transferred > 0) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("transfer {} never started", queued.id);
+    }
+
+    #[tokio::test]
+    async fn gd_studio_is_off_until_turned_on_and_says_where_to_turn_it_on() {
+        let db = test_db::migrated().await;
+        let gd = &shared::backends::GDSTUDIO;
+        let Err(e) = switched_on(&db, gd).await else {
+            panic!("GD Studio is on before an admin turned it on");
+        };
+        assert_eq!(
+            e.to_string(),
+            "NetEase (GD Studio) is turned off in Settings > Config > Connections"
+        );
+        let f = e.failure(Stage::SourceSearch, e.to_string());
+        assert_eq!(
+            (f.code, f.retry, f.user_action.map(|a| a.what)),
+            (
+                FailureCode::BackendNotConfigured,
+                RetryAdvice::NeedsUser,
+                Some("Turn on NetEase (GD Studio)".to_string())
+            )
+        );
+        let ids = |metas: Vec<&BackendMeta>| metas.iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd"]);
+        AppConfig::set_in(&db, &keys::backend_enabled("gdstudio"), "true")
+            .await
+            .unwrap();
+        assert_eq!(ids(enabled_in(&db, METAS).await), ["slskd", "gdstudio"]);
+        assert!(switched_on(&db, gd).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_gdstudio_handle_still_lists_the_transfer_the_old_one_sent() {
+        let file = silent_mp3(400, 1);
+        let base = gdstudio_double(vec![file.clone()], true);
+        let (_root, settings) = gdstudio_settings_at(&base).await;
+        let cell = soulbeet::gdstudio::EngineCell::new();
+        let first = gdstudio_backend(&cell, settings.clone()).await.unwrap();
+        let queued = sent_to(
+            &first,
+            gdstudio_item("17455800", "Moon Age", &file),
+            "Stratosphere [aaaa1111]",
+        )
+        .await;
+        transferring(&first, &queued).await;
+
+        // Saving another backend's settings, or turning this one on again, builds a new handle.
+        let rebuilt = gdstudio_backend(&cell, settings).await.unwrap();
+        let row = rebuilt
+            .get_download(&queued.source, &queued.id)
+            .await
+            .unwrap()
+            .expect("the rebuilt handle lists the running transfer");
+        assert_eq!(row.request.as_deref(), Some("r1"));
+        cell.stop().await;
+    }
+
+    #[tokio::test]
+    async fn turning_gdstudio_off_leaves_no_part_file_and_refuses_the_older_handle() {
+        let file = silent_mp3(400, 2);
+        let base = gdstudio_double(vec![file.clone()], true);
+        let (_root, settings) = gdstudio_settings_at(&base).await;
+        let cell = soulbeet::gdstudio::EngineCell::new();
+        let backend = gdstudio_backend(&cell, settings.clone()).await.unwrap();
+        let queued = sent_to(
+            &backend,
+            gdstudio_item("17455800", "Moon Age", &file),
+            "Stratosphere [aaaa1111]",
+        )
+        .await;
+        transferring(&backend, &queued).await;
+        assert_eq!(gdstudio_parts(&settings).len(), 1);
+
+        assert!(cell.stop().await);
+
+        assert!(gdstudio_parts(&settings).is_empty());
+        assert!(backend
+            .get_download(&queued.source, &queued.id)
+            .await
+            .unwrap()
+            .is_none());
+        let refused = backend
+            .download(
+                vec![gdstudio_item("2", "Heading for the Door", &file)],
+                "Stratosphere [aaaa1111]",
+                "r2",
+                "u1",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.failure(Stage::Enqueue, refused.to_string()).code,
+            FailureCode::BackendNotConfigured
+        );
+        let spec = shared::download::SearchSpec::of(None, vec![]);
+        assert!(backend.start_search(&spec).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_gdstudio_file_lands_where_the_monitor_looks_for_it() {
+        use crate::server_fns::download::utils::{file_id, resolve_in_destination};
+        let files = vec![silent_mp3(30, 3), silent_mp3(30, 4)];
+        let base = gdstudio_double(files.clone(), false);
+        let (root, settings) = gdstudio_settings_at(&base).await;
+        let cell = soulbeet::gdstudio::EngineCell::new();
+        let backend = gdstudio_backend(&cell, settings).await.unwrap();
+        let destination = "Stratosphere [aaaa1111]";
+        let mut claimed = HashSet::new();
+        let mut found = Vec::new();
+        for (track, file) in ["1", "2"].into_iter().zip(&files) {
+            let queued = sent_to(
+                &backend,
+                gdstudio_item(track, "Moon Age: Live?", file),
+                destination,
+            )
+            .await;
+            let row = ended(&backend, &queued).await;
+            assert_eq!(
+                row.state,
+                shared::download::DownloadState::Completed,
+                "{row:?}"
+            );
+            let path =
+                resolve_in_destination(&row.item, root.path(), destination, &claimed).unwrap();
+            claimed.insert(file_id(&path).unwrap());
+            found.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+        assert_eq!(
+            found,
+            [
+                "01 - Moon Age_ Live_ [1].mp3",
+                "01 - Moon Age_ Live_ [2].mp3"
+            ]
+        );
+        cell.stop().await;
     }
 }

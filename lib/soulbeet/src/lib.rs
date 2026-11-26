@@ -5,6 +5,7 @@ pub mod beets;
 pub mod deezer;
 pub mod engine;
 pub mod error;
+pub mod gdstudio;
 pub mod history;
 pub mod http;
 pub mod knowledge;

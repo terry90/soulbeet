@@ -7,6 +7,7 @@ The backends in this build:
 - `slskd`, Soulseek through the user's slskd server ([configuration.md](configuration.md#settings-in-the-web-ui)).
 - `archive`, the Internet Archive ([archive.md](archive.md)): searches archive.org and downloads in Soulbeet's own engine, with partial files in `PartialDir` and its transfers in the transfer book, so a restart resumes them.
 - `ytdlp`, YouTube Music ([ytdlp.md](ytdlp.md)): lossy only. A Python helper runs ytmusicapi and yt-dlp, one child process per call; its queue is in memory, so a restart loses what was not finished, and its staging folders are in `PartialDir`.
+- `gdstudio`, NetEase through GD Studio's API ([gdstudio.md](gdstudio.md)): searches and downloads in Soulbeet's own engine under a call budget for the whole install, with partial files in `PartialDir`. Its transfers are kept in memory only: a restart loses the unfinished ones, which reconcile then treats as lost, and the engine clears its partial folder when it starts.
 
 ## The contract
 
@@ -53,7 +54,7 @@ Failure texts the app writes for a backend name its `BackendMeta::service` ("Dow
 - Resume, prune and `clear_except` run once, when the engine is first created, never on a rebuild of the handle. A rebuild while transfers run must not touch their parts or their book entries.
 - An engine that keeps partial files opens its `PartialDir` before anything else. On any error (another server holds the lock, the downloads folder cannot be written) the backend reports it as its health failure and touches neither the book nor any file.
 - A build holds up the lookups of its own id only, so keep it short and never look the same backend up from inside it.
-- The Internet Archive engine (`soulbeet::archive::ENGINE`) is the model, and the YouTube Music one (`soulbeet::ytdlp::ENGINE`) follows it: the build starts it once and wraps each handle around it; the handle keeps the generation it was built in, and the engine's stop bumps the generation, so an older handle's `download` and `start_search` fail with `backend_not_configured`. When the backend is turned off before anything built it since a restart, its stop arm still forgets the unfinished transfers the previous run left in the book, and deletes their partial files.
+- The Internet Archive engine (`soulbeet::archive::ENGINE`) is the model, and the YouTube Music (`soulbeet::ytdlp::ENGINE`) and GD Studio (`soulbeet::gdstudio::ENGINE`) ones follow it: the build starts it once and wraps each handle around it; the handle keeps the generation it was built in, and the engine's stop bumps the generation, so an older handle's `download` and `start_search` fail with `backend_not_configured`. When the backend is turned off before anything built it since a restart, its stop arm still forgets the unfinished transfers the previous run left in the book, and deletes their partial files. GD Studio keeps no book, so its arm deletes every partial file the previous run left.
 
 ## Where a backend plugs in
 

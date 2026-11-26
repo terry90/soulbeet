@@ -1,9 +1,36 @@
 // Turns a download backend on or off through Settings > Config > Connections, as an admin
 // does. The page must be signed in as an admin.
 
-import type { Locator, Page } from '@playwright/test';
+import type { Browser, BrowserContext, Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
-import { openSettings } from './app.js';
+import { admin, loginViaApi, openSettings } from './app.js';
+import { navidromeAdminPassword, navidromeAdminUser, navidromeEnabled } from './env.js';
+
+/**
+ * Signs `context` in as the seeded admin. Once navidrome.spec.ts has signed it in through
+ * Navidrome, the account is linked to Navidrome's admin and only Navidrome's password opens it.
+ */
+export async function signInAdmin(context: BrowserContext): Promise<void> {
+  const local = await context.request.post('/api/auth/login', { data: admin });
+  if (local.ok()) {
+    return;
+  }
+  expect(navidromeEnabled, `admin sign-in: ${local.status()}`).toBe(true);
+  await loginViaApi(context, { username: navidromeAdminUser, password: navidromeAdminPassword });
+}
+
+/** Runs `act` on a page of a new context signed in as the admin. */
+export async function asAdmin(browser: Browser, act: (page: Page) => Promise<void>): Promise<void> {
+  const context = await browser.newContext();
+  try {
+    await signInAdmin(context);
+    const page = await context.newPage();
+    await page.goto('/');
+    await act(page);
+  } finally {
+    await context.close();
+  }
+}
 
 /** The backend's name over its switch. */
 function heading(page: Page, name: string): Locator {

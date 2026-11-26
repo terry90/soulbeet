@@ -1,10 +1,13 @@
 // Client for the stubs' /_control APIs: scripts slskd peer behavior and
-// outages and how MusicBrainz answers beets per spec, reads what beets asked
-// MusicBrainz for, and resets shared stub state between destructive tests.
+// outages, how MusicBrainz answers beets per spec, and how the GD Studio
+// double's API and tracks answer; reads what beets asked MusicBrainz for and
+// the calls GD Studio answered, and resets shared stub state between
+// destructive tests.
 
 import type { PeerBehavior } from '../fixtures/dataset.js';
+import type { ApiMode, TrackBehavior } from '../stubs/src/gdstudio-state.js';
 import type { MbMode } from '../stubs/src/mb-server.js';
-import { mbControlUrl, slskdControlUrl } from './env.js';
+import { gdstudioControlUrl, mbControlUrl, slskdControlUrl } from './env.js';
 
 /** A transfer as the slskd stub's state snapshot reports it. */
 export interface StubTransfer {
@@ -82,4 +85,27 @@ export async function removeStubDownloads(destination: string): Promise<void> {
   if (response.status !== 200) {
     throw new Error(`control downloads failed: ${response.status} ${await response.text()}`);
   }
+}
+
+/** How the GD Studio double's API answers every call from now on. */
+export async function setGdStudioMode(mode: ApiMode): Promise<void> {
+  await post('/_control/mode', { mode }, gdstudioControlUrl);
+}
+
+/** How the GD Studio double answers for one NetEase track from now on. */
+export async function setNetEaseTrack(trackId: string, behavior: TrackBehavior): Promise<void> {
+  await post(`/_control/tracks/${trackId}`, { behavior }, gdstudioControlUrl);
+}
+
+/** The API calls the GD Studio double answered since its last reset, and the most in 5 minutes. */
+export async function gdstudioCalls(): Promise<{ total: number; maxInWindow: number }> {
+  const response = await fetch(`${gdstudioControlUrl}/_control/calls`);
+  if (!response.ok) {
+    throw new Error(`control calls failed: ${response.status}`);
+  }
+  return (await response.json()) as { total: number; maxInWindow: number };
+}
+
+export async function resetGdStudio(): Promise<void> {
+  await post('/_control/reset', {}, gdstudioControlUrl);
 }
