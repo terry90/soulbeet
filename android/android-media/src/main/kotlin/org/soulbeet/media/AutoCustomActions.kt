@@ -8,6 +8,10 @@ import androidx.media3.session.CommandButton
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.soulbeet.core.FfiOutboxMutation
 import org.soulbeet.corebindings.CoreClient
 
@@ -141,19 +145,26 @@ object AutoCustomActions {
     }
 
     /**
-     * Executes Android Auto custom actions against [CoreClient]'s offline-first outbox, updates
-     * optimistic local metadata immediately, skips when appropriate, and refreshes the MediaSession
-     * custom action bar.
+     * Executes Android Auto custom actions against [CoreClient]'s offline-first outbox.
+     *
+     * Threading & consistency guarantees:
+     * - Must be invoked on the main/player thread (`Dispatchers.Main.immediate`); ONLY `CoreClient`
+     *   and outbox scheduling run on [ioDispatcher].
+     * - Mutations are durably enqueued into SQLite **before** mutating in-memory context or
+     *   refreshing the MediaSession custom layout, preventing UI desync if persistence fails.
+     * - `onSkipToNext` returns `true` if playback advanced to a next item, or `false` if playback
+     *   stopped at the end of the queue (in which case the custom layout is cleared cleanly).
      */
     class ActionHandler(
         private val core: CoreClient,
+        private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         private val secondaryLibraryActionProvider: () -> LibrarySecondaryAction = {
             LibrarySecondaryAction.DISLIKE_SKIP
         },
         private val currentTrackContextProvider: () -> TrackActionContext?,
-        private val onUpdateTrackContext: (TrackActionContext) -> Unit,
+        private val onUpdateTrackContext: (TrackActionContext?) -> Unit,
         private val onRefreshCustomLayout: (List<CommandButton>) -> Unit,
-        private val onSkipToNext: () -> Unit,
+        private val onSkipToNext: () -> Boolean,
         private val onStartTrackRadio: suspend (String) -> Unit = {},
         private val onMutationEnqueued: () -> Unit = {},
     ) {
@@ -163,62 +174,64 @@ object AutoCustomActions {
 
             return when (action) {
                 ACTION_KEEP_DISCOVERY -> {
-                    val discoveryId = resolveDiscoveryTrackId(current)
-                    val updated = current.copy(
-                        isPendingDiscovery = false,
-                        userRating = maxOf(current.userRating, 4),
-                        discoveryTrackId = discoveryId,
-                    )
-                    onUpdateTrackContext(updated)
-                    onRefreshCustomLayout(
-                        buildCustomLayout(updated, secondaryLibraryActionProvider()),
-                    )
-                    core.enqueueMutation(
+                    val discoveryId = withContext(ioDispatcher) {
+                        resolveDiscoveryTrackId(current)
+                    }
+                    val enqueued = enqueueSafely(
                         FfiOutboxMutation.Keep(
                             songId = current.trackId,
                             discoveryTrackId = discoveryId,
                             targetFolderId = null,
                         ),
                     )
-                    onMutationEnqueued()
+                    if (!enqueued) return SessionResult(SessionError.ERROR_IO)
+
+                    val updated = current.copy(
+                        isPendingDiscovery = false,
+                        userRating = maxOf(current.userRating, 4),
+                        discoveryTrackId = discoveryId,
+                    )
+                    if (currentTrackContextProvider()?.trackId == current.trackId) {
+                        onUpdateTrackContext(updated)
+                        onRefreshCustomLayout(
+                            buildCustomLayout(updated, secondaryLibraryActionProvider()),
+                        )
+                    }
+                    notifyMutationEnqueued()
                     SessionResult(SessionResult.RESULT_SUCCESS)
                 }
 
                 ACTION_DROP_DISCOVERY -> {
-                    val discoveryId = resolveDiscoveryTrackId(current)
-                    val updated = current.copy(
-                        isPendingDiscovery = false,
-                        discoveryTrackId = discoveryId,
-                    )
-                    onUpdateTrackContext(updated)
-                    core.enqueueMutation(
+                    val discoveryId = withContext(ioDispatcher) {
+                        resolveDiscoveryTrackId(current)
+                    }
+                    val enqueued = enqueueSafely(
                         FfiOutboxMutation.Drop(
                             songId = current.trackId,
                             discoveryTrackId = discoveryId,
                             confirmDelete = false,
                         ),
                     )
-                    onMutationEnqueued()
-                    onSkipToNext()
+                    if (!enqueued) return SessionResult(SessionError.ERROR_IO)
+
+                    notifyMutationEnqueued()
+                    if (currentTrackContextProvider()?.trackId == current.trackId) {
+                        val advanced = onSkipToNext()
+                        if (!advanced) {
+                            onUpdateTrackContext(null)
+                            onRefreshCustomLayout(emptyList())
+                        }
+                    }
                     SessionResult(SessionResult.RESULT_SUCCESS)
                 }
 
                 ACTION_STAR_TOGGLE -> {
                     val newStarred = !current.isStarred
                     val discoveryId = if (newStarred && current.isPendingDiscovery) {
-                        resolveDiscoveryTrackId(current)
+                        withContext(ioDispatcher) { resolveDiscoveryTrackId(current) }
                     } else {
                         current.discoveryTrackId
                     }
-                    val updated = current.copy(
-                        isStarred = newStarred,
-                        isPendingDiscovery = if (newStarred) false else current.isPendingDiscovery,
-                        discoveryTrackId = discoveryId,
-                    )
-                    onUpdateTrackContext(updated)
-                    onRefreshCustomLayout(
-                        buildCustomLayout(updated, secondaryLibraryActionProvider()),
-                    )
                     val mutation = if (newStarred) {
                         FfiOutboxMutation.Star(
                             songId = current.trackId,
@@ -230,23 +243,43 @@ object AutoCustomActions {
                             discoveryTrackId = discoveryId,
                         )
                     }
-                    core.enqueueMutation(mutation)
-                    onMutationEnqueued()
+                    if (!enqueueSafely(mutation)) return SessionResult(SessionError.ERROR_IO)
+
+                    val updated = current.copy(
+                        isStarred = newStarred,
+                        isPendingDiscovery = if (newStarred) false else current.isPendingDiscovery,
+                        discoveryTrackId = discoveryId,
+                    )
+                    if (currentTrackContextProvider()?.trackId == current.trackId) {
+                        onUpdateTrackContext(updated)
+                        onRefreshCustomLayout(
+                            buildCustomLayout(updated, secondaryLibraryActionProvider()),
+                        )
+                    }
+                    notifyMutationEnqueued()
                     SessionResult(SessionResult.RESULT_SUCCESS)
                 }
 
                 ACTION_DISLIKE_SKIP -> {
-                    val updated = current.copy(userRating = 1)
-                    onUpdateTrackContext(updated)
-                    core.enqueueMutation(
+                    val enqueued = enqueueSafely(
                         FfiOutboxMutation.Rate(
                             songId = current.trackId,
                             rating = 1u,
                             discoveryTrackId = current.discoveryTrackId,
                         ),
                     )
-                    onMutationEnqueued()
-                    onSkipToNext()
+                    if (!enqueued) return SessionResult(SessionError.ERROR_IO)
+
+                    notifyMutationEnqueued()
+                    if (currentTrackContextProvider()?.trackId == current.trackId) {
+                        val updated = current.copy(userRating = 1)
+                        onUpdateTrackContext(updated)
+                        val advanced = onSkipToNext()
+                        if (!advanced) {
+                            onUpdateTrackContext(null)
+                            onRefreshCustomLayout(emptyList())
+                        }
+                    }
                     SessionResult(SessionResult.RESULT_SUCCESS)
                 }
 
@@ -259,13 +292,35 @@ object AutoCustomActions {
             }
         }
 
+        private suspend fun enqueueSafely(mutation: FfiOutboxMutation): Boolean =
+            try {
+                withContext(ioDispatcher) {
+                    core.enqueueMutation(mutation)
+                }
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                false
+            }
+
+        private suspend fun notifyMutationEnqueued() {
+            withContext(ioDispatcher) {
+                onMutationEnqueued()
+            }
+        }
+
         private suspend fun resolveDiscoveryTrackId(context: TrackActionContext): String? {
             if (!context.discoveryTrackId.isNullOrBlank()) return context.discoveryTrackId
-            return runCatching {
+            return try {
                 core.listDiscoveryTriage(pendingOnly = true)
                     .firstOrNull { it.songId == context.trackId }
                     ?.id
-            }.getOrNull()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
         }
     }
 }

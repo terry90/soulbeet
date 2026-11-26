@@ -14,6 +14,7 @@ import org.soulbeet.core.FfiConnectState
 import org.soulbeet.core.FfiDiscoveryTrack
 import org.soulbeet.core.FfiDownloadOutcome
 import org.soulbeet.core.FfiDrainReport
+import org.soulbeet.core.FfiException
 import org.soulbeet.core.FfiLibraryStats
 import org.soulbeet.core.FfiNavidromeCredentials
 import org.soulbeet.core.FfiOutboxMutation
@@ -40,12 +41,21 @@ open class FakeCoreClient : CoreClient {
     var rootTabs: List<FfiAutoBrowseNode> = defaultFourRootTabs()
     val childrenByParent: MutableMap<String, List<FfiAutoBrowseNode>> = mutableMapOf()
     val tracksById: MutableMap<String, FfiTrack> = mutableMapOf()
+    val albumsById: MutableMap<String, FfiAlbum> = mutableMapOf()
+    val artistsById: MutableMap<String, FfiArtist> = mutableMapOf()
+    val playlists: MutableList<FfiPlaylist> = mutableListOf()
     val offlineTracks: MutableList<FfiDownloadOutcome> = mutableListOf()
     val discoveryTracks: MutableList<FfiDiscoveryTrack> = mutableListOf()
     val coverArtPaths: MutableMap<String, String> = mutableMapOf()
     val enqueuedMutations: MutableList<FfiOutboxMutation> = mutableListOf()
     var persistedSession: FfiPersistedPlaybackSession? = null
     var returnTracksOutOfOrder: Boolean = false
+    var enqueueMutationException: Exception? = null
+    var onEnqueueMutationCallback: ((FfiOutboxMutation) -> Unit)? = null
+    var voiceSearchHandler: (String) -> FfiVoiceMatchResult? = { null }
+    var playbackSourceHandler: (String, FfiAudioQualityProfile) -> FfiPlaybackSource = { _, _ ->
+        throw FfiException.Offline("not cached")
+    }
 
     override fun autoRootTabs(): List<FfiAutoBrowseNode> = rootTabs
 
@@ -69,12 +79,20 @@ open class FakeCoreClient : CoreClient {
         return if (returnTracksOutOfOrder) found.reversed() else found
     }
 
+    override suspend fun getAlbum(albumId: String): FfiAlbum? = albumsById[albumId]
+
+    override suspend fun getArtist(artistId: String): FfiArtist? = artistsById[artistId]
+
+    override suspend fun listPlaylists(): List<FfiPlaylist> = playlists.toList()
+
     override suspend fun listOfflineTracks(): List<FfiDownloadOutcome> = offlineTracks.toList()
 
     override suspend fun listDiscoveryTriage(pendingOnly: Boolean): List<FfiDiscoveryTrack> =
         if (pendingOnly) discoveryTracks.filter { it.status == "pending" } else discoveryTracks.toList()
 
     override suspend fun enqueueMutation(mutation: FfiOutboxMutation): Long {
+        onEnqueueMutationCallback?.invoke(mutation)
+        enqueueMutationException?.let { throw it }
         enqueuedMutations.add(mutation)
         return enqueuedMutations.size.toLong()
     }
@@ -89,6 +107,13 @@ open class FakeCoreClient : CoreClient {
     }
 
     override suspend fun loadPlaybackSession(): FfiPersistedPlaybackSession? = persistedSession
+
+    override suspend fun voiceSearch(query: String): FfiVoiceMatchResult? = voiceSearchHandler(query)
+
+    override suspend fun resolvePlaybackSource(
+        trackId: String,
+        profile: FfiAudioQualityProfile,
+    ): FfiPlaybackSource = playbackSourceHandler(trackId, profile)
 
     override fun close() = Unit
 
@@ -114,15 +139,12 @@ open class FakeCoreClient : CoreClient {
     override suspend fun drainOutbox(): FfiDrainReport = FfiDrainReport(0uL, 0uL, 0uL)
     override suspend fun enforceCacheBudget(): ULong = 0uL
     override suspend fun fetchBootstrap(): FfiClientBootstrap? = null
-    override suspend fun getAlbum(albumId: String): FfiAlbum? = null
-    override suspend fun getArtist(artistId: String): FfiArtist? = null
     override suspend fun getOrFetchCoverArt(coverArtId: String, size: UInt?): String =
         coverArtPaths[coverArtId] ?: ""
     override suspend fun libraryStats(): FfiLibraryStats = throw UnsupportedOperationException()
-    override suspend fun listAlbums(artistId: String?): List<FfiAlbum> = emptyList()
-    override suspend fun listArtists(): List<FfiArtist> = emptyList()
+    override suspend fun listAlbums(artistId: String?): List<FfiAlbum> = albumsById.values.toList()
+    override suspend fun listArtists(): List<FfiArtist> = artistsById.values.toList()
     override suspend fun listPinnedTargets(): List<FfiPinState> = emptyList()
-    override suspend fun listPlaylists(): List<FfiPlaylist> = emptyList()
     override suspend fun listStarredTracks(): List<FfiTrack> = tracksById.values.filter { it.starred }
     override suspend fun listTracksByAlbum(albumId: String): List<FfiTrack> =
         tracksById.values.filter { it.albumId == albumId }
@@ -136,10 +158,6 @@ open class FakeCoreClient : CoreClient {
         profile: FfiAudioQualityProfile,
         isWifi: Boolean,
     ): List<String> = emptyList()
-    override suspend fun resolvePlaybackSource(
-        trackId: String,
-        profile: FfiAudioQualityProfile,
-    ): FfiPlaybackSource = throw UnsupportedOperationException()
     override suspend fun retryDeadLetters(): ULong = 0uL
     override suspend fun runAutoCacheRules(
         profile: FfiAudioQualityProfile,
@@ -155,7 +173,6 @@ open class FakeCoreClient : CoreClient {
     override suspend fun syncNow(forceFull: Boolean): FfiSyncReport =
         throw UnsupportedOperationException()
     override suspend fun unpin(target: FfiPinTarget): ULong = 0uL
-    override suspend fun voiceSearch(query: String): FfiVoiceMatchResult? = null
 
     companion object {
         fun defaultFourRootTabs(): List<FfiAutoBrowseNode> = listOf(

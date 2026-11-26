@@ -134,6 +134,34 @@ class SoulbeetMediaRepository {
         _playbackState.update { it.copy(lastError = error) }
     }
 
+    /**
+     * Clears active track and playback state (e.g. when the player transitions to `null` or stops)
+     * while preserving user preferences (`offlineOnly`, `librarySecondaryAction`, `audioQualityProfile`).
+     */
+    fun clearActiveTrack() {
+        _playbackState.update { prev ->
+            prev.copy(
+                currentTrackId = null,
+                title = "",
+                artist = "",
+                album = "",
+                coverArtId = null,
+                isPlaying = false,
+                isBuffering = false,
+                positionMs = 0L,
+                durationMs = 0L,
+                queueTrackIds = emptyList(),
+                currentIndex = 0,
+                isPendingDiscovery = false,
+                isStarred = false,
+                userRating = 0,
+                isOfflineCached = false,
+                sourceLabel = null,
+                lastError = null,
+            )
+        }
+    }
+
     fun reset() {
         _playbackState.value = MediaPlaybackUiState()
     }

@@ -20,10 +20,8 @@ kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 kotlinx-coroutines-guava = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-guava", version.ref = "coroutines" }
 kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
-# JNA @aar is required on Android so libjnidispatch.so is packaged into APK/AAR.
-jna-aar = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
-# Standard JNA JAR for JVM unit tests (does not require AAR extraction).
-jna-jvm = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
+# JNA library (packaged as @aar in :core-bindings so libjnidispatch.so is included; JAR for JVM unit tests).
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
 
 androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
 androidx-media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }

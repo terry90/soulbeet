@@ -50,7 +50,7 @@ dependencies {
     api(libs.androidx.work.runtime.ktx)
     implementation(libs.guava)
 
-    testImplementation(libs.jna.jvm)
+    testImplementation(libs.jna)
     testImplementation(libs.junit4)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)

@@ -8,13 +8,26 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.FileDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
 import kotlinx.coroutines.runBlocking
 import org.soulbeet.core.FfiAudioQualityProfile
+import org.soulbeet.core.FfiException
 import org.soulbeet.core.FfiPlaybackSource
 import org.soulbeet.corebindings.CoreClient
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
+
+/**
+ * Thrown by [SoulbeetDataSource] when offline mode is active and the requested track is not
+ * present in the local offline cache. Allows [SoulbeetMediaLibraryService] to distinguish offline
+ * cache misses from generic decode/IO failures when deciding whether to skip to the next cached item.
+ */
+class OfflineTrackUnavailableException(
+    message: String,
+    cause: Throwable? = null,
+) : IOException(message, cause)
 
 /**
  * Media3 [DataSource.Factory] backed by `lib/client-core`'s offline-first [CoreClient.resolvePlaybackSource].
@@ -23,7 +36,8 @@ import java.io.IOException
  * its background loader thread:
  * - [FfiPlaybackSource.LocalFile] streams directly from disk via [FileDataSource] (zero network).
  * - [FfiPlaybackSource.StreamUrl] streams via [DefaultHttpDataSource], injecting every custom HTTP
- *   header returned in [FfiPlaybackSource.StreamUrl.headers].
+ *   header returned in [FfiPlaybackSource.StreamUrl.headers] and disabling cross-protocol redirects
+ *   whenever custom headers are attached (preventing HTTPS→HTTP credential leakage).
  */
 @OptIn(UnstableApi::class)
 class SoulbeetDataSourceFactory(
@@ -31,9 +45,12 @@ class SoulbeetDataSourceFactory(
     private val qualityProfileProvider: () -> FfiAudioQualityProfile = {
         FfiAudioQualityProfile.CellularOpus160
     },
-    private val httpDataSourceFactory: DefaultHttpDataSource.Factory = DefaultHttpDataSource.Factory()
+    private val httpDataSourceFactory: HttpDataSource.Factory = DefaultHttpDataSource.Factory()
         .setUserAgent("SoulbeetAndroid/1.0")
         .setAllowCrossProtocolRedirects(true),
+    private val authenticatedHttpDataSourceFactory: HttpDataSource.Factory = DefaultHttpDataSource.Factory()
+        .setUserAgent("SoulbeetAndroid/1.0")
+        .setAllowCrossProtocolRedirects(false),
 ) : DataSource.Factory {
 
     override fun createDataSource(): DataSource =
@@ -41,6 +58,7 @@ class SoulbeetDataSourceFactory(
             coreProvider = coreProvider,
             qualityProfileProvider = qualityProfileProvider,
             httpDataSourceFactory = httpDataSourceFactory,
+            authenticatedHttpDataSourceFactory = authenticatedHttpDataSourceFactory,
         )
 
     companion object {
@@ -65,7 +83,8 @@ class SoulbeetDataSourceFactory(
 internal class SoulbeetDataSource(
     private val coreProvider: () -> CoreClient?,
     private val qualityProfileProvider: () -> FfiAudioQualityProfile,
-    private val httpDataSourceFactory: DefaultHttpDataSource.Factory,
+    private val httpDataSourceFactory: HttpDataSource.Factory,
+    private val authenticatedHttpDataSourceFactory: HttpDataSource.Factory,
 ) : DataSource {
 
     private val transferListeners = mutableListOf<TransferListener>()
@@ -77,6 +96,8 @@ internal class SoulbeetDataSource(
     }
 
     override fun open(dataSpec: DataSpec): Long {
+        close()
+
         val uri = dataSpec.uri
         val (delegate, resolvedSpec) = when (uri.scheme) {
             SoulbeetDataSourceFactory.SCHEME_SOULBEET -> resolveSoulbeetSource(dataSpec)
@@ -89,7 +110,13 @@ internal class SoulbeetDataSource(
             delegate.addTransferListener(listener)
         }
         activeDelegate = delegate
-        return delegate.open(resolvedSpec)
+        return try {
+            delegate.open(resolvedSpec)
+        } catch (e: Exception) {
+            runCatching { delegate.close() }
+            activeDelegate = null
+            throw e
+        }
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
@@ -108,7 +135,7 @@ internal class SoulbeetDataSource(
         delegate?.close()
     }
 
-    private fun resolveSoulbeetSource(dataSpec: DataSpec): Pair<DataSource, DataSpec> {
+    internal fun resolveSoulbeetSource(dataSpec: DataSpec): Pair<DataSource, DataSpec> {
         val trackId = SoulbeetDataSourceFactory.extractTrackIdFromUri(dataSpec.uri)
             ?: throw IOException("Invalid Soulbeet track URI: ${dataSpec.uri}")
         val core = coreProvider()
@@ -118,8 +145,18 @@ internal class SoulbeetDataSource(
             runBlocking {
                 core.resolvePlaybackSource(trackId, qualityProfileProvider())
             }
-        } catch (t: Throwable) {
-            throw IOException("Failed to resolve playback source for track '$trackId': ${t.message}", t)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw InterruptedIOException("Interrupted while resolving playback source for '$trackId'").apply {
+                initCause(e)
+            }
+        } catch (e: FfiException.Offline) {
+            throw OfflineTrackUnavailableException(
+                "Track '$trackId' is not cached offline: ${e.message}",
+                e,
+            )
+        } catch (e: Exception) {
+            throw IOException("Failed to resolve playback source for track '$trackId': ${e.message}", e)
         }
 
         return when (source) {
@@ -132,7 +169,12 @@ internal class SoulbeetDataSource(
             }
 
             is FfiPlaybackSource.StreamUrl -> {
-                val httpSource = httpDataSourceFactory.createDataSource()
+                val factory = if (source.headers.isNotEmpty()) {
+                    authenticatedHttpDataSourceFactory
+                } else {
+                    httpDataSourceFactory
+                }
+                val httpSource = factory.createDataSource()
                 for (header in source.headers) {
                     httpSource.setRequestProperty(header.name, header.value)
                 }

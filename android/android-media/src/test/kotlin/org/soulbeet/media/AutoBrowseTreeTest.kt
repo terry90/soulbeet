@@ -1,6 +1,8 @@
 package org.soulbeet.media
 
+import androidx.annotation.OptIn
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaConstants
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -13,7 +15,9 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.soulbeet.core.FfiAutoNodeKind
+import org.soulbeet.core.FfiPersistedPlaybackSession
 
+@OptIn(UnstableApi::class)
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class AutoBrowseTreeTest {
@@ -23,7 +27,6 @@ class AutoBrowseTreeTest {
     @Test
     fun rootTabsExposeExactFourCarValidatorTabsWithStyleHints() = runTest {
         val core = FakeCoreClient()
-        // Even if a future core returned >4 tabs, CAR.VALIDATOR strictly caps at 4.
         core.rootTabs = FakeCoreClient.defaultFourRootTabs() + FakeCoreClient.browseNode(
             id = "tab:extra",
             title = "Extra",
@@ -50,7 +53,6 @@ class AutoBrowseTreeTest {
             assertFalse("Tab ${tab.mediaId} must not be playable", tab.mediaMetadata.isPlayable == true)
         }
 
-        // For You, Playlists, Radio use Grid; Library uses List
         val forYouExtras = tabs[0].mediaMetadata.extras!!
         assertEquals(
             MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,
@@ -74,19 +76,17 @@ class AutoBrowseTreeTest {
         assertEquals(listOf(10), AutoBrowseTree.paginate(items, page = 3, pageSize = 3))
         assertEquals(emptyList<Int>(), AutoBrowseTree.paginate(items, page = 4, pageSize = 3))
 
-        // Android Auto commonly requests page=0/1 with pageSize=Int.MAX_VALUE
         assertEquals(items, AutoBrowseTree.paginate(items, page = 0, pageSize = Int.MAX_VALUE))
         assertEquals(emptyList<Int>(), AutoBrowseTree.paginate(items, page = 1, pageSize = Int.MAX_VALUE))
 
-        // Defensive guards
         assertEquals(emptyList<Int>(), AutoBrowseTree.paginate(items, page = -1, pageSize = 5))
         assertEquals(emptyList<Int>(), AutoBrowseTree.paginate(items, page = 0, pageSize = 0))
     }
 
     @Test
-    fun trackLeafMapsContentProviderArtworkUriAndOmitsWhenNull() = runTest {
+    fun trackLeafEncodesParentContextMapsArtworkUriAndOmitsWhenNull() = runTest {
         val core = FakeCoreClient()
-        val withArt = FakeCoreClient.sampleTrack(
+        core.tracksById["s1"] = FakeCoreClient.sampleTrack(
             id = "s1",
             title = "Instant Crush",
             artist = "Daft Punk",
@@ -96,7 +96,7 @@ class AutoBrowseTreeTest {
             userRating = 5L,
             isDiscovery = false,
         )
-        val withoutArt = FakeCoreClient.sampleTrack(
+        core.tracksById["s2"] = FakeCoreClient.sampleTrack(
             id = "s2",
             title = "Fresh Find",
             artist = "New Artist",
@@ -106,8 +106,6 @@ class AutoBrowseTreeTest {
             userRating = 0L,
             isDiscovery = true,
         )
-        core.tracksById["s1"] = withArt
-        core.tracksById["s2"] = withoutArt
         core.childrenByParent["playlist:p1"] = listOf(
             FakeCoreClient.browseNode(
                 id = "track:s1",
@@ -140,6 +138,9 @@ class AutoBrowseTreeTest {
         assertEquals(2, items.size)
 
         val item1 = items[0]
+        assertEquals("ctx:playlist:p1|track:s1", item1.mediaId)
+        assertEquals(ContextualTrackRef("playlist:p1", "s1"), AutoBrowseTree.parseContextualTrackId(item1.mediaId))
+        assertEquals("s1", AutoBrowseTree.extractTrackId(item1.mediaId))
         assertEquals(MediaMetadata.MEDIA_TYPE_MUSIC, item1.mediaMetadata.mediaType)
         assertEquals("content://$authority/art/cov-123", item1.mediaMetadata.artworkUri?.toString())
         assertEquals("RAM", item1.mediaMetadata.albumTitle?.toString())
@@ -162,23 +163,82 @@ class AutoBrowseTreeTest {
     }
 
     @Test
-    fun offlineOnlyFiltersOutUncachedLeafTracks() = runTest {
+    fun offlineOnlyFiltersOutUncachedTracksAndUncachedPlayableContainers() = runTest {
         val core = FakeCoreClient()
-        core.childrenByParent["playlist:p1"] = listOf(
-            FakeCoreClient.browseNode("track:cached", "Cached", FfiAutoNodeKind.TRACK, isOfflineReady = true),
-            FakeCoreClient.browseNode("track:remote", "Remote", FfiAutoNodeKind.TRACK, isOfflineReady = false),
+        core.childrenByParent[AutoBrowseTree.TAB_PLAYLISTS] = listOf(
+            FakeCoreClient.browseNode(
+                id = "playlist:offline-pl",
+                title = "Offline Mix",
+                kind = FfiAutoNodeKind.PLAYLIST,
+                playable = true,
+                browsable = true,
+                isOfflineReady = true,
+            ),
+            FakeCoreClient.browseNode(
+                id = "playlist:remote-pl",
+                title = "Remote Only Mix",
+                kind = FfiAutoNodeKind.PLAYLIST,
+                playable = true,
+                browsable = true,
+                isOfflineReady = false,
+            ),
+            FakeCoreClient.browseNode(
+                id = "az:a-d",
+                title = "A–D",
+                kind = FfiAutoNodeKind.FOLDER,
+                playable = false,
+                browsable = true,
+                isOfflineReady = false,
+            ),
         )
 
         val items = AutoBrowseTree.loadChildren(
             core = core,
-            parentId = "playlist:p1",
+            parentId = AutoBrowseTree.TAB_PLAYLISTS,
             page = 0,
             pageSize = 25,
             artAuthority = authority,
             offlineOnly = true,
         )
 
-        assertEquals(1, items.size)
-        assertEquals("track:cached", items[0].mediaId)
+        assertEquals(listOf("playlist:offline-pl", "az:a-d"), items.map { it.mediaId })
+    }
+
+    @Test
+    fun recentRootReturnsSingleLastPlayedTrackOrEmptyWhenNoSession() = runTest {
+        val core = FakeCoreClient()
+
+        // No persisted session yet
+        val empty = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.RECENT_ROOT_ID,
+            page = 0,
+            pageSize = 10,
+            artAuthority = authority,
+        )
+        assertTrue(empty.isEmpty())
+
+        // With persisted session
+        core.tracksById["t1"] = FakeCoreClient.sampleTrack("t1", title = "First")
+        core.tracksById["t2"] = FakeCoreClient.sampleTrack("t2", title = "Resumed Track")
+        core.persistedSession = FfiPersistedPlaybackSession(
+            queueTrackIds = listOf("t1", "t2"),
+            currentIndex = 1u,
+            positionMs = 15_000uL,
+            isPlaying = false,
+            sourceLabel = "Drive Mix",
+            updatedAt = 1_700_000_000L,
+        )
+
+        val recent = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.RECENT_ROOT_ID,
+            page = 0,
+            pageSize = 10,
+            artAuthority = authority,
+        )
+        assertEquals(1, recent.size)
+        assertEquals("t2", recent[0].mediaId)
+        assertEquals("Resumed Track", recent[0].mediaMetadata.title?.toString())
     }
 }

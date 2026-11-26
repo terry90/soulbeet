@@ -13,6 +13,16 @@ import org.soulbeet.core.FfiTrack
 import org.soulbeet.corebindings.CoreClient
 
 /**
+ * Parsed contextual track reference (`ctx:<parentId>|track:<trackId>`) allowing Android Auto
+ * track taps inside playlists, albums, offline downloads, or discovery triage to hydrate the
+ * full sibling queue starting at [trackId].
+ */
+data class ContextualTrackRef(
+    val parentId: String,
+    val trackId: String,
+)
+
+/**
  * Pure mapper turning `lib/client-core`'s bounded Android Auto browse tree into
  * `CAR.VALIDATOR`-compliant Media3 [MediaItem] hierarchies.
  *
@@ -26,6 +36,7 @@ import org.soulbeet.corebindings.CoreClient
 object AutoBrowseTree {
 
     const val ROOT_ID: String = "root"
+    const val RECENT_ROOT_ID: String = "root:recent"
     const val TAB_FOR_YOU: String = "tab:for_you"
     const val TAB_PLAYLISTS: String = "tab:playlists"
     const val TAB_LIBRARY: String = "tab:library"
@@ -40,6 +51,10 @@ object AutoBrowseTree {
     const val PREFIX_ALBUM: String = "album:"
     const val PREFIX_ARTIST: String = "artist:"
     const val PREFIX_RADIO_ARTIST: String = "radio:artist:"
+    const val PREFIX_AZ: String = "az:"
+
+    const val CONTEXT_PREFIX: String = "ctx:"
+    const val CONTEXT_SEPARATOR: String = "|track:"
 
     const val EXTRA_IS_DISCOVERY: String = "org.soulbeet.media.extra.IS_DISCOVERY"
     const val EXTRA_IS_STARRED: String = "org.soulbeet.media.extra.IS_STARRED"
@@ -49,6 +64,7 @@ object AutoBrowseTree {
     const val EXTRA_COVER_ART_ID: String = "org.soulbeet.media.extra.COVER_ART_ID"
     const val EXTRA_NODE_KIND: String = "org.soulbeet.media.extra.NODE_KIND"
     const val EXTRA_SOURCE_LABEL: String = "org.soulbeet.media.extra.SOURCE_LABEL"
+    const val EXTRA_PARENT_BROWSE_ID: String = "org.soulbeet.media.extra.PARENT_BROWSE_ID"
 
     const val EXTRAS_KEY_CONTENT_STYLE_SUPPORTED: String =
         "android.media.browse.CONTENT_STYLE_SUPPORTED"
@@ -81,6 +97,23 @@ object AutoBrowseTree {
             .build()
         return MediaItem.Builder()
             .setMediaId(ROOT_ID)
+            .setMediaMetadata(metadata)
+            .build()
+    }
+
+    /**
+     * Builds the dedicated recent-media root [MediaItem] returned when `params.isRecent == true`
+     * (used by Android SystemUI / Android Auto media resumption cards).
+     */
+    fun recentRootMediaItem(): MediaItem {
+        val metadata = MediaMetadata.Builder()
+            .setTitle("Continue Listening")
+            .setIsBrowsable(true)
+            .setIsPlayable(false)
+            .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+            .build()
+        return MediaItem.Builder()
+            .setMediaId(RECENT_ROOT_ID)
             .setMediaMetadata(metadata)
             .build()
     }
@@ -136,12 +169,13 @@ object AutoBrowseTree {
 
     /**
      * Maps a single [FfiAutoBrowseNode] into a Media3 [MediaItem], optionally enriched with full
-     * [FfiTrack] metadata when available.
+     * [FfiTrack] metadata and parent browse context when available.
      */
     fun mapNode(
         node: FfiAutoBrowseNode,
         artAuthority: String,
         trackDetails: FfiTrack? = null,
+        parentBrowseId: String? = null,
     ): MediaItem {
         if (node.kind == FfiAutoNodeKind.TAB) {
             return mapRootTabs(listOf(node), artAuthority).first()
@@ -151,6 +185,11 @@ object AutoBrowseTree {
             extractTrackId(node.id)
         } else {
             null
+        }
+        val effectiveMediaId = if (rawTrackId != null && !parentBrowseId.isNullOrBlank()) {
+            contextualTrackId(parentBrowseId, rawTrackId)
+        } else {
+            node.id
         }
         val effectiveCoverArtId = trackDetails?.coverArtId ?: node.coverArtId
         val isDiscovery = trackDetails?.isDiscovery ?: node.isPendingDiscovery
@@ -178,6 +217,9 @@ object AutoBrowseTree {
             putString(EXTRA_NODE_KIND, node.kind.name)
             if (rawTrackId != null) {
                 putString(EXTRA_TRACK_ID, rawTrackId)
+            }
+            if (!parentBrowseId.isNullOrBlank()) {
+                putString(EXTRA_PARENT_BROWSE_ID, parentBrowseId)
             }
             if (!effectiveCoverArtId.isNullOrBlank()) {
                 putString(EXTRA_COVER_ART_ID, effectiveCoverArtId)
@@ -207,7 +249,7 @@ object AutoBrowseTree {
         }
 
         return MediaItem.Builder()
-            .setMediaId(node.id)
+            .setMediaId(effectiveMediaId)
             .setMediaMetadata(metadataBuilder.build())
             .build()
     }
@@ -283,9 +325,19 @@ object AutoBrowseTree {
             return paginate(rootTabs, page, pageSize)
         }
 
+        if (parentId == RECENT_ROOT_ID) {
+            val restored = PlaybackSessionStore.restoreSession(core, artAuthority) ?: return emptyList()
+            val lastPlayed = restored.items.getOrNull(restored.startIndex) ?: return emptyList()
+            return paginate(listOf(lastPlayed), page, pageSize)
+        }
+
         val rawNodes = core.autoChildren(parentId)
         val filteredNodes = if (offlineOnly) {
-            rawNodes.filter { it.browsable || it.isOfflineReady }
+            rawNodes.filter { node ->
+                node.isOfflineReady ||
+                    node.kind == FfiAutoNodeKind.TAB ||
+                    (node.kind == FfiAutoNodeKind.FOLDER && !node.playable)
+            }
         } else {
             rawNodes
         }
@@ -306,7 +358,12 @@ object AutoBrowseTree {
             } else {
                 null
             }
-            mapNode(node, artAuthority, details)
+            mapNode(
+                node = node,
+                artAuthority = artAuthority,
+                trackDetails = details,
+                parentBrowseId = parentId,
+            )
         }
     }
 
@@ -325,7 +382,21 @@ object AutoBrowseTree {
         return items.subList(start, endLong.toInt())
     }
 
-    fun extractTrackId(mediaId: String): String = mediaId.removePrefix(PREFIX_TRACK)
+    fun contextualTrackId(parentId: String, rawTrackId: String): String =
+        "$CONTEXT_PREFIX$parentId$CONTEXT_SEPARATOR$rawTrackId"
+
+    fun parseContextualTrackId(mediaId: String): ContextualTrackRef? {
+        if (!mediaId.startsWith(CONTEXT_PREFIX)) return null
+        val sepIndex = mediaId.indexOf(CONTEXT_SEPARATOR)
+        if (sepIndex <= CONTEXT_PREFIX.length) return null
+        val parentId = mediaId.substring(CONTEXT_PREFIX.length, sepIndex)
+        val trackId = mediaId.substring(sepIndex + CONTEXT_SEPARATOR.length)
+        if (parentId.isBlank() || trackId.isBlank()) return null
+        return ContextualTrackRef(parentId = parentId, trackId = trackId)
+    }
+
+    fun extractTrackId(mediaId: String): String =
+        parseContextualTrackId(mediaId)?.trackId ?: mediaId.removePrefix(PREFIX_TRACK)
 
     private fun artworkUriOrNull(artAuthority: String, coverArtId: String?): Uri? {
         val cleanId = coverArtId?.trim()?.takeIf { it.isNotEmpty() } ?: return null

@@ -1,18 +1,25 @@
 package org.soulbeet.media
 
+import androidx.annotation.OptIn
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.CommandButton
+import androidx.media3.session.SessionError
 import androidx.media3.session.SessionResult
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.soulbeet.core.FfiDiscoveryTrack
+import org.soulbeet.core.FfiException
 import org.soulbeet.core.FfiOutboxMutation
 
+@OptIn(UnstableApi::class)
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class AutoCustomActionsTest {
@@ -68,26 +75,30 @@ class AutoCustomActionsTest {
     }
 
     @Test
-    fun keepActionEnqueuesKeepMutationAndFlipsCustomLayoutToLibraryBar() = runTest {
-        val core = FakeCoreClient()
-        core.discoveryTracks.add(
-            FfiDiscoveryTrack(
-                id = "dt-42",
-                songId = "song-99",
-                artist = "Parcels",
-                title = "Tieduprightnow",
-                album = null,
-                folderPath = null,
-                profileSlug = "balanced",
-                mixSlug = "weekly-radar",
-                status = "pending",
-                createdAt = null,
-                expiresAt = null,
-                reasonJson = null,
-                excludeFromCoreTaste = false,
-                updatedAt = 1_700_000_000L,
-            ),
-        )
+    fun keepActionEnqueuesBeforeUpdatingContextAndRunsUiCallbacksOnCallerThread() = runTest {
+        val callerThreadName = Thread.currentThread().name
+        val events = mutableListOf<String>()
+        val core = FakeCoreClient().apply {
+            discoveryTracks.add(
+                FfiDiscoveryTrack(
+                    id = "dt-42",
+                    songId = "song-99",
+                    artist = "Parcels",
+                    title = "Tieduprightnow",
+                    album = null,
+                    folderPath = null,
+                    profileSlug = "balanced",
+                    mixSlug = "weekly-radar",
+                    status = "pending",
+                    createdAt = null,
+                    expiresAt = null,
+                    reasonJson = null,
+                    excludeFromCoreTaste = false,
+                    updatedAt = 1_700_000_000L,
+                ),
+            )
+            onEnqueueMutationCallback = { events.add("enqueue") }
+        }
 
         var activeContext: TrackActionContext? = TrackActionContext(
             trackId = "song-99",
@@ -99,54 +110,96 @@ class AutoCustomActionsTest {
 
         val handler = AutoCustomActions.ActionHandler(
             core = core,
+            ioDispatcher = Dispatchers.IO,
             currentTrackContextProvider = { activeContext },
-            onUpdateTrackContext = { activeContext = it },
-            onRefreshCustomLayout = { latestLayout = it },
-            onSkipToNext = { skipped = true },
+            onUpdateTrackContext = {
+                assertEquals(callerThreadName, Thread.currentThread().name)
+                events.add("updateContext")
+                activeContext = it
+            },
+            onRefreshCustomLayout = {
+                assertEquals(callerThreadName, Thread.currentThread().name)
+                events.add("refreshLayout")
+                latestLayout = it
+            },
+            onSkipToNext = {
+                skipped = true
+                true
+            },
         )
 
         val res = handler.handle(AutoCustomActions.ACTION_KEEP_DISCOVERY)
 
         assertEquals(SessionResult.RESULT_SUCCESS, res.resultCode)
         assertFalse("Keep must NOT skip playback", skipped)
-        assertFalse("Track should optimistically transition out of discovery", activeContext!!.isPendingDiscovery)
-        assertEquals(1, core.enqueuedMutations.size)
+        assertEquals(listOf("enqueue", "updateContext", "refreshLayout"), events)
+        assertFalse(activeContext!!.isPendingDiscovery)
         assertEquals(
-            FfiOutboxMutation.Keep(songId = "song-99", discoveryTrackId = "dt-42", targetFolderId = null),
-            core.enqueuedMutations[0],
+            listOf(FfiOutboxMutation.Keep(songId = "song-99", discoveryTrackId = "dt-42", targetFolderId = null)),
+            core.enqueuedMutations,
         )
-        assertEquals(2, latestLayout.size)
         assertEquals(AutoCustomActions.ACTION_STAR_TOGGLE, latestLayout[0].sessionCommand?.customAction)
     }
 
     @Test
-    fun dropDiscoveryEnqueuesDropMutationAndSkipsToNext() = runTest {
-        val core = FakeCoreClient()
-        var activeContext: TrackActionContext? = TrackActionContext(
-            trackId = "song-drop",
+    fun failedEnqueueDoesNotDesyncContextOrLayout() = runTest {
+        val core = FakeCoreClient().apply {
+            enqueueMutationException = FfiException.Database("disk full")
+        }
+        val initial = TrackActionContext(
+            trackId = "song-99",
             isPendingDiscovery = true,
             isStarred = false,
-            discoveryTrackId = "dt-7",
         )
-        var skipped = false
+        var activeContext: TrackActionContext? = initial
+        var layoutRefreshed = false
 
         val handler = AutoCustomActions.ActionHandler(
             core = core,
+            ioDispatcher = Dispatchers.Unconfined,
             currentTrackContextProvider = { activeContext },
             onUpdateTrackContext = { activeContext = it },
-            onRefreshCustomLayout = {},
-            onSkipToNext = { skipped = true },
+            onRefreshCustomLayout = { layoutRefreshed = true },
+            onSkipToNext = { true },
+        )
+
+        val res = handler.handle(AutoCustomActions.ACTION_KEEP_DISCOVERY)
+
+        assertEquals(SessionError.ERROR_IO, res.resultCode)
+        assertEquals(initial, activeContext)
+        assertFalse("Layout must not refresh when mutation enqueue fails", layoutRefreshed)
+    }
+
+    @Test
+    fun dropDiscoveryOnLastTrackClearsContextAndCustomLayoutWhenStopped() = runTest {
+        val core = FakeCoreClient()
+        var activeContext: TrackActionContext? = TrackActionContext(
+            trackId = "song-last",
+            isPendingDiscovery = true,
+            isStarred = false,
+            discoveryTrackId = "dt-last",
+        )
+        var latestLayout: List<CommandButton> = AutoCustomActions.buildCustomLayout(activeContext)
+
+        val handler = AutoCustomActions.ActionHandler(
+            core = core,
+            ioDispatcher = Dispatchers.Unconfined,
+            currentTrackContextProvider = { activeContext },
+            onUpdateTrackContext = { activeContext = it },
+            onRefreshCustomLayout = { latestLayout = it },
+            onSkipToNext = { false }, // no next item -> player stopped
         )
 
         val res = handler.handle(AutoCustomActions.ACTION_DROP_DISCOVERY)
 
         assertEquals(SessionResult.RESULT_SUCCESS, res.resultCode)
-        assertTrue("Drop must skip immediately", skipped)
+        assertNull("Stopping on last track must clear active context", activeContext)
+        assertTrue("Stopping on last track must clear stale Keep/Drop custom layout", latestLayout.isEmpty())
         assertEquals(
             listOf(
                 FfiOutboxMutation.Drop(
-                    songId = "song-drop",
-                    discoveryTrackId = "dt-7",
+                    songId = "song-last",
+                    discoveryTrackId = "dt-last",
                     confirmDelete = false,
                 ),
             ),
@@ -166,10 +219,11 @@ class AutoCustomActionsTest {
 
         val handler = AutoCustomActions.ActionHandler(
             core = core,
+            ioDispatcher = Dispatchers.Unconfined,
             currentTrackContextProvider = { activeContext },
             onUpdateTrackContext = { activeContext = it },
             onRefreshCustomLayout = { latestLayout = it },
-            onSkipToNext = {},
+            onSkipToNext = { true },
         )
 
         handler.handle(AutoCustomActions.ACTION_STAR_TOGGLE)
@@ -201,10 +255,14 @@ class AutoCustomActionsTest {
 
         val handler = AutoCustomActions.ActionHandler(
             core = core,
+            ioDispatcher = Dispatchers.Unconfined,
             currentTrackContextProvider = { activeContext },
             onUpdateTrackContext = { activeContext = it },
             onRefreshCustomLayout = {},
-            onSkipToNext = { skipped = true },
+            onSkipToNext = {
+                skipped = true
+                true
+            },
         )
 
         val res = handler.handle(AutoCustomActions.ACTION_DISLIKE_SKIP)

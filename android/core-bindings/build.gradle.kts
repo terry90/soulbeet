@@ -30,12 +30,16 @@ android {
 
 dependencies {
     // CRITICAL: @aar ensures Android packages libjnidispatch.so for every ABI.
-    api("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
+    api(libs.jna) {
+        artifact {
+            type = "aar"
+        }
+    }
     implementation(libs.androidx.annotation)
     api(libs.kotlinx.coroutines.core)
     api(libs.kotlinx.coroutines.android)
 
-    testImplementation(libs.jna.jvm)
+    testImplementation(libs.jna)
     testImplementation(libs.junit4)
 }
 

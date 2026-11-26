@@ -14,6 +14,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.CancellationException
 import org.soulbeet.core.FfiAudioQualityProfile
 import org.soulbeet.core.FfiException
 import org.soulbeet.corebindings.SoulbeetCoreProvider
@@ -29,7 +30,13 @@ class OfflineSyncWorker(
 ) : CoroutineWorker(appContext, params) {
 
     override suspend fun doWork(): Result {
-        val core = SoulbeetCoreProvider.getOrNull() ?: return Result.success()
+        val core = SoulbeetCoreProvider.awaitOrNull()
+        if (core == null) {
+            if (SoulbeetCoreProvider.isExplicitlyUnconfigured()) {
+                return Result.success()
+            }
+            return if (runAttemptCount < MAX_RETRY_ATTEMPTS) Result.retry() else Result.failure()
+        }
         if (core.isOfflineOnly()) {
             return Result.success()
         }
@@ -52,13 +59,15 @@ class OfflineSyncWorker(
                 core.runAutoCacheRules(profile = profile, isWifi = isUnmeteredWifi)
             }
             Result.success()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: FfiException) {
             if (isRetryableError(e) && runAttemptCount < MAX_RETRY_ATTEMPTS) {
                 Result.retry()
             } else {
                 Result.failure()
             }
-        } catch (_: Throwable) {
+        } catch (_: Exception) {
             if (runAttemptCount < MAX_RETRY_ATTEMPTS) {
                 Result.retry()
             } else {
@@ -66,16 +75,6 @@ class OfflineSyncWorker(
             }
         }
     }
-
-    private fun isRetryableError(error: FfiException): Boolean =
-        when (error) {
-            is FfiException.Http,
-            is FfiException.WebSocket,
-            is FfiException.ServerHttp,
-            is FfiException.Io -> true
-
-            else -> false
-        }
 
     companion object {
         const val KEY_DRAIN_OUTBOX: String = "drain_outbox"
@@ -87,7 +86,25 @@ class OfflineSyncWorker(
         const val PROFILE_LOSSLESS_FLAC: String = "lossless_flac"
         const val PROFILE_CELLULAR_OPUS_160: String = "cellular_opus_160"
 
-        private const val MAX_RETRY_ATTEMPTS: Int = 5
+        internal const val MAX_RETRY_ATTEMPTS: Int = 5
+
+        /**
+         * Returns `true` only for transient network/server errors. Permanent client HTTP errors
+         * (400/401/403/404) are NOT retried to avoid futile battery-draining loops.
+         */
+        internal fun isRetryableError(error: FfiException): Boolean =
+            when (error) {
+                is FfiException.Http,
+                is FfiException.WebSocket,
+                is FfiException.Io -> true
+
+                is FfiException.ServerHttp -> {
+                    val status = error.status.toInt()
+                    status == 408 || status == 429 || status >= 500
+                }
+
+                else -> false
+            }
 
         internal fun parseQualityProfile(raw: String?): FfiAudioQualityProfile =
             when (raw) {
@@ -188,7 +205,8 @@ object SoulbeetWorkScheduler {
 
     /**
      * Enqueues a one-time [NetworkType.CONNECTED] job to drain pending outbox mutations as soon as
-     * connectivity is available.
+     * connectivity is available. Uses [ExistingWorkPolicy.APPEND_OR_REPLACE] so rapid mutations
+     * never cancel an in-flight drain.
      */
     fun enqueueImmediateOutboxDrain(context: Context) {
         val constraints = Constraints.Builder()
@@ -209,7 +227,7 @@ object SoulbeetWorkScheduler {
 
         WorkManager.getInstance(context).enqueueUniqueWork(
             WORK_IMMEDIATE_OUTBOX_DRAIN,
-            ExistingWorkPolicy.REPLACE,
+            ExistingWorkPolicy.APPEND_OR_REPLACE,
             request,
         )
     }
