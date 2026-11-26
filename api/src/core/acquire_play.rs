@@ -257,9 +257,20 @@ pub(crate) async fn acquire_and_play_in(
         return Err(failure);
     }
 
-    // 2. Resolve target library folder and usable download backends.
+    // 2. Resolve target library folder, user lossy-fallback preference, and usable backends.
+    //    - `LossyFallback::Never`: lossy-only backends are strictly excluded from search.
+    //    - `LossyFallback::Ask` + `prefer_fast == false`: lossy-only backends may still be
+    //      searched as fallback, but a lossy-only candidate is never auto-picked without
+    //      explicit user confirmation (`NeedsManualChoice`).
+    //    - `LossyFallback::Ask` + `prefer_fast == true` (the explicit 1-tap fast-play path)
+    //      or `LossyFallback::Auto`: lossy-only fast backends may be auto-picked immediately
+    //      (and upgraded to archival FLAC later only on explicit Keep/Star/Promote).
     let folder = resolve_target_folder_in(db, ctx, req.folder_id.as_deref()).await?;
-    let usable = sources::usable_from(backends, enabled_meta, LossyFallback::Auto).await?;
+    let settings = UserSettings::get_in(db, &ctx.user_id)
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    let lossy_fallback = settings.lossy_fallback;
+    let usable = sources::usable_from(backends, enabled_meta, lossy_fallback).await?;
     let lossy_only_ids: Vec<String> = usable
         .last_resort
         .iter()
@@ -357,6 +368,7 @@ pub(crate) async fn acquire_and_play_in(
             fallback_tier,
             bg_backends,
             lossy_only_ids,
+            lossy_fallback,
         )
         .await;
         unregister_user_task(&task_user).await;
@@ -396,6 +408,7 @@ async fn try_enqueue_picked(
     picked: DownloadableGroup,
     alternates: Vec<DownloadableGroup>,
     all_backends: &[Searched],
+    lossy_only_ids: &[String],
 ) -> EnqueueAttempt {
     let user = ctx.id();
     let picked_quality = picked.quality.clone();
@@ -446,13 +459,20 @@ async fn try_enqueue_picked(
     let tx = get_or_create_user_channel(&user).await;
     let rx = tx.subscribe();
 
+    let delivery_mode = if lossy_only_ids.iter().any(|id| id == &routed_id) {
+        Delivery::LossyOnly
+    } else {
+        shared::backends::delivery(&routed_id)
+    };
+    let duplicates = DuplicateRule::Guarded.for_delivery(delivery_mode);
+
     let fresh = NewBatch {
         batch_id: batch_id.to_string(),
         label: format!("{artist} - {title}"),
         backend: routed_id.clone(),
         target,
         import_mode: ImportMode::Singleton,
-        duplicates: DuplicateRule::Guarded,
+        duplicates,
     };
     let acquisition = Acquisition {
         job: job_id.to_string(),
@@ -490,6 +510,21 @@ async fn try_enqueue_picked(
     }
 }
 
+fn is_lossy_only_group(group: &DownloadableGroup, lossy_only_ids: &[String]) -> bool {
+    group.items.first().is_some_and(|item| {
+        lossy_only_ids.iter().any(|id| id == &item.backend)
+            || shared::backends::delivery(&item.backend) == Delivery::LossyOnly
+    })
+}
+
+fn may_auto_pick_lossy(lossy_fallback: LossyFallback, prefer_fast: bool) -> bool {
+    match lossy_fallback {
+        LossyFallback::Never => false,
+        LossyFallback::Ask => prefer_fast,
+        LossyFallback::Auto => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_acquire_and_play_pipeline(
     db: SqlitePool,
@@ -507,6 +542,7 @@ async fn run_acquire_and_play_pipeline(
     fallback_tier: Vec<Searched>,
     all_backends: Vec<Searched>,
     lossy_only_ids: Vec<String>,
+    lossy_fallback: LossyFallback,
 ) {
     let user = ctx.id();
     let artist = track.artist.clone();
@@ -575,7 +611,9 @@ async fn run_acquire_and_play_pipeline(
     }
 
     let best_score = all_groups[0].score;
-    if best_score < AUTO_SELECT_SCORE_THRESHOLD {
+    let requires_lossy_confirmation = !may_auto_pick_lossy(lossy_fallback, req.prefer_fast)
+        && is_lossy_only_group(&all_groups[0], &lossy_only_ids);
+    if best_score < AUTO_SELECT_SCORE_THRESHOLD || requires_lossy_confirmation {
         ledger.record(JobEvent::NeedsSourceChoice {
             job: job_id.clone(),
         });
@@ -613,6 +651,7 @@ async fn run_acquire_and_play_pipeline(
         picked,
         all_groups,
         &all_backends,
+        &lossy_only_ids,
     )
     .await
     {
@@ -760,7 +799,10 @@ async fn run_acquire_and_play_pipeline(
             }
 
             let fb_best = fb_groups[0].score;
-            if fb_best < AUTO_SELECT_SCORE_THRESHOLD {
+            let fb_requires_lossy_confirmation =
+                !may_auto_pick_lossy(lossy_fallback, req.prefer_fast)
+                    && is_lossy_only_group(&fb_groups[0], &lossy_only_ids);
+            if fb_best < AUTO_SELECT_SCORE_THRESHOLD || fb_requires_lossy_confirmation {
                 ledger.record(JobEvent::NeedsSourceChoice {
                     job: fb_job_id,
                 });
@@ -797,6 +839,7 @@ async fn run_acquire_and_play_pipeline(
                 fb_picked,
                 fb_groups,
                 &all_backends,
+                &lossy_only_ids,
             )
             .await
             {
@@ -891,7 +934,15 @@ async fn search_tiered(
     let mut searched_fallback = false;
     if !fallback_tier.is_empty() {
         searched_fallback = true;
-        found = found.then(sources::search_tier(fallback_tier, None, tracks).await);
+        let fallback = sources::search_tier(fallback_tier, None, tracks).await;
+        // When the fast tier returned nothing, put fallback first so archival (e.g. slskd)
+        // diagnostics (`SearchAllFiltered`, `unanswered_note`, backend failures) are not
+        // masked by an empty fast-tier finish.
+        found = if found.groups.is_empty() {
+            fallback.then(found)
+        } else {
+            found.then(fallback)
+        };
     }
 
     if found.groups.is_empty() {
@@ -2348,5 +2399,303 @@ mod tests {
         );
         assert_eq!(fast_stub.specs().len(), 1);
         assert_eq!(slskd_stub.specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lossy_fallback_never_skips_lossy_only_backends_even_when_prefer_fast_is_true() {
+        let db = test_db::migrated().await;
+        let (ctx, _folder, _dir) = seed_user(&db, "never-lossy-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        UserSettings::upsert_in(
+            &db,
+            &ctx.user_id,
+            crate::models::user_settings::UpdateUserSettings {
+                lossy_fallback: Some(LossyFallback::Never),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        static FAST_META: BackendMeta = BackendMeta {
+            id: "fast-never",
+            name: "Fast Never",
+            service: "fast-never",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+
+        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let mut rx = tx.subscribe();
+
+        let fast_stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let slskd_stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let slskd_item = item_on(DEFAULT_DOWNLOAD_BACKEND, "peer_flac", "Wake Up", "wake.flac");
+        let slskd_group = group("peer_flac", vec![slskd_item], 0.94);
+        slskd_stub.script_polls(vec![Ok(search_result(
+            "search-slskd",
+            SearchState::Completed,
+            vec![slskd_group],
+        ))]);
+
+        let backends = StubBackends::default()
+            .with(DEFAULT_DOWNLOAD_BACKEND, slskd_stub.clone())
+            .with("fast-never", fast_stub.clone());
+
+        let resp = acquire_and_play_in(
+            &db,
+            &ledger,
+            Arc::new(StubNavidrome(None)),
+            &backends,
+            &[&shared::backends::SLSKD, &FAST_META],
+            None,
+            &ctx,
+            AcquireAndPlayRequest {
+                artist: "Kowloon".into(),
+                title: "Wake Up".into(),
+                album: None,
+                recording_mbid: None,
+                release_mbid: None,
+                duration_s: None,
+                folder_id: None,
+                prefer_fast: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        match &resp.status {
+            AcquireAndPlayInitialStatus::Started { backend_ids, .. } => {
+                assert_eq!(backend_ids, &[DEFAULT_DOWNLOAD_BACKEND]);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut picked_slskd = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(DownloadEvent::AcquireAndPlay(ap))) if ap.request_id == resp.request_id => {
+                    if let AcquireAndPlayStage::Acquiring {
+                        backend_id,
+                        source: Some(src),
+                        ..
+                    } = ap.stage
+                    {
+                        assert_eq!(backend_id, DEFAULT_DOWNLOAD_BACKEND);
+                        assert_eq!(src, "peer_flac");
+                        picked_slskd = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(picked_slskd, "expected Soulseek to be picked when lossy_fallback is Never");
+        assert!(
+            fast_stub.specs().is_empty(),
+            "LossyOnly backend must never be searched when user set lossy_fallback = Never"
+        );
+        assert_eq!(slskd_stub.specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lossy_only_enqueue_uses_skip_duplicate_rule() {
+        let db = test_db::migrated().await;
+        let (ctx, _folder, dir) = seed_user(&db, "lossy-dup-skip-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        static FAST_META: BackendMeta = BackendMeta {
+            id: "fast-skip-rule",
+            name: "Fast Skip Rule",
+            service: "fast-skip-rule",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+
+        let fast_stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let (reached, release) = fast_stub.hold_downloads();
+        let mut fast_item = item_on("fast-skip-rule", "cdn-skip", "Wake Up", "wake-skip.opus");
+        fast_item.quality = "OPUS 160".into();
+        let mut fast_group = group("cdn-skip", vec![fast_item], 0.95);
+        fast_group.quality = "OPUS 160".into();
+        fast_stub.script_polls(vec![Ok(search_result(
+            "search-fast-skip",
+            SearchState::Completed,
+            vec![fast_group],
+        ))]);
+
+        let slskd_stub = StubBackend::new(vec![]);
+        let backends = StubBackends::default()
+            .with(DEFAULT_DOWNLOAD_BACKEND, slskd_stub)
+            .with("fast-skip-rule", fast_stub.clone());
+
+        let _resp = acquire_and_play_in(
+            &db,
+            &ledger,
+            Arc::new(StubNavidrome(None)),
+            &backends,
+            &[&shared::backends::SLSKD, &FAST_META],
+            None,
+            &ctx,
+            AcquireAndPlayRequest {
+                artist: "Kowloon".into(),
+                title: "Wake Up".into(),
+                album: None,
+                recording_mbid: None,
+                release_mbid: None,
+                duration_s: None,
+                folder_id: None,
+                prefer_fast: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .expect("fast backend download should be invoked");
+
+        let fast_dyn: Arc<dyn soulbeet::DownloadBackend> = fast_stub.clone();
+        let key = crate::server_fns::download::test_support::key(
+            &fast_dyn,
+            "cdn-skip",
+            "wake-skip.opus",
+        );
+        let probe = crate::transfer_registry::BatchRef::new(
+            crate::transfer_registry::TransferOwner {
+                user_id: ctx.id(),
+                batch_id: "probe-skip".into(),
+            },
+            "probe".into(),
+            dir.path().to_path_buf(),
+            ImportMode::Singleton,
+            "fast-skip-rule".into(),
+        );
+        let claim = crate::transfer_registry::TransferRegistry::global().claim(&[key], &probe);
+        release.notify_waiters();
+
+        assert_eq!(claim.mine.len(), 1);
+        assert_eq!(claim.mine[0].1.duplicates, DuplicateRule::Skip);
+    }
+
+    #[tokio::test]
+    async fn lossy_fallback_ask_with_prefer_fast_false_prompts_manual_choice_instead_of_auto_picking_lossy()
+    {
+        let db = test_db::migrated().await;
+        let (ctx, _folder, _dir) = seed_user(&db, "ask-no-fast-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        // Default user_settings.lossy_fallback is Ask.
+        let settings = UserSettings::get_in(&db, &ctx.user_id).await.unwrap();
+        assert_eq!(settings.lossy_fallback, LossyFallback::Ask);
+
+        static FAST_META: BackendMeta = BackendMeta {
+            id: "fast-ask",
+            name: "Fast Ask",
+            service: "fast-ask",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+
+        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let mut rx = tx.subscribe();
+
+        // Soulseek finds nothing; lossy-only fallback finds a high-scoring match.
+        let slskd_stub = StubBackend::new(vec![]);
+        slskd_stub.script_polls(vec![Ok(search_result(
+            "search-slskd-empty",
+            SearchState::Completed,
+            vec![],
+        ))]);
+
+        let fast_stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let mut fast_item = item_on("fast-ask", "cdn-ask", "Wake Up", "wake.opus");
+        fast_item.quality = "OPUS 160".into();
+        let mut fast_group = group("cdn-ask", vec![fast_item], 0.95);
+        fast_group.quality = "OPUS 160".into();
+        fast_stub.script_polls(vec![Ok(search_result(
+            "search-fast-ask",
+            SearchState::Completed,
+            vec![fast_group],
+        ))]);
+
+        let backends = StubBackends::default()
+            .with(DEFAULT_DOWNLOAD_BACKEND, slskd_stub.clone())
+            .with("fast-ask", fast_stub.clone());
+
+        let resp = acquire_and_play_in(
+            &db,
+            &ledger,
+            Arc::new(StubNavidrome(None)),
+            &backends,
+            &[&shared::backends::SLSKD, &FAST_META],
+            None,
+            &ctx,
+            AcquireAndPlayRequest {
+                artist: "Kowloon".into(),
+                title: "Wake Up".into(),
+                album: None,
+                recording_mbid: None,
+                release_mbid: None,
+                duration_s: None,
+                folder_id: None,
+                prefer_fast: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        match &resp.status {
+            AcquireAndPlayInitialStatus::Started { backend_ids, .. } => {
+                assert_eq!(backend_ids, &[DEFAULT_DOWNLOAD_BACKEND, "fast-ask"]);
+            }
+            other => panic!("expected Started, got {other:?}"),
+        }
+
+        let mut saw_manual_choice = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(DownloadEvent::AcquireAndPlay(ap))) if ap.request_id == resp.request_id => {
+                    if let AcquireAndPlayStage::NeedsManualChoice {
+                        results,
+                        best_score,
+                        threshold,
+                        ..
+                    } = ap.stage
+                    {
+                        assert!(best_score >= threshold);
+                        assert_eq!(results.len(), 1);
+                        saw_manual_choice = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_manual_choice,
+            "expected NeedsManualChoice instead of silently auto-picking lossy when Ask + prefer_fast=false"
+        );
+        assert!(
+            fast_stub.requests().is_empty(),
+            "LossyOnly backend must not be auto-enqueued when Ask + prefer_fast=false"
+        );
     }
 }
