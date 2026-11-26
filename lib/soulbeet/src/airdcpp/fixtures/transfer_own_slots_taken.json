@@ -1,0 +1,43 @@
+{
+ "bytes_transferred": -1.0,
+ "download": true,
+ "encryption": {
+  "str": "TLSv1.3 / TLS_AES_256_GCM_SHA384",
+  "trusted": false
+ },
+ "flags": [
+  "C",
+  "U"
+ ],
+ "id": 13,
+ "ip": "192.0.2.7",
+ "name": "24. Portishead - Glory Box.flac",
+ "queue_file_id": 20,
+ "seconds_left": -1.0,
+ "size": 1048576.0,
+ "speed": -1.0,
+ "status": {
+  "id": "failed",
+  "str": "All download slots taken"
+ },
+ "supports": [],
+ "target": "/downloads/singles/24. Portishead - Glory Box.flac",
+ "time_started": 439227.0,
+ "type": {
+  "content_type": "audio",
+  "id": "file",
+  "str": "flac"
+ },
+ "user": {
+  "cid": "IRO2LQLN7YPT2A3UV3I77FU7UL2TTZFNTRBHXDA",
+  "flags": [
+   "nmdc"
+  ],
+  "hub_names": "Hub Six",
+  "hub_url": "dchub://hub-six.example:411",
+  "hub_urls": [
+   "dchub://hub-six.example:411"
+  ],
+  "nicks": "peer40"
+ }
+}

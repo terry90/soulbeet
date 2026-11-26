@@ -48,6 +48,25 @@ services:
       #   ports:
       #     - "5030:5030"
       #   restart: unless-stopped
+      # Optional: an AirDC++ Web Client for the Direct Connect download source, off until an
+      # admin turns it on (docs/direct-connect.md). Soulbeet reaches it at http://airdcpp:5600.
+      # airdcpp:
+      #   image: gangefors/airdcpp-webclient:2.14.0
+      #   container_name: airdcpp
+      #   environment:
+      #     # Soulbeet's user and group, so beets can move what AirDC++ saves.
+      #     - PUID=1000
+      #     - PGID=1000
+      #     - UMASK=0022
+      #   volumes:
+      #     - /path/to/your/airdcpp_data:/.airdcpp
+      #     # IMPORTANT: the SAME physical folder as Soulbeet's /downloads.
+      #     - /path/to/your/downloads:/Downloads
+      #     # Mount nothing under /Share: AirDC++ shares every folder there with the hubs.
+      #   # Its web UI, for setting it up from this machine only. Never publish 5600 to the internet.
+      #   ports:
+      #     - "127.0.0.1:5600:5600"
+      #   restart: unless-stopped
 
 volumes:
   soulbeet_data:

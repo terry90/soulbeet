@@ -3,15 +3,11 @@
 //! Every enqueue site claims its keys before it asks the backend for
 //! anything, and releases each key whose file was not enqueued.
 
-use shared::download::{
-    DownloadProgress, DownloadableItem, EnqueueStatus, JobSlot, QueuedDownload,
-};
+use shared::download::{DownloadProgress, DownloadableItem, EnqueueStatus, QueuedDownload};
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::{BackendError, BackendResult, DownloadBackend};
 use std::sync::Arc;
 
-use super::failover::{alternates_for, item_index};
-use crate::core::acquire::Acquisition;
 use crate::ledger::DuplicateRule;
 use crate::transfer_registry::{
     AddedSlot, BatchRef, Claim, InboxReservation, RequestClaim, TransferKey, TransferRegistry,
@@ -249,16 +245,12 @@ pub struct RequestEnqueue {
     pub elsewhere: Vec<TransferKey>,
 }
 
-impl RequestEnqueue {
-    /// The request's failure when it did nothing because its files are
-    /// already downloading into another folder.
-    pub fn refusal(&self) -> Option<Failure> {
-        let enqueued = self
-            .results
-            .iter()
-            .any(|q| q.status == EnqueueStatus::Enqueued);
-        (!self.elsewhere.is_empty() && !enqueued).then(|| another_folder(RetryAdvice::NotRetryable))
-    }
+/// A request's failure when it did nothing, its answers being `results`,
+/// because files of it, the keys `elsewhere`, are already downloading into
+/// another folder.
+pub fn request_refusal(results: &[QueuedDownload], elsewhere: &[TransferKey]) -> Option<Failure> {
+    let enqueued = results.iter().any(|q| q.status == EnqueueStatus::Enqueued);
+    (!elsewhere.is_empty() && !enqueued).then(|| another_folder(RetryAdvice::NotRetryable))
 }
 
 /// A request's files as `claim_request` left them, nothing sent yet.
@@ -432,43 +424,16 @@ fn sort_claim(
     }
 }
 
-/// Hands a joining request's enqueued transfers to `batch`'s monitor, each
-/// as the slot of the job its file has among `acquisition`'s items, with the
-/// alternates and source cap `acquisition` gives it. A transfer no picked file lines up with is no
-/// slot of the job and is not handed over.
-/// Returns the ones nobody will watch because that monitor stopped first,
-/// with their keys released and their transfers cancelled, since they would
-/// download into the batch's folder with nobody to import them.
+/// Hands `slots`, a joining request's enqueued transfers, to `batch`'s
+/// monitor. Returns the ones nobody will watch because that monitor stopped
+/// first, with their keys released and their transfers cancelled, since they
+/// would download into the batch's folder with nobody to import them.
 pub async fn deliver(
     reservation: InboxReservation,
-    enqueued: &[QueuedDownload],
-    acquisition: &Acquisition,
+    slots: Vec<AddedSlot>,
     backend: &Arc<dyn DownloadBackend>,
     batch: &BatchRef,
 ) -> Vec<AddedSlot> {
-    let Acquisition {
-        job,
-        items: picked,
-        alternates: rest,
-        max_sources,
-    } = acquisition;
-    let slots = enqueued
-        .iter()
-        .filter_map(|q| {
-            let (slot, item) = &picked[item_index(q, picked.iter().map(|(_, item)| item))?];
-            Some(AddedSlot {
-                source: q.source.clone(),
-                filename: q.item.clone(),
-                transfer_id: q.id.clone(),
-                alternates: alternates_for(item, rest),
-                max_sources: *max_sources,
-                job: JobSlot {
-                    job: job.clone(),
-                    slot: *slot,
-                },
-            })
-        })
-        .collect();
     let lost = match reservation.deliver(slots) {
         Ok(()) => return Vec::new(),
         Err(lost) => lost,
@@ -484,8 +449,10 @@ pub async fn deliver(
             .await
         {
             warn!(
-                "Failed to cancel unwatched transfer {} in slskd: {}",
-                slot.transfer_id, e
+                "Failed to cancel unwatched transfer {} in {}: {}",
+                slot.transfer_id,
+                backend.name(),
+                e
             );
         }
     }
@@ -513,10 +480,10 @@ mod tests {
     use super::*;
     use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
     use crate::server_fns::download::test_support::{
-        batch, group, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend,
-        STUB_IN_FLIGHT,
+        batch, item, key, same_user_into, Cancel, ScriptedOutcome, StubBackend, STUB_IN_FLIGHT,
     };
     use crate::transfer_registry::TransferOwner;
+    use shared::download::JobSlot;
     use shared::failure::{FailureCode, RetryAdvice, Service, Stage};
     use soulbeet::ImportMode;
     use std::path::PathBuf;
@@ -766,16 +733,6 @@ mod tests {
             item("peer_a", "Two", "02.flac"),
         ];
 
-        let rest = vec![group(
-            "peer_b",
-            vec![
-                item("peer_b", "Two", "b/02.flac"),
-                item("peer_b", "Three", "b/03.flac"),
-            ],
-            0.8,
-        )];
-
-        let picked: Vec<(u32, DownloadableItem)> = (0..).zip(items.clone()).collect();
         let enq = enqueue_request(&backend, items, fresh.clone()).await;
 
         assert_eq!(
@@ -795,76 +752,23 @@ mod tests {
         let Watcher::Joined(reservation) = enq.watcher else {
             panic!("expected to join the running batch");
         };
-        let enqueued: Vec<QueuedDownload> = enq
-            .results
-            .into_iter()
-            .filter(|q| q.status == EnqueueStatus::Enqueued)
-            .collect();
-        assert!(deliver(
-            reservation,
-            &enqueued,
-            &Acquisition {
-                job: "j1".into(),
-                items: picked.clone(),
-                alternates: rest.clone(),
-                max_sources: MAX_SOURCES_PER_TRACK,
-            },
-            &backend,
-            &running,
-        )
-        .await
-        .is_empty());
-        assert_eq!(
-            running.inbox.take(),
-            vec![AddedSlot {
-                source: "peer_a".to_string(),
-                filename: "02.flac".to_string(),
-                transfer_id: "t-02.flac".to_string(),
-                alternates: vec![item("peer_b", "Two", "b/02.flac")],
-                max_sources: MAX_SOURCES_PER_TRACK,
-                job: JobSlot {
-                    job: "j1".to_string(),
-                    slot: 1,
-                },
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_transfer_no_picked_file_lines_up_with_is_not_delivered() {
-        let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
-        let running = batch("Come Over");
-        let reservation = running.inbox.reserve().expect("open inbox");
-        // The backend answered for a file the request never named.
-        let enqueued = vec![QueuedDownload {
-            id: "t-02.flac".to_string(),
+        let slot = AddedSlot {
             source: "peer_a".to_string(),
-            item: "02.flac".to_string(),
-            size: 0,
-            status: EnqueueStatus::Enqueued,
-        }];
-        let rest = vec![group(
-            "peer_b",
-            vec![item("peer_b", "Two", "b/02.flac")],
-            0.8,
-        )];
-
-        let lost = deliver(
-            reservation,
-            &enqueued,
-            &Acquisition {
-                job: "j1".into(),
-                items: vec![(0, item("peer_a", "One", "01.flac"))],
-                alternates: rest.clone(),
-                max_sources: MAX_SOURCES_PER_TRACK,
+            filename: "02.flac".to_string(),
+            transfer_id: "t-02.flac".to_string(),
+            alternates: vec![item("peer_b", "Two", "b/02.flac")],
+            used: 1,
+            max_sources: MAX_SOURCES_PER_TRACK,
+            sent: vec![],
+            job: JobSlot {
+                job: "j1".to_string(),
+                slot: 1,
             },
-            &backend,
-            &running,
-        )
-        .await;
-
-        assert!(lost.is_empty());
-        assert!(running.inbox.take().is_empty(), "it is no slot of the job");
+        };
+        assert!(deliver(reservation, vec![slot.clone()], &backend, &running)
+            .await
+            .is_empty());
+        assert_eq!(running.inbox.take(), vec![slot]);
     }
 
     #[tokio::test]
@@ -886,7 +790,7 @@ mod tests {
             statuses(&enq.results),
             vec![("02.flac".to_string(), Answer::Enqueued)]
         );
-        assert_eq!(enq.refusal(), None);
+        assert_eq!(request_refusal(&enq.results, &enq.elsewhere), None);
         assert!(matches!(enq.watcher, Watcher::Own));
         assert_eq!(enq.batch.owner, fresh.owner);
         assert_eq!(stub.destinations(), vec![fresh.destination.clone()]);
@@ -943,7 +847,7 @@ mod tests {
             "no row would replace the running one"
         );
         assert_eq!(
-            enq.refusal(),
+            request_refusal(&enq.results, &enq.elsewhere),
             Some(another_folder(RetryAdvice::NotRetryable))
         );
         assert!(stub.destinations().is_empty());
@@ -1100,20 +1004,21 @@ mod tests {
         let reservation = running.inbox.reserve().expect("open inbox");
         let enqueued = enqueue_claimed_for(&backend, &running).await;
         running.inbox.close();
-
-        let lost = deliver(
-            reservation,
-            &enqueued,
-            &Acquisition {
-                job: "j1".into(),
-                items: vec![(0, item("peer_a", "One", "01.flac"))],
-                alternates: vec![],
-                max_sources: MAX_SOURCES_PER_TRACK,
+        let slot = AddedSlot {
+            source: enqueued[0].source.clone(),
+            filename: enqueued[0].item.clone(),
+            transfer_id: enqueued[0].id.clone(),
+            alternates: vec![],
+            used: 1,
+            max_sources: MAX_SOURCES_PER_TRACK,
+            sent: vec![],
+            job: JobSlot {
+                job: "j1".to_string(),
+                slot: 0,
             },
-            &backend,
-            &running,
-        )
-        .await;
+        };
+
+        let lost = deliver(reservation, vec![slot], &backend, &running).await;
 
         assert_eq!(lost.len(), 1);
         assert!(TransferRegistry::global()

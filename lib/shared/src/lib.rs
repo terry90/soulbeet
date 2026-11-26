@@ -1,3 +1,4 @@
+pub mod airdcpp;
 pub mod archive;
 pub mod backends;
 pub mod changelog;

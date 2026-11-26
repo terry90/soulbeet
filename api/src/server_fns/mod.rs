@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+pub mod airdcpp;
 pub mod auth;
 pub mod backends;
 pub mod changelog;
@@ -17,6 +18,7 @@ pub mod sso;
 pub mod system;
 pub mod user;
 
+pub use airdcpp::*;
 pub use auth::*;
 pub use backends::*;
 pub use changelog::*;

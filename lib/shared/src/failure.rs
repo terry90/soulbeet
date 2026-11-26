@@ -277,6 +277,8 @@ pub enum Service {
     Youtube,
     /// GD Studio's API and NetEase's file servers, the GD Studio download backend's service.
     GdStudio,
+    /// The AirDC++ Web Client the Direct Connect download backend runs on.
+    Airdcpp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -688,6 +690,21 @@ mod tests {
         assert_eq!(
             wire["cause"],
             serde_json::json!({"service": "gd_studio", "status": null, "raw": "md5 differs"})
+        );
+    }
+
+    #[test]
+    fn airdcpp_is_written_airdcpp() {
+        let f = Failure::new(
+            FailureCode::TransferChecksumMismatch,
+            Stage::Transfer,
+            RetryAdvice::OtherSource,
+            "AirDC++ threw away bytes that did not match the file's TTH",
+        )
+        .with_cause(Service::Airdcpp, None, "TTH inconsistency");
+        assert_eq!(
+            serde_json::to_value(&f).unwrap()["cause"],
+            serde_json::json!({"service": "airdcpp", "status": null, "raw": "TTH inconsistency"})
         );
     }
 

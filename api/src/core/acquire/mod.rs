@@ -20,12 +20,14 @@ use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
     another_folder, claim_into, claim_request, deliver, failed_reason, nothing_enqueued,
-    stopped_rows, transfer_key, RequestEnqueue, Watcher,
+    request_refusal, stopped_rows, transfer_key, RequestEnqueue, Watcher,
 };
-use crate::server_fns::download::failover::{align_pool_tracks, item_index, SourcePool};
+use crate::server_fns::download::failover::{item_index, Sent, SourcePool};
 use crate::server_fns::download::monitor::{DownloadMonitor, WatchedTransfer};
 use crate::services::Registry;
-use crate::transfer_registry::{BatchRef, InboxReservation, TransferOwner};
+use crate::transfer_registry::{
+    AddedSlot, BatchRef, InboxReservation, TransferOwner, TransferRegistry,
+};
 use dioxus::logger::tracing::info;
 use shared::download::{
     DownloadEvent, DownloadProgress, DownloadableGroup, DownloadableItem, EnqueueStatus, JobSlot,
@@ -160,6 +162,13 @@ pub(crate) async fn prepare_target(folder: &Folder) -> Result<PathBuf, Failure> 
 /// or `batch` names one, else one of the new batch. Either fails a slot over
 /// to its track's alternates.
 ///
+/// A file whose answer refuses it where another source would do
+/// (`RetryAdvice::OtherSource`: the peer left, it refused the file) is sent
+/// from its slot's next alternates at once, each step stored as the
+/// monitor's failover stores it (`SourcePool::fail_over`), and the slot
+/// carries the sources it used to its monitor. With no alternate accepted
+/// the slot fails with the first refusal.
+///
 /// Every row it sends carries its slot and is recorded in `ledger`: failed
 /// files Failed, queued ones Downloading. The batch a file goes into and the
 /// backend request it is sent in are stored before the backend hears of it,
@@ -236,36 +245,87 @@ pub(super) async fn queue_and_watch(
         None => claimed.enqueue(&backend, &request).await,
         Some(_) => claimed.withdraw(&backend),
     };
-    let refusal = enq.refusal();
     let RequestEnqueue {
         batch,
-        results,
+        mut results,
         watcher,
         error,
         elsewhere,
     } = enq;
 
-    // The answer for each slot, by its index in `picked`. Every answer is
-    // for a file the request asked for: the enqueue drops the others.
-    let mut answers: Vec<Option<&QueuedDownload>> = vec![None; picked.len()];
-    for q in &results {
+    // The index in `results` of each slot's answer, by the slot's index in
+    // `picked`. Every answer is for a file the request asked for: the enqueue
+    // drops the others.
+    let mut answers: Vec<Option<usize>> = vec![None; picked.len()];
+    for (i, q) in results.iter().enumerate() {
         if let Some(at) = item_index(q, &items) {
-            answers[at] = Some(q);
+            answers[at] = Some(i);
         }
     }
     let slot = |n: u32| JobSlot {
         job: job.clone(),
         slot: n,
     };
-    let (enqueued_slots, enqueued): (Vec<u32>, Vec<QueuedDownload>) = picked
-        .iter()
-        .zip(&answers)
-        .filter_map(|((n, _), answer)| {
+
+    // Each slot's other sources and its budget, by its index in `picked`. A
+    // file refused where another source would do is sent from the slot's
+    // next source, as the monitor does for a transfer that fails later; not
+    // when the request could not be stored or its backend call failed, nor
+    // once its job is cancelled.
+    let tracks: Vec<Option<DownloadableItem>> = items.iter().cloned().map(Some).collect();
+    let mut pool = SourcePool::from_tracks(&tracks, alternates, *max_sources);
+    let mut sent: Vec<Vec<Sent>> = vec![Vec::new(); picked.len()];
+    let fails_over = unstored.is_none() && error.is_none();
+    for (at, (n, _)) in picked.iter().enumerate() {
+        let Some(i) = answers[at] else { continue };
+        let Some(failure) = failed_reason(&results[i].status) else {
+            continue;
+        };
+        if !fails_over
+            || failure.retry != RetryAdvice::OtherSource
+            || !pool.has_next(at)
+            || TransferRegistry::global().job_cancelled(job)
+        {
+            continue;
+        }
+        let refused = &results[i];
+        let (source, file) = (refused.source.clone(), refused.item.clone());
+        let left = DownloadProgress::failed(
+            refused.id.clone(),
+            source.clone(),
+            file.clone(),
+            failure.clone(),
+        );
+        let left = batch.mark(left).with_job(slot(*n));
+        let (next, sends) = pool
+            .fail_over(at, &backend, &batch, &ledger, &slot(*n), left)
+            .await;
+        sent[at] = sends;
+        if let Some((_, queued)) = next.queued {
+            info!(
+                "{} for {} from {}, sending it from {} instead ({}/{})",
+                failure.message,
+                file,
+                source,
+                queued.source,
+                pool.attempts_used(at),
+                pool.max_sources(at)
+            );
+            results[i] = queued;
+        }
+    }
+    let refusal = request_refusal(&results, &elsewhere);
+    let answers: Vec<Option<&QueuedDownload>> =
+        (answers.iter()).map(|i| i.map(|i| &results[i])).collect();
+
+    // The enqueued slots: their index in `picked`, their slot and their download.
+    let enqueued: Vec<(usize, u32, QueuedDownload)> = (picked.iter().zip(&answers).enumerate())
+        .filter_map(|(at, ((n, _), answer))| {
             answer
                 .filter(|q| q.status == EnqueueStatus::Enqueued)
-                .map(|q| (*n, q.clone()))
+                .map(|q| (at, *n, q.clone()))
         })
-        .unzip();
+        .collect();
 
     // A request only ever joins a batch of its own user, so every row of it
     // goes to that user's channel.
@@ -340,7 +400,22 @@ pub(super) async fn queue_and_watch(
                 enqueued.len(),
                 batch.owner.batch_id
             );
-            let lost = deliver(reservation, &enqueued, &acquisition, &backend, &batch).await;
+            let slots = (enqueued.into_iter())
+                .map(|(at, n, q)| {
+                    let (alternates, used, max_sources) = pool.sources_of(at);
+                    AddedSlot {
+                        source: q.source,
+                        filename: q.item,
+                        transfer_id: q.id,
+                        alternates,
+                        used,
+                        max_sources,
+                        sent: std::mem::take(&mut sent[at]),
+                        job: slot(n),
+                    }
+                })
+                .collect();
+            let lost = deliver(reservation, slots, &backend, &batch).await;
             if !lost.is_empty() {
                 let rows = stopped_rows(&lost, &batch);
                 let _ = tx.send(DownloadEvent::Progress(rows.clone()));
@@ -356,20 +431,20 @@ pub(super) async fn queue_and_watch(
         Watcher::Own => {
             info!(
                 "Started monitoring downloads: {:?}",
-                enqueued.iter().map(|d| &d.item).collect::<Vec<_>>()
+                enqueued.iter().map(|(_, _, d)| &d.item).collect::<Vec<_>>()
             );
-            let transfers = enqueued
-                .iter()
-                .zip(enqueued_slots)
-                .map(|(q, n)| WatchedTransfer::enqueued(q, slot(n)))
+            // The monitor's slots follow `enqueued`, and so do their sources.
+            let pool = SourcePool::resumed(
+                (enqueued.iter())
+                    .map(|(at, _, _)| pool.sources_of(*at))
+                    .collect(),
+            );
+            let transfers = (enqueued.iter())
+                .map(|(at, n, q)| WatchedTransfer {
+                    sent: std::mem::take(&mut sent[*at]),
+                    ..WatchedTransfer::enqueued(q, slot(*n))
+                })
                 .collect();
-            // Pool slots must line up with the monitor's slots, which follow
-            // `enqueued`, not `items`.
-            let pool = SourcePool::from_tracks(
-                &align_pool_tracks(&enqueued, &items),
-                alternates,
-                *max_sources,
-            );
             let target = batch.target.clone();
             spawn_monitor(
                 &ctx,
@@ -807,6 +882,149 @@ mod tests {
         assert_eq!(
             (slots[0].filename.as_str(), slots[0].alternates.clone()),
             ("02.flac", vec![item("peer_b", "Two", "b/02.flac")])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_its_source_refuses_is_sent_from_the_next_source_of_its_slot() {
+        // The picked peer left before its file was asked for; the next one has it.
+        let stub = StubBackend::new(vec![ScriptedOutcome::Rejected, ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let (ledger, mut recorded) = Ledger::recording();
+        let ctx = own_ctx();
+        let mut rx = get_or_create_user_channel(&ctx.id()).await.subscribe();
+        let fresh = new_batch("Come Over");
+        let rest = vec![group(
+            "peer_b",
+            vec![item("peer_b", "One", "b/01.flac")],
+            0.8,
+        )];
+
+        let results = enqueue_and_watch(
+            &ledger,
+            &ctx,
+            backend,
+            fresh,
+            acquisition(vec![item("peer_a", "One", "a/01.flac")], rest),
+        )
+        .await
+        .unwrap();
+
+        let answered: Vec<(&str, &str, &EnqueueStatus)> = (results.iter())
+            .map(|q| (q.source.as_str(), q.item.as_str(), &q.status))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![("peer_b", "b/01.flac", &EnqueueStatus::Enqueued)]
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(stub.destinations()[0], stub.destinations()[1]);
+        // The refusal ends the first source's attempt with the slot still downloading, the next
+        // source is stored before it is sent, and its row is the slot's.
+        let rows = |rows: Vec<DownloadProgress>| -> Vec<String> {
+            (rows.iter())
+                .map(|r| {
+                    let code = r.failure.as_ref().map_or("-", |f| f.code.as_str());
+                    format!("{}:{}:{code}", r.source, r.item)
+                })
+                .collect()
+        };
+        let steps: Vec<String> = (recorded.events().into_iter())
+            .map(|e| match e {
+                JobEvent::Enqueued { .. } => "enqueued".to_string(),
+                JobEvent::Slots { state, rows: r } => format!("{state:?} {:?}", rows(r)),
+                JobEvent::Attempt {
+                    slot,
+                    candidate: Some(c),
+                    request: Some(request),
+                } => format!(
+                    "attempt {} {}:{} in the second request: {}",
+                    slot.slot,
+                    c.source,
+                    c.id,
+                    request == requests[1]
+                ),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                "enqueued".to_string(),
+                r#"Downloading ["peer_a:a/01.flac:peer_offline"]"#.to_string(),
+                "attempt 0 peer_b:b/01.flac in the second request: true".to_string(),
+                r#"Downloading ["peer_b:b/01.flac:-"]"#.to_string(),
+            ]
+        );
+        // The user sees the file coming from the next source, never the refusal.
+        let shown: Vec<(String, bool)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                DownloadEvent::Progress(rows) => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .map(|r| (r.source, r.failure.is_some()))
+            .collect();
+        assert_eq!(shown, vec![("peer_b".to_string(), false)]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_file_of_a_joining_request_reaches_the_running_batch_with_its_budget() {
+        let stub = StubBackend::new(vec![
+            ScriptedOutcome::Rejected,
+            ScriptedOutcome::Rejected,
+            ScriptedOutcome::Enqueued,
+        ]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let running = batch("Come Over");
+        TransferRegistry::global().claim(&[key(&backend, "peer_a", "01.flac")], &running);
+        let fresh = new_batch_beside(&running, running.target.clone());
+        let two = |peer: &str| item(peer, "Two", &format!("{}/02.flac", &peer[5..]));
+        let rest = vec![
+            group("peer_b", vec![two("peer_b")], 0.9),
+            group("peer_c", vec![two("peer_c")], 0.8),
+            group("peer_d", vec![two("peer_d")], 0.7),
+        ];
+
+        enqueue_and_watch(
+            &Ledger::recording().0,
+            &ctx_of(&running),
+            backend,
+            fresh,
+            acquisition(
+                vec![
+                    item("peer_a", "One", "01.flac"),
+                    item("peer_a", "Two", "02.flac"),
+                ],
+                rest,
+            ),
+        )
+        .await
+        .unwrap();
+
+        // 02.flac and peer_b's copy were refused: peer_c's is the slot's third source.
+        let slots = running.inbox.take();
+        assert_eq!(slots.len(), 1);
+        let slot = &slots[0];
+        assert_eq!(
+            (slot.source.as_str(), slot.filename.as_str(), slot.used),
+            ("peer_c", "c/02.flac", 3)
+        );
+        assert_eq!(
+            (slot.alternates.clone(), slot.max_sources),
+            (vec![two("peer_d")], MAX_SOURCES_PER_TRACK)
+        );
+        let sent: Vec<&str> = (slot.sent.iter())
+            .map(|s| s.candidate.id.as_str())
+            .collect();
+        assert_eq!(sent, vec!["b/02.flac", "c/02.flac"]);
+        assert_eq!(
+            slot.job,
+            JobSlot {
+                job: "j1".into(),
+                slot: 1
+            }
         );
     }
 

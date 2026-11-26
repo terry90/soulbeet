@@ -8,6 +8,7 @@ The backends in this build:
 - `archive`, the Internet Archive ([archive.md](archive.md)): searches archive.org and downloads in Soulbeet's own engine, with partial files in `PartialDir` and its transfers in the transfer book, so a restart resumes them.
 - `ytdlp`, YouTube Music ([ytdlp.md](ytdlp.md)): lossy only. A Python helper runs ytmusicapi and yt-dlp, one child process per call; its queue is in memory, so a restart loses what was not finished, and its staging folders are in `PartialDir`.
 - `gdstudio`, NetEase through GD Studio's API ([gdstudio.md](gdstudio.md)): searches and downloads in Soulbeet's own engine under a call budget for the whole install, with partial files in `PartialDir`. Its transfers are kept in memory only: a restart loses the unfinished ones, which reconcile then treats as lost, and the engine clears its partial folder when it starts.
+- `airdcpp`, Direct Connect ([direct-connect.md](direct-connect.md)): an AirDC++ Web Client the admin runs, reached over its Web API as slskd is. AirDC++ downloads and checks each file's TTH; the backend keeps its files in the transfer book, so a restart finds them again, and gives up on a file that got no byte for 5 minutes.
 
 ## The contract
 
@@ -22,11 +23,12 @@ A backend implements `DownloadBackend` (`lib/soulbeet/src/traits.rs`). The app r
 - `QueuedDownload::id` is stable and is the id `get_downloads_for` and `get_download` list the transfer under. Each listed row names the item's `source` and `DownloadableItem::id`, and echoes the `download` call's `request`.
 - A succeeded transfer stays listed until `cancel_download` with `remove`. `remove` forgets an ended record and never moves or deletes a file in the destination; the backend's own partial files are its own.
 - A backend that keeps transfers in memory loses them on restart; `get_download` then answers None, which reconcile treats as a lost transfer. An ended record may be forgotten 7 days after it ended.
-- `queue_position` is the transfer's place in the line it waits in before it starts: the source's queue for a peer backend, the backend's own queue otherwise; `Some(0)` once it is not waiting; None when the backend no longer has the transfer.
+- `queue_position` is the transfer's place in the line it waits in before it starts: the source's queue for a peer backend, the backend's own queue otherwise; `Some(0)` once it is not waiting; None when the backend no longer has the transfer, or when the source has given no place yet.
 - `source_status` says whether this backend can fetch from the source now. `Blocked` means the backend will not give this source's files.
 - `health_check` is called every 10 s per open tab. A backend that calls a third-party service costs it at most one request per minute, so it caches inside the backend, or answers from its own last request to the service when that is recent (the Internet Archive does). slskd is the user's own server and is checked live.
 - Failures, their causes and health answers are shown to every user and written to the log, so they never hold a key, a password or a URL with credentials in it.
 - An item `download` cannot send gets no answer, and the caller fails it.
+- An item `download` answers `Failed` with `RetryAdvice::OtherSource` (its peer is gone, it refused the file) is sent at once from the next source of its track, as a transfer that fails later is; any other advice fails it. So a refusal says whether another source would do.
 
 A backend whose meta says `Delivery::LossyOnly` is a last resort, by its meta and never by its id:
 

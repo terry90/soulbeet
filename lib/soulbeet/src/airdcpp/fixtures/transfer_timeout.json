@@ -1,0 +1,41 @@
+{
+ "bytes_transferred": -1.0,
+ "download": true,
+ "encryption": null,
+ "flags": [],
+ "id": 3,
+ "ip": {
+  "country": "",
+  "ip": "",
+  "str": ""
+ },
+ "name": "03 - Don, Aman.flac",
+ "queue_file_id": 4,
+ "seconds_left": -1.0,
+ "size": 28132633.0,
+ "speed": -1.0,
+ "status": {
+  "id": "failed",
+  "str": "Connection timeout"
+ },
+ "supports": [],
+ "target": "/downloads/Slint - Spiderland (1991)/03 - Don, Aman.flac",
+ "time_started": 0.0,
+ "type": {
+  "content_type": "audio",
+  "id": "file",
+  "str": "flac"
+ },
+ "user": {
+  "cid": "WQWOJKRXPHHD4WFJD4BDH3NJXALMSOGXRCBF3CA",
+  "flags": [
+   "nmdc"
+  ],
+  "hub_names": "Hub Seven",
+  "hub_url": "dchub://hub-seven.example:411",
+  "hub_urls": [
+   "dchub://hub-seven.example:411"
+  ],
+  "nicks": "peer01"
+ }
+}

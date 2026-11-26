@@ -307,6 +307,7 @@ class Reporting(Session):
     kept_for_removal = False
 
     def run(self):
+        ignore_partial_files()
         if self.duplicates in KEEPS_LIBRARY:
             # A plugin can set remove again once the run has begun (the
             # import_begin event comes after this), so beets stops before it
@@ -449,6 +450,19 @@ class PickSession(Reporting):
         return super().choose_item(task) if self._pin(task) else Action.SKIP
 
 
+# What a download client writes while a file downloads, next to where it lands:
+# AirDC++ names it <name>.dctmp. Such a file is never imported.
+PARTIAL_FILES = ["*.dctmp"]
+
+
+def ignore_partial_files():
+    """Adds PARTIAL_FILES to the file names beets' importer leaves out."""
+    ignored = config["ignore"].as_str_seq()
+    missing = [p for p in PARTIAL_FILES if p not in ignored]
+    if missing:
+        config["ignore"] = [*ignored, *missing]
+
+
 def source_items(session, toppath):
     """The items beets imports from one source, read by beets' own task
     factory, so archives, flat, ignore and extension fixes apply as in the
@@ -507,6 +521,7 @@ def untagged_refusal(session):
 
 class AsIsSession(Reporting):
     def run(self):
+        ignore_partial_files()
         # The task factory reads the session config, which run() sets only
         # after it opens the run log.
         self.set_config(config["import"])

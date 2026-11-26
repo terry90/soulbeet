@@ -8,6 +8,7 @@ use shared::backends::{BackendMeta, BackendSwitch, Switch};
 use shared::system::DownloaderHealth;
 
 use super::connection_status_row::StatusLine;
+use super::direct_connect::DirectConnectSettings;
 use super::panel::LoadError;
 use super::toggle::{save_switch, Toggle};
 use crate::{friendly_error, use_auth, use_system_health};
@@ -136,9 +137,9 @@ fn BackendSwitchRow(
 }
 
 /// A backend's own settings form, under its switch. Each backend that has one adds its arm.
-#[allow(clippy::match_single_binding)]
 fn extra_settings(id: &str) -> Option<Element> {
     match id {
+        shared::airdcpp::BACKEND_ID => Some(rsx! { DirectConnectSettings {} }),
         _ => None,
     }
 }

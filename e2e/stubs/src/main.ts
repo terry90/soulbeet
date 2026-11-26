@@ -1,8 +1,10 @@
-// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer, archive.org, GD Studio
-// and OpenID Connect doubles.
+// Entry point: boots the slskd, MusicBrainz, ListenBrainz, Labs, Deezer, archive.org, GD Studio,
+// AirDC++ and OpenID Connect doubles.
 
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createAirdcppServer } from './airdcpp-server.js';
+import { AirdcppState } from './airdcpp-state.js';
 import { createArchiveServer } from './archive-server.js';
 import { createDeezerServer } from './deezer-server.js';
 import { createGdStudioServer } from './gdstudio-server.js';
@@ -23,6 +25,7 @@ const labsPort = Number(process.env.LABS_PORT ?? 5061);
 const deezerPort = Number(process.env.DEEZER_PORT ?? 5062);
 const archivePort = Number(process.env.ARCHIVE_PORT ?? 5064);
 const gdstudioPort = Number(process.env.GDSTUDIO_PORT ?? 5063);
+const airdcppPort = Number(process.env.AIRDCPP_PORT ?? 5065);
 const apiKey = process.env.SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 const audioDir = resolve(process.env.AUDIO_DIR ?? join(e2eRoot, '.fixtures', 'audio'));
 const downloadsDir = resolve(process.env.DOWNLOADS_DIR ?? join(e2eRoot, '.runtime', 'downloads'));
@@ -83,6 +86,13 @@ gdstudio.listen(gdstudioPort, '0.0.0.0', () => {
   console.log(`[gdstudio] listening on :${gdstudioPort}`);
 });
 
+const airdcppState = new AirdcppState(audioDir, downloadsDir);
+setInterval(() => airdcppState.tick(), 200).unref();
+const airdcpp = createAirdcppServer(airdcppState);
+airdcpp.listen(airdcppPort, '0.0.0.0', () => {
+  console.log(`[airdcpp] listening on :${airdcppPort} (downloads -> ${downloadsDir})`);
+});
+
 const oidc = createOidcServer({
   issuer: oidcIssuer,
   browserUrl: oidcBrowserUrl,
@@ -104,6 +114,7 @@ process.on('SIGTERM', () => {
   deezer.close();
   archive.close();
   gdstudio.close();
+  airdcpp.close();
   oidc.close();
   process.exit(0);
 });

@@ -37,6 +37,21 @@ export const slskdUrlForApp = process.env.E2E_SLSKD_URL ?? 'http://127.0.0.1:503
 
 export const slskdApiKey = process.env.E2E_SLSKD_API_KEY ?? 'e2e-slskd-api-key';
 
+/**
+ * The AirDC++ double as the APP must dial it: on the slskd double's host, port 5065
+ * (`stubs:5065` in compose).
+ */
+export const airdcppUrlForApp = process.env.E2E_AIRDCPP_URL ?? sameHost(slskdUrlForApp, 5065);
+
+/** The AirDC++ double's control endpoint as seen from the host running the specs. */
+export const airdcppControlUrl = process.env.E2E_AIRDCPP_CONTROL_URL ?? 'http://127.0.0.1:5065';
+
+function sameHost(url: string, port: number): string {
+  const at = new URL(url);
+  at.port = String(port);
+  return at.origin;
+}
+
 /** Stub control endpoint as seen from the host running the specs. */
 export const slskdControlUrl = process.env.E2E_SLSKD_CONTROL_URL ?? 'http://127.0.0.1:5030';
 

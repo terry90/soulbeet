@@ -106,8 +106,27 @@ pub const GDSTUDIO: BackendMeta = BackendMeta {
     blocked: None,
 };
 
+pub const AIRDCPP: BackendMeta = BackendMeta {
+    id: crate::airdcpp::BACKEND_ID,
+    name: "Direct Connect",
+    service: "AirDC++",
+    delivery: Delivery::AsFound,
+    switch: Switch::AdminToggle,
+    about: &[
+        "Off until an admin turns it on. Auto-download then searches the Direct Connect hubs an AirDC++ Web Client you run is connected to, next to Soulseek.",
+        "AirDC++ must save into the same downloads folder as Soulbeet. It checks each file against its TTH before Soulbeet imports it.",
+        "Hubs and peers see the IP address of the machine AirDC++ runs on. Each hub has its own rules.",
+    ],
+    link: Some((
+        "Setting up the AirDC++ sidecar",
+        "https://github.com/terry90/soulbeet/blob/master/docs/direct-connect.md",
+    )),
+    attribution: None,
+    blocked: None,
+};
+
 /// Every backend this build has, the default one first.
-pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE, YTDLP, GDSTUDIO];
+pub const ALL: &[BackendMeta] = &[SLSKD, ARCHIVE, YTDLP, GDSTUDIO, AIRDCPP];
 
 /// The backend a search or a send uses when none is named.
 pub const DEFAULT_ID: &str = SLSKD.id;
@@ -165,6 +184,7 @@ mod tests {
         assert_eq!(meta("archive"), Some(&ARCHIVE));
         assert_eq!(meta("ytdlp"), Some(&YTDLP));
         assert_eq!(meta("gdstudio"), Some(&GDSTUDIO));
+        assert_eq!(meta("airdcpp"), Some(&AIRDCPP));
         assert_eq!(meta("nicotine"), None);
     }
 
@@ -214,6 +234,19 @@ mod tests {
         assert_eq!(
             blocked("ytdlp"),
             "YouTube will not give files from this source"
+        );
+    }
+
+    #[test]
+    fn direct_connect_is_off_until_an_admin_turns_it_on_and_links_its_setup() {
+        assert_eq!(AIRDCPP.switch, Switch::AdminToggle);
+        assert_eq!(AIRDCPP.delivery, Delivery::AsFound);
+        assert!(AIRDCPP
+            .link
+            .is_some_and(|(_, url)| url.starts_with("https://")));
+        assert_eq!(
+            blocked("airdcpp"),
+            "AirDC++ will not give files from this source"
         );
     }
 

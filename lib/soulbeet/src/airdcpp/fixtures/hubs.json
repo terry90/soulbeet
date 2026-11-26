@@ -1,0 +1,42 @@
+[
+ {
+  "id": 1,
+  "hub_url": "nmdcs://hub-five.example:411",
+  "connect_state": {
+   "id": "connected",
+   "str": "Connected"
+  }
+ },
+ {
+  "id": 2,
+  "hub_url": "nmdcs://hub-one.example:411",
+  "connect_state": {
+   "id": "connected",
+   "str": "Connected"
+  }
+ },
+ {
+  "id": 3,
+  "hub_url": "dchub://hub-two.example:411",
+  "connect_state": {
+   "id": "connected",
+   "str": "Connected"
+  }
+ },
+ {
+  "id": 4,
+  "hub_url": "nmdcs://hub-three.example:411",
+  "connect_state": {
+   "id": "connected",
+   "str": "Connected"
+  }
+ },
+ {
+  "id": 5,
+  "hub_url": "nmdcs://hub-four.example:411",
+  "connect_state": {
+   "id": "connected",
+   "str": "Connected"
+  }
+ }
+]

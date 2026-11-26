@@ -104,7 +104,7 @@ pub trait DownloadBackend: Send + Sync {
     /// The transfer's place in the line it waits in before it starts: the source's queue for a
     /// peer backend (asked now, or the last place the source gave when it cannot be asked), the
     /// backend's own queue otherwise; Some(0) once it is not waiting; None when the backend no
-    /// longer has the transfer.
+    /// longer has the transfer, or when the source has given no place yet.
     async fn queue_position(&self, source: &str, id: &str) -> BackendResult<Option<u32>>;
     /// Whether this backend can fetch from the source now.
     async fn source_status(&self, source: &str) -> BackendResult<SourcePresence>;

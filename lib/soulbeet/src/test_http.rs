@@ -67,6 +67,42 @@ pub(crate) fn serve_with_headers(
     (url, seen)
 }
 
+/// Answers every connection with what `answer` gives for its request (`Connection: close`, JSON
+/// content type), each on its own thread, and records each request; base URL
+/// `http://127.0.0.1:{port}`. For a double that answers by route, as a service does.
+pub(crate) fn serve_fn(
+    answer: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<Seen>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let answer = Arc::new(answer);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let (answer, recorded) = (answer.clone(), recorded.clone());
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let request = read_request(&mut reader);
+                let reply = answer(&request);
+                recorded.lock().unwrap().push(request);
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.status,
+                    reason(reply.status),
+                    reply.body.len(),
+                    reply.body
+                );
+                // The client may hang up first, as on a timeout.
+                let _ = reader.get_mut().write_all(response.as_bytes());
+            });
+        }
+    });
+    (url, seen)
+}
+
 /// The request line, the headers and `Content-Length` bytes of body.
 fn read_request(reader: &mut impl BufRead) -> Seen {
     let mut line = String::new();

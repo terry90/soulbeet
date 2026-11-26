@@ -139,7 +139,7 @@ export async function confirmIn(page: Page, message: string): Promise<void> {
  */
 export async function configureInstance(page: Page, slskdUrl: string, musicDir: string): Promise<void> {
   await openSettings(page);
-  await page.getByRole('button', { name: 'Config' }).click();
+  await openConfigTab(page);
 
   await page.getByPlaceholder('http://localhost:5030').fill(slskdUrl);
   await page.getByPlaceholder('Enter slskd API key').fill(slskdApiKey);
@@ -188,6 +188,14 @@ export async function loginViaUi(page: Page, user: TestUser): Promise<void> {
 export async function openSettings(page: Page): Promise<void> {
   await page.getByRole('link', { name: 'Settings' }).click();
   await expect(page).toHaveURL(/\/settings$/);
+}
+
+/**
+ * Opens the Config tab of the settings page. Its name is matched exactly: while the tab is
+ * open, its "Save Configuration" button holds "Config" too.
+ */
+export async function openConfigTab(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Config', exact: true }).click();
 }
 
 /**

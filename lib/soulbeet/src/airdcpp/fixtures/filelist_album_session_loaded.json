@@ -1,0 +1,40 @@
+{
+ "id": "VXZH5HQZXLKIS3B7PH7W4NXGNGQ6GE6WEBRF6ZQ",
+ "location": {
+  "complete": true,
+  "dupe": null,
+  "id": 4,
+  "name": "1991 – Spiderland",
+  "path": "/music/Slint/1991 – Spiderland/",
+  "size": 206474836,
+  "time": 0.0,
+  "tth": "",
+  "type": {
+   "directories": 1,
+   "files": 10,
+   "id": "directory",
+   "str": "1 folder, 10 files"
+  }
+ },
+ "partial_list": true,
+ "read": false,
+ "share_profile": null,
+ "state": {
+  "id": "loaded",
+  "str": "Loaded"
+ },
+ "total_files": 0,
+ "total_size": 2213160124179,
+ "user": {
+  "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+  "flags": [
+   "nmdc"
+  ],
+  "hub_names": "Hub One",
+  "hub_url": "nmdcs://hub-one.example:411",
+  "hub_urls": [
+   "nmdcs://hub-one.example:411"
+  ],
+  "nicks": "peer01"
+ }
+}

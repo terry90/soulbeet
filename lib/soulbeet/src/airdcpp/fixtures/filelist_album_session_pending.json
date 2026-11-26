@@ -1,0 +1,26 @@
+{
+ "id": "VXZH5HQZXLKIS3B7PH7W4NXGNGQ6GE6WEBRF6ZQ",
+ "location": null,
+ "partial_list": true,
+ "read": false,
+ "share_profile": null,
+ "state": {
+  "id": "download_pending",
+  "str": "Download pending",
+  "time_finished": 0
+ },
+ "total_files": 0,
+ "total_size": 2213160124179,
+ "user": {
+  "cid": "HFGNLDTLJTWYHOVR5CYRNREZPGEN24KO5VFAL3Y",
+  "flags": [
+   "nmdc"
+  ],
+  "hub_names": "Hub One",
+  "hub_url": "nmdcs://hub-one.example:411",
+  "hub_urls": [
+   "nmdcs://hub-one.example:411"
+  ],
+  "nicks": "peer01"
+ }
+}

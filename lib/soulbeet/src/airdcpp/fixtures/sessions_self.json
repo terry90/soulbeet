@@ -1,0 +1,26 @@
+{
+ "id": 648758104,
+ "ip": "127.0.0.1",
+ "last_activity": 0,
+ "type": "basic_auth",
+ "user": {
+  "active_sessions": 1.0,
+  "id": "soulbeet",
+  "last_login": 1795653984.0,
+  "permissions": [
+   "search",
+   "download",
+   "transfers",
+   "queue_view",
+   "queue_edit",
+   "settings_view",
+   "share_view",
+   "filesystem_view",
+   "filesystem_edit",
+   "hubs_view",
+   "filelists_view",
+   "filelists_edit"
+  ],
+  "username": "soulbeet"
+ }
+}

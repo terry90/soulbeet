@@ -73,6 +73,7 @@ pub(crate) fn logged(f: &Failure) -> String {
         Service::InternetArchive => "internet_archive",
         Service::Youtube => "youtube",
         Service::GdStudio => "gd_studio",
+        Service::Airdcpp => "airdcpp",
     };
     let status = cause.status.map(|s| format!(" {s}")).unwrap_or_default();
     format!("{} (cause: {service}{status}: {})", f.message, cause.raw)

@@ -1,0 +1,2600 @@
+[
+ {
+  "connection": 1310.0,
+  "dupe": null,
+  "hits": 2.0,
+  "id": "MRHSPMYNQ6SWGCUNN6CBUJQXIC2R3MJ5DRAFXPY",
+  "name": "Portishead Glory Box. Cover by the Graystones..mp4",
+  "path": "/music videoes/Portishead Glory Box. Cover by the Graystones..mp4",
+  "relevance": 0.9654545454545455,
+  "size": 67827148.0,
+  "slots": {
+   "free": 58,
+   "str": "58/60",
+   "total": 60
+  },
+  "time": 0.0,
+  "tth": "MRHSPMYNQ6SWGCUNN6CBUJQXIC2R3MJ5DRAFXPY",
+  "type": {
+   "content_type": "video",
+   "id": "file",
+   "str": "mp4"
+  },
+  "users": {
+   "count": 2,
+   "user": {
+    "cid": "ROTWVE2Y7YY7QHKREQ6Q6RLBUMBZLLKUB7NI3EQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer03"
+   }
+  }
+ },
+ {
+  "connection": 117964800.0,
+  "dupe": null,
+  "hits": 9.0,
+  "id": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+  "name": "Portishead - Glory Box.mp3",
+  "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/181.FM Chilled/Portishead - Glory Box.mp3",
+  "relevance": 0.9627272727272727,
+  "size": 4521885.0,
+  "slots": {
+   "free": 0,
+   "str": "0/2295",
+   "total": 2295
+  },
+  "time": 0.0,
+  "tth": "ZB3QGTPAEKSS5M3VWP2ACCJATGJRO7OFZT4PRHI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 9,
+   "user": {
+    "cid": "4JAJHDJW2MSCERSM7IHNEZFA24Z5XLM5WHB6WDA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer04"
+   }
+  }
+ },
+ {
+  "connection": 131072000.0,
+  "dupe": null,
+  "hits": 10.0,
+  "id": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+  "name": "Portishead - Glorybox.mp3",
+  "path": "/DOWN/Chillout (Ambient, Chillstep, Lounge, Downtempo)/RaimaRadio/1.FM Chillout Lounge/Portishead - Glorybox.mp3",
+  "relevance": 0.9363636363636363,
+  "size": 5041837.0,
+  "slots": {
+   "free": 0,
+   "str": "0/2550",
+   "total": 2550
+  },
+  "time": 0.0,
+  "tth": "T7UNBSAEE3WNUVYUA6JNBF2VPIECM3QU7TY5IAQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 10,
+   "user": {
+    "cid": "4JAJHDJW2MSCERSM7IHNEZFA24Z5XLM5WHB6WDA",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer04"
+   }
+  }
+ },
+ {
+  "connection": 39321600.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY",
+  "name": "Portishead - Glory Box (MM).vob",
+  "path": "/Videos/~Portishead/Portishead - Glory Box (MM).vob",
+  "relevance": 0.9027272727272727,
+  "size": 257396736.0,
+  "slots": {
+   "free": 0,
+   "str": "0/765",
+   "total": 765
+  },
+  "time": 0.0,
+  "tth": "Q73WVQMZ4HUTSNRUBMJTBBLMXW4WVZ4O6QHPCQY",
+  "type": {
+   "content_type": "video",
+   "id": "file",
+   "str": "vob"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ },
+ {
+  "connection": 39321600.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI",
+  "name": "Portishead - Glory Box.mp4",
+  "path": "/Videos/~Portishead/Portishead - Glory Box.mp4",
+  "relevance": 0.9027272727272727,
+  "size": 24496730.0,
+  "slots": {
+   "free": 0,
+   "str": "0/765",
+   "total": 765
+  },
+  "time": 0.0,
+  "tth": "52UVKW53QGX5AAVJ6G5BHJ3AHRLMTFHIQZJIXXI",
+  "type": {
+   "content_type": "video",
+   "id": "file",
+   "str": "mp4"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "NFBTV4JFQEQKHSE2P6EPNMMSFW4E662JZZAON4Y",
+  "name": "Portishead - Glory Box.mp3",
+  "path": "/музыка/Oldinina_Storinina/Portishead - Glory Box.mp3",
+  "relevance": 0.8827272727272727,
+  "size": 8944800.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "NFBTV4JFQEQKHSE2P6EPNMMSFW4E662JZZAON4Y",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "RXAWJ5T5NUK6GINA2KJJFTFH7QAJ75NAIVF5EEI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer06"
+   }
+  }
+ },
+ {
+  "connection": 52428800.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "HWED3L624J6F34LHSOT3S2V6VYEQSRTSTPIGT3Q",
+  "name": "Portishead - Glory Box (Mudflap Mix).mp3",
+  "path": "/Music/Razno/Portishead - Glory Box (Mudflap Mix).mp3",
+  "relevance": 0.8827272727272727,
+  "size": 13422592.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "HWED3L624J6F34LHSOT3S2V6VYEQSRTSTPIGT3Q",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "Z5XDU3YT4MGTJZDHYMYC7I6OMX55NPOLE6IYAMA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer07"
+   }
+  }
+ },
+ {
+  "connection": 4587520.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "CNPPZX6TSGAVDPCOAE776LTWHPEI2RET3ZMJJ2A",
+  "name": "Portishead - Glory Box.mp3",
+  "path": "/Music/P/Portishead/1995/HITS 95, Volume 1/Portishead - Glory Box.mp3",
+  "relevance": 0.8827272727272727,
+  "size": 3441572.0,
+  "slots": {
+   "free": 3,
+   "str": "3/5",
+   "total": 5
+  },
+  "time": 0.0,
+  "tth": "CNPPZX6TSGAVDPCOAE776LTWHPEI2RET3ZMJJ2A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "Y23A3TR6VKRIQMIWHIZ2TZMQF7GAESVMSEYTX3Q",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer08"
+   }
+  }
+ },
+ {
+  "connection": 52428800.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "6M427UPWSYVENQWLOHA5SYE5AY3ZJUJV2YHPU6Y",
+  "name": "Portishead - Glory Box.mp3",
+  "path": "/Music/Razno/Portishead - Glory Box.mp3",
+  "relevance": 0.8827272727272727,
+  "size": 12095488.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "6M427UPWSYVENQWLOHA5SYE5AY3ZJUJV2YHPU6Y",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "Z5XDU3YT4MGTJZDHYMYC7I6OMX55NPOLE6IYAMA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer07"
+   }
+  }
+ },
+ {
+  "connection": 52428800.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "VD6SKHNWQL2XPNMOMJYABFGOYNZEMOXMORGVUEQ",
+  "name": "Portishead - Glory Box (Instrumental).mp3",
+  "path": "/Music/Razno/Portishead - Glory Box (Instrumental).mp3",
+  "relevance": 0.8827272727272727,
+  "size": 7254143.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "VD6SKHNWQL2XPNMOMJYABFGOYNZEMOXMORGVUEQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "Z5XDU3YT4MGTJZDHYMYC7I6OMX55NPOLE6IYAMA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer07"
+   }
+  }
+ },
+ {
+  "connection": 26214.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "VFPK6I5H3IDNCZKLFO6MRDP5DZ7VX77SCYZ62YY",
+  "name": "portishead_dummy_11_glory_box.mp3",
+  "path": "/Audio/_Teknelektro/Portishead_Dummy_1994_MP3/portishead_dummy_11_glory_box.mp3",
+  "relevance": 0.8544444444444445,
+  "size": 7356552.0,
+  "slots": {
+   "free": 6,
+   "str": "6/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "VFPK6I5H3IDNCZKLFO6MRDP5DZ7VX77SCYZ62YY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "HSTH5DK5EMCQZDA5TYRWNVHY7WOS6SS7VTNO2YY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer09"
+   }
+  }
+ },
+ {
+  "connection": 26214.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "BOKDAGA3XFQTBWRB2QPLVGFJE3QZZTDDIRZLW2A",
+  "name": "portishead_symphony_05_glory_box.mp3",
+  "path": "/Audio/_Teknelektro/Portishead_Symphony_19980821_Koeln_MP3/portishead_symphony_05_glory_box.mp3",
+  "relevance": 0.8524242424242424,
+  "size": 7667986.0,
+  "slots": {
+   "free": 6,
+   "str": "6/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "BOKDAGA3XFQTBWRB2QPLVGFJE3QZZTDDIRZLW2A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "HSTH5DK5EMCQZDA5TYRWNVHY7WOS6SS7VTNO2YY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer09"
+   }
+  }
+ },
+ {
+  "connection": 1310720.0,
+  "dupe": null,
+  "hits": 2.0,
+  "id": "2HJGCY6X62G5LMW32TAE72YBSCYE2CTXIF6HH7Q",
+  "name": "Glory Box.vqf",
+  "path": "/Muz/P/Portishead/Portishead - Dummy/Glory Box.vqf",
+  "relevance": 0.8432445520581114,
+  "size": 3655718.0,
+  "slots": {
+   "free": 0,
+   "str": "0/510",
+   "total": 510
+  },
+  "time": 0.0,
+  "tth": "2HJGCY6X62G5LMW32TAE72YBSCYE2CTXIF6HH7Q",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "vqf"
+  },
+  "users": {
+   "count": 2,
+   "user": {
+    "cid": "5JF3IXKBFUI3IUTJA44LCEKB7OPENVPYHMM2LXI",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer10"
+   }
+  }
+ },
+ {
+  "connection": 1310720.0,
+  "dupe": null,
+  "hits": 2.0,
+  "id": "T5D2YUKF442P34V32DF5GB5PZPRDGSEC4GVKXFI",
+  "name": "Glory Box.vqf",
+  "path": "/Muz/P/Portishead/Portishead - Roseland NYC Live/Glory Box.vqf",
+  "relevance": 0.8371275646743979,
+  "size": 4046322.0,
+  "slots": {
+   "free": 0,
+   "str": "0/510",
+   "total": 510
+  },
+  "time": 0.0,
+  "tth": "T5D2YUKF442P34V32DF5GB5PZPRDGSEC4GVKXFI",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "vqf"
+  },
+  "users": {
+   "count": 2,
+   "user": {
+    "cid": "5JF3IXKBFUI3IUTJA44LCEKB7OPENVPYHMM2LXI",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer10"
+   }
+  }
+ },
+ {
+  "connection": 655360000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+  "name": "03 - Glory Box.mp3",
+  "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1994 Dummy/03 - Glory Box.mp3",
+  "relevance": 0.8164399092970521,
+  "size": 12095488.0,
+  "slots": {
+   "free": 0,
+   "str": "0/1275",
+   "total": 1275
+  },
+  "time": 0.0,
+  "tth": "HJPTNXWQ6R67H2QTJBGVLXLJNYEYOLGWCRQZBJQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  }
+ },
+ {
+  "connection": 655360000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+  "name": "07 - Glory Box Edit.mp3",
+  "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/2002 Melody Nelson/07 - Glory Box Edit.mp3",
+  "relevance": 0.8147907647907648,
+  "size": 6815744.0,
+  "slots": {
+   "free": 0,
+   "str": "0/1275",
+   "total": 1275
+  },
+  "time": 0.0,
+  "tth": "RFPZBISFSUJXDCL75T3Q5FFCM2AVWV42YL4LHKQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  }
+ },
+ {
+  "connection": 39321600.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I",
+  "name": "11.Glory Box.mp3",
+  "path": "/Shared Music/Portishead/Portishead - Dummy (Go! Beat 828 553-2)/11.Glory Box.mp3",
+  "relevance": 0.8118480043739749,
+  "size": 12333893.0,
+  "slots": {
+   "free": 27,
+   "str": "27/30",
+   "total": 30
+  },
+  "time": 0.0,
+  "tth": "QB67LA3GEGY6AWWFQ74TQMUJN7FG4CNVLVHVY2I",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "BO5SGBEICQHNHO7X5PWKBKTJ2IIE74BXEJK7D7I",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  }
+ },
+ {
+  "connection": 39321600.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ",
+  "name": "(portishead)_-08-_glory_box.mp3",
+  "path": "/Shared Music/Portishead/PNYC/(portishead)_-08-_glory_box.mp3",
+  "relevance": 0.8057575757575758,
+  "size": 6772041.0,
+  "slots": {
+   "free": 27,
+   "str": "27/30",
+   "total": 30
+  },
+  "time": 0.0,
+  "tth": "2GW5BTP4LYACRV7EAKT4UP43VAV7DDDJLSDKOEQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "BO5SGBEICQHNHO7X5PWKBKTJ2IIE74BXEJK7D7I",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer12"
+   }
+  }
+ },
+ {
+  "connection": 399507456.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY",
+  "name": "08 - Glory Box.MP3",
+  "path": "/MUS/Lounge/Lounge/Portishead/Pearl/08 - Glory Box.MP3",
+  "relevance": 0.7989594356261024,
+  "size": 6042241.0,
+  "slots": {
+   "free": 9,
+   "str": "9/520",
+   "total": 520
+  },
+  "time": 0.0,
+  "tth": "QBENPFYDCGVOBPIDNC7PWLS5S7PIXXU3GVOQUTY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "MP3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  }
+ },
+ {
+  "connection": 399507456.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY",
+  "name": "11 - Glory Box.mp3",
+  "path": "/MUS/Lounge/Lounge/Portishead/Dummy/11 - Glory Box.mp3",
+  "relevance": 0.7989594356261024,
+  "size": 4893143.0,
+  "slots": {
+   "free": 9,
+   "str": "9/520",
+   "total": 520
+  },
+  "time": 0.0,
+  "tth": "DUW7KVF6PENR6OFCMQGEGX3YLKZ4DGSR3RCLOGY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  }
+ },
+ {
+  "connection": 399507456.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY",
+  "name": "08 - Glory Box.MP3",
+  "path": "/MUS/Lounge/Lounge/Portishead/Roseland Nyc Live/08 - Glory Box.MP3",
+  "relevance": 0.7949281934996222,
+  "size": 5383598.0,
+  "slots": {
+   "free": 9,
+   "str": "9/520",
+   "total": 520
+  },
+  "time": 0.0,
+  "tth": "A4GWME3IMAL6N6OYXTDGJJGM3XQEKRHHMR6RMUY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "MP3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "V4YJJGVDC5VAGMBBMXG6XBIHPZ5CQAGNSFJVYRA",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer13"
+   }
+  }
+ },
+ {
+  "connection": 655360000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+  "name": "07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+  "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/07 - Portishead - Glory Box (Empress Ballroom, Blackpool, 5 25 1995).mp3",
+  "relevance": 0.7918181818181819,
+  "size": 8274957.0,
+  "slots": {
+   "free": 0,
+   "str": "0/1275",
+   "total": 1275
+  },
+  "time": 0.0,
+  "tth": "NSYM2KSUZIW6NX4G4UWB334F3YGVBVAJ2F5UWRA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  }
+ },
+ {
+  "connection": 655360000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+  "name": "08 - Portishead - Glory Box.mp3",
+  "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.mp3",
+  "relevance": 0.7918181818181819,
+  "size": 13490804.0,
+  "slots": {
+   "free": 0,
+   "str": "0/1275",
+   "total": 1275
+  },
+  "time": 0.0,
+  "tth": "AIQQRVPHL3XQGGOSLBIOC7OW636L24B5KUDDW7Q",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  }
+ },
+ {
+  "connection": 655360000.0,
+  "dupe": null,
+  "hits": 5.0,
+  "id": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+  "name": "11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+  "path": "/Music 2/_Trip-hop, Downtempo, Acid Jazz/PortisHead/1995 - Welcome to Portishead (Blackpool and Paris)/11 - Portishead - Glory Box (La Cigale, Paris, 4 12 1995).mp3",
+  "relevance": 0.7918181818181819,
+  "size": 7233601.0,
+  "slots": {
+   "free": 0,
+   "str": "0/1275",
+   "total": 1275
+  },
+  "time": 0.0,
+  "tth": "N3UHELP3H2EAVFILP47CXB7EVHJLF4R627OH5LY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 5,
+   "user": {
+    "cid": "QHZM36PGXCVRUE5MQ2XUU75XS2MTM3GQPGALMVA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer11"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "K2W6VW47Y6R4ONHB5TJHM55LB5WTGSJZNGPSQZI",
+  "name": "11 - Glory Box.mp3",
+  "path": "/MUSIC/_Easy/Portishead/Dummy/11 - Glory Box.mp3",
+  "relevance": 0.7789594356261024,
+  "size": 4893143.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "K2W6VW47Y6R4ONHB5TJHM55LB5WTGSJZNGPSQZI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "KW4D3BHK2KMSN4GBX7YE276FMF5TP2A4ETYQ6NI",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer14"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "2JOH264TG6XP5IA4RFXNDPRQ7J7PPJNUIY4ZOPQ",
+  "name": "08 - Glory Box.MP3",
+  "path": "/MUSIC/_Easy/Portishead/Pearl/08 - Glory Box.MP3",
+  "relevance": 0.7789594356261024,
+  "size": 6041207.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "2JOH264TG6XP5IA4RFXNDPRQ7J7PPJNUIY4ZOPQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "MP3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "KW4D3BHK2KMSN4GBX7YE276FMF5TP2A4ETYQ6NI",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer14"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "N3OSLS5GM7XL25RKUTHWTL7EBMTAIRUNDB5ZQ2A",
+  "name": "11. Glory Box.opus",
+  "path": "/Music/P/Portishead/1994 Dummy/11. Glory Box.opus",
+  "relevance": 0.7767887667887668,
+  "size": 11328029.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "N3OSLS5GM7XL25RKUTHWTL7EBMTAIRUNDB5ZQ2A",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "QAGLWIE72I6REIRNZ7WUZZPFZYFR5ZE6H7EXNTY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer15"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "42OTUQDAKQHWIANMBXDLIJ2V5B6GJP4SCSQ66ZI",
+  "name": "08  Glory Box.mp3",
+  "path": "/Music/Portishead/1999 Pearl/08  Glory Box.mp3",
+  "relevance": 0.7767887667887668,
+  "size": 12097664.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "42OTUQDAKQHWIANMBXDLIJ2V5B6GJP4SCSQ66ZI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "JVNZYWRWIL2ZWWY7UNE7K3UNHSU2S7KOBVNCTZI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer16"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "OFRSEBNL5QMIUOKKZ6KUCQL3VF2MHN26P3HQ7TY",
+  "name": "11 Glory Box.mp3",
+  "path": "/My Music/Portishead/1994 - Dummy/11 Glory Box.mp3",
+  "relevance": 0.7764399092970521,
+  "size": 6350730.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "OFRSEBNL5QMIUOKKZ6KUCQL3VF2MHN26P3HQ7TY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "BBA7F7N5MRVHRVOBZ3IRDMPJGAZZZ3YCWTSMZDY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer17"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "ENO2KWX23OKNRW36554MNTVDMV2Z7475ZTPGYTI",
+  "name": "10 Glory Box.mp3",
+  "path": "/Music/Portishead/1994 - Dummy/10 Glory Box.mp3",
+  "relevance": 0.7764399092970521,
+  "size": 12310481.0,
+  "slots": {
+   "free": 16,
+   "str": "16/16",
+   "total": 16
+  },
+  "time": 0.0,
+  "tth": "ENO2KWX23OKNRW36554MNTVDMV2Z7475ZTPGYTI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "4YXMGQPFW43XFN25GCWK2NQFVFANS4HZDP7AFJI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer18"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "MBB5FTGNLTMTS2GBJ7KAUTGRZVNJ22U2YDU3O3A",
+  "name": "07 Glory box(edit).mp3",
+  "path": "/Music/Portishead/Melody Nelson/07 Glory box(edit).mp3",
+  "relevance": 0.7761375661375661,
+  "size": 3401728.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "MBB5FTGNLTMTS2GBJ7KAUTGRZVNJ22U2YDU3O3A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "JVNZYWRWIL2ZWWY7UNE7K3UNHSU2S7KOBVNCTZI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer16"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "UV56JHRRC7LYGVUHACCM6CHVUBGNH45TYOHYJSA",
+  "name": "06 - Glory Box.mp3",
+  "path": "/Music/Portishead/1999 - Pearl/06 - Glory Box.mp3",
+  "relevance": 0.7758730158730159,
+  "size": 6041832.0,
+  "slots": {
+   "free": 16,
+   "str": "16/16",
+   "total": 16
+  },
+  "time": 0.0,
+  "tth": "UV56JHRRC7LYGVUHACCM6CHVUBGNH45TYOHYJSA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "4YXMGQPFW43XFN25GCWK2NQFVFANS4HZDP7AFJI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer18"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "HYSBYKK6AFKW22MA4UOG2UFTMPS5LPH4YDWCQWQ",
+  "name": "04 Glory Box.mp3",
+  "path": "/My Music/Portishead/1998 - Elysium/04 Glory Box.mp3",
+  "relevance": 0.7758730158730159,
+  "size": 9346859.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "HYSBYKK6AFKW22MA4UOG2UFTMPS5LPH4YDWCQWQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "BBA7F7N5MRVHRVOBZ3IRDMPJGAZZZ3YCWTSMZDY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer17"
+   }
+  }
+ },
+ {
+  "connection": 7864320.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ",
+  "name": "24. Portishead - Glory Box.flac",
+  "path": "/G:_/Various Artists - British Songs That Everybody Knows [2026] [FLAC]/24. Portishead - Glory Box.flac",
+  "relevance": 0.7754545454545455,
+  "size": 25202425.0,
+  "slots": {
+   "free": 18,
+   "str": "18/63",
+   "total": 63
+  },
+  "time": 0.0,
+  "tth": "L2FELT25KPMPOIIV3GDOHJJPXWTCUPYXWGPT3JQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "632QH7JSZ3PX6UA7RGAXR4KJ67PJ43QQRQCQFXA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "OWORDBUGVQ5MGGZJAWCIUQXBJ6VSY7PVXVV6AUI",
+  "name": "09 - Glory Box (Mudflop mix).ogg",
+  "path": "/Music/Portishead/2002 - Mysteries/09 - Glory Box (Mudflop mix).ogg",
+  "relevance": 0.775079365079365,
+  "size": 6341913.0,
+  "slots": {
+   "free": 16,
+   "str": "16/16",
+   "total": 16
+  },
+  "time": 0.0,
+  "tth": "OWORDBUGVQ5MGGZJAWCIUQXBJ6VSY7PVXVV6AUI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "ogg"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "4YXMGQPFW43XFN25GCWK2NQFVFANS4HZDP7AFJI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer18"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "X54GZUSUGDGNWXFN3CGLZT4MB7ECMLW523VZ34A",
+  "name": "05 Glory Box (Glastonbury 1998).mp3",
+  "path": "/My Music/Portishead/1998 - Desolation Row/05 Glory Box (Glastonbury 1998).mp3",
+  "relevance": 0.7746652864044169,
+  "size": 9329613.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "X54GZUSUGDGNWXFN3CGLZT4MB7ECMLW523VZ34A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "BBA7F7N5MRVHRVOBZ3IRDMPJGAZZZ3YCWTSMZDY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer17"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "JHL76KNWPN2JFIKZQXPRDOVZ3X3IS2H3WUK4D5Q",
+  "name": "07 - Glory Box (Edit).mp3",
+  "path": "/Music/Portishead/2002 - Melody Nelson/07 - Glory Box (Edit).mp3",
+  "relevance": 0.7745502645502645,
+  "size": 5179617.0,
+  "slots": {
+   "free": 16,
+   "str": "16/16",
+   "total": 16
+  },
+  "time": 0.0,
+  "tth": "JHL76KNWPN2JFIKZQXPRDOVZ3X3IS2H3WUK4D5Q",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "4YXMGQPFW43XFN25GCWK2NQFVFANS4HZDP7AFJI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer18"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "CIO2RHVSYVBOQHTGJNL7YWL772R46AAK2J55MFQ",
+  "name": "08 - Glory Box.mp3",
+  "path": "/Music/Portishead/1998 - Roseland Nyc Live/08 - Glory Box.mp3",
+  "relevance": 0.774172335600907,
+  "size": 5413842.0,
+  "slots": {
+   "free": 16,
+   "str": "16/16",
+   "total": 16
+  },
+  "time": 0.0,
+  "tth": "CIO2RHVSYVBOQHTGJNL7YWL772R46AAK2J55MFQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "4YXMGQPFW43XFN25GCWK2NQFVFANS4HZDP7AFJI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Two",
+    "hub_url": "dchub://hub-two.example:411",
+    "hub_urls": [
+     "dchub://hub-two.example:411"
+    ],
+    "nicks": "peer18"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "3TF5UFMAYCWSVTE7BDQOBUPPVPKA7UB7RIUAW4A",
+  "name": "02 Glory box.mp3",
+  "path": "/My Music/Portishead/1995 - Nobody loves me! (live - April '95)/02 Glory box.mp3",
+  "relevance": 0.7733477633477635,
+  "size": 6330194.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "3TF5UFMAYCWSVTE7BDQOBUPPVPKA7UB7RIUAW4A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "BBA7F7N5MRVHRVOBZ3IRDMPJGAZZZ3YCWTSMZDY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer17"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "HXAD3W34H6ETKNPNGZUTAGTTWIY2FIX4TX3XLCQ",
+  "name": "09 Glory box.mp3",
+  "path": "/My Music/Portishead/1995 - Nobody loves me! (live - April '95)/09 Glory box.mp3",
+  "relevance": 0.7733477633477635,
+  "size": 6290700.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "HXAD3W34H6ETKNPNGZUTAGTTWIY2FIX4TX3XLCQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "BBA7F7N5MRVHRVOBZ3IRDMPJGAZZZ3YCWTSMZDY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer17"
+   }
+  }
+ },
+ {
+  "connection": 7864320.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y",
+  "name": "18 - Portishead - Glory Box.mp3",
+  "path": "/F:_/Now That's What I Call Music! - Complete Collection (1 to 87)/Now That's What I Call Music! 30/CD 1/18 - Portishead - Glory Box.mp3",
+  "relevance": 0.7718181818181818,
+  "size": 9091799.0,
+  "slots": {
+   "free": 18,
+   "str": "18/63",
+   "total": 63
+  },
+  "time": 0.0,
+  "tth": "HOMBX6QJVL3OVV2BNRFMSGPQCZQJOIX2KBWT36Y",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "632QH7JSZ3PX6UA7RGAXR4KJ67PJ43QQRQCQFXA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer19"
+   }
+  }
+ },
+ {
+  "connection": 39321600.0,
+  "dupe": null,
+  "hits": 3.0,
+  "id": "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I",
+  "name": "{Rage HD} Portishead - Glory Box.mpg",
+  "path": "/Videos/{Rage HD}/{Rage HD} Portishead - Glory Box.mpg",
+  "relevance": 0.7645454545454545,
+  "size": 269944836.0,
+  "slots": {
+   "free": 0,
+   "str": "0/765",
+   "total": 765
+  },
+  "time": 0.0,
+  "tth": "JNPVNUPE355LFZB5UN6K2XSA7B47ECIP5IYT54I",
+  "type": {
+   "content_type": "video",
+   "id": "file",
+   "str": "mpg"
+  },
+  "users": {
+   "count": 3,
+   "user": {
+    "cid": "SWFAYIHEB5NUGGU6F2GDLKX47FIS24ECY7DABYY",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer05"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "7ABAADJZDKWWROZ3Z4MTNBXK7JTNPV4VRIGHLWA",
+  "name": "05. Toy Box.opus",
+  "path": "/Music/P/Portishead/1995 Glory Times/2 - Glory/05. Toy Box.opus",
+  "relevance": 0.758564867967853,
+  "size": 12846981.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "7ABAADJZDKWWROZ3Z4MTNBXK7JTNPV4VRIGHLWA",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "QAGLWIE72I6REIRNZ7WUZZPFZYFR5ZE6H7EXNTY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer15"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "P5A4MLKLC4XK4VX7M7TU7XVDINJ4JGHA2KDX3DY",
+  "name": "04. Sheared Box.opus",
+  "path": "/Music/P/Portishead/1995 Glory Times/2 - Glory/04. Sheared Box.opus",
+  "relevance": 0.7582587064676617,
+  "size": 7748700.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "P5A4MLKLC4XK4VX7M7TU7XVDINJ4JGHA2KDX3DY",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "QAGLWIE72I6REIRNZ7WUZZPFZYFR5ZE6H7EXNTY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer15"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "HHGRRUCJGSEBHWH5YZBUZFMKFJCF42ORNVWCPBI",
+  "name": "14. Portishead - Glory Box.mp3",
+  "path": "/Music/OST/Stealing Beauty/14. Portishead - Glory Box.mp3",
+  "relevance": 0.7554545454545455,
+  "size": 12021760.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "HHGRRUCJGSEBHWH5YZBUZFMKFJCF42ORNVWCPBI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "JVNZYWRWIL2ZWWY7UNE7K3UNHSU2S7KOBVNCTZI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer16"
+   }
+  }
+ },
+ {
+  "connection": 13107.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "PXLAF6WZDA7HG7FNYX2R4QGIYT2JFANV622ZZEA",
+  "name": "15. Portishead - Glory Box.flac",
+  "path": "/Музыка/Flac/_Top sbornik/VA - Now Thats What I Call Music - The Millennium Series/1995/CD 1/15. Portishead - Glory Box.flac",
+  "relevance": 0.7554545454545455,
+  "size": 19168628.0,
+  "slots": {
+   "free": 3,
+   "str": "3/3",
+   "total": 3
+  },
+  "time": 0.0,
+  "tth": "PXLAF6WZDA7HG7FNYX2R4QGIYT2JFANV622ZZEA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "flac"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "NV2SXYKEDF2QL35VEL2SSW42UACHIEOI56L4IOI",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer20"
+   }
+  }
+ },
+ {
+  "connection": 655360.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "NI4ZMDAYA5XRRDGFVBKR4TUXXRAYA4BTWN5AREA",
+  "name": "11. Portishead - Glory Box (Edit).mp3",
+  "path": "/Немного музыки/Relax/Бессонница/Бессонница 03/11. Portishead - Glory Box (Edit).mp3",
+  "relevance": 0.7554545454545455,
+  "size": 8773220.0,
+  "slots": {
+   "free": 17,
+   "str": "17/17",
+   "total": 17
+  },
+  "time": 0.0,
+  "tth": "NI4ZMDAYA5XRRDGFVBKR4TUXXRAYA4BTWN5AREA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "XJRNSTLBDZ4BBYWSD64FXNAUF5BENI3YW5SJ3GI",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer21"
+   }
+  }
+ },
+ {
+  "connection": 52428800.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "VOXGKMRRPTQPXVVXLSC3FBWLXUX2PWWK3CRYODY",
+  "name": "068. Portishead - Glory Box.mp3",
+  "path": "/Music/Balade, Smooth Jazz, Lounge/Light Rock/Light Rock - Volume 2/068. Portishead - Glory Box.mp3",
+  "relevance": 0.7518181818181818,
+  "size": 6242235.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "VOXGKMRRPTQPXVVXLSC3FBWLXUX2PWWK3CRYODY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "Z5XDU3YT4MGTJZDHYMYC7I6OMX55NPOLE6IYAMA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer07"
+   }
+  }
+ },
+ {
+  "connection": 268435456.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "ARQXEBJPYZATMBPUYVD355DOLECADU4KDX4NA3I",
+  "name": "19 - Portishead - Glory Box (Mudflap Mix).mp3",
+  "path": "/base.rtmfm.ru/Trip Hop/!Portishead/2002 - Melody Nelson/19 - Portishead - Glory Box (Mudflap Mix).mp3",
+  "relevance": 0.7518181818181818,
+  "size": 7739854.0,
+  "slots": {
+   "free": 15,
+   "str": "15/15",
+   "total": 15
+  },
+  "time": 0.0,
+  "tth": "ARQXEBJPYZATMBPUYVD355DOLECADU4KDX4NA3I",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "U2T3APBY7ABWG6GJDMOEZL2OPXTSI7NZVAFPDWA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer22"
+   }
+  }
+ },
+ {
+  "connection": 268435456.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "2DSDFTLDDEFSODNT5SI24CRA7FCPVDXZKGK4POQ",
+  "name": "12 - Portishead - Glory Box (edit).mp3",
+  "path": "/base.rtmfm.ru/Trip Hop/!Portishead/2002 - Toy Box/12 - Portishead - Glory Box (edit).mp3",
+  "relevance": 0.7518181818181818,
+  "size": 5093591.0,
+  "slots": {
+   "free": 15,
+   "str": "15/15",
+   "total": 15
+  },
+  "time": 0.0,
+  "tth": "2DSDFTLDDEFSODNT5SI24CRA7FCPVDXZKGK4POQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "U2T3APBY7ABWG6GJDMOEZL2OPXTSI7NZVAFPDWA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer22"
+   }
+  }
+ },
+ {
+  "connection": 268435456.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "YF74S5KCBIWYXQKFJIQJH266JW3ARI62KYQV3JY",
+  "name": "07 - Portishead - Glory Box (Edit).mp3",
+  "path": "/base.rtmfm.ru/Trip Hop/!Portishead/2002 - Melody Nelson/07 - Portishead - Glory Box (Edit).mp3",
+  "relevance": 0.7518181818181818,
+  "size": 5104203.0,
+  "slots": {
+   "free": 15,
+   "str": "15/15",
+   "total": 15
+  },
+  "time": 0.0,
+  "tth": "YF74S5KCBIWYXQKFJIQJH266JW3ARI62KYQV3JY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "U2T3APBY7ABWG6GJDMOEZL2OPXTSI7NZVAFPDWA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer22"
+   }
+  }
+ },
+ {
+  "connection": 268435456.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "626LT46L6LNEG7OAK6GQCZ3OVLNHFAH7XI7G72Q",
+  "name": "08 - Portishead - Glory Box.wma",
+  "path": "/base.rtmfm.ru/Trip Hop/!Portishead/1998 - Roseland NYC Live/08 - Portishead - Glory Box.wma",
+  "relevance": 0.7518181818181818,
+  "size": 37130035.0,
+  "slots": {
+   "free": 15,
+   "str": "15/15",
+   "total": 15
+  },
+  "time": 0.0,
+  "tth": "626LT46L6LNEG7OAK6GQCZ3OVLNHFAH7XI7G72Q",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "wma"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "U2T3APBY7ABWG6GJDMOEZL2OPXTSI7NZVAFPDWA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer22"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "YRO6NY34P6MOQ6MHOGSM7VBNJPYARE7SL7WTIOA",
+  "name": "11 - Portishead - Glory Box.mp3",
+  "path": "/Music/Portishead/1994 Dummy/11 - Portishead - Glory Box.mp3",
+  "relevance": 0.7518181818181818,
+  "size": 7331407.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "YRO6NY34P6MOQ6MHOGSM7VBNJPYARE7SL7WTIOA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "JVNZYWRWIL2ZWWY7UNE7K3UNHSU2S7KOBVNCTZI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer16"
+   }
+  }
+ },
+ {
+  "connection": 268435456.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "FEL766R3CYIXGRSC43QTPLHGDYIV2PA3WXDW2EI",
+  "name": "11 - Portishead - Glory Box.wma",
+  "path": "/base.rtmfm.ru/Trip Hop/!Portishead/1994 - Dummy/11 - Portishead - Glory Box.wma",
+  "relevance": 0.7518181818181818,
+  "size": 24537970.0,
+  "slots": {
+   "free": 15,
+   "str": "15/15",
+   "total": 15
+  },
+  "time": 0.0,
+  "tth": "FEL766R3CYIXGRSC43QTPLHGDYIV2PA3WXDW2EI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "wma"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "U2T3APBY7ABWG6GJDMOEZL2OPXTSI7NZVAFPDWA",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer22"
+   }
+  }
+ },
+ {
+  "connection": 201326592.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "ZYCT7BWZTKRCKBLA6VKRQKVGLHXRY5HMIAEIUDI",
+  "name": "Remixes Vol.1 - 03 - Portishead - Glory Box (Sheared Box).opus",
+  "path": "/music/a/Portishead/Remixes Vol.1 '05/Remixes Vol.1 - 03 - Portishead - Glory Box (Sheared Box).opus",
+  "relevance": 0.7407359307359308,
+  "size": 4070942.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "ZYCT7BWZTKRCKBLA6VKRQKVGLHXRY5HMIAEIUDI",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "JE7LYILN6NCBNL4FRVSUBDUTLHK7QPPADZLXZCY",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Four",
+    "hub_url": "nmdcs://hub-four.example:411",
+    "hub_urls": [
+     "nmdcs://hub-four.example:411"
+    ],
+    "nicks": "peer23"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "57VAKSHSC2KG4ANJ47VM7NRPVSU5JHNRAQLF2ZY",
+  "name": "02. Glory Box (Muflap Mix).opus",
+  "path": "/Music/P/Portishead/1995 Glory Times/2 - Glory/02. Glory Box (Muflap Mix).opus",
+  "relevance": 0.7285501066098081,
+  "size": 12778140.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "57VAKSHSC2KG4ANJ47VM7NRPVSU5JHNRAQLF2ZY",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "QAGLWIE72I6REIRNZ7WUZZPFZYFR5ZE6H7EXNTY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer15"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "EM7WXLXWM5RHNCADCXIRLJSVGLIM5SY6HUQL2KY",
+  "name": "01. Glory Box (Edit).opus",
+  "path": "/Music/P/Portishead/1995 Glory Times/2 - Glory/01. Glory Box (Edit).opus",
+  "relevance": 0.7285501066098081,
+  "size": 7999728.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "EM7WXLXWM5RHNCADCXIRLJSVGLIM5SY6HUQL2KY",
+  "type": {
+   "content_type": "",
+   "id": "file",
+   "str": "opus"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "QAGLWIE72I6REIRNZ7WUZZPFZYFR5ZE6H7EXNTY",
+    "flags": [
+     "passive",
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer15"
+   }
+  }
+ },
+ {
+  "connection": 131072000.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "LXFBUSWCMOPJU25O264M2PZOIWSOJV6RPUAQUIA",
+  "name": "21 - Portishead & The Gentle People - Glory Box.mp3",
+  "path": "/MUSIC/LOUNGE-CHILL/Cafe Del Mar - Discographie/2021 - Cafe´ Del Mar - The Evolution of Chill - Part 1/21 - Portishead & The Gentle People - Glory Box.mp3",
+  "relevance": 0.7187603305785124,
+  "size": 6980913.0,
+  "slots": {
+   "free": 9,
+   "str": "9/10",
+   "total": 10
+  },
+  "time": 0.0,
+  "tth": "LXFBUSWCMOPJU25O264M2PZOIWSOJV6RPUAQUIA",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "NZG2LPUQ3PPDBYJXWQDRUTFWNLJRKNTAVHZSTFI",
+    "flags": [
+     "away",
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer24"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "PQMW6EVPRPSCLLXCNR7KLW7J52YDOPI7ZLDSIWI",
+  "name": "11-Glory Box.mp3",
+  "path": "/Музыка/!_НЕ РАЗОБРАНО/Portishead/Sound/01-Portishead - Dummy (1994)/11-Glory Box.mp3",
+  "relevance": 0.6806547025589897,
+  "size": 7294754.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "PQMW6EVPRPSCLLXCNR7KLW7J52YDOPI7ZLDSIWI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "3U6YDNZBGAWWLZU6S75ZOKM362AT5SSRLGVIFIQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer25"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "OAAMYR77A3J5PC2YBN5UDAJHJFFVLOBCI4XVNPY",
+  "name": "11-Glory Box.mp3",
+  "path": "/Music/Portishead/01-Portishead - Dummy (1994)/11-Glory Box.mp3",
+  "relevance": 0.6806547025589897,
+  "size": 7298911.0,
+  "slots": {
+   "free": 7,
+   "str": "7/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "OAAMYR77A3J5PC2YBN5UDAJHJFFVLOBCI4XVNPY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "EJX7OB3HX7ELKYFAYGMYWGQX3LVVS3PP6XQFQBI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer26"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "XGYU534YTKNL6RPX74774A3QL4YMAQ57QHZCLAI",
+  "name": "11-Glory Box.rtf",
+  "path": "/Музыка/!_НЕ РАЗОБРАНО/Portishead/Text/01-Portishead - Dummy (1994)/11-Glory Box.rtf",
+  "relevance": 0.6806547025589897,
+  "size": 1229.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "XGYU534YTKNL6RPX74774A3QL4YMAQ57QHZCLAI",
+  "type": {
+   "content_type": "document",
+   "id": "file",
+   "str": "rtf"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "3U6YDNZBGAWWLZU6S75ZOKM362AT5SSRLGVIFIQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer25"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "RLST37OPYXIGDM5V7RZCY5AAJNIOZLRSKQPQ4NQ",
+  "name": "19-Glory Box (Mudflap Mix).mp3",
+  "path": "/Music/Portishead/04-Portishead - Melody Nelson/19-Glory Box (Mudflap Mix).mp3",
+  "relevance": 0.6804331450094162,
+  "size": 7739854.0,
+  "slots": {
+   "free": 7,
+   "str": "7/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "RLST37OPYXIGDM5V7RZCY5AAJNIOZLRSKQPQ4NQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "EJX7OB3HX7ELKYFAYGMYWGQX3LVVS3PP6XQFQBI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer26"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "HGZBDR2G5WI2L3B2LWQ73LZWPNRZFBBHFVVOZ6Y",
+  "name": "07-Glory Box (Edit).mp3",
+  "path": "/Музыка/!_НЕ РАЗОБРАНО/Portishead/Sound/04-Portishead - Melody Nelson/07-Glory Box (Edit).mp3",
+  "relevance": 0.6804331450094162,
+  "size": 5104203.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "HGZBDR2G5WI2L3B2LWQ73LZWPNRZFBBHFVVOZ6Y",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "3U6YDNZBGAWWLZU6S75ZOKM362AT5SSRLGVIFIQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer25"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "4H6RU5KV25L7PNYABV4XWG3ABGAKTAKI6LL3MKY",
+  "name": "07-Glory Box (Edit).mp3",
+  "path": "/Music/Portishead/04-Portishead - Melody Nelson/07-Glory Box (Edit).mp3",
+  "relevance": 0.6804331450094162,
+  "size": 5104203.0,
+  "slots": {
+   "free": 7,
+   "str": "7/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "4H6RU5KV25L7PNYABV4XWG3ABGAKTAKI6LL3MKY",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "EJX7OB3HX7ELKYFAYGMYWGQX3LVVS3PP6XQFQBI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer26"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "DS3GLCTJ7ZPYD5GSLERE7AL7SSSVUI63RKIPU3A",
+  "name": "19-Glory Box (Mudflap Mix).mp3",
+  "path": "/Музыка/!_НЕ РАЗОБРАНО/Portishead/Sound/04-Portishead - Melody Nelson/19-Glory Box (Mudflap Mix).mp3",
+  "relevance": 0.6804331450094162,
+  "size": 7739854.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "DS3GLCTJ7ZPYD5GSLERE7AL7SSSVUI63RKIPU3A",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "3U6YDNZBGAWWLZU6S75ZOKM362AT5SSRLGVIFIQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer25"
+   }
+  }
+ },
+ {
+  "connection": 6553600.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "J4GRXYFXSFAMMDTDFD3QGQK2IIJC4CHY4YRHEVQ",
+  "name": "08-Glory Box.mp3",
+  "path": "/Музыка/!_НЕ РАЗОБРАНО/Portishead/Sound/03-Portishead - Roseland NYC Live (1998)/08-Glory Box.mp3",
+  "relevance": 0.6790044808104422,
+  "size": 8094739.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "J4GRXYFXSFAMMDTDFD3QGQK2IIJC4CHY4YRHEVQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "3U6YDNZBGAWWLZU6S75ZOKM362AT5SSRLGVIFIQ",
+    "flags": [
+     "passive",
+     "nmdc"
+    ],
+    "hub_names": "Hub Five",
+    "hub_url": "nmdcs://hub-five.example:411",
+    "hub_urls": [
+     "nmdcs://hub-five.example:411"
+    ],
+    "nicks": "peer25"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "MJMCH3TP5FJWLUND2YLCP44GSORN6HJ4XA6BSGQ",
+  "name": "08-Glory Box.mp3",
+  "path": "/Music/Portishead/03-Portishead - Roseland NYC Live (1998)/08-Glory Box.mp3",
+  "relevance": 0.6790044808104422,
+  "size": 8098885.0,
+  "slots": {
+   "free": 7,
+   "str": "7/8",
+   "total": 8
+  },
+  "time": 0.0,
+  "tth": "MJMCH3TP5FJWLUND2YLCP44GSORN6HJ4XA6BSGQ",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "EJX7OB3HX7ELKYFAYGMYWGQX3LVVS3PP6XQFQBI",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub Three",
+    "hub_url": "nmdcs://hub-three.example:411",
+    "hub_urls": [
+     "nmdcs://hub-three.example:411"
+    ],
+    "nicks": "peer26"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "R5RBCQJM4DA6PXJ6C6RRFF7MUZR7YWLUXBF4RRI",
+  "name": "1995 - Glory Box (Portishead Cover Live Chile).mpg",
+  "path": "/VIDEO CLIPS/Faith No More/1995 - Glory Box (Portishead Cover Live Chile).mpg",
+  "relevance": 0.07363636363636362,
+  "size": 22870484.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "R5RBCQJM4DA6PXJ6C6RRFF7MUZR7YWLUXBF4RRI",
+  "type": {
+   "content_type": "video",
+   "id": "file",
+   "str": "mpg"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "MPEP6XS4YTXAQGFJY5HZ4PG6OSTTWKV4PQMVRGQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer27"
+   }
+  }
+ },
+ {
+  "connection": 13107200.0,
+  "dupe": null,
+  "hits": 1.0,
+  "id": "PT5OQBMDRNTTSJWO74PCC3HM75F3PVOH76FNAHI",
+  "name": "14. Glory Box (Portishead).mp3",
+  "path": "/Music1/F/Faith No More/Lives & Bootlegs/1995 - Hard Rock Caca/14. Glory Box (Portishead).mp3",
+  "relevance": 0.07363636363636362,
+  "size": 2379309.0,
+  "slots": {
+   "free": 0,
+   "str": "0/255",
+   "total": 255
+  },
+  "time": 0.0,
+  "tth": "PT5OQBMDRNTTSJWO74PCC3HM75F3PVOH76FNAHI",
+  "type": {
+   "content_type": "audio",
+   "id": "file",
+   "str": "mp3"
+  },
+  "users": {
+   "count": 1,
+   "user": {
+    "cid": "MPEP6XS4YTXAQGFJY5HZ4PG6OSTTWKV4PQMVRGQ",
+    "flags": [
+     "nmdc"
+    ],
+    "hub_names": "Hub One",
+    "hub_url": "nmdcs://hub-one.example:411",
+    "hub_urls": [
+     "nmdcs://hub-one.example:411"
+    ],
+    "nicks": "peer27"
+   }
+  }
+ }
+]

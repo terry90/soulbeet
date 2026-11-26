@@ -53,6 +53,7 @@ down() {
   free_port 5050
   free_port 5063
   free_port 5064
+  free_port 5065
   free_port 5070
   echo "stack stopped"
 }
@@ -82,6 +83,7 @@ up() {
   free_port 5050
   free_port 5063
   free_port 5064
+  free_port 5065
   free_port 5070
 
   mkdir -p "$PID_DIR" "$LOG_DIR"
@@ -140,7 +142,7 @@ up() {
   wait_for "http://127.0.0.1:9766/" "soulbeet-user90"
 
   echo "stack up: app http://127.0.0.1:9765, issue #90 app http://127.0.0.1:9766,"
-  echo "slskd stub :5030, mb stub :5050, GD Studio stub :5063, archive.org stub :5064, oidc stub :5070"
+  echo "slskd stub :5030, mb stub :5050, GD Studio stub :5063, archive.org stub :5064, AirDC++ stub :5065, oidc stub :5070"
   echo "logs: $LOG_DIR"
 }
 

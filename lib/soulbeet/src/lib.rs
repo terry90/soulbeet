@@ -1,3 +1,4 @@
+pub mod airdcpp;
 pub mod archive;
 pub mod audio;
 pub mod backend_error;

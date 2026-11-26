@@ -1,0 +1,15 @@
+{
+ "auto_follow_redirects": false,
+ "connection_mode_v4": 2,
+ "connection_mode_v6": -1,
+ "description": "",
+ "dont_download_queued": false,
+ "dont_download_shared": false,
+ "download_directory": "/downloads/",
+ "email": "",
+ "finished_remove_exit": false,
+ "language_file": "",
+ "min_search_interval": 60,
+ "nick": "quietpeer",
+ "use_partial_sharing": false
+}

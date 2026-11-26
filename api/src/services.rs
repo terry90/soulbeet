@@ -13,6 +13,7 @@ use shared::failure::{
 };
 #[cfg(feature = "server")]
 use soulbeet::{
+    airdcpp::{AirdcppBackend, AirdcppError, Missing},
     archive::{ArchiveBackend, EngineCell, EngineSettings},
     beets::{BeetsImporter, BeetsSettings},
     gdstudio::GdStudioBackend,
@@ -36,6 +37,7 @@ pub mod downloaders {
     pub const ARCHIVE: &str = shared::archive::BACKEND_ID;
     pub const YTDLP: &str = shared::ytdlp::BACKEND_ID;
     pub const GDSTUDIO: &str = shared::gdstudio::BACKEND_ID;
+    pub const AIRDCPP: &str = shared::airdcpp::BACKEND_ID;
 }
 
 pub mod importers {
@@ -215,6 +217,12 @@ async fn init_download_backend(id: &str) -> Result<Arc<dyn DownloadBackend>, Bac
         downloaders::GDSTUDIO => {
             gdstudio_backend(&soulbeet::gdstudio::ENGINE, gdstudio_settings().await?).await
         }
+        downloaders::AIRDCPP => {
+            let connection = airdcpp_connection().await?;
+            let backend =
+                airdcpp_backend(&soulbeet::airdcpp::ENGINE, airdcpp_settings(), connection).await?;
+            Ok(backend)
+        }
         _ => Err(BackendLookupError::Unknown(id.to_string())),
     }
 }
@@ -287,6 +295,73 @@ async fn gdstudio_backend(
     let engine =
         (cell.get_or_start(settings).await).map_err(|e| BackendLookupError::Backend(e.into()))?;
     Ok(Arc::new(GdStudioBackend::new(engine)))
+}
+
+/// What the Direct Connect engine runs on: this install's downloads folder and the transfer
+/// book.
+#[cfg(feature = "server")]
+fn airdcpp_settings() -> soulbeet::airdcpp::EngineSettings {
+    soulbeet::airdcpp::EngineSettings {
+        download_path: crate::config::CONFIG.download_path().clone(),
+        book: transfer_book(),
+    }
+}
+
+/// How Soulful signs in to the AirDC++ sidecar, as an admin stored it.
+#[cfg(feature = "server")]
+pub(crate) async fn airdcpp_connection() -> Result<soulbeet::airdcpp::Connection, BackendLookupError>
+{
+    airdcpp_connection_in(&crate::db::DB, crate::secret_key::current()).await
+}
+
+#[cfg(feature = "server")]
+pub(crate) async fn airdcpp_connection_in(
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+) -> Result<soulbeet::airdcpp::Connection, BackendLookupError> {
+    let read = |name| async move {
+        AppConfig::get_in(db, name)
+            .await
+            .map_err(BackendLookupError::Settings)
+    };
+    let url = read(keys::AIRDCPP_URL).await?;
+    let username = read(keys::AIRDCPP_USERNAME).await?;
+    let password = match read(keys::AIRDCPP_PASSWORD).await? {
+        Some(stored) => Some(crate::crypto::decrypt(key, &stored).map_err(|_| {
+            BackendLookupError::Backend(
+                AirdcppError::NotConfigured(Missing::PasswordUnreadable).into(),
+            )
+        })?),
+        None => None,
+    };
+    soulbeet::airdcpp::Connection::from_settings(url, username, password)
+        .map_err(|e| BackendLookupError::Backend(e.into()))
+}
+
+/// A handle on the engine of `cell`, made on the first build, for the sidecar `connection`
+/// names: a handle built after a settings save asks with the new ones.
+#[cfg(feature = "server")]
+async fn airdcpp_backend(
+    cell: &soulbeet::airdcpp::EngineCell,
+    settings: soulbeet::airdcpp::EngineSettings,
+    connection: soulbeet::airdcpp::Connection,
+) -> Result<Arc<AirdcppBackend>, BackendLookupError> {
+    let sidecar = soulbeet::airdcpp::Sidecar::new(connection)
+        .map_err(|e| BackendLookupError::Backend(e.into()))?;
+    let engine = cell.get_or_start(settings).await;
+    Ok(Arc::new(AirdcppBackend::new(engine, sidecar)))
+}
+
+/// What a check of the sidecar the stored settings name finds, whether Direct Connect is on or
+/// not, so an admin can try the settings before turning it on.
+#[cfg(feature = "server")]
+pub async fn check_airdcpp() -> Result<shared::airdcpp::SidecarReport, Failure> {
+    let failed = |e: BackendLookupError| e.failure(Stage::Input, e.to_string());
+    let connection = airdcpp_connection().await.map_err(failed)?;
+    let backend = airdcpp_backend(&soulbeet::airdcpp::ENGINE, airdcpp_settings(), connection)
+        .await
+        .map_err(failed)?;
+    Ok(backend.check().await)
 }
 
 /// The backend `download_backend(None)` gives.
@@ -420,6 +495,14 @@ pub(crate) async fn stop_backend(id: &str) {
             if let Err(e) = cleared {
                 tracing::warn!("Could not delete the partial files GD Studio left: {e}");
             }
+        }
+        downloaders::AIRDCPP => {
+            // Without usable settings the unfinished bundles stay recorded for the next stop.
+            let sidecar = (airdcpp_connection().await.ok())
+                .and_then(|c| soulbeet::airdcpp::Sidecar::new(c).ok());
+            (soulbeet::airdcpp::ENGINE)
+                .stop(airdcpp_settings(), sidecar.as_ref())
+                .await;
         }
         _ => {}
     }
@@ -1564,6 +1647,218 @@ mod tests {
         );
         let spec = shared::download::SearchSpec::of(None, vec![]);
         assert!(backend.start_search(&spec).await.is_err());
+    }
+
+    /// The bundle removals a double got: each one's path and body.
+    type Removals = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// An AirDC++ sidecar as the stop asks it: `bundles` listed, no transfer, and each bundle
+    /// removal answered 204 and recorded with its body.
+    fn airdcpp_double(bundles: serde_json::Value) -> (String, Removals) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let removed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = removed.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut length = 0;
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 2 {
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    line.clear();
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let target = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let (status, answer) = if target.ends_with("/remove") {
+                    let body = String::from_utf8(body).unwrap();
+                    recorded.lock().unwrap().push((target, body));
+                    ("204 No Content", String::new())
+                } else if target.starts_with("/api/v1/queue/bundles/") {
+                    ("200 OK", bundles.to_string())
+                } else {
+                    ("200 OK", "[]".to_string())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    answer.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        (base, removed)
+    }
+
+    /// A Direct Connect book entry bound to the bundle `id`, whose file is `target` in AirDC++.
+    fn airdcpp_entry(id: u64, target: &str) -> soulbeet::BookEntry {
+        soulbeet::BookEntry {
+            backend: downloaders::AIRDCPP.into(),
+            key: format!("key-{id}"),
+            transfer_id: Some(id.to_string()),
+            file_id: None,
+            source: "HDHIYJMY23IYPTC75NB6OHBKAU3UTCU5HRMXYPQ@nmdcs://hub-one.example:411".into(),
+            item: "/music/Slint/1991 – Spiderland/04 - Washer.flac".into(),
+            request: "r1".into(),
+            target: "Spiderland [ab12cd34]".into(),
+            data: serde_json::json!({"name": "04 - Washer.flac", "sidecar_target": target,
+                "size": 10, "tth": "V55EZ7R7EDJ7JTMFVF7DQJRVYB5P3UP65DKBSZY"}),
+            created_at: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    #[tokio::test]
+    async fn turning_direct_connect_off_removes_each_unfinished_bundle_and_no_finished_file() {
+        use soulbeet::TransferBook;
+        let bundle = |id: u64, target: &str, state: &str| {
+            serde_json::json!({"id": id, "target": target, "downloaded_bytes": 0, "speed": 0,
+                "status": {"id": state, "str": ""}, "sources": {"online": 1}})
+        };
+        let (running, done) = (
+            "/downloads/Spiderland [ab12cd34]/04 - Washer.flac",
+            "/downloads/Spiderland [ab12cd34]/05 - For Dinner....flac",
+        );
+        let (base, removed) = airdcpp_double(serde_json::json!([
+            bundle(1, running, "queued"),
+            bundle(2, done, "completed"),
+        ]));
+        let root = tempfile::tempdir().unwrap();
+        let db = test_db::migrated().await;
+        let book = Arc::new(crate::ledger::transfer_book::SqliteTransferBook::new(
+            db.clone(),
+        ));
+        book.put(&airdcpp_entry(1, running)).await.unwrap();
+        book.put(&airdcpp_entry(2, done)).await.unwrap();
+        let settings = soulbeet::airdcpp::EngineSettings {
+            download_path: root.path().to_path_buf(),
+            book: book.clone(),
+        };
+        let connection = soulbeet::airdcpp::Connection {
+            url: base,
+            username: "soulbeet".into(),
+            password: "pw".into(),
+        };
+        let cell = soulbeet::airdcpp::EngineCell::new();
+        let backend = airdcpp_backend(&cell, settings.clone(), connection.clone())
+            .await
+            .unwrap();
+        let sidecar = soulbeet::airdcpp::Sidecar::new(connection).unwrap();
+        cell.stop(settings, Some(&sidecar)).await;
+
+        assert_eq!(
+            *removed.lock().unwrap(),
+            [(
+                "/api/v1/queue/bundles/1/remove".to_string(),
+                r#"{"remove_finished":false}"#.to_string()
+            )]
+        );
+        let kept: Vec<String> = book
+            .all(downloaders::AIRDCPP)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(kept, ["key-2"]);
+        let spec = shared::download::SearchSpec::of(None, vec![]);
+        let refused = backend.start_search(&spec).await.unwrap_err();
+        assert_eq!(
+            refused.failure(Stage::SourceSearch, "m").code,
+            FailureCode::BackendNotConfigured
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_connect_file_whose_queue_answer_was_lost_is_bound_to_its_bundle_in_sqlite() {
+        use soulbeet::{DownloadBackend, TransferBook};
+        let target = "/downloads/Spiderland [ab12cd34]/04 - Washer.flac";
+        let (base, _) = airdcpp_double(serde_json::json!([{"id": 7, "target": target,
+            "downloaded_bytes": 0, "speed": 0, "status": {"id": "queued", "str": ""},
+            "sources": {"online": 1}}]));
+        let db = test_db::migrated().await;
+        let book = Arc::new(crate::ledger::transfer_book::SqliteTransferBook::new(
+            db.clone(),
+        ));
+        let mut pending = airdcpp_entry(7, target);
+        pending.transfer_id = None;
+        book.put(&pending).await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let settings = soulbeet::airdcpp::EngineSettings {
+            download_path: root.path().to_path_buf(),
+            book: book.clone(),
+        };
+        let connection = soulbeet::airdcpp::Connection {
+            url: base,
+            username: "soulbeet".into(),
+            password: "pw".into(),
+        };
+        let cell = soulbeet::airdcpp::EngineCell::new();
+        let backend = airdcpp_backend(&cell, settings, connection).await.unwrap();
+
+        let rows = backend
+            .get_downloads_for(std::slice::from_ref(&pending.source))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "7");
+        let bound = book
+            .by_transfer(downloaders::AIRDCPP, "7")
+            .await
+            .unwrap()
+            .expect("bound in the database");
+        assert_eq!(bound.key, pending.key);
+        // The unique index keeps a second entry off the same bundle.
+        let mut other = airdcpp_entry(8, target);
+        other.transfer_id = None;
+        book.put(&other).await.unwrap();
+        assert!(book
+            .bind(downloaders::AIRDCPP, &other.key, "7", None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_file_airdcpp_is_still_writing_is_neither_found_nor_imported() {
+        use crate::server_fns::download::utils::{file_id, resolve_in_destination};
+        let root = tempfile::tempdir().unwrap();
+        let destination = "Spiderland [ab12cd34]";
+        let folder = root.path().join(destination);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("04 - Washer.flac.dctmp"), b"fLaC partial").unwrap();
+        let remote = "/music/Slint/1991 – Spiderland/04 - Washer.flac";
+        assert!(resolve_in_destination(remote, root.path(), destination, &HashSet::new()).is_err());
+        assert_eq!(
+            soulbeet::audio::count_audio_files(&[folder.as_path()]).await,
+            0
+        );
+
+        // The names the backend queues under, the plain one and a ticks copy, are each found.
+        let copy = shared::download::ticks_copy("04 - Washer.flac", 638_999_999_999_999_999);
+        std::fs::write(folder.join("04 - Washer.flac"), b"one").unwrap();
+        std::fs::write(folder.join(&copy), b"two").unwrap();
+        let mut claimed = HashSet::new();
+        let mut found = Vec::new();
+        for _ in 0..2 {
+            let path = resolve_in_destination(remote, root.path(), destination, &claimed).unwrap();
+            claimed.insert(file_id(&path).unwrap());
+            found.push(std::fs::read(&path).unwrap());
+        }
+        assert_eq!(found, [b"one".to_vec(), b"two".to_vec()]);
+        assert_eq!(
+            soulbeet::audio::count_audio_files(&[folder.as_path()]).await,
+            2
+        );
     }
 
     #[tokio::test]

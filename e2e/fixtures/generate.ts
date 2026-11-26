@@ -11,6 +11,7 @@ import { copyFileSync, cpSync, mkdirSync, existsSync, readFileSync, writeFileSyn
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'yaml';
+import { airdcppAudioFiles } from './airdcpp-dataset.js';
 import { archiveAudioFiles } from './archive-dataset.js';
 import { gdstudioAudioFiles } from './gdstudio-dataset.js';
 import { allAudioFiles, audioFileName, taggedRecording } from './dataset.js';
@@ -28,7 +29,12 @@ const mbHost = process.env.E2E_MB_HOST ?? '127.0.0.1:5050';
 function generateAudio(): void {
   mkdirSync(audioDir, { recursive: true });
 
-  for (const share of [...allAudioFiles(), ...archiveAudioFiles(), ...gdstudioAudioFiles()]) {
+  for (const share of [
+    ...allAudioFiles(),
+    ...archiveAudioFiles(),
+    ...gdstudioAudioFiles(),
+    ...airdcppAudioFiles(),
+  ]) {
     const target = join(audioDir, audioFileName(share));
     if (existsSync(target)) {
       continue;
