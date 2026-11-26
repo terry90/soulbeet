@@ -50,7 +50,7 @@ use crate::ledger::{
 };
 use crate::models::archival_upgrade::NewFastAcquisition;
 use crate::models::folder::Folder;
-use crate::models::user_settings::UserSettings;
+use crate::models::user_settings::{LossyFallback, UserSettings};
 use crate::server_fns::download::enqueue::{already_running, not_enqueued_failure};
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{
@@ -259,20 +259,17 @@ pub(crate) async fn acquire_and_play_in(
 
     // 2. Resolve target library folder and usable download backends.
     let folder = resolve_target_folder_in(db, ctx, req.folder_id.as_deref()).await?;
-    let (first_usable, rest_usable) = sources::usable_from(backends, enabled_meta).await?;
-    let mut usable = Vec::with_capacity(1 + rest_usable.len());
-    usable.push(first_usable);
-    usable.extend(rest_usable);
-
+    let usable = sources::usable_from(backends, enabled_meta, LossyFallback::Auto).await?;
     let lossy_only_ids: Vec<String> = usable
+        .last_resort
         .iter()
-        .filter(|(id, _)| {
-            meta_for(id, enabled_meta).is_some_and(|m| m.delivery == Delivery::LossyOnly)
-        })
         .map(|(id, _)| id.clone())
         .collect();
+    let mut all_usable = Vec::with_capacity(usable.primary.len() + usable.last_resort.len());
+    all_usable.extend(usable.primary);
+    all_usable.extend(usable.last_resort);
 
-    let (fast_tier, fallback_tier) = partition_backends(usable, enabled_meta, req.prefer_fast);
+    let (fast_tier, fallback_tier) = partition_backends(all_usable, enabled_meta, req.prefer_fast);
     let backend_ids: Vec<String> = fast_tier
         .iter()
         .chain(fallback_tier.iter())
@@ -665,7 +662,7 @@ async fn run_acquire_and_play_pipeline(
                 request_id, first_failure.message
             );
 
-            let (fb_first, fb_rest) = fallback_tier.split_first().expect("non-empty fallback_tier");
+            let fb_first = fallback_tier.first().expect("non-empty fallback_tier");
             emit_stage(
                 &user,
                 &request_id,
@@ -681,43 +678,23 @@ async fn run_acquire_and_play_pipeline(
             )
             .await;
 
-            let mut fb_groups =
-                match sources::search_ranked(fb_first, fb_rest, None, std::slice::from_ref(&track))
-                    .await
-                {
-                    Ok(g) if !g.is_empty() => g,
-                    Ok(_) => {
-                        emit_stage(
-                            &user,
-                            &request_id,
-                            &artist,
-                            &title,
-                            mbid.as_deref(),
-                            AcquireAndPlayStage::Failed {
-                                failure: first_failure,
-                            },
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(fb_err) => {
-                        emit_stage(
-                            &user,
-                            &request_id,
-                            &artist,
-                            &title,
-                            mbid.as_deref(),
-                            AcquireAndPlayStage::Failed { failure: fb_err },
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            fb_groups.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let fb_found =
+                sources::search_tier(&fallback_tier, None, std::slice::from_ref(&track)).await;
+            if fb_found.groups.is_empty() {
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::Failed {
+                        failure: fb_found.failure(),
+                    },
+                )
+                .await;
+                return;
+            }
+            let mut fb_groups = fb_found.groups;
 
             let fb_job_id = uuid::Uuid::new_v4().to_string();
             let fb_batch_id = uuid::Uuid::new_v4().to_string();
@@ -896,54 +873,37 @@ async fn search_tiered(
     fallback_tier: &[Searched],
     track: &Track,
 ) -> Result<(Vec<DownloadableGroup>, bool), Failure> {
-    let mut combined = Vec::new();
-    let mut last_err = None;
-
-    if let Some((first, rest)) = fast_tier.split_first() {
-        match sources::search_ranked(first, rest, None, std::slice::from_ref(track)).await {
-            Ok(groups) => {
-                if groups
-                    .first()
-                    .is_some_and(|g| g.score >= AUTO_SELECT_SCORE_THRESHOLD)
-                {
-                    return Ok((groups, false));
-                }
-                combined.extend(groups);
-            }
-            Err(failure) => last_err = Some(failure),
+    let tracks = std::slice::from_ref(track);
+    let mut found = if fast_tier.is_empty() {
+        sources::Found::default()
+    } else {
+        let fast = sources::search_tier(fast_tier, None, tracks).await;
+        if fast
+            .groups
+            .first()
+            .is_some_and(|g| g.score >= AUTO_SELECT_SCORE_THRESHOLD)
+        {
+            return Ok((fast.groups, false));
         }
-    }
+        fast
+    };
 
     let mut searched_fallback = false;
-    if let Some((first, rest)) = fallback_tier.split_first() {
+    if !fallback_tier.is_empty() {
         searched_fallback = true;
-        match sources::search_ranked(first, rest, None, std::slice::from_ref(track)).await {
-            Ok(groups) => combined.extend(groups),
-            Err(failure) => {
-                if combined.is_empty() {
-                    last_err = Some(failure);
-                }
-            }
-        }
+        found = found.then(sources::search_tier(fallback_tier, None, tracks).await);
     }
 
-    if combined.is_empty() {
-        return Err(last_err.unwrap_or_else(|| {
-            Failure::new(
-                FailureCode::SearchNoResults,
-                Stage::SourceSearch,
-                RetryAdvice::OtherQuery,
-                "No results found",
-            )
-        }));
+    if found.groups.is_empty() {
+        return Err(found.failure());
     }
 
-    combined.sort_by(|a, b| {
+    found.groups.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok((combined, searched_fallback))
+    Ok((found.groups, searched_fallback))
 }
 
 /// Context needed by the stage relay loop.

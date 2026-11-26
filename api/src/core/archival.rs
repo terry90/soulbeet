@@ -649,37 +649,37 @@ pub async fn process_next_upgrade_in(
     let query = DownloadQuery::new(vec![track.clone()]).backend(archival_backend_id);
     let searched = (archival_backend_id.to_string(), backend.clone());
 
-    let groups = match sources::search_ranked(&searched, &[], None, &[track]).await {
-        Ok(g) => g,
-        Err(failure) => {
-            let next_attempts = upgrade.attempts + 1;
-            let next_status = if next_attempts >= MAX_UPGRADE_ATTEMPTS {
-                ArchivalUpgradeStatus::Failed
-            } else {
-                ArchivalUpgradeStatus::Queued
-            };
-            let _ = ArchivalUpgradeRow::mark_status_in(
-                db,
-                &upgrade.id,
-                next_status,
-                None,
-                1,
-                Some(&failure.message),
-            )
-            .await;
-            return Ok(if next_status == ArchivalUpgradeStatus::Failed {
-                WorkerTickOutcome::Failed {
-                    upgrade_id: upgrade.id,
-                    reason: failure.message,
-                }
-            } else {
-                WorkerTickOutcome::Deferred {
-                    upgrade_id: upgrade.id,
-                    reason: failure.message,
-                }
-            });
-        }
-    };
+    let found = sources::search_tier(std::slice::from_ref(&searched), None, &[track]).await;
+    if found.groups.is_empty() {
+        let failure = found.failure();
+        let next_attempts = upgrade.attempts + 1;
+        let next_status = if next_attempts >= MAX_UPGRADE_ATTEMPTS {
+            ArchivalUpgradeStatus::Failed
+        } else {
+            ArchivalUpgradeStatus::Queued
+        };
+        let _ = ArchivalUpgradeRow::mark_status_in(
+            db,
+            &upgrade.id,
+            next_status,
+            None,
+            1,
+            Some(&failure.message),
+        )
+        .await;
+        return Ok(if next_status == ArchivalUpgradeStatus::Failed {
+            WorkerTickOutcome::Failed {
+                upgrade_id: upgrade.id,
+                reason: failure.message,
+            }
+        } else {
+            WorkerTickOutcome::Deferred {
+                upgrade_id: upgrade.id,
+                reason: failure.message,
+            }
+        });
+    }
+    let groups = found.groups;
 
     let Some((picked, alternates)) = pick_lossless_group(groups) else {
         let reason = "No lossless (FLAC) candidate met the quality threshold".to_string();
