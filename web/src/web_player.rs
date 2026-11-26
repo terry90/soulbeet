@@ -1437,6 +1437,8 @@ pub fn WebStudioProvider(children: Element) -> Element {
         };
         audio.set_preload("auto");
 
+        let runtime = dioxus::core::Runtime::current();
+        let scope_id = dioxus::core::current_scope_id();
         let load_gen = Rc::new(Cell::new(0u64));
         let loaded_track_id = Rc::new(RefCell::new(None::<String>));
         let pending_seek_secs = Rc::new(Cell::new(None::<f64>));
@@ -1448,27 +1450,35 @@ pub fn WebStudioProvider(children: Element) -> Element {
             let audio_ref = audio.clone();
             let loaded_ref = Rc::clone(&loaded_track_id);
             let scrobble_ref = Rc::clone(&scrobble);
+            let rt = Rc::clone(&runtime);
             let boot_sig = bootstrap;
             let mut pos_sig = position_secs;
             let mut dur_sig = duration_secs;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_none() {
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded {
                     return;
                 }
                 let ct = audio_ref.current_time();
                 let dur = audio_ref.duration();
-                if ct.is_finite() {
-                    pos_sig.set(ct.max(0.0));
-                }
-                if dur.is_finite() && dur > 0.0 {
-                    dur_sig.set(dur);
-                }
-                if let Some(song_id) = scrobble_ref.borrow_mut().on_timeupdate(ct, dur) {
-                    if let Some(nav) = boot_sig.peek().as_ref().and_then(|b| b.navidrome.clone()) {
-                        spawn(async move {
-                            crate::navidrome_web::send_scrobble(&nav, &song_id, true).await;
-                        });
+                let scrobble_song_id = scrobble_ref.borrow_mut().on_timeupdate(ct, dur);
+
+                let nav_for_scrobble = rt.in_scope(scope_id, || {
+                    if ct.is_finite() {
+                        pos_sig.set(ct.max(0.0));
                     }
+                    if dur.is_finite() && dur > 0.0 {
+                        dur_sig.set(dur);
+                    }
+                    scrobble_song_id.as_ref().and_then(|_| {
+                        boot_sig.peek().as_ref().and_then(|b| b.navidrome.clone())
+                    })
+                });
+
+                if let (Some(song_id), Some(nav)) = (scrobble_song_id, nav_for_scrobble) {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        crate::navidrome_web::send_scrobble(&nav, &song_id, true).await;
+                    });
                 }
             });
             let _ = audio
@@ -1481,25 +1491,32 @@ pub fn WebStudioProvider(children: Element) -> Element {
             let audio_ref = audio.clone();
             let loaded_ref = Rc::clone(&loaded_track_id);
             let pending_seek = Rc::clone(&pending_seek_secs);
+            let rt = Rc::clone(&runtime);
             let mut pos_sig = position_secs;
             let mut dur_sig = duration_secs;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_none() {
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded {
                     return;
                 }
                 let dur = audio_ref.duration();
-                if dur.is_finite() && dur > 0.0 {
-                    dur_sig.set(dur);
-                }
-                if let Some(target_secs) = pending_seek.take() {
+                let applied_seek = pending_seek.take().map(|target_secs| {
                     let clamped = if dur.is_finite() && dur > 0.0 {
                         target_secs.clamp(0.0, dur)
                     } else {
                         target_secs.max(0.0)
                     };
                     audio_ref.set_current_time(clamped);
-                    pos_sig.set(clamped);
-                }
+                    clamped
+                });
+                rt.in_scope(scope_id, || {
+                    if dur.is_finite() && dur > 0.0 {
+                        dur_sig.set(dur);
+                    }
+                    if let Some(clamped) = applied_seek {
+                        pos_sig.set(clamped);
+                    }
+                });
             });
             let _ = audio
                 .add_event_listener_with_callback("loadedmetadata", cb.as_ref().unchecked_ref());
@@ -1510,19 +1527,28 @@ pub fn WebStudioProvider(children: Element) -> Element {
         {
             let loaded_ref = Rc::clone(&loaded_track_id);
             let scrobble_ref = Rc::clone(&scrobble);
+            let rt = Rc::clone(&runtime);
             let mut state_sig = player_state;
             let boot_sig = bootstrap;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_none() {
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded {
                     return;
                 }
-                state_sig.write().status = PlaybackStatus::Playing;
-                if let Some(song_id) = scrobble_ref.borrow_mut().on_playing() {
-                    if let Some(nav) = boot_sig.peek().as_ref().and_then(|b| b.navidrome.clone()) {
-                        spawn(async move {
-                            crate::navidrome_web::send_scrobble(&nav, &song_id, false).await;
-                        });
-                    }
+                // Release RefMut immediately before touching any Dioxus signal or async task.
+                let now_playing_song_id = scrobble_ref.borrow_mut().on_playing();
+
+                let nav_for_scrobble = rt.in_scope(scope_id, || {
+                    state_sig.write().status = PlaybackStatus::Playing;
+                    now_playing_song_id.as_ref().and_then(|_| {
+                        boot_sig.peek().as_ref().and_then(|b| b.navidrome.clone())
+                    })
+                });
+
+                if let (Some(song_id), Some(nav)) = (now_playing_song_id, nav_for_scrobble) {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        crate::navidrome_web::send_scrobble(&nav, &song_id, false).await;
+                    });
                 }
             });
             let _ =
@@ -1533,11 +1559,18 @@ pub fn WebStudioProvider(children: Element) -> Element {
         // waiting -> Buffering
         {
             let loaded_ref = Rc::clone(&loaded_track_id);
+            let rt = Rc::clone(&runtime);
             let mut state_sig = player_state;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_some() && state_sig.peek().status.is_active() {
-                    state_sig.write().status = PlaybackStatus::Buffering;
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded {
+                    return;
                 }
+                rt.in_scope(scope_id, || {
+                    if state_sig.peek().status.is_active() {
+                        state_sig.write().status = PlaybackStatus::Buffering;
+                    }
+                });
             });
             let _ =
                 audio.add_event_listener_with_callback("waiting", cb.as_ref().unchecked_ref());
@@ -1548,14 +1581,18 @@ pub fn WebStudioProvider(children: Element) -> Element {
         {
             let audio_ref = audio.clone();
             let loaded_ref = Rc::clone(&loaded_track_id);
+            let rt = Rc::clone(&runtime);
             let mut state_sig = player_state;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_some()
-                    && !audio_ref.ended()
-                    && state_sig.peek().status == PlaybackStatus::Playing
-                {
-                    state_sig.write().status = PlaybackStatus::Paused;
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded || audio_ref.ended() {
+                    return;
                 }
+                rt.in_scope(scope_id, || {
+                    if state_sig.peek().status == PlaybackStatus::Playing {
+                        state_sig.write().status = PlaybackStatus::Paused;
+                    }
+                });
             });
             let _ = audio.add_event_listener_with_callback("pause", cb.as_ref().unchecked_ref());
             listeners.push(("pause", cb));
@@ -1565,9 +1602,11 @@ pub fn WebStudioProvider(children: Element) -> Element {
         {
             let audio_ref = audio.clone();
             let loaded_ref = Rc::clone(&loaded_track_id);
+            let rt = Rc::clone(&runtime);
             let mut state_sig = player_state;
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_none() || audio_ref.src().is_empty() {
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded || audio_ref.src().is_empty() {
                     return;
                 }
                 let msg = match audio_ref.error().map(|e| e.code()) {
@@ -1576,7 +1615,9 @@ pub fn WebStudioProvider(children: Element) -> Element {
                     Some(4) => "Unsupported audio source or unreachable Navidrome".to_string(),
                     _ => "Playback error".to_string(),
                 };
-                state_sig.write().status = PlaybackStatus::Error(msg);
+                rt.in_scope(scope_id, || {
+                    state_sig.write().status = PlaybackStatus::Error(msg);
+                });
             });
             let _ = audio.add_event_listener_with_callback("error", cb.as_ref().unchecked_ref());
             listeners.push(("error", cb));
@@ -1724,7 +1765,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         let _ = prev_track_id;
     });
 
-    // Attach `ended` listener with explicit Drop guard so it detaches cleanly on sign-out.
+    // Attach `ended` listener with explicit Drop guard and active Dioxus Runtime scope.
     #[cfg(feature = "web")]
     {
         let audio_for_ended = Rc::clone(&audio_handle);
@@ -1732,12 +1773,17 @@ pub fn WebStudioProvider(children: Element) -> Element {
             use wasm_bindgen::closure::Closure;
             use wasm_bindgen::JsCast;
             let engine = audio_for_ended.as_ref().as_ref()?;
+            let runtime = dioxus::core::Runtime::current();
+            let scope_id = dioxus::core::current_scope_id();
             let loaded_ref = Rc::clone(&engine.loaded_track_id);
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-                if loaded_ref.borrow().is_none() {
+                let is_loaded = loaded_ref.borrow().is_some();
+                if !is_loaded {
                     return;
                 }
-                dispatcher.call(PlayerCommand::TrackEnded);
+                runtime.in_scope(scope_id, || {
+                    dispatcher.call(PlayerCommand::TrackEnded);
+                });
             });
             let _ = engine
                 .audio
