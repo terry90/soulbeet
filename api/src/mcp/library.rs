@@ -107,10 +107,11 @@ async fn find_items(
 ) -> Result<CallToolResult, ToolError> {
     let (elements, refs, listing, start) = read_references(args)?;
     let navi = navidrome_of(state, caller, Stage::LibraryCheck, args).await?;
-    let resolver = FolderResolver::load_in(
+    let resolver = FolderResolver::load_for_in(
         &state.db,
         &caller.ctx.user_id,
         state.navidrome_music_path.as_deref(),
+        caller.has_admin_access(),
     )
     .await;
     let mut it = Items {

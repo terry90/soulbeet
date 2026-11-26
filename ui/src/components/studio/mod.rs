@@ -26,6 +26,7 @@ pub use lyrics::{
 pub use player_bar::StudioPlayerBar;
 pub use right_drawer::{DrawerTab, StudioRightDrawer};
 pub use shell::{
+    classify_local_playlist_category, classify_playlist_category, PlaylistCategory,
     SidebarPlaylistItem, StudioMobileNav, StudioNavSection, StudioSidebar, StudioTopBar,
 };
 pub use undo_queue::{PendingDropItem, PendingDropQueue};

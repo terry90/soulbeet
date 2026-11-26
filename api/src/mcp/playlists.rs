@@ -216,10 +216,11 @@ pub(crate) async fn get_playlist(
             let page = Page::read(&args, json!({"playlist_id": playlist_id}))?;
             args.finish()?;
             let navi = navidrome_of(state, caller, Stage::Playlist, &args).await?;
-            let resolver = FolderResolver::load_in(
+            let resolver = FolderResolver::load_for_in(
                 &state.db,
                 &caller.ctx.user_id,
                 state.navidrome_music_path.as_deref(),
+                caller.has_admin_access(),
             )
             .await;
             let (playlist, entries) =

@@ -23,19 +23,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.Explore
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.LibraryMusic
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -389,6 +390,7 @@ private fun MainStudioShell(
             onPlayQueueIndex = viewModel::playQueueIndex,
             onOpenConnect = { viewModel.setShowConnectSheet(true) },
             onDismissConnect = { viewModel.setShowConnectSheet(false) },
+            onReconnectConnect = { viewModel.reconnectConnect(force = true) },
             onClaimActiveDevice = viewModel::claimActiveConnectDevice,
             onTransferPlayback = viewModel::transferPlaybackToDevice,
             onUndoPendingDrop = viewModel::undoPendingDrop,
@@ -440,9 +442,10 @@ private fun SoulbeetTopAppBar(
                 .height(56.dp)
                 .padding(horizontal = 16.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Row(
+                modifier = Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
@@ -451,6 +454,8 @@ private fun SoulbeetTopAppBar(
                     text = title,
                     style = type.titleLg,
                     color = colors.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
 
@@ -459,32 +464,43 @@ private fun SoulbeetTopAppBar(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 if (activeAcquisitions > 0) {
-                    Surface(
-                        color = colors.accentSurface,
-                        shape = SoulbeetShapes.full,
-                        border = BorderStroke(1.dp, colors.accentText.copy(alpha = 0.45f)),
+                    Box(
+                        modifier = Modifier.heightIn(min = 48.dp),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        Surface(
+                            modifier = Modifier.height(32.dp),
+                            color = colors.accentSurface,
+                            shape = SoulbeetShapes.full,
+                            border = BorderStroke(1.dp, colors.accentText.copy(alpha = 0.45f)),
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.CloudDownload,
-                                contentDescription = "Active acquisitions",
-                                tint = colors.accentText,
-                                modifier = Modifier.size(14.dp),
-                            )
-                            Text(
-                                text = "$activeAcquisitions",
-                                style = type.monoXs,
-                                color = colors.accentText,
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.CloudDownload,
+                                    contentDescription = "Active acquisitions",
+                                    tint = colors.accentText,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Text(
+                                    text = "$activeAcquisitions",
+                                    style = type.monoXs,
+                                    color = colors.accentText,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
+                            }
                         }
                     }
                 }
 
-                // Global Offline Only Pill (>= 48dp touch target)
+                // Global Online / Offline Only Pill (>= 48dp touch target, 32dp visual height)
+                val offlineAmber = Color(0xFFF59E0B)
+                val offlineAmberSurface = Color(0x26F59E0B)
+                val offlineAmberBorder = Color(0x73F59E0B)
                 Box(
                     modifier = Modifier
                         .heightIn(min = 48.dp)
@@ -492,28 +508,45 @@ private fun SoulbeetTopAppBar(
                     contentAlignment = Alignment.Center,
                 ) {
                     Surface(
-                        color = if (offlineOnly) colors.leafSurface else colors.surface,
+                        modifier = Modifier.height(32.dp),
+                        color = if (offlineOnly) offlineAmberSurface else colors.surface,
                         shape = SoulbeetShapes.full,
                         border = BorderStroke(
                             1.dp,
-                            if (offlineOnly) colors.leafText.copy(alpha = 0.45f) else colors.borderDefault,
+                            if (offlineOnly) offlineAmberBorder else colors.borderDefault,
                         ),
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            modifier = Modifier.padding(horizontal = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(if (offlineOnly) colors.leafGlow else colors.textMuted),
-                            )
+                            if (offlineOnly) {
+                                Icon(
+                                    imageVector = Icons.Filled.CloudOff,
+                                    contentDescription = "Offline Only",
+                                    tint = offlineAmber,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier.size(14.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(colors.leafGlow),
+                                    )
+                                }
+                            }
                             Text(
-                                text = "Offline",
+                                text = if (offlineOnly) "Offline Only" else "Online",
                                 style = type.monoXs,
-                                color = if (offlineOnly) colors.leafText else colors.textSecondary,
+                                color = if (offlineOnly) offlineAmber else colors.textPrimary,
+                                maxLines = 1,
+                                softWrap = false,
                             )
                         }
                     }
@@ -643,7 +676,7 @@ private fun FloatingMiniPlayer(
                     )
                 }
 
-                // 1-Tap Context Action (Keep if Discovery, Star if Library)
+                // 1-Tap Context Action (Keep if Discovery, Favorite if Library)
                 IconButton(
                     onClick = onContextAction,
                     modifier = Modifier.size(48.dp),
@@ -656,9 +689,9 @@ private fun FloatingMiniPlayer(
                         )
                     } else {
                         Icon(
-                            imageVector = if (pb.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
-                            contentDescription = if (pb.isStarred) "Unstar track" else "Star track",
-                            tint = if (pb.isStarred) colors.gold else colors.textMuted,
+                            imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                            contentDescription = if (pb.isStarred) "Remove from favorites" else "Favorite track",
+                            tint = if (pb.isStarred) colors.accentText else colors.textMuted,
                         )
                     }
                 }

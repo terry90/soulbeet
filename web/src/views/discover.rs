@@ -9,7 +9,7 @@ use shared::recommendation::{
 use ui::{
     discovery::DiscoveryOverview, format_discovery_badge, format_mix_subtitle, format_mix_title,
     format_mix_window_badge, friendly_error, subsonic_cover_art_url, use_player, IconCheck,
-    IconLoader, IconMusic, IconPlay, IconRadio, IconSparkles, IconStar, IconThumbsDown,
+    IconHeart, IconLoader, IconMusic, IconPlay, IconRadio, IconSparkles, IconThumbsDown,
     PlayerTrack, SeasonalHeroCard, TasteDnaBar, TrackRow, TrackRowState,
 };
 
@@ -315,10 +315,10 @@ pub fn DiscoverPage() -> Element {
                                         }
                                         button {
                                             r#type: "button",
-                                            class: "inline-flex items-center gap-2 h-10 px-4 rounded-full bg-beet-gold-surface border border-beet-gold/40 text-beet-gold hover:brightness-110 text-[13px] font-semibold cursor-pointer transition-[filter]",
+                                            class: "inline-flex items-center gap-2 h-10 px-4 rounded-full bg-beet-accent-surface border border-beet-accent/40 text-beet-accent-text hover:brightness-110 text-[13px] font-semibold cursor-pointer transition-[filter]",
                                             onclick: move |_| studio.star_track(auth, player, t_star.clone(), true),
-                                            IconStar { size: 15, filled: true }
-                                            span { "Star & Keep" }
+                                            IconHeart { size: 15, filled: true }
+                                            span { "Favorite & Keep" }
                                         }
                                         button {
                                             r#type: "button",

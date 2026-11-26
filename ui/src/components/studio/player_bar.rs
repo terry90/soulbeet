@@ -8,11 +8,11 @@ use dioxus::prelude::*;
 use shared::client::{ConnectDevice, DevicePlatform};
 
 use crate::{
-    format_discovery_badge, format_duration, use_player, IconCar, IconCheck, IconInfo, IconLaptop,
-    IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause, IconPictureInPicture2,
-    IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShuffle, IconSkipBack, IconSkipForward,
-    IconSmartphone, IconSparkles, IconStar, IconThumbsDown, IconTrash2, IconVolume1, IconVolume2,
-    IconVolumeX, PlayerTrack, RepeatMode, StarStrip, StarStripSize,
+    format_discovery_badge, format_duration, use_player, IconCar, IconCheck, IconHeart, IconInfo,
+    IconLaptop, IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause,
+    IconPictureInPicture2, IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShuffle,
+    IconSkipBack, IconSkipForward, IconSmartphone, IconSparkles, IconThumbsDown, IconTrash2,
+    IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode, StarStrip, StarStripSize,
 };
 
 use super::DrawerTab;
@@ -597,15 +597,15 @@ pub fn StudioPlayerBar(
                                     button {
                                         r#type: "button",
                                         aria_pressed: if is_starred { "true" } else { "false" },
-                                        title: if is_starred { "Unstar track (S)" } else { "Star track (S)" },
-                                        aria_label: if is_starred { "Unstar track" } else { "Star track" },
+                                        title: if is_starred { "Remove from favorites (S)" } else { "Favorite track (S)" },
+                                        aria_label: if is_starred { "Remove from favorites" } else { "Favorite track" },
                                         class: if is_starred {
-                                            "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-gold hover:bg-beet-gold-surface cursor-pointer transition-colors"
+                                            "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-accent-text hover:bg-beet-accent-surface cursor-pointer transition-colors"
                                         } else {
-                                            "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-gold hover:bg-beet-surface-high cursor-pointer transition-colors"
+                                            "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-accent-text hover:bg-beet-surface-high cursor-pointer transition-colors"
                                         },
                                         onclick: move |_| on_star.call((track_star.clone(), !is_starred)),
-                                        IconStar { size: 16, filled: is_starred }
+                                        IconHeart { size: 16, filled: is_starred }
                                     }
                                     div { class: "hidden 2xl:flex items-center",
                                         StarStrip {

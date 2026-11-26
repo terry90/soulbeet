@@ -480,7 +480,27 @@ pub async fn list_tracks_by_album(
 
 pub async fn list_playlists(pool: &SqlitePool) -> CoreResult<Vec<LocalPlaylist>> {
     let rows = sqlx::query_as::<_, LocalPlaylist>(
-        "SELECT * FROM playlists ORDER BY updated_at DESC, name COLLATE NOCASE ASC",
+        r#"
+        SELECT
+            p.id,
+            p.name,
+            p.comment,
+            p.owner,
+            CASE
+                WHEN EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+                    THEN (SELECT COUNT(1) FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+                ELSE p.song_count
+            END AS song_count,
+            p.duration_secs,
+            p.cover_art_id,
+            p.is_smart,
+            p.kind,
+            p.slug,
+            p.changed_at,
+            p.updated_at
+        FROM playlists p
+        ORDER BY p.updated_at DESC, p.name COLLATE NOCASE ASC
+        "#,
     )
     .fetch_all(pool)
     .await?;

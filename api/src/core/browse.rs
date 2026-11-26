@@ -305,14 +305,86 @@ pub async fn browse_library(
     music_path: Option<&Path>,
     query: BrowseQuery,
 ) -> Result<BrowseResult, Failure> {
-    if let Some(ref folder_id) = query.folder_id {
-        folders::owned_in(db, ctx, folder_id).await?;
+    browse_library_with_admin(db, navi, None, ctx, music_path, query, false).await
+}
+
+/// Like `browse_library`, optionally allowing admin cross-user folder filtering and resolution.
+/// When `admin_access` is true and `query.folder_id` points to another user's folder, filters by
+/// the target folder's canonical path (avoiding shared-path folder ID ties) and falls back to
+/// reading via the folder owner's Navidrome client when `navidrome_of` is provided and the
+/// caller's Navidrome account cannot see songs in that folder.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn browse_library_with_admin(
+    db: &SqlitePool,
+    navi: &NavidromeClient,
+    navidrome_of: Option<&dyn NavidromeOf>,
+    ctx: &UserCtx,
+    music_path: Option<&Path>,
+    query: BrowseQuery,
+    admin_access: bool,
+) -> Result<BrowseResult, Failure> {
+    let target_folder = if let Some(ref folder_id) = query.folder_id {
+        let folder = if admin_access {
+            folders::get_in(db, folder_id).await?
+        } else {
+            folders::owned_in(db, ctx, folder_id).await?
+        };
+        let canonical =
+            crate::folder_policy::canonical_folder_path(Path::new(&folder.path))
+                .unwrap_or_else(|_| std::path::PathBuf::from(&folder.path));
+        Some((folder, canonical))
+    } else {
+        None
+    };
+
+    let target_root = target_folder.as_ref().map(|(_, p)| p.as_path());
+    let result = match query.kind {
+        BrowseKind::Songs => {
+            browse_songs(db, navi, ctx, music_path, &query, admin_access, target_root).await?
+        }
+        BrowseKind::Albums => {
+            browse_albums(db, navi, ctx, music_path, &query, admin_access, target_root).await?
+        }
+    };
+
+    // If an admin browses another user's private folder and sees 0 matches through their own
+    // Navidrome account, fall back to the folder owner's linked Navidrome account.
+    if result.total == 0 && admin_access {
+        if let (Some((folder, canonical)), Some(provider)) = (&target_folder, navidrome_of) {
+            if folder.user_id != ctx.user_id {
+                if let Ok(owner_navi) = provider.navidrome_of(&UserId::new(&folder.user_id)).await {
+                    return match query.kind {
+                        BrowseKind::Songs => {
+                            browse_songs(
+                                db,
+                                &owner_navi,
+                                ctx,
+                                music_path,
+                                &query,
+                                admin_access,
+                                Some(canonical.as_path()),
+                            )
+                            .await
+                        }
+                        BrowseKind::Albums => {
+                            browse_albums(
+                                db,
+                                &owner_navi,
+                                ctx,
+                                music_path,
+                                &query,
+                                admin_access,
+                                Some(canonical.as_path()),
+                            )
+                            .await
+                        }
+                    };
+                }
+            }
+        }
     }
 
-    match query.kind {
-        BrowseKind::Songs => browse_songs(db, navi, ctx, music_path, &query).await,
-        BrowseKind::Albums => browse_albums(db, navi, ctx, music_path, &query).await,
-    }
+    Ok(result)
 }
 
 async fn browse_songs(
@@ -321,6 +393,8 @@ async fn browse_songs(
     ctx: &UserCtx,
     music_path: Option<&Path>,
     query: &BrowseQuery,
+    admin_access: bool,
+    target_root: Option<&Path>,
 ) -> Result<BrowseResult, Failure> {
     let want_missing = query.missing.unwrap_or(false);
     let page = navi
@@ -328,7 +402,7 @@ async fn browse_songs(
         .await
         .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
 
-    let resolver = FolderResolver::load_in(db, &ctx.user_id, music_path).await;
+    let resolver = FolderResolver::load_for_in(db, &ctx.user_id, music_path, admin_access).await;
     let normalized_format = query
         .format
         .as_deref()
@@ -342,16 +416,12 @@ async fn browse_songs(
         if !song_passes_metadata_filters(&s, query, normalized_format) {
             continue;
         }
-        let facts = resolver.facts(&s.song);
-        if let Some(ref want_folder) = query.folder_id {
-            if facts
-                .folder
-                .as_ref()
-                .is_none_or(|f| f.folder_id != *want_folder)
-            {
+        if let Some(root) = target_root {
+            if !resolver.song_in_folder(&s.song, root) {
                 continue;
             }
         }
+        let facts = resolver.facts(&s.song);
         matched.push((s, facts));
     }
 
@@ -380,11 +450,13 @@ async fn browse_albums(
     ctx: &UserCtx,
     music_path: Option<&Path>,
     query: &BrowseQuery,
+    admin_access: bool,
+    target_root: Option<&Path>,
 ) -> Result<BrowseResult, Failure> {
     let failure = |e: NavidromeError| navidrome_failure(Stage::LibraryCheck, &e);
     let albums = navi.all_browse_albums().await.map_err(failure)?;
 
-    let needs_song_filter = query.folder_id.is_some()
+    let needs_song_filter = target_root.is_some()
         || query.format.is_some()
         || query.max_bitrate_kbps.is_some()
         || query.missing == Some(true);
@@ -395,8 +467,8 @@ async fn browse_albums(
             .all_browse_songs_filtered(Some(want_missing))
             .await
             .map_err(failure)?;
-        let resolver = if query.folder_id.is_some() {
-            Some(FolderResolver::load_in(db, &ctx.user_id, music_path).await)
+        let resolver = if target_root.is_some() {
+            Some(FolderResolver::load_for_in(db, &ctx.user_id, music_path, admin_access).await)
         } else {
             None
         };
@@ -419,11 +491,8 @@ async fn browse_albums(
                     continue;
                 }
             }
-            if let (Some(ref want_folder), Some(ref resolver)) = (&query.folder_id, &resolver) {
-                if resolver
-                    .resolve_native(&s.song)
-                    .is_none_or(|f| f.folder_id != *want_folder)
-                {
+            if let (Some(root), Some(ref resolver)) = (target_root, &resolver) {
+                if !resolver.song_in_folder(&s.song, root) {
                     continue;
                 }
             }

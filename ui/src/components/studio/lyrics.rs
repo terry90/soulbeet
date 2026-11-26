@@ -40,7 +40,20 @@ fn parse_lrc_timestamp_ms(tag: &str) -> Option<i64> {
             }
         }
     };
-    Some(mins * 60_000 + secs * 1_000 + frac_ms)
+    let min_ms = mins.checked_mul(60_000)?;
+    let sec_ms = secs.checked_mul(1_000)?;
+    min_ms.checked_add(sec_ms)?.checked_add(frac_ms)
+}
+
+fn line_starts_with_lrc_timestamp(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(after_open) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some((tag, _)) = after_open.split_once(']') else {
+        return false;
+    };
+    parse_lrc_timestamp_ms(tag).is_some()
 }
 
 /// Parses LRC-formatted text (supporting multiple timestamps per line, e.g. `[00:12.50][01:02.00]Chorus`)
@@ -110,7 +123,8 @@ pub fn normalize_track_lyrics(entries: &[TrackLyrics]) -> (bool, Vec<NormalizedL
             .lines
             .iter()
             .filter_map(|line| {
-                let ts = line.start_ms.map(|ms| (ms + offset).max(0));
+                // Per LRC / OpenSubsonic spec: positive offset displays lyrics earlier (ms - offset).
+                let ts = line.start_ms.map(|ms| ms.saturating_sub(offset).max(0));
                 if line.text.trim().is_empty() && ts.is_none() {
                     None
                 } else {
@@ -125,22 +139,38 @@ pub fn normalize_track_lyrics(entries: &[TrackLyrics]) -> (bool, Vec<NormalizedL
         return (true, lines);
     }
 
-    // Plain lyrics might still carry inline LRC timestamps when sourced from legacy endpoints.
-    if entry.lines.len() == 1 {
-        let (is_lrc, parsed) = parse_lrc_lines(&entry.lines[0].text);
+    // Plain/unsynced payloads (single-line or multi-line) may still carry inline LRC timestamps.
+    let all_untimed = entry.lines.iter().all(|l| l.start_ms.is_none());
+    let has_inline_lrc = all_untimed
+        && (entry.lines.len() == 1
+            || entry
+                .lines
+                .iter()
+                .any(|l| line_starts_with_lrc_timestamp(&l.text)));
+    if has_inline_lrc {
+        let joined = entry
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (is_lrc, parsed) = parse_lrc_lines(&joined);
         if is_lrc {
-            let shifted = parsed
+            let mut shifted: Vec<NormalizedLyricLine> = parsed
                 .into_iter()
                 .map(|mut l| {
                     if let Some(ms) = l.start_ms {
-                        l.start_ms = Some((ms + offset).max(0));
+                        l.start_ms = Some(ms.saturating_sub(offset).max(0));
                     }
                     l
                 })
                 .collect();
+            shifted.sort_by_key(|l| l.start_ms.unwrap_or(i64::MAX));
             return (true, shifted);
         }
-        return (false, parsed);
+        if entry.lines.len() == 1 {
+            return (false, parsed);
+        }
     }
 
     let plain: Vec<NormalizedLyricLine> = entry
@@ -198,6 +228,7 @@ pub fn find_active_lyric_line(lines: &[NormalizedLyricLine], position_ms: i64) -
 pub fn LyricsPanel(
     #[props(into)] lyrics: ReadSignal<Vec<TrackLyrics>>,
     #[props(default)] loading: bool,
+    #[props(default)] fetched: bool,
     #[props(default)] error: Option<String>,
     #[props(default)] has_track: bool,
     #[props(default)] on_fetch: Option<EventHandler<()>>,
@@ -271,10 +302,18 @@ pub fn LyricsPanel(
                 IconMic2 { size: 28, class: "text-beet-text-disabled".to_string() }
                 div { class: "space-y-1",
                     p { class: "text-[14px] font-medium text-beet-text-primary",
-                        "No synced lyrics saved yet"
+                        if fetched {
+                            "No lyrics found for this track"
+                        } else {
+                            "No synced lyrics saved yet"
+                        }
                     }
                     p { class: "text-[12px] text-beet-text-tertiary",
-                        "Check Navidrome for embedded or synced lyrics for this track."
+                        if fetched {
+                            "Checked Navidrome and LRCLIB, but no synced or plain lyrics are available yet."
+                        } else {
+                            "Search Navidrome and LRCLIB for synced or plain lyrics for this track."
+                        }
                     }
                 }
                 if let Some(fetch_cb) = on_fetch {
@@ -283,7 +322,9 @@ pub fn LyricsPanel(
                         class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-primary hover:border-beet-accent/40 hover:text-beet-accent-text text-[13px] font-medium cursor-pointer transition-colors",
                         onclick: move |_| fetch_cb.call(()),
                         IconRefreshCw { size: 14 }
-                        span { "Fetch Lyrics" }
+                        span {
+                            if fetched { "Try Again" } else { "Fetch Lyrics" }
+                        }
                     }
                 }
             }
@@ -417,10 +458,42 @@ mod tests {
         let (synced, lines) = normalize_track_lyrics(&entries);
         assert!(synced);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].start_ms, Some(1_500));
+        // Positive offset_ms (500) shifts timestamps earlier: ms - 500
+        assert_eq!(lines[0].start_ms, Some(500));
         assert_eq!(lines[0].text, "First");
-        assert_eq!(lines[1].start_ms, Some(5_500));
+        assert_eq!(lines[1].start_ms, Some(4_500));
         assert_eq!(lines[1].text, "Second");
+    }
+
+    #[test]
+    fn guards_against_huge_lrc_timestamps_and_parses_multiline_inline_lrc() {
+        assert_eq!(parse_lrc_timestamp_ms("999999999999999:00.00"), None);
+        assert_eq!(parse_lrc_timestamp_ms("01:02.50"), Some(62_500));
+
+        let entries = vec![TrackLyrics {
+            display_artist: None,
+            display_title: None,
+            lang: "en".into(),
+            synced: false,
+            offset_ms: Some(250),
+            lines: vec![
+                TrackLyricLine {
+                    start_ms: None,
+                    text: "[00:01.00]Line A".into(),
+                },
+                TrackLyricLine {
+                    start_ms: None,
+                    text: "[00:05.50]Line B".into(),
+                },
+            ],
+        }];
+        let (synced, lines) = normalize_track_lyrics(&entries);
+        assert!(synced);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].start_ms, Some(750));
+        assert_eq!(lines[0].text, "Line A");
+        assert_eq!(lines[1].start_ms, Some(5_250));
+        assert_eq!(lines[1].text, "Line B");
     }
 
     #[test]
@@ -449,5 +522,59 @@ mod tests {
         assert_eq!(find_active_lyric_line(&lines, 12_499), Some(1));
         assert_eq!(find_active_lyric_line(&lines, 12_500), Some(2));
         assert_eq!(find_active_lyric_line(&lines, 99_000), Some(2));
+    }
+
+    #[test]
+    fn renders_distinct_empty_copy_before_and_after_fetch() {
+        use crate::{PlayerCommand, PlayerProvider, PlayerState};
+
+        let mut before_dom = VirtualDom::new(|| {
+            let state = use_signal(PlayerState::default);
+            let pos = use_signal(|| 0.0f64);
+            let dur = use_signal(|| 0.0f64);
+            rsx! {
+                PlayerProvider {
+                    state,
+                    position_secs: pos,
+                    duration_secs: dur,
+                    on_command: move |_: PlayerCommand| {},
+                    LyricsPanel {
+                        lyrics: Vec::<TrackLyrics>::new(),
+                        has_track: true,
+                        fetched: false,
+                        on_fetch: move |_| {},
+                    }
+                }
+            }
+        });
+        before_dom.rebuild_in_place();
+        let before_html = dioxus_ssr::render(&before_dom);
+        assert!(before_html.contains("No synced lyrics saved yet"), "{before_html}");
+        assert!(before_html.contains("Fetch Lyrics"), "{before_html}");
+
+        let mut after_dom = VirtualDom::new(|| {
+            let state = use_signal(PlayerState::default);
+            let pos = use_signal(|| 0.0f64);
+            let dur = use_signal(|| 0.0f64);
+            rsx! {
+                PlayerProvider {
+                    state,
+                    position_secs: pos,
+                    duration_secs: dur,
+                    on_command: move |_: PlayerCommand| {},
+                    LyricsPanel {
+                        lyrics: Vec::<TrackLyrics>::new(),
+                        has_track: true,
+                        fetched: true,
+                        on_fetch: move |_| {},
+                    }
+                }
+            }
+        });
+        after_dom.rebuild_in_place();
+        let after_html = dioxus_ssr::render(&after_dom);
+        assert!(after_html.contains("No lyrics found for this track"), "{after_html}");
+        assert!(after_html.contains("Navidrome and LRCLIB"), "{after_html}");
+        assert!(after_html.contains("Try Again"), "{after_html}");
     }
 }

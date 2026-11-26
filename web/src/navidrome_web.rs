@@ -19,7 +19,23 @@ pub struct SubsonicPlaylistSummary {
     pub song_count: u32,
     pub duration: u32,
     pub cover_art: Option<String>,
+    pub comment: String,
+    pub owner: String,
+    pub public: bool,
     pub is_smart: bool,
+    pub category: ui::PlaylistCategory,
+}
+
+/// Detects whether a Navidrome playlist is smart or Soulbeet-managed from its name and comment.
+#[cfg(any(feature = "web", test))]
+pub fn detect_is_smart_playlist(name: &str, comment: &str) -> bool {
+    let comment_lower = comment.to_ascii_lowercase();
+    let name_lower = name.to_ascii_lowercase();
+    comment_lower.contains("soulbeet discovery")
+        || comment_lower.contains("soulbeet:contextual:")
+        || comment_lower.contains("smart")
+        || comment_lower.contains("discovery")
+        || name_lower.contains("discovery")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -94,6 +110,10 @@ mod wire {
         pub(super) cover_art: Option<String>,
         #[serde(default)]
         pub(super) comment: Option<String>,
+        #[serde(default)]
+        pub(super) owner: Option<String>,
+        #[serde(default)]
+        pub(super) public: bool,
     }
 
     #[derive(Debug, Deserialize, Default)]
@@ -333,31 +353,77 @@ pub async fn fetch_song(
 }
 
 #[cfg(feature = "web")]
+pub async fn fetch_playlist_live_count(
+    info: &NavidromeSessionInfo,
+    playlist_id: &str,
+) -> Option<u32> {
+    let data: PlaylistDetailData =
+        fetch_subsonic(info, "getPlaylist", &[("id", playlist_id)])
+            .await
+            .ok()?;
+    data.playlist.map(|p| p.entry.len() as u32)
+}
+
+#[cfg(feature = "web")]
 pub async fn fetch_playlists(
     info: &NavidromeSessionInfo,
 ) -> Result<Vec<SubsonicPlaylistSummary>, String> {
     let data: PlaylistsData = fetch_subsonic(info, "getPlaylists", &[]).await?;
-    Ok(data
+    let mut playlists: Vec<SubsonicPlaylistSummary> = data
         .playlists
         .map(|p| p.playlist)
         .unwrap_or_default()
         .into_iter()
         .map(|pl| {
-            let is_smart = pl
-                .comment
-                .as_deref()
-                .is_some_and(|c| c.to_ascii_lowercase().contains("smart"))
-                || pl.name.to_ascii_lowercase().contains("discovery");
+            let comment = pl.comment.unwrap_or_default();
+            let owner = pl.owner.unwrap_or_default();
+            let is_smart = detect_is_smart_playlist(&pl.name, &comment);
+            let category = ui::classify_playlist_category(&pl.id, Some(&comment), is_smart, &[]);
             SubsonicPlaylistSummary {
                 id: pl.id,
                 name: pl.name,
                 song_count: pl.song_count,
                 duration: pl.duration,
                 cover_art: pl.cover_art,
+                comment,
+                owner,
+                public: pl.public,
                 is_smart,
+                category,
             }
         })
-        .collect())
+        .collect();
+
+    // Navidrome's `getPlaylists` `songCount` can include stale `missing = true` rows on smart /
+    // Soulbeet playlists. Resolve exact live non-missing counts via concurrent `getPlaylist` calls.
+    let resolve_all = playlists.len() <= 25;
+    let indices_to_resolve: Vec<usize> = playlists
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, pl)| {
+            (resolve_all || pl.is_smart || pl.category.is_soulbeet_mix()).then_some(idx)
+        })
+        .collect();
+
+    if !indices_to_resolve.is_empty() {
+        use futures::stream::{self, StreamExt};
+        let resolved: Vec<(usize, Option<u32>)> = stream::iter(indices_to_resolve.into_iter().map(
+            |idx| {
+                let pid = playlists[idx].id.clone();
+                async move { (idx, fetch_playlist_live_count(info, &pid).await) }
+            },
+        ))
+        .buffer_unordered(6)
+        .collect()
+        .await;
+        for (idx, live_count) in resolved {
+            if let Some(count) = live_count {
+                playlists[idx].song_count = count;
+            }
+        }
+    }
+
+    Ok(playlists)
 }
 
 #[cfg(not(feature = "web"))]
@@ -514,4 +580,18 @@ pub async fn send_scrobble(info: &NavidromeSessionInfo, song_id: &str, submissio
         &[("id", song_id), ("submission", sub)],
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_smart_and_soulbeet_playlists_from_comment_and_name() {
+        assert!(detect_is_smart_playlist("Comfort Zone", "Soulbeet Discovery: conservative"));
+        assert!(detect_is_smart_playlist("Summer Anthems", "soulbeet:contextual:summer"));
+        assert!(detect_is_smart_playlist("Favorites", "Auto smart playlist"));
+        assert!(detect_is_smart_playlist("Weekly Discovery", ""));
+        assert!(!detect_is_smart_playlist("Road Trip", "Songs for the highway"));
+    }
 }

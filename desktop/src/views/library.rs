@@ -1,16 +1,17 @@
-//! Desktop Studio Library & Offline Cache View — Offline-Only pill, cache budget meter,
+//! Desktop Studio Library & Offline Cache View: cache budget meter,
 //! Pin/Unpin offline playlists & albums, local track browser, and Sync Now / Outbox controls.
 
 use client_core::models::PinTarget;
 use dioxus::prelude::*;
 use ui::{
-    use_player, IconCloudCheck, IconDownload, IconListMusic, IconMusic, IconPlay, IconRefreshCw,
-    OfflineTogglePill, TrackRow, TrackRowState,
+    classify_local_playlist_category, use_player, IconCloudCheck, IconCompass, IconDownload,
+    IconListMusic, IconMusic, IconPlay, IconRadio, IconRefreshCw, IconSparkles, PlaylistCategory,
+    TrackRow, TrackRowState,
 };
 
 use crate::desktop_state::{
     desktop_cover_art_url, load_library_albums, load_library_tracks, load_tracks_for_album,
-    load_tracks_for_playlist, use_desktop_studio,
+    load_tracks_for_playlist, use_desktop_studio, DesktopPlaylist,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,11 +104,6 @@ pub fn LibraryView() -> Element {
                     }
 
                     div { class: "flex flex-wrap items-center gap-2",
-                        OfflineTogglePill {
-                            offline_only,
-                            on_toggle: move |next| player.set_offline_only(next),
-                            compact: true,
-                        }
                         button {
                             r#type: "button",
                             disabled: sync_st.syncing || offline_only,
@@ -158,60 +154,81 @@ pub fn LibraryView() -> Element {
             match active_tab() {
                 LibraryTab::Playlists => rsx! {
                     div { class: "grid grid-cols-1 lg:grid-cols-3 gap-5",
-                        // Left: Playlists List with 1-tap Offline Pinning
-                        div { class: "space-y-2",
+                        // Left: Grouped Playlists List with 1-tap Offline Pinning
+                        div { class: "space-y-4",
                             if playlists.is_empty() {
                                 p { class: "text-[13px] text-beet-text-tertiary py-4",
                                     "No playlists mirrored yet. Click Sync Now to load playlists from Navidrome."
                                 }
                             } else {
-                                for item in playlists.iter() {
-                                    {
-                                        let pid = item.playlist.id.clone();
-                                        let pid_select = pid.clone();
-                                        let pid_pin = pid.clone();
-                                        let pname = item.playlist.name.clone();
-                                        let is_pinned = item.is_pinned;
-                                        let is_selected = selected_playlist.as_deref() == Some(pid.as_str());
-                                        rsx! {
-                                            div {
-                                                key: "pl-{pid}",
-                                                class: if is_selected {
-                                                    "flex items-center justify-between gap-2 p-2.5 rounded-[10px] bg-beet-surface-high border border-beet-leaf-solid/40"
-                                                } else {
-                                                    "flex items-center justify-between gap-2 p-2.5 rounded-[10px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default"
-                                                },
-                                                button {
-                                                    r#type: "button",
-                                                    class: "flex items-center gap-2.5 flex-1 min-w-0 text-left cursor-pointer",
-                                                    onclick: move |_| studio.selected_playlist_id.set(Some(pid_select.clone())),
-                                                    IconListMusic { size: 15, class: "text-beet-text-tertiary shrink-0".to_string() }
-                                                    div { class: "min-w-0",
-                                                        p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{item.playlist.name}" }
-                                                        p { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary", "{item.playlist.song_count} TRACKS" }
+                                {
+                                    let classified: Vec<(&DesktopPlaylist, PlaylistCategory)> = playlists
+                                        .iter()
+                                        .map(|item| {
+                                            let cat = classify_local_playlist_category(
+                                                &item.playlist.kind,
+                                                item.playlist.comment.as_deref(),
+                                                item.playlist.is_smart,
+                                            );
+                                            (item, cat)
+                                        })
+                                        .collect();
+                                    let user_items: Vec<(&DesktopPlaylist, PlaylistCategory)> = classified
+                                        .iter()
+                                        .copied()
+                                        .filter(|(_, cat)| !cat.is_soulbeet_mix())
+                                        .collect();
+                                    let mut mix_items: Vec<(&DesktopPlaylist, PlaylistCategory)> = classified
+                                        .iter()
+                                        .copied()
+                                        .filter(|(_, cat)| cat.is_soulbeet_mix())
+                                        .collect();
+                                    mix_items.sort_by_key(|(_, cat)| cat.sort_rank());
+
+                                    rsx! {
+                                        if !user_items.is_empty() {
+                                            div { class: "space-y-2",
+                                                p { class: "px-1 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                                    "Your Playlists"
+                                                }
+                                                for (item, category) in user_items.iter() {
+                                                    DesktopPlaylistRow {
+                                                        key: "pl-user-{item.playlist.id}",
+                                                        item: (*item).clone(),
+                                                        category: *category,
+                                                        is_selected: selected_playlist.as_deref() == Some(item.playlist.id.as_str()),
+                                                        on_select: move |pid| studio.selected_playlist_id.set(Some(pid)),
+                                                        on_toggle_pin: move |(pid, pname, pinned)| {
+                                                            if pinned {
+                                                                studio.unpin_target_offline(PinTarget::Playlist(pid), pname);
+                                                            } else {
+                                                                studio.pin_target_offline(PinTarget::Playlist(pid), pname);
+                                                            }
+                                                        },
                                                     }
                                                 }
-                                                button {
-                                                    r#type: "button",
-                                                    title: if is_pinned { "Unpin offline" } else { "Pin playlist offline" },
-                                                    class: if is_pinned {
-                                                        "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text text-[11px] font-semibold cursor-pointer shrink-0"
-                                                    } else {
-                                                        "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-surface-high border border-beet-border-subtle text-beet-text-secondary hover:text-beet-leaf-text text-[11px] font-medium cursor-pointer shrink-0"
-                                                    },
-                                                    onclick: move |_| {
-                                                        if is_pinned {
-                                                            studio.unpin_target_offline(PinTarget::Playlist(pid_pin.clone()), pname.clone());
-                                                        } else {
-                                                            studio.pin_target_offline(PinTarget::Playlist(pid_pin.clone()), pname.clone());
-                                                        }
-                                                    },
-                                                    if is_pinned {
-                                                        IconCloudCheck { size: 12 }
-                                                        span { "Pinned" }
-                                                    } else {
-                                                        IconDownload { size: 12 }
-                                                        span { "Pin" }
+                                            }
+                                        }
+
+                                        if !mix_items.is_empty() {
+                                            div { class: "space-y-2",
+                                                p { class: "px-1 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                                    "Discovery & Mixes"
+                                                }
+                                                for (item, category) in mix_items.iter() {
+                                                    DesktopPlaylistRow {
+                                                        key: "pl-mix-{item.playlist.id}",
+                                                        item: (*item).clone(),
+                                                        category: *category,
+                                                        is_selected: selected_playlist.as_deref() == Some(item.playlist.id.as_str()),
+                                                        on_select: move |pid| studio.selected_playlist_id.set(Some(pid)),
+                                                        on_toggle_pin: move |(pid, pname, pinned)| {
+                                                            if pinned {
+                                                                studio.unpin_target_offline(PinTarget::Playlist(pid), pname);
+                                                            } else {
+                                                                studio.pin_target_offline(PinTarget::Playlist(pid), pname);
+                                                            }
+                                                        },
                                                     }
                                                 }
                                             }
@@ -414,6 +431,89 @@ pub fn LibraryView() -> Element {
                         }
                     }
                 },
+            }
+        }
+    }
+}
+
+#[component]
+fn DesktopPlaylistRow(
+    item: DesktopPlaylist,
+    category: PlaylistCategory,
+    is_selected: bool,
+    on_select: EventHandler<String>,
+    on_toggle_pin: EventHandler<(String, String, bool)>,
+) -> Element {
+    let pid_select = item.playlist.id.clone();
+    let pid_pin = item.playlist.id.clone();
+    let pname = item.playlist.name.clone();
+    let is_pinned = item.is_pinned;
+
+    let tag_cls = match category {
+        PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
+            "bg-beet-accent-surface border-beet-accent/30 text-beet-accent-text"
+        }
+        PlaylistCategory::MomentMix => {
+            "bg-beet-leaf-surface border-beet-leaf-solid/30 text-beet-leaf-text"
+        }
+        PlaylistCategory::Smart | PlaylistCategory::User => {
+            "bg-beet-surface-high border-beet-border-subtle text-beet-text-tertiary"
+        }
+    };
+
+    rsx! {
+        div {
+            class: if is_selected {
+                "flex items-center justify-between gap-2 p-2.5 rounded-[10px] bg-beet-surface-high border border-beet-leaf-solid/40"
+            } else {
+                "flex items-center justify-between gap-2 p-2.5 rounded-[10px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default"
+            },
+            button {
+                r#type: "button",
+                class: "flex items-center gap-2.5 flex-1 min-w-0 text-left cursor-pointer",
+                onclick: move |_| on_select.call(pid_select.clone()),
+                match category {
+                    PlaylistCategory::Seasonal => rsx! {
+                        IconSparkles { size: 15, class: "text-beet-accent-text shrink-0".to_string() }
+                    },
+                    PlaylistCategory::Discovery => rsx! {
+                        IconCompass { size: 15, class: "text-beet-accent-text shrink-0".to_string() }
+                    },
+                    PlaylistCategory::MomentMix => rsx! {
+                        IconRadio { size: 15, class: "text-beet-leaf-text shrink-0".to_string() }
+                    },
+                    PlaylistCategory::Smart | PlaylistCategory::User => rsx! {
+                        IconListMusic { size: 15, class: "text-beet-text-tertiary shrink-0".to_string() }
+                    },
+                }
+                div { class: "min-w-0 space-y-0.5",
+                    p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{item.playlist.name}" }
+                    div { class: "flex items-center gap-1.5 flex-wrap",
+                        span { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary", "{item.playlist.song_count} TRACKS" }
+                        if let Some(tag) = category.badge_label() {
+                            span { class: "px-1.5 py-0.5 rounded border tabular-nums-mono text-[9px] font-semibold tracking-wider {tag_cls}",
+                                "{tag}"
+                            }
+                        }
+                    }
+                }
+            }
+            button {
+                r#type: "button",
+                title: if is_pinned { "Unpin offline" } else { "Pin playlist offline" },
+                class: if is_pinned {
+                    "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text text-[11px] font-semibold cursor-pointer shrink-0"
+                } else {
+                    "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-surface-high border border-beet-border-subtle text-beet-text-secondary hover:text-beet-leaf-text text-[11px] font-medium cursor-pointer shrink-0"
+                },
+                onclick: move |_| on_toggle_pin.call((pid_pin.clone(), pname.clone(), is_pinned)),
+                if is_pinned {
+                    IconCloudCheck { size: 12 }
+                    span { "Pinned" }
+                } else {
+                    IconDownload { size: 12 }
+                    span { "Pin" }
+                }
             }
         }
     }

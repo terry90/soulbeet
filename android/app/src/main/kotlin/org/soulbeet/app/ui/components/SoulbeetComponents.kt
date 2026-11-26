@@ -30,11 +30,13 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -371,33 +373,40 @@ fun TrackRow(
 
                 when {
                     isUnownedCatalog -> {
-                        Surface(
-                            color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
-                            shape = SoulbeetShapes.full,
-                            border = BorderStroke(
-                                1.dp,
-                                if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
-                            ),
+                        Box(
                             modifier = Modifier
                                 .heightIn(min = 48.dp)
                                 .clickable(enabled = !isAcquiring, onClick = onClick),
+                            contentAlignment = Alignment.Center,
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            Surface(
+                                modifier = Modifier.height(32.dp),
+                                color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
+                                shape = SoulbeetShapes.full,
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
+                                ),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.CloudDownload,
-                                    contentDescription = "Acquire and Play",
-                                    tint = if (isAcquiring) colors.accentText else colors.leafText,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Text(
-                                    text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING…") else "ACQUIRE",
-                                    style = type.monoXs,
-                                    color = if (isAcquiring) colors.accentText else colors.textPrimary,
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.CloudDownload,
+                                        contentDescription = "Acquire and Play",
+                                        tint = if (isAcquiring) colors.accentText else colors.leafText,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Text(
+                                        text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING…") else "ACQUIRE",
+                                        style = type.monoXs,
+                                        color = if (isAcquiring) colors.accentText else colors.textPrimary,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                    )
+                                }
                             }
                         }
                     }
@@ -442,9 +451,9 @@ fun TrackRow(
                                 modifier = Modifier.size(48.dp),
                             ) {
                                 Icon(
-                                    imageVector = if (isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
-                                    contentDescription = if (isStarred) "Unstar track" else "Star track",
-                                    tint = if (isStarred) colors.gold else colors.textMuted,
+                                    imageVector = if (isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                    contentDescription = if (isStarred) "Remove from favorites" else "Favorite track",
+                                    tint = if (isStarred) colors.accentText else colors.textMuted,
                                     modifier = Modifier.size(20.dp),
                                 )
                             }

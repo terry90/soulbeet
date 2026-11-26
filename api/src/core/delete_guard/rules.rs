@@ -58,6 +58,34 @@ pub(crate) fn owning_folders<'a>(
         .ok_or_else(|| outside_library("The file is not inside one of your library folders"))
 }
 
+/// Deepest registered folder across ALL users that holds `path` strictly (for admin cross-user
+/// library access). Prefers `prefer_user`'s registration when multiple users register the exact
+/// same path.
+pub(crate) fn deepest_registered_folder<'a>(
+    path: &Path,
+    folders: &'a [PolicyFolder],
+    prefer_user: &UserId,
+) -> Result<(&'a PolicyFolder, &'a Path), Failure> {
+    let prefer = prefer_user.to_string();
+    let mut holding: Vec<(&PolicyFolder, &Path)> = folders
+        .iter()
+        .filter_map(|f| {
+            let folder = f.path.as_deref().ok()?;
+            (path != folder && path.starts_with(folder)).then_some((f, folder))
+        })
+        .collect();
+    holding.sort_by(|a, b| {
+        b.1.components()
+            .count()
+            .cmp(&a.1.components().count())
+            .then_with(|| (b.0.user_id == prefer).cmp(&(a.0.user_id == prefer)))
+    });
+    holding
+        .into_iter()
+        .next()
+        .ok_or_else(|| outside_library("The file is not inside any registered library folder"))
+}
+
 /// The ids of every registered folder, of any user, that holds the canonical file `path`
 /// strictly, or does not resolve and whose stored path does not show `path` outside it: the
 /// folders a job importing into could write `path` in.

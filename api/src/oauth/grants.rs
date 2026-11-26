@@ -325,6 +325,7 @@ pub(crate) struct Access {
     pub grant_id: String,
     pub resource: String,
     pub allow_delete: bool,
+    pub allow_admin: bool,
     /// The user as their row stands now.
     pub ctx: UserCtx,
 }
@@ -339,8 +340,8 @@ pub(crate) async fn access_in(
     now: i64,
 ) -> Result<Option<Access>, String> {
     let database = |e: sqlx::Error| e.to_string();
-    let row: Option<(String, String, bool, String, Option<i64>)> = sqlx::query_as(
-        "SELECT g.id, g.resource, g.allow_delete, g.user_id, g.last_used_at \
+    let row: Option<(String, String, bool, bool, String, Option<i64>)> = sqlx::query_as(
+        "SELECT g.id, g.resource, g.allow_delete, g.allow_admin, g.user_id, g.last_used_at \
          FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id \
          WHERE t.token_hash = ? AND t.kind = 'access' AND t.expires_at > ?",
     )
@@ -349,7 +350,7 @@ pub(crate) async fn access_in(
     .fetch_optional(db)
     .await
     .map_err(database)?;
-    let Some((grant_id, resource, allow_delete, user_id, last_used_at)) = row else {
+    let Some((grant_id, resource, allow_delete, allow_admin, user_id, last_used_at)) = row else {
         return Ok(None);
     };
     let Some(user) = User::find_by_id_in(db, &user_id).await? else {
@@ -373,6 +374,7 @@ pub(crate) async fn access_in(
         grant_id,
         resource,
         allow_delete,
+        allow_admin: allow_admin && user.role.is_admin(),
         ctx: UserCtx {
             user_id: user.id,
             username: user.username,
@@ -392,6 +394,7 @@ struct AppRow {
     username: String,
     last_used_at: Option<i64>,
     allow_delete: bool,
+    allow_admin: bool,
 }
 
 /// The apps connected as `ctx`'s user, or as any user for an admin, the
@@ -399,7 +402,8 @@ struct AppRow {
 pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<ConnectedApp>, String> {
     let rows: Vec<AppRow> = sqlx::query_as(
         "SELECT g.id AS grant_id, c.kind, c.client_id, c.client_name, g.redirect_uri, \
-                g.user_id, u.username, g.last_used_at, g.allow_delete \
+                g.user_id, u.username, g.last_used_at, g.allow_delete, \
+                (g.allow_admin AND u.role = 'admin') AS allow_admin \
          FROM oauth_grants g \
          JOIN oauth_clients c ON c.client_id = g.client_id \
          JOIN users u ON u.id = g.user_id \
@@ -425,6 +429,7 @@ pub(crate) async fn apps_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Vec<Connec
                 owner: (!mine).then_some(row.username),
                 last_used_at: row.last_used_at,
                 allow_delete: row.allow_delete,
+                allow_admin: row.allow_admin,
                 mine,
             })
         })
@@ -484,6 +489,42 @@ pub(crate) async fn set_allow_delete_in(
         .await
         .map(|done| done.rows_affected() > 0)
         .map_err(|e| e.to_string())
+}
+
+/// Turns admin library access through grant `grant_id` on or off.
+/// Requires `ctx` to be an admin. Enabling is restricted to the caller's own grant (whose user
+/// row must hold `admin` role); turning it off is allowed for any admin on any grant.
+pub(crate) async fn set_allow_admin_in(
+    db: &SqlitePool,
+    ctx: &UserCtx,
+    grant_id: &str,
+    allowed: bool,
+) -> Result<bool, String> {
+    if !ctx.role.is_admin() {
+        return Ok(false);
+    }
+    if allowed {
+        sqlx::query(
+            "UPDATE oauth_grants SET allow_admin = 1 \
+             WHERE id = ? AND user_id = ? \
+               AND EXISTS (SELECT 1 FROM users u WHERE u.id = oauth_grants.user_id AND u.role = 'admin')",
+        )
+        .bind(grant_id)
+        .bind(&ctx.user_id)
+        .execute(db)
+        .await
+        .map(|done| done.rows_affected() > 0)
+        .map_err(|e| e.to_string())
+    } else {
+        sqlx::query("UPDATE oauth_grants SET allow_admin = 0 WHERE id = ? AND (user_id = ? OR ?)")
+            .bind(grant_id)
+            .bind(&ctx.user_id)
+            .bind(ctx.role.is_admin())
+            .execute(db)
+            .await
+            .map(|done| done.rows_affected() > 0)
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Ends grant `grant_id` with its tokens, for its own user or an admin (D7):
@@ -1610,6 +1651,7 @@ mod tests {
                 owner: None,
                 last_used_at: None,
                 allow_delete: false,
+                allow_admin: false,
                 mine: true
             }]
         );
@@ -1721,5 +1763,59 @@ mod tests {
             revoke_grant_in(&db, &ctx("u2", "eve", Role::User), &evas).await,
             Ok(true)
         );
+    }
+
+    #[tokio::test]
+    async fn only_an_admin_owner_turns_admin_library_access_on() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u1", "bob").await;
+        let user_token = access_token(&db, "u1", RESOURCE).await;
+        let user_grant = grant_of(&db, "u1").await;
+        let admin_token = access_token(&db, SEEDED_ADMIN_ID, RESOURCE).await;
+        let admin_grant = grant_of(&db, SEEDED_ADMIN_ID).await;
+
+        let bob = ctx("u1", "bob", Role::User);
+        let admin = ctx(SEEDED_ADMIN_ID, "admin", Role::Admin);
+
+        // Regular user cannot enable allow_admin on their own grant or admin's grant.
+        assert_eq!(set_allow_admin_in(&db, &bob, &user_grant, true).await, Ok(false));
+        assert_eq!(set_allow_admin_in(&db, &bob, &admin_grant, true).await, Ok(false));
+        // Admin cannot enable allow_admin on a regular user's grant.
+        assert_eq!(set_allow_admin_in(&db, &admin, &user_grant, true).await, Ok(false));
+        assert!(!access_in(&db, &user_token, now_unix()).await.unwrap().unwrap().allow_admin);
+
+        // Admin enables allow_admin on their own grant.
+        assert_eq!(set_allow_admin_in(&db, &admin, &admin_grant, true).await, Ok(true));
+        assert!(access_in(&db, &admin_token, now_unix()).await.unwrap().unwrap().allow_admin);
+
+        // Admin disables allow_admin on their own grant.
+        assert_eq!(set_allow_admin_in(&db, &admin, &admin_grant, false).await, Ok(true));
+        assert!(!access_in(&db, &admin_token, now_unix()).await.unwrap().unwrap().allow_admin);
+    }
+
+    #[tokio::test]
+    async fn demoting_an_admin_clears_allow_admin_on_their_grants() {
+        let db = test_db::migrated().await;
+        add_user(&db, "u2", "co_admin").await;
+        User::set_role_in(&db, "u2", Role::Admin).await.unwrap();
+        let token = access_token(&db, "u2", RESOURCE).await;
+        let grant = grant_of(&db, "u2").await;
+        let co_admin = ctx("u2", "co_admin", Role::Admin);
+
+        assert_eq!(set_allow_admin_in(&db, &co_admin, &grant, true).await, Ok(true));
+        assert!(access_in(&db, &token, now_unix()).await.unwrap().unwrap().allow_admin);
+
+        // Demote u2 to regular user: allow_admin is immediately cleared in DB and masked on reads.
+        User::set_role_in(&db, "u2", Role::User).await.unwrap();
+        let raw_flag: bool =
+            sqlx::query_scalar("SELECT allow_admin FROM oauth_grants WHERE id = ?")
+                .bind(&grant)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(!raw_flag);
+        assert!(!access_in(&db, &token, now_unix()).await.unwrap().unwrap().allow_admin);
+        let apps = apps_in(&db, &ctx("u2", "co_admin", Role::User)).await.unwrap();
+        assert!(!apps[0].allow_admin);
     }
 }

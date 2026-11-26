@@ -26,4 +26,9 @@ class MainActivity : ComponentActivity() {
             SoulbeetApp(viewModel = viewModel)
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        viewModel.reconnectConnect()
+    }
 }

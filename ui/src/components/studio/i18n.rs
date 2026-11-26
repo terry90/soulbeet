@@ -43,9 +43,9 @@ pub fn format_mix_title(summary: &ContextualMixSummary) -> String {
         "mix.moment.morning" => "Morning Lift",
         "mix.moment.focus" => "Deep Focus",
         "mix.moment.late_night" => "Late Night",
-        "mix.rolling.comfort" => "Comfort Mix",
-        "mix.rolling.weekly_radar" => "Weekly Radar",
-        "mix.rolling.deep_cuts" => "Deep Cuts",
+        "mix.rolling.conservative" | "mix.rolling.comfort" => "Comfort Zone",
+        "mix.rolling.balanced" | "mix.rolling.weekly_radar" => "Fresh Picks",
+        "mix.rolling.adventurous" | "mix.rolling.deep_cuts" => "Deep Cuts",
         other => {
             let tail = other.rsplit('.').next().unwrap_or(&summary.slug);
             return humanize_slug(tail);
@@ -116,13 +116,13 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
         "mix.moment.late_night" => {
             "Low-lit dream pop, trip hop, and midnight library favorites.".to_string()
         }
-        "mix.rolling.comfort" => {
+        "mix.rolling.conservative" | "mix.rolling.comfort" => {
             "High-rotation favorites and trusted genres from your library.".to_string()
         }
-        "mix.rolling.weekly_radar" => {
+        "mix.rolling.balanced" | "mix.rolling.weekly_radar" => {
             "Fresh recommendations tuned to your recent listening momentum.".to_string()
         }
-        "mix.rolling.deep_cuts" => {
+        "mix.rolling.adventurous" | "mix.rolling.deep_cuts" => {
             "Hidden gems and adventurous tracks beyond your usual rotation.".to_string()
         }
         _ => match summary.kind {
@@ -417,6 +417,21 @@ mod tests {
             format_mix_window_badge(&fr_noel).as_deref(),
             Some("NOV 20 – DEC 27 · AUTO-CLEANS JAN 5")
         );
+    }
+
+    #[test]
+    fn formats_rolling_mix_titles_for_backend_and_legacy_keys() {
+        for (key, expected) in [
+            ("mix.rolling.conservative", "Comfort Zone"),
+            ("mix.rolling.balanced", "Fresh Picks"),
+            ("mix.rolling.adventurous", "Deep Cuts"),
+            ("mix.rolling.comfort", "Comfort Zone"),
+            ("mix.rolling.weekly_radar", "Fresh Picks"),
+            ("mix.rolling.deep_cuts", "Deep Cuts"),
+        ] {
+            let summary = sample_summary("rolling", ContextualMixKind::Rolling, key, None);
+            assert_eq!(format_mix_title(&summary), expected, "key={key}");
+        }
     }
 
     #[test]

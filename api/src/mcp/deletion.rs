@@ -163,10 +163,11 @@ async fn find_duplicates(
             let page = Page::read(&args, json!({}))?;
             args.finish()?;
             let navi = navidrome_of(state, caller, Stage::LibraryCheck, &args).await?;
-            let resolver = FolderResolver::load_in(
+            let resolver = FolderResolver::load_for_in(
                 &state.db,
                 &caller.ctx.user_id,
                 state.navidrome_music_path.as_deref(),
+                caller.has_admin_access(),
             )
             .await;
             let groups = library::duplicates_with_folders(&navi, Some(&resolver))

@@ -315,15 +315,29 @@ impl User {
         id: &str,
         role: Role,
     ) -> Result<(), UserChangeError> {
+        let mut tx = db
+            .begin()
+            .await
+            .map_err(|e| UserChangeError::Db(e.to_string()))?;
         let done = sqlx::query(
             "UPDATE users SET role = ?1 WHERE id = ?2 AND (?1 = 'admin' OR role <> 'admin' \
              OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)",
         )
         .bind(role)
         .bind(id)
-        .execute(db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| UserChangeError::Db(e.to_string()))?;
+        if done.rows_affected() > 0 && role != Role::Admin {
+            sqlx::query("UPDATE oauth_grants SET allow_admin = 0 WHERE user_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| UserChangeError::Db(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| UserChangeError::Db(e.to_string()))?;
         Self::refusal_for_untouched(db, id, done.rows_affected()).await
     }
 

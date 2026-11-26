@@ -3,7 +3,10 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, FailureCode, RetryAdvice, Stage, RAW_MAX_CHARS, TEXT_MAX_CHARS};
+use shared::failure::{
+    cut_json, Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode, RAW_MAX_CHARS,
+    TEXT_MAX_CHARS,
+};
 use soulbeet::{DriverChoice, TagEdits};
 
 use super::args::Args;
@@ -20,6 +23,7 @@ use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::database_failure;
 use crate::core::delete_guard::{Guard, Origin};
+use crate::core::folders;
 use crate::core::time;
 use crate::core::tracks::inspect::{self, InspectedTrack};
 use crate::core::tracks::move_tracks::{self, MoveEntry, MoveItemError, MoveReport, MoveRequest};
@@ -84,10 +88,10 @@ pub(crate) const MOVE_TRACKS: ToolSpec = ToolSpec {
     title: "Move tracks between folders",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Moves up to {SONGS_PER_CALL} songs (song_ids) or one whole album (album_id, up to {ALBUM_MAX_TRACKS} tracks) from their current folder to target_folder_id (one of this user's folders from list_folders), preserving file bytes, filename, beets libraries, Navidrome song_id, ratings, stars, play counts and static playlists. Pass dry_run: true to preview checks, exact paths, duplicates, multi-user vetoes and partial-album split warnings without moving anything (dry_run does not need the file-management switch). ALWAYS ask the user for confirmation before calling move_tracks with dry_run: false. When moving a subset of an album across Navidrome libraries, Navidrome splits the album and may move album ratings/stars (Soulbeet restores the caller's album rating/star on the original album after scanning); show the warning and offer moving the whole album with album_id instead. Moving out of a shared folder into a non-shared folder across libraries runs the multi-user veto and refuses any track another listener rated, starred or kept in a static playlist. Duplicates already in target_folder_id are refused by default with both copies' facts; pass replace_existing: true only after the user agrees to replace the target copy (which runs the full delete guard and counts against the daily delete quota). Executing a move (dry_run: false) requires 'Allow managing library files (delete, move, re-tag)' switched on for this app in Settings > Users > Connected apps. Failure codes: {common}, {NAVIDROME_CODES}, permission_not_granted, unknown_handle, already_running, partial, and per song move_same_folder, move_target_exists, move_duplicate_in_target, move_failed, delete_path_unresolved, delete_outside_library, delete_not_a_track, delete_in_use, delete_blocked_by_other_user, delete_veto_unknown, delete_daily_limit.")
+        format!("Moves up to {SONGS_PER_CALL} songs (song_ids) or one whole album (album_id, up to {ALBUM_MAX_TRACKS} tracks) from their current folder to target_folder_id (a folder_id from list_folders; when 'Admin library access (all users' folders)' is enabled for an admin's app, this includes other users' private and shared folders as well as cross-user moves), preserving file bytes, filename, beets libraries, Navidrome song_id, ratings, stars, play counts and static playlists. Whenever multiple folders exist (personal, shared/common, or other users' folders for admins) and the user did not explicitly specify which target folder to move into, ask the user which folder they want before calling move_tracks; if target_folder_id is omitted, move_tracks answers folder_required with all accessible folders so you can ask the user. Pass dry_run: true to preview checks, exact paths, duplicates, multi-user vetoes and partial-album split warnings without moving anything (dry_run does not need the file-management switch). ALWAYS ask the user for confirmation before calling move_tracks with dry_run: false. When moving a subset of an album across Navidrome libraries, Navidrome splits the album and may move album ratings/stars (Soulbeet restores the caller's album rating/star on the original album after scanning); show the warning and offer moving the whole album with album_id instead. Moving out of a shared or multi-user-visible folder into a non-shared folder across libraries runs the multi-user veto and refuses any track another listener rated, starred or kept in a static playlist. Duplicates already in target_folder_id are refused by default with both copies' facts; pass replace_existing: true only after the user agrees to replace the target copy (which runs the full delete guard and counts against the daily delete quota). Executing a move (dry_run: false) requires 'Allow managing library files (delete, move, re-tag)' switched on for this app in Settings > Users > Connected apps. Failure codes: {common}, {NAVIDROME_CODES}, folder_required, permission_not_granted, unknown_handle, already_running, partial, and per song move_same_folder, move_target_exists, move_duplicate_in_target, move_failed, delete_path_unresolved, delete_outside_library, delete_not_a_track, delete_in_use, delete_blocked_by_other_user, delete_veto_unknown, delete_daily_limit.")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["target_folder_id"], "properties": {"song_ids": {"type": "array", "minItems": 1, "maxItems": 25, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "album_id": {"type": "string", "minLength": 1}, "target_folder_id": {"type": "string", "minLength": 1}, "dry_run": {"type": "boolean"}, "replace_existing": {"type": "boolean"}, "#,
+        r#"{"type": "object", "additionalProperties": false, "properties": {"song_ids": {"type": "array", "minItems": 1, "maxItems": 25, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "album_id": {"type": "string", "minLength": 1}, "target_folder_id": {"type": "string", "minLength": 1}, "dry_run": {"type": "boolean"}, "replace_existing": {"type": "boolean"}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -193,6 +197,7 @@ async fn inspect_tracks(
         state.navidrome_music_path.as_deref(),
         &caller.ctx,
         &song_ids,
+        caller.has_admin_access(),
     )
     .await
     {
@@ -238,29 +243,35 @@ async fn move_tracks(
     let read = || {
         let song_ids = args.opt_strings("song_ids", SONGS_PER_CALL)?;
         let album_id = args.opt_string("album_id")?;
-        let target_folder_id = args.string("target_folder_id")?;
+        let target_folder_id = args.opt_string("target_folder_id")?;
         let dry_run = args.opt_bool("dry_run")?.unwrap_or(false);
         let replace_existing = args.opt_bool("replace_existing")?.unwrap_or(false);
         let key = request_key(&args)?;
         args.finish()?;
         let selection = read_selection(&args, song_ids, album_id)?;
-        Ok::<_, ToolError>((
-            MoveRequest {
-                selection,
-                target_folder_id,
-                dry_run,
-                replace_existing,
-            },
-            key,
-        ))
+        Ok::<_, ToolError>((selection, target_folder_id, dry_run, replace_existing, key))
     };
-    let (req, key) = match read() {
+    let (selection, target_folder_id, dry_run, replace_existing, key) = match read() {
         Ok(r) => r,
         Err(e) => return failed(e),
     };
-    if !req.dry_run && !caller.allow_delete {
+    if !dry_run && !caller.allow_delete {
         return failed(deletion_off_at(Stage::Move));
     }
+
+    let admin_access = caller.has_admin_access();
+    let Some(target_folder_id) = target_folder_id else {
+        return folder_required_for_move(state, caller, admin_access).await;
+    };
+
+    let req = MoveRequest {
+        selection,
+        target_folder_id,
+        dry_run,
+        replace_existing,
+        admin_access,
+        allow_delete: caller.allow_delete,
+    };
 
     if req.dry_run {
         let guard = guard_of(state);
@@ -305,6 +316,84 @@ async fn move_tracks(
         }
     };
     keyed(&state.acquire, caller, MOVE_TRACKS.name, key, &call, work).await
+}
+
+async fn folder_required_for_move(
+    state: &ConnectionState,
+    caller: &McpCaller,
+    admin_access: bool,
+) -> CallToolResult {
+    let folder_list: Vec<Value> = if admin_access {
+        match folders::list_all_with_owners_in(&state.db).await {
+            Ok(all) => all
+                .into_iter()
+                .map(|row| {
+                    let is_own = row.folder.user_id == caller.ctx.user_id;
+                    json!({
+                        "folder_id": row.folder.id,
+                        "name": cut_json(row.folder.name, TEXT_MAX_CHARS),
+                        "owner": cut_json(row.owner, TEXT_MAX_CHARS),
+                        "shared": row.folder.shared,
+                        "is_own": is_own,
+                        "path": row.folder.path,
+                    })
+                })
+                .collect(),
+            Err(f) => return failed(upstream_error(f, Map::new(), None)),
+        }
+    } else {
+        match folders::list_in(&state.db, &caller.ctx).await {
+            Ok(own) => own
+                .into_iter()
+                .map(|f| {
+                    json!({
+                        "folder_id": f.id,
+                        "name": cut_json(f.name, TEXT_MAX_CHARS),
+                        "owner": cut_json(caller.ctx.username.clone(), TEXT_MAX_CHARS),
+                        "shared": f.shared,
+                        "is_own": true,
+                        "path": f.path,
+                    })
+                })
+                .collect(),
+            Err(f) => return failed(upstream_error(f, Map::new(), None)),
+        }
+    };
+
+    if folder_list.is_empty() {
+        let failure = Failure::new(
+            FailureCode::FolderRequired,
+            Stage::Input,
+            RetryAdvice::NeedsUser,
+            "No library folders are configured",
+        )
+        .with_user_action(UserAction::new(
+            UserActionCode::AddFolder,
+            "Add a library folder",
+            "Settings > Library",
+        ));
+        return failed(ToolError {
+            failure,
+            facts: Map::new(),
+            tried: vec![],
+            next: vec![],
+        });
+    }
+
+    let failure = Failure::new(
+        FailureCode::FolderRequired,
+        Stage::Input,
+        RetryAdvice::NeedsDecision,
+        "No target_folder_id was given. Ask the user which folder to move the track(s) into, then call move_tracks with target_folder_id.",
+    );
+    let mut facts = Map::new();
+    facts.insert("folders".into(), json!(folder_list));
+    failed(ToolError {
+        failure,
+        facts,
+        tried: vec![],
+        next: vec![NextCall::new("list_folders", json!({}))],
+    })
 }
 
 fn move_answer(req: &MoveRequest, report: MoveReport) -> CallToolResult {
@@ -1680,5 +1769,132 @@ mod tests {
         let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(dt.timestamp() as u64);
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(ts).unwrap();
+    }
+
+    #[tokio::test]
+    async fn move_tracks_without_target_folder_returns_folder_required() {
+        let lib = Library::new().await;
+        lib.folder("alice", "shared-music", "music/shared", true)
+            .await;
+        std::fs::create_dir_all(lib.root.join("music/shared")).unwrap();
+        let (app, token, _) = track_app(&lib, None, true).await;
+
+        let doc = document(
+            &call_tool(
+                app,
+                &token,
+                "move_tracks",
+                json!({"song_ids": ["s1"], "dry_run": true}),
+            )
+            .await,
+        );
+        assert_eq!(doc["ok"], false);
+        assert_eq!(doc["error"]["code"], "folder_required", "{doc}");
+        assert_eq!(doc["error"]["retry"], "needs_decision");
+        let folders = doc["error"]["facts"]["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert!(folders.iter().any(|f| f["folder_id"] == "shared-music"));
+    }
+
+    #[tokio::test]
+    async fn admin_with_allow_admin_can_inspect_and_move_other_users_track_into_shared_folder() {
+        let lib = Library::new().await;
+        // Make alice an admin and give her a shared folder; bob has a private track s-bob.
+        sqlx::query("UPDATE users SET role = 'admin' WHERE id = 'alice'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        lib.folder("alice", "shared-music", "music/shared", true)
+            .await;
+        std::fs::create_dir_all(lib.root.join("music/shared")).unwrap();
+        lib.song("s-bob", "bob/B/y.flac", b"audio");
+        let bob_file = lib.root.join("music/bob/B/y.flac");
+        // Hide s-bob from alice in Navidrome so admin fallback to bob's linked account is tested!
+        lib.fake.unsee("alice", "s-bob");
+
+        let navi = NavidromeStub::start();
+        let lib_path = lib.root.join("music").to_string_lossy().into_owned();
+        navi.answer("/rest/getUser", &[&user_role(true)]);
+        navi.answer("/api/song", &["[]"]);
+        navi.answer_when(
+            "/api/song",
+            "id=s-bob",
+            200,
+            &format!(
+                "[{}]",
+                native_song_json(
+                    "s-bob",
+                    "shared/B/y.flac",
+                    "Bob Track",
+                    5,
+                    1,
+                    &lib_path,
+                    "al-bob",
+                )
+            ),
+        );
+        navi.answer(
+            "/rest/getScanStatus",
+            &[
+                &scan_status(false, "2026-11-14T21:00:00Z"),
+                &scan_status(false, "2026-11-14T21:00:00Z"),
+                &scan_status(false, "2026-11-14T21:00:05Z"),
+            ],
+        );
+
+        let (app, token, _) = track_app(&lib, Some(&navi), true).await;
+
+        // Without allow_admin, alice cannot move into bob's folder or move bob's track.
+        let refused = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "move_tracks",
+                json!({"song_ids": ["s1"], "target_folder_id": "bob-music", "dry_run": true}),
+            )
+            .await,
+        );
+        assert_eq!(refused["error"]["code"], "permission_not_granted", "{refused}");
+        assert!(refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Admin library access (all users' folders)"));
+
+        // Enable allow_admin on alice's grant.
+        sqlx::query("UPDATE oauth_grants SET allow_admin = 1 WHERE user_id = 'alice'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+
+        // inspect_tracks finds s-bob via bob's linked account and shows bob's folder owner.
+        let inspected = document(
+            &call_tool(
+                app.clone(),
+                &token,
+                "inspect_tracks",
+                json!({"song_ids": ["s-bob"]}),
+            )
+            .await,
+        );
+        assert_eq!(inspected["ok"], true, "{inspected}");
+        assert_eq!(inspected["results"][0]["folder"]["folder_id"], "bob-music");
+        assert_eq!(inspected["results"][0]["folder"]["owner"], "bob");
+        assert_eq!(inspected["results"][0]["folder"]["is_own"], false);
+
+        // Moving bob's private track into a shared folder expands visibility and succeeds!
+        let moved = document(
+            &call_tool(
+                app,
+                &token,
+                "move_tracks",
+                json!({"song_ids": ["s-bob"], "target_folder_id": "shared-music", "dry_run": false}),
+            )
+            .await,
+        );
+        assert_eq!(moved["ok"], true, "{moved}");
+        assert_eq!(moved["results"][0]["status"], "moved");
+        assert_eq!(moved["results"][0]["source_folder"]["owner"], "bob");
+        assert!(!bob_file.exists());
+        assert!(lib.root.join("music/shared/B/y.flac").exists());
     }
 }

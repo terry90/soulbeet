@@ -45,6 +45,8 @@ pub struct ConnectedApp {
     pub owner: Option<String>,
     pub last_used_at: Option<i64>,
     pub allow_delete: bool,
+    #[serde(default)]
+    pub allow_admin: bool,
     /// The app is the caller's own.
     pub mine: bool,
 }

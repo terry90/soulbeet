@@ -178,6 +178,22 @@ pub(crate) fn folder_fields(
     })
 }
 
+/// Like `folder_fields`, adding `owner` and `is_own` for `list_folders`.
+pub(crate) fn owned_folder_fields(
+    f: &FolderFacts,
+    owner: &str,
+    is_own: bool,
+    default_folder_id: Option<&str>,
+    library_roots: &[PathBuf],
+) -> Value {
+    let mut val = folder_fields(f, if is_own { default_folder_id } else { None }, library_roots);
+    if let Value::Object(ref mut map) = val {
+        map.insert("owner".into(), json!(cut_json(owner.to_string(), TEXT_MAX_CHARS)));
+        map.insert("is_own".into(), json!(is_own));
+    }
+    val
+}
+
 /// The running instance's free-space reads.
 static FREE_SPACE: LazyLock<Arc<FreeSpaceReads>> =
     LazyLock::new(|| FreeSpaceReads::new(free_space, FREE_SPACE_WAIT));
@@ -367,6 +383,7 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
         },
         "default_folder_id": facts.default_folder_id,
         "deletion_enabled": caller.allow_delete,
+        "allow_admin": caller.has_admin_access(),
     }) else {
         unreachable!("an object literal is an object");
     };
@@ -458,11 +475,24 @@ mod tests {
                 "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "unfinished_jobs": 2}],
                 "running_batches_left_out": 0,
-                "deletion_enabled": false
+                "deletion_enabled": false,
+                "allow_admin": false
             })
         );
         assert_eq!(
             status_fields(&sample_facts(), &alice_caller(true))["deletion_enabled"],
+            true
+        );
+        let mut admin_caller = alice_caller(true);
+        admin_caller.ctx.role = crate::auth::Role::Admin;
+        admin_caller.allow_admin = false;
+        assert_eq!(
+            status_fields(&sample_facts(), &admin_caller)["allow_admin"],
+            false
+        );
+        admin_caller.allow_admin = true;
+        assert_eq!(
+            status_fields(&sample_facts(), &admin_caller)["allow_admin"],
             true
         );
     }

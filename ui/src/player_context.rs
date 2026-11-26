@@ -82,6 +82,13 @@ pub enum PlayerCommand {
         tracks: Vec<PlayerTrack>,
         start_index: usize,
     },
+    /// Loads a queue at `start_index`, either auto-playing (`PlaybackStatus::Loading`)
+    /// or staying paused (`PlaybackStatus::Paused`) when `autoplay == false`.
+    LoadQueue {
+        tracks: Vec<PlayerTrack>,
+        start_index: usize,
+        autoplay: bool,
+    },
     TogglePlayPause,
     /// Explicit user skip to the next track (advances even under `RepeatMode::One`).
     Next,
@@ -176,6 +183,25 @@ impl PlayerState {
                 let idx = (*start_index).min(tracks.len() - 1);
                 self.queue = tracks.clone();
                 self.select_queue_index(idx, PlaybackStatus::Loading, position_secs, duration_secs);
+                self.sync_shuffle_order();
+            }
+            PlayerCommand::LoadQueue {
+                tracks,
+                start_index,
+                autoplay,
+            } => {
+                if tracks.is_empty() {
+                    self.clear_playback(position_secs, duration_secs);
+                    return;
+                }
+                let idx = (*start_index).min(tracks.len() - 1);
+                let next_status = if *autoplay {
+                    PlaybackStatus::Loading
+                } else {
+                    PlaybackStatus::Paused
+                };
+                self.queue = tracks.clone();
+                self.select_queue_index(idx, next_status, position_secs, duration_secs);
                 self.sync_shuffle_order();
             }
             PlayerCommand::TogglePlayPause => match self.status {
@@ -686,10 +712,31 @@ impl PlayerContext {
         self.dispatch(PlayerCommand::PlayTrack(track));
     }
 
+    pub fn play_track_with_autoplay(&self, track: PlayerTrack, autoplay: bool) {
+        self.dispatch(PlayerCommand::LoadQueue {
+            tracks: vec![track],
+            start_index: 0,
+            autoplay,
+        });
+    }
+
     pub fn play_queue(&self, tracks: Vec<PlayerTrack>, start_index: usize) {
         self.dispatch(PlayerCommand::PlayQueue {
             tracks,
             start_index,
+        });
+    }
+
+    pub fn play_queue_with_autoplay(
+        &self,
+        tracks: Vec<PlayerTrack>,
+        start_index: usize,
+        autoplay: bool,
+    ) {
+        self.dispatch(PlayerCommand::LoadQueue {
+            tracks,
+            start_index,
+            autoplay,
         });
     }
 
@@ -1074,5 +1121,38 @@ mod tests {
         state.apply_local_command(&PlayerCommand::SetVolume(2.5), &mut pos, &mut dur);
         assert_eq!(state.volume, 1.0);
         assert!(!state.muted);
+    }
+
+    #[test]
+    fn load_queue_respects_autoplay_flag() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+
+        state.apply_local_command(
+            &PlayerCommand::LoadQueue {
+                tracks: vec![track("a", 180), track("b", 210)],
+                start_index: 1,
+                autoplay: false,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        assert_eq!(state.status, PlaybackStatus::Paused);
+        assert_eq!(state.queue_index, Some(1));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+        assert_eq!(dur, 210.0);
+
+        state.apply_local_command(
+            &PlayerCommand::LoadQueue {
+                tracks: vec![track("a", 180), track("b", 210)],
+                start_index: 0,
+                autoplay: true,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        assert_eq!(state.status, PlaybackStatus::Loading);
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("a"));
     }
 }

@@ -5,7 +5,10 @@ use shared::client::{
 };
 
 #[cfg(feature = "server")]
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+#[cfg(feature = "server")]
+static LRCLIB_FETCHER: LazyLock<LiveExtrasFetcher> = LazyLock::new(LiveExtrasFetcher::new);
 
 #[cfg(feature = "server")]
 use shared::client::{NavidromeSessionInfo, ServerCapabilities, TrackLyricLine};
@@ -22,7 +25,7 @@ use crate::core::curation::{
     LiveCurationNavidrome,
 };
 #[cfg(feature = "server")]
-use crate::core::delete_guard::Guard;
+use crate::core::delete_guard::{paths, rules, Guard};
 #[cfg(feature = "server")]
 use crate::core::discovery::DiscoveryEffects;
 #[cfg(feature = "server")]
@@ -30,7 +33,15 @@ use crate::core::index::ServerNavidrome;
 #[cfg(feature = "server")]
 use crate::core::library::{navidrome_failure, navidrome_for};
 #[cfg(feature = "server")]
+use crate::core::tracks::extras::{atomic_write_file, parse_lrc, ExtrasFetcher, LiveExtrasFetcher};
+#[cfg(feature = "server")]
+use crate::core::tracks::is_inside_discovery;
+#[cfg(feature = "server")]
+use crate::folder_policy::PolicyRows;
+#[cfg(feature = "server")]
 use crate::import_queue::IMPORT_QUEUE;
+#[cfg(feature = "server")]
+use crate::models::discovery_playlist::DiscoveryTrackRow;
 #[cfg(feature = "server")]
 use crate::models::user_settings::UserSettings;
 #[cfg(feature = "server")]
@@ -130,8 +141,11 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
     })
 }
 
-/// Fetches structured (synced) lyrics for `song_id` via OpenSubsonic `getLyricsBySongId`,
-/// falling back gracefully to legacy `getLyrics` when `artist` and `title` are provided.
+/// Fetches structured (synced) lyrics for `song_id` via OpenSubsonic `getLyricsBySongId`
+/// (with legacy `getLyrics` fallback), and falls back to LRCLIB when Navidrome returns no lyrics.
+/// When LRCLIB returns lyrics and the audio file resolves inside one of the caller's library
+/// folders without an existing `.lrc` sidecar, saves the sidecar best-effort so Navidrome serves
+/// it natively on future plays.
 #[get("/api/client/lyrics?song_id&artist&title", auth: AuthSession)]
 pub async fn get_track_lyrics(
     song_id: String,
@@ -146,7 +160,7 @@ pub async fn get_track_lyrics(
         .await
         .map_err(|e| failure_error(navidrome_failure(Stage::LibraryCheck, &e)))?;
 
-    Ok(lyrics
+    let mapped: Vec<TrackLyrics> = lyrics
         .into_iter()
         .map(|entry| TrackLyrics {
             display_artist: entry.display_artist,
@@ -163,7 +177,147 @@ pub async fn get_track_lyrics(
                 })
                 .collect(),
         })
-        .collect())
+        .filter(|entry| !entry.lines.is_empty())
+        .collect();
+
+    if !mapped.is_empty() {
+        return Ok(mapped);
+    }
+
+    // Fallback to LRCLIB using native Navidrome track metadata (or query params).
+    let native_song = navi.get_native_song(&song_id).await.ok().flatten();
+    let eff_artist = native_song
+        .as_ref()
+        .map(|s| s.artist.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| artist.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    let eff_title = native_song
+        .as_ref()
+        .map(|s| s.title.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    let eff_album = native_song
+        .as_ref()
+        .map(|s| s.album.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let eff_duration_s = native_song
+        .as_ref()
+        .filter(|s| s.duration > 0.0)
+        .map(|s| s.duration.round() as u32);
+
+    let (Some(eff_artist), Some(eff_title)) = (eff_artist, eff_title) else {
+        return Ok(vec![]);
+    };
+
+    let fetched = match LRCLIB_FETCHER
+        .fetch_lyrics(
+            &eff_artist,
+            &eff_title,
+            eff_album.as_deref(),
+            eff_duration_s,
+        )
+        .await
+    {
+        Ok(Some(f)) => f,
+        Ok(None) => return Ok(vec![]),
+        Err(e) => {
+            tracing::warn!(
+                "LRCLIB fallback failed for song {} ({} - {}): {}",
+                song_id,
+                eff_artist,
+                eff_title,
+                e
+            );
+            return Ok(vec![]);
+        }
+    };
+
+    let parsed = parse_lrc(
+        &fetched.content,
+        fetched.synced,
+        Some(eff_artist),
+        Some(eff_title),
+    );
+    if parsed.lines.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Best-effort: cache the .lrc sidecar next to the audio file when safely inside the user's
+    // own library folder and not already present. Never fail the HTTP response.
+    if let Some(native) = native_song {
+        cache_lrc_sidecar_best_effort(&auth.0, &native, fetched.content).await;
+    }
+
+    Ok(vec![parsed])
+}
+
+#[cfg(feature = "server")]
+async fn cache_lrc_sidecar_best_effort(
+    ctx: &crate::auth::UserCtx,
+    native: &soulbeet::navidrome::models::NativeSong,
+    content: String,
+) {
+    let user = ctx.id();
+    let Ok((audio_path, _)) = paths::local_file_learning(
+        &crate::db::DB,
+        native,
+        crate::config::CONFIG.navidrome_music_path(),
+        &user,
+    )
+    .await
+    else {
+        return;
+    };
+    if rules::audio_file(&audio_path).is_err() {
+        return;
+    }
+    let Ok(rows) = PolicyRows::load_in(&crate::db::DB).await else {
+        return;
+    };
+    let (policy_folders, _) = rows.inputs();
+    if rules::owning_folders(&audio_path, &policy_folders, &user).is_err() {
+        return;
+    }
+    if is_inside_discovery(&audio_path, &policy_folders) {
+        return;
+    }
+    let pending = DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, &ctx.user_id)
+        .await
+        .unwrap_or_default();
+    for track in &pending {
+        if track.song_id.as_deref() == Some(native.id.as_str()) {
+            return;
+        }
+        if tokio::fs::canonicalize(&track.path)
+            .await
+            .is_ok_and(|p| p == audio_path)
+        {
+            return;
+        }
+    }
+    let lrc_path = audio_path.with_extension("lrc");
+    // Use symlink_metadata (does not follow symlinks) so even a dangling symlink is never
+    // overwritten or followed.
+    if tokio::fs::symlink_metadata(&lrc_path).await.is_ok() {
+        return;
+    }
+    let write_path = lrc_path.clone();
+    let bytes = content.into_bytes();
+    match tokio::task::spawn_blocking(move || atomic_write_file(&write_path, &bytes)).await {
+        Ok(Ok(())) => {
+            tracing::info!("Cached fetched LRCLIB sidecar at {}", lrc_path.display());
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(
+                "Skipped caching LRCLIB sidecar at {}: {}",
+                lrc_path.display(),
+                e
+            );
+        }
+        Err(e) => {
+            tracing::debug!("LRCLIB sidecar write task failed: {}", e);
+        }
+    }
 }
 
 /// Promotes a Pending Discovery track to the permanent library (raising rating >= promote

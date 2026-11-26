@@ -104,6 +104,7 @@ fn StudioShellContent() -> Element {
             song_count: p.song_count,
             is_smart: p.is_smart,
             is_offline_pinned: false,
+            category: p.category,
         })
         .collect();
 
@@ -132,6 +133,7 @@ fn StudioShellContent() -> Element {
                     on_navigate: move |section| navigate_to_section(nav, section),
                     offline_only,
                     on_toggle_offline: move |next| player.set_offline_only(next),
+                    show_offline_toggle: false,
                     active_transfers_count: active_transfers,
                     pinned_seasonal,
                     on_open_seasonal: move |_slug| {
@@ -153,6 +155,7 @@ fn StudioShellContent() -> Element {
                         active: active_section,
                         offline_only,
                         on_toggle_offline: move |next| player.set_offline_only(next),
+                        show_offline_toggle: false,
                         on_open_palette: move |_| studio.cmdk_open.set(true),
                         on_open_downloads: move |_| studio.downloads_drawer_open.toggle(),
                         on_downloads_toggle_mounted: move |data| {
@@ -210,6 +213,7 @@ fn StudioShellContent() -> Element {
                     inspected_track: (studio.inspected_track)(),
                     lyrics: (studio.lyrics)(),
                     lyrics_loading: (studio.lyrics_loading)(),
+                    lyrics_fetched: (studio.lyrics_fetched)(),
                     lyrics_error: (studio.lyrics_error)(),
                     on_fetch_lyrics: move |_| {
                         if let Some(track) = player.current_track() {
@@ -242,6 +246,7 @@ fn StudioShellContent() -> Element {
                     studio.send_connect(ConnectClientMessage::ClaimActive);
                 },
                 on_transfer_to_device: move |target_id| {
+                    let has_track = player.current_track().is_some();
                     let from_id = studio.local_device_id.peek().clone();
                     let snapshot = build_connect_snapshot(player);
                     studio.send_connect(ConnectClientMessage::SendCommand {
@@ -254,7 +259,11 @@ fn StudioShellContent() -> Element {
                     if player.is_playing() {
                         player.toggle_play_pause();
                     }
-                    studio.show_toast("Playback handed off to remote device");
+                    if has_track {
+                        studio.show_toast("Playback handed off to remote device");
+                    } else {
+                        studio.show_toast("Switched active device");
+                    }
                 },
             }
 
@@ -488,18 +497,6 @@ fn build_palette_commands(
             keywords: vec!["volume".into(), "silence".into()],
         },
         PaletteCommand {
-            id: "toggle.offline".into(),
-            label: if player.offline_only() {
-                "Disable Offline Only Mode".into()
-            } else {
-                "Enable Offline Only Mode".into()
-            },
-            subtitle: Some("Filter views to locally cached tracks".into()),
-            category: PaletteCategory::Playback,
-            shortcut: None,
-            keywords: vec!["cache".into(), "network".into()],
-        },
-        PaletteCommand {
             id: "drawer.lyrics".into(),
             label: "Toggle Synced Lyrics".into(),
             subtitle: None,
@@ -602,7 +599,6 @@ fn execute_palette_command(
         "play.next" => player.next(),
         "play.prev" => player.previous(),
         "play.mute" => player.toggle_mute(),
-        "toggle.offline" => player.toggle_offline_only(),
         "drawer.lyrics" => studio.toggle_drawer(DrawerTab::Lyrics),
         "drawer.queue" => studio.toggle_drawer(DrawerTab::Queue),
         "drawer.inspector" => studio.toggle_drawer(DrawerTab::Inspector),
