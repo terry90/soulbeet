@@ -2,6 +2,24 @@ use dioxus::prelude::*;
 
 use crate::IconWifiOff;
 
+/// Formats the optional cached telemetry suffix for [`OfflineTogglePill`].
+pub fn format_offline_telemetry(
+    cached_tracks: Option<u32>,
+    cache_size_label: Option<&str>,
+    compact: bool,
+) -> Option<String> {
+    if compact {
+        return None;
+    }
+    let clean_size = cache_size_label.map(str::trim).filter(|s| !s.is_empty());
+    match (cached_tracks, clean_size) {
+        (Some(count), Some(size)) => Some(format!("{count} · {size}")),
+        (Some(count), None) => Some(format!("{count} cached")),
+        (None, Some(size)) => Some(size.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Compact global toggle pill for Soulbeet's Offline Only mode.
 ///
 /// When enabled, highlights with `beet-leaf` tonal surface and status indicator dot,
@@ -27,16 +45,7 @@ pub fn OfflineTogglePill(
         "bg-beet-text-disabled"
     };
 
-    let telemetry = if compact {
-        None
-    } else {
-        match (cached_tracks, cache_size_label.as_deref()) {
-            (Some(count), Some(size)) => Some(format!("{count} · {size}")),
-            (Some(count), None) => Some(format!("{count} cached")),
-            (None, Some(size)) => Some(size.to_string()),
-            (None, None) => None,
-        }
-    };
+    let telemetry = format_offline_telemetry(cached_tracks, cache_size_label.as_deref(), compact);
 
     let aria_label = if offline_only {
         "Offline only mode enabled. Click to go back online."
@@ -62,5 +71,27 @@ pub fn OfflineTogglePill(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_whitespace_only_cache_size_label() {
+        assert_eq!(
+            format_offline_telemetry(Some(42), Some("   "), false),
+            Some("42 cached".to_string())
+        );
+        assert_eq!(
+            format_offline_telemetry(Some(42), Some(" 4.2 GB "), false),
+            Some("42 · 4.2 GB".to_string())
+        );
+        assert_eq!(format_offline_telemetry(None, Some("   "), false), None);
+        assert_eq!(
+            format_offline_telemetry(Some(42), Some("4.2 GB"), true),
+            None
+        );
     }
 }

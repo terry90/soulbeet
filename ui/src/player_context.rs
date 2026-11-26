@@ -17,6 +17,10 @@ impl PlaybackStatus {
         matches!(self, Self::Playing)
     }
 
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Playing | Self::Loading | Self::Buffering)
+    }
+
     pub fn is_busy(&self) -> bool {
         matches!(self, Self::Loading | Self::Buffering)
     }
@@ -77,7 +81,10 @@ pub enum PlayerCommand {
         start_index: usize,
     },
     TogglePlayPause,
+    /// Explicit user skip to the next track (advances even under `RepeatMode::One`).
     Next,
+    /// Natural end-of-track event from the audio engine (obeys `RepeatMode::One`).
+    TrackEnded,
     Previous,
     Seek(f64),
     SetVolume(f32),
@@ -93,14 +100,16 @@ pub enum PlayerCommand {
 
 /// Reactive playback state shared across navigation shells, player bars, queues,
 /// and track rows.
+///
+/// High-frequency progress ticks (`position_secs` / `duration_secs`) live on dedicated
+/// signals inside [`PlayerContext`] so 4–10Hz audio time updates do not re-render
+/// unrelated components subscribing to `PlayerState`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerState {
     pub current_track: Option<PlayerTrack>,
     pub queue: Vec<PlayerTrack>,
-    pub queue_index: usize,
+    pub queue_index: Option<usize>,
     pub status: PlaybackStatus,
-    pub position_secs: f64,
-    pub duration_secs: f64,
     pub volume: f32,
     pub muted: bool,
     pub shuffle: bool,
@@ -114,10 +123,8 @@ impl Default for PlayerState {
         Self {
             current_track: None,
             queue: Vec::new(),
-            queue_index: 0,
+            queue_index: None,
             status: PlaybackStatus::Idle,
-            position_secs: 0.0,
-            duration_secs: 0.0,
             volume: 1.0,
             muted: false,
             shuffle: false,
@@ -130,17 +137,23 @@ impl Default for PlayerState {
 
 impl PlayerState {
     /// Applies deterministic queue, transport, and preference transitions locally.
-    /// Concrete backends (`web` HTML5 `<audio>`, `desktop` `libmpv`) can call this to keep
-    /// UI state synchronized immediately while issuing side effects to the audio engine.
-    pub fn apply_local_command(&mut self, command: &PlayerCommand) {
+    /// Concrete backends (`web` HTML5 `<audio>`, `desktop` `libmpv`) can call this alongside
+    /// their clock signals to keep UI state synchronized immediately while issuing side effects
+    /// to the audio engine.
+    pub fn apply_local_command(
+        &mut self,
+        command: &PlayerCommand,
+        position_secs: &mut f64,
+        duration_secs: &mut f64,
+    ) {
         match command {
             PlayerCommand::PlayTrack(track) => {
                 let dur = track.duration_secs.map(f64::from).unwrap_or(0.0);
                 self.queue = vec![track.clone()];
-                self.queue_index = 0;
+                self.queue_index = Some(0);
                 self.current_track = Some(track.clone());
-                self.position_secs = 0.0;
-                self.duration_secs = dur;
+                *position_secs = 0.0;
+                *duration_secs = dur;
                 self.status = PlaybackStatus::Loading;
             }
             PlayerCommand::PlayQueue {
@@ -148,75 +161,79 @@ impl PlayerState {
                 start_index,
             } => {
                 if tracks.is_empty() {
-                    self.clear_playback();
+                    self.clear_playback(position_secs, duration_secs);
                     return;
                 }
                 let idx = (*start_index).min(tracks.len() - 1);
-                let current = tracks[idx].clone();
-                let dur = current.duration_secs.map(f64::from).unwrap_or(0.0);
                 self.queue = tracks.clone();
-                self.queue_index = idx;
-                self.current_track = Some(current);
-                self.position_secs = 0.0;
-                self.duration_secs = dur;
-                self.status = PlaybackStatus::Loading;
+                self.select_queue_index(idx, PlaybackStatus::Loading, position_secs, duration_secs);
             }
             PlayerCommand::TogglePlayPause => match self.status {
                 PlaybackStatus::Playing => self.status = PlaybackStatus::Paused,
                 PlaybackStatus::Paused => self.status = PlaybackStatus::Playing,
-                PlaybackStatus::Idle if self.current_track.is_some() => {
-                    self.status = PlaybackStatus::Loading;
+                PlaybackStatus::Idle => {
+                    if self.current_track.is_some() {
+                        self.status = PlaybackStatus::Loading;
+                    } else if !self.queue.is_empty() {
+                        self.select_queue_index(
+                            0,
+                            PlaybackStatus::Loading,
+                            position_secs,
+                            duration_secs,
+                        );
+                    }
                 }
                 _ => {}
             },
             PlayerCommand::Next => {
-                if self.queue.is_empty() {
-                    return;
-                }
-                if self.repeat == RepeatMode::One {
-                    self.position_secs = 0.0;
-                    self.status = PlaybackStatus::Loading;
-                    return;
-                }
-                if self.queue_index + 1 < self.queue.len() {
-                    self.select_queue_index(self.queue_index + 1);
-                } else if self.repeat == RepeatMode::All {
-                    self.select_queue_index(0);
-                } else {
-                    self.position_secs = self.duration_secs;
-                    self.status = PlaybackStatus::Paused;
-                }
+                self.advance_next(false, position_secs, duration_secs);
+            }
+            PlayerCommand::TrackEnded => {
+                self.advance_next(true, position_secs, duration_secs);
             }
             PlayerCommand::Previous => {
                 if self.queue.is_empty() {
                     return;
                 }
-                if self.position_secs > 3.0 {
-                    self.position_secs = 0.0;
+                if *position_secs > 3.0 {
+                    *position_secs = 0.0;
                     return;
                 }
-                if self.queue_index > 0 {
-                    self.select_queue_index(self.queue_index - 1);
+                let cur = self.queue_index.unwrap_or(0);
+                if cur > 0 {
+                    self.select_queue_index(
+                        cur - 1,
+                        PlaybackStatus::Loading,
+                        position_secs,
+                        duration_secs,
+                    );
                 } else if self.repeat == RepeatMode::All {
-                    self.select_queue_index(self.queue.len() - 1);
+                    let last = self.queue.len() - 1;
+                    self.select_queue_index(
+                        last,
+                        PlaybackStatus::Loading,
+                        position_secs,
+                        duration_secs,
+                    );
                 } else {
-                    self.position_secs = 0.0;
+                    *position_secs = 0.0;
                 }
             }
             PlayerCommand::Seek(secs) => {
-                let target = if secs.is_finite() { *secs } else { 0.0 };
-                self.position_secs = if self.duration_secs > 0.0 {
-                    target.clamp(0.0, self.duration_secs)
+                if !secs.is_finite() {
+                    return;
+                }
+                *position_secs = if *duration_secs > 0.0 {
+                    secs.clamp(0.0, *duration_secs)
                 } else {
-                    target.max(0.0)
+                    secs.max(0.0)
                 };
             }
             PlayerCommand::SetVolume(volume) => {
-                let clamped = if volume.is_finite() {
-                    volume.clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
+                if !volume.is_finite() {
+                    return;
+                }
+                let clamped = volume.clamp(0.0, 1.0);
                 self.volume = clamped;
                 if clamped > 0.0 {
                     self.muted = false;
@@ -234,13 +251,27 @@ impl PlayerState {
             PlayerCommand::EnqueueNext(track) => {
                 if self.queue.is_empty() {
                     self.queue.push(track.clone());
+                    let keep_status = self.status.clone();
+                    self.select_queue_index(0, keep_status, position_secs, duration_secs);
+                } else if self.current_track.is_none() {
+                    self.queue.insert(0, track.clone());
+                    let keep_status = self.status.clone();
+                    self.select_queue_index(0, keep_status, position_secs, duration_secs);
                 } else {
-                    let insert_at = (self.queue_index + 1).min(self.queue.len());
+                    let insert_at = self
+                        .queue_index
+                        .map_or(0, |idx| (idx + 1).min(self.queue.len()));
                     self.queue.insert(insert_at, track.clone());
                 }
             }
             PlayerCommand::EnqueueLast(track) => {
+                let was_empty = self.queue.is_empty();
                 self.queue.push(track.clone());
+                if was_empty || self.current_track.is_none() {
+                    let idx = if was_empty { 0 } else { self.queue.len() - 1 };
+                    let keep_status = self.status.clone();
+                    self.select_queue_index(idx, keep_status, position_secs, duration_secs);
+                }
             }
             PlayerCommand::RemoveFromQueue(idx) => {
                 if *idx >= self.queue.len() {
@@ -248,16 +279,37 @@ impl PlayerState {
                 }
                 self.queue.remove(*idx);
                 if self.queue.is_empty() {
-                    self.clear_playback();
-                } else if *idx < self.queue_index {
-                    self.queue_index -= 1;
-                } else if *idx == self.queue_index {
-                    let next_idx = (*idx).min(self.queue.len() - 1);
-                    self.select_queue_index(next_idx);
+                    self.clear_playback(position_secs, duration_secs);
+                    return;
+                }
+                let Some(cur) = self.queue_index else {
+                    return;
+                };
+                if *idx < cur {
+                    self.queue_index = Some(cur - 1);
+                } else if *idx == cur {
+                    let next_status = if self.status.is_active() {
+                        PlaybackStatus::Loading
+                    } else {
+                        self.status.clone()
+                    };
+                    if *idx < self.queue.len() {
+                        self.select_queue_index(*idx, next_status, position_secs, duration_secs);
+                    } else if self.repeat == RepeatMode::All {
+                        self.select_queue_index(0, next_status, position_secs, duration_secs);
+                    } else {
+                        // Removed the last track under Repeat::Off / Repeat::One: stop cleanly
+                        // without jumping backwards or unexpectedly auto-playing an earlier track.
+                        self.current_track = None;
+                        self.queue_index = None;
+                        self.status = PlaybackStatus::Idle;
+                        *position_secs = 0.0;
+                        *duration_secs = 0.0;
+                    }
                 }
             }
             PlayerCommand::ClearQueue => {
-                self.clear_playback();
+                self.clear_playback(position_secs, duration_secs);
             }
             PlayerCommand::SetOfflineOnly(enabled) => {
                 self.offline_only = *enabled;
@@ -265,43 +317,119 @@ impl PlayerState {
         }
     }
 
-    fn select_queue_index(&mut self, index: usize) {
-        if let Some(track) = self.queue.get(index).cloned() {
-            let dur = track.duration_secs.map(f64::from).unwrap_or(0.0);
-            self.queue_index = index;
-            self.current_track = Some(track);
-            self.position_secs = 0.0;
-            self.duration_secs = dur;
+    fn advance_next(
+        &mut self,
+        obey_repeat_one: bool,
+        position_secs: &mut f64,
+        duration_secs: &mut f64,
+    ) {
+        if self.queue.is_empty() {
+            return;
+        }
+        if obey_repeat_one && self.repeat == RepeatMode::One && self.current_track.is_some() {
+            *position_secs = 0.0;
             self.status = PlaybackStatus::Loading;
+            return;
+        }
+        match self.queue_index {
+            Some(cur) if cur + 1 < self.queue.len() => {
+                self.select_queue_index(
+                    cur + 1,
+                    PlaybackStatus::Loading,
+                    position_secs,
+                    duration_secs,
+                );
+            }
+            None => {
+                self.select_queue_index(0, PlaybackStatus::Loading, position_secs, duration_secs);
+            }
+            Some(_) if self.repeat == RepeatMode::All => {
+                self.select_queue_index(0, PlaybackStatus::Loading, position_secs, duration_secs);
+            }
+            Some(_) => {
+                *position_secs = *duration_secs;
+                self.status = PlaybackStatus::Paused;
+            }
         }
     }
 
-    fn clear_playback(&mut self) {
+    fn select_queue_index(
+        &mut self,
+        index: usize,
+        next_status: PlaybackStatus,
+        position_secs: &mut f64,
+        duration_secs: &mut f64,
+    ) {
+        if let Some(track) = self.queue.get(index).cloned() {
+            let dur = track.duration_secs.map(f64::from).unwrap_or(0.0);
+            self.queue_index = Some(index);
+            self.current_track = Some(track);
+            *position_secs = 0.0;
+            *duration_secs = dur;
+            self.status = next_status;
+        }
+    }
+
+    fn clear_playback(&mut self, position_secs: &mut f64, duration_secs: &mut f64) {
         self.queue.clear();
-        self.queue_index = 0;
+        self.queue_index = None;
         self.current_track = None;
-        self.position_secs = 0.0;
-        self.duration_secs = 0.0;
+        *position_secs = 0.0;
+        *duration_secs = 0.0;
         self.status = PlaybackStatus::Idle;
     }
 }
 
-/// Shared Dioxus context exposing reactive playback state and command dispatch.
+/// Shared Dioxus context exposing reactive playback state, isolated high-frequency clock
+/// signals (`position_secs` / `duration_secs`), and command dispatch.
 #[derive(Clone, Copy)]
 pub struct PlayerContext {
     state: Signal<PlayerState>,
+    position_secs: Signal<f64>,
+    duration_secs: Signal<f64>,
     dispatcher: Callback<PlayerCommand>,
 }
 
 impl PlayerContext {
-    pub fn new(state: Signal<PlayerState>, dispatcher: Callback<PlayerCommand>) -> Self {
-        Self { state, dispatcher }
+    pub fn new(
+        state: Signal<PlayerState>,
+        position_secs: Signal<f64>,
+        duration_secs: Signal<f64>,
+        dispatcher: Callback<PlayerCommand>,
+    ) -> Self {
+        Self {
+            state,
+            position_secs,
+            duration_secs,
+            dispatcher,
+        }
     }
 
     /// Underlying state signal for platform backends (`web`, `desktop`) to push
-    /// timeupdate, buffering, track-end, or Connect device updates.
+    /// track, queue, status, or Connect device updates.
     pub fn state_signal(&self) -> Signal<PlayerState> {
         self.state
+    }
+
+    /// Dedicated high-frequency playback position signal (isolated from `PlayerState`
+    /// so progress ticks only re-render scrubbers and timestamp labels).
+    pub fn position_signal(&self) -> Signal<f64> {
+        self.position_secs
+    }
+
+    /// Dedicated track duration signal in seconds.
+    pub fn duration_signal(&self) -> Signal<f64> {
+        self.duration_secs
+    }
+
+    /// Updates playback progress clock without notifying `PlayerState` subscribers.
+    pub fn set_progress(&mut self, position: f64, duration: f64) {
+        if position.is_finite() {
+            self.position_secs.set(position.max(0.0));
+        }
+        if duration.is_finite() {
+            self.duration_secs.set(duration.max(0.0));
+        }
     }
 
     /// Returns a cloned snapshot of the current playback state, subscribing the caller.
@@ -340,16 +468,16 @@ impl PlayerContext {
         self.state.read().queue.clone()
     }
 
-    pub fn queue_index(&self) -> usize {
+    pub fn queue_index(&self) -> Option<usize> {
         self.state.read().queue_index
     }
 
     pub fn position_secs(&self) -> f64 {
-        self.state.read().position_secs
+        *self.position_secs.read()
     }
 
     pub fn duration_secs(&self) -> f64 {
-        self.state.read().duration_secs
+        *self.duration_secs.read()
     }
 
     pub fn volume(&self) -> f32 {
@@ -397,6 +525,10 @@ impl PlayerContext {
 
     pub fn next(&self) {
         self.dispatch(PlayerCommand::Next);
+    }
+
+    pub fn track_ended(&self) {
+        self.dispatch(PlayerCommand::TrackEnded);
     }
 
     pub fn previous(&self) {
@@ -463,25 +595,47 @@ pub fn try_use_player() -> Option<PlayerContext> {
 #[component]
 pub fn PlayerProvider(
     state: Signal<PlayerState>,
+    position_secs: Signal<f64>,
+    duration_secs: Signal<f64>,
     on_command: Callback<PlayerCommand>,
     children: Element,
 ) -> Element {
-    use_context_provider(|| PlayerContext::new(state, on_command));
+    use_context_provider(|| PlayerContext::new(state, position_secs, duration_secs, on_command));
     rsx! { {children} }
 }
 
 /// Self-contained local provider for previews, tests, and offline/noop shells.
-/// Applies all commands deterministically to local reactive state.
+/// Applies all commands deterministically to local reactive state and clock signals.
 #[component]
 pub fn LocalPlayerProvider(
     #[props(default)] initial_state: Option<PlayerState>,
     children: Element,
 ) -> Element {
+    let initial_dur = initial_state
+        .as_ref()
+        .and_then(|s| s.current_track.as_ref())
+        .and_then(|t| t.duration_secs)
+        .map(f64::from)
+        .unwrap_or(0.0);
+
     let mut state = use_signal(move || initial_state.clone().unwrap_or_default());
+    let mut position_secs = use_signal(|| 0.0f64);
+    let mut duration_secs = use_signal(move || initial_dur);
+
     let dispatcher = use_callback(move |cmd: PlayerCommand| {
-        state.write().apply_local_command(&cmd);
+        let mut pos = *position_secs.peek();
+        let mut dur = *duration_secs.peek();
+        let (prev_pos, prev_dur) = (pos, dur);
+        state.write().apply_local_command(&cmd, &mut pos, &mut dur);
+        if (pos - prev_pos).abs() > f64::EPSILON {
+            position_secs.set(pos);
+        }
+        if (dur - prev_dur).abs() > f64::EPSILON {
+            duration_secs.set(dur);
+        }
     });
-    use_context_provider(|| PlayerContext::new(state, dispatcher));
+
+    use_context_provider(|| PlayerContext::new(state, position_secs, duration_secs, dispatcher));
     rsx! { {children} }
 }
 
@@ -502,110 +656,186 @@ mod tests {
     #[test]
     fn play_queue_clamps_start_index_and_sets_metadata() {
         let mut state = PlayerState::default();
-        state.apply_local_command(&PlayerCommand::PlayQueue {
-            tracks: vec![track("a", 180), track("b", 240)],
-            start_index: 99,
-        });
-        assert_eq!(state.queue_index, 1);
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 180), track("b", 240)],
+                start_index: 99,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        assert_eq!(state.queue_index, Some(1));
         assert_eq!(state.current_track.as_ref().unwrap().id, "b");
-        assert_eq!(state.duration_secs, 240.0);
+        assert_eq!(dur, 240.0);
         assert_eq!(state.status, PlaybackStatus::Loading);
     }
 
     #[test]
-    fn next_and_previous_respect_repeat_modes_and_3s_restart_rule() {
+    fn track_ended_obeys_repeat_one_while_explicit_next_advances() {
         let mut state = PlayerState::default();
-        state.apply_local_command(&PlayerCommand::PlayQueue {
-            tracks: vec![track("a", 100), track("b", 200)],
-            start_index: 0,
-        });
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 200)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.repeat = RepeatMode::One;
+        pos = 95.0;
 
-        // Advance to second track
-        state.apply_local_command(&PlayerCommand::Next);
-        assert_eq!(state.queue_index, 1);
+        // TrackEnded restarts current track under RepeatMode::One
+        state.apply_local_command(&PlayerCommand::TrackEnded, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().unwrap().id, "a");
+        assert_eq!(pos, 0.0);
+
+        // Explicit Next skips past current track even under RepeatMode::One
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
         assert_eq!(state.current_track.as_ref().unwrap().id, "b");
+    }
+
+    #[test]
+    fn next_and_previous_respect_repeat_all_and_3s_restart_rule() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 200)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
 
         // Past end with Repeat::Off pauses at end of duration
-        state.apply_local_command(&PlayerCommand::Next);
-        assert_eq!(state.queue_index, 1);
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
         assert_eq!(state.status, PlaybackStatus::Paused);
-        assert_eq!(state.position_secs, 200.0);
+        assert_eq!(pos, 200.0);
 
         // Previous when position > 3s restarts current track instead of skipping back
-        state.apply_local_command(&PlayerCommand::Previous);
-        assert_eq!(state.queue_index, 1);
-        assert_eq!(state.position_secs, 0.0);
+        state.apply_local_command(&PlayerCommand::Previous, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
+        assert_eq!(pos, 0.0);
 
         // Previous at 0s moves back to first track
-        state.apply_local_command(&PlayerCommand::Previous);
-        assert_eq!(state.queue_index, 0);
-        assert_eq!(state.current_track.as_ref().unwrap().id, "a");
+        state.apply_local_command(&PlayerCommand::Previous, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(0));
 
         // Repeat::All wraps around both directions
-        state.apply_local_command(&PlayerCommand::CycleRepeat);
+        state.apply_local_command(&PlayerCommand::CycleRepeat, &mut pos, &mut dur);
         assert_eq!(state.repeat, RepeatMode::All);
-        state.apply_local_command(&PlayerCommand::Previous);
-        assert_eq!(state.queue_index, 1);
-        state.apply_local_command(&PlayerCommand::Next);
-        assert_eq!(state.queue_index, 0);
-
-        // Repeat::One restarts same track on Next
-        state.apply_local_command(&PlayerCommand::CycleRepeat);
-        assert_eq!(state.repeat, RepeatMode::One);
-        state.position_secs = 42.0;
-        state.apply_local_command(&PlayerCommand::Next);
-        assert_eq!(state.queue_index, 0);
-        assert_eq!(state.position_secs, 0.0);
+        state.apply_local_command(&PlayerCommand::Previous, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(0));
     }
 
     #[test]
-    fn enqueue_and_remove_keep_queue_index_consistent() {
+    fn enqueue_on_empty_queue_selects_track_without_autoplaying() {
         let mut state = PlayerState::default();
-        state.apply_local_command(&PlayerCommand::PlayQueue {
-            tracks: vec![track("a", 100), track("b", 120)],
-            start_index: 0,
-        });
-        state.apply_local_command(&PlayerCommand::EnqueueNext(track("next", 90)));
-        state.apply_local_command(&PlayerCommand::EnqueueLast(track("last", 150)));
-        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "next", "b", "last"]);
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::EnqueueLast(track("a", 150)),
+            &mut pos,
+            &mut dur,
+        );
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().unwrap().id, "a");
+        assert_eq!(dur, 150.0);
+        assert_eq!(state.status, PlaybackStatus::Idle);
 
-        // Move to index 2 ("b") and remove index 0 ("a") -> index shifts to 1 ("b")
-        state.queue_index = 2;
-        state.current_track = Some(state.queue[2].clone());
-        state.apply_local_command(&PlayerCommand::RemoveFromQueue(0));
-        assert_eq!(state.queue_index, 1);
-        assert_eq!(state.current_track.as_ref().unwrap().id, "b");
+        // TogglePlayPause starts the queued track cleanly
+        state.apply_local_command(&PlayerCommand::TogglePlayPause, &mut pos, &mut dur);
+        assert_eq!(state.status, PlaybackStatus::Loading);
+    }
 
-        // Removing the currently playing item selects the next available item
-        state.apply_local_command(&PlayerCommand::RemoveFromQueue(1));
-        assert_eq!(state.queue_index, 1);
-        assert_eq!(state.current_track.as_ref().unwrap().id, "last");
+    #[test]
+    fn remove_from_queue_preserves_paused_state_and_stops_cleanly_at_end() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 120), track("c", 140)],
+                start_index: 1,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Paused;
 
-        // Clearing queue resets to Idle
-        state.apply_local_command(&PlayerCommand::ClearQueue);
-        assert!(state.queue.is_empty());
+        // Removing active track while Paused stays Paused (never auto-plays!)
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(1), &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(1));
+        assert_eq!(state.current_track.as_ref().unwrap().id, "c");
+        assert_eq!(state.status, PlaybackStatus::Paused);
+
+        // Removing the last track under Repeat::Off stops cleanly instead of jumping back to "a"
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(1), &mut pos, &mut dur);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue_index, None);
         assert!(state.current_track.is_none());
         assert_eq!(state.status, PlaybackStatus::Idle);
+
+        // Removing the last track under Repeat::All wraps cleanly to index 0
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 120)],
+                start_index: 1,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Playing;
+        state.repeat = RepeatMode::All;
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(1), &mut pos, &mut dur);
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().unwrap().id, "a");
+        assert_eq!(state.status, PlaybackStatus::Loading);
     }
 
     #[test]
-    fn seek_and_volume_clamp_safely() {
+    fn seek_and_volume_ignore_non_finite_and_clamp_safely() {
         let mut state = PlayerState::default();
-        state.apply_local_command(&PlayerCommand::PlayTrack(track("a", 120)));
-        state.apply_local_command(&PlayerCommand::Seek(999.0));
-        assert_eq!(state.position_secs, 120.0);
-        state.apply_local_command(&PlayerCommand::Seek(-10.0));
-        assert_eq!(state.position_secs, 0.0);
-        state.apply_local_command(&PlayerCommand::Seek(f64::NAN));
-        assert_eq!(state.position_secs, 0.0);
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayTrack(track("a", 120)),
+            &mut pos,
+            &mut dur,
+        );
+        state.apply_local_command(&PlayerCommand::Seek(42.0), &mut pos, &mut dur);
+        assert_eq!(pos, 42.0);
+        // Non-finite seek is ignored instead of resetting position to 0
+        state.apply_local_command(&PlayerCommand::Seek(f64::NAN), &mut pos, &mut dur);
+        assert_eq!(pos, 42.0);
+        state.apply_local_command(&PlayerCommand::Seek(f64::INFINITY), &mut pos, &mut dur);
+        assert_eq!(pos, 42.0);
+        state.apply_local_command(&PlayerCommand::Seek(999.0), &mut pos, &mut dur);
+        assert_eq!(pos, 120.0);
+        state.apply_local_command(&PlayerCommand::Seek(-10.0), &mut pos, &mut dur);
+        assert_eq!(pos, 0.0);
 
-        state.apply_local_command(&PlayerCommand::ToggleMute);
+        state.apply_local_command(&PlayerCommand::SetVolume(0.4), &mut pos, &mut dur);
+        state.apply_local_command(&PlayerCommand::ToggleMute, &mut pos, &mut dur);
         assert!(state.muted);
-        state.apply_local_command(&PlayerCommand::SetVolume(0.75));
-        assert_eq!(state.volume, 0.75);
-        assert!(!state.muted);
-        state.apply_local_command(&PlayerCommand::SetVolume(2.5));
+        // Non-finite volume is ignored without unmuting or resetting to 1.0
+        state.apply_local_command(&PlayerCommand::SetVolume(f32::NAN), &mut pos, &mut dur);
+        assert_eq!(state.volume, 0.4);
+        assert!(state.muted);
+        state.apply_local_command(&PlayerCommand::SetVolume(f32::INFINITY), &mut pos, &mut dur);
+        assert_eq!(state.volume, 0.4);
+        assert!(state.muted);
+
+        // Valid finite volume unmutes and clamps
+        state.apply_local_command(&PlayerCommand::SetVolume(2.5), &mut pos, &mut dur);
         assert_eq!(state.volume, 1.0);
+        assert!(!state.muted);
     }
 }

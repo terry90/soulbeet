@@ -5,6 +5,8 @@
 /* ==========================================================================
    Soulbeet — Refined Midnight Studio Design Tokens (CSS / Tailwind v4)
    WCAG 2.1 AA+ verified across all surface tiers.
+   All non-Tailwind custom tokens are strictly namespaced with `--beet-*` so
+   they never override Tailwind v4's `@layer theme` scale variables.
    ========================================================================== */
 
 :root {
@@ -59,35 +61,35 @@
     --beet-crimson-surface: rgba(255, 102, 140, 0.14);
 
     /* Typography */
-    --font-display: "Space Grotesk", system-ui, -apple-system, sans-serif;
-    --font-mono: "Commit Mono", ui-monospace, monospace;
+    --beet-font-display: "Space Grotesk", system-ui, -apple-system, sans-serif;
+    --beet-font-mono: "Commit Mono", ui-monospace, monospace;
 
-    /* 4/8px Spacing Scale */
-    --space-1: 4px;
-    --space-2: 8px;
-    --space-3: 12px;
-    --space-4: 16px;
-    --space-6: 24px;
-    --space-8: 32px;
-    --space-12: 48px;
-    --space-16: 64px;
+    /* 4/8px Spacing Scale (namespaced to avoid Tailwind v4 theme collisions) */
+    --beet-space-1: 4px;
+    --beet-space-2: 8px;
+    --beet-space-3: 12px;
+    --beet-space-4: 16px;
+    --beet-space-6: 24px;
+    --beet-space-8: 32px;
+    --beet-space-12: 48px;
+    --beet-space-16: 64px;
 
-    /* Radii */
-    --radius-xs: 6px;
-    --radius-sm: 8px;
-    --radius-md: 12px;
-    --radius-lg: 16px;
-    --radius-full: 9999px;
+    /* Radii (namespaced so Tailwind's rounded-sm/md/lg/full remain intact) */
+    --beet-radius-xs: 6px;
+    --beet-radius-sm: 8px;
+    --beet-radius-md: 12px;
+    --beet-radius-lg: 16px;
+    --beet-radius-full: 9999px;
 
     /* Motion */
-    --dur-fast: 140ms;
-    --dur-base: 220ms;
-    --dur-slow: 360ms;
-    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --beet-dur-fast: 140ms;
+    --beet-dur-base: 220ms;
+    --beet-dur-slow: 360ms;
+    --beet-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --beet-ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
 
     /* Focus Ring (WCAG 2.2 AA/AAA visible 2px offset) */
-    --focus-ring: 0 0 0 2px var(--beet-canvas), 0 0 0 4px var(--beet-leaf-solid);
+    --beet-focus-ring: 0 0 0 2px var(--beet-canvas), 0 0 0 4px var(--beet-leaf-solid);
 }
 
 [data-oled="true"],
@@ -96,6 +98,14 @@
     --beet-sunken: #000000;
     --beet-surface-low: #0c0614;
     --beet-surface: #140922;
+
+    /* Override Tailwind v4 @theme color variables so bg-beet-* utilities switch to true OLED */
+    --color-beet-canvas: #000000;
+    --color-beet-sunken: #000000;
+    --color-beet-surface-low: #0c0614;
+    --color-beet-surface: #140922;
+    --color-beet-dark: #000000;
+    --color-beet-panel: #140922;
 }
 
 @theme {
@@ -167,17 +177,17 @@
     .studio-card {
         background-color: var(--beet-surface);
         border: 1px solid var(--beet-border-subtle);
-        border-radius: var(--radius-md);
+        border-radius: var(--beet-radius-md);
     }
 
     .studio-card-low {
         background-color: var(--beet-surface-low);
         border: 1px solid var(--beet-border-subtle);
-        border-radius: var(--radius-md);
+        border-radius: var(--beet-radius-md);
     }
 
     .tabular-nums-mono {
-        font-family: var(--font-mono);
+        font-family: var(--beet-font-mono);
         font-feature-settings: "ss03", "ss04", "ss05";
         font-variant-numeric: tabular-nums;
     }
@@ -243,10 +253,10 @@
     }
 
     /* Signature Soulbeet Seam-Light (Acquiring / Importing / Indexing / Buffering).
-       Without motion it rests as a calm static gradient line across the seam. */
+       `.seam-light` preserves caller-controlled height (e.g. SearchBar's `h-px`),
+       while `.beet-seam-light` sets the standard 2px studio seam height. */
     .seam-light,
     .beet-seam-light {
-        height: 2px;
         background: linear-gradient(
             90deg,
             transparent,
@@ -256,6 +266,10 @@
         ) no-repeat;
         background-size: 42% 100%;
         animation: beet-seam-sweep 1.4s ease-in-out infinite;
+    }
+
+    .beet-seam-light {
+        height: 2px;
     }
 
     /* Linear 5-second undo countdown rail */
@@ -324,10 +338,13 @@ textarea {
     }
 }
 
-/* Accessible WCAG 2.2 focus-visible ring across all interactive elements */
-:where(button, a, input, select, textarea, [tabindex]):focus-visible {
-    outline: none;
-    box-shadow: var(--focus-ring);
+/* Accessible WCAG 2.2 focus-visible ring across interactive elements.
+   Excludes programmatic focus containers (`tabindex="-1"`, e.g. modal bodies) and keeps
+   a transparent outline so Windows forced-colors mode still paints a visible ring. */
+:where(button, a, input, select, textarea, [tabindex]:not([tabindex="-1"])):focus-visible {
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    box-shadow: var(--beet-focus-ring);
 }
 
 @keyframes beet-seam-sweep {
@@ -380,7 +397,7 @@ body {
     color: var(--beet-text-primary);
     min-height: 100vh;
     overflow: hidden;
-    font-family: var(--font-display);
+    font-family: var(--beet-font-display);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     scrollbar-width: thin;

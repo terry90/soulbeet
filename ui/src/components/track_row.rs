@@ -2,8 +2,8 @@ use dioxus::prelude::*;
 use shared::download::AcquireAndPlayStage;
 
 use crate::{
-    IconCheck, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw, IconSparkles,
-    IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
+    IconCheck, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
+    IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -13,6 +13,7 @@ pub enum AcquireStageBadge {
     Acquiring { label: Option<String> },
     Importing,
     Indexing,
+    NeedsManualChoice { message: Option<String> },
     Failed { message: Option<String> },
 }
 
@@ -35,8 +36,8 @@ impl AcquireStageBadge {
             }
             AcquireAndPlayStage::Importing => Some(Self::Importing),
             AcquireAndPlayStage::Indexing => Some(Self::Indexing),
-            AcquireAndPlayStage::NeedsManualChoice { .. } => Some(Self::Failed {
-                message: Some("Pick source".to_string()),
+            AcquireAndPlayStage::NeedsManualChoice { .. } => Some(Self::NeedsManualChoice {
+                message: Some("Best match was ambiguous — pick a source".to_string()),
             }),
             AcquireAndPlayStage::Failed { failure } => Some(Self::Failed {
                 message: Some(failure.message.clone()),
@@ -60,6 +61,7 @@ impl AcquireStageBadge {
             Self::Acquiring { .. } => "ACQUIRING…".to_string(),
             Self::Importing => "IMPORTING…".to_string(),
             Self::Indexing => "INDEXING…".to_string(),
+            Self::NeedsManualChoice { .. } => "PICK SOURCE".to_string(),
             Self::Failed { .. } => "RETRY".to_string(),
         }
     }
@@ -97,6 +99,25 @@ impl Default for TrackRowState {
     }
 }
 
+/// Computes whether the row's primary click surface is interactive for `state` and callbacks.
+pub fn is_primary_action_enabled(
+    state: &TrackRowState,
+    has_play: bool,
+    has_acquire: bool,
+    has_pick_source: bool,
+) -> bool {
+    match state {
+        TrackRowState::OfflineUnavailable => false,
+        TrackRowState::UnownedCatalog { acquiring_stage } => match acquiring_stage {
+            Some(stage) if stage.is_in_flight() => false,
+            Some(AcquireStageBadge::NeedsManualChoice { .. }) => has_pick_source,
+            None | Some(AcquireStageBadge::Failed { .. }) => has_acquire,
+            Some(_) => false,
+        },
+        TrackRowState::Owned { .. } | TrackRowState::PendingDiscovery { .. } => has_play,
+    }
+}
+
 /// Formats track duration in seconds as `MM:SS` or `H:MM:SS` for tabular mono display.
 pub fn format_duration(total_secs: u32) -> String {
     let hours = total_secs / 3600;
@@ -118,7 +139,8 @@ pub fn format_discovery_badge(days_remaining: Option<u32>) -> String {
 }
 
 /// Unified Refined Midnight Studio track row supporting Owned, Pending Discovery,
-/// Unowned Catalog (with `seam-light` acquisition sweep), and Offline Unavailable states.
+/// Unowned Catalog (with `seam-light` acquisition sweep & manual source choice),
+/// and Offline Unavailable states.
 #[component]
 pub fn TrackRow(
     title: String,
@@ -136,6 +158,7 @@ pub fn TrackRow(
     #[props(default)] on_star: Option<EventHandler<bool>>,
     #[props(default)] on_rate: Option<EventHandler<u8>>,
     #[props(default)] on_acquire: Option<EventHandler<()>>,
+    #[props(default)] on_pick_source: Option<EventHandler<()>>,
     #[props(default)] on_inspect: Option<EventHandler<()>>,
     #[props(default)] class: String,
 ) -> Element {
@@ -153,6 +176,13 @@ pub fn TrackRow(
         TrackRowState::UnownedCatalog {
             acquiring_stage: None
         }
+    );
+
+    let can_primary_click = is_primary_action_enabled(
+        &state,
+        on_play.is_some(),
+        on_acquire.is_some(),
+        on_pick_source.is_some(),
     );
 
     let row_surface = if is_offline_unavailable {
@@ -183,23 +213,25 @@ pub fn TrackRow(
         None => artist.clone(),
     };
 
-    let play_aria_label = if is_offline_unavailable {
-        format!("{title} by {artist} is not cached offline")
-    } else if matches!(state, TrackRowState::UnownedCatalog { .. }) {
-        format!("Acquire and play {title} by {artist}")
-    } else if is_playing {
-        format!("Now playing {title} by {artist}")
-    } else {
-        format!("Play {title} by {artist}")
+    let play_aria_label = match &state {
+        TrackRowState::OfflineUnavailable => {
+            format!("{title} by {artist} is not cached offline")
+        }
+        TrackRowState::UnownedCatalog {
+            acquiring_stage: Some(AcquireStageBadge::NeedsManualChoice { .. }),
+        } => format!("Pick source for {title} by {artist}"),
+        TrackRowState::UnownedCatalog { .. } => {
+            format!("Acquire and play {title} by {artist}")
+        }
+        _ if is_playing => format!("Now playing {title} by {artist}"),
+        _ => format!("Play {title} by {artist}"),
     };
-
-    let can_primary_click = !is_offline_unavailable && (on_play.is_some() || on_acquire.is_some());
 
     rsx! {
         div {
-            role: "row",
+            role: "listitem",
             aria_disabled: if is_offline_unavailable { "true" } else { "false" },
-            title: if is_offline_unavailable { "Not cached offline" } else { "" },
+            title: is_offline_unavailable.then_some("Not cached offline"),
             class: "group relative flex items-center gap-3 px-3 py-2 min-h-[56px] rounded-[8px] border border-transparent transition-[background-color,border-color,opacity] duration-150 {row_surface} {class}",
 
             // Optional track number column
@@ -209,7 +241,8 @@ pub fn TrackRow(
                 }
             }
 
-            // Primary clickable area: Artwork + Title/Artist/Provenance (never nests sibling buttons)
+            // Primary clickable area: Artwork + Title/Artist/Provenance.
+            // Uses only phrasing-content `<span>` descendants for valid HTML5 inside `<button>`.
             button {
                 r#type: "button",
                 disabled: !can_primary_click,
@@ -220,29 +253,34 @@ pub fn TrackRow(
                     "flex items-center gap-3 flex-1 min-w-0 text-left cursor-default rounded-[6px]"
                 },
                 onclick: move |_| {
-                    if is_offline_unavailable {
+                    if !can_primary_click {
                         return;
                     }
                     match &state {
-                        TrackRowState::UnownedCatalog { acquiring_stage } => {
-                            if !acquiring_stage.as_ref().is_some_and(AcquireStageBadge::is_in_flight) {
-                                if let Some(handler) = &on_acquire {
-                                    handler.call(());
-                                } else if let Some(handler) = &on_play {
+                        TrackRowState::UnownedCatalog { acquiring_stage } => match acquiring_stage {
+                            Some(AcquireStageBadge::NeedsManualChoice { .. }) => {
+                                if let Some(handler) = &on_pick_source {
                                     handler.call(());
                                 }
                             }
-                        }
-                        _ => {
+                            None | Some(AcquireStageBadge::Failed { .. }) => {
+                                if let Some(handler) = &on_acquire {
+                                    handler.call(());
+                                }
+                            }
+                            Some(_) => {}
+                        },
+                        TrackRowState::Owned { .. } | TrackRowState::PendingDiscovery { .. } => {
                             if let Some(handler) = &on_play {
                                 handler.call(());
                             }
                         }
+                        TrackRowState::OfflineUnavailable => {}
                     }
                 },
 
                 // 44px Artwork Thumbnail
-                div {
+                span {
                     class: if is_playing {
                         "relative w-11 h-11 rounded-[6px] overflow-hidden bg-beet-surface border border-beet-leaf-solid/40 shrink-0 flex items-center justify-center"
                     } else {
@@ -262,8 +300,8 @@ pub fn TrackRow(
                     }
 
                     // Hover play overlay on playable rows
-                    if !is_offline_unavailable && !is_acquiring {
-                        div {
+                    if can_primary_click || is_playing {
+                        span {
                             class: if is_playing {
                                 "absolute inset-0 bg-beet-canvas/60 flex items-center justify-center"
                             } else {
@@ -271,7 +309,7 @@ pub fn TrackRow(
                             },
                             if is_playing {
                                 // 3-bar studio equalizer
-                                div {
+                                span {
                                     class: "flex items-end gap-[2px] h-3.5",
                                     aria_hidden: "true",
                                     span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
@@ -296,8 +334,8 @@ pub fn TrackRow(
                 }
 
                 // Track Title, Artist/Album, and Discovery Reason
-                div { class: "flex-1 min-w-0",
-                    div { class: "flex items-center gap-2 min-w-0",
+                span { class: "block flex-1 min-w-0",
+                    span { class: "flex items-center gap-2 min-w-0",
                         span { class: "text-[15px] font-medium leading-[1.35] truncate {title_class}",
                             "{title}"
                         }
@@ -318,7 +356,7 @@ pub fn TrackRow(
                         }
                     }
 
-                    div { class: "flex items-center gap-2 mt-0.5 min-w-0",
+                    span { class: "flex items-center gap-2 mt-0.5 min-w-0",
                         span { class: "text-[13px] text-beet-text-secondary truncate",
                             "{subtitle}"
                         }
@@ -431,6 +469,34 @@ pub fn TrackRow(
                                     }
                                 }
                             }
+                            Some(AcquireStageBadge::NeedsManualChoice { message }) => {
+                                let tip = message
+                                    .as_deref()
+                                    .unwrap_or("Pick a source manually");
+                                rsx! {
+                                    if let Some(pick_cb) = on_pick_source {
+                                        button {
+                                            r#type: "button",
+                                            title: "{tip}",
+                                            aria_label: format!("Pick source for {title}"),
+                                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-gold-surface border border-beet-gold/40 text-beet-gold hover:brightness-110 tabular-nums-mono text-[11px] font-semibold tracking-wider transition-[filter] duration-150 cursor-pointer",
+                                            onclick: move |evt| {
+                                                evt.stop_propagation();
+                                                pick_cb.call(());
+                                            },
+                                            IconSlidersHorizontal { size: 13 }
+                                            "PICK SOURCE"
+                                        }
+                                    } else {
+                                        span {
+                                            title: "{tip}",
+                                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-gold-surface border border-beet-gold/40 text-beet-gold tabular-nums-mono text-[11px] font-semibold tracking-wider",
+                                            IconSlidersHorizontal { size: 13 }
+                                            "PICK SOURCE"
+                                        }
+                                    }
+                                }
+                            }
                             Some(AcquireStageBadge::Failed { message }) => {
                                 let tip = message
                                     .as_deref()
@@ -448,6 +514,12 @@ pub fn TrackRow(
                                             },
                                             IconRefreshCw { size: 13 }
                                             "RETRY"
+                                        }
+                                    } else {
+                                        span {
+                                            title: "{tip}",
+                                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/35 text-beet-crimson-text tabular-nums-mono text-[11px] font-semibold tracking-wider",
+                                            "FAILED"
                                         }
                                     }
                                 }
@@ -537,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_acquire_and_play_stages_to_badges() {
+    fn maps_acquire_and_play_stages_including_manual_choice() {
         let acq = AcquireStageBadge::from_stage(&AcquireAndPlayStage::Acquiring {
             backend_id: "slskd".into(),
             backend_name: "Soulseek".into(),
@@ -555,6 +627,20 @@ mod tests {
         let idx = AcquireStageBadge::from_stage(&AcquireAndPlayStage::Indexing).unwrap();
         assert!(idx.is_in_flight());
         assert_eq!(idx.badge_label(), "INDEXING…");
+
+        let manual = AcquireStageBadge::from_stage(&AcquireAndPlayStage::NeedsManualChoice {
+            search_id: "s1".into(),
+            results: vec![],
+            best_score: 0.4,
+            threshold: 0.7,
+        })
+        .unwrap();
+        assert!(!manual.is_in_flight());
+        assert!(matches!(
+            manual,
+            AcquireStageBadge::NeedsManualChoice { .. }
+        ));
+        assert_eq!(manual.badge_label(), "PICK SOURCE");
 
         let ready = AcquireStageBadge::from_stage(&AcquireAndPlayStage::Ready {
             navidrome_song_id: Some("song-1".into()),
@@ -576,5 +662,94 @@ mod tests {
         .unwrap();
         assert!(!failed.is_in_flight());
         assert_eq!(failed.badge_label(), "RETRY");
+    }
+
+    #[test]
+    fn computes_primary_action_enabled_strictly_per_state() {
+        // UnownedCatalog never falls back to on_play
+        assert!(!is_primary_action_enabled(
+            &TrackRowState::UnownedCatalog {
+                acquiring_stage: None
+            },
+            true,
+            false,
+            false
+        ));
+        // Acquiring disables primary click even if callbacks exist
+        assert!(!is_primary_action_enabled(
+            &TrackRowState::UnownedCatalog {
+                acquiring_stage: Some(AcquireStageBadge::Importing)
+            },
+            true,
+            true,
+            true
+        ));
+        // NeedsManualChoice enables primary click only with on_pick_source
+        assert!(!is_primary_action_enabled(
+            &TrackRowState::UnownedCatalog {
+                acquiring_stage: Some(AcquireStageBadge::NeedsManualChoice { message: None })
+            },
+            true,
+            true,
+            false
+        ));
+        assert!(is_primary_action_enabled(
+            &TrackRowState::UnownedCatalog {
+                acquiring_stage: Some(AcquireStageBadge::NeedsManualChoice { message: None })
+            },
+            false,
+            false,
+            true
+        ));
+        // OfflineUnavailable is always disabled
+        assert!(!is_primary_action_enabled(
+            &TrackRowState::OfflineUnavailable,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn renders_valid_listitem_markup_and_non_interactive_status_fallbacks() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Rare Track".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::UnownedCatalog {
+                        acquiring_stage: Some(AcquireStageBadge::Failed {
+                            message: Some("Timed out".to_string()),
+                        }),
+                    },
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("role=\"listitem\""), "{html}");
+        assert!(!html.contains("title=\"\""), "{html}");
+        assert!(html.contains(">FAILED</span>"), "{html}");
+        // Verify no <div> nested inside the primary <button>
+        let btn_start = html.find("<button").unwrap();
+        let btn_end = html[btn_start..].find("</button>").unwrap() + btn_start;
+        assert!(!html[btn_start..btn_end].contains("<div"), "{html}");
+
+        let mut dom_pick = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Ambiguous Track".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::UnownedCatalog {
+                        acquiring_stage: Some(AcquireStageBadge::NeedsManualChoice {
+                            message: None,
+                        }),
+                    },
+                }
+            }
+        });
+        dom_pick.rebuild_in_place();
+        let html_pick = dioxus_ssr::render(&dom_pick);
+        assert!(html_pick.contains("PICK SOURCE</span>"), "{html_pick}");
     }
 }

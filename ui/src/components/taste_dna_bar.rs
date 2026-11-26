@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use dioxus::prelude::*;
 use shared::recommendation::UserCultureProfile;
 
@@ -10,22 +12,26 @@ pub struct TasteSegment {
     pub percent: u8,
 }
 
-/// Normalizes a [`UserCultureProfile`]'s `inferred_area_weights` into at most 4 segments
-/// (top 3 regions + optional `"INTL"` remainder) whose percentages sum strictly to `100`.
+/// Normalizes a [`UserCultureProfile`]'s `inferred_area_weights` into at most 4 unique
+/// segments (top 3 regions + optional `"OTHER"` remainder) whose percentages sum strictly
+/// to `100`. Duplicate country codes (case-insensitive) are aggregated before grouping.
 /// Returns an empty list if there are no positive finite area weights.
 pub fn normalize_taste_segments(profile: &UserCultureProfile) -> Vec<TasteSegment> {
-    let mut valid: Vec<(String, f32)> = profile
-        .inferred_area_weights
-        .iter()
-        .filter(|(code, w)| !code.trim().is_empty() && w.is_finite() && *w > 0.0)
-        .map(|(code, w)| (code.trim().to_ascii_uppercase(), *w))
-        .collect();
+    let mut totals: HashMap<String, f32> = HashMap::new();
+    for (code, w) in &profile.inferred_area_weights {
+        let trimmed = code.trim();
+        if !trimmed.is_empty() && w.is_finite() && *w > 0.0 {
+            let upper = trimmed.to_ascii_uppercase();
+            *totals.entry(upper).or_insert(0.0) += *w;
+        }
+    }
 
-    if valid.is_empty() {
+    if totals.is_empty() {
         return Vec::new();
     }
 
-    valid.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut valid: Vec<(String, f32)> = totals.into_iter().collect();
+    valid.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let mut grouped: Vec<(String, f32)> = Vec::new();
     if valid.len() <= 4 {
@@ -85,9 +91,31 @@ pub fn local_vs_international_split(profile: &UserCultureProfile) -> (u8, u8) {
     (local, 100u8.saturating_sub(local))
 }
 
+/// Deduplicates strings case-insensitively while preserving first-seen order.
+pub fn dedup_case_insensitive<'a>(
+    items: impl IntoIterator<Item = &'a str>,
+    limit: usize,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for raw in items {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_ascii_lowercase()) {
+            out.push(trimmed.to_string());
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Visualizes a user's [`UserCultureProfile`] as a crisp Refined Midnight Studio
-/// segmented bar (`Local Culture` vs `International`), optional inferred area breakdown,
-/// and top language/region/genre chips.
+/// segmented bar matching its regional legend 1:1 (falling back to the binary Local vs.
+/// International split when no area weights exist) plus language and genre chips.
 #[component]
 pub fn TasteDnaBar(
     profile: UserCultureProfile,
@@ -110,15 +138,30 @@ pub fn TasteDnaBar(
         "bg-beet-border-strong",
     ];
 
-    let mut tag_chips: Vec<String> = profile
-        .inferred_local_tags
-        .iter()
-        .chain(top_genres.iter())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    tag_chips.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    tag_chips.truncate(8);
+    let languages: Vec<String> =
+        dedup_case_insensitive(profile.preferred_languages.iter().map(String::as_str), 6)
+            .into_iter()
+            .map(|l| l.to_ascii_uppercase())
+            .collect();
+
+    let tag_chips = dedup_case_insensitive(
+        profile
+            .inferred_local_tags
+            .iter()
+            .chain(top_genres.iter())
+            .map(String::as_str),
+        8,
+    );
+
+    let bar_aria_label = if !area_segments.is_empty() {
+        area_segments
+            .iter()
+            .map(|s| format!("{} {} percent", s.label, s.percent))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        format!("{local_pct} percent {local_code} and {intl_pct} percent International")
+    };
 
     rsx! {
         section {
@@ -147,31 +190,42 @@ pub fn TasteDnaBar(
                 }
             }
 
-            // Segmented horizontal studio bar (Local Culture vs International)
+            // Segmented horizontal studio bar: mirrors `area_segments` 1:1 when present,
+            // falling back to the 2-segment Local vs International split otherwise.
             div {
                 class: "h-2.5 w-full rounded-full overflow-hidden flex gap-0.5 bg-beet-sunken",
                 role: "img",
-                aria_label: "{local_pct} percent {local_code} and {intl_pct} percent International",
-                if local_pct > 0 {
-                    div {
-                        class: "h-full bg-beet-accent-solid transition-[width] duration-300",
-                        style: "width: {local_pct}%;",
+                aria_label: "{bar_aria_label}",
+                if !area_segments.is_empty() {
+                    for (idx, seg) in area_segments.iter().enumerate() {
+                        div {
+                            key: "bar-{seg.label}",
+                            class: "h-full transition-[width] duration-300 {segment_colors[idx % segment_colors.len()]}",
+                            style: "width: {seg.percent}%;",
+                        }
                     }
-                }
-                if intl_pct > 0 {
-                    div {
-                        class: "h-full bg-beet-leaf-solid transition-[width] duration-300",
-                        style: "width: {intl_pct}%;",
+                } else {
+                    if local_pct > 0 {
+                        div {
+                            class: "h-full bg-beet-accent-solid transition-[width] duration-300",
+                            style: "width: {local_pct}%;",
+                        }
+                    }
+                    if intl_pct > 0 {
+                        div {
+                            class: "h-full bg-beet-leaf-solid transition-[width] duration-300",
+                            style: "width: {intl_pct}%;",
+                        }
                     }
                 }
             }
 
-            // Inferred regional area distribution (when available)
+            // Inferred regional area distribution legend (matches bar segments 1:1)
             if !area_segments.is_empty() {
                 div { class: "flex flex-wrap items-center gap-3 text-[11px] tabular-nums-mono text-beet-text-secondary",
                     for (idx, seg) in area_segments.iter().enumerate() {
                         div {
-                            key: "{seg.label}",
+                            key: "legend-{seg.label}",
                             class: "inline-flex items-center gap-1.5",
                             span {
                                 class: "w-2 h-2 rounded-full {segment_colors[idx % segment_colors.len()]}",
@@ -183,14 +237,14 @@ pub fn TasteDnaBar(
                 }
             }
 
-            // Language & genre chips
-            if !profile.preferred_languages.is_empty() || !tag_chips.is_empty() {
+            // Deduplicated language & genre chips
+            if !languages.is_empty() || !tag_chips.is_empty() {
                 div { class: "flex flex-wrap items-center gap-1.5 pt-0.5",
-                    for lang in profile.preferred_languages.iter().filter(|l| !l.trim().is_empty()) {
+                    for lang in languages.iter() {
                         span {
                             key: "lang-{lang}",
                             class: "px-2 py-0.5 rounded-full bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider",
-                            "{lang.trim().to_ascii_uppercase()}"
+                            "{lang}"
                         }
                     }
                     for tag in tag_chips.iter() {
@@ -209,6 +263,35 @@ pub fn TasteDnaBar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregates_duplicate_country_codes_case_insensitively() {
+        let profile = UserCultureProfile {
+            home_country: Some("FR".into()),
+            inferred_area_weights: vec![
+                ("fr".into(), 20.0),
+                (" FR ".into(), 30.0),
+                ("us".into(), 50.0),
+            ],
+            ..Default::default()
+        };
+        let segs = normalize_taste_segments(&profile);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(
+            segs[0],
+            TasteSegment {
+                label: "FR".into(),
+                percent: 50
+            }
+        );
+        assert_eq!(
+            segs[1],
+            TasteSegment {
+                label: "US".into(),
+                percent: 50
+            }
+        );
+    }
 
     #[test]
     fn normalizes_area_weights_to_exact_hundred_percent() {
@@ -271,6 +354,45 @@ mod tests {
                 percent: 10
             }
         );
+    }
+
+    #[test]
+    fn deduplicates_non_consecutive_languages_and_tags_case_insensitively() {
+        let out = dedup_case_insensitive(["fr", "en", "FR", "  ", "En", "jp"], 6);
+        assert_eq!(out, vec!["fr", "en", "jp"]);
+    }
+
+    #[test]
+    fn renders_area_segments_matching_legend_colors_in_ssr() {
+        let profile = UserCultureProfile {
+            home_country: Some("FR".into()),
+            preferred_languages: vec!["fr".into(), "en".into(), "FR".into()],
+            local_culture_ratio: 0.45,
+            inferred_area_weights: vec![
+                ("US".into(), 50.0),
+                ("FR".into(), 30.0),
+                ("JP".into(), 20.0),
+            ],
+            inferred_local_tags: vec!["French House".into(), "Ambient".into()],
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |profile: UserCultureProfile| {
+                rsx! {
+                    TasteDnaBar {
+                        profile,
+                        top_genres: vec!["french house".to_string(), "Synthpop".to_string()],
+                    }
+                }
+            },
+            profile,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("width: 50%;"), "{html}");
+        assert!(html.contains("width: 30%;"), "{html}");
+        assert!(html.contains("width: 20%;"), "{html}");
+        assert!(html.contains("bg-beet-gold"), "{html}");
+        assert_eq!(html.matches(">FR</span>").count(), 1, "{html}");
     }
 
     #[test]

@@ -3,6 +3,41 @@ use shared::client::{DeleteGuardPreview, ListenerProtectionKind};
 
 use crate::{IconShieldAlert, IconTrash2, Modal};
 
+/// Explicit modal decision mode derived from [`DeleteGuardPreview`] aligned with
+/// `api/src/core/curation.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardModalMode {
+    /// Staged discovery track: removes from discovery staging and records rejection.
+    PendingDiscovery,
+    /// Permanent library track owned solely by caller and deletable from disk.
+    PermanentDelete,
+    /// Permanent library track protected by another household listener's star/rating/playlist.
+    ListenerProtected,
+    /// Hard-blocked deletion (e.g. outside library, unresolved path, in use, unreadable listener).
+    HardBlocked,
+}
+
+/// Classifies a [`DeleteGuardPreview`] into one of the 4 explicit curation guard modes.
+pub fn classify_guard_mode(preview: &DeleteGuardPreview) -> GuardModalMode {
+    if preview.is_pending_discovery {
+        return GuardModalMode::PendingDiscovery;
+    }
+    if preview.sole_owner && preview.can_delete && preview.other_listeners.is_empty() {
+        return GuardModalMode::PermanentDelete;
+    }
+    let has_listener_protection = preview.other_listeners.iter().any(|p| {
+        matches!(
+            p.kind,
+            ListenerProtectionKind::OtherListenerMark
+                | ListenerProtectionKind::OtherListenerPlaylist
+        )
+    });
+    if has_listener_protection {
+        return GuardModalMode::ListenerProtected;
+    }
+    GuardModalMode::HardBlocked
+}
+
 /// Human-readable short badge for a [`ListenerProtectionKind`].
 pub fn protection_kind_label(kind: ListenerProtectionKind) -> &'static str {
     match kind {
@@ -18,11 +53,11 @@ pub fn protection_kind_label(kind: ListenerProtectionKind) -> &'static str {
 
 /// Accessible multi-listener deletion guard dialog powered by [`DeleteGuardPreview`].
 ///
-/// - When `sole_owner && can_delete && other_listeners.is_empty()`: explains permanent
-///   file removal and offers `Cancel` vs crimson `Delete Permanently`.
-/// - When other listeners protect the track (or disk deletion is blocked): lists each
-///   protecting listener calmly, explains the shared audio file stays intact on disk,
-///   and offers `Cancel` vs `Unstar & Hide From My Mixes`.
+/// Handles all 4 curation guard states cleanly:
+/// 1. `PendingDiscovery` — drops staged track from discovery queue (`Drop Track`).
+/// 2. `PermanentDelete` — sole-owner permanent removal from disk (`Delete Permanently`).
+/// 3. `ListenerProtected` — lists protecting listeners and preserves disk file (`Unstar & Hide From My Mixes`).
+/// 4. `HardBlocked` — displays blocking reason calmly with a single `Close` button.
 #[component]
 pub fn MultiListenerGuardModal(
     preview: DeleteGuardPreview,
@@ -32,31 +67,37 @@ pub fn MultiListenerGuardModal(
     on_confirm: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
-    let is_permanent_delete =
-        preview.sole_owner && preview.can_delete && preview.other_listeners.is_empty();
+    let mode = classify_guard_mode(&preview);
 
     let track_label = match track_artist.as_deref().filter(|a| !a.trim().is_empty()) {
         Some(artist) => format!("{track_title} — {artist}"),
         None => track_title.clone(),
     };
 
-    let heading = if is_permanent_delete {
-        "Delete permanently?"
-    } else if !preview.other_listeners.is_empty() {
-        "Protected by other listeners"
-    } else {
-        "Shared file kept on disk"
+    let heading = match mode {
+        GuardModalMode::PendingDiscovery => "Drop from discovery?",
+        GuardModalMode::PermanentDelete => "Delete permanently?",
+        GuardModalMode::ListenerProtected => "Protected by other listeners",
+        GuardModalMode::HardBlocked => "Deletion unavailable",
     };
+
+    let is_destructive = matches!(
+        mode,
+        GuardModalMode::PendingDiscovery | GuardModalMode::PermanentDelete
+    );
 
     let confirm_label = if busy {
         "Applying…"
-    } else if is_permanent_delete {
-        "Delete Permanently"
     } else {
-        "Unstar & Hide From My Mixes"
+        match mode {
+            GuardModalMode::PendingDiscovery => "Drop Track",
+            GuardModalMode::PermanentDelete => "Delete Permanently",
+            GuardModalMode::ListenerProtected => "Unstar & Hide From My Mixes",
+            GuardModalMode::HardBlocked => "",
+        }
     };
 
-    let confirm_class = if is_permanent_delete {
+    let confirm_class = if is_destructive {
         "h-9 px-4 rounded-[8px] bg-beet-crimson-solid text-white text-[13px] font-semibold hover:brightness-110 disabled:opacity-50 transition-[filter,opacity] duration-150 cursor-pointer"
     } else {
         "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-crimson-surface hover:text-beet-crimson-text hover:border-beet-crimson-text/30 disabled:opacity-50 text-[13px] font-semibold transition-colors duration-150 cursor-pointer"
@@ -72,12 +113,12 @@ pub fn MultiListenerGuardModal(
             header: rsx! {
                 div { class: "flex items-center gap-3",
                     div {
-                        class: if is_permanent_delete {
+                        class: if is_destructive {
                             "w-9 h-9 rounded-[8px] bg-beet-crimson-surface text-beet-crimson-text flex items-center justify-center shrink-0"
                         } else {
                             "w-9 h-9 rounded-[8px] bg-beet-gold-surface text-beet-gold flex items-center justify-center shrink-0"
                         },
-                        if is_permanent_delete {
+                        if is_destructive {
                             IconTrash2 { size: 18 }
                         } else {
                             IconShieldAlert { size: 18 }
@@ -95,43 +136,59 @@ pub fn MultiListenerGuardModal(
             },
             footer: rsx! {
                 div { class: "flex flex-wrap items-center justify-end gap-2",
-                    button {
-                        r#type: "button",
-                        disabled: busy,
-                        class: "h-9 px-4 rounded-[8px] text-[13px] font-medium text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 transition-colors duration-150 cursor-pointer",
-                        onclick: move |_| on_cancel.call(()),
-                        "Cancel"
-                    }
-                    button {
-                        r#type: "button",
-                        disabled: busy,
-                        class: "{confirm_class}",
-                        onclick: move |_| on_confirm.call(()),
-                        "{confirm_label}"
+                    if mode == GuardModalMode::HardBlocked {
+                        button {
+                            r#type: "button",
+                            disabled: busy,
+                            class: "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 text-[13px] font-semibold transition-colors duration-150 cursor-pointer",
+                            onclick: move |_| on_cancel.call(()),
+                            "Close"
+                        }
+                    } else {
+                        button {
+                            r#type: "button",
+                            disabled: busy,
+                            class: "h-9 px-4 rounded-[8px] text-[13px] font-medium text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 transition-colors duration-150 cursor-pointer",
+                            onclick: move |_| on_cancel.call(()),
+                            "Cancel"
+                        }
+                        button {
+                            r#type: "button",
+                            disabled: busy,
+                            class: "{confirm_class}",
+                            onclick: move |_| on_confirm.call(()),
+                            "{confirm_label}"
+                        }
                     }
                 }
             },
 
             // Modal body
             div { class: "space-y-4 text-[14px] leading-[1.5]",
-                if is_permanent_delete {
-                    p { class: "text-beet-text-secondary",
-                        "No other household listeners have starred, rated, or added this track to a playlist. Confirming will permanently remove the audio file from your library on disk."
-                    }
-                    if !preview.own_playlists.is_empty() {
-                        div { class: "p-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle space-y-1.5",
-                            p { class: "text-[11px] tabular-nums-mono font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                                "Also in your playlists"
-                            }
-                            ul { class: "space-y-1 text-[13px] text-beet-text-primary",
-                                for playlist in preview.own_playlists.iter() {
-                                    li { key: "{playlist}", "• {playlist}" }
+                match mode {
+                    GuardModalMode::PendingDiscovery => rsx! {
+                        p { class: "text-beet-text-secondary",
+                            "This staged discovery track will be removed from your discovery queue and marked as skipped so it won't be recommended again. Your permanent library will not be touched."
+                        }
+                    },
+                    GuardModalMode::PermanentDelete => rsx! {
+                        p { class: "text-beet-text-secondary",
+                            "No other household listeners have starred, rated, or added this track to a playlist. Confirming will permanently remove the audio file from your library on disk."
+                        }
+                        if !preview.own_playlists.is_empty() {
+                            div { class: "p-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle space-y-1.5",
+                                p { class: "text-[11px] tabular-nums-mono font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                    "Also in your playlists"
+                                }
+                                ul { class: "space-y-1 text-[13px] text-beet-text-primary",
+                                    for playlist in preview.own_playlists.iter() {
+                                        li { key: "{playlist}", "• {playlist}" }
+                                    }
                                 }
                             }
                         }
-                    }
-                } else {
-                    if !preview.other_listeners.is_empty() {
+                    },
+                    GuardModalMode::ListenerProtected => rsx! {
                         p { class: "text-beet-text-secondary",
                             "This file is shared with other listeners in your library and will be kept intact on disk. You can safely unstar it and hide it from your personal mixes."
                         }
@@ -151,18 +208,35 @@ pub fn MultiListenerGuardModal(
                                 }
                             }
                         }
-                    } else if let Some(reason) = preview.block_reason.as_deref() {
-                        div { class: "p-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle text-[13px] text-beet-text-secondary",
-                            "{reason}"
-                        }
+                    },
+                    GuardModalMode::HardBlocked => rsx! {
                         p { class: "text-beet-text-secondary",
-                            "The audio file will remain on disk. Confirming will unstar this track and exclude it from your personal mixes."
+                            "This track cannot be deleted right now. The audio file remains untouched on disk."
                         }
-                    } else {
-                        p { class: "text-beet-text-secondary",
-                            "The shared audio file will remain on disk. Confirming will unstar this track and hide it from your personal mixes."
+                        if let Some(reason) = preview.block_reason.as_deref().filter(|r| !r.trim().is_empty()) {
+                            div { class: "p-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle text-[13px] text-beet-text-primary",
+                                "{reason}"
+                            }
                         }
-                    }
+                        if !preview.other_listeners.is_empty() {
+                            ul {
+                                class: "space-y-2",
+                                aria_label: "Deletion guard reasons",
+                                for (idx, item) in preview.other_listeners.iter().enumerate() {
+                                    li {
+                                        key: "{idx}-{item.summary}",
+                                        class: "flex items-start justify-between gap-3 p-3 rounded-[8px] bg-beet-surface-high border border-beet-border-subtle",
+                                        span { class: "text-[13px] text-beet-text-primary",
+                                            "{item.summary}"
+                                        }
+                                        span { class: "shrink-0 px-2 py-0.5 rounded-full bg-beet-surface-highest text-beet-text-tertiary tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider",
+                                            "{protection_kind_label(item.kind)}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -174,34 +248,7 @@ mod tests {
     use super::*;
     use shared::client::ListenerProtection;
 
-    #[test]
-    fn maps_all_protection_kinds_to_calm_labels() {
-        assert_eq!(
-            protection_kind_label(ListenerProtectionKind::OtherListenerMark),
-            "Listener favorite"
-        );
-        assert_eq!(
-            protection_kind_label(ListenerProtectionKind::OtherListenerPlaylist),
-            "Shared playlist"
-        );
-        assert_eq!(
-            protection_kind_label(ListenerProtectionKind::InUse),
-            "In active use"
-        );
-    }
-
-    #[test]
-    fn renders_sole_owner_vs_protected_variants_in_ssr() {
-        let sole = DeleteGuardPreview {
-            song_id: "s1".into(),
-            is_pending_discovery: false,
-            discovery_track_id: None,
-            can_delete: true,
-            sole_owner: true,
-            other_listeners: vec![],
-            own_playlists: vec!["Late Night".into()],
-            block_reason: None,
-        };
+    fn render_modal(preview: DeleteGuardPreview) -> String {
         let mut dom = VirtualDom::new_with_props(
             |preview: DeleteGuardPreview| {
                 rsx! {
@@ -214,15 +261,111 @@ mod tests {
                     }
                 }
             },
-            sole,
+            preview,
         );
         dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
-        assert!(html.contains("Delete permanently?"));
-        assert!(html.contains("Delete Permanently"));
-        assert!(html.contains("Late Night"));
+        dioxus_ssr::render(&dom)
+    }
 
-        let shared = DeleteGuardPreview {
+    #[test]
+    fn classifies_all_four_guard_modes_accurately() {
+        let discovery = DeleteGuardPreview {
+            song_id: "d1".into(),
+            is_pending_discovery: true,
+            discovery_track_id: Some("dt1".into()),
+            can_delete: true,
+            sole_owner: true,
+            other_listeners: vec![],
+            own_playlists: vec![],
+            block_reason: None,
+        };
+        assert_eq!(
+            classify_guard_mode(&discovery),
+            GuardModalMode::PendingDiscovery
+        );
+
+        let sole = DeleteGuardPreview {
+            song_id: "s1".into(),
+            is_pending_discovery: false,
+            discovery_track_id: None,
+            can_delete: true,
+            sole_owner: true,
+            other_listeners: vec![],
+            own_playlists: vec!["Late Night".into()],
+            block_reason: None,
+        };
+        assert_eq!(classify_guard_mode(&sole), GuardModalMode::PermanentDelete);
+
+        let listener_protected = DeleteGuardPreview {
+            song_id: "s2".into(),
+            is_pending_discovery: false,
+            discovery_track_id: None,
+            can_delete: false,
+            sole_owner: false,
+            other_listeners: vec![ListenerProtection {
+                kind: ListenerProtectionKind::OtherListenerPlaylist,
+                summary: "In Marie's Road Trip".into(),
+            }],
+            own_playlists: vec![],
+            block_reason: None,
+        };
+        assert_eq!(
+            classify_guard_mode(&listener_protected),
+            GuardModalMode::ListenerProtected
+        );
+
+        let hard_blocked = DeleteGuardPreview {
+            song_id: "s3".into(),
+            is_pending_discovery: false,
+            discovery_track_id: None,
+            can_delete: false,
+            sole_owner: false,
+            other_listeners: vec![ListenerProtection {
+                kind: ListenerProtectionKind::OutsideLibrary,
+                summary: "File sits outside managed library root".into(),
+            }],
+            own_playlists: vec![],
+            block_reason: Some("Outside managed library".into()),
+        };
+        assert_eq!(
+            classify_guard_mode(&hard_blocked),
+            GuardModalMode::HardBlocked
+        );
+    }
+
+    #[test]
+    fn renders_all_four_guard_variants_cleanly_in_ssr() {
+        // 1. Pending discovery
+        let html_disc = render_modal(DeleteGuardPreview {
+            song_id: "d1".into(),
+            is_pending_discovery: true,
+            discovery_track_id: Some("dt1".into()),
+            can_delete: true,
+            sole_owner: true,
+            other_listeners: vec![],
+            own_playlists: vec![],
+            block_reason: None,
+        });
+        assert!(html_disc.contains("Drop from discovery?"), "{html_disc}");
+        assert!(html_disc.contains("Drop Track"), "{html_disc}");
+
+        // 2. Permanent delete
+        let html_perm = render_modal(DeleteGuardPreview {
+            song_id: "s1".into(),
+            is_pending_discovery: false,
+            discovery_track_id: None,
+            can_delete: true,
+            sole_owner: true,
+            other_listeners: vec![],
+            own_playlists: vec!["Late Night".into()],
+            block_reason: None,
+        });
+        assert!(html_perm.contains("Delete permanently?"), "{html_perm}");
+        assert!(html_perm.contains("Delete Permanently"), "{html_perm}");
+        assert!(html_perm.contains("Late Night"), "{html_perm}");
+
+        // 3. Listener protected
+        let html_shared = render_modal(DeleteGuardPreview {
             song_id: "s2".into(),
             is_pending_discovery: false,
             discovery_track_id: None,
@@ -230,32 +373,55 @@ mod tests {
             sole_owner: false,
             other_listeners: vec![ListenerProtection {
                 kind: ListenerProtectionKind::OtherListenerMark,
-                summary: "Marie starred & rated 5★".into(),
+                summary: "Marie starred and rated 5★".into(),
             }],
             own_playlists: vec![],
             block_reason: None,
-        };
-        let mut dom2 = VirtualDom::new_with_props(
-            |preview: DeleteGuardPreview| {
-                rsx! {
-                    MultiListenerGuardModal {
-                        preview,
-                        track_title: "Veridis Quo".to_string(),
-                        on_confirm: |_| {},
-                        on_cancel: |_| {},
-                    }
-                }
-            },
-            shared,
-        );
-        dom2.rebuild_in_place();
-        let html2 = dioxus_ssr::render(&dom2);
-        assert!(html2.contains("Protected by other listeners"));
-        assert!(html2.contains("Marie starred"));
+        });
         assert!(
-            html2.contains("Unstar &#38; Hide From My Mixes")
-                || html2.contains("Unstar &amp; Hide From My Mixes"),
-            "{html2}"
+            html_shared.contains("Protected by other listeners"),
+            "{html_shared}"
+        );
+        assert!(
+            html_shared.contains("Marie starred and rated 5★"),
+            "{html_shared}"
+        );
+        assert!(
+            html_shared.contains("Unstar &#38; Hide From My Mixes")
+                || html_shared.contains("Unstar &amp; Hide From My Mixes"),
+            "{html_shared}"
+        );
+
+        // 4. Hard-blocked (Close only, no confirm action)
+        let html_blocked = render_modal(DeleteGuardPreview {
+            song_id: "s3".into(),
+            is_pending_discovery: false,
+            discovery_track_id: None,
+            can_delete: false,
+            sole_owner: false,
+            other_listeners: vec![ListenerProtection {
+                kind: ListenerProtectionKind::PathUnresolved,
+                summary: "Navidrome path could not be mapped".into(),
+            }],
+            own_playlists: vec![],
+            block_reason: Some("Enable ReportRealPath in Navidrome".into()),
+        });
+        assert!(
+            html_blocked.contains("Deletion unavailable"),
+            "{html_blocked}"
+        );
+        assert!(
+            html_blocked.contains("Enable ReportRealPath in Navidrome"),
+            "{html_blocked}"
+        );
+        assert!(html_blocked.contains(">Close</button>"), "{html_blocked}");
+        assert!(
+            !html_blocked.contains("Delete Permanently"),
+            "{html_blocked}"
+        );
+        assert!(
+            !html_blocked.contains("Hide From My Mixes"),
+            "{html_blocked}"
         );
     }
 }

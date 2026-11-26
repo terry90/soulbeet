@@ -22,8 +22,8 @@ pub fn format_culture_split(local_ratio: f32, local_label: &str) -> String {
 }
 
 /// Rich dark studio hero card for Seasonal & Contextual Discovery packs with adaptive
-/// gradient scrim, live Culture Steering segmented chips, offline pin toggle, and
-/// anti-taste-pollution disclosure pill.
+/// OLED-aware gradient scrim, live Culture Steering segmented chips, offline pin toggle,
+/// and anti-taste-pollution disclosure pill.
 #[component]
 pub fn SeasonalHeroCard(
     title: String,
@@ -91,11 +91,11 @@ pub fn SeasonalHeroCard(
                 }
             }
 
-            // Adaptive dark gradient scrim preserving WCAG AAA readability
+            // Adaptive OLED-aware dark gradient scrim preserving WCAG AAA readability
             div {
                 class: "absolute inset-0 pointer-events-none",
                 aria_hidden: "true",
-                style: "background: linear-gradient(95deg, rgba(15, 5, 24, 0.94) 0%, rgba(15, 5, 24, 0.80) 56%, rgba(15, 5, 24, 0.48) 100%), linear-gradient(0deg, rgba(15, 5, 24, 0.92) 0%, transparent 55%);",
+                style: "background: linear-gradient(95deg, color-mix(in srgb, var(--beet-canvas) 94%, transparent) 0%, color-mix(in srgb, var(--beet-canvas) 80%, transparent) 56%, color-mix(in srgb, var(--beet-canvas) 48%, transparent) 100%), linear-gradient(0deg, color-mix(in srgb, var(--beet-canvas) 92%, transparent) 0%, transparent 55%);",
             }
 
             // Content layer
@@ -160,7 +160,7 @@ pub fn SeasonalHeroCard(
 
                     if let Some(steer_cb) = on_steer {
                         div {
-                            role: "radiogroup",
+                            role: "group",
                             aria_label: "Culture mix steering",
                             class: "inline-flex items-center gap-1 p-1 rounded-full bg-beet-sunken/80 border border-beet-border-subtle",
                             for (option, label) in steering_options {
@@ -175,8 +175,7 @@ pub fn SeasonalHeroCard(
                                         button {
                                             key: "{option.as_str()}",
                                             r#type: "button",
-                                            role: "radio",
-                                            aria_checked: if active { "true" } else { "false" },
+                                            aria_pressed: if active { "true" } else { "false" },
                                             class: "h-8 px-3 rounded-full border text-[12px] font-medium transition-colors duration-150 cursor-pointer {chip_class}",
                                             onclick: move |_| steer_cb.call(option),
                                             "{label}"
@@ -210,5 +209,29 @@ mod tests {
         assert_eq!(format_culture_split(1.2, "jp"), "100% JP · 0% INTL");
         assert_eq!(format_culture_split(-0.5, ""), "0% LOCAL · 100% INTL");
         assert_eq!(format_culture_split(f32::NAN, "de"), "50% DE · 50% INTL");
+    }
+
+    #[test]
+    fn renders_group_steering_chips_and_oled_aware_scrim() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                SeasonalHeroCard {
+                    title: "Noël à la Française".to_string(),
+                    subtitle: "Festive mix".to_string(),
+                    track_count: 24,
+                    local_ratio: 0.45,
+                    local_label: "FR".to_string(),
+                    steering: CultureSteering::Balanced,
+                    on_play: |_| {},
+                    on_steer: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("role=\"group\""), "{html}");
+        assert!(html.contains("aria-pressed=\"true\""), "{html}");
+        assert!(html.contains("var(--beet-canvas)"), "{html}");
+        assert!(!html.contains("role=\"radiogroup\""), "{html}");
     }
 }
