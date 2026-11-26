@@ -125,7 +125,7 @@ pub(crate) mod test_db {
     pub const BACKEND_ID: i64 = 20261203000000;
     pub const ITEM_BACKEND: i64 = 20261203000001;
     pub const BACKEND_TRANSFERS: i64 = 20261204000001;
-    pub const LOSSY_FALLBACK: i64 = 20261205000000;
+    pub const LOSSY_FALLBACK: i64 = 20261205000002;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
