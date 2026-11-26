@@ -10,13 +10,25 @@
 
 Soulbeet is an all-in-one self-hosted music player, downloader, library manager, and discovery studio backed by Navidrome. Play your library across the Web, Linux and Windows Desktop, Android, and Android Auto, acquire missing tracks in one tap, let beets tag and organize everything automatically, and discover new music tailored to your listening history. Or skip the UI and ask your AI assistant: Soulbeet is also an [MCP server](#mcp-server).
 
+<p align="center">
+  <img src="screenshots/home.png" alt="Soulbeet Studio Home" width="100%" />
+</p>
+
 > "Make a Christmas playlist with 30 classics and download the ones I don't have."
 
 ## Screenshots
 
-| Studio Home | Discovery 2.0 | Mobile |
-| :---: | :---: | :---: |
-| ![Soulbeet Studio Home](screenshots/home.png) | ![Soulbeet Discovery 2.0](screenshots/discover.png) | ![Soulbeet Mobile](screenshots/mobile.png) |
+| Discovery 2.0 & Fast Triage | Library Stats Bento |
+| :---: | :---: |
+| ![Soulbeet Discovery 2.0](screenshots/discover.png) | ![Soulbeet Library Stats Bento](screenshots/dashboard.png) |
+
+| Unified Multi-Backend Search | Active Transfers |
+| :---: | :---: |
+| ![Soulbeet Unified Search](screenshots/search.png) | ![Soulbeet Active Transfers](screenshots/downloads.png) |
+
+<p align="center">
+  <img src="screenshots/mobile.png" alt="Soulbeet Mobile" width="280" />
+</p>
 
 Full screenshot gallery (home, discover, search, album, dashboard, downloads, settings, mobile): [screenshots](./screenshots)
 
