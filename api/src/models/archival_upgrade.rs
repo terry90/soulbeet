@@ -84,7 +84,7 @@ impl FastAcquisitionRow {
             if let Some(row) = sqlx::query_as::<_, Self>(
                 "SELECT * FROM fast_acquisitions \
                  WHERE user_id = ? AND navidrome_song_id = ? \
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
             )
             .bind(user_id)
             .bind(song_id)
@@ -100,7 +100,7 @@ impl FastAcquisitionRow {
             if let Some(row) = sqlx::query_as::<_, Self>(
                 "SELECT * FROM fast_acquisitions \
                  WHERE user_id = ? AND discovery_track_id = ? \
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
             )
             .bind(user_id)
             .bind(track_id)
@@ -115,7 +115,7 @@ impl FastAcquisitionRow {
         sqlx::query_as::<_, Self>(
             "SELECT * FROM fast_acquisitions \
              WHERE user_id = ? AND lower(artist) = lower(?) AND lower(title) = lower(?) \
-             ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
         )
         .bind(user_id)
         .bind(artist)
@@ -123,6 +123,50 @@ impl FastAcquisitionRow {
         .fetch_optional(db)
         .await
         .map_err(|e| e.to_string())
+    }
+
+    /// Marks matching `fast_acquisitions` rows as upgraded to a lossless codec so future
+    /// keep/star evaluations see the track is already lossless.
+    pub async fn mark_upgraded_in(
+        db: &SqlitePool,
+        user_id: &str,
+        navidrome_song_id: Option<&str>,
+        artist: &str,
+        title: &str,
+        new_codec: &str,
+        new_song_id: Option<&str>,
+    ) -> Result<u64, String> {
+        let mut affected = 0_u64;
+        if let Some(song_id) = navidrome_song_id.filter(|s| !s.is_empty()) {
+            let res = sqlx::query(
+                "UPDATE fast_acquisitions \
+                 SET codec = ?, is_lossy = 0, navidrome_song_id = COALESCE(?, navidrome_song_id) \
+                 WHERE user_id = ? AND navidrome_song_id = ?",
+            )
+            .bind(new_codec)
+            .bind(new_song_id)
+            .bind(user_id)
+            .bind(song_id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+            affected += res.rows_affected();
+        }
+        let res = sqlx::query(
+            "UPDATE fast_acquisitions \
+             SET codec = ?, is_lossy = 0, navidrome_song_id = COALESCE(?, navidrome_song_id) \
+             WHERE user_id = ? AND lower(artist) = lower(?) AND lower(title) = lower(?)",
+        )
+        .bind(new_codec)
+        .bind(new_song_id)
+        .bind(user_id)
+        .bind(artist)
+        .bind(title)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        affected += res.rows_affected();
+        Ok(affected)
     }
 }
 
@@ -201,7 +245,7 @@ impl ArchivalUpgradeRow {
                 "SELECT * FROM archival_upgrade_jobs \
                  WHERE user_id = ? AND navidrome_song_id = ? \
                    AND status IN ('queued', 'searching', 'downloading', 'completed') \
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
             )
             .bind(user_id)
             .bind(song_id)
@@ -217,7 +261,7 @@ impl ArchivalUpgradeRow {
             "SELECT * FROM archival_upgrade_jobs \
              WHERE user_id = ? AND lower(artist) = lower(?) AND lower(title) = lower(?) \
                AND status IN ('queued', 'searching', 'downloading', 'completed') \
-             ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
         )
         .bind(user_id)
         .bind(artist)
@@ -267,7 +311,7 @@ impl ArchivalUpgradeRow {
     ) -> Result<Vec<Self>, String> {
         sqlx::query_as::<_, Self>(
             "SELECT * FROM archival_upgrade_jobs \
-             WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+             WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
         )
         .bind(user_id)
         .bind(limit)
@@ -283,12 +327,36 @@ impl ArchivalUpgradeRow {
         sqlx::query_as::<_, Self>(
             "SELECT * FROM archival_upgrade_jobs \
              WHERE status = 'queued' AND attempts < ? \
-             ORDER BY created_at ASC, rowid ASC LIMIT 1",
+             ORDER BY updated_at ASC, created_at ASC, rowid ASC LIMIT 1",
         )
         .bind(max_attempts)
         .fetch_optional(db)
         .await
         .map_err(|e| e.to_string())
+    }
+
+    pub async fn list_downloading_in(db: &SqlitePool) -> Result<Vec<Self>, String> {
+        sqlx::query_as::<_, Self>(
+            "SELECT * FROM archival_upgrade_jobs \
+             WHERE status = 'downloading' \
+             ORDER BY updated_at ASC, created_at ASC, rowid ASC",
+        )
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Resets any rows left in `'searching'` by a previous process crash/restart back to `'queued'`.
+    pub async fn reset_stale_searching_in(db: &SqlitePool) -> Result<u64, String> {
+        let result = sqlx::query(
+            "UPDATE archival_upgrade_jobs \
+             SET status = 'queued', updated_at = datetime('now') \
+             WHERE status = 'searching'",
+        )
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(result.rows_affected())
     }
 
     pub async fn mark_status_in(

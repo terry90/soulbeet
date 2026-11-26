@@ -21,7 +21,7 @@ CREATE INDEX IF NOT EXISTS idx_fast_acquisitions_user_song
 CREATE INDEX IF NOT EXISTS idx_fast_acquisitions_user_discovery
     ON fast_acquisitions(user_id, discovery_track_id);
 CREATE INDEX IF NOT EXISTS idx_fast_acquisitions_user_track
-    ON fast_acquisitions(user_id, artist, title);
+    ON fast_acquisitions(user_id, lower(artist), lower(title));
 
 -- Low-priority background archival FLAC upgrade queue. Populated ONLY when a
 -- lossy fast-acquired track is explicitly kept, starred, or promoted.
@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS archival_upgrade_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_archival_upgrades_status
-    ON archival_upgrade_jobs(status, created_at);
+    ON archival_upgrade_jobs(status, updated_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_archival_upgrades_user
     ON archival_upgrade_jobs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_archival_upgrades_user_track
+    ON archival_upgrade_jobs(user_id, lower(artist), lower(title));
+CREATE INDEX IF NOT EXISTS idx_archival_upgrades_user_song
+    ON archival_upgrade_jobs(user_id, navidrome_song_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archival_upgrades_active_unique
+    ON archival_upgrade_jobs(user_id, lower(artist), lower(title))
+    WHERE status IN ('queued', 'searching', 'downloading');

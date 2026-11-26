@@ -41,7 +41,9 @@ use crate::core::folders;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::library::{self, MatchKind, Reference};
 use crate::core::sources::{self, Searched};
-use crate::globals::{get_or_create_user_channel, send_user_event};
+use crate::globals::{
+    get_or_create_user_channel, register_user_task, send_user_event, unregister_user_task,
+};
 use crate::ledger::{
     store, DuplicateRule, JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, SlotResult,
     LEDGER,
@@ -49,7 +51,7 @@ use crate::ledger::{
 use crate::models::archival_upgrade::NewFastAcquisition;
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
-use crate::server_fns::download::enqueue::not_enqueued_failure;
+use crate::server_fns::download::enqueue::{already_running, not_enqueued_failure};
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{
     enabled_download_backends, Backends, Registry, DEFAULT_DOWNLOAD_BACKEND,
@@ -62,28 +64,43 @@ const STAGE_WATCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// a job's ledger slot reach `Done` / `Failed`.
 const STAGE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Splits enabled backends into `(fast_tier, archival_tier)` according to `prefer_fast`.
+/// Short retry settings used in `finalize_ready` to ensure the ledger writer has flushed
+/// `SlotResult::Imported { listed: Some(_) }` before emitting `Ready`.
+const FINALIZE_FLUSH_RETRIES: usize = 5;
+const FINALIZE_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(40);
+
+fn meta_for<'a>(id: &str, enabled_meta: &[&'a BackendMeta]) -> Option<&'a BackendMeta> {
+    enabled_meta
+        .iter()
+        .copied()
+        .find(|m| m.id == id)
+        .or_else(|| shared::backends::meta(id))
+}
+
+/// Splits enabled backends into `(primary_tier, fallback_tier)` according to `prefer_fast`.
 ///
-/// When `prefer_fast == true`: non-default enabled backends (instant secondary sources)
-/// run in the fast tier, and `DEFAULT_DOWNLOAD_BACKEND` (Soulseek) forms the fallback tier.
-/// When `prefer_fast == false`: `DEFAULT_DOWNLOAD_BACKEND` / lossless-capable backends run first.
+/// When `prefer_fast == true`: ONLY explicit `Delivery::LossyOnly` backends run in the fast
+/// tier, and `Delivery::AsFound` backends (including Soulseek and Internet Archive) stay in
+/// the archival/fallback tier so non-lossy secondary sources never block Soulseek searches.
+/// When `prefer_fast == false`: `Delivery::AsFound` backends run first and `Delivery::LossyOnly`
+/// backends form the fallback tier.
 pub fn partition_backends(
     backends: Vec<Searched>,
+    enabled_meta: &[&BackendMeta],
     prefer_fast: bool,
 ) -> (Vec<Searched>, Vec<Searched>) {
     let mut fast = Vec::new();
     let mut archival = Vec::new();
     for entry in backends {
-        let is_default = entry.0 == DEFAULT_DOWNLOAD_BACKEND;
-        let is_lossy_only = shared::backends::meta(&entry.0)
-            .is_some_and(|m| m.delivery == Delivery::LossyOnly);
+        let is_lossy_only =
+            meta_for(&entry.0, enabled_meta).is_some_and(|m| m.delivery == Delivery::LossyOnly);
         if prefer_fast {
-            if !is_default || is_lossy_only {
+            if is_lossy_only {
                 fast.push(entry);
             } else {
                 archival.push(entry);
             }
-        } else if is_default || !is_lossy_only {
+        } else if !is_lossy_only {
             fast.push(entry);
         } else {
             archival.push(entry);
@@ -138,16 +155,15 @@ pub async fn acquire_and_play(
     ctx: &UserCtx,
     req: AcquireAndPlayRequest,
 ) -> Result<AcquireAndPlayResponse, Failure> {
-    if let Some(failure) = crate::importer_health::blocking_failure().await {
-        return Err(failure);
-    }
     let enabled = enabled_download_backends().await;
+    let importer_failure = crate::importer_health::blocking_failure().await;
     acquire_and_play_in(
         &crate::db::DB,
         &LEDGER,
-        &ServerNavidrome,
+        Arc::new(ServerNavidrome),
         &Registry,
         &enabled,
+        importer_failure,
         ctx,
         req,
     )
@@ -155,12 +171,14 @@ pub async fn acquire_and_play(
 }
 
 /// Testable core of `acquire_and_play`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn acquire_and_play_in(
     db: &SqlitePool,
     ledger: &Ledger,
-    navidrome: &dyn NavidromeOf,
+    navidrome: Arc<dyn NavidromeOf>,
     backends: &dyn Backends,
     enabled_meta: &[&BackendMeta],
+    importer_failure: Option<Failure>,
     ctx: &UserCtx,
     req: AcquireAndPlayRequest,
 ) -> Result<AcquireAndPlayResponse, Failure> {
@@ -177,7 +195,8 @@ pub(crate) async fn acquire_and_play_in(
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // 1. Check Navidrome first — instant playback if the track is already owned.
+    // 1. Check Navidrome first — instant playback if the track is already owned,
+    // even if beets/importer health is currently degraded.
     let reference = Reference {
         artist: artist.clone(),
         title: title.clone(),
@@ -232,6 +251,12 @@ pub(crate) async fn acquire_and_play_in(
         }
     }
 
+    // Only block new downloads/imports when beets is degraded; already-owned tracks above
+    // return immediately without touching the importer.
+    if let Some(failure) = importer_failure {
+        return Err(failure);
+    }
+
     // 2. Resolve target library folder and usable download backends.
     let folder = resolve_target_folder_in(db, ctx, req.folder_id.as_deref()).await?;
     let (first_usable, rest_usable) = sources::usable_from(backends, enabled_meta).await?;
@@ -239,7 +264,15 @@ pub(crate) async fn acquire_and_play_in(
     usable.push(first_usable);
     usable.extend(rest_usable);
 
-    let (fast_tier, fallback_tier) = partition_backends(usable, req.prefer_fast);
+    let lossy_only_ids: Vec<String> = usable
+        .iter()
+        .filter(|(id, _)| {
+            meta_for(id, enabled_meta).is_some_and(|m| m.delivery == Delivery::LossyOnly)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    let (fast_tier, fallback_tier) = partition_backends(usable, enabled_meta, req.prefer_fast);
     let backend_ids: Vec<String> = fast_tier
         .iter()
         .chain(fallback_tier.iter())
@@ -290,11 +323,13 @@ pub(crate) async fn acquire_and_play_in(
         .await
         .map_err(|e| database_failure(Stage::SourceSearch, e))?;
 
-    // Ensure channel exists before spawning background pipeline so immediate subscribers receive events.
+    // Ensure channel exists and keep it alive for the duration of the background pipeline.
     let _ = get_or_create_user_channel(&ctx.id()).await;
+    register_user_task(&ctx.id()).await;
 
     let bg_db = db.clone();
     let bg_ledger = ledger.clone();
+    let bg_navidrome = Arc::clone(&navidrome);
     let bg_ctx = ctx.clone();
     let bg_request_id = request_id.clone();
     let bg_batch_id = batch_id.clone();
@@ -306,11 +341,13 @@ pub(crate) async fn acquire_and_play_in(
         .chain(fallback_tier.iter())
         .cloned()
         .collect();
+    let task_user = ctx.id();
 
     tokio::spawn(async move {
         run_acquire_and_play_pipeline(
             bg_db,
             bg_ledger,
+            bg_navidrome,
             bg_ctx,
             folder,
             bg_req,
@@ -322,8 +359,10 @@ pub(crate) async fn acquire_and_play_in(
             fast_tier,
             fallback_tier,
             bg_backends,
+            lossy_only_ids,
         )
         .await;
+        unregister_user_task(&task_user).await;
     });
 
     Ok(AcquireAndPlayResponse {
@@ -336,10 +375,129 @@ pub(crate) async fn acquire_and_play_in(
     })
 }
 
+enum EnqueueAttempt {
+    Enqueued {
+        routed_id: String,
+        picked_quality: String,
+        rx: broadcast::Receiver<DownloadEvent>,
+    },
+    AlreadyRunning(Failure),
+    Failed(Failure),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_enqueue_picked(
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    folder: &Folder,
+    request_id: &str,
+    batch_id: &str,
+    job_id: &str,
+    artist: &str,
+    title: &str,
+    mbid: Option<&str>,
+    picked: DownloadableGroup,
+    alternates: Vec<DownloadableGroup>,
+    all_backends: &[Searched],
+) -> EnqueueAttempt {
+    let user = ctx.id();
+    let picked_quality = picked.quality.clone();
+    let picked_source = picked.source.clone();
+
+    let routed_id = match backend_of(&picked.items) {
+        Ok(id) => id.to_string(),
+        Err(failure) => return EnqueueAttempt::Failed(failure),
+    };
+
+    let Some((_, backend)) = all_backends.iter().find(|(id, _)| id == &routed_id) else {
+        return EnqueueAttempt::Failed(Failure::new(
+            FailureCode::BackendNotConfigured,
+            Stage::Enqueue,
+            RetryAdvice::NotRetryable,
+            format!("Picked backend '{routed_id}' is not available"),
+        ));
+    };
+
+    emit_stage(
+        &user,
+        request_id,
+        artist,
+        title,
+        mbid,
+        AcquireAndPlayStage::Acquiring {
+            backend_id: routed_id.clone(),
+            backend_name: backend.name().to_string(),
+            source: Some(picked_source),
+            quality: Some(picked_quality.clone()),
+        },
+    )
+    .await;
+
+    let target = match prepare_target(folder).await {
+        Ok(t) => t,
+        Err(failure) => return EnqueueAttempt::Failed(failure),
+    };
+
+    let picked_items = numbered(picked.items);
+    ledger.record(JobEvent::Picked {
+        job: job_id.to_string(),
+        items: picked_items.clone(),
+    });
+
+    // Subscribe to the user's download event channel BEFORE enqueueing so we cannot miss
+    // rapid transitions (Importing -> Indexing -> Ready).
+    let tx = get_or_create_user_channel(&user).await;
+    let rx = tx.subscribe();
+
+    let fresh = NewBatch {
+        batch_id: batch_id.to_string(),
+        label: format!("{artist} - {title}"),
+        backend: routed_id.clone(),
+        target,
+        import_mode: ImportMode::Singleton,
+        duplicates: DuplicateRule::Guarded,
+    };
+    let acquisition = Acquisition {
+        job: job_id.to_string(),
+        items: picked_items,
+        alternates,
+        max_sources: MAX_SOURCES_PER_TRACK,
+    };
+
+    let enqueued = enqueue_and_watch(ledger, ctx, Arc::clone(backend), fresh, acquisition).await;
+    match &enqueued {
+        Ok(results) if results.iter().any(|d| d.status == EnqueueStatus::Enqueued) => {
+            info!(
+                "Acquire & Play {} enqueued on '{}' for '{} - {}'",
+                request_id, routed_id, artist, title
+            );
+            EnqueueAttempt::Enqueued {
+                routed_id,
+                picked_quality,
+                rx,
+            }
+        }
+        Ok(results)
+            if results
+                .iter()
+                .any(|d: &QueuedDownload| d.status == EnqueueStatus::AlreadyRunning) =>
+        {
+            EnqueueAttempt::AlreadyRunning(
+                already_running().with_message("Track is already downloading in another batch"),
+            )
+        }
+        Ok(results) => EnqueueAttempt::Failed(
+            not_enqueued_failure(results).with_message("Acquire & Play failed to queue download"),
+        ),
+        Err(failure) => EnqueueAttempt::Failed(failure.clone()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_acquire_and_play_pipeline(
     db: SqlitePool,
     ledger: Ledger,
+    navidrome: Arc<dyn NavidromeOf>,
     ctx: UserCtx,
     folder: Folder,
     req: AcquireAndPlayRequest,
@@ -351,6 +509,7 @@ async fn run_acquire_and_play_pipeline(
     fast_tier: Vec<Searched>,
     fallback_tier: Vec<Searched>,
     all_backends: Vec<Searched>,
+    lossy_only_ids: Vec<String>,
 ) {
     let user = ctx.id();
     let artist = track.artist.clone();
@@ -377,27 +536,27 @@ async fn run_acquire_and_play_pipeline(
     )
     .await;
 
-    let search_outcome = search_tiered(&fast_tier, &fallback_tier, &track).await;
-    let mut all_groups = match search_outcome {
-        Ok(groups) => groups,
-        Err(failure) => {
-            ledger.record(JobEvent::Ended {
-                job: job_id,
-                state: JobState::Failed,
-                failure: Some(failure.clone()),
-            });
-            emit_stage(
-                &user,
-                &request_id,
-                &artist,
-                &title,
-                mbid.as_deref(),
-                AcquireAndPlayStage::Failed { failure },
-            )
-            .await;
-            return;
-        }
-    };
+    let (mut all_groups, mut fallback_searched) =
+        match search_tiered(&fast_tier, &fallback_tier, &track).await {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                ledger.record(JobEvent::Ended {
+                    job: job_id,
+                    state: JobState::Failed,
+                    failure: Some(failure.clone()),
+                });
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::Failed { failure },
+                )
+                .await;
+                return;
+            }
+        };
 
     if let Err(e) = ledger.store_candidates(&search_id, all_groups.clone()).await {
         let failure = database_failure(Stage::SourceSearch, e);
@@ -441,77 +600,31 @@ async fn run_acquire_and_play_pipeline(
     }
 
     let picked = all_groups.remove(0);
-    let picked_quality = picked.quality.clone();
-    let picked_source = picked.source.clone();
+    let mut active_job_id = job_id.clone();
+    let mut active_batch_id = batch_id.clone();
 
-    let routed_id = match backend_of(&picked.items) {
-        Ok(id) => id.to_string(),
-        Err(failure) => {
-            ledger.record(JobEvent::Ended {
-                job: job_id,
-                state: JobState::Failed,
-                failure: Some(failure.clone()),
-            });
-            emit_stage(
-                &user,
-                &request_id,
-                &artist,
-                &title,
-                mbid.as_deref(),
-                AcquireAndPlayStage::Failed { failure },
-            )
-            .await;
-            return;
-        }
-    };
-
-    let Some((_, backend)) = all_backends.iter().find(|(id, _)| id == &routed_id) else {
-        let failure = Failure::new(
-            FailureCode::BackendNotConfigured,
-            Stage::Enqueue,
-            RetryAdvice::NotRetryable,
-            format!("Picked backend '{routed_id}' is not available"),
-        );
-        ledger.record(JobEvent::Ended {
-            job: job_id,
-            state: JobState::Failed,
-            failure: Some(failure.clone()),
-        });
-        emit_stage(
-            &user,
-            &request_id,
-            &artist,
-            &title,
-            mbid.as_deref(),
-            AcquireAndPlayStage::Failed { failure },
-        )
-        .await;
-        return;
-    };
-
-    emit_stage(
-        &user,
+    let (routed_id, picked_quality, rx) = match try_enqueue_picked(
+        &ledger,
+        &ctx,
+        &folder,
         &request_id,
+        &active_batch_id,
+        &active_job_id,
         &artist,
         &title,
         mbid.as_deref(),
-        AcquireAndPlayStage::Acquiring {
-            backend_id: routed_id.clone(),
-            backend_name: backend.name().to_string(),
-            source: Some(picked_source),
-            quality: Some(picked_quality.clone()),
-        },
+        picked,
+        all_groups,
+        &all_backends,
     )
-    .await;
-
-    let target = match prepare_target(&folder).await {
-        Ok(t) => t,
-        Err(failure) => {
-            ledger.record(JobEvent::Ended {
-                job: job_id,
-                state: JobState::Failed,
-                failure: Some(failure.clone()),
-            });
+    .await
+    {
+        EnqueueAttempt::Enqueued {
+            routed_id,
+            picked_quality,
+            rx,
+        } => (routed_id, picked_quality, rx),
+        EnqueueAttempt::AlreadyRunning(failure) => {
             emit_stage(
                 &user,
                 &request_id,
@@ -523,116 +636,266 @@ async fn run_acquire_and_play_pipeline(
             .await;
             return;
         }
-    };
+        EnqueueAttempt::Failed(first_failure) => {
+            ledger.record(JobEvent::Ended {
+                job: active_job_id.clone(),
+                state: JobState::Failed,
+                failure: Some(first_failure.clone()),
+            });
 
-    let picked_items = numbered(picked.items);
-    ledger.record(JobEvent::Picked {
-        job: job_id.clone(),
-        items: picked_items.clone(),
-    });
-
-    // Subscribe to the user's download event channel BEFORE enqueueing so we cannot miss
-    // rapid transitions (Importing -> Indexing -> Ready).
-    let tx = get_or_create_user_channel(&user).await;
-    let rx = tx.subscribe();
-
-    let fresh = NewBatch {
-        batch_id: batch_id.clone(),
-        label: format!("{artist} - {title}"),
-        backend: routed_id.clone(),
-        target,
-        import_mode: ImportMode::Singleton,
-        duplicates: DuplicateRule::Guarded,
-    };
-    let acquisition = Acquisition {
-        job: job_id.clone(),
-        items: picked_items,
-        alternates: all_groups,
-        max_sources: MAX_SOURCES_PER_TRACK,
-    };
-
-    let enqueued = enqueue_and_watch(&ledger, &ctx, Arc::clone(backend), fresh, acquisition).await;
-    let on_its_way = |d: &QueuedDownload| {
-        matches!(
-            d.status,
-            EnqueueStatus::Enqueued | EnqueueStatus::AlreadyRunning
-        )
-    };
-    match &enqueued {
-        Ok(results) if results.iter().any(on_its_way) => {
-            info!(
-                "Acquire & Play {} enqueued on '{}' for '{} - {}'",
-                request_id, routed_id, artist, title
+            // If fast-tier enqueue failed and fallback_tier hasn't been tried yet, fall back to it!
+            if fallback_searched || fallback_tier.is_empty() {
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::Failed {
+                        failure: first_failure,
+                    },
+                )
+                .await;
+                return;
+            }
+            fallback_searched = true;
+            let _ = fallback_searched;
+            warn!(
+                "Acquire & Play {} fast-tier enqueue failed ({}); falling back to archival tier",
+                request_id, first_failure.message
             );
-        }
-        Ok(results) => {
-            let failure = not_enqueued_failure(results)
-                .with_message("Acquire & Play failed to queue download");
-            ledger.record(JobEvent::Ended {
-                job: job_id,
-                state: JobState::Failed,
-                failure: Some(failure.clone()),
-            });
+
+            let (fb_first, fb_rest) = fallback_tier.split_first().expect("non-empty fallback_tier");
             emit_stage(
                 &user,
                 &request_id,
                 &artist,
                 &title,
                 mbid.as_deref(),
-                AcquireAndPlayStage::Failed { failure },
-            )
-            .await;
-            return;
-        }
-        Err(failure) => {
-            ledger.record(JobEvent::Ended {
-                job: job_id,
-                state: JobState::Failed,
-                failure: Some(failure.clone()),
-            });
-            emit_stage(
-                &user,
-                &request_id,
-                &artist,
-                &title,
-                mbid.as_deref(),
-                AcquireAndPlayStage::Failed {
-                    failure: failure.clone(),
+                AcquireAndPlayStage::Acquiring {
+                    backend_id: fb_first.0.clone(),
+                    backend_name: fb_first.1.name().to_string(),
+                    source: None,
+                    quality: None,
                 },
             )
             .await;
-            return;
+
+            let mut fb_groups =
+                match sources::search_ranked(fb_first, fb_rest, None, std::slice::from_ref(&track))
+                    .await
+                {
+                    Ok(g) if !g.is_empty() => g,
+                    Ok(_) => {
+                        emit_stage(
+                            &user,
+                            &request_id,
+                            &artist,
+                            &title,
+                            mbid.as_deref(),
+                            AcquireAndPlayStage::Failed {
+                                failure: first_failure,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(fb_err) => {
+                        emit_stage(
+                            &user,
+                            &request_id,
+                            &artist,
+                            &title,
+                            mbid.as_deref(),
+                            AcquireAndPlayStage::Failed { failure: fb_err },
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            fb_groups.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let fb_job_id = uuid::Uuid::new_v4().to_string();
+            let fb_batch_id = uuid::Uuid::new_v4().to_string();
+            let fb_search_id = uuid::Uuid::new_v4().to_string();
+            let query = DownloadQuery::new(vec![track.clone()]);
+            if let Err(e) = ledger
+                .create(
+                    NewJob {
+                        id: fb_job_id.clone(),
+                        user: ctx.id(),
+                        folder_id: folder.id.clone(),
+                        wanted: query.clone(),
+                        import_mode: ImportMode::Singleton,
+                        state: JobState::Searching,
+                        search_id: Some(fb_search_id.clone()),
+                        picked: vec![],
+                        kind: JobKind::Track,
+                        options: None,
+                    },
+                    Some(NewSearch {
+                        id: fb_search_id.clone(),
+                        user: ctx.id(),
+                        backend: None,
+                        query,
+                        spec: None,
+                    }),
+                )
+                .await
+            {
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::Failed {
+                        failure: database_failure(Stage::SourceSearch, e),
+                    },
+                )
+                .await;
+                return;
+            }
+            if let Err(e) = ledger
+                .store_candidates(&fb_search_id, fb_groups.clone())
+                .await
+            {
+                let failure = database_failure(Stage::SourceSearch, e);
+                ledger.record(JobEvent::Ended {
+                    job: fb_job_id,
+                    state: JobState::Failed,
+                    failure: Some(failure.clone()),
+                });
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::Failed { failure },
+                )
+                .await;
+                return;
+            }
+
+            let fb_best = fb_groups[0].score;
+            if fb_best < AUTO_SELECT_SCORE_THRESHOLD {
+                ledger.record(JobEvent::NeedsSourceChoice {
+                    job: fb_job_id,
+                });
+                emit_stage(
+                    &user,
+                    &request_id,
+                    &artist,
+                    &title,
+                    mbid.as_deref(),
+                    AcquireAndPlayStage::NeedsManualChoice {
+                        search_id: fb_search_id,
+                        results: fb_groups,
+                        best_score: fb_best,
+                        threshold: AUTO_SELECT_SCORE_THRESHOLD,
+                    },
+                )
+                .await;
+                return;
+            }
+
+            let fb_picked = fb_groups.remove(0);
+            active_job_id = fb_job_id;
+            active_batch_id = fb_batch_id;
+            match try_enqueue_picked(
+                &ledger,
+                &ctx,
+                &folder,
+                &request_id,
+                &active_batch_id,
+                &active_job_id,
+                &artist,
+                &title,
+                mbid.as_deref(),
+                fb_picked,
+                fb_groups,
+                &all_backends,
+            )
+            .await
+            {
+                EnqueueAttempt::Enqueued {
+                    routed_id,
+                    picked_quality,
+                    rx,
+                } => (routed_id, picked_quality, rx),
+                EnqueueAttempt::AlreadyRunning(failure) => {
+                    emit_stage(
+                        &user,
+                        &request_id,
+                        &artist,
+                        &title,
+                        mbid.as_deref(),
+                        AcquireAndPlayStage::Failed { failure },
+                    )
+                    .await;
+                    return;
+                }
+                EnqueueAttempt::Failed(failure) => {
+                    ledger.record(JobEvent::Ended {
+                        job: active_job_id,
+                        state: JobState::Failed,
+                        failure: Some(failure.clone()),
+                    });
+                    emit_stage(
+                        &user,
+                        &request_id,
+                        &artist,
+                        &title,
+                        mbid.as_deref(),
+                        AcquireAndPlayStage::Failed { failure },
+                    )
+                    .await;
+                    return;
+                }
+            }
         }
-    }
+    };
+
+    let backend_lossy_only = lossy_only_ids.iter().any(|id| id == &routed_id)
+        || shared::backends::meta(&routed_id).is_some_and(|m| m.delivery == Delivery::LossyOnly);
 
     relay_job_stages_until_terminal(
         &db,
+        &ledger,
+        &*navidrome,
         &ctx,
         &folder,
         rx,
         StageRelayContext {
             request_id,
-            batch_id,
-            job_id,
+            batch_id: active_batch_id,
+            job_id: active_job_id,
             artist,
             title,
             album: req.album,
             recording_mbid: mbid,
+            duration_s: req.duration_s,
             backend_id: routed_id,
+            backend_lossy_only,
             picked_quality,
         },
     )
     .await;
 }
 
-/// Searches `fast_tier` first; if a group reaches `AUTO_SELECT_SCORE_THRESHOLD`, returns it
-/// immediately without waiting for `fallback_tier`. Otherwise searches `fallback_tier` and
-/// merges all groups best-first.
+/// Searches `fast_tier` first; if a group reaches `AUTO_SELECT_SCORE_THRESHOLD`, returns
+/// `(groups, false)` immediately without searching `fallback_tier`. Otherwise searches
+/// `fallback_tier` and returns `(merged_groups, true)`.
 async fn search_tiered(
     fast_tier: &[Searched],
     fallback_tier: &[Searched],
     track: &Track,
-) -> Result<Vec<DownloadableGroup>, Failure> {
+) -> Result<(Vec<DownloadableGroup>, bool), Failure> {
     let mut combined = Vec::new();
     let mut last_err = None;
 
@@ -643,7 +906,7 @@ async fn search_tiered(
                     .first()
                     .is_some_and(|g| g.score >= AUTO_SELECT_SCORE_THRESHOLD)
                 {
-                    return Ok(groups);
+                    return Ok((groups, false));
                 }
                 combined.extend(groups);
             }
@@ -651,7 +914,9 @@ async fn search_tiered(
         }
     }
 
+    let mut searched_fallback = false;
     if let Some((first, rest)) = fallback_tier.split_first() {
+        searched_fallback = true;
         match sources::search_ranked(first, rest, None, std::slice::from_ref(track)).await {
             Ok(groups) => combined.extend(groups),
             Err(failure) => {
@@ -678,7 +943,7 @@ async fn search_tiered(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(combined)
+    Ok((combined, searched_fallback))
 }
 
 /// Context needed by the stage relay loop.
@@ -690,18 +955,22 @@ pub(crate) struct StageRelayContext {
     pub title: String,
     pub album: Option<String>,
     pub recording_mbid: Option<String>,
+    pub duration_s: Option<u32>,
     pub backend_id: String,
+    pub backend_lossy_only: bool,
     pub picked_quality: String,
 }
 
-/// Watches live `DownloadEvent`s and ledger slot state for `ctx.job_id`, emitting
+/// Watches live `DownloadEvent`s and ledger slot state for `relay.job_id`, emitting
 /// deduplicated `AcquireAndPlayStage::{Importing, Indexing, Ready, Failed}` frames
 /// and recording lossy fast acquisitions in SQLite (without scheduling archival upgrades).
 pub(crate) async fn relay_job_stages_until_terminal(
     db: &SqlitePool,
+    ledger: &Ledger,
+    navidrome: &dyn NavidromeOf,
     user_ctx: &UserCtx,
     folder: &Folder,
-    mut rx: broadcast::Receiver<DownloadEvent>,
+    rx: broadcast::Receiver<DownloadEvent>,
     relay: StageRelayContext,
 ) {
     let user = user_ctx.id();
@@ -709,11 +978,19 @@ pub(crate) async fn relay_job_stages_until_terminal(
     let mut poll = tokio::time::interval(STAGE_POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut rx = Some(rx);
     let mut emitted_importing = false;
     let mut emitted_indexing = false;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
+            let (code, stage) = if emitted_indexing {
+                (FailureCode::IndexNotFoundAfterScan, Stage::Index)
+            } else if emitted_importing {
+                (FailureCode::ImportTotalTimeout, Stage::Import)
+            } else {
+                (FailureCode::TransferTimedOut, Stage::Transfer)
+            };
             emit_stage(
                 &user,
                 &relay.request_id,
@@ -722,8 +999,8 @@ pub(crate) async fn relay_job_stages_until_terminal(
                 relay.recording_mbid.as_deref(),
                 AcquireAndPlayStage::Failed {
                     failure: Failure::new(
-                        FailureCode::SearchTimeout,
-                        Stage::Index,
+                        code,
+                        stage,
                         RetryAdvice::SameSourceLater,
                         "Timed out waiting for track acquisition and indexing",
                     ),
@@ -734,7 +1011,12 @@ pub(crate) async fn relay_job_stages_until_terminal(
         }
 
         tokio::select! {
-            recv = rx.recv() => {
+            recv = async {
+                match rx.as_mut() {
+                    Some(channel) => channel.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 match recv {
                     Ok(DownloadEvent::Progress(rows)) => {
                         for row in rows {
@@ -743,6 +1025,8 @@ pub(crate) async fn relay_job_stages_until_terminal(
                             }
                             if let Some(terminal) = process_progress_row(
                                 db,
+                                ledger,
+                                navidrome,
                                 user_ctx,
                                 folder,
                                 &relay,
@@ -766,6 +1050,8 @@ pub(crate) async fn relay_job_stages_until_terminal(
                         if row_matches_job(&entry, &relay.batch_id, &relay.job_id) {
                             if let Some(terminal) = process_progress_row(
                                 db,
+                                ledger,
+                                navidrome,
                                 user_ctx,
                                 folder,
                                 &relay,
@@ -786,12 +1072,17 @@ pub(crate) async fn relay_job_stages_until_terminal(
                         }
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Keep polling the ledger until terminal even if the broadcast channel closes.
+                        rx = None;
+                    }
                 }
             }
             _ = poll.tick() => {
                 if let Some(terminal) = poll_ledger_slot(
                     db,
+                    ledger,
+                    navidrome,
                     user_ctx,
                     folder,
                     &relay,
@@ -818,8 +1109,11 @@ fn row_matches_job(row: &DownloadProgress, batch_id: &str, job_id: &str) -> bool
         || row.batch_id.as_deref() == Some(batch_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_progress_row(
     db: &SqlitePool,
+    ledger: &Ledger,
+    navidrome: &dyn NavidromeOf,
     user_ctx: &UserCtx,
     folder: &Folder,
     relay: &StageRelayContext,
@@ -896,7 +1190,7 @@ async fn process_progress_row(
                 )
                 .await;
             }
-            Some(finalize_ready(db, user_ctx, folder, relay).await)
+            Some(finalize_ready(db, ledger, navidrome, user_ctx, folder, relay, false).await)
         }
         (DownloadState::Imported, Some(IndexState::Failed(failure))) => {
             Some(AcquireAndPlayStage::Failed {
@@ -927,7 +1221,7 @@ async fn process_progress_row(
                 row.skip,
                 Some(shared::download::SkipKind::AlreadyInLibrary)
             ) {
-                Some(finalize_ready(db, user_ctx, folder, relay).await)
+                Some(finalize_ready(db, ledger, navidrome, user_ctx, folder, relay, true).await)
             } else {
                 let failure = row.failure.clone().unwrap_or_else(|| {
                     Failure::new(
@@ -944,8 +1238,11 @@ async fn process_progress_row(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn poll_ledger_slot(
     db: &SqlitePool,
+    ledger: &Ledger,
+    navidrome: &dyn NavidromeOf,
     user_ctx: &UserCtx,
     folder: &Folder,
     relay: &StageRelayContext,
@@ -998,19 +1295,65 @@ async fn poll_ledger_slot(
             }
             None
         }
-        JobState::Done => Some(finalize_ready(db, user_ctx, folder, relay).await),
-        JobState::Failed | JobState::Cancelled | JobState::NeedsDecision => {
+        JobState::Done => {
+            let is_already_in_library =
+                matches!(first.result, Some(SlotResult::AlreadyInLibrary { .. }));
+            if !is_already_in_library {
+                if !*emitted_importing {
+                    *emitted_importing = true;
+                    emit_stage(
+                        &user,
+                        &relay.request_id,
+                        &relay.artist,
+                        &relay.title,
+                        relay.recording_mbid.as_deref(),
+                        AcquireAndPlayStage::Importing,
+                    )
+                    .await;
+                }
+                if !*emitted_indexing {
+                    *emitted_indexing = true;
+                    emit_stage(
+                        &user,
+                        &relay.request_id,
+                        &relay.artist,
+                        &relay.title,
+                        relay.recording_mbid.as_deref(),
+                        AcquireAndPlayStage::Indexing,
+                    )
+                    .await;
+                }
+            }
+            Some(
+                finalize_ready(
+                    db,
+                    ledger,
+                    navidrome,
+                    user_ctx,
+                    folder,
+                    relay,
+                    is_already_in_library,
+                )
+                .await,
+            )
+        }
+        JobState::Failed | JobState::Cancelled | JobState::NeedsDecision | JobState::Dismissed => {
             let failure = first
                 .row
                 .as_ref()
                 .and_then(|r| r.failure.clone())
                 .unwrap_or_else(|| {
-                    Failure::new(
-                        FailureCode::TransferAborted,
-                        Stage::Transfer,
-                        RetryAdvice::OtherSource,
-                        format!("Acquire & Play ended in state {}", first.state.as_str()),
-                    )
+                    if first.state == JobState::Dismissed {
+                        already_running()
+                            .with_message("Track is already downloading in another batch")
+                    } else {
+                        Failure::new(
+                            FailureCode::TransferAborted,
+                            Stage::Transfer,
+                            RetryAdvice::OtherSource,
+                            format!("Acquire & Play ended in state {}", first.state.as_str()),
+                        )
+                    }
                 });
             Some(AcquireAndPlayStage::Failed { failure })
         }
@@ -1018,19 +1361,37 @@ async fn poll_ledger_slot(
     }
 }
 
-/// Reads the indexed Navidrome song facts from the job's ledger slot, records a
-/// `fast_acquisitions` entry (strictly without scheduling any archival upgrade yet),
-/// and builds `AcquireAndPlayStage::Ready`.
+/// Reads the indexed Navidrome song facts from the job's ledger slot (flushing the ledger
+/// writer first so `SlotResult::Imported { listed: Some(_) }` is never missed by a race),
+/// records a `fast_acquisitions` entry for freshly imported tracks (strictly without
+/// scheduling any archival upgrade yet), and builds `AcquireAndPlayStage::Ready`.
+///
+/// When the slot was skipped as `AlreadyInLibrary`, looks up the existing Navidrome song
+/// ID and format instead of returning `None` or recording a bogus `fast_acquisitions` row.
 async fn finalize_ready(
     db: &SqlitePool,
+    ledger: &Ledger,
+    navidrome: &dyn NavidromeOf,
     user_ctx: &UserCtx,
     folder: &Folder,
     relay: &StageRelayContext,
+    already_in_library_hint: bool,
 ) -> AcquireAndPlayStage {
-    let (navidrome_song_id, listed_codec) = match store::tracks_of(db, &relay.job_id).await {
-        Ok(tracks) => tracks
-            .into_iter()
-            .find_map(|t| match t.result {
+    let mut navidrome_song_id = None;
+    let mut listed_codec = None;
+    let mut already_in_library = already_in_library_hint;
+
+    for attempt in 0..FINALIZE_FLUSH_RETRIES {
+        let _ = ledger.applied().await;
+        if let Ok(tracks) = store::tracks_of(db, &relay.job_id).await {
+            if tracks
+                .iter()
+                .any(|t| matches!(t.result, Some(SlotResult::AlreadyInLibrary { .. })))
+            {
+                already_in_library = true;
+                break;
+            }
+            if let Some((song_id, format)) = tracks.into_iter().find_map(|t| match t.result {
                 Some(SlotResult::Imported {
                     listed: Some(songs),
                     ..
@@ -1039,21 +1400,55 @@ async fn finalize_ready(
                     .next()
                     .map(|song| (Some(song.song_id), song.format)),
                 _ => None,
-            })
-            .unwrap_or((None, None)),
-        Err(_) => (None, None),
-    };
+            }) {
+                navidrome_song_id = song_id;
+                listed_codec = format;
+                break;
+            }
+        }
+        if already_in_library || attempt + 1 >= FINALIZE_FLUSH_RETRIES {
+            break;
+        }
+        tokio::time::sleep(FINALIZE_FLUSH_RETRY_DELAY).await;
+    }
 
-    let codec = listed_codec
-        .or_else(|| {
-            let q = relay.picked_quality.trim();
-            (!q.is_empty()).then(|| q.to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    if already_in_library {
+        let reference = Reference {
+            artist: relay.artist.clone(),
+            title: relay.title.clone(),
+            album: relay.album.clone(),
+            recording_mbid: relay.recording_mbid.clone(),
+            duration_s: relay.duration_s,
+        };
+        let (existing_id, existing_codec) = match navidrome.navidrome_of(&user_ctx.id()).await {
+            Ok(navi) => match library::find(&navi, &reference).await {
+                Ok(found) => found
+                    .matches
+                    .iter()
+                    .find(|m| matches!(m.how.kind, MatchKind::Mbid | MatchKind::Exact))
+                    .or_else(|| found.matches.first())
+                    .map(|m| (Some(m.song.song_id.clone()), m.song.format.clone()))
+                    .unwrap_or((None, None)),
+                Err(_) => (None, None),
+            },
+            Err(_) => (None, None),
+        };
+        let is_lossy = existing_codec.as_deref().is_some_and(is_lossy_format);
+        return AcquireAndPlayStage::Ready {
+            navidrome_song_id: existing_id,
+            codec: existing_codec,
+            is_lossy,
+            already_owned: true,
+            backend_id: None,
+        };
+    }
 
-    let backend_lossy_only = shared::backends::meta(&relay.backend_id)
-        .is_some_and(|m| m.delivery == Delivery::LossyOnly);
-    let is_lossy = backend_lossy_only || is_lossy_format(&codec);
+    let codec = listed_codec.or_else(|| {
+        let q = relay.picked_quality.trim();
+        (!q.is_empty()).then(|| q.to_string())
+    });
+
+    let is_lossy = relay.backend_lossy_only || codec.as_deref().is_some_and(is_lossy_format);
 
     if let Err(f) = record_fast_acquisition_in(
         db,
@@ -1067,7 +1462,7 @@ async fn finalize_ready(
             album: relay.album.as_deref(),
             recording_mbid: relay.recording_mbid.as_deref(),
             backend_id: &relay.backend_id,
-            codec: &codec,
+            codec: codec.as_deref().unwrap_or("unknown"),
             is_lossy,
         },
     )
@@ -1083,7 +1478,7 @@ async fn finalize_ready(
 
     AcquireAndPlayStage::Ready {
         navidrome_song_id,
-        codec: Some(codec),
+        codec,
         is_lossy,
         already_owned: false,
         backend_id: Some(relay.backend_id.clone()),
@@ -1194,9 +1589,15 @@ mod tests {
         let resp = acquire_and_play_in(
             &db,
             &ledger,
-            &StubNavidrome(Some(navi)),
+            Arc::new(StubNavidrome(Some(navi))),
             &backends,
             &[&shared::backends::SLSKD],
+            Some(Failure::new(
+                FailureCode::ImporterBroken,
+                Stage::Import,
+                RetryAdvice::NeedsUser,
+                "beets is broken",
+            )),
             &ctx,
             AcquireAndPlayRequest {
                 artist: "Kowloon".into(),
@@ -1264,9 +1665,10 @@ mod tests {
         let resp = acquire_and_play_in(
             &db,
             &ledger,
-            &StubNavidrome(None),
+            Arc::new(StubNavidrome(None)),
             &backends,
             &[&shared::backends::SLSKD],
+            None,
             &ctx,
             AcquireAndPlayRequest {
                 artist: "Kowloon".into(),
@@ -1361,9 +1763,10 @@ mod tests {
         let resp = acquire_and_play_in(
             &db,
             &ledger,
-            &StubNavidrome(None),
+            Arc::new(StubNavidrome(None)),
             &backends,
             &[&shared::backends::SLSKD, &FAST_META],
+            None,
             &ctx,
             AcquireAndPlayRequest {
                 artist: "Kowloon".into(),
@@ -1453,6 +1856,7 @@ mod tests {
 
         let relay_task = tokio::spawn({
             let db = db.clone();
+            let ledger = ledger.clone();
             let ctx = ctx.clone();
             let folder = folder.clone();
             let job_id = job_id.clone();
@@ -1460,6 +1864,8 @@ mod tests {
             async move {
                 relay_job_stages_until_terminal(
                     &db,
+                    &ledger,
+                    &StubNavidrome(None),
                     &ctx,
                     &folder,
                     relay_rx,
@@ -1471,7 +1877,9 @@ mod tests {
                         title: "Wake Up".into(),
                         album: Some("Come Over".into()),
                         recording_mbid: Some("mbid-9".into()),
+                        duration_s: None,
                         backend_id: "fast-net".into(),
+                        backend_lossy_only: false,
                         picked_quality: "OPUS 160".into(),
                     },
                 )
@@ -1580,5 +1988,405 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn partition_backends_does_not_put_as_found_backends_ahead_of_soulseek() {
+        static INTERNET_ARCHIVE: BackendMeta = BackendMeta {
+            id: "internet_archive",
+            name: "Internet Archive",
+            service: "internet_archive",
+            delivery: Delivery::AsFound,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+        static FAST_LOSSY: BackendMeta = BackendMeta {
+            id: "fast-lossy",
+            name: "Fast Lossy",
+            service: "fast-lossy",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+
+        let slskd: Searched = (
+            DEFAULT_DOWNLOAD_BACKEND.into(),
+            StubBackend::new(vec![]),
+        );
+        let archive: Searched = ("internet_archive".into(), StubBackend::new(vec![]));
+        let fast: Searched = ("fast-lossy".into(), StubBackend::new(vec![]));
+
+        // With only AsFound backends (Soulseek + Internet Archive), prefer_fast=true must NOT
+        // isolate Internet Archive in fast_tier ahead of Soulseek.
+        let (primary, fallback) = partition_backends(
+            vec![slskd.clone(), archive.clone()],
+            &[&shared::backends::SLSKD, &INTERNET_ARCHIVE],
+            true,
+        );
+        assert_eq!(
+            primary.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![DEFAULT_DOWNLOAD_BACKEND, "internet_archive"]
+        );
+        assert!(fallback.is_empty());
+
+        // With a LossyOnly backend present, ONLY LossyOnly enters fast_tier when prefer_fast=true.
+        let (primary, fallback) = partition_backends(
+            vec![slskd, archive, fast],
+            &[&shared::backends::SLSKD, &INTERNET_ARCHIVE, &FAST_LOSSY],
+            true,
+        );
+        assert_eq!(
+            primary.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["fast-lossy"]
+        );
+        assert_eq!(
+            fallback.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![DEFAULT_DOWNLOAD_BACKEND, "internet_archive"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_track_is_blocked_when_importer_is_degraded() {
+        let db = test_db::migrated().await;
+        let (ctx, _folder, _dir) = seed_user(&db, "broken-imp-user").await;
+        let ledger = Ledger::start(db.clone());
+        let stub = StubBackend::new(vec![]);
+        let backends = StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub);
+
+        let err = acquire_and_play_in(
+            &db,
+            &ledger,
+            Arc::new(StubNavidrome(None)),
+            &backends,
+            &[&shared::backends::SLSKD],
+            Some(Failure::new(
+                FailureCode::ImporterBroken,
+                Stage::Import,
+                RetryAdvice::NeedsUser,
+                "beets broken",
+            )),
+            &ctx,
+            AcquireAndPlayRequest {
+                artist: "Kowloon".into(),
+                title: "Wake Up".into(),
+                album: None,
+                recording_mbid: None,
+                release_mbid: None,
+                duration_s: None,
+                folder_id: None,
+                prefer_fast: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::ImporterBroken);
+    }
+
+    #[tokio::test]
+    async fn dismissed_ledger_slot_terminates_cleanly_without_hanging() {
+        let db = test_db::migrated().await;
+        let (ctx, folder, _dir) = seed_user(&db, "dismissed-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        let job_id = "job-dismissed-1".to_string();
+        let slot = JobSlot {
+            job: job_id.clone(),
+            slot: 0,
+        };
+        ledger
+            .create(
+                NewJob {
+                    id: job_id.clone(),
+                    user: ctx.id(),
+                    folder_id: folder.id.clone(),
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Downloading,
+                    search_id: None,
+                    picked: vec![(0, item_on("slskd", "peer", "Wake Up", "wake.flac"))],
+                    kind: JobKind::Track,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        ledger.record(JobEvent::Dismiss(vec![slot]));
+        ledger.settled().await;
+
+        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let relay_rx = tx.subscribe();
+        let mut client_rx = tx.subscribe();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_job_stages_until_terminal(
+                &db,
+                &ledger,
+                &StubNavidrome(None),
+                &ctx,
+                &folder,
+                relay_rx,
+                StageRelayContext {
+                    request_id: "req-dismissed".into(),
+                    batch_id: "batch-dismissed".into(),
+                    job_id,
+                    artist: "Kowloon".into(),
+                    title: "Wake Up".into(),
+                    album: None,
+                    recording_mbid: None,
+                    duration_s: None,
+                    backend_id: DEFAULT_DOWNLOAD_BACKEND.into(),
+                    backend_lossy_only: false,
+                    picked_quality: "FLAC".into(),
+                },
+            ),
+        )
+        .await
+        .expect("dismissed slot must terminate promptly without hanging");
+
+        let mut stages = Vec::new();
+        while let Ok(ev) = client_rx.try_recv() {
+            if let DownloadEvent::AcquireAndPlay(ap) = ev {
+                if ap.request_id == "req-dismissed" {
+                    stages.push(ap.stage);
+                }
+            }
+        }
+        assert!(matches!(
+            stages.last(),
+            Some(AcquireAndPlayStage::Failed { failure }) if failure.code == FailureCode::AlreadyRunning
+        ));
+    }
+
+    #[tokio::test]
+    async fn already_in_library_looks_up_existing_navidrome_song_without_recording_fast_acquisition()
+    {
+        let db = test_db::migrated().await;
+        let (ctx, folder, _dir) = seed_user(&db, "already-lib-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        let song = native_song(
+            "nd-existing-55",
+            "Kowloon",
+            "Wake Up",
+            200.0,
+            Some("rec-mbid-55"),
+        );
+        let stub_nd = NavidromeStub::start();
+        stub_nd.answer("/api/song", &[&format!("[{song}]")]);
+        let navi = stub_nd.client();
+
+        let job_id = "job-already-lib".to_string();
+        let batch_id = "batch-already-lib".to_string();
+        let slot = JobSlot {
+            job: job_id.clone(),
+            slot: 0,
+        };
+        ledger
+            .create(
+                NewJob {
+                    id: job_id.clone(),
+                    user: ctx.id(),
+                    folder_id: folder.id.clone(),
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Importing,
+                    search_id: None,
+                    picked: vec![(0, item_on("fast-net", "cdn", "Wake Up", "wake.opus"))],
+                    kind: JobKind::Track,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let mut skipped_row =
+            DownloadProgress::queued("t-55".into(), "cdn".into(), "wake.opus".into(), 100)
+                .with_batch(batch_id.clone(), "Kowloon - Wake Up".into())
+                .with_job(slot.clone())
+                .with_state(DownloadState::ImportSkipped);
+        skipped_row.skip = Some(shared::download::SkipKind::AlreadyInLibrary);
+        ledger.record(JobEvent::Settled {
+            state: JobState::Done,
+            rows: vec![skipped_row.clone()],
+            results: vec![(slot, SlotResult::AlreadyInLibrary { existing: vec![] })],
+        });
+        ledger.settled().await;
+
+        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let relay_rx = tx.subscribe();
+        let mut client_rx = tx.subscribe();
+
+        let relay_task = tokio::spawn({
+            let db = db.clone();
+            let ledger = ledger.clone();
+            let ctx = ctx.clone();
+            let folder = folder.clone();
+            let navi = Arc::clone(&navi);
+            async move {
+                relay_job_stages_until_terminal(
+                    &db,
+                    &ledger,
+                    &StubNavidrome(Some(navi)),
+                    &ctx,
+                    &folder,
+                    relay_rx,
+                    StageRelayContext {
+                        request_id: "req-already-lib".into(),
+                        batch_id,
+                        job_id,
+                        artist: "Kowloon".into(),
+                        title: "Wake Up".into(),
+                        album: Some("Come Over".into()),
+                        recording_mbid: Some("rec-mbid-55".into()),
+                        duration_s: Some(200),
+                        backend_id: "fast-net".into(),
+                        backend_lossy_only: true,
+                        picked_quality: "OPUS 160".into(),
+                    },
+                )
+                .await;
+            }
+        });
+
+        tx.send(DownloadEvent::Progress(vec![skipped_row])).unwrap();
+        relay_task.await.unwrap();
+
+        let mut stages = Vec::new();
+        while let Ok(ev) = client_rx.try_recv() {
+            if let DownloadEvent::AcquireAndPlay(ap) = ev {
+                if ap.request_id == "req-already-lib" {
+                    stages.push(ap.stage);
+                }
+            }
+        }
+        assert_eq!(
+            stages,
+            vec![AcquireAndPlayStage::Ready {
+                navidrome_song_id: Some("nd-existing-55".into()),
+                codec: Some("flac".into()),
+                is_lossy: false,
+                already_owned: true,
+                backend_id: None,
+            }]
+        );
+
+        // Must NOT record a bogus fast_acquisitions entry for AlreadyInLibrary!
+        assert!(FastAcquisitionRow::find_matching_in(
+            &db,
+            &ctx.user_id,
+            Some("nd-existing-55"),
+            None,
+            "Kowloon",
+            "Wake Up",
+        )
+        .await
+        .unwrap()
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn fast_tier_enqueue_failure_falls_back_to_soulseek_tier() {
+        let db = test_db::migrated().await;
+        let (ctx, _folder, _dir) = seed_user(&db, "fallback-enq-user").await;
+        let ledger = Ledger::start(db.clone());
+
+        static FAST_META: BackendMeta = BackendMeta {
+            id: "fast-flaky",
+            name: "Fast Flaky",
+            service: "fast-flaky",
+            delivery: Delivery::LossyOnly,
+            switch: Switch::AdminToggle,
+            about: &[],
+            link: None,
+            attribution: None,
+            blocked: None,
+        };
+
+        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let mut rx = tx.subscribe();
+
+        // Fast tier finds a match, but enqueue fails!
+        let fast_stub = StubBackend::new(vec![ScriptedOutcome::Rejected]);
+        let mut fast_item = item_on("fast-flaky", "cdn", "Wake Up", "wake.opus");
+        fast_item.quality = "OPUS 160".into();
+        let mut fast_group = group("cdn", vec![fast_item], 0.95);
+        fast_group.quality = "OPUS 160".into();
+        fast_stub.script_polls(vec![Ok(search_result(
+            "search-fast",
+            SearchState::Completed,
+            vec![fast_group],
+        ))]);
+
+        // Fallback Soulseek tier succeeds on search and enqueue!
+        let slskd_stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let slskd_item = item_on(DEFAULT_DOWNLOAD_BACKEND, "peer_flac", "Wake Up", "wake.flac");
+        let slskd_group = group("peer_flac", vec![slskd_item], 0.93);
+        slskd_stub.script_polls(vec![Ok(search_result(
+            "search-slskd",
+            SearchState::Completed,
+            vec![slskd_group],
+        ))]);
+
+        let backends = StubBackends::default()
+            .with(DEFAULT_DOWNLOAD_BACKEND, slskd_stub.clone())
+            .with("fast-flaky", fast_stub.clone());
+
+        let resp = acquire_and_play_in(
+            &db,
+            &ledger,
+            Arc::new(StubNavidrome(None)),
+            &backends,
+            &[&shared::backends::SLSKD, &FAST_META],
+            None,
+            &ctx,
+            AcquireAndPlayRequest {
+                artist: "Kowloon".into(),
+                title: "Wake Up".into(),
+                album: None,
+                recording_mbid: None,
+                release_mbid: None,
+                duration_s: None,
+                folder_id: None,
+                prefer_fast: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut fell_back_to_slskd = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(DownloadEvent::AcquireAndPlay(ap))) if ap.request_id == resp.request_id => {
+                    if let AcquireAndPlayStage::Acquiring {
+                        backend_id,
+                        source: Some(src),
+                        ..
+                    } = ap.stage
+                    {
+                        if backend_id == DEFAULT_DOWNLOAD_BACKEND && src == "peer_flac" {
+                            fell_back_to_slskd = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            fell_back_to_slskd,
+            "expected fallback to Soulseek after fast-tier enqueue failed"
+        );
+        assert_eq!(fast_stub.specs().len(), 1);
+        assert_eq!(slskd_stub.specs().len(), 1);
     }
 }

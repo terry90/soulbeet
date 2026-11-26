@@ -33,7 +33,7 @@ pub async fn list_archival_upgrades() -> Result<Vec<ArchivalUpgradeJob>, ServerF
 pub async fn trigger_archival_upgrade(
     req: TriggerArchivalUpgradeRequest,
 ) -> Result<ArchivalUpgradeOutcome, ServerFnError> {
-    crate::core::archival::enqueue_on_keep_in(&crate::db::DB, &auth.0.user_id, &req)
+    crate::core::archival::enqueue_on_keep_in(&crate::db::DB, &auth.0, &req)
         .await
         .map_err(failure_error)
 }

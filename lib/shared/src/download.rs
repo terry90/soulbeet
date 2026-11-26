@@ -889,23 +889,41 @@ pub enum ArchivalUpgradeOutcome {
     AlreadyScheduled { upgrade_id: String },
     AlreadyLossless { codec: String },
     NotFastAcquired,
+    /// Track is still a pending (unpromoted) discovery track, so it cannot be upgraded yet.
+    SkippedNotKept,
 }
 
-/// Returns `true` when an audio format/codec label represents a lossy format
-/// (and `false` for lossless formats such as FLAC, WAV, ALAC, AIFF, APE, WavPack, DSD).
-pub fn is_lossy_format(codec_or_quality: &str) -> bool {
-    let lower = codec_or_quality.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    let lossless_tokens = [
-        "flac", "wav", "alac", "aiff", "aif", "ape", "wv", "wavpack", "dsf", "dff", "dsd", "pcm",
+fn has_format_token(input: &str, tokens: &[&str]) -> bool {
+    input
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| tokens.iter().any(|known| tok.eq_ignore_ascii_case(known)))
+}
+
+/// Returns `true` when an audio format/codec/extension label explicitly names a lossless
+/// format (`flac`, `alac`, `wav`, `aiff`, `aif`, `ape`, `wv`, `wavpack`, `dsd`, `dsf`,
+/// `dff`, `pcm`, `lossless`). Returns `false` for empty or unknown strings and avoids
+/// substring false positives such as `"tape"` or `"wave"`.
+pub fn is_lossless_format(codec_or_ext: &str) -> bool {
+    const LOSSLESS_TOKENS: &[&str] = &[
+        "flac", "alac", "wav", "aiff", "aif", "ape", "wv", "wavpack", "dsd", "dsf", "dff", "pcm",
         "lossless",
     ];
-    if lossless_tokens.iter().any(|tok| lower.contains(tok)) {
+    has_format_token(codec_or_ext, LOSSLESS_TOKENS)
+}
+
+/// Returns `true` when an audio format/codec label explicitly names a lossy format
+/// (and does not name a lossless codec). Returns `false` for empty or unknown strings
+/// so unknown codecs are never blindly classified as lossy or lossless.
+pub fn is_lossy_format(codec_or_quality: &str) -> bool {
+    const LOSSY_TOKENS: &[&str] = &[
+        "mp3", "opus", "ogg", "oga", "vorbis", "aac", "m4a", "m4b", "mp4", "wma", "mpc",
+        "musepack", "ac3", "eac3", "mp2", "spx", "speex", "amr", "lossy",
+    ];
+    if is_lossless_format(codec_or_quality) {
         return false;
     }
-    true
+    has_format_token(codec_or_quality, LOSSY_TOKENS)
 }
 
 /// Events from the auto-download pipeline, sent over WebSocket
@@ -1267,5 +1285,62 @@ mod tests {
         assert!(long.len() <= 200 + " [1f2e3d4c]".len());
         assert!(long.ends_with(" [1f2e3d4c]"));
         assert!(!long.contains('/'));
+    }
+
+    #[test]
+    fn format_classification_uses_exact_tokens_and_rejects_unknown() {
+        for lossless in [
+            "flac",
+            "FLAC",
+            "FLAC 24/96",
+            ".flac",
+            "audio/flac",
+            "alac",
+            "m4a (ALAC)",
+            "wav",
+            "aiff",
+            "aif",
+            "ape",
+            "wv",
+            "wavpack",
+            "dsd",
+            "dsf",
+            "dff",
+            "pcm",
+            "lossless",
+        ] {
+            assert!(is_lossless_format(lossless), "expected lossless: {lossless}");
+            assert!(!is_lossy_format(lossless), "expected not lossy: {lossless}");
+        }
+
+        for lossy in [
+            "mp3",
+            "MP3 320",
+            "320kbps MP3",
+            "OPUS 160",
+            "opus",
+            "ogg",
+            "vorbis",
+            "aac",
+            "m4a",
+            "wma",
+            "lossy",
+        ] {
+            assert!(!is_lossless_format(lossy), "expected not lossless: {lossy}");
+            assert!(is_lossy_format(lossy), "expected lossy: {lossy}");
+        }
+
+        // Empty, unknown, and substring traps ("tape" contains "ape", "wave" contains "wav")
+        // must be neither lossless nor lossy.
+        for ambiguous in ["", "   ", "unknown", "UNKNOWN", "tape", "cassette tape", "wave", "synthwave"] {
+            assert!(
+                !is_lossless_format(ambiguous),
+                "expected not lossless: {ambiguous:?}"
+            );
+            assert!(
+                !is_lossy_format(ambiguous),
+                "expected not lossy: {ambiguous:?}"
+            );
+        }
     }
 }
