@@ -3790,7 +3790,10 @@ mod tests {
         if let Some(ref mut snap) = keepalive.snapshot {
             snap.updated_at_unix = 1_025;
         }
-        assert!(connect_devices_visibly_equal(&[base.clone()], &[keepalive]));
+        assert!(connect_devices_visibly_equal(
+            std::slice::from_ref(&base),
+            &[keepalive]
+        ));
 
         let mut changed = base.clone();
         changed.name = "Renamed".into();

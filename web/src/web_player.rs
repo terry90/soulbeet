@@ -2694,7 +2694,10 @@ mod tests {
         if let Some(ref mut snap) = heartbeat_update.snapshot {
             snap.updated_at_unix = 125;
         }
-        assert!(connect_devices_visibly_equal(&[base.clone()], &[heartbeat_update]));
+        assert!(connect_devices_visibly_equal(
+            std::slice::from_ref(&base),
+            &[heartbeat_update]
+        ));
 
         let mut active_changed = base.clone();
         active_changed.is_active = false;
