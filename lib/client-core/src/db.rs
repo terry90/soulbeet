@@ -8,7 +8,7 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::error::CoreResult;
 use crate::models::{
-    LocalAlbum, LocalArtist, LocalDiscoveryTrack, LocalPlaylist, LocalTrack,
+    LibraryStats, LocalAlbum, LocalArtist, LocalDiscoveryTrack, LocalPlaylist, LocalTrack,
     PersistedPlaybackSession,
 };
 
@@ -390,6 +390,134 @@ pub async fn list_tracks_for_playlist(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+pub async fn get_album(pool: &SqlitePool, album_id: &str) -> CoreResult<Option<LocalAlbum>> {
+    let row = sqlx::query_as::<_, LocalAlbum>("SELECT * FROM albums WHERE id = ?")
+        .bind(album_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub async fn get_artist(pool: &SqlitePool, artist_id: &str) -> CoreResult<Option<LocalArtist>> {
+    let row = sqlx::query_as::<_, LocalArtist>("SELECT * FROM artists WHERE id = ?")
+        .bind(artist_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+pub async fn list_artists(pool: &SqlitePool) -> CoreResult<Vec<LocalArtist>> {
+    let rows =
+        sqlx::query_as::<_, LocalArtist>("SELECT * FROM artists ORDER BY name COLLATE NOCASE ASC")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+pub async fn list_albums(
+    pool: &SqlitePool,
+    artist_id: Option<&str>,
+) -> CoreResult<Vec<LocalAlbum>> {
+    let rows = if let Some(aid) = artist_id {
+        sqlx::query_as::<_, LocalAlbum>(
+            "SELECT * FROM albums WHERE artist_id = ? ORDER BY COALESCE(year, 0) DESC, name COLLATE NOCASE ASC",
+        )
+        .bind(aid)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, LocalAlbum>("SELECT * FROM albums ORDER BY name COLLATE NOCASE ASC")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows)
+}
+
+pub async fn list_tracks_by_album(
+    pool: &SqlitePool,
+    album_id: &str,
+) -> CoreResult<Vec<LocalTrack>> {
+    let rows = sqlx::query_as::<_, LocalTrack>(
+        r#"
+        SELECT * FROM tracks
+        WHERE album_id = ?
+        ORDER BY COALESCE(disc_number, 1) ASC, COALESCE(track_number, 0) ASC, title COLLATE NOCASE ASC
+        "#,
+    )
+    .bind(album_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn list_playlists(pool: &SqlitePool) -> CoreResult<Vec<LocalPlaylist>> {
+    let rows = sqlx::query_as::<_, LocalPlaylist>(
+        "SELECT * FROM playlists ORDER BY updated_at DESC, name COLLATE NOCASE ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn list_starred_tracks(pool: &SqlitePool) -> CoreResult<Vec<LocalTrack>> {
+    let rows = sqlx::query_as::<_, LocalTrack>(
+        "SELECT * FROM tracks WHERE starred = 1 ORDER BY updated_at DESC, title COLLATE NOCASE ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn list_discovery_triage(
+    pool: &SqlitePool,
+    pending_only: bool,
+) -> CoreResult<Vec<LocalDiscoveryTrack>> {
+    let rows = if pending_only {
+        sqlx::query_as::<_, LocalDiscoveryTrack>(
+            "SELECT * FROM discovery_tracks WHERE status = 'pending' ORDER BY updated_at DESC",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, LocalDiscoveryTrack>(
+            "SELECT * FROM discovery_tracks ORDER BY updated_at DESC",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
+pub async fn library_stats(pool: &SqlitePool) -> CoreResult<LibraryStats> {
+    let artist_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM artists")
+        .fetch_one(pool)
+        .await?;
+    let album_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM albums")
+        .fetch_one(pool)
+        .await?;
+    let (track_count, starred_track_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(1), COALESCE(SUM(CASE WHEN starred = 1 THEN 1 ELSE 0 END), 0) FROM tracks",
+    )
+    .fetch_one(pool)
+    .await?;
+    let playlist_count: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM playlists")
+        .fetch_one(pool)
+        .await?;
+    let pending_discovery_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(1) FROM discovery_tracks WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await?;
+
+    Ok(LibraryStats {
+        artist_count: artist_count.max(0) as u64,
+        album_count: album_count.max(0) as u64,
+        track_count: track_count.max(0) as u64,
+        playlist_count: playlist_count.max(0) as u64,
+        starred_track_count: starred_track_count.max(0) as u64,
+        pending_discovery_count: pending_discovery_count.max(0) as u64,
+    })
 }
 
 pub async fn save_playback_session(

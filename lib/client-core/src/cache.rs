@@ -14,7 +14,7 @@ use crate::db::now_unix;
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
     AudioQualityProfile, CachePolicy, CacheStats, NavidromeCredentials, OfflineTrackEntry,
-    PinTarget, PlaybackSource,
+    PinRecord, PinTarget, PlaybackSource,
 };
 use crate::subsonic::{
     is_subsonic_error_content_type, parse_subsonic_error_bytes, SubsonicClient,
@@ -662,6 +662,30 @@ impl CacheManager {
             cached_cover_art_count: cover_count.max(0) as u64,
             max_audio_bytes,
         })
+    }
+
+    pub async fn list_pinned_targets(&self) -> CoreResult<Vec<PinRecord>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT target_kind, target_id, pinned_at FROM offline_pins ORDER BY pinned_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, id, pinned_at)| {
+                PinTarget::from_db_pair(&kind, &id).map(|target| PinRecord { target, pinned_at })
+            })
+            .collect())
+    }
+
+    pub async fn list_offline_tracks(&self) -> CoreResult<Vec<OfflineTrackEntry>> {
+        let rows = sqlx::query_as::<_, OfflineTrackEntry>(
+            "SELECT * FROM offline_downloads ORDER BY pinned DESC, last_accessed_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     async fn is_track_pinned_by_rules(&self, track_id: &str) -> CoreResult<bool> {

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::db::{get_cursor, now_unix};
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
-    DrainReport, NavidromeCredentials, OutboxMutation, OutboxRow, SoulbeetAuth,
+    DrainReport, NavidromeCredentials, OutboxMutation, OutboxRow, OutboxSummary, SoulbeetAuth,
 };
 use crate::subsonic::SubsonicClient;
 use crate::sync::CURSOR_PROMOTE_THRESHOLD;
@@ -274,6 +274,43 @@ impl MutationOutbox {
         .fetch_one(&self.pool)
         .await?;
         Ok(count.max(0) as usize)
+    }
+
+    pub async fn summary(&self) -> CoreResult<OutboxSummary> {
+        let (pending_count, dead_letter_count, oldest_pending_at): (i64, i64, Option<i64>) =
+            sqlx::query_as(
+                r#"
+                SELECT
+                    COALESCE(SUM(CASE WHEN dead_letter = 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN dead_letter = 1 THEN 1 ELSE 0 END), 0),
+                    MIN(CASE WHEN dead_letter = 0 THEN created_at ELSE NULL END)
+                FROM mutation_outbox
+                "#,
+            )
+            .fetch_one(&self.pool)
+            .await?;
+
+        let last_error: Option<String> = sqlx::query_scalar(
+            "SELECT last_error FROM mutation_outbox WHERE last_error IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(OutboxSummary {
+            pending_count: pending_count.max(0) as usize,
+            dead_letter_count: dead_letter_count.max(0) as usize,
+            oldest_pending_at,
+            last_error,
+        })
+    }
+
+    pub async fn retry_dead_letters(&self) -> CoreResult<usize> {
+        let res = sqlx::query(
+            "UPDATE mutation_outbox SET dead_letter = 0, next_retry_at = 0 WHERE dead_letter = 1",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() as usize)
     }
 
     /// Replays due outbox mutations strictly in chronological order (`seq ASC`).

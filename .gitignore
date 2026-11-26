@@ -19,3 +19,7 @@ secret.key
 
 # Python bytecode (beets fixture capture plugin)
 **/__pycache__
+
+# Generated Android native libraries & UniFFI Kotlin bindings (built by scripts/build-android-core.sh)
+android/core-bindings/src/main/jniLibs/
+android/core-bindings/src/main/kotlin/org/soulbeet/core/

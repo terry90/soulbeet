@@ -33,6 +33,7 @@ pub struct ConnectClient {
     platform: DevicePlatform,
     soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     state: Arc<RwLock<ConnectState>>,
+    state_tx: watch::Sender<ConnectState>,
     events_tx: broadcast::Sender<ConnectServerEventDto>,
     outbound_tx: Arc<RwLock<Option<mpsc::UnboundedSender<ConnectClientMessageDto>>>>,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
@@ -47,12 +48,14 @@ impl ConnectClient {
         soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     ) -> Self {
         let (events_tx, _) = broadcast::channel(64);
+        let (state_tx, _) = watch::channel(ConnectState::default());
         Self {
             device_id,
             device_name,
             platform,
             soulbeet_auth,
             state: Arc::new(RwLock::new(ConnectState::default())),
+            state_tx,
             events_tx,
             outbound_tx: Arc::new(RwLock::new(None)),
             tasks: Arc::new(StdMutex::new(Vec::new())),
@@ -62,6 +65,10 @@ impl ConnectClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ConnectServerEventDto> {
         self.events_tx.subscribe()
+    }
+
+    pub fn subscribe_state(&self) -> watch::Receiver<ConnectState> {
+        self.state_tx.subscribe()
     }
 
     pub async fn state(&self) -> ConnectState {
@@ -117,9 +124,15 @@ impl ConnectClient {
         });
 
         *self.outbound_tx.write().await = Some(out_tx.clone());
-        self.state.write().await.connected = true;
+        let connected_state = {
+            let mut st = self.state.write().await;
+            st.connected = true;
+            st.clone()
+        };
+        let _ = self.state_tx.send(connected_state);
 
         let writer_state = self.state.clone();
+        let writer_state_tx = self.state_tx.clone();
         let writer_outbound = self.outbound_tx.clone();
         let writer_gen = self.conn_gen.clone();
         let writer_shutdown_tx = shutdown_tx.clone();
@@ -147,7 +160,18 @@ impl ConnectClient {
             let _ = writer_shutdown_tx.send(true);
             if writer_gen.load(Ordering::SeqCst) == gen {
                 *writer_outbound.write().await = None;
-                writer_state.write().await.connected = false;
+                let disconnected = {
+                    let mut st = writer_state.write().await;
+                    if !st.connected {
+                        None
+                    } else {
+                        st.connected = false;
+                        Some(st.clone())
+                    }
+                };
+                if let Some(st) = disconnected {
+                    let _ = writer_state_tx.send(st);
+                }
             }
         });
 
@@ -169,6 +193,7 @@ impl ConnectClient {
         });
 
         let reader_state = self.state.clone();
+        let reader_state_tx = self.state_tx.clone();
         let reader_outbound = self.outbound_tx.clone();
         let reader_gen = self.conn_gen.clone();
         let reader_shutdown_tx = shutdown_tx;
@@ -208,7 +233,7 @@ impl ConnectClient {
                 };
 
                 if let Some(event) = decoded {
-                    {
+                    let updated_state = {
                         let mut st = reader_state.write().await;
                         match &event {
                             ConnectServerEventDto::DeviceList {
@@ -227,6 +252,7 @@ impl ConnectClient {
                                             .insert(dev.device_id.clone(), snap.clone());
                                     }
                                 }
+                                Some(st.clone())
                             }
                             ConnectServerEventDto::PlaybackUpdated {
                                 device_id,
@@ -238,9 +264,13 @@ impl ConnectClient {
                                 {
                                     dev.snapshot = Some(snapshot.clone());
                                 }
+                                Some(st.clone())
                             }
-                            ConnectServerEventDto::Command { .. } => {}
+                            ConnectServerEventDto::Command { .. } => None,
                         }
+                    };
+                    if let Some(st) = updated_state {
+                        let _ = reader_state_tx.send(st);
                     }
                     let _ = events_tx.send(event);
                 }
@@ -248,7 +278,18 @@ impl ConnectClient {
             let _ = reader_shutdown_tx.send(true);
             if reader_gen.load(Ordering::SeqCst) == gen {
                 *reader_outbound.write().await = None;
-                reader_state.write().await.connected = false;
+                let disconnected = {
+                    let mut st = reader_state.write().await;
+                    if !st.connected {
+                        None
+                    } else {
+                        st.connected = false;
+                        Some(st.clone())
+                    }
+                };
+                if let Some(st) = disconnected {
+                    let _ = reader_state_tx.send(st);
+                }
             }
         });
 
@@ -311,7 +352,18 @@ impl ConnectClient {
                 handle.abort();
             }
         }
-        self.state.write().await.connected = false;
+        let disconnected = {
+            let mut st = self.state.write().await;
+            if !st.connected {
+                None
+            } else {
+                st.connected = false;
+                Some(st.clone())
+            }
+        };
+        if let Some(st) = disconnected {
+            let _ = self.state_tx.send(st);
+        }
     }
 }
 
