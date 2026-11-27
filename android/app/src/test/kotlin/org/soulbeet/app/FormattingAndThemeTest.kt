@@ -14,6 +14,8 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.soulbeet.app.data.AcquireWsEvent
 import org.soulbeet.app.data.CoarseLocationProvider
+import org.soulbeet.app.data.ContextualMixUi
+import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.SoulbeetApiClient
 import org.soulbeet.app.data.StoredAuthKind
@@ -21,6 +23,13 @@ import org.soulbeet.app.data.optNonNullString
 import org.soulbeet.app.theme.BeetCanvas
 import org.soulbeet.app.theme.BeetCanvasOled
 import org.soulbeet.app.theme.soulbeetPaletteFor
+import org.soulbeet.app.ui.components.MixMotif
+import org.soulbeet.app.ui.components.MixShelfBucket
+import org.soulbeet.app.ui.components.classifyMixShelf
+import org.soulbeet.app.ui.components.formatMixSleeveMeta
+import org.soulbeet.app.ui.components.formatMixSleeveTag
+import org.soulbeet.app.ui.components.mixSleeveSpecFor
+import org.soulbeet.app.ui.components.normalizeMixSlug
 import org.soulbeet.core.FfiAudioQualityProfile
 
 @RunWith(RobolectricTestRunner::class)
@@ -558,6 +567,237 @@ class FormattingAndThemeTest {
             assertNull(nanCoords.queryParameter("lon"))
         } finally {
             Locale.setDefault(originalLocale)
+        }
+    }
+
+    private fun sampleMix(
+        slug: String,
+        kind: String = "moment",
+        offlinePriority: Boolean = false,
+        trackCount: Int = 25,
+        countryCode: String? = null,
+        localPct: Int? = null,
+        ownedPct: Int = 80,
+    ): ContextualMixUi = ContextualMixUi(
+        slug = slug,
+        kind = kind,
+        i18nKey = "mix.$kind.$slug",
+        title = slug,
+        subtitle = "Sample mix subtitle",
+        countryCode = countryCode,
+        localPct = localPct,
+        ownedPct = ownedPct,
+        offlinePriority = offlinePriority,
+        excludeFromCoreTaste = false,
+        steering = CultureSteeringOption.BALANCED,
+        activeFrom = null,
+        activeUntil = null,
+        expiresAt = null,
+        navidromePlaylistId = null,
+        trackCount = trackCount,
+        targetTracks = 25,
+    )
+
+    @Test
+    fun classifyMixShelfPartitionsRightNowVsCollectionAccurately() {
+        val rightNowCases = listOf(
+            sampleMix("rainy_day", kind = "moment"),
+            sampleMix("snow_day", kind = "moment"),
+            sampleMix("storm_night", kind = "moment"),
+            sampleMix("sunny_day", kind = "moment"),
+            sampleMix("morning", kind = "moment"),
+            sampleMix("focus", kind = "moment"),
+            sampleMix("evening_unwind", kind = "moment"),
+            sampleMix("dinner_groove", kind = "moment"),
+            sampleMix("late_night", kind = "moment"),
+            sampleMix("friday_night", kind = "moment"),
+            sampleMix("sunday_morning", kind = "moment"),
+            sampleMix("drive", kind = "moment", offlinePriority = true),
+            sampleMix("autumn", kind = "seasonal"),
+            sampleMix("custom_coding", kind = "custom"),
+        )
+        for (mix in rightNowCases) {
+            assertEquals("Expected RIGHT_NOW for ${mix.slug}", MixShelfBucket.RIGHT_NOW, classifyMixShelf(mix))
+        }
+
+        val collectionCases = listOf(
+            sampleMix("forgotten_gems", kind = "moment"),
+            sampleMix("fresh_arrivals", kind = "moment"),
+            sampleMix("decade_80s", kind = "moment"),
+            sampleMix("decade_90s", kind = "moment"),
+            sampleMix("decade_2000s", kind = "moment"),
+            sampleMix("conservative", kind = "rolling"),
+            sampleMix("comfort", kind = "rolling"),
+            sampleMix("balanced", kind = "rolling"),
+            sampleMix("weekly_radar", kind = "rolling"),
+            sampleMix("adventurous", kind = "rolling"),
+            sampleMix("deep_cuts", kind = "rolling"),
+            sampleMix("custom_rolling", kind = "ROLLING"),
+        )
+        for (mix in collectionCases) {
+            assertEquals("Expected COLLECTION for ${mix.slug}", MixShelfBucket.COLLECTION, classifyMixShelf(mix))
+        }
+    }
+
+    @Test
+    fun formatMixSleeveTagCoversAllCategoriesWithoutWeatherTelemetry() {
+        assertEquals("1980S", formatMixSleeveTag(sampleMix("decade_80s")))
+        assertEquals("1990S", formatMixSleeveTag(sampleMix("decade_90s")))
+        assertEquals("2000S", formatMixSleeveTag(sampleMix("decade_2000s")))
+        assertEquals("VAULT", formatMixSleeveTag(sampleMix("forgotten_gems")))
+        assertEquals("NEW", formatMixSleeveTag(sampleMix("fresh_arrivals")))
+        assertEquals("FRIDAY", formatMixSleeveTag(sampleMix("friday_night")))
+        assertEquals("SUNDAY", formatMixSleeveTag(sampleMix("sunday_morning")))
+        assertEquals("OFFLINE PRIORITY", formatMixSleeveTag(sampleMix("drive", offlinePriority = true)))
+        assertEquals("SEASONAL", formatMixSleeveTag(sampleMix("winter_holiday", kind = "seasonal")))
+        assertEquals("ROLLING", formatMixSleeveTag(sampleMix("balanced", kind = "rolling")))
+        assertEquals("MOMENT", formatMixSleeveTag(sampleMix("evening_unwind", kind = "moment")))
+        assertEquals("MIX", formatMixSleeveTag(sampleMix("late_coding", kind = "custom")))
+
+        // Weather mixes stay clean editorial "MOMENT" tags with zero temperature or weather telemetry
+        for (weatherSlug in listOf("rainy_day", "snow_day", "storm_night", "sunny_day")) {
+            val tag = formatMixSleeveTag(sampleMix(weatherSlug, kind = "moment"))
+            assertEquals("MOMENT", tag)
+            assertFalse("Tag must not contain temperature symbols", tag.contains("°") || tag.contains("C") || tag.contains("F"))
+        }
+    }
+
+    @Test
+    fun mixSleeveSpecForMapsEveryBuiltinSlugToDedicatedNonFallbackMotif() {
+        val builtinExpectations = mapOf(
+            // Weather (4)
+            "rainy_day" to MixMotif.RAINY_DAY,
+            "snow_day" to MixMotif.SNOW_DAY,
+            "storm_night" to MixMotif.STORM_NIGHT,
+            "sunny_day" to MixMotif.SUNNY_DAY,
+            // Moments & Weekdays (8)
+            "drive" to MixMotif.DRIVE,
+            "evening_unwind" to MixMotif.EVENING_UNWIND,
+            "friday_night" to MixMotif.FRIDAY_NIGHT,
+            "morning" to MixMotif.MORNING,
+            "focus" to MixMotif.FOCUS,
+            "dinner_groove" to MixMotif.DINNER_GROOVE,
+            "late_night" to MixMotif.LATE_NIGHT,
+            "sunday_morning" to MixMotif.SUNDAY_MORNING,
+            // Collection & Decades (5)
+            "forgotten_gems" to MixMotif.FORGOTTEN_GEMS,
+            "fresh_arrivals" to MixMotif.FRESH_ARRIVALS,
+            "decade_80s" to MixMotif.DECADE_80S,
+            "decade_90s" to MixMotif.DECADE_90S,
+            "decade_2000s" to MixMotif.DECADE_2000S,
+            // Rolling (3 groups, 6 aliases)
+            "conservative" to MixMotif.ROLLING_COMFORT,
+            "comfort" to MixMotif.ROLLING_COMFORT,
+            "balanced" to MixMotif.ROLLING_RADAR,
+            "weekly_radar" to MixMotif.ROLLING_RADAR,
+            "adventurous" to MixMotif.ROLLING_DEEP_CUTS,
+            "deep_cuts" to MixMotif.ROLLING_DEEP_CUTS,
+            // Seasonals (13 groups + aliases)
+            "winter_holiday" to MixMotif.SEASONAL_WINTER_HOLIDAY,
+            "noel" to MixMotif.SEASONAL_WINTER_HOLIDAY,
+            "christmas" to MixMotif.SEASONAL_WINTER_HOLIDAY,
+            "new_years_eve" to MixMotif.SEASONAL_NEW_YEARS_EVE,
+            "nye" to MixMotif.SEASONAL_NEW_YEARS_EVE,
+            "cozy_winter" to MixMotif.SEASONAL_COZY_WINTER,
+            "lunar_new_year" to MixMotif.SEASONAL_LUNAR_NEW_YEAR,
+            "valentines" to MixMotif.SEASONAL_VALENTINES,
+            "carnival" to MixMotif.SEASONAL_CARNIVAL,
+            "celtic_spring" to MixMotif.SEASONAL_CELTIC_SPRING,
+            "spring" to MixMotif.SEASONAL_SPRING,
+            "summer" to MixMotif.SEASONAL_SUMMER,
+            "summer_solstice" to MixMotif.SEASONAL_SUMMER_SOLSTICE,
+            "late_summer_reset" to MixMotif.SEASONAL_LATE_SUMMER_RESET,
+            "autumn" to MixMotif.SEASONAL_AUTUMN,
+            "halloween" to MixMotif.SEASONAL_HALLOWEEN,
+        )
+
+        for ((slug, expectedMotif) in builtinExpectations) {
+            val spec = mixSleeveSpecFor(slug)
+            assertNotEquals("Built-in slug $slug must not use FALLBACK", MixMotif.FALLBACK, spec.motif)
+            assertEquals("Unexpected motif for $slug", expectedMotif, spec.motif)
+            assertEquals("Case-insensitive lookup for $slug", expectedMotif, mixSleeveSpecFor("  ${slug.uppercase()}  ").motif)
+        }
+
+        // Decade watermarks match locked strings
+        assertEquals("80s", mixSleeveSpecFor("decade_80s").decadeWatermark)
+        assertEquals("90s", mixSleeveSpecFor("decade_90s").decadeWatermark)
+        assertEquals("00s", mixSleeveSpecFor("decade_2000s").decadeWatermark)
+        assertNull(mixSleeveSpecFor("rainy_day").decadeWatermark)
+
+        // Unknown custom slug maps cleanly to FALLBACK
+        assertEquals(MixMotif.FALLBACK, mixSleeveSpecFor("my_custom_mix").motif)
+    }
+
+    @Test
+    fun mixSleeveHelpersNormalizePrefixesAreTurkishLocaleSafeAndSingularizeTracks() {
+        val prev = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+
+            // Prefix stripping and Locale.ROOT lowercasing
+            assertEquals("forgotten_gems", normalizeMixSlug("  mix.moment.forgotten_gems  "))
+            assertEquals("winter_holiday", normalizeMixSlug("MIX.SEASONAL.WINTER_HOLIDAY"))
+            assertEquals("balanced", normalizeMixSlug("mix.rolling.BALANCED"))
+            assertEquals("friday_night", normalizeMixSlug("FRIDAY_NIGHT"))
+
+            // classifyMixShelf under Turkish locale (uppercase 'I' in slugs and kind)
+            assertEquals(
+                MixShelfBucket.COLLECTION,
+                classifyMixShelf(sampleMix("mix.moment.forgotten_gems", kind = "MOMENT")),
+            )
+            assertEquals(
+                MixShelfBucket.COLLECTION,
+                classifyMixShelf(sampleMix("MIX.MOMENT.FRESH_ARRIVALS", kind = "MOMENT")),
+            )
+            assertEquals(
+                MixShelfBucket.COLLECTION,
+                classifyMixShelf(sampleMix("mix.rolling.WEEKLY_RADAR", kind = "ROLLING")),
+            )
+            assertEquals(
+                MixShelfBucket.RIGHT_NOW,
+                classifyMixShelf(sampleMix("FRIDAY_NIGHT", kind = "MOMENT")),
+            )
+            assertEquals(
+                MixShelfBucket.RIGHT_NOW,
+                classifyMixShelf(sampleMix("WINTER_HOLIDAY", kind = "SEASONAL")),
+            )
+
+            // formatMixSleeveTag under Turkish locale
+            assertEquals("VAULT", formatMixSleeveTag(sampleMix("mix.moment.forgotten_gems")))
+            assertEquals("FRIDAY", formatMixSleeveTag(sampleMix("FRIDAY_NIGHT")))
+            assertEquals("SEASONAL", formatMixSleeveTag(sampleMix("WINTER_HOLIDAY", kind = "SEASONAL")))
+            assertEquals("ROLLING", formatMixSleeveTag(sampleMix("mix.rolling.BALANCED", kind = "ROLLING")))
+            assertEquals("MOMENT", formatMixSleeveTag(sampleMix("mix.moment.RAINY_DAY", kind = "MOMENT")))
+
+            // mixSleeveSpecFor under Turkish locale and prefixed slugs
+            assertEquals(MixMotif.FORGOTTEN_GEMS, mixSleeveSpecFor("mix.moment.forgotten_gems").motif)
+            assertEquals(MixMotif.FRIDAY_NIGHT, mixSleeveSpecFor("FRIDAY_NIGHT").motif)
+            assertEquals(MixMotif.SEASONAL_WINTER_HOLIDAY, mixSleeveSpecFor("WINTER_HOLIDAY").motif)
+            assertEquals(MixMotif.SEASONAL_WINTER_HOLIDAY, mixSleeveSpecFor("mix.seasonal.WINTER_HOLIDAY").motif)
+            assertEquals(MixMotif.ROLLING_RADAR, mixSleeveSpecFor("mix.rolling.WEEKLY_RADAR").motif)
+
+            // Singular track grammar + Locale.ROOT country code uppercasing ("in" -> "IN", not "İN")
+            assertEquals(
+                "1 TRACK",
+                formatMixSleeveMeta(sampleMix("forgotten_gems", trackCount = 1), compact = true),
+            )
+            assertEquals(
+                "1 TRACK · 60% IN",
+                formatMixSleeveMeta(
+                    sampleMix("WINTER_HOLIDAY", kind = "SEASONAL", trackCount = 1, countryCode = " in ", localPct = 60),
+                    compact = false,
+                ),
+            )
+            assertEquals(
+                "0 TRACKS",
+                formatMixSleeveMeta(sampleMix("forgotten_gems", trackCount = 0), compact = true),
+            )
+            assertEquals(
+                "25 TRACKS · 80% LIBRARY",
+                formatMixSleeveMeta(sampleMix("forgotten_gems", trackCount = 25, ownedPct = 80), compact = false),
+            )
+        } finally {
+            Locale.setDefault(prev)
         }
     }
 

@@ -1,7 +1,9 @@
 use dioxus::prelude::*;
 use shared::recommendation::CultureSteering;
 
-use crate::{IconCloudCheck, IconDownload, IconPlay, IconSparkles};
+use crate::{
+    mix_sleeve_theme, render_mix_sleeve_art, IconCloudCheck, IconDownload, IconPlay, IconSparkles,
+};
 
 /// Formats the cultural mix ratio pill (e.g. `45% FR · 55% INTL`).
 pub fn format_culture_split(local_ratio: f32, local_label: &str) -> String {
@@ -30,6 +32,7 @@ pub fn SeasonalHeroCard(
     subtitle: String,
     #[props(default)] window_badge: Option<String>,
     #[props(default)] artwork_url: Option<String>,
+    #[props(default)] mix_slug: Option<String>,
     track_count: u32,
     /// Current effective local-culture share (`0.0..=1.0`).
     local_ratio: f32,
@@ -45,11 +48,25 @@ pub fn SeasonalHeroCard(
     #[props(default)] class: String,
 ) -> Element {
     let mut failed_art_url = use_signal(|| None::<String>);
+    let hero_instance_id = use_hook(super::mix_sleeve_card::next_svg_instance_id);
 
     let show_art = artwork_url
         .as_ref()
         .filter(|url| !url.is_empty() && failed_art_url.read().as_ref() != Some(*url))
         .cloned();
+    let procedural_slug = mix_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let procedural_theme = procedural_slug.as_deref().map(mix_sleeve_theme);
+    let section_style = if show_art.is_none() {
+        procedural_theme
+            .map(|t| format!("border-color:{};", t.border))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let clean_code = local_label.trim().to_ascii_uppercase();
     let more_local_label = if clean_code.is_empty() || clean_code == "LOCAL" {
@@ -71,8 +88,9 @@ pub fn SeasonalHeroCard(
         section {
             aria_label: "{title}",
             class: "relative overflow-hidden rounded-[16px] border border-beet-border-default bg-beet-surface min-h-[220px] {class}",
+            style: "{section_style}",
 
-            // Full-bleed artwork backdrop or subtle midnight-violet studio radial aura
+            // Full-bleed artwork backdrop, procedural mix sleeve art, or subtle midnight-violet aura
             if let Some(url) = show_art {
                 img {
                     src: "{url}",
@@ -82,6 +100,13 @@ pub fn SeasonalHeroCard(
                     loading: "lazy",
                     decoding: "async",
                     onerror: move |_| failed_art_url.set(Some(url.clone())),
+                }
+            } else if let (Some(slug), Some(theme)) = (procedural_slug.as_deref(), procedural_theme) {
+                div {
+                    class: "absolute inset-0 pointer-events-none",
+                    aria_hidden: "true",
+                    style: "background:{theme.background};",
+                    {render_mix_sleeve_art(slug, &format!("hero-{hero_instance_id}-{slug}"))}
                 }
             } else {
                 div {
@@ -233,5 +258,27 @@ mod tests {
         assert!(html.contains("aria-pressed=\"true\""), "{html}");
         assert!(html.contains("var(--beet-canvas)"), "{html}");
         assert!(!html.contains("role=\"radiogroup\""), "{html}");
+    }
+
+    #[test]
+    fn renders_procedural_mix_sleeve_art_when_mix_slug_provided_without_artwork() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                SeasonalHeroCard {
+                    title: "Christmas Mix".to_string(),
+                    subtitle: "Festive mix".to_string(),
+                    mix_slug: Some("winter_holiday".to_string()),
+                    track_count: 25,
+                    local_ratio: 0.45,
+                    local_label: "FR".to_string(),
+                    on_play: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("id=\"ms-hero-"), "{html}");
+        assert!(html.contains("-winter-holiday-wh-rg\""), "{html}");
+        assert!(html.contains("linear-gradient(135deg, #2c1220"), "{html}");
     }
 }

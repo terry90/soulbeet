@@ -72,8 +72,12 @@ import org.soulbeet.app.data.UserCultureProfileUi
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
+import org.soulbeet.app.ui.components.MixShelfBucket
+import org.soulbeet.app.ui.components.MixSleeveCard
+import org.soulbeet.app.ui.components.MixSleeveLayout
 import org.soulbeet.app.ui.components.SeasonalHeroCard
 import org.soulbeet.app.ui.components.TrackArtwork
+import org.soulbeet.app.ui.components.classifyMixShelf
 import org.soulbeet.core.FfiPinTarget
 import kotlin.math.roundToInt
 
@@ -111,6 +115,10 @@ fun DiscoverScreen(
         }
     }
 
+    val (rightNowMixes, collectionMixes) = remember(state.rollingAndMomentMixes) {
+        state.rollingAndMomentMixes.partition { classifyMixShelf(it) == MixShelfBucket.RIGHT_NOW }
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(
@@ -141,72 +149,75 @@ fun DiscoverScreen(
             }
         }
 
-        // 2. Rolling & Moment Mixes
-        if (state.rollingAndMomentMixes.isNotEmpty()) {
-            item(key = "rolling_mixes") {
+        // 2. Split-Shelf Curated Mixes ("Right Now" wide sleeves + "From Your Collection" square sleeves)
+        if (rightNowMixes.isNotEmpty()) {
+            item(key = "right_now_mixes") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        text = "Curated Mixes",
-                        style = type.titleMd,
-                        color = colors.textPrimary,
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Right Now",
+                            style = type.titleMd,
+                            color = colors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = "LIVE WEATHER & TIME",
+                            style = type.monoXs,
+                            color = colors.textMuted,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(state.rollingAndMomentMixes, key = { it.slug }) { mix ->
-                            Surface(
-                                color = colors.surface,
-                                shape = SoulbeetShapes.md,
-                                border = BorderStroke(1.dp, colors.borderSubtle),
-                                modifier = Modifier
-                                    .width(200.dp)
-                                    .clickable { onPlayMix(mix) },
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(16.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Surface(
-                                        color = colors.surfaceHigh,
-                                        shape = SoulbeetShapes.full,
-                                    ) {
-                                        Text(
-                                            text = mix.kind.uppercase(),
-                                            style = type.monoXs,
-                                            color = colors.leafText,
-                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                        )
-                                    }
-                                    Text(
-                                        text = mix.title,
-                                        style = type.titleMd,
-                                        color = colors.textPrimary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    Text(
-                                        text = mix.subtitle,
-                                        style = type.bodySm,
-                                        color = colors.textSecondary,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    val metaLine = if (mix.kind == "seasonal") {
-                                        val cc = mix.countryCode?.takeIf { it.isNotBlank() }
-                                        val localPct = mix.localPct
-                                        if (cc != null && localPct != null) {
-                                            "${mix.trackCount} tracks · $localPct% $cc"
-                                        } else {
-                                            "${mix.trackCount} tracks · Seasonal"
-                                        }
-                                    } else {
-                                        "${mix.trackCount} tracks · ${mix.ownedPct}% library"
-                                    }
-                                    Text(
-                                        text = metaLine,
-                                        style = type.monoXs,
-                                        color = colors.textMuted,
-                                    )
-                                }
-                            }
+                        items(rightNowMixes, key = { it.slug }) { mix ->
+                            MixSleeveCard(
+                                mix = mix,
+                                layout = MixSleeveLayout.WIDE,
+                                onClick = { onPlayMix(mix) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (collectionMixes.isNotEmpty()) {
+            item(key = "collection_mixes") {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "From Your Collection",
+                            style = type.titleMd,
+                            color = colors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = "LIBRARY & DECADES",
+                            style = type.monoXs,
+                            color = colors.textMuted,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        items(collectionMixes, key = { it.slug }) { mix ->
+                            MixSleeveCard(
+                                mix = mix,
+                                layout = MixSleeveLayout.SQUARE,
+                                onClick = { onPlayMix(mix) },
+                            )
                         }
                     }
                 }

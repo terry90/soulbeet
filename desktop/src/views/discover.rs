@@ -195,6 +195,7 @@ pub fn DiscoverView() -> Element {
                         .slug
                         .clone()
                         .unwrap_or_else(|| seasonal.playlist.id.clone());
+                    let slug_art = slug.clone();
                     let slug_steer = slug.clone();
                     let title = if seasonal.playlist.name.starts_with("Soulbeet: ") {
                         seasonal
@@ -227,6 +228,7 @@ pub fn DiscoverView() -> Element {
                             title,
                             subtitle,
                             window_badge: Some("SEASONAL PACK · AUTO-EXPIRES".to_string()),
+                            mix_slug: Some(slug_art),
                             track_count: count,
                             local_ratio: effective_ratio,
                             local_label: local_code.clone(),
@@ -281,6 +283,7 @@ pub fn DiscoverView() -> Element {
                             title: "Fresh Picks".to_string(),
                             subtitle: "Keep your favorites in permanent lossless storage or drop them with 1 click (5-second Undo safety).".to_string(),
                             window_badge: Some("DISCOVERY TRIAGE · OFFLINE READY".to_string()),
+                            mix_slug: Some("balanced".to_string()),
                             track_count: radar_count,
                             local_ratio: effective_ratio,
                             local_label: local_code.clone(),
