@@ -343,6 +343,7 @@ pub fn DownloadItem(
         }
         if let Some(ref job_id) = file.job_id {
           JobDiagnosticsPanel {
+            key: "{job_id}",
             job_id: job_id.clone(),
             failed: matches!(state, DownloadState::Failed(_) | DownloadState::ImportSkipped),
           }

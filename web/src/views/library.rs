@@ -34,6 +34,10 @@ pub fn LibraryPage() -> Element {
 
     let mut active_tab = use_signal(|| LibraryTab::Playlists);
     let mut import_modal_open = use_signal(|| false);
+    let on_view_activity = use_callback(move |()| {
+        import_modal_open.set(false);
+        navigator.push(Route::ActivityPage {});
+    });
     let mut detail_title = use_signal(|| None::<String>);
     let mut detail_tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut detail_loading = use_signal(|| false);
@@ -498,10 +502,7 @@ pub fn LibraryPage() -> Element {
                             });
                         }
                     },
-                    on_view_activity: Some(EventHandler::new(move |()| {
-                        import_modal_open.set(false);
-                        navigator.push(Route::ActivityPage {});
-                    })),
+                    on_view_activity: Some(on_view_activity),
                 }
             }
         }

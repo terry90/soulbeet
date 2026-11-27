@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use reqwest::redirect::Policy;
 use serde::de::DeserializeOwned;
 use shared::recommendation::fold_name;
 
@@ -8,7 +10,10 @@ use super::models::{
     PlaylistTrackItem, RadioTrack,
 };
 use crate::knowledge::{cached, KnowledgeError, TTL_DEEZER_ARTIST, TTL_DEEZER_RADIO};
-use crate::polite::{Pace, PoliteClient, RemoteError};
+use crate::playlist_import::{
+    pinned_https_redirect, read_bounded_bytes, MAX_RESPONSE_BYTES,
+};
+use crate::polite::{HostGate, Pace, PoliteClient, RemoteError, USER_AGENT};
 use crate::traits::KnowledgeCache;
 
 /// Deezer's "no data" error code, an empty answer and not a failure.
@@ -17,6 +22,8 @@ const NO_DATA: u32 = 800;
 /// Deezer's keyless public API, reduced to the two calls discovery needs.
 pub struct DeezerClient {
     http: PoliteClient,
+    base_url: String,
+    pace: Pace,
     cache: Arc<dyn KnowledgeCache>,
 }
 
@@ -27,7 +34,27 @@ impl DeezerClient {
         cache: Arc<dyn KnowledgeCache>,
     ) -> Result<Self, RemoteError> {
         let http = PoliteClient::new(base_url, "Deezer", pace)?.with_quota_check(is_quota_error);
-        Ok(Self { http, cache })
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            pace,
+            cache,
+        })
+    }
+
+    pub fn without_redirects(
+        base_url: &str,
+        pace: Pace,
+        cache: Arc<dyn KnowledgeCache>,
+    ) -> Result<Self, RemoteError> {
+        let http = PoliteClient::without_redirects(base_url, "Deezer", pace)?
+            .with_quota_check(is_quota_error);
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            pace,
+            cache,
+        })
     }
 
     /// The artist whose name equals `name` once folded; a near match is not one.
@@ -67,12 +94,43 @@ impl DeezerClient {
         id: &str,
         max_tracks: usize,
     ) -> Result<Option<DeezerPlaylist>, KnowledgeError> {
+        self.playlist_bounded(id, max_tracks, false).await
+    }
+
+    /// Reads a public Deezer playlist with strict response size bounds and redirect pinning
+    /// (restricted to `https://api.deezer.com` on the default port when `enforce_deezer_host` is
+    /// true, or blocking all redirects otherwise).
+    pub(crate) async fn playlist_bounded(
+        &self,
+        id: &str,
+        max_tracks: usize,
+        enforce_deezer_host: bool,
+    ) -> Result<Option<DeezerPlaylist>, KnowledgeError> {
         const PAGE_SIZE: usize = 100;
         const MAX_EXTRA_PAGES: usize = 10;
 
+        let redirect = if enforce_deezer_host {
+            pinned_https_redirect("api.deezer.com")
+        } else {
+            Policy::none()
+        };
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(self.pace.timeout)
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(redirect)
+            .build()
+            .map_err(|e| RemoteError::Unavailable {
+                service: "Deezer",
+                detail: e.without_url().to_string(),
+            })?;
+        let gate = HostGate::of(&self.base_url).map_err(|detail| RemoteError::Unavailable {
+            service: "Deezer",
+            detail,
+        })?;
+
         let Some(resp) = self
-            .http
-            .get::<PlaylistResponse>(&format!("/playlist/{id}"))
+            .get_bounded::<PlaylistResponse>(&http, &gate, &format!("/playlist/{id}"))
             .await?
         else {
             return Ok(None);
@@ -113,7 +171,10 @@ impl DeezerClient {
         {
             let index = raw_tracks.len();
             let path = format!("/playlist/{id}/tracks?index={index}&limit={PAGE_SIZE}");
-            let Some(envelope) = self.http.get::<Envelope<PlaylistTrackItem>>(&path).await? else {
+            let Some(envelope) = self
+                .get_bounded::<Envelope<PlaylistTrackItem>>(&http, &gate, &path)
+                .await?
+            else {
                 break;
             };
             if let Some(e) = envelope.error {
@@ -133,6 +194,9 @@ impl DeezerClient {
             raw_tracks.extend(page_items);
             pages_fetched += 1;
         }
+
+        let raw_total_hint = (raw_tracks.len() + usize::from(has_more)) as u32;
+        let nb_tracks = resp.nb_tracks.max(raw_total_hint);
 
         let tracks = raw_tracks
             .into_iter()
@@ -161,9 +225,94 @@ impl DeezerClient {
             id: playlist_id,
             title,
             description,
-            nb_tracks: resp.nb_tracks,
+            nb_tracks,
             tracks,
         }))
+    }
+
+    async fn get_bounded<T: DeserializeOwned>(
+        &self,
+        http: &reqwest::Client,
+        gate: &HostGate,
+        path: &str,
+    ) -> Result<Option<T>, KnowledgeError> {
+        let url = format!("{}{path}", self.base_url);
+        let mut last = RemoteError::Unavailable {
+            service: "Deezer",
+            detail: String::new(),
+        };
+        for attempt in 0..=self.pace.retries {
+            let wait = self.pace.backoff * 2u32.pow(attempt);
+            gate.wait_for_turn(self.pace.min_interval).await;
+            let resp = match http.get(&url).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    last = RemoteError::Unavailable {
+                        service: "Deezer",
+                        detail: e.without_url().to_string(),
+                    };
+                    if attempt < self.pace.retries {
+                        tokio::time::sleep(wait).await;
+                    }
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let bytes = match read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(RemoteError::Unreadable {
+                        service: "Deezer",
+                        detail: e.to_string(),
+                    }
+                    .into());
+                }
+            };
+            let quota = status.is_success() && is_quota_error(&bytes);
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || quota {
+                gate.hold(wait);
+                last = RemoteError::RateLimited { service: "Deezer" };
+                if attempt < self.pace.retries {
+                    tokio::time::sleep(wait).await;
+                }
+                continue;
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                gate.hold(wait);
+            }
+            if status.is_server_error() {
+                last = RemoteError::Unavailable {
+                    service: "Deezer",
+                    detail: format!("HTTP {}", status.as_u16()),
+                };
+                if attempt < self.pace.retries {
+                    tokio::time::sleep(wait).await;
+                }
+                continue;
+            }
+            if status == reqwest::StatusCode::NO_CONTENT {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(RemoteError::Status {
+                    service: "Deezer",
+                    status: status.as_u16(),
+                    body: String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect(),
+                }
+                .into());
+            }
+            return serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+                RemoteError::Unreadable {
+                    service: "Deezer",
+                    detail: e.to_string(),
+                }
+                .into()
+            });
+        }
+        Err(last.into())
     }
 
     async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, KnowledgeError> {

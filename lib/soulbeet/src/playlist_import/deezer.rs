@@ -34,19 +34,33 @@ pub async fn fetch_playlist(
     id: &str,
     source_url: &str,
 ) -> Result<ExternalPlaylist, PlaylistImportError> {
-    fetch_playlist_from(DEEZER_API_BASE, id, source_url, Pace::DEEZER).await
+    fetch_playlist_from_inner(DEEZER_API_BASE, id, source_url, Pace::DEEZER, true).await
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_playlist_from(
     base_url: &str,
     id: &str,
     source_url: &str,
     pace: Pace,
 ) -> Result<ExternalPlaylist, PlaylistImportError> {
-    let client = DeezerClient::new(base_url, pace, Arc::new(NoopCache))
+    fetch_playlist_from_inner(base_url, id, source_url, pace, false).await
+}
+
+async fn fetch_playlist_from_inner(
+    base_url: &str,
+    id: &str,
+    source_url: &str,
+    pace: Pace,
+    enforce_deezer_host: bool,
+) -> Result<ExternalPlaylist, PlaylistImportError> {
+    let client = DeezerClient::without_redirects(base_url, pace, Arc::new(NoopCache))
         .map_err(|e| PlaylistImportError::Upstream(e.to_string()))?;
 
-    let playlist = match client.playlist(id, MAX_PLAYLIST_TRACKS).await {
+    let playlist = match client
+        .playlist_bounded(id, MAX_PLAYLIST_TRACKS, enforce_deezer_host)
+        .await
+    {
         Ok(Some(pl)) => pl,
         Ok(None) => {
             return Err(PlaylistImportError::NotFound(
@@ -60,11 +74,6 @@ pub(crate) async fn fetch_playlist_from(
                 "Deezer playlist was not found or is private.".into(),
             ));
         }
-        Err(KnowledgeError::Deezer { code: 800, .. }) => {
-            return Err(PlaylistImportError::NotFound(
-                "Deezer playlist was not found or is private.".into(),
-            ));
-        }
         Err(e) => return Err(PlaylistImportError::Upstream(e.to_string())),
     };
 
@@ -72,9 +81,8 @@ pub(crate) async fn fetch_playlist_from(
         return Err(PlaylistImportError::EmptyPlaylist);
     }
 
-    let truncated_note = (playlist.tracks.len() >= MAX_PLAYLIST_TRACKS
-        && playlist.nb_tracks as usize > MAX_PLAYLIST_TRACKS)
-        .then(|| TRUNCATED_500_NOTE.to_string());
+    let truncated_note =
+        (playlist.nb_tracks as usize > MAX_PLAYLIST_TRACKS).then(|| TRUNCATED_500_NOTE.to_string());
 
     let tracks = playlist
         .tracks
@@ -206,5 +214,62 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PlaylistImportError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn deezer_blocks_redirects_and_sets_truncated_note_from_nb_tracks() {
+        use crate::test_http::serve_with_headers;
+
+        let (redir_base, _) = serve_with_headers(vec![(
+            Reply {
+                status: 302,
+                body: String::new(),
+            },
+            vec![("Location", "http://169.254.169.254/latest/meta-data/".into())],
+        )]);
+        let err = fetch_playlist_from(
+            &redir_base,
+            "908622995",
+            "https://www.deezer.com/playlist/908622995",
+            Pace::immediate(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PlaylistImportError::Upstream(_)), "{err:?}");
+
+        // nb_tracks > MAX_PLAYLIST_TRACKS sets truncated_note even when fewer than 500 tracks pass filtering.
+        let truncated_body = serde_json::json!({
+            "id": 908622995u64,
+            "title": "Huge Playlist",
+            "nb_tracks": 650,
+            "tracks": {
+                "data": [
+                    {
+                        "title": "Valid Track",
+                        "duration": 200,
+                        "artist": { "name": "Valid Artist" }
+                    }
+                ]
+            }
+        });
+        let (base, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: truncated_body.to_string(),
+            },
+            Reply {
+                status: 200,
+                body: r#"{"data":[]}"#.into(),
+            },
+        ]);
+        let pl = fetch_playlist_from(
+            &base,
+            "908622995",
+            "https://www.deezer.com/playlist/908622995",
+            Pace::immediate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pl.truncated_note.as_deref(), Some(TRUNCATED_500_NOTE));
     }
 }

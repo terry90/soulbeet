@@ -122,7 +122,7 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
         async move {
             match on_load.call(item).await {
                 Ok(choices) => {
-                    if choices.missing_tags {
+                    if choices.missing_tags && choices.kind == MatchKind::Track {
                         tag_form_open.set(true);
                     }
                     found.set(Some(choices));
@@ -166,6 +166,8 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                         let choice = chosen(&choices.candidates, picked.read().as_ref(), &typed.read());
                         let on_enter = choice.clone();
                         let id_label = id_label(choices.kind);
+                        let busy = props.busy;
+                        let allows_tag_as_is = choices.kind == MatchKind::Track;
                         rsx! {
                             div { class: "mt-2 p-2.5 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle space-y-2.5",
                                 if list.is_empty() {
@@ -195,37 +197,46 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                                         typed.set(text);
                                     },
                                     on_enter: move |_| {
-                                        if let Some(choice) = on_enter.clone() {
-                                            on_choose.call(choice);
+                                        if !busy {
+                                            if let Some(choice) = on_enter.clone() {
+                                                on_choose.call(choice);
+                                            }
                                         }
                                     },
                                 }
                                 div { class: "flex flex-wrap items-center justify-between gap-2",
                                     RowAction {
-                                        busy: props.busy,
+                                        busy,
                                         disabled: choice.is_none(),
                                         onclick: move |_| {
-                                            if let Some(choice) = choice.clone() {
-                                                on_choose.call(choice);
+                                            if !busy {
+                                                if let Some(choice) = choice.clone() {
+                                                    on_choose.call(choice);
+                                                }
                                             }
                                         },
                                         "Import with this match"
                                     }
-                                    button {
-                                        r#type: "button",
-                                        class: "text-[11px] font-medium text-beet-accent-text hover:underline cursor-pointer",
-                                        onclick: move |_| {
-                                            let next = !*tag_form_open.peek();
-                                            tag_form_open.set(next);
-                                        },
-                                        if tag_form_open() { "Hide tag form" } else { "Tag & Import As-Is" }
+                                    if allows_tag_as_is {
+                                        button {
+                                            r#type: "button",
+                                            class: "text-[11px] font-medium text-beet-accent-text hover:underline cursor-pointer",
+                                            onclick: move |_| {
+                                                let next = !*tag_form_open.peek();
+                                                tag_form_open.set(next);
+                                            },
+                                            if tag_form_open() { "Hide tag form" } else { "Tag & Import As-Is" }
+                                        }
                                     }
                                 }
-                                if tag_form_open() {
+                                if allows_tag_as_is && tag_form_open() {
                                     {
                                         let can_stamp = !tag_artist.read().trim().is_empty()
                                             && !tag_title.read().trim().is_empty();
                                         let submit_tags = move || {
+                                            if busy {
+                                                return;
+                                            }
                                             let artist = tag_artist.read().trim().to_string();
                                             let title = tag_title.read().trim().to_string();
                                             if artist.is_empty() || title.is_empty() {
@@ -537,5 +548,28 @@ mod tests {
         assert!(html.contains("Title (required)"), "{html}");
         assert!(html.contains("Album (optional)"), "{html}");
         assert!(html.contains("Tag &#38; Import As-Is"), "{html}");
+    }
+
+    #[test]
+    fn album_imports_hide_single_track_tag_and_import_as_is_form() {
+        let mut picker = ToggleDriver::new(VirtualDom::new(|| {
+            let notice = use_signal(|| None::<String>);
+            let on_load: ChoicesLoader = Callback::new(move |_: String| {
+                Box::pin(async move {
+                    Ok(MatchChoices {
+                        kind: MatchKind::Album,
+                        candidates: vec![],
+                        missing_tags: true,
+                    })
+                }) as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
+            });
+            rsx! {
+                MatchPicker { item: "album-dir", busy: false, on_load, on_choose: |_| {}, notice }
+            }
+        }));
+        picker.click();
+        let html = picker.html();
+        assert!(!html.contains("Artist (required)"), "{html}");
+        assert!(!html.contains("Tag &#38; Import As-Is"), "{html}");
     }
 }

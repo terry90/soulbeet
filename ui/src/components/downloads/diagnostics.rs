@@ -111,25 +111,36 @@ pub fn JobDiagnosticsPanel(
     #[props(default)] failed: bool,
     #[props(default)] class: String,
 ) -> Element {
+    let mut current_job_id = use_signal(|| job_id.clone());
     let mut open = use_signal(|| false);
     let mut loading = use_signal(|| false);
     let mut data = use_signal(|| None::<JobDiagnostics>);
     let mut error = use_signal(|| None::<String>);
 
+    if *current_job_id.peek() != job_id {
+        current_job_id.set(job_id.clone());
+        open.set(false);
+        loading.set(false);
+        data.set(None);
+        error.set(None);
+    }
+
     let auth_ctx = try_use_context::<Auth>();
-    let fetch_job_id = job_id.clone();
     let trigger_fetch = use_callback(move |()| {
         if loading() {
             return;
         }
         loading.set(true);
         error.set(None);
-        let jid = fetch_job_id.clone();
+        let jid = current_job_id.peek().clone();
         spawn(async move {
             let result = match auth_ctx {
-                Some(auth) => auth.call(api::get_job_diagnostics(jid)).await,
-                None => api::get_job_diagnostics(jid).await,
+                Some(auth) => auth.call(api::get_job_diagnostics(jid.clone())).await,
+                None => api::get_job_diagnostics(jid.clone()).await,
             };
+            if *current_job_id.peek() != jid {
+                return;
+            }
             match result {
                 Ok(diag) => data.set(Some(diag)),
                 Err(e) => error.set(Some(friendly_error(&e))),

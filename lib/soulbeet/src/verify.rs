@@ -7,10 +7,12 @@
 
 use lofty::file::{AudioFile, FileType, TaggedFileExt};
 use lofty::probe::Probe;
+use lofty::tag::Accessor;
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
@@ -59,10 +61,66 @@ const PREVIEW_TRUNCATION_RATIO: f64 = 0.45;
 const SPECTRAL_FFT_SIZE: usize = 4096;
 /// Duration of each interior spectral analysis window in seconds.
 const SPECTRAL_WINDOW_SECS: f64 = 2.0;
+/// Maximum plausible audio sample rate accepted by verification (384 kHz DXD).
+const MAX_PLAUSIBLE_SAMPLE_RATE: u32 = 384_000;
+/// Hard upper bound on frames decoded into a single analysis window (3s at 384 kHz).
+const MAX_DECODE_WINDOW_FRAMES: usize = (MAX_PLAUSIBLE_SAMPLE_RATE as usize) * 3;
+/// Hard upper bound on packets inspected in a single decode pass.
+const MAX_PACKETS_INSPECTED: usize = 4096;
+/// Hard upper bound on decode errors tolerated in a single decode pass.
+const MAX_DECODE_ERRORS: usize = 16;
+/// Hard upper bound on decoder resets tolerated in a single decode pass.
+const MAX_DECODE_RESETS: usize = 4;
+/// Maximum audio channels retained per analysis window to bound memory usage.
+const MAX_ANALYSIS_CHANNELS: usize = 8;
+/// 16-byte ASF Header Object GUID (`75B22630-668E-11CF-A6D9-00AA0062CE6C`).
+const ASF_HEADER_GUID: [u8; 16] = [
+    0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+];
 
 fn verify_failure(code: FailureCode, message: impl Into<String>) -> Failure {
     Failure::new(code, Stage::Verify, RetryAdvice::OtherSource, message)
         .with_cause(Service::Soulful, None, "post-download audio verification")
+}
+
+fn validate_sample_rate(sample_rate: Option<u32>) -> Result<(), Failure> {
+    if let Some(sr) = sample_rate {
+        if sr == 0 || sr > MAX_PLAUSIBLE_SAMPLE_RATE {
+            return Err(verify_failure(
+                FailureCode::AudioCorrupt,
+                format!("Downloaded audio declares implausible sample rate ({sr} Hz)"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Basic track ordering and duration metadata extracted via `lofty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioTrackMeta {
+    pub disc: Option<u32>,
+    pub track: Option<u32>,
+    pub duration_s: Option<u32>,
+}
+
+/// Reads an audio file's `(disc, track, duration_s)` metadata using `lofty`,
+/// returning `None` when the file is unreadable or unsupported.
+pub fn audio_track_meta(path: &Path) -> Option<AudioTrackMeta> {
+    let tagged = probe_lofty(path).ok()?;
+    let secs = tagged.properties().duration().as_secs_f64();
+    let duration_s = if secs.is_finite() && secs >= 1.0 {
+        Some(secs.round() as u32)
+    } else {
+        None
+    };
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
+    let disc = tag.and_then(|t| t.disk()).filter(|&n| n > 0);
+    let track = tag.and_then(|t| t.track()).filter(|&n| n > 0);
+    Some(AudioTrackMeta {
+        disc,
+        track,
+        duration_s,
+    })
 }
 
 /// Reads an audio file's duration in whole seconds using `lofty`, returning
@@ -87,13 +145,46 @@ fn probe_lofty(path: &Path) -> Result<lofty::file::TaggedFile, String> {
         .map_err(|e| format!("container metadata read failed: {e}"))
 }
 
+fn is_wma_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wma"))
+}
+
+fn verify_wma_asf_header(path: &Path) -> Result<VerifiedAudio, Failure> {
+    let mut file = File::open(path).map_err(|e| {
+        verify_failure(
+            FailureCode::AudioCorrupt,
+            format!("Downloaded WMA audio unreadable: {e}"),
+        )
+    })?;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).map_err(|_| {
+        verify_failure(
+            FailureCode::AudioCorrupt,
+            "Downloaded WMA file is truncated before ASF header",
+        )
+    })?;
+    if header != ASF_HEADER_GUID {
+        return Err(verify_failure(
+            FailureCode::AudioCorrupt,
+            "Downloaded WMA file does not start with a valid ASF header",
+        ));
+    }
+    Ok(VerifiedAudio {
+        duration_secs: 0.0,
+        sample_rate: None,
+        peak_dbfs: None,
+    })
+}
+
 fn is_lofty_only_codec(file_type: FileType, path: &Path) -> bool {
-    if matches!(file_type, FileType::Opus) {
+    if matches!(file_type, FileType::Opus | FileType::Aac) {
         return true;
     }
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("opus") || ext.eq_ignore_ascii_case("wma"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("opus") || ext.eq_ignore_ascii_case("aac"))
 }
 
 fn is_lossless_for_spectral(file_type: FileType, path: &Path) -> bool {
@@ -146,6 +237,12 @@ pub fn verify_downloaded_audio(
         ));
     }
 
+    // WMA (ASF container) is not supported by lofty or pure-Rust symphonia;
+    // validate non-zero size and the 16-byte ASF Header Object GUID before probing.
+    if is_wma_path(path) {
+        return verify_wma_asf_header(path);
+    }
+
     let tagged = probe_lofty(path).map_err(|e| {
         verify_failure(
             FailureCode::AudioCorrupt,
@@ -162,13 +259,14 @@ pub fn verify_downloaded_audio(
         ));
     }
     let lofty_sample_rate = props.sample_rate();
+    validate_sample_rate(lofty_sample_rate)?;
 
     if policy != VerifyPolicy::Fast {
         check_truncation(duration_secs, expected_duration_s)?;
     }
 
-    // Opus and WMA require C libraries in symphonia; validate cleanly via lofty
-    // container + non-zero duration (+ truncation check above).
+    // Opus and raw ADTS AAC are validated via lofty container + non-zero duration
+    // (+ truncation check above).
     if is_lofty_only_codec(file_type, path) {
         return Ok(VerifiedAudio {
             duration_secs,
@@ -178,6 +276,7 @@ pub fn verify_downloaded_audio(
     }
 
     let mut stream = open_symphonia(path, lofty_sample_rate)?;
+    validate_sample_rate(stream.sample_rate)?;
 
     // Fast spot-decode: verify start, middle, and end packets decode cleanly.
     spot_decode(&mut *stream.format, &mut *stream.decoder, stream.track_id, duration_secs)?;
@@ -299,17 +398,33 @@ fn decode_n_packets(
     max_packets: usize,
 ) -> Result<(usize, f32), Failure> {
     let mut decoded_packets = 0usize;
+    let mut packets_inspected = 0usize;
     let mut decode_errors = 0usize;
+    let mut resets = 0usize;
     let mut peak = 0.0_f32;
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     while decoded_packets < max_packets {
+        packets_inspected += 1;
+        if packets_inspected > MAX_PACKETS_INSPECTED {
+            return Err(verify_failure(
+                FailureCode::AudioCorrupt,
+                "Audio stream exceeded packet inspection limit",
+            ));
+        }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => {
+                resets += 1;
+                if resets > MAX_DECODE_RESETS {
+                    return Err(verify_failure(
+                        FailureCode::AudioCorrupt,
+                        "Audio stream triggered repeated decoder resets",
+                    ));
+                }
                 decoder.reset();
                 continue;
             }
@@ -342,7 +457,8 @@ fn decode_n_packets(
             }
             Err(SymphoniaError::DecodeError(_)) => {
                 decode_errors += 1;
-                if decode_errors >= 4 && decoded_packets == 0 {
+                if (decode_errors >= 4 && decoded_packets == 0) || decode_errors > MAX_DECODE_ERRORS
+                {
                     return Err(verify_failure(
                         FailureCode::AudioCorrupt,
                         "Audio frames failed decoding repeatedly",
@@ -353,6 +469,13 @@ fn decode_n_packets(
                 break;
             }
             Err(SymphoniaError::ResetRequired) => {
+                resets += 1;
+                if resets > MAX_DECODE_RESETS {
+                    return Err(verify_failure(
+                        FailureCode::AudioCorrupt,
+                        "Audio stream triggered repeated decoder resets",
+                    ));
+                }
                 decoder.reset();
             }
             Err(e) => {
@@ -466,25 +589,48 @@ fn spot_decode(
     Ok(())
 }
 
-/// Decodes up to `target_frames` mono-averaged samples starting at the current
-/// stream position, returning the samples and the peak absolute value across all channels.
-fn decode_mono_window(
+/// Decodes up to `target_frames` per-channel samples starting at the current
+/// stream position, returning deinterleaved channel buffers and the peak
+/// absolute value across all channels.
+fn decode_channel_window(
     format: &mut dyn FormatReader,
     decoder: &mut dyn Decoder,
     track_id: u32,
     target_frames: usize,
-) -> Result<(Vec<f32>, f32), Failure> {
-    let mut mono = Vec::with_capacity(target_frames);
+) -> Result<(Vec<Vec<f32>>, f32), Failure> {
+    let target_frames = target_frames.min(MAX_DECODE_WINDOW_FRAMES);
+    let mut channel_samples: Vec<Vec<f32>> = Vec::new();
+    let mut frames_decoded = 0usize;
+    let mut packets_inspected = 0usize;
+    let mut decode_errors = 0usize;
+    let mut resets = 0usize;
     let mut peak = 0.0_f32;
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
-    while mono.len() < target_frames {
+    while frames_decoded < target_frames {
+        packets_inspected += 1;
+        if packets_inspected > MAX_PACKETS_INSPECTED {
+            if frames_decoded == 0 {
+                return Err(verify_failure(
+                    FailureCode::AudioCorrupt,
+                    "Audio stream exceeded packet inspection limit during analysis",
+                ));
+            }
+            break;
+        }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(SymphoniaError::ResetRequired) => {
+                resets += 1;
+                if resets > MAX_DECODE_RESETS {
+                    return Err(verify_failure(
+                        FailureCode::AudioCorrupt,
+                        "Audio stream triggered repeated decoder resets during analysis",
+                    ));
+                }
                 decoder.reset();
                 continue;
             }
@@ -501,34 +647,57 @@ fn decode_mono_window(
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
                 let spec = *audio_buf.spec();
-                let channels = spec.channels.count().max(1);
+                let raw_channels = spec.channels.count().max(1);
+                let kept_channels = raw_channels.min(MAX_ANALYSIS_CHANNELS);
                 let frames = audio_buf.capacity() as u64;
                 let buf = match &mut sample_buf {
-                    Some(b) if b.capacity() >= audio_buf.capacity() * channels => b,
+                    Some(b) if b.capacity() >= audio_buf.capacity() * raw_channels => b,
                     slot => slot.insert(SampleBuffer::<f32>::new(frames, spec)),
                 };
                 buf.copy_interleaved_ref(audio_buf);
-                let inv_ch = 1.0 / channels as f32;
-                for frame in buf.samples().chunks_exact(channels) {
-                    let mut sum = 0.0_f32;
+                if channel_samples.is_empty() {
+                    channel_samples = (0..kept_channels)
+                        .map(|_| Vec::with_capacity(target_frames))
+                        .collect();
+                }
+                for frame in buf.samples().chunks_exact(raw_channels) {
                     for &s in frame {
                         let a = s.abs();
                         if a > peak {
                             peak = a;
                         }
-                        sum += s;
                     }
-                    mono.push(sum * inv_ch);
-                    if mono.len() >= target_frames {
+                    for (ch_buf, &s) in channel_samples.iter_mut().zip(frame.iter()) {
+                        ch_buf.push(s);
+                    }
+                    frames_decoded += 1;
+                    if frames_decoded >= target_frames {
                         break;
                     }
                 }
             }
-            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError(_)) => {
+                decode_errors += 1;
+                if decode_errors > MAX_DECODE_ERRORS {
+                    return Err(verify_failure(
+                        FailureCode::AudioCorrupt,
+                        "Audio frames failed decoding repeatedly during analysis",
+                    ));
+                }
+            }
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
-            Err(SymphoniaError::ResetRequired) => decoder.reset(),
+            Err(SymphoniaError::ResetRequired) => {
+                resets += 1;
+                if resets > MAX_DECODE_RESETS {
+                    return Err(verify_failure(
+                        FailureCode::AudioCorrupt,
+                        "Audio stream triggered repeated decoder resets during analysis",
+                    ));
+                }
+                decoder.reset();
+            }
             Err(e) => {
                 return Err(verify_failure(
                     FailureCode::AudioCorrupt,
@@ -538,7 +707,7 @@ fn decode_mono_window(
         }
     }
 
-    Ok((mono, peak))
+    Ok((channel_samples, peak))
 }
 
 /// Checks 5 interior slices (15%, 30%, 50%, 70%, 85%) for dead digital silence
@@ -550,7 +719,9 @@ fn check_interior_silence(
     duration_secs: f64,
     sample_rate: Option<u32>,
 ) -> Result<f32, Failure> {
-    let sr = sample_rate.unwrap_or(44_100) as usize;
+    let sr = sample_rate
+        .unwrap_or(44_100)
+        .min(MAX_PLAUSIBLE_SAMPLE_RATE) as usize;
     let slice_frames = (sr / 2).max(2048); // ~0.5s per interior slice
     let positions = [0.15, 0.30, 0.50, 0.70, 0.85];
     let mut max_peak = 0.0_f32;
@@ -560,8 +731,9 @@ fn check_interior_silence(
         let target_s = duration_secs * frac;
         match seek_to_secs(format, decoder, track_id, target_s) {
             SeekOutcome::Seeked => {
-                let (mono, peak) = decode_mono_window(format, decoder, track_id, slice_frames)?;
-                total_samples += mono.len();
+                let (channels, peak) =
+                    decode_channel_window(format, decoder, track_id, slice_frames)?;
+                total_samples += channels.first().map_or(0, Vec::len);
                 if peak > max_peak {
                     max_peak = peak;
                 }
@@ -599,16 +771,26 @@ enum WindowSpectralVerdict {
     Brickwall { cutoff_hz: f64 },
 }
 
-/// Evaluates Welch-averaged power spectral density of a mono window for a
-/// high-confidence lossy brickwall lowpass cutoff.
-fn analyze_window_spectrum(samples: &[f32], sample_rate: u32) -> WindowSpectralVerdict {
-    if samples.len() < SPECTRAL_FFT_SIZE || sample_rate < 44_100 {
+/// Evaluates Welch-averaged power spectral density per channel (averaged across
+/// channels per frequency bin) to detect a high-confidence lossy brickwall
+/// lowpass cutoff without out-of-phase stereo cancellation.
+fn analyze_window_spectrum(channels: &[Vec<f32>], sample_rate: u32) -> WindowSpectralVerdict {
+    if sample_rate < 44_100 {
         return WindowSpectralVerdict::TooQuiet;
     }
 
     let n = SPECTRAL_FFT_SIZE;
     let hop = n / 2;
     let num_bins = n / 2 + 1;
+
+    let usable: Vec<&[f32]> = channels
+        .iter()
+        .map(Vec::as_slice)
+        .filter(|ch| ch.len() >= n)
+        .collect();
+    if usable.is_empty() {
+        return WindowSpectralVerdict::TooQuiet;
+    }
 
     // Precompute Hann window and its power normalization.
     let mut hann = Vec::with_capacity(n);
@@ -622,35 +804,47 @@ fn analyze_window_spectrum(samples: &[f32], sample_rate: u32) -> WindowSpectralV
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(n);
     let mut psd = vec![0.0_f64; num_bins];
+    let mut ch_psd = vec![0.0_f64; num_bins];
     let mut frame_buf = vec![Complex { re: 0.0_f32, im: 0.0_f32 }; n];
-    let mut frame_count = 0usize;
+    let mut active_channels = 0usize;
 
-    let mut offset = 0usize;
-    while offset + n <= samples.len() {
-        for i in 0..n {
-            frame_buf[i] = Complex {
-                re: samples[offset + i] * hann[i],
-                im: 0.0,
-            };
+    for samples in usable {
+        ch_psd.fill(0.0);
+        let mut frame_count = 0usize;
+        let mut offset = 0usize;
+        while offset + n <= samples.len() {
+            for i in 0..n {
+                frame_buf[i] = Complex {
+                    re: samples[offset + i] * hann[i],
+                    im: 0.0,
+                };
+            }
+            fft.process(&mut frame_buf);
+            // One-sided Parseval-calibrated power per bin: sum_k psd[k] == mean(x^2).
+            for k in 0..num_bins {
+                let re = frame_buf[k].re as f64;
+                let im = frame_buf[k].im as f64;
+                let scale = if k == 0 || k == num_bins - 1 { 1.0 } else { 2.0 };
+                ch_psd[k] += scale * (re * re + im * im) / (win_power * n as f64);
+            }
+            frame_count += 1;
+            offset += hop;
         }
-        fft.process(&mut frame_buf);
-        // One-sided Parseval-calibrated power per bin: sum_k psd[k] == mean(x^2).
-        for k in 0..num_bins {
-            let re = frame_buf[k].re as f64;
-            let im = frame_buf[k].im as f64;
-            let scale = if k == 0 || k == num_bins - 1 { 1.0 } else { 2.0 };
-            psd[k] += scale * (re * re + im * im) / (win_power * n as f64);
+        if frame_count > 0 {
+            let inv_frames = 1.0 / frame_count as f64;
+            for (acc, &val) in psd.iter_mut().zip(&ch_psd) {
+                *acc += val * inv_frames;
+            }
+            active_channels += 1;
         }
-        frame_count += 1;
-        offset += hop;
     }
 
-    if frame_count == 0 {
+    if active_channels == 0 {
         return WindowSpectralVerdict::TooQuiet;
     }
-    let inv_frames = 1.0 / frame_count as f64;
+    let inv_channels = 1.0 / active_channels as f64;
     for p in &mut psd {
-        *p *= inv_frames;
+        *p *= inv_channels;
     }
 
     let bin_hz = sample_rate as f64 / n as f64;
@@ -736,8 +930,9 @@ fn check_spectral_brickwall(
         let target_s = (duration_secs * frac).min((duration_secs - SPECTRAL_WINDOW_SECS).max(0.0));
         match seek_to_secs(format, decoder, track_id, target_s) {
             SeekOutcome::Seeked => {
-                let (mono, _) = decode_mono_window(format, decoder, track_id, window_frames)?;
-                match analyze_window_spectrum(&mono, sample_rate) {
+                let (channels, _) =
+                    decode_channel_window(format, decoder, track_id, window_frames)?;
+                match analyze_window_spectrum(&channels, sample_rate) {
                     WindowSpectralVerdict::TooQuiet => {}
                     WindowSpectralVerdict::Genuine => {
                         active_windows += 1;
@@ -978,6 +1173,105 @@ mod tests {
         let full = full_spectrum_signal(44_100, 18);
         let lofi = gentle_analog_rolloff(&full, 44_100, 4_000.0);
         let path = write_wav(&dir, "vintage_lofi.wav", 44_100, &lofi);
+
+        assert!(verify_downloaded_audio(&path, VerifyPolicy::ArchivalLossless, None).is_ok());
+    }
+
+    #[test]
+    fn implausible_sample_rate_fails_as_audio_corrupt_without_oom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crafted_sr.wav");
+        let data_bytes: u32 = 320_000;
+        let riff_size: u32 = 36 + data_bytes;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&u32::MAX.to_le_bytes()); // implausible sample rate
+        wav.extend_from_slice(&16_000u32.to_le_bytes()); // byte rate -> 20s declared duration
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        wav.resize(44 + data_bytes as usize, 0);
+        std::fs::write(&path, wav).unwrap();
+
+        let err = verify_downloaded_audio(&path, VerifyPolicy::Standard, None).unwrap_err();
+        assert_eq!(err.code, FailureCode::AudioCorrupt);
+        assert_eq!(err.stage, Stage::Verify);
+    }
+
+    #[test]
+    fn valid_asf_wma_passes_and_corrupt_wma_fails_as_audio_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let valid_wma = dir.path().join("valid.wma");
+        let mut asf_bytes = ASF_HEADER_GUID.to_vec();
+        asf_bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&valid_wma, asf_bytes).unwrap();
+        assert!(verify_downloaded_audio(&valid_wma, VerifyPolicy::Standard, Some(180)).is_ok());
+
+        let corrupt_wma = dir.path().join("corrupt.wma");
+        std::fs::write(&corrupt_wma, b"not an asf container at all").unwrap();
+        let err = verify_downloaded_audio(&corrupt_wma, VerifyPolicy::Standard, None).unwrap_err();
+        assert_eq!(err.code, FailureCode::AudioCorrupt);
+        assert_eq!(err.stage, Stage::Verify);
+
+        let short_wma = dir.path().join("short.wma");
+        std::fs::write(&short_wma, &ASF_HEADER_GUID[..8]).unwrap();
+        let err = verify_downloaded_audio(&short_wma, VerifyPolicy::Fast, None).unwrap_err();
+        assert_eq!(err.code, FailureCode::AudioCorrupt);
+        assert_eq!(err.stage, Stage::Verify);
+    }
+
+    #[test]
+    fn out_of_phase_stereo_high_frequencies_do_not_false_positive() {
+        // Build a stereo signal where mid-band (440 Hz + 14 kHz) is in-phase mono,
+        // while high-band (19.5 kHz) is strictly out-of-phase (L = +h, R = -h).
+        // Naive (L + R) / 2 mono downmix cancels the 19.5 kHz content completely
+        // and would falsely flag a brickwall; per-channel PSD preserves it.
+        let sr = 44_100u32;
+        let total = sr as usize * 18;
+        let full = full_spectrum_signal(sr, 18);
+        let low = brickwall_lowpass(&full, sr, 15_500.0);
+        let mut left = Vec::with_capacity(total);
+        let mut right = Vec::with_capacity(total);
+        for (i, &m) in low.iter().enumerate() {
+            let t = i as f32 / sr as f32;
+            let high = 0.08 * (TAU * 19_500.0 * t).sin() + 0.06 * (TAU * 20_200.0 * t).sin();
+            left.push((m + high).clamp(-0.95, 0.95));
+            right.push((m - high).clamp(-0.95, 0.95));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("antiphase_stereo.wav");
+        let data_bytes = (total * 4) as u32;
+        let riff_size = 36 + data_bytes;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        wav.extend_from_slice(&sr.to_le_bytes());
+        wav.extend_from_slice(&(sr * 4).to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for (&l, &r) in left.iter().zip(&right) {
+            let ql = (l.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            let qr = (r.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+            wav.extend_from_slice(&ql.to_le_bytes());
+            wav.extend_from_slice(&qr.to_le_bytes());
+        }
+        std::fs::write(&path, wav).unwrap();
 
         assert!(verify_downloaded_audio(&path, VerifyPolicy::ArchivalLossless, None).is_ok());
     }

@@ -192,6 +192,7 @@ pub(crate) async fn resume_downloads(
     let mut resumed = Resumed::default();
     let mut unlisted = Vec::new();
     for (slot, record) in slots {
+        let expected_duration_s = current_pick(&record).and_then(|p| p.duration);
         // A slot is downloading only once a row put it there.
         let Some(row) = record.row else {
             continue;
@@ -214,7 +215,7 @@ pub(crate) async fn resume_downloads(
             job: slot.clone(),
             adopted,
             sent: Vec::new(),
-            expected_duration_s: None,
+            expected_duration_s,
         };
         let destination = (!adopted).then(|| batch.destination.clone());
         match backend.get_download(&row.source, &row.id).await {
@@ -451,6 +452,9 @@ struct Downloads {
     /// and the others are sent again into this batch.
     queued: Vec<Queued>,
     pools: HashMap<JobSlot, (Vec<DownloadableItem>, usize, usize)>,
+    /// Wanted track duration per slot from `job.wanted`, preferred over
+    /// peer-reported candidate duration during post-download truncation checks.
+    wanted_durations: HashMap<JobSlot, u32>,
 }
 
 impl Downloads {
@@ -463,6 +467,7 @@ impl Downloads {
         record: SlotRecord,
         candidates: &[DownloadableGroup],
         max_sources: usize,
+        wanted_duration_s: Option<u32>,
     ) {
         let tried: Vec<DownloadableItem> = record.attempts.iter().flatten().cloned().collect();
         let alternates = match current_pick(&record) {
@@ -473,6 +478,9 @@ impl Downloads {
         let used = record.attempts.len().saturating_sub(earlier);
         self.pools
             .insert(slot.clone(), (alternates, used, max_sources));
+        if let Some(dur) = wanted_duration_s.filter(|&s| s > 0) {
+            self.wanted_durations.insert(slot.clone(), dur);
+        }
         self.slots.push((slot, record));
     }
 }
@@ -514,6 +522,7 @@ fn batch_of<'a>(
                 ),
                 slots: Vec::new(),
                 pools: HashMap::new(),
+                wanted_durations: HashMap::new(),
             });
             downloads.len() - 1
         }
@@ -805,11 +814,17 @@ pub(crate) async fn resume_unfinished(
                         fail_slots(ledger, &user, &[(slot, record)], &lost).await;
                         continue;
                     };
+                    let wanted_duration_s = job
+                        .wanted
+                        .tracks
+                        .get(record.slot as usize)
+                        .and_then(|t| t.duration_secs());
                     batch_of(&mut downloads, &job, &batch_id, &label, &backend).add(
                         slot,
                         record,
                         &candidates,
                         cap,
+                        wanted_duration_s,
                     );
                 }
                 JobState::Queued => waiting.push((slot, record)),
@@ -943,7 +958,13 @@ async fn adopt_sent(
         rows.push(row.clone());
         record.row = Some(row);
         record.state = JobState::Downloading;
-        resumed.add(slot, record, &queued.candidates, cap);
+        let wanted_duration_s = queued
+            .job
+            .wanted
+            .tracks
+            .get(record.slot as usize)
+            .and_then(|t| t.duration_secs());
+        resumed.add(slot, record, &queued.candidates, cap, wanted_duration_s);
     }
     if !rows.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -998,6 +1019,7 @@ async fn resume_batch(
         slots,
         queued,
         mut pools,
+        wanted_durations,
     } = downloads;
     let user = ctx.id();
     let waiting = queued
@@ -1005,13 +1027,18 @@ async fn resume_batch(
         .flat_map(|q| q.slots.iter().cloned())
         .collect();
     let Resumed {
-        watch,
+        mut watch,
         finished,
         failed: lost,
         rebound,
         abandon,
         on_disk,
     } = resume_downloads(&backend, download_base, &batch, slots, waiting).await;
+    for w in &mut watch {
+        if let Some(&dur) = wanted_durations.get(&w.job) {
+            w.expected_duration_s = Some(dur);
+        }
+    }
     fail_rows(ledger, &user, lost).await;
     if !rebound.is_empty() {
         ledger.record(JobEvent::Slots {
@@ -3633,6 +3660,7 @@ mod tests {
             slots: Vec::new(),
             queued: Vec::new(),
             pools: HashMap::new(),
+            wanted_durations: HashMap::new(),
         };
         let slot = JobSlot {
             job: "j1".into(),
@@ -3657,7 +3685,7 @@ mod tests {
             group("peer_b", vec![item("peer_b", "One", "b/01.flac")], 0.8),
             group("peer_c", vec![item("peer_c", "One", "c/01.flac")], 0.7),
         ];
-        downloads.add(slot.clone(), record, &candidates, 3);
+        downloads.add(slot.clone(), record, &candidates, 3, None);
         assert_eq!(
             downloads.pools[&slot],
             (vec![item("peer_c", "One", "c/01.flac")], 2, 3),

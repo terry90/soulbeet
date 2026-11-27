@@ -49,20 +49,29 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
     let mut playlist_name = use_signal(String::new);
     let mut selected_indices = use_signal(HashSet::<usize>::new);
     let mut folders = use_signal(Vec::<Folder>::new);
+    let mut folders_loading = use_signal(|| true);
+    let mut folders_error = use_signal(|| None::<String>);
     let mut selected_folder_id = use_signal(|| None::<String>);
 
     use_future(move || async move {
-        if let Ok(list) = auth.call(api::get_user_folders()).await {
-            if selected_folder_id.peek().is_none() {
-                let default_id = settings
-                    .get()
-                    .and_then(|s| s.default_download_folder_id)
-                    .filter(|id| list.iter().any(|f| f.id == *id));
-                let chosen = default_id.or_else(|| list.first().map(|f| f.id.clone()));
-                selected_folder_id.set(chosen);
+        match auth.call(api::get_user_folders()).await {
+            Ok(list) => {
+                if selected_folder_id.peek().is_none() {
+                    let default_id = settings
+                        .get()
+                        .and_then(|s| s.default_download_folder_id)
+                        .filter(|id| list.iter().any(|f| f.id == *id));
+                    let chosen = default_id.or_else(|| list.first().map(|f| f.id.clone()));
+                    selected_folder_id.set(chosen);
+                }
+                folders.set(list);
+                folders_error.set(None);
             }
-            folders.set(list);
+            Err(e) => {
+                folders_error.set(Some(friendly_error(&e)));
+            }
         }
+        folders_loading.set(false);
     });
 
     let run_preview = use_callback(move |()| {
@@ -102,9 +111,11 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
             return;
         }
         let Some(folder_id) = selected_folder_id.read().clone() else {
-            error.set(Some(
-                "Add a library folder in Settings before importing playlists.".into(),
-            ));
+            let msg = match folders_error.read().clone() {
+                Some(err) => format!("Could not load library folders: {err}"),
+                None => "Add a library folder in Settings before importing playlists.".into(),
+            };
+            error.set(Some(msg));
             return;
         };
         let chosen_set = selected_indices.read().clone();
@@ -348,7 +359,15 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                                         label { class: "block text-[11px] font-medium uppercase tracking-wider text-beet-text-tertiary",
                                             "Target Folder"
                                         }
-                                        if folder_list.is_empty() {
+                                        if let Some(err) = folders_error() {
+                                            p { class: "text-[12px] text-beet-crimson-text py-2 break-words",
+                                                "Could not load folders: {err}"
+                                            }
+                                        } else if folders_loading() {
+                                            p { class: "text-[12px] text-beet-text-tertiary py-2",
+                                                "Loading folders..."
+                                            }
+                                        } else if folder_list.is_empty() {
                                             p { class: "text-[12px] text-beet-crimson-text py-2",
                                                 "No folders configured"
                                             }
@@ -507,6 +526,16 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                                     span { class: "px-2.5 py-1 rounded-full bg-beet-surface border border-beet-border-subtle text-beet-text-secondary text-[11px] font-medium tabular-nums-mono",
                                         "{resp.already_running} already downloading"
                                     }
+                                }
+                                if resp.refused > 0 {
+                                    span { class: "px-2.5 py-1 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text text-[11px] font-medium tabular-nums-mono",
+                                        "{resp.refused} could not be queued"
+                                    }
+                                }
+                            }
+                            if resp.refused > 0 {
+                                p { class: "text-[12px] text-beet-crimson-text leading-relaxed",
+                                    "Some tracks could not be queued (for example, because you reached the active download limit or a library lookup failed). Wait for active jobs to finish and try again to add the rest."
                                 }
                             }
                             if resp.queued_for_download > 0 || resp.already_running > 0 {

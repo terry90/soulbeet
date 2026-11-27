@@ -138,3 +138,28 @@ pub struct CommitPlaylistImportResponse {
     pub already_running: usize,
     pub refused: usize,
 }
+
+/// Candidate summary offered when an automated playlist import job needs manual source approval
+/// (e.g., lossy fallback when preference is Ask, or match score below auto-select threshold).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportJobCandidate {
+    pub candidate_index: usize,
+    pub source: String,
+    pub label: String,
+    pub quality: String,
+    pub is_lossy: bool,
+}
+
+/// Compact summary of a `BatchOrigin::Import` job shown on the Activity page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportJobSummary {
+    pub job_id: String,
+    pub batch_id: String,
+    pub artist: String,
+    pub title: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<ImportJobCandidate>,
+}

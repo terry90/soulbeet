@@ -15,6 +15,54 @@ use url::Url;
 /// Maximum number of tracks resolved from a single external playlist URL.
 pub const MAX_PLAYLIST_TRACKS: usize = 500;
 
+/// Default hard cap on response body bytes read by playlist resolvers (8 MiB).
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Builds a redirect policy restricted to `https://{allowed_host}` on the default HTTPS port.
+pub(crate) fn pinned_https_redirect(allowed_host: &'static str) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 3 {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url();
+        if url.scheme() == "https"
+            && url.host_str() == Some(allowed_host)
+            && url.port().is_none()
+        {
+            attempt.follow()
+        } else {
+            attempt.error(format!("refused redirect outside {allowed_host}"))
+        }
+    })
+}
+
+/// Reads a `reqwest::Response` body up to `max_bytes`, rejecting oversized payloads both upfront
+/// via `Content-Length` and incrementally while streaming chunks.
+pub(crate) async fn read_bounded_bytes(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, PlaylistImportError> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            return Err(PlaylistImportError::Upstream(format!(
+                "Playlist response exceeded maximum allowed size of {max_bytes} bytes."
+            )));
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        PlaylistImportError::Upstream(format!("Could not read playlist response: {e}"))
+    })? {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(PlaylistImportError::Upstream(format!(
+                "Playlist response exceeded maximum allowed size of {max_bytes} bytes."
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Errors returned while validating or fetching an external playlist URL.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PlaylistImportError {
@@ -337,5 +385,34 @@ mod tests {
                 "expected InvalidUrl for {raw:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_bounded_bytes_rejects_oversized_responses() {
+        use crate::test_http::{serve, Reply};
+
+        let oversized = "a".repeat(256);
+        let (base, _) = serve(vec![
+            Reply {
+                status: 200,
+                body: oversized,
+            },
+            Reply {
+                status: 200,
+                body: "ok".into(),
+            },
+        ]);
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("{base}/big")).send().await.unwrap();
+        let err = read_bounded_bytes(resp, 64).await.unwrap_err();
+        assert!(
+            matches!(err, PlaylistImportError::Upstream(ref m) if m.contains("maximum allowed size")),
+            "{err:?}"
+        );
+
+        let resp_ok = client.get(format!("{base}/small")).send().await.unwrap();
+        let bytes = read_bounded_bytes(resp_ok, 64).await.unwrap();
+        assert_eq!(bytes, b"ok");
     }
 }

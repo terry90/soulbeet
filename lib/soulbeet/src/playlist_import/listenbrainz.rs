@@ -15,19 +15,30 @@ pub async fn fetch_playlist(
     mbid: &str,
     source_url: &str,
 ) -> Result<ExternalPlaylist, PlaylistImportError> {
-    fetch_playlist_from(LISTENBRAINZ_API_BASE, mbid, source_url, Pace::METABRAINZ).await
+    fetch_playlist_from_inner(LISTENBRAINZ_API_BASE, mbid, source_url, Pace::METABRAINZ, true).await
 }
 
+#[cfg(test)]
 pub(crate) async fn fetch_playlist_from(
     base_url: &str,
     mbid: &str,
     source_url: &str,
     pace: Pace,
 ) -> Result<ExternalPlaylist, PlaylistImportError> {
-    let client = ListenBrainzClient::new(base_url, None, pace)
+    fetch_playlist_from_inner(base_url, mbid, source_url, pace, false).await
+}
+
+async fn fetch_playlist_from_inner(
+    base_url: &str,
+    mbid: &str,
+    source_url: &str,
+    pace: Pace,
+    enforce_lb_host: bool,
+) -> Result<ExternalPlaylist, PlaylistImportError> {
+    let client = ListenBrainzClient::without_redirects(base_url, None, pace)
         .map_err(|e| PlaylistImportError::Upstream(e.to_string()))?;
 
-    let playlist = match client.playlist_full(mbid).await {
+    let playlist = match client.playlist_full_bounded(mbid, enforce_lb_host).await {
         Ok(Some(pl)) => pl,
         Ok(None) => {
             return Err(PlaylistImportError::NotFound(
@@ -157,5 +168,73 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, PlaylistImportError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn ignores_non_recording_or_non_musicbrainz_identifiers_and_blocks_redirects() {
+        use crate::test_http::serve_with_headers;
+
+        let fixture = r#"{
+            "playlist": {
+                "title": "Mixed Identifiers",
+                "track": [
+                    {
+                        "title": "Spotify Track",
+                        "creator": "Some Artist",
+                        "identifier": ["https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"]
+                    },
+                    {
+                        "title": "Release URL Not Recording",
+                        "creator": "Some Artist",
+                        "identifier": ["https://musicbrainz.org/release/22c7fa7f-2404-4103-8267-6a98b4b1f8ee"]
+                    },
+                    {
+                        "title": "Second Identifier Is Valid",
+                        "creator": "Some Artist",
+                        "identifier": [
+                            "https://open.spotify.com/track/notambid",
+                            "https://musicbrainz.org/recording/22c7fa7f-2404-4103-8267-6a98b4b1f8ee"
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        let mbid = "48f2eb97-33e7-496c-8da1-25ead7280a81";
+        let (base, _) = serve(vec![Reply {
+            status: 200,
+            body: fixture.into(),
+        }]);
+        let pl = fetch_playlist_from(
+            &base,
+            mbid,
+            &format!("https://listenbrainz.org/playlist/{mbid}"),
+            Pace::immediate(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pl.tracks.len(), 3);
+        assert_eq!(pl.tracks[0].recording_mbid, None);
+        assert_eq!(pl.tracks[1].recording_mbid, None);
+        assert_eq!(
+            pl.tracks[2].recording_mbid.as_deref(),
+            Some("22c7fa7f-2404-4103-8267-6a98b4b1f8ee")
+        );
+
+        let (redir_base, _) = serve_with_headers(vec![(
+            Reply {
+                status: 302,
+                body: String::new(),
+            },
+            vec![("Location", "http://127.0.0.1:9999/secret".into())],
+        )]);
+        let err = fetch_playlist_from(
+            &redir_base,
+            mbid,
+            &format!("https://listenbrainz.org/playlist/{mbid}"),
+            Pace::immediate(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PlaylistImportError::Upstream(_)), "{err:?}");
     }
 }

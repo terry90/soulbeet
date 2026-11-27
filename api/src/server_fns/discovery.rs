@@ -539,6 +539,8 @@ struct QueuedTrack {
     reason_json: Option<String>,
     /// Optional `CultureBucket` label for contextual/seasonal tracks.
     culture_bucket: Option<String>,
+    /// Expected duration in seconds from the selected source metadata, when known.
+    expected_duration_s: Option<u32>,
 }
 
 /// The track's import is done or abandoned once it is dropped, so whoever
@@ -1185,6 +1187,7 @@ pub async fn generate_discovery_playlist_internal(
                             abandoned: Vec::new(),
                             reason_json: None,
                             culture_bucket: None,
+                            expected_duration_s: item.duration,
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -1354,11 +1357,12 @@ pub async fn generate_discovery_playlist_internal(
                 };
 
                 let verify_path = src.clone();
+                let expected_duration_s = qt.expected_duration_s;
                 let verified = tokio::task::spawn_blocking(move || {
                     soulbeet::verify_downloaded_audio(
                         &verify_path,
                         soulbeet::VerifyPolicy::Standard,
-                        None,
+                        expected_duration_s,
                     )
                 })
                 .await;
@@ -2118,6 +2122,7 @@ async fn generate_seasonal_packs_with_work(
                             abandoned: Vec::new(),
                             reason_json: reason_json.clone(),
                             culture_bucket: culture_bucket.clone(),
+                            expected_duration_s: item.duration,
                         });
                         enqueued = true;
                         break;
@@ -2240,11 +2245,12 @@ async fn generate_seasonal_packs_with_work(
                 };
 
                 let verify_path = src.clone();
+                let expected_duration_s = qt.expected_duration_s;
                 let verified = tokio::task::spawn_blocking(move || {
                     soulbeet::verify_downloaded_audio(
                         &verify_path,
                         soulbeet::VerifyPolicy::Standard,
-                        None,
+                        expected_duration_s,
                     )
                 })
                 .await;
@@ -3151,6 +3157,7 @@ mod tests {
             abandoned: Vec::new(),
             reason_json: None,
             culture_bucket: None,
+            expected_duration_s: None,
         }
     }
 

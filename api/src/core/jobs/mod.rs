@@ -18,6 +18,7 @@ use crate::ledger::{
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
 use crate::services::NavidromeLookupError;
+use futures::StreamExt;
 use runner::{spawn_drive, Acquire};
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableItem, IndexState, JobSlot};
@@ -334,17 +335,48 @@ pub(crate) async fn ensure_with_origin(
             }
         },
     };
+    // Run Navidrome lookups with bounded concurrency, then process in exact input order so
+    // replacement-token claiming and output ordering stay deterministic.
+    const ENSURE_LOOKUP_CONCURRENCY: usize = 8;
+    let lookups: Vec<(usize, Option<Result<crate::core::library::Found, Failure>>)> =
+        if let Some(ref navi) = navi {
+            let lookup_inputs: Vec<(usize, Option<Reference>)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    Wanted::Track(reference) => (i, Some(reference.clone())),
+                    Wanted::Album(_) => (i, None),
+                })
+                .collect();
+            let mut out: Vec<_> = futures::stream::iter(lookup_inputs.into_iter().map(|(i, reference)| {
+                let navi = navi.clone();
+                async move {
+                    match reference {
+                        Some(reference) => (i, Some(find(&navi, &reference).await)),
+                        None => (i, None),
+                    }
+                }
+            }))
+            .buffer_unordered(ENSURE_LOOKUP_CONCURRENCY)
+            .collect()
+            .await;
+            out.sort_by_key(|(i, _)| *i);
+            out
+        } else {
+            (0..items.len()).map(|i| (i, None)).collect()
+        };
+
     // Each item's result, None while it waits for its job; and the items that get one, with
     // their fuzzy matches and the token songs they replace.
     let mut results: Vec<Option<EnsureItem>> = Vec::with_capacity(items.len());
     let mut wanting: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let (Some(navi), Wanted::Track(reference)) = (&navi, item) else {
+    for (i, lookup) in lookups {
+        let Some(lookup) = lookup else {
             results.push(None);
             wanting.push((i, vec![], vec![]));
             continue;
         };
-        match find(navi, reference).await {
+        match lookup {
             Ok(found) => {
                 let (owned, fuzzy): (Vec<_>, Vec<_>) =
                     (found.matches.into_iter()).partition(|m| m.how.kind != MatchKind::Fuzzy);
@@ -365,7 +397,7 @@ pub(crate) async fn ensure_with_origin(
                     results.push(Some(EnsureItem::InLibrary { song_ids }));
                 }
             }
-            Err(failure) => results.push(Some(EnsureItem::Refused(failure, item.facts()))),
+            Err(failure) => results.push(Some(EnsureItem::Refused(failure, items[i].facts()))),
         }
     }
     let library_checked = navi.is_some();

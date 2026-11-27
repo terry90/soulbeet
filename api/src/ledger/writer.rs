@@ -26,6 +26,9 @@ use tracing::warn;
 
 pub(super) type Reply<T> = oneshot::Sender<Result<T, LedgerError>>;
 
+/// Maximum unfinished playlist-import jobs allowed per user at one time.
+const IMPORT_UNFINISHED_JOBS_PER_USER: u32 = 500;
+
 /// What the writer reads its writes from, sends its change numbers and freed places on and keeps
 /// the live rows in.
 pub(super) struct Inbox {
@@ -286,6 +289,18 @@ impl Entry {
     /// The entry a slot in `state` with `row` as its last row shows; None for a state before
     /// its download.
     fn of_slot(slot: u32, state: JobState, row: Option<&DownloadProgress>) -> Option<Entry> {
+        if state == JobState::Downloading {
+            if let Some(row) = row {
+                if let Some(failure) = row.failure.as_ref().filter(|f| f.stage == Stage::Verify) {
+                    return Some(
+                        Entry::at(state, "verify_failed")
+                            .slot(slot)
+                            .item(&row.source, &row.item)
+                            .failure(failure),
+                    );
+                }
+            }
+        }
         let event = match state {
             JobState::Downloading
                 if row.is_some_and(|row| row.state == DownloadState::Completed) =>
@@ -1260,9 +1275,14 @@ impl Writer {
                 });
                 continue;
             }
-            if batch.origin == BatchOrigin::Mcp {
-                let unfinished = unfinished_mcp_jobs(&mut tx, &job.user).await?;
-                if unfinished >= MCP_UNFINISHED_JOBS_PER_USER {
+            if matches!(batch.origin, BatchOrigin::Mcp | BatchOrigin::Import) {
+                let cap = if batch.origin == BatchOrigin::Import {
+                    IMPORT_UNFINISHED_JOBS_PER_USER
+                } else {
+                    MCP_UNFINISHED_JOBS_PER_USER
+                };
+                let unfinished = unfinished_origin_jobs(&mut tx, &job.user, batch.origin).await?;
+                if unfinished >= cap {
                     admitted.push(Admitted::OverLimit { unfinished });
                     continue;
                 }
@@ -1937,7 +1957,7 @@ async fn follow_attempt(
     let at = now();
     // An adopted transfer's attempt (a restart found it, its candidate unknown) is followed by
     // the slot's rows, and takes their source.
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE job_attempts SET last_row = ?, \
              started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END, \
              ended_at = CASE WHEN ? THEN ? END, \
@@ -1964,7 +1984,35 @@ async fn follow_attempt(
     .bind(&row.source)
     .bind(&row.item)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        if let Some(failure) = row.failure.as_ref().filter(|f| f.stage == Stage::Verify) {
+            // Post-download verification runs after the transfer already reported
+            // `DownloadState::Completed` (closing the open attempt with `failure = NULL`).
+            // Attach the verification failure to that most recent completed attempt so
+            // job diagnostics reflect why the peer failed instead of showing "downloaded".
+            sqlx::query(
+                "UPDATE job_attempts SET last_row = ?, failure = ? \
+                 WHERE job_id = ? AND slot = ? AND n = ( \
+                     SELECT MAX(n) FROM job_attempts \
+                     WHERE job_id = ? AND slot = ? AND failure IS NULL \
+                     AND ((source = ? AND json_extract(candidate, '$.id') = ?) OR candidate IS NULL) \
+                 )",
+            )
+            .bind(stored_row)
+            .bind(serde_json::to_string(failure)?)
+            .bind(&slot.job)
+            .bind(slot.slot)
+            .bind(&slot.job)
+            .bind(slot.slot)
+            .bind(&row.source)
+            .bind(&row.item)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -2084,14 +2132,18 @@ async fn same_recording(
         .transpose()
 }
 
-/// How many of `user`'s MCP jobs are unfinished.
-async fn unfinished_mcp_jobs(tx: &mut SqliteConnection, user: &UserId) -> Result<u32, LedgerError> {
+/// How many of `user`'s unfinished jobs belong to batches of `origin`.
+async fn unfinished_origin_jobs(
+    tx: &mut SqliteConnection,
+    user: &UserId,
+    origin: BatchOrigin,
+) -> Result<u32, LedgerError> {
     let count: u32 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id = j.batch_id \
          WHERE j.user_id = ? AND b.origin = ? AND j.state NOT IN {TERMINAL_SQL}"
     ))
     .bind(user.to_string())
-    .bind(BatchOrigin::Mcp.as_str())
+    .bind(origin.as_str())
     .fetch_one(&mut *tx)
     .await?;
     Ok(count)
@@ -2158,9 +2210,16 @@ async fn store_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{store, JobKind, JobState, Ledger, NewJob, NewSearch};
+    use super::super::{
+        store, Admitted, BatchOrigin, JobEvent, JobKind, JobState, Ledger, NewJob, NewJobBatch,
+        NewSearch,
+    };
+    use super::IMPORT_UNFINISHED_JOBS_PER_USER;
     use crate::auth::UserId;
-    use shared::download::DownloadQuery;
+    use crate::server_fns::download::test_support::item;
+    use shared::download::{DownloadProgress, DownloadQuery, DownloadState, JobSlot};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+    use shared::metadata::Track;
     use soulbeet::ImportMode;
 
     #[tokio::test]
@@ -2207,6 +2266,169 @@ mod tests {
         assert_eq!(
             store::job_state(&db, "first").await,
             Some(JobState::NeedsSourceChoice)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_failure_during_failover_records_verify_event_and_updates_completed_attempt() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let picked = item("peer_a", "One", "a/01.flac");
+        let slot = JobSlot {
+            job: "j-verify".into(),
+            slot: 0,
+        };
+        ledger
+            .create(
+                NewJob {
+                    id: slot.job.clone(),
+                    user: UserId::new("alice"),
+                    folder_id: folder,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: vec![(0, picked.clone())],
+                    kind: JobKind::Track,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Transfer completes, which closes the open attempt with ended_at != NULL, failure = NULL.
+        let completed = DownloadProgress::queued(
+            "t-1".into(),
+            picked.source.clone(),
+            picked.id.clone(),
+            1024,
+        )
+        .with_state(DownloadState::Completed)
+        .with_job(slot.clone());
+        ledger
+            .record_stored(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![completed.clone()],
+            })
+            .await
+            .unwrap();
+
+        // 2. Post-download verification fails and failover records the failed row
+        //    while the slot stays in JobState::Downloading.
+        let verify_err = Failure::new(
+            FailureCode::AudioCorrupt,
+            Stage::Verify,
+            RetryAdvice::OtherSource,
+            "corrupt audio frames",
+        );
+        let failed = completed.failed_with(verify_err);
+        ledger
+            .record_stored(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![failed],
+            })
+            .await
+            .unwrap();
+
+        let timeline = store::timeline_of(&db, &slot.job).await.unwrap();
+        let verify_event = timeline
+            .iter()
+            .find(|e| e.stage == Stage::Verify && e.event == "verify_failed")
+            .expect("job_events must record a Stage::Verify verify_failed event during failover");
+        assert_eq!(
+            verify_event.facts.get("code").and_then(|v| v.as_str()),
+            Some("audio_corrupt")
+        );
+
+        let attempt_failure: Option<String> = sqlx::query_scalar(
+            "SELECT failure FROM job_attempts WHERE job_id = ? AND slot = 0 AND n = 1",
+        )
+        .bind(&slot.job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let parsed: Failure = serde_json::from_str(
+            attempt_failure
+                .as_deref()
+                .expect("completed job_attempt must have verification failure attached"),
+        )
+        .unwrap();
+        assert_eq!(parsed.stage, Stage::Verify);
+        assert_eq!(parsed.code, FailureCode::AudioCorrupt);
+    }
+
+    #[tokio::test]
+    async fn import_origin_batches_enforce_unfinished_job_cap() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let alice = UserId::new("alice");
+
+        let make_job = |i: u32| {
+            let track = Track {
+                id: format!("t-{i}"),
+                title: format!("Unique Song {i}"),
+                artist: "Import Artist".into(),
+                album_id: None,
+                album_title: None,
+                release_date: None,
+                duration: None,
+                mbid: None,
+                release_mbid: None,
+            };
+            NewJob {
+                id: format!("imp-job-{i}"),
+                user: alice.clone(),
+                folder_id: folder.clone(),
+                wanted: DownloadQuery::new(vec![track]),
+                import_mode: ImportMode::Singleton,
+                state: JobState::Queued,
+                search_id: None,
+                picked: vec![],
+                kind: JobKind::Track,
+                options: None,
+            }
+        };
+
+        let first_batch: Vec<NewJob> = (0..IMPORT_UNFINISHED_JOBS_PER_USER)
+            .map(make_job)
+            .collect();
+        let admitted = ledger
+            .create_batch(
+                NewJobBatch {
+                    id: "imp-batch-1".into(),
+                    user: alice.clone(),
+                    label: Some("Big Playlist".into()),
+                    origin: BatchOrigin::Import,
+                    for_playlist: true,
+                },
+                first_batch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.len(), IMPORT_UNFINISHED_JOBS_PER_USER as usize);
+        assert!(admitted.iter().all(|a| matches!(a, Admitted::Created)));
+
+        let overflow = ledger
+            .create_batch(
+                NewJobBatch {
+                    id: "imp-batch-2".into(),
+                    user: alice.clone(),
+                    label: Some("Overflow Playlist".into()),
+                    origin: BatchOrigin::Import,
+                    for_playlist: true,
+                },
+                vec![make_job(IMPORT_UNFINISHED_JOBS_PER_USER + 1)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            overflow,
+            vec![Admitted::OverLimit {
+                unfinished: IMPORT_UNFINISHED_JOBS_PER_USER
+            }]
         );
     }
 }

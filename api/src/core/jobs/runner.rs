@@ -511,6 +511,21 @@ impl Runner<'_> {
             }
         };
         if view.candidates.is_empty() {
+            if !view.filter_rejections.rejection_counts.is_empty()
+                || !view.filter_rejections.top_rejected.is_empty()
+            {
+                if let Ok(Some(stored)) =
+                    store::search_of(&self.acquire.db, &search_id, &self.ctx.id()).await
+                {
+                    let mut stats = stored.stats.unwrap_or_default();
+                    view.merge_rejections_into(&mut stats);
+                    let _ = self
+                        .acquire
+                        .ledger
+                        .search_ended(&search_id, Ok((groups, Some(stats))))
+                        .await;
+                }
+            }
             self.fail(no_candidate_passed(), Some(search_id)).await;
             return None;
         }
@@ -612,6 +627,10 @@ impl Runner<'_> {
             }
         };
         let usable = self.acquire.effects.usable_backends(self.ctx).await?;
+        let since = chrono::Utc::now().timestamp() - RECENT_FAILURES_SECS;
+        let failures = store::recent_failures(&self.acquire.db, since)
+            .await
+            .unwrap_or_default();
         let run = SearchRun {
             id: id.to_string(),
             query,
@@ -624,6 +643,8 @@ impl Runner<'_> {
             usable,
             run,
             self.options.min_score,
+            self.job.excluded_sources.clone(),
+            failures,
         )
         .await?;
         task.await.map_err(|e| {
@@ -1937,5 +1958,71 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec.state, JobState::Failed);
+    }
+
+    #[tokio::test]
+    async fn runner_falls_back_to_last_resort_when_primary_candidates_fail_filters() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let ytdlp_stub = crate::server_fns::download::test_support::StubBackend::new(vec![]);
+        effects
+            .stub_backends()
+            .insert(shared::ytdlp::BACKEND_ID, ytdlp_stub.clone());
+        effects.set_enabled_backends(vec![&shared::backends::SLSKD, &shared::backends::YTDLP]);
+        effects.set_lossy_fallback(LossyFallback::Auto);
+
+        // Primary returns a high-scoring mp3, but job filters require opus or flac.
+        let mut slsk_item = item("peer_a", "O Holy Night", "dir/01.mp3");
+        slsk_item.facts.extension = Some("mp3".into());
+        effects
+            .stub()
+            .script_polls(found(vec![group("peer_a", vec![slsk_item], 0.95)]));
+
+        let mut ytm_item = item("youtube", "O Holy Night", "ytm/01.opus");
+        ytm_item.backend = shared::ytdlp::BACKEND_ID.into();
+        ytm_item.facts.extension = Some("opus".into());
+        ytdlp_stub.script_polls(found(vec![group("youtube", vec![ytm_item], 0.9)]));
+
+        let mut opts = auto(0.7);
+        opts.filters.formats = vec!["flac".into(), "opus".into()];
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", opts).await;
+        drive(&acq, &alice(), &job).await;
+
+        let enqueued = effects.enqueued();
+        assert_eq!(enqueued.len(), 1);
+        assert_eq!(enqueued[0].0.backend, shared::ytdlp::BACKEND_ID);
+    }
+
+    #[tokio::test]
+    async fn runner_records_filter_rejections_in_search_stats_and_timeline_when_all_filtered() {
+        let (acq, effects) = Acquire::for_alice().await;
+
+        let mut slsk_item = item("peer_a", "O Holy Night", "dir/01.mp3");
+        slsk_item.facts.extension = Some("mp3".into());
+        effects
+            .stub()
+            .script_polls(found(vec![group("peer_a", vec![slsk_item], 0.95)]));
+
+        let mut opts = auto(0.7);
+        opts.filters.lossless_only = true;
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", opts).await;
+        drive(&acq, &alice(), &job).await;
+
+        let rec = store::job_record(&acq.db, &job, &alice().id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, JobState::Failed);
+        assert_eq!(
+            rec.failure.as_ref().map(|f| f.code),
+            Some(FailureCode::SearchAllFiltered)
+        );
+        let stored = store::search_of(&acq.db, rec.search_id.as_deref().unwrap(), &alice().id())
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = stored.stats.expect("filter rejections merged into stats");
+        assert!(stats.rejection_counts.get("format_filtered").copied().unwrap_or(0) >= 1);
+        let timeline = store::timeline_of(&acq.db, &job).await.unwrap();
+        assert!(timeline.iter().any(|e| e.event == "search_diagnostics"));
     }
 }

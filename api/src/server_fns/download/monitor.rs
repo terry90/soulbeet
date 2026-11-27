@@ -336,6 +336,27 @@ struct TrackState {
     phase: SlotPhase,
 }
 
+/// Classification of a low-speed throughput stall.
+#[derive(Debug)]
+enum SpeedStall {
+    /// Rolling throughput fell below `LOW_SPEED_FAILOVER_BPS` while alternates
+    /// exist: switch only if an alternate enqueues, otherwise keep the working
+    /// transfer alive.
+    FailoverOnly(Failure),
+    /// Rolling throughput stayed below `DEAD_TRICKLE_BPS` for `DEAD_TRICKLE_WINDOW`:
+    /// fail over if possible, otherwise cancel and time out the slot.
+    DeadTrickle(Failure),
+}
+
+impl SpeedStall {
+    #[cfg(test)]
+    fn failure(&self) -> &Failure {
+        match self {
+            Self::FailoverOnly(f) | Self::DeadTrickle(f) => f,
+        }
+    }
+}
+
 impl TrackState {
     /// Fresh state for a slot bound to a transfer right now. Every
     /// construction site is a binding or a rebinding, so there is no
@@ -370,16 +391,16 @@ impl TrackState {
     /// - Paused/reset outside `InProgress`, while `queued_at_source`, or while `pending_retry`.
     /// - Exempt during the initial `SPEED_WARMUP_GRACE` (25s) and when near completion
     ///   (`percent >= 85%` or remaining bytes `< 512 KiB`).
-    /// - Triggers failover when rolling speed over `SPEED_WINDOW` (60s) is below
-    ///   `LOW_SPEED_FAILOVER_BPS` (12 KiB/s) ONLY when `has_next` is true.
-    /// - Triggers last-resort abort when rolling speed remains below `DEAD_TRICKLE_BPS`
-    ///   (1 KiB/s) for `DEAD_TRICKLE_WINDOW` (5 min) even without alternates.
+    /// - Triggers `SpeedStall::FailoverOnly` when rolling speed over `SPEED_WINDOW` (60s)
+    ///   is below `LOW_SPEED_FAILOVER_BPS` (12 KiB/s) ONLY when `has_next` is true.
+    /// - Triggers `SpeedStall::DeadTrickle` when rolling speed remains below
+    ///   `DEAD_TRICKLE_BPS` (1 KiB/s) for `DEAD_TRICKLE_WINDOW` (5 min) even without alternates.
     fn check_low_speed_stall(
         &mut self,
         download: &DownloadProgress,
         has_next: bool,
         now: Instant,
-    ) -> Option<Failure> {
+    ) -> Option<SpeedStall> {
         if download.state != DownloadState::InProgress
             || download.queued_at_source
             || download.pending_retry.is_some()
@@ -435,19 +456,23 @@ impl TrackState {
         let delta_bytes = download.transferred.saturating_sub(oldest_bytes);
         let rolling_bps = (delta_bytes as f64) / span.as_secs_f64();
 
-        if has_next && rolling_bps < LOW_SPEED_FAILOVER_BPS as f64 {
-            return Some(low_speed_stall(rolling_bps as u64));
-        }
-
         if rolling_bps < DEAD_TRICKLE_BPS as f64 {
             let since = *self.dead_trickle_since.get_or_insert(now);
             if now.saturating_duration_since(since)
                 >= DEAD_TRICKLE_WINDOW.saturating_sub(SPEED_WINDOW)
             {
-                return Some(dead_trickle_stall(rolling_bps as u64));
+                return Some(SpeedStall::DeadTrickle(dead_trickle_stall(
+                    rolling_bps as u64,
+                )));
             }
         } else {
             self.dead_trickle_since = None;
+        }
+
+        if has_next && rolling_bps < LOW_SPEED_FAILOVER_BPS as f64 {
+            return Some(SpeedStall::FailoverOnly(low_speed_stall(
+                rolling_bps as u64,
+            )));
         }
 
         None
@@ -864,6 +889,17 @@ impl DownloadMonitor {
         backend: &Arc<dyn DownloadBackend>,
         left: DownloadProgress,
     ) -> bool {
+        self.try_failover_with_abandon(slot, backend, left, true)
+            .await
+    }
+
+    async fn try_failover_with_abandon(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        left: DownloadProgress,
+        abandon_current: bool,
+    ) -> bool {
         if !self.pool.has_next(slot) || self.job_cancelled(slot) {
             return false;
         }
@@ -897,7 +933,9 @@ impl DownloadMonitor {
             self.pool.max_sources(slot)
         );
 
-        self.abandon(slot, backend).await;
+        if abandon_current {
+            self.abandon(slot, backend).await;
+        }
         let old_key = self.slot_key(slot, backend.id());
         let new_key = transfer_key(backend.id(), &queued.source, &queued.item);
         TransferRegistry::global().hand_over(&old_key, &new_key, &self.batch.owner);
@@ -1504,14 +1542,36 @@ impl DownloadMonitor {
                 continue;
             }
 
-            if let Some(failure) = self.track_states[slot].check_low_speed_stall(
+            if let Some(stall) = self.track_states[slot].check_low_speed_stall(
                 download,
                 self.pool.has_next(slot),
                 Instant::now(),
             ) {
-                warn!("{}: {}", failure.message, download.item);
-                self.time_out(slot, download, failure, backend).await;
-                continue;
+                match stall {
+                    SpeedStall::FailoverOnly(failure) => {
+                        let row = DownloadProgress {
+                            queued_at_source: false,
+                            ..download.clone()
+                        }
+                        .failed_with(failure.clone());
+                        if self.try_failover(slot, backend, row).await {
+                            warn!("{}: {}", failure.message, download.item);
+                            continue;
+                        }
+                        // No alternate could be enqueued: keep the working slow transfer
+                        // alive rather than cancelling it (dead_trickle and PER_TRACK_TIMEOUT
+                        // still bound truly stalled transfers).
+                        warn!(
+                            "{} for {}, but no alternate could be enqueued; keeping current transfer",
+                            failure.message, download.item
+                        );
+                    }
+                    SpeedStall::DeadTrickle(failure) => {
+                        warn!("{}: {}", failure.message, download.item);
+                        self.time_out(slot, download, failure, backend).await;
+                        continue;
+                    }
+                }
             }
 
             // A peer can hold its queue for hours; another source may send
@@ -1713,7 +1773,12 @@ impl DownloadMonitor {
             ..download.clone()
         }
         .failed_with(failure);
-        if self.try_failover(slot, backend, failed_row.clone()).await {
+        // Transfer record was already removed above with `remove = true`; do not
+        // issue a redundant `cancel_download(..., false)` via `abandon`.
+        if self
+            .try_failover_with_abandon(slot, backend, failed_row.clone(), false)
+            .await
+        {
             return true;
         }
         let row = self.write_off(slot, SlotPhase::Settled, backend.id(), failed_row);
@@ -1935,9 +2000,11 @@ impl DownloadMonitor {
     /// for a batch that cannot): its watched slots, the ones joining
     /// requests added, and the files it was handed found.
     ///
-    /// A track is settled when it left `Watching` or its transfer completed
-    /// successfully. Settled must be judged per track: in album mode
-    /// completed tracks stay watched until the whole batch is handled.
+    /// A track is settled when it left `Watching`, or in album mode when its
+    /// transfer completed successfully (completed album slots stay `Watching`
+    /// until the whole batch is handled). Singleton slots stay `Watching` while
+    /// awaiting deferred pre-handoff verification on disk, so they are only
+    /// settled once they leave `Watching`.
     /// Failed states settle through the phase only, after process_tracks
     /// confirms the failure persisted (slskd 0.26 may retry it).
     async fn check_completion(
@@ -1945,8 +2012,9 @@ impl DownloadMonitor {
         matched: &[(usize, DownloadProgress)],
         backend: &Arc<dyn DownloadBackend>,
     ) -> bool {
+        let is_album = self.batch.import_mode == ImportMode::Album;
         let all_settled = (0..self.tracked_files.len())
-            .all(|slot| !self.watching(slot) || self.finished_in(slot, matched));
+            .all(|slot| !self.watching(slot) || (is_album && self.finished_in(slot, matched)));
 
         if !all_settled {
             return false;
@@ -5033,7 +5101,10 @@ mod tests {
             true,
             base + Duration::from_secs(85),
         );
-        assert_eq!(stall.map(|f| f.code), Some(FailureCode::TransferTimedOut));
+        assert_eq!(
+            stall.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
 
         // 3. Fast-then-trickle detection: fast during t=25..55, then 2 KiB/s during t=55..115.
         let mut ts = TrackState::bound_now();
@@ -5071,7 +5142,10 @@ mod tests {
             true,
             base + Duration::from_secs(115),
         );
-        assert_eq!(stall.map(|f| f.code), Some(FailureCode::TransferTimedOut));
+        assert_eq!(
+            stall.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
 
         // 4. Near-completion immunity: >= 85% or < 512 KiB remaining never aborts.
         let mut ts = TrackState::bound_now();
@@ -5159,7 +5233,10 @@ mod tests {
             false,
             base + Duration::from_secs(325),
         );
-        assert_eq!(aborted.map(|f| f.code), Some(FailureCode::TransferTimedOut));
+        assert_eq!(
+            aborted.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
     }
 
     #[tokio::test]
@@ -6062,5 +6139,131 @@ mod tests {
         assert_eq!(rows[0].id, "t-02");
         assert!(late.deliver(vec![]).is_err(), "a late join is handed back");
         assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn deferred_singleton_verification_does_not_exit_monitor_early() {
+        let (mut m, base, _imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-deferred-verify"),
+            &["one.flac"],
+            &[],
+        )
+        .await;
+        m.batch.import_mode = ImportMode::Singleton;
+        m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "One", "one.flac"),
+            item("peer_b", "One", "alt/one.flac"),
+        ]));
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let listing = vec![listed("peer_a", "one.flac", DownloadState::Completed)];
+
+        // File is not yet on disk while alternates remain: monitor defers
+        // handoff and MUST NOT report completion while still Watching.
+        let mut empty = 0;
+        let done = m
+            .process_poll_result(listing.clone(), &mut empty, 1, &backend)
+            .await;
+        assert!(!done, "monitor must not exit early during deferred verification");
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+        assert!(m.track_states[0].completed_since.is_some());
+
+        let matched = m.find_matching_downloads(&listing, &backend);
+        assert!(
+            !m.check_completion(&matched, &backend).await,
+            "check_completion must return false for Watching singleton slot"
+        );
+
+        // Once the valid audio file appears on disk, verification succeeds and
+        // the slot hands off and completes.
+        std::fs::write(
+            base.path().join(&m.batch.destination).join("one.flac"),
+            valid_test_audio(),
+        )
+        .unwrap();
+        let done = m
+            .process_poll_result(listing, &mut empty, 2, &backend)
+            .await;
+        assert!(done);
+        assert_eq!(phase(&m, 0), SlotPhase::HandedOff);
+        m.join_handoffs().await;
+    }
+
+    #[tokio::test]
+    async fn low_speed_stall_keeps_working_transfer_when_alternates_fail_to_enqueue() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/slow.flac"]);
+        let mut m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Slow", "dirA/slow.flac"),
+            item("peer_b", "Slow", "dirB/slow.flac"),
+        ]));
+        // Alternate peer rejects enqueue.
+        let stub = StubBackend::new(vec![ScriptedOutcome::Rejected]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        // Seed speed tracking so rolling speed over 60s is 4 KiB/s (< 12 KiB/s, > 1 KiB/s).
+        let now = Instant::now();
+        m.track_states[0].in_progress_since =
+            Some(now.checked_sub(Duration::from_secs(120)).unwrap());
+        m.track_states[0].speed_samples.push_back((
+            now.checked_sub(Duration::from_secs(65)).unwrap(),
+            100_000,
+        ));
+        let dl = DownloadProgress {
+            transferred: 100_000 + 65 * 4096,
+            size: 20_000_000,
+            percent: 2.0,
+            ..listed("peer_a", "dirA/slow.flac", DownloadState::InProgress)
+        };
+
+        poll_tracks(&mut m, &[dl], &backend).await;
+
+        assert_eq!(
+            phase(&m, 0),
+            SlotPhase::Watching,
+            "working slow transfer must not be written off when alternates fail"
+        );
+        assert_eq!(m.tracked_files[0].source, "peer_a");
+        assert!(
+            stub.cancelled().is_empty(),
+            "working slow transfer must not be cancelled when no alternate enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_failure_failover_does_not_redundantly_cancel_removed_transfer() {
+        let (mut m, base, _imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-verify-no-double-cancel"),
+            &["bad.flac"],
+            &[],
+        )
+        .await;
+        m.batch.import_mode = ImportMode::Singleton;
+        m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Bad", "bad.flac"),
+            item("peer_b", "Bad", "alt/bad.flac"),
+        ]));
+        // Write corrupt bytes on disk so post-download verification fails and fails over.
+        std::fs::write(
+            base.path().join(&m.batch.destination).join("bad.flac"),
+            b"<html>corrupt</html>",
+        )
+        .unwrap();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "bad.flac", DownloadState::Completed)],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("bad.flac"))],
+            "handle_verify_failure already removed the transfer; try_failover must not call cancel_download(..., false)"
+        );
     }
 }

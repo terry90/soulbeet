@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use shared::backends::{delivery, Delivery};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::playlist_import::{
-    CommitPlaylistImportRequest, CommitPlaylistImportResponse, ExternalPlaylist, ImportMatchStatus,
-    ImportPreviewTrack, PlaylistImportPreview, PlaylistImportTarget,
+    CommitPlaylistImportRequest, CommitPlaylistImportResponse, ExternalPlaylist,
+    ImportJobCandidate, ImportJobSummary, ImportMatchStatus, ImportPreviewTrack,
+    PlaylistImportPreview, PlaylistImportTarget,
 };
 use soulbeet::playlist_import::{resolve_playlist_url, PlaylistImportError, MAX_PLAYLIST_TRACKS};
 use tracing::warn;
@@ -16,18 +18,29 @@ use super::fill::{self, PlaylistTarget};
 use super::NewPlaylist;
 use crate::auth::UserCtx;
 use crate::core::acquire::AUTO_SELECT_SCORE_THRESHOLD;
+use crate::core::database_failure;
 use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
+use crate::core::jobs::retry::{cancel, download_source, RetryAnswer, SourceTarget};
 use crate::core::jobs::runner::Acquire;
-use crate::core::jobs::{ensure_with_origin, EnsureItem, EnsureRefusal, Wanted};
+use crate::core::jobs::{
+    ensure_with_origin, job_failure, job_not_found, job_view, recent_failures, untried_given,
+    views_of, EnsureItem, EnsureRefusal, Wanted,
+};
 use crate::core::library::{find, navidrome_for, MatchKind, Reference};
-use crate::ledger::{BatchOrigin, JobOptions, Pick, SourceFilters};
+use crate::core::sources::{candidate_id, parse_candidate_id};
+use crate::ledger::store;
+use crate::ledger::{BatchOrigin, JobOptions, JobState, Pick, SourceFilters};
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::NavidromeLookupError;
 
 const PREVIEW_LOOKUP_CONCURRENCY: usize = 8;
 const MAX_PLAYLIST_NAME_CHARS: usize = 255;
 const MAX_PLAYLIST_COMMENT_CHARS: usize = 2000;
+const RECENT_IMPORT_JOBS_WINDOW_SECS: i64 = 24 * 60 * 60;
+const MAX_IMPORT_JOBS_LISTED: usize = 50;
+const MAX_IMPORT_JOB_CANDIDATES: usize = 5;
+const LOSSLESS_EXTS: [&str; 6] = ["flac", "wav", "aiff", "aif", "ape", "wv"];
 
 fn map_import_error(err: PlaylistImportError) -> Failure {
     match err {
@@ -276,9 +289,12 @@ pub(crate) async fn commit_playlist_import(
     }
 
     let navi = navidrome_for(navidrome, ctx, Stage::Playlist).await?;
-    let _locks = fill::prepare(&navi, ctx, &target)
-        .await
-        .map_err(|r| r.failure())?;
+    // Pre-flight target validation without holding the playlist mutex across library lookups.
+    {
+        let _preflight_locks = fill::prepare(&navi, ctx, &target)
+            .await
+            .map_err(|r| r.failure())?;
+    }
 
     let options = JobOptions {
         pick: Pick::Auto,
@@ -307,7 +323,18 @@ pub(crate) async fn commit_playlist_import(
         EnsureRefusal::Taken { failure, .. } => failure,
     })?;
 
-    let written = fill::begin(
+    // Re-acquire the playlist mutex only for the actual playlist creation/update.
+    // If re-validation or playlist creation fails after jobs were created, cancel those newly
+    // created jobs so they are not silently orphaned.
+    let _locks = match fill::prepare(&navi, ctx, &target).await {
+        Ok(locks) => locks,
+        Err(refusal) => {
+            cancel_created_jobs(acquire, ctx, &ensured.items).await;
+            return Err(refusal.failure());
+        }
+    };
+
+    let written = match fill::begin(
         &acquire.ledger,
         &navi,
         ctx,
@@ -316,7 +343,13 @@ pub(crate) async fn commit_playlist_import(
         &ensured.items,
     )
     .await
-    .map_err(|r| r.failure())?;
+    {
+        Ok(written) => written,
+        Err(refusal) => {
+            cancel_created_jobs(acquire, ctx, &ensured.items).await;
+            return Err(refusal.failure());
+        }
+    };
 
     let mut already_in_library = 0usize;
     let mut queued_for_download = 0usize;
@@ -340,6 +373,196 @@ pub(crate) async fn commit_playlist_import(
         already_running,
         refused,
     })
+}
+
+async fn cancel_created_jobs(acquire: &Acquire, ctx: &UserCtx, items: &[EnsureItem]) {
+    for item in items {
+        if let EnsureItem::Created { job_id, .. } = item {
+            if let Err(err) = cancel(acquire, ctx, job_id).await {
+                warn!(
+                    "Could not cancel orphaned playlist import job {job_id} after playlist failure: {}",
+                    err.message
+                );
+            }
+        }
+    }
+}
+
+fn candidate_quality(item: Option<&shared::download::DownloadableItem>) -> (String, bool) {
+    let Some(item) = item else {
+        return ("Unknown".to_string(), false);
+    };
+    let lossy_backend = delivery(&item.backend) == Delivery::LossyOnly;
+    let ext = item
+        .facts
+        .extension
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let is_lossy = lossy_backend
+        || ext.is_some_and(|e| !LOSSLESS_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+    let quality = match (ext, item.facts.bitrate_kbps) {
+        (Some(e), Some(kbps)) if !LOSSLESS_EXTS.contains(&e.to_ascii_lowercase().as_str()) => {
+            format!("{} {}k", e.to_ascii_uppercase(), kbps)
+        }
+        (Some(e), _) => e.to_ascii_uppercase(),
+        (None, Some(kbps)) => format!("{kbps}k"),
+        (None, None) => shared::backends::meta(&item.backend)
+            .map(|m| m.name.to_string())
+            .unwrap_or_else(|| item.backend.clone()),
+    };
+    (quality, is_lossy)
+}
+
+/// Lists the caller's active and recent (last 24h) `BatchOrigin::Import` jobs, capped at 50,
+/// including selectable candidates for any job waiting in `needs_source_choice`.
+pub(crate) async fn list_import_jobs(
+    acquire: &Acquire,
+    ctx: &UserCtx,
+) -> Result<Vec<ImportJobSummary>, Failure> {
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - RECENT_IMPORT_JOBS_WINDOW_SECS;
+
+    let mut records: Vec<_> = store::jobs_of(&acquire.db, &ctx.id(), None, None, &[])
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?
+        .into_iter()
+        .filter(|job| {
+            job.origin == BatchOrigin::Import
+                && (!job.state.is_terminal() || job.updated_at >= cutoff)
+        })
+        .collect();
+
+    // Active jobs first (needs_source_choice at the top), then recent terminal jobs newest-first.
+    records.sort_by(|a, b| {
+        let rank = |s: JobState| -> u8 {
+            if s == JobState::NeedsSourceChoice {
+                0
+            } else if !s.is_terminal() {
+                1
+            } else {
+                2
+            }
+        };
+        rank(a.state)
+            .cmp(&rank(b.state))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    records.truncate(MAX_IMPORT_JOBS_LISTED);
+
+    let views = views_of(&acquire.db, &acquire.ledger, ctx, records).await?;
+    let needs_choice = views
+        .iter()
+        .any(|v| v.job.state == JobState::NeedsSourceChoice);
+    let failures = if needs_choice {
+        recent_failures(&acquire.db, now).await?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let mut summaries = Vec::with_capacity(views.len());
+    for view in views {
+        let (artist, title) = if let Some(track) = view.job.wanted.tracks.first() {
+            (track.artist.clone(), track.title.clone())
+        } else if let Some(album) = &view.job.wanted.album {
+            (album.artist.clone(), album.title.clone())
+        } else {
+            (String::new(), "Unknown Track".to_string())
+        };
+
+        let candidates = if view.job.state == JobState::NeedsSourceChoice {
+            let untried = untried_given(&view, &failures, now);
+            untried
+                .candidates
+                .into_iter()
+                .filter_map(|c| {
+                    let (_, candidate_index) = parse_candidate_id(&c.id)?;
+                    let first_item = c.group.items.first();
+                    let (quality, is_lossy) = candidate_quality(first_item);
+                    let source = if !c.group.source.trim().is_empty() {
+                        c.group.source.clone()
+                    } else {
+                        first_item
+                            .map(|i| i.backend.clone())
+                            .unwrap_or_else(|| "source".to_string())
+                    };
+                    let label = if !c.group.title.trim().is_empty() {
+                        c.group.title.clone()
+                    } else {
+                        first_item
+                            .map(|i| i.title.clone())
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| c.group.group_id.clone())
+                    };
+                    Some(ImportJobCandidate {
+                        candidate_index,
+                        source,
+                        label,
+                        quality,
+                        is_lossy,
+                    })
+                })
+                .take(MAX_IMPORT_JOB_CANDIDATES)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        summaries.push(ImportJobSummary {
+            job_id: view.job.id.clone(),
+            batch_id: view.job.batch_id.clone(),
+            artist,
+            title,
+            state: view.job.state.as_str().to_string(),
+            error: job_failure(&view).map(|f| f.message),
+            candidates,
+        });
+    }
+
+    Ok(summaries)
+}
+
+/// Resolves a `BatchOrigin::Import` job waiting for a source choice: downloads the chosen
+/// candidate (`Some(candidate_index)`) or cancels/skips the job (`None`), enforcing job ownership.
+pub(crate) async fn resolve_import_job_choice(
+    acquire: &Arc<Acquire>,
+    ctx: &UserCtx,
+    job_id: &str,
+    candidate_index: Option<usize>,
+) -> Result<(), Failure> {
+    let view = job_view(acquire, ctx, job_id)
+        .await?
+        .ok_or_else(job_not_found)?;
+    if view.job.origin != BatchOrigin::Import {
+        return Err(job_not_found());
+    }
+
+    let answer = match candidate_index {
+        Some(idx) => {
+            let search_id = view.job.search_id.as_deref().ok_or_else(|| {
+                Failure::new(
+                    FailureCode::UnknownHandle,
+                    Stage::Input,
+                    RetryAdvice::NotRetryable,
+                    "No search results available for this import job",
+                )
+            })?;
+            let cid = candidate_id(search_id, idx);
+            download_source(acquire, ctx, SourceTarget::Job(job_id.to_string()), &cid).await?
+        }
+        None => cancel(acquire, ctx, job_id).await?,
+    };
+
+    match answer {
+        RetryAnswer::Applied(_) | RetryAnswer::AppliedUnread { .. } => Ok(()),
+        RetryAnswer::Refused(f, _) | RetryAnswer::Unavailable(f, _) => Err(f),
+        RetryAnswer::InvalidInput { field, expected } => Err(Failure::new(
+            FailureCode::InvalidInput,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            format!("Invalid {field}: {expected}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -459,7 +682,10 @@ mod tests {
         let navi = NavidromeStub::start();
         let holy = native_song(HOLY.0, "Marrow Choir", HOLY.1, 263.0, None);
 
-        navi.answer("/rest/getPlaylists", &[&playlists_body(&[])]);
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&playlists_body(&[]), &playlists_body(&[])],
+        );
         navi.answer_when(
             "/api/song",
             "title=Marrow+Choir+O+Holy+Night",
@@ -565,5 +791,109 @@ mod tests {
         .execute(&acq.db)
         .await;
         assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn commit_cancels_created_jobs_when_playlist_creation_fails() {
+        let (acq, _effects) = Acquire::for_alice().await;
+        // Hold the search turn so the spawned runner stays in Searching while playlist creation fails.
+        let _hold = acq.searches.hold_turn_for_test().await;
+        let ctx = test_ctx("alice");
+        let navi = NavidromeStub::start();
+
+        navi.answer(
+            "/rest/getPlaylists",
+            &[&playlists_body(&[]), &playlists_body(&[])],
+        );
+        navi.answer_when(
+            "/api/song",
+            "title=Carbon+Based+Lifeforms+Fauna",
+            200,
+            "[]",
+        );
+        navi.answer_with_status("/rest/createPlaylist", &[(500, "internal error")]);
+
+        let req = CommitPlaylistImportRequest {
+            target: PlaylistImportTarget::Create {
+                name: "Will Fail".into(),
+                comment: None,
+                allow_duplicate_name: false,
+            },
+            folder_id: "alice-folder".into(),
+            tracks: vec![CommitPlaylistImportTrack {
+                artist: "Carbon Based Lifeforms".into(),
+                title: "Fauna".into(),
+                album: None,
+                duration_s: Some(312),
+                recording_mbid: None,
+            }],
+        };
+
+        let err = commit_playlist_import(&acq, &NavidromeFor(Ok(navi.client())), &ctx, req)
+            .await
+            .unwrap_err();
+        assert_eq!(err.stage, Stage::Playlist);
+
+        // Every created job must have been cancelled rather than left searching/orphaned.
+        let jobs = store::jobs_of(&acq.db, &ctx.id(), None, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn list_and_resolve_import_jobs_supports_choice_cancel_and_ownership() {
+        use crate::core::jobs::test_support::{choosing_track_job, view_of};
+
+        let (acq, _effects) = Acquire::for_alice().await;
+        let alice_ctx = test_ctx("alice");
+        let bob_ctx = test_ctx("bob");
+
+        // Create a job in NeedsSourceChoice and flip its batch origin to 'import'.
+        let job_id = choosing_track_job(&acq).await;
+        let view = view_of(&acq, &job_id).await;
+        sqlx::query("UPDATE batches SET origin = 'import' WHERE id = ?")
+            .bind(&view.job.batch_id)
+            .execute(&acq.db)
+            .await
+            .unwrap();
+
+        let listed = list_import_jobs(&acq, &alice_ctx).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, job_id);
+        assert_eq!(listed[0].state, "needs_source_choice");
+        assert!(!listed[0].candidates.is_empty());
+
+        // Another user cannot see or resolve Alice's import job.
+        assert!(list_import_jobs(&acq, &bob_ctx).await.unwrap().is_empty());
+        let err = resolve_import_job_choice(&acq, &bob_ctx, &job_id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, FailureCode::UnknownHandle);
+
+        // Alice can skip/cancel the NeedsSourceChoice import job.
+        resolve_import_job_choice(&acq, &alice_ctx, &job_id, None)
+            .await
+            .unwrap();
+        let after = view_of(&acq, &job_id).await;
+        assert_eq!(after.job.state, JobState::Cancelled);
+
+        // Second NeedsSourceChoice job: Alice approves candidate 0 to queue download.
+        let job_id_2 = choosing_track_job(&acq).await;
+        let view_2 = view_of(&acq, &job_id_2).await;
+        sqlx::query("UPDATE batches SET origin = 'import' WHERE id = ?")
+            .bind(&view_2.job.batch_id)
+            .execute(&acq.db)
+            .await
+            .unwrap();
+        let listed_2 = list_import_jobs(&acq, &alice_ctx).await.unwrap();
+        let summary_2 = listed_2.iter().find(|j| j.job_id == job_id_2).unwrap();
+        let cand_idx = summary_2.candidates[0].candidate_index;
+        resolve_import_job_choice(&acq, &alice_ctx, &job_id_2, Some(cand_idx))
+            .await
+            .unwrap();
+        let after_2 = view_of(&acq, &job_id_2).await;
+        assert_ne!(after_2.job.state, JobState::NeedsSourceChoice);
     }
 }

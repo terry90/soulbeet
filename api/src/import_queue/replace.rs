@@ -42,6 +42,107 @@ fn replacement_duration_mismatch(new_s: u32, old_s: u32) -> Failure {
     )
 }
 
+/// Track ordering and duration extracted for replacement comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackDuration {
+    disc: Option<u32>,
+    track: Option<u32>,
+    duration_s: Option<u32>,
+}
+
+fn check_pair_duration(old_s: u32, new_s: u32) -> Result<(), Failure> {
+    if old_s > 0 && new_s > 0 {
+        let tolerance = DURATION_GUARD_MIN_TOLERANCE_S.max(old_s / 10);
+        if new_s.abs_diff(old_s) > tolerance {
+            return Err(replacement_duration_mismatch(new_s, old_s));
+        }
+    }
+    Ok(())
+}
+
+/// Compares existing and newly imported track durations without relying on
+/// arbitrary filesystem/list ordering:
+/// - 1-to-1 singleton replacements compare directly.
+/// - Multi-track albums match tracks by `(disc, track_no)` when tags are present,
+///   deduplicating multiple existing copies of the same album by key before comparing.
+/// - Untagged multi-track albums with equal track counts compare sorted durations.
+/// - Untagged multi-track albums where `existing.len()` is a multiple of `imported.len()`
+///   normalize total duration per copy so duplicate existing copies do not false-fail.
+fn compare_replacement_tracks(
+    existing: &[TrackDuration],
+    imported: &[TrackDuration],
+) -> Result<(), Failure> {
+    if existing.is_empty() || imported.is_empty() {
+        return Ok(());
+    }
+
+    if existing.len() == 1 && imported.len() == 1 {
+        if let (Some(old_s), Some(new_s)) = (existing[0].duration_s, imported[0].duration_s) {
+            check_pair_duration(old_s, new_s)?;
+        }
+        return Ok(());
+    }
+
+    let mut old_by_key: std::collections::BTreeMap<(u32, u32), u32> =
+        std::collections::BTreeMap::new();
+    for t in existing {
+        if let (Some(track_no), Some(dur)) = (t.track, t.duration_s.filter(|&d| d > 0)) {
+            let key = (t.disc.unwrap_or(1), track_no);
+            old_by_key.entry(key).or_insert(dur);
+        }
+    }
+    let mut new_by_key: std::collections::BTreeMap<(u32, u32), u32> =
+        std::collections::BTreeMap::new();
+    for t in imported {
+        if let (Some(track_no), Some(dur)) = (t.track, t.duration_s.filter(|&d| d > 0)) {
+            let key = (t.disc.unwrap_or(1), track_no);
+            new_by_key.entry(key).or_insert(dur);
+        }
+    }
+
+    let has_keyed_overlap =
+        !old_by_key.is_empty() && new_by_key.keys().any(|k| old_by_key.contains_key(k));
+    if has_keyed_overlap {
+        for (key, &new_s) in &new_by_key {
+            if let Some(&old_s) = old_by_key.get(key) {
+                check_pair_duration(old_s, new_s)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if existing.len() == imported.len() {
+        if existing.iter().all(|t| t.duration_s.is_some_and(|s| s > 0))
+            && imported.iter().all(|t| t.duration_s.is_some_and(|s| s > 0))
+        {
+            let mut old_durs: Vec<u32> = existing.iter().filter_map(|t| t.duration_s).collect();
+            let mut new_durs: Vec<u32> = imported.iter().filter_map(|t| t.duration_s).collect();
+            old_durs.sort_unstable();
+            new_durs.sort_unstable();
+            for (old_s, new_s) in old_durs.into_iter().zip(new_durs) {
+                check_pair_duration(old_s, new_s)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if existing.iter().all(|t| t.duration_s.is_some_and(|s| s > 0))
+        && imported.iter().all(|t| t.duration_s.is_some_and(|s| s > 0))
+    {
+        let old_raw_total: u32 = existing.iter().filter_map(|t| t.duration_s).sum();
+        let old_total = if existing.len() > imported.len()
+            && existing.len().is_multiple_of(imported.len())
+        {
+            old_raw_total / (existing.len() / imported.len()) as u32
+        } else {
+            old_raw_total
+        };
+        let new_total: u32 = imported.iter().filter_map(|t| t.duration_s).sum();
+        check_pair_duration(old_total, new_total)?;
+    }
+    Ok(())
+}
+
 /// Compares the newly imported file(s) against the existing library file(s)
 /// before deleting any existing copy. If both durations are known (> 0) and
 /// `|new_s - old_s| > max(15s, old_s / 10)`, returns `ReplacementDurationMismatch`.
@@ -61,37 +162,38 @@ async fn check_replacement_durations(
     let imported_paths: Vec<PathBuf> = imported.iter().map(|(_, rel)| target.join(rel)).collect();
 
     tokio::task::spawn_blocking(move || {
-        let old_durations: Vec<Option<u32>> = existing_inputs
+        let existing_tracks: Vec<TrackDuration> = existing_inputs
             .iter()
-            .map(|(path, fallback)| soulbeet::audio_duration_secs(path).or(*fallback))
+            .map(|(path, fallback)| match soulbeet::verify::audio_track_meta(path) {
+                Some(meta) => TrackDuration {
+                    disc: meta.disc,
+                    track: meta.track,
+                    duration_s: meta.duration_s.or(*fallback),
+                },
+                None => TrackDuration {
+                    disc: None,
+                    track: None,
+                    duration_s: *fallback,
+                },
+            })
             .collect();
-        let new_durations: Vec<Option<u32>> = imported_paths
+        let imported_tracks: Vec<TrackDuration> = imported_paths
             .iter()
-            .map(|path| soulbeet::audio_duration_secs(path))
+            .map(|path| match soulbeet::verify::audio_track_meta(path) {
+                Some(meta) => TrackDuration {
+                    disc: meta.disc,
+                    track: meta.track,
+                    duration_s: meta.duration_s,
+                },
+                None => TrackDuration {
+                    disc: None,
+                    track: None,
+                    duration_s: None,
+                },
+            })
             .collect();
 
-        if old_durations.len() == new_durations.len() {
-            for (old_s, new_s) in old_durations.into_iter().zip(new_durations) {
-                if let (Some(old_s), Some(new_s)) = (old_s, new_s) {
-                    if old_s > 0 && new_s > 0 {
-                        let tolerance = DURATION_GUARD_MIN_TOLERANCE_S.max(old_s / 10);
-                        if new_s.abs_diff(old_s) > tolerance {
-                            return Err(replacement_duration_mismatch(new_s, old_s));
-                        }
-                    }
-                }
-            }
-        } else if old_durations.iter().all(|d| d.is_some_and(|s| s > 0))
-            && new_durations.iter().all(|d| d.is_some_and(|s| s > 0))
-        {
-            let old_total: u32 = old_durations.into_iter().flatten().sum();
-            let new_total: u32 = new_durations.into_iter().flatten().sum();
-            let tolerance = DURATION_GUARD_MIN_TOLERANCE_S.max(old_total / 10);
-            if new_total.abs_diff(old_total) > tolerance {
-                return Err(replacement_duration_mismatch(new_total, old_total));
-            }
-        }
-        Ok(())
+        compare_replacement_tracks(&existing_tracks, &imported_tracks)
     })
     .await
     .unwrap_or(Ok(()))
@@ -685,6 +787,127 @@ mod tests {
             settled.replaced[0].outcome,
             ReplacementOutcome::Replaced
         ));
+    }
+
+    #[tokio::test]
+    async fn multi_track_album_replacement_out_of_order_succeeds_and_mismatched_fails() {
+        let wav_180 = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 180]);
+        let wav_240 = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 240]);
+        let wav_90 = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 90]);
+
+        // 1. Out-of-order existing [track2(180s), track1(240s)] vs imported [track1(240s), track2(180s)]
+        //    must succeed instead of falsely failing with ReplacementDurationMismatch.
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        lib.song("s-t2", "alice/Album/02.flac", &wav_180);
+        lib.song("s-t1", "alice/Album/01.flac", &wav_240);
+        lib.fake.rates("alice", "s-t2", 1);
+        lib.fake.rates("alice", "s-t1", 1);
+
+        let new_t1 = new_copy(11, 1);
+        let new_t2 = new_copy(12, 2);
+        std::fs::create_dir_all(target.join(&new_t1.1).parent().unwrap()).unwrap();
+        std::fs::write(target.join(&new_t1.1), &wav_240).unwrap();
+        std::fs::write(target.join(&new_t2.1), &wav_180).unwrap();
+
+        let rem = WantedRemoval {
+            existing: vec![
+                earlier("Album/02.flac", "Track Two"),
+                earlier("Album/01.flac", "Track One"),
+            ],
+            imported: vec![new_t1, new_t2],
+        };
+        let settled = settle_removals(
+            &lib.guard(),
+            &stub,
+            &lib.alice(),
+            Removals::Guarded(&Origin::Ui),
+            &[],
+            &target,
+            imported_with(vec![rem]),
+        )
+        .await;
+        assert_eq!(settled.replaced.len(), 1);
+        assert!(
+            matches!(settled.replaced[0].outcome, ReplacementOutcome::Replaced),
+            "out-of-order matching album should replace cleanly, got {:?}",
+            settled.replaced[0].outcome
+        );
+
+        // 2. When a track duration genuinely mismatches (90s vs 180s), replacement must still fail.
+        let lib2 = Library::new().await;
+        let stub2 = StubImporter::new();
+        let target2 = lib2.root.join("music/alice");
+        lib2.song("s2-t2", "alice/Album/02.flac", &wav_180);
+        lib2.song("s2-t1", "alice/Album/01.flac", &wav_240);
+        lib2.fake.rates("alice", "s2-t2", 1);
+        lib2.fake.rates("alice", "s2-t1", 1);
+
+        let new2_t1 = new_copy(21, 1);
+        let new2_t2 = new_copy(22, 2);
+        std::fs::create_dir_all(target2.join(&new2_t1.1).parent().unwrap()).unwrap();
+        std::fs::write(target2.join(&new2_t1.1), &wav_240).unwrap();
+        std::fs::write(target2.join(&new2_t2.1), &wav_90).unwrap();
+
+        let rem2 = WantedRemoval {
+            existing: vec![
+                earlier("Album/02.flac", "Track Two"),
+                earlier("Album/01.flac", "Track One"),
+            ],
+            imported: vec![new2_t1, new2_t2],
+        };
+        let settled2 = settle_removals(
+            &lib2.guard(),
+            &stub2,
+            &lib2.alice(),
+            Removals::Guarded(&Origin::Ui),
+            &[],
+            &target2,
+            imported_with(vec![rem2]),
+        )
+        .await;
+        match &settled2.replaced[0].outcome {
+            ReplacementOutcome::Kept { failure } => {
+                assert_eq!(failure.code, FailureCode::ReplacementDurationMismatch);
+            }
+            other => panic!("expected ReplacementDurationMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compare_replacement_tracks_matches_by_disc_track_and_deduplicates_duplicate_copies() {
+        let td = |disc, track, dur| TrackDuration {
+            disc: Some(disc),
+            track: Some(track),
+            duration_s: Some(dur),
+        };
+        // Out-of-order tagged album succeeds.
+        assert!(compare_replacement_tracks(
+            &[td(1, 2, 180), td(1, 1, 240)],
+            &[td(1, 1, 240), td(1, 2, 180)],
+        )
+        .is_ok());
+
+        // Swapped durations on tagged tracks still fail.
+        let err = compare_replacement_tracks(
+            &[td(1, 1, 240), td(1, 2, 180)],
+            &[td(1, 1, 180), td(1, 2, 240)],
+        )
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::ReplacementDurationMismatch);
+
+        // Two duplicate existing copies of a 2-track album replaced by one new copy succeed.
+        assert!(compare_replacement_tracks(
+            &[
+                td(1, 1, 240),
+                td(1, 2, 180),
+                td(1, 1, 240),
+                td(1, 2, 180),
+            ],
+            &[td(1, 1, 240), td(1, 2, 180)],
+        )
+        .is_ok());
     }
 
     #[tokio::test]

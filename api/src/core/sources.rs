@@ -18,8 +18,8 @@ use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
 use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
-    DownloadQuery, DownloadableGroup, FileFacts, RejectedCandidateSummary, SearchPriority,
-    SearchResult, SearchSpec, SearchState, SearchStats,
+    DownloadQuery, DownloadableGroup, FileFacts, SearchPriority, SearchResult, SearchSpec,
+    SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
@@ -796,7 +796,9 @@ pub enum FindRefused {
 
 /// Records a job's search `run.id` for `ctx` across `usable` backends and runs it in its own task
 /// once it holds the turn, trying `usable.primary` first and falling back to `usable.last_resort`
-/// only when no primary group meets `min_score` (and `lossless_only` is false).
+/// only when no primary group passes `run.spec.filters`, `excluded`, and `failures` with score at
+/// least `min_score` (and `lossless_only` is false).
+#[allow(clippy::too_many_arguments)]
 pub async fn start_stored_multi(
     searches: &Arc<Searches>,
     ledger: &Ledger,
@@ -804,9 +806,14 @@ pub async fn start_stored_multi(
     usable: Usable,
     run: SearchRun,
     min_score: f64,
+    excluded: Vec<String>,
+    failures: HashMap<String, u32>,
 ) -> Result<JoinHandle<SearchProgress>, Failure> {
     let place = searches.enter(&run.id, ctx.id());
-    run_usable_in_line(place, searches, ledger, ctx, usable, run, min_score).await
+    run_usable_in_line(
+        place, searches, ledger, ctx, usable, run, min_score, excluded, failures,
+    )
+    .await
 }
 
 /// Runs a single tier of backends in parallel, registering each started search with `searches`
@@ -844,6 +851,7 @@ async fn search_tier_tracked(
     Found { groups, stops }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_usable_in_line(
     place: Place,
     searches: &Arc<Searches>,
@@ -852,6 +860,8 @@ async fn run_usable_in_line(
     usable: Usable,
     run: SearchRun,
     min_score: f64,
+    excluded: Vec<String>,
+    failures: HashMap<String, u32>,
 ) -> Result<JoinHandle<SearchProgress>, Failure> {
     let SearchRun { id, query, spec } = run;
     let total_backends = usable.primary.len() + usable.last_resort.len();
@@ -893,10 +903,11 @@ async fn run_usable_in_line(
         } else {
             search_tier_tracked(&searches, &id, &usable.primary, &search).await
         };
-        let has_qualifying_primary = found
-            .groups
+        let primary_view = view(&id, &found.groups, &spec.filters, &failures, &excluded);
+        let has_qualifying_primary = primary_view
+            .candidates
             .iter()
-            .any(|g| g.score >= min_score && !g.items.iter().any(|i| i.below_floor));
+            .any(|c| c.automatic() && c.group.score >= min_score);
         if !has_qualifying_primary
             && !usable.last_resort.is_empty()
             && !spec.filters.lossless_only
@@ -1184,7 +1195,6 @@ pub fn view(
             group,
         });
     }
-    let _ = std::marker::PhantomData::<RejectedCandidateSummary>;
     CandidateView {
         candidates,
         dropped_by_filter: dropped,

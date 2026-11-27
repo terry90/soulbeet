@@ -6,7 +6,10 @@ use reqwest::redirect::Policy;
 use serde::Deserialize;
 use shared::playlist_import::{ExternalPlaylist, ExternalTrack, PlaylistPlatform};
 
-use super::{PlaylistImportError, MAX_PLAYLIST_TRACKS};
+use super::{
+    pinned_https_redirect, read_bounded_bytes, PlaylistImportError, MAX_PLAYLIST_TRACKS,
+    MAX_RESPONSE_BYTES,
+};
 
 const SPOTIFY_BASE: &str = "https://open.spotify.com";
 const SPOTIFY_TRUNCATED_NOTE: &str = "Spotify public previews include up to 100 tracks.";
@@ -191,19 +194,9 @@ pub(crate) async fn fetch_playlist_from(
     enforce_spotify_host: bool,
 ) -> Result<ExternalPlaylist, PlaylistImportError> {
     let redirect = if enforce_spotify_host {
-        Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.error("too many redirects");
-            }
-            let url = attempt.url();
-            if url.scheme() == "https" && url.host_str() == Some("open.spotify.com") {
-                attempt.follow()
-            } else {
-                attempt.error("refused redirect outside open.spotify.com")
-            }
-        })
+        pinned_https_redirect("open.spotify.com")
     } else {
-        Policy::limited(3)
+        Policy::none()
     };
 
     let client = reqwest::Client::builder()
@@ -231,9 +224,8 @@ pub(crate) async fn fetch_playlist_from(
         )));
     }
 
-    let html = resp.text().await.map_err(|e| {
-        PlaylistImportError::Upstream(format!("Could not read Spotify response: {e}"))
-    })?;
+    let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?;
+    let html = String::from_utf8_lossy(&bytes);
     parse_embed_html(&html, source_url)
 }
 

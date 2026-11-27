@@ -265,6 +265,8 @@ impl SearchPacer {
                 && self.interactive_waiting.load(Ordering::Acquire) > 0
             {
                 let notified = self.turn_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if self.interactive_waiting.load(Ordering::Acquire) > 0 {
                     notified.await;
                     continue;
@@ -475,7 +477,89 @@ impl SoulseekClientBuilder {
     }
 }
 
+enum SingleAttempt<T> {
+    Ok(T),
+    RateLimited { retry_after_secs: u64, body: String },
+}
+
 impl SoulseekClient {
+    async fn send_once<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        body: Option<&B>,
+        attempt: u32,
+    ) -> Result<SingleAttempt<T>> {
+        const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
+
+        // Check circuit breaker before making request
+        if self.circuit_breaker.is_open().await {
+            warn!(
+                "Circuit breaker is open ({} consecutive failures), rejecting request to {}",
+                self.circuit_breaker.failure_count().await,
+                endpoint
+            );
+            return Err(SoulseekError::Api {
+                status: 503,
+                message: "Circuit breaker is open - slskd appears to be unavailable".to_string(),
+            });
+        }
+
+        let url = self.base_url.join(&format!("api/v0/{endpoint}"))?;
+        debug!("Request: {} {} (attempt {})", method, url, attempt + 1);
+        let mut request = self.client.request(method, url);
+        if let Some(key) = &self.api_key {
+            request = request.header("X-API-Key", key);
+        }
+        if let Some(b) = body {
+            request = request.json(b);
+        }
+
+        let response = match request.send().await {
+            Ok(resp) => {
+                self.circuit_breaker.record_success().await;
+                resp
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure().await;
+                // A failure never holds a request URL (design 10): the URL names the
+                // slskd host and the peer asked about.
+                let e = e.without_url();
+                if e.is_timeout() {
+                    warn!("Request to {} timed out", endpoint);
+                    return Err(SoulseekError::Api {
+                        status: 408,
+                        message: format!("Request timed out: {}", e),
+                    });
+                }
+                if e.is_connect() {
+                    warn!("Failed to connect to slskd at {}", endpoint);
+                    return Err(SoulseekError::Api {
+                        status: 503,
+                        message: format!("Connection failed: {}", e),
+                    });
+                }
+                return Err(e.into());
+            }
+        };
+
+        if response.status().as_u16() == 429 {
+            let retry_after_secs = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_RETRY_AFTER_SECS);
+            let body = response.text().await.unwrap_or_default();
+            return Ok(SingleAttempt::RateLimited {
+                retry_after_secs,
+                body,
+            });
+        }
+
+        Self::handle_response(response).await.map(SingleAttempt::Ok)
+    }
+
     async fn make_request<T: DeserializeOwned, B: Serialize + Clone>(
         &self,
         method: Method,
@@ -483,89 +567,37 @@ impl SoulseekClient {
         body: Option<B>,
     ) -> Result<T> {
         const MAX_429_RETRIES: u32 = 3;
-        const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
 
         for attempt in 0..=MAX_429_RETRIES {
-            // Check circuit breaker before making request
-            if self.circuit_breaker.is_open().await {
-                warn!(
-                    "Circuit breaker is open ({} consecutive failures), rejecting request to {}",
-                    self.circuit_breaker.failure_count().await,
-                    endpoint
-                );
-                return Err(SoulseekError::Api {
-                    status: 503,
-                    message: "Circuit breaker is open - slskd appears to be unavailable"
-                        .to_string(),
-                });
-            }
-
-            let url = self.base_url.join(&format!("api/v0/{endpoint}"))?;
-            debug!("Request: {} {} (attempt {})", method, url, attempt + 1);
-            let mut request = self.client.request(method.clone(), url);
-            if let Some(key) = &self.api_key {
-                request = request.header("X-API-Key", key);
-            }
-            if let Some(ref b) = body {
-                request = request.json(b);
-            }
-
-            let response = match request.send().await {
-                Ok(resp) => {
-                    self.circuit_breaker.record_success().await;
-                    resp
-                }
-                Err(e) => {
-                    self.circuit_breaker.record_failure().await;
-                    // A failure never holds a request URL (design 10): the URL names the
-                    // slskd host and the peer asked about.
-                    let e = e.without_url();
-                    if e.is_timeout() {
-                        warn!("Request to {} timed out", endpoint);
-                        return Err(SoulseekError::Api {
-                            status: 408,
-                            message: format!("Request timed out: {}", e),
-                        });
+            match self
+                .send_once(method.clone(), endpoint, body.as_ref(), attempt)
+                .await?
+            {
+                SingleAttempt::Ok(val) => return Ok(val),
+                SingleAttempt::RateLimited {
+                    retry_after_secs,
+                    body,
+                } => {
+                    if attempt < MAX_429_RETRIES {
+                        warn!(
+                            "Rate limited (429) on {}, waiting {}s before retry {}/{}",
+                            endpoint,
+                            retry_after_secs,
+                            attempt + 1,
+                            MAX_429_RETRIES
+                        );
+                        tokio::time::sleep(StdDuration::from_secs(retry_after_secs)).await;
+                        continue;
                     }
-                    if e.is_connect() {
-                        warn!("Failed to connect to slskd at {}", endpoint);
-                        return Err(SoulseekError::Api {
-                            status: 503,
-                            message: format!("Connection failed: {}", e),
-                        });
-                    }
-                    return Err(e.into());
+                    return Err(SoulseekError::Api {
+                        status: 429,
+                        message: format!(
+                            "Rate limited after {} retries: {}",
+                            MAX_429_RETRIES, body
+                        ),
+                    });
                 }
-            };
-
-            // Handle 429 rate limiting: wait and retry
-            if response.status().as_u16() == 429 {
-                if attempt < MAX_429_RETRIES {
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(DEFAULT_RETRY_AFTER_SECS);
-                    warn!(
-                        "Rate limited (429) on {}, waiting {}s before retry {}/{}",
-                        endpoint,
-                        retry_after,
-                        attempt + 1,
-                        MAX_429_RETRIES
-                    );
-                    tokio::time::sleep(StdDuration::from_secs(retry_after)).await;
-                    continue;
-                }
-                // Exhausted 429 retries
-                let text = response.text().await.unwrap_or_default();
-                return Err(SoulseekError::Api {
-                    status: 429,
-                    message: format!("Rate limited after {} retries: {}", MAX_429_RETRIES, text),
-                });
             }
-
-            return Self::handle_response(response).await;
         }
 
         // Unreachable, but required by the compiler
@@ -634,8 +666,7 @@ impl SoulseekClient {
             query,
             timeout.num_milliseconds()
         );
-        let permit = self.search_pacer.acquire(priority).await;
-        let search_id = self.post_search(permit, &query).await?;
+        let search_id = self.post_search(priority, &query).await?;
 
         self.active_searches.lock().await.insert(
             search_id.clone(),
@@ -663,26 +694,83 @@ impl SoulseekClient {
         Ok(search_id)
     }
 
-    /// Starts one slskd search for `text` while holding `permit` so concurrent POSTs
-    /// never race slskd's internal SemaphoreSlim(1, 1). Records quota ONLY after
-    /// `POST /api/v0/searches` succeeds.
-    async fn post_search(&self, permit: SearchPermit<'_>, text: &str) -> Result<String> {
+    /// Starts one slskd search for `text` while holding a `SearchPermit` only
+    /// across each individual HTTP POST attempt so concurrent POSTs never race
+    /// slskd's internal SemaphoreSlim(1, 1) and HTTP 429 `Retry-After` sleeps
+    /// never stall interactive callers behind `post_gate`. Records quota ONLY
+    /// after `POST /api/v0/searches` succeeds.
+    async fn post_search(&self, priority: SearchPriority, text: &str) -> Result<String> {
+        self.post_search_with_initial_permit(None, priority, text)
+            .await
+    }
+
+    async fn post_search_with_initial_permit(
+        &self,
+        mut initial_permit: Option<SearchPermit<'_>>,
+        priority: SearchPriority,
+        text: &str,
+    ) -> Result<String> {
+        const MAX_429_RETRIES: u32 = 3;
+        const MAX_RETRY_AFTER_SECS: u64 = 60;
         #[derive(Deserialize)]
         struct SearchId {
             id: String,
         }
-        let started: SearchId = self
-            .make_request(Method::POST, "searches", Some(&SearchRequest::new(text)))
-            .await
-            .map_err(|e| match e {
-                SoulseekError::Api {
-                    status: 400,
-                    message,
-                } => search_refused(message),
-                e => e,
-            })?;
-        permit.record_accepted();
-        Ok(started.id)
+        let payload = SearchRequest::new(text);
+
+        for attempt in 0..=MAX_429_RETRIES {
+            let permit = match initial_permit.take() {
+                Some(p) => p,
+                None => self.search_pacer.acquire(priority).await,
+            };
+            let outcome: SingleAttempt<SearchId> = self
+                .send_once(Method::POST, "searches", Some(&payload), attempt)
+                .await
+                .map_err(|e| match e {
+                    SoulseekError::Api {
+                        status: 400,
+                        message,
+                    } => search_refused(message),
+                    e => e,
+                })?;
+            match outcome {
+                SingleAttempt::Ok(started) => {
+                    permit.record_accepted();
+                    return Ok(started.id);
+                }
+                SingleAttempt::RateLimited {
+                    retry_after_secs,
+                    body,
+                } => {
+                    // Release `post_gate` BEFORE sleeping so a Background 429 never
+                    // stalls Interactive searches.
+                    drop(permit);
+                    if attempt < MAX_429_RETRIES {
+                        let sleep_secs = retry_after_secs.min(MAX_RETRY_AFTER_SECS);
+                        warn!(
+                            "Rate limited (429) on searches, waiting {}s before retry {}/{}",
+                            sleep_secs,
+                            attempt + 1,
+                            MAX_429_RETRIES
+                        );
+                        tokio::time::sleep(StdDuration::from_secs(sleep_secs)).await;
+                        continue;
+                    }
+                    return Err(SoulseekError::Api {
+                        status: 429,
+                        message: format!(
+                            "Rate limited after {} retries: {}",
+                            MAX_429_RETRIES, body
+                        ),
+                    });
+                }
+            }
+        }
+
+        Err(SoulseekError::Api {
+            status: 429,
+            message: "Rate limited: max retries exceeded".to_string(),
+        })
     }
 
     /// One poll of `search_id`, holding for up to 10 seconds while the search
@@ -878,7 +966,10 @@ impl SoulseekClient {
             return false;
         }
         info!("Search {search_id} drew no response, sending it again as '{text}'");
-        let next = match self.post_search(permit, &text).await {
+        let next = match self
+            .post_search_with_initial_permit(Some(permit), context.priority, &text)
+            .await
+        {
             Ok(next) => next,
             Err(e) => {
                 warn!("Search {search_id} could not be sent again as '{text}': {e}");
@@ -3177,6 +3268,27 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SoulseekError::Api { status: 500, .. }));
         assert_eq!(client.search_pacer.total_recorded(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn search_pacer_background_wakes_without_deadlock_after_interactive_finishes() {
+        // Repeatedly race Interactive acquire/drop against Background acquire across
+        // worker threads so a lost Notify wakeup would hang immediately.
+        let pacer = Arc::new(SearchPacer::new(1000, StdDuration::from_secs(1)));
+        for _ in 0..100 {
+            let interactive_permit = pacer.acquire(SearchPriority::Interactive).await;
+            let bg_pacer = Arc::clone(&pacer);
+            let bg = tokio::spawn(async move {
+                let permit = bg_pacer.acquire(SearchPriority::Background).await;
+                drop(permit);
+            });
+            tokio::task::yield_now().await;
+            drop(interactive_permit);
+            tokio::time::timeout(StdDuration::from_secs(2), bg)
+                .await
+                .expect("background task stalled after interactive permit dropped")
+                .unwrap();
+        }
     }
 
     /// slskd refused the retry text: the search ends as the texts that ran found it.

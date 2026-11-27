@@ -24,7 +24,8 @@ use tracing::{debug, info, warn};
 
 use crate::auth::{Role, UserCtx};
 use crate::core::acquire::{
-    enqueue_and_watch, numbered, prepare_target, Acquisition, NewBatch, AUTO_SELECT_SCORE_THRESHOLD,
+    enqueue_and_watch_with_durations, numbered, prepare_target, Acquisition, NewBatch,
+    AUTO_SELECT_SCORE_THRESHOLD,
 };
 use crate::core::database_failure;
 use crate::core::folders;
@@ -840,6 +841,15 @@ pub async fn process_next_upgrade_in(
         return Err(failure);
     }
 
+    let original_duration_s = upgrade
+        .original_duration_s
+        .and_then(|s| u32::try_from(s).ok())
+        .filter(|&s| s > 0);
+    let expected_durations: std::collections::HashMap<u32, u32> = original_duration_s
+        .into_iter()
+        .flat_map(|dur| picked_items.iter().map(move |(slot, _)| (*slot, dur)))
+        .collect();
+
     let fresh = NewBatch {
         batch_id,
         label: format!("Archival FLAC: {} - {}", upgrade.artist, upgrade.title),
@@ -856,7 +866,16 @@ pub async fn process_next_upgrade_in(
         max_sources: MAX_SOURCES_PER_TRACK,
     };
 
-    match enqueue_and_watch(ledger, &ctx, Arc::clone(&backend), fresh, acquisition).await {
+    match enqueue_and_watch_with_durations(
+        ledger,
+        &ctx,
+        Arc::clone(&backend),
+        fresh,
+        acquisition,
+        expected_durations,
+    )
+    .await
+    {
         Ok(results) if results.iter().any(|d| d.status == EnqueueStatus::Enqueued) => {
             let _ = ArchivalUpgradeRow::mark_status_in(
                 db,

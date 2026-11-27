@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use shared::playlist_import::{
-    CommitPlaylistImportRequest, CommitPlaylistImportResponse, PlaylistImportPreview,
+    CommitPlaylistImportRequest, CommitPlaylistImportResponse, ImportJobSummary,
+    PlaylistImportPreview,
 };
 
 #[cfg(feature = "server")]
@@ -30,6 +31,35 @@ pub async fn commit_playlist_import(
         &crate::core::index::ServerNavidrome,
         &auth.0,
         req,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+/// Lists the caller's active and recent (last 24h) playlist import jobs (`BatchOrigin::Import`),
+/// including selectable source candidates for jobs waiting in `needs_source_choice`.
+#[get("/api/playlists/import/jobs", auth: AuthSession)]
+pub async fn list_import_jobs() -> Result<Vec<ImportJobSummary>, ServerFnError> {
+    crate::core::playlists::import::list_import_jobs(
+        &crate::core::jobs::runner::ACQUIRE,
+        &auth.0,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+/// Resolves a playlist import job waiting for source choice: downloads the chosen candidate
+/// (`Some(candidate_index)`) or skips/cancels the job (`None`).
+#[post("/api/playlists/import/jobs/resolve", auth: AuthSession)]
+pub async fn resolve_import_job_choice(
+    job_id: String,
+    candidate_index: Option<usize>,
+) -> Result<(), ServerFnError> {
+    crate::core::playlists::import::resolve_import_job_choice(
+        &crate::core::jobs::runner::ACQUIRE,
+        &auth.0,
+        &job_id,
+        candidate_index,
     )
     .await
     .map_err(failure_error)

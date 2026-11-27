@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use reqwest::redirect::Policy;
 use shared::recommendation::TimePeriod;
 
-use crate::polite::{Pace, PoliteClient, RemoteError};
+use crate::playlist_import::{
+    pinned_https_redirect, read_bounded_bytes, MAX_RESPONSE_BYTES,
+};
+use crate::polite::{HostGate, Pace, PoliteClient, RemoteError, USER_AGENT};
 
 use super::models::*;
 
@@ -11,12 +16,35 @@ use super::models::*;
 /// every request when the user saved one.
 pub struct ListenBrainzClient {
     http: PoliteClient,
+    base_url: String,
+    pace: Pace,
+    token: Option<String>,
 }
 
 impl ListenBrainzClient {
     pub fn new(base_url: &str, token: Option<String>, pace: Pace) -> Result<Self, RemoteError> {
-        let http = PoliteClient::new(base_url, "ListenBrainz", pace)?.with_token(token);
-        Ok(Self { http })
+        let http = PoliteClient::new(base_url, "ListenBrainz", pace)?.with_token(token.clone());
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            pace,
+            token,
+        })
+    }
+
+    pub fn without_redirects(
+        base_url: &str,
+        token: Option<String>,
+        pace: Pace,
+    ) -> Result<Self, RemoteError> {
+        let http = PoliteClient::without_redirects(base_url, "ListenBrainz", pace)?
+            .with_token(token.clone());
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            pace,
+            token,
+        })
     }
 
     pub fn has_token(&self) -> bool {
@@ -164,18 +192,136 @@ impl ListenBrainzClient {
     }
 
     /// Reads a JSPF playlist with its title, annotation, and full track metadata
-    /// (including album, duration, and recording MBID).
+    /// (including album, duration, and validated recording MBID).
     pub async fn playlist_full(
         &self,
         playlist_mbid: &str,
     ) -> Result<Option<FullPlaylist>, RemoteError> {
-        let path = format!("/1/playlist/{playlist_mbid}");
-        let Some(page) = self
-            .http
-            .get::<PlaylistEnvelope<JspfPlaylist>>(&path)
-            .await?
-        else {
-            return Ok(None);
+        self.playlist_full_bounded(playlist_mbid, false).await
+    }
+
+    /// Reads a JSPF playlist with strict response size bounds and redirect pinning
+    /// (restricted to `https://api.listenbrainz.org` on the default port when `enforce_lb_host`
+    /// is true, or blocking all redirects otherwise).
+    pub(crate) async fn playlist_full_bounded(
+        &self,
+        playlist_mbid: &str,
+        enforce_lb_host: bool,
+    ) -> Result<Option<FullPlaylist>, RemoteError> {
+        let redirect = if enforce_lb_host {
+            pinned_https_redirect("api.listenbrainz.org")
+        } else {
+            Policy::none()
+        };
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(self.pace.timeout)
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(redirect)
+            .build()
+            .map_err(|e| RemoteError::Unavailable {
+                service: "ListenBrainz",
+                detail: e.without_url().to_string(),
+            })?;
+        let gate = HostGate::of(&self.base_url).map_err(|detail| RemoteError::Unavailable {
+            service: "ListenBrainz",
+            detail,
+        })?;
+        let url = format!("{}/1/playlist/{playlist_mbid}", self.base_url);
+        let mut last = RemoteError::Unavailable {
+            service: "ListenBrainz",
+            detail: String::new(),
+        };
+        let mut page_opt: Option<PlaylistEnvelope<JspfPlaylist>> = None;
+        for attempt in 0..=self.pace.retries {
+            let wait = self.pace.backoff * 2u32.pow(attempt);
+            gate.wait_for_turn(self.pace.min_interval).await;
+            let mut req = http.get(&url);
+            if let Some(ref token) = self.token {
+                req = req.header("Authorization", format!("Token {token}"));
+            }
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    last = RemoteError::Unavailable {
+                        service: "ListenBrainz",
+                        detail: e.without_url().to_string(),
+                    };
+                    if attempt < self.pace.retries {
+                        tokio::time::sleep(wait).await;
+                    }
+                    continue;
+                }
+            };
+            let status = resp.status();
+            let bytes = match read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Err(RemoteError::Unreadable {
+                        service: "ListenBrainz",
+                        detail: e.to_string(),
+                    });
+                }
+            };
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                gate.hold(wait);
+                last = RemoteError::RateLimited {
+                    service: "ListenBrainz",
+                };
+                if attempt < self.pace.retries {
+                    tokio::time::sleep(wait).await;
+                }
+                continue;
+            }
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                gate.hold(wait);
+            }
+            if status.is_server_error() {
+                last = RemoteError::Unavailable {
+                    service: "ListenBrainz",
+                    detail: format!("HTTP {}", status.as_u16()),
+                };
+                if attempt < self.pace.retries {
+                    tokio::time::sleep(wait).await;
+                }
+                continue;
+            }
+            if status == reqwest::StatusCode::NO_CONTENT {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(RemoteError::Status {
+                    service: "ListenBrainz",
+                    status: status.as_u16(),
+                    body: String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect(),
+                });
+            }
+            match serde_json::from_slice::<PlaylistEnvelope<JspfPlaylist>>(&bytes) {
+                Ok(parsed) => {
+                    page_opt = Some(parsed);
+                    break;
+                }
+                Err(_) if bytes.trim_ascii_start().first() == Some(&b'<') => {
+                    last = RemoteError::Challenged {
+                        service: "ListenBrainz",
+                    };
+                    if attempt < self.pace.retries {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                Err(e) => {
+                    return Err(RemoteError::Unreadable {
+                        service: "ListenBrainz",
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+        let Some(page) = page_opt else {
+            return Err(last);
         };
         let p = page.playlist;
         let title = p
@@ -204,18 +350,12 @@ impl ListenBrainzClient {
                     .filter(|&ms| ms > 0)
                     .and_then(|ms| u32::try_from(ms / 1000).ok())
                     .filter(|&s| s > 0);
-                let recording_mbid = t
-                    .identifier
-                    .first()
-                    .map(|u| last_segment(u).trim().to_string())
-                    .filter(|id| !id.is_empty());
+                let recording_mbid = extract_recording_mbid(&t.identifier);
                 let artist_mbid = t
                     .extension
                     .as_ref()
                     .and_then(|ext| ext.musicbrainz.as_ref())
-                    .and_then(|mb| mb.artist_identifiers.first())
-                    .map(|u| last_segment(u).trim().to_string())
-                    .filter(|id| !id.is_empty());
+                    .and_then(|mb| extract_artist_mbid(&mb.artist_identifiers));
                 Some(FullPlaylistTrack {
                     title,
                     creator,
@@ -372,6 +512,46 @@ fn range(period: TimePeriod) -> &'static str {
 /// The MBID at the end of a MusicBrainz or ListenBrainz URL.
 fn last_segment(url: &str) -> &str {
     url.rsplit_once('/').map_or(url, |(_, id)| id)
+}
+
+/// Extracts a validated MusicBrainz entity UUID from a `musicbrainz.org/{entity}/{uuid}` URL
+/// or a bare UUID string. Non-MusicBrainz URLs (e.g., Spotify links) and non-UUIDs are ignored.
+fn extract_mbid_for_entity(identifiers: &[String], entity: &str) -> Option<String> {
+    for raw in identifiers {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            let is_mb = parsed.host_str().is_some_and(|h| {
+                let lower = h.to_ascii_lowercase();
+                lower == "musicbrainz.org" || lower.ends_with(".musicbrainz.org")
+            });
+            if !is_mb {
+                continue;
+            }
+            let segs: Vec<&str> = parsed
+                .path_segments()
+                .map(|s| s.filter(|p| !p.is_empty()).collect())
+                .unwrap_or_default();
+            if segs.len() == 2 && segs[0] == entity {
+                if let Ok(uuid) = uuid::Uuid::parse_str(segs[1]) {
+                    return Some(uuid.hyphenated().to_string());
+                }
+            }
+        } else if let Ok(uuid) = uuid::Uuid::parse_str(trimmed) {
+            return Some(uuid.hyphenated().to_string());
+        }
+    }
+    None
+}
+
+fn extract_recording_mbid(identifiers: &[String]) -> Option<String> {
+    extract_mbid_for_entity(identifiers, "recording")
+}
+
+fn extract_artist_mbid(identifiers: &[String]) -> Option<String> {
+    extract_mbid_for_entity(identifiers, "artist")
 }
 
 /// Form encoding for tags in a query string.
