@@ -13,8 +13,8 @@ use ui::{
     format_discovery_badge, format_mix_subtitle, format_mix_title, format_mix_window_badge,
     friendly_error, subsonic_cover_art_url, use_player, IconCheck, IconHeart, IconLoader,
     IconMusic, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSettings, IconSparkles,
-    IconThumbsDown, PlayerTrack, SeasonalHeroCard, StarStrip, StarStripSize, TasteDnaBar,
-    TrackRow, TrackRowState,
+    IconThumbsDown, MixSleeveShelves, PlayerTrack, SeasonalHeroCard, StarStrip, StarStripSize,
+    TasteDnaBar, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -591,6 +591,7 @@ pub fn DiscoverPage() -> Element {
                             title: format_mix_title(&pack),
                             subtitle: format_mix_subtitle(&pack),
                             window_badge: format_mix_window_badge(&pack),
+                            mix_slug: Some(pack.slug.clone()),
                             track_count: pack.track_count,
                             local_ratio,
                             local_label: pack_country,
@@ -991,48 +992,12 @@ pub fn DiscoverPage() -> Element {
                 }
             }
 
-            // 4. Contextual & Rolling Mixes Shelf
+            // 4. Contextual & Collection Mix Sleeves
             if !other_mixes.is_empty() {
-                section { class: "space-y-3",
-                    h2 { class: "text-[18px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                        "Curated Mixes"
-                    }
-                    div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
-                        for mix in other_mixes.iter() {
-                            {
-                                let slug = mix.slug.clone();
-                                let badge = format_mix_window_badge(mix)
-                                    .unwrap_or_else(|| "MIX".to_string());
-                                rsx! {
-                                    button {
-                                        key: "disc-mix-{mix.slug}",
-                                        r#type: "button",
-                                        class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default p-4 text-left transition-colors cursor-pointer flex flex-col justify-between gap-3",
-                                        onclick: move |_| studio.play_contextual_mix(auth, player, slug.clone()),
-                                        div { class: "space-y-1.5",
-                                            div { class: "flex items-center justify-between gap-2",
-                                                span { class: "px-2 py-0.5 rounded-full bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-tertiary",
-                                                    "{badge}"
-                                                }
-                                                span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center group-hover:scale-105 transition-transform",
-                                                    IconPlay { size: 13, filled: true }
-                                                }
-                                            }
-                                            h3 { class: "text-[16px] font-semibold text-beet-text-primary",
-                                                "{format_mix_title(mix)}"
-                                            }
-                                            p { class: "text-[13px] text-beet-text-secondary line-clamp-2",
-                                                "{format_mix_subtitle(mix)}"
-                                            }
-                                        }
-                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                            "{mix.track_count} TRACKS"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                MixSleeveShelves {
+                    mixes: other_mixes,
+                    id_prefix: "disc".to_string(),
+                    on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
                 }
             }
         }

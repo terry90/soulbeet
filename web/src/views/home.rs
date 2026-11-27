@@ -5,8 +5,8 @@ use dioxus::prelude::*;
 use shared::recommendation::{ContextualMixKind, CultureSteering};
 use ui::{
     format_mix_subtitle, format_mix_title, format_mix_window_badge, use_player, IconArrowRight,
-    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, PlaylistCategory,
-    SeasonalHeroCard, TrackRow, TrackRowState,
+    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, MixSleeveCard,
+    MixSleeveLayout, PlaylistCategory, SeasonalHeroCard, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -264,6 +264,7 @@ pub fn HomePage() -> Element {
                             title: format_mix_title(&pack),
                             subtitle: format_mix_subtitle(&pack),
                             window_badge: format_mix_window_badge(&pack),
+                            mix_slug: Some(pack.slug.clone()),
                             track_count: pack.track_count,
                             local_ratio,
                             local_label: pack_country,
@@ -362,44 +363,15 @@ pub fn HomePage() -> Element {
                         }
                     }
 
-                    div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
-                        for mix in moment_and_rolling.iter() {
-                            {
-                                let slug = mix.slug.clone();
-                                let title = format_mix_title(mix);
-                                let subtitle = format_mix_subtitle(mix);
-                                let badge = format_mix_window_badge(mix)
-                                    .unwrap_or_else(|| "MIX".to_string());
-                                rsx! {
-                                    button {
-                                        key: "home-mix-{mix.slug}",
-                                        r#type: "button",
-                                        class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default p-4 text-left transition-colors cursor-pointer flex flex-col justify-between gap-3",
-                                        onclick: move |_| studio.play_contextual_mix(auth, player, slug.clone()),
-                                        div { class: "space-y-2",
-                                            div { class: "flex items-center justify-between gap-2",
-                                                span { class: "px-2 py-0.5 rounded-full bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-tertiary",
-                                                    "{badge}"
-                                                }
-                                                span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center group-hover:scale-105 transition-transform",
-                                                    IconPlay { size: 13, filled: true }
-                                                }
-                                            }
-                                            h3 { class: "text-[16px] font-semibold text-beet-text-primary leading-snug",
-                                                "{title}"
-                                            }
-                                            p { class: "text-[13px] text-beet-text-secondary line-clamp-2",
-                                                "{subtitle}"
-                                            }
-                                        }
-                                        div { class: "flex items-center gap-2 tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                            span { "{mix.track_count} TRACKS" }
-                                            if mix.owned_pct > 0 {
-                                                span { "· {mix.owned_pct}% LIBRARY" }
-                                            }
-                                        }
-                                    }
-                                }
+                    div { class: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4",
+                        for (idx, mix) in moment_and_rolling.into_iter().enumerate() {
+                            MixSleeveCard {
+                                key: "home-mix-{idx}-{mix.slug}",
+                                mix,
+                                layout: MixSleeveLayout::Wide,
+                                id_prefix: format!("home-{idx}"),
+                                show_owned_pct: true,
+                                on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
                             }
                         }
                     }

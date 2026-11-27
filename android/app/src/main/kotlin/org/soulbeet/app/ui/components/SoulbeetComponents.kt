@@ -665,29 +665,47 @@ fun SeasonalHeroCard(
     val localPct = mix.localPct
     val intlPct = localPct?.let { (100 - it).coerceIn(0, 100) }
 
+    val sleeveSpec = remember(mix.slug) { mixSleeveSpecFor(mix.slug) }
+
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = colors.surface,
         shape = SoulbeetShapes.lg,
-        border = BorderStroke(1.dp, colors.borderDefault),
+        border = BorderStroke(1.dp, sleeveSpec.borderColor),
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    Brush.radialGradient(
-                        colors = listOf(
-                            colors.accentGlow.copy(alpha = 0.16f),
-                            colors.surfaceLow.copy(alpha = 0.6f),
-                            colors.surface,
+        Box(modifier = Modifier.fillMaxWidth()) {
+            MixSleeveBackdrop(
+                slug = mix.slug,
+                modifier = Modifier.matchParentSize(),
+            )
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            colorStops = arrayOf(
+                                0.0f to colors.canvas.copy(alpha = if (colors.isOled) 0.94f else 0.88f),
+                                0.56f to colors.surface.copy(alpha = if (colors.isOled) 0.78f else 0.68f),
+                                1.0f to colors.surfaceLow.copy(alpha = if (colors.isOled) 0.54f else 0.42f),
+                            ),
                         ),
-                        center = Offset(720f, 80f),
-                        radius = 700f,
+                    )
+                    .background(
+                        Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0.0f to Color.Transparent,
+                                0.48f to colors.canvas.copy(alpha = if (colors.isOled) 0.24f else 0.16f),
+                                1.0f to colors.canvas.copy(alpha = if (colors.isOled) 0.52f else 0.38f),
+                            ),
+                        ),
                     ),
-                )
-                .padding(20.dp),
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
