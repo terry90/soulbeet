@@ -1145,7 +1145,7 @@ pub fn SearchPage() -> Element {
                                                                 let current_folders = folders.read().clone();
                                                                 let current_folder_id = selected_folder_id();
 
-                                                                let key = acquire_key(&track.artist, &track.title);
+                                                                let key = acquire_key(track.mbid.as_deref(), &track.artist, &track.title);
                                                                 let acq_entry = acquire_map.get(&key).cloned();
                                                                 let acquiring_stage = acq_entry.as_ref().map(|e| e.badge.clone());
                                                                 let manual_choice = acq_entry.and_then(|e| e.manual_choice);
@@ -1160,6 +1160,7 @@ pub fn SearchPage() -> Element {
                                                                     folder_id: current_folder_id.clone(),
                                                                     prefer_fast: true,
                                                                 };
+                                                                let mbid_for_pick = track.mbid.clone();
                                                                 let artist_for_pick = track.artist.clone();
                                                                 let title_for_pick = track.title.clone();
 
@@ -1174,6 +1175,7 @@ pub fn SearchPage() -> Element {
                                                                             on_pick_acquire_source: move |_| {
                                                                                 if let Some((search_id, groups)) = manual_choice.clone() {
                                                                                     studio.manual_choice_modal.set(Some(ManualChoiceModalState {
+                                                                                        recording_mbid: mbid_for_pick.clone(),
                                                                                         artist: artist_for_pick.clone(),
                                                                                         title: title_for_pick.clone(),
                                                                                         search_id,

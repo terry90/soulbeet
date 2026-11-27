@@ -580,6 +580,7 @@ pub(crate) async fn reconcile_discovery_song_ids_in(
 /// Lazily fetches the caller's Navidrome library ONLY when at least one pending track in `tracks`
 /// is missing its `song_id`, then runs `reconcile_discovery_song_ids_in`. Gracefully skips when
 /// Navidrome is unlinked or unreachable so listing endpoints never fail.
+#[cfg(test)]
 pub(crate) async fn maybe_reconcile_discovery_song_ids_in(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,

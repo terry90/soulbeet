@@ -125,7 +125,12 @@ pub fn ActivityPage() -> Element {
         });
     });
 
-    let acquire_items: Vec<_> = studio.acquire_states.read().values().cloned().collect();
+    let acquire_items: Vec<(String, _)> = studio
+        .acquire_states
+        .read()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let import_job_list = import_jobs.read().clone();
     let downloads_count = studio.downloads.read().len();
     let in_flight_dl = studio
@@ -168,25 +173,26 @@ pub fn ActivityPage() -> Element {
                     }
                 } else {
                     div { class: "space-y-1", role: "list",
-                        for item in acquire_items.iter() {
+                        for (map_key, item) in acquire_items.iter() {
                             {
                                 let retry_req = AcquireAndPlayRequest {
                                     artist: item.artist.clone(),
                                     title: item.title.clone(),
                                     album: None,
-                                    recording_mbid: None,
+                                    recording_mbid: item.recording_mbid.clone(),
                                     release_mbid: None,
                                     duration_s: None,
                                     folder_id: None,
                                     prefer_fast: true,
                                 };
                                 let manual = item.manual_choice.clone();
+                                let mbid = item.recording_mbid.clone();
                                 let a = item.artist.clone();
                                 let t = item.title.clone();
                                 let failed = matches!(item.badge, AcquireStageBadge::Failed { .. });
                                 rsx! {
                                     div {
-                                        key: "act-acq-{item.artist}-{item.title}",
+                                        key: "act-acq-{map_key}",
                                         class: "space-y-1",
                                         TrackRow {
                                             title: item.title.clone(),
@@ -200,6 +206,7 @@ pub fn ActivityPage() -> Element {
                                             on_pick_source: move |_| {
                                                 if let Some((search_id, groups)) = manual.clone() {
                                                     studio.manual_choice_modal.set(Some(ManualChoiceModalState {
+                                                        recording_mbid: mbid.clone(),
                                                         artist: a.clone(),
                                                         title: t.clone(),
                                                         search_id,
