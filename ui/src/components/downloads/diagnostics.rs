@@ -32,6 +32,7 @@ fn stage_label(stage: Stage) -> &'static str {
         Stage::Enqueue => "Enqueue",
         Stage::Transfer => "Transfer",
         Stage::FileLookup => "File lookup",
+        Stage::Verify => "Verify",
         Stage::Import => "Import",
         Stage::Index => "Navidrome",
         Stage::Delete => "Delete",

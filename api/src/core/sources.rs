@@ -18,9 +18,8 @@ use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
 use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
-    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, RejectedCandidateSummary,
-    SearchPriority, SearchResult,
-    SearchSpec, SearchState, SearchStats,
+    DownloadQuery, DownloadableGroup, FileFacts, RejectedCandidateSummary, SearchPriority,
+    SearchResult, SearchSpec, SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
@@ -887,6 +886,7 @@ async fn run_usable_in_line(
             tracks: query.tracks,
             text: spec.text,
             keep_below_floor: spec.keep_below_floor,
+            priority: SearchPriority::Background,
         };
         let mut found = if usable.primary.is_empty() {
             Found::default()
@@ -905,14 +905,7 @@ async fn run_usable_in_line(
             let last = search_tier_tracked(&searches, &id, &usable.last_resort, &search).await;
             found = found.then(last);
         }
-        let stats = if found.stops.len() == 1 {
-            match &found.stops[0] {
-                SearchStop::Finished { stats } => Some(stats.clone()),
-                SearchStop::TimedOut | SearchStop::Failed(_) => None,
-            }
-        } else {
-            None
-        };
+        let stats = found.stats();
         let outcome = if found.groups.is_empty() {
             Err((found.failure(), stats))
         } else {
