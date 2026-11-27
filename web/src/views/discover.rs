@@ -18,7 +18,7 @@ use ui::{
 };
 
 use crate::auth::use_auth;
-use crate::web_player::use_studio;
+use crate::web_player::{local_browser_hour, local_browser_weekday, use_studio};
 use crate::Route;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,16 +181,11 @@ pub fn DiscoverPage() -> Element {
                     .unwrap_or(0);
                 discovery_cfg.restart();
                 spawn(async move {
-                    let local_hour = Some(
-                        chrono::Local::now()
-                            .format("%H")
-                            .to_string()
-                            .parse::<u8>()
-                            .unwrap_or(12),
-                    );
+                    let local_hour = local_browser_hour();
+                    let local_weekday = local_browser_weekday();
                     let (triage_res, mixes_res) = futures::future::join(
                         auth.call(api::list_triage_queue()),
-                        auth.call(api::list_active_contextual_mixes(local_hour)),
+                        auth.call(api::list_active_contextual_mixes(local_hour, local_weekday)),
                     )
                     .await;
                     if let Ok(triage) = triage_res {
@@ -277,9 +272,13 @@ pub fn DiscoverPage() -> Element {
         .iter()
         .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
+    let hero_slug = seasonal.as_ref().map(|h| h.slug.as_str());
     let other_mixes: Vec<_> = mixes
         .iter()
-        .filter(|m| m.kind != ContextualMixKind::Seasonal)
+        .filter(|m| {
+            Some(m.slug.as_str()) != hero_slug
+                && !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0)
+        })
         .cloned()
         .collect();
 
@@ -321,15 +320,10 @@ pub fn DiscoverPage() -> Element {
                     studio.culture_profile.set(updated);
                     editing_culture.set(false);
                     studio.show_toast("Taste DNA updated");
-                    let local_hour = Some(
-                        chrono::Local::now()
-                            .format("%H")
-                            .to_string()
-                            .parse::<u8>()
-                            .unwrap_or(12),
-                    );
+                    let local_hour = local_browser_hour();
+                    let local_weekday = local_browser_weekday();
                     if let Ok(refreshed) = auth
-                        .call(api::list_active_contextual_mixes(local_hour))
+                        .call(api::list_active_contextual_mixes(local_hour, local_weekday))
                         .await
                     {
                         studio.contextual_mixes.set(refreshed);
@@ -884,7 +878,7 @@ pub fn DiscoverPage() -> Element {
             if !other_mixes.is_empty() {
                 section { class: "space-y-3",
                     h2 { class: "text-[18px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                        "Moment & Rolling Mixes"
+                        "Curated Mixes"
                     }
                     div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
                         for mix in other_mixes.iter() {

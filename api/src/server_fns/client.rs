@@ -143,6 +143,7 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
             &auth.0,
             chrono::Utc::now(),
             None,
+            None,
         );
         match tokio::time::timeout(std::time::Duration::from_secs(3), mixes_fut).await {
             Ok(Ok(mixes)) => mixes

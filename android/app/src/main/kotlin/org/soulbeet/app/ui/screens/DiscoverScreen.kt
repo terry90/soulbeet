@@ -123,7 +123,7 @@ fun DiscoverScreen(
             item(key = "rolling_mixes") {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        text = "Rolling & Moment Mixes",
+                        text = "Curated Mixes",
                         style = type.titleMd,
                         color = colors.textPrimary,
                     )
@@ -166,8 +166,19 @@ fun DiscoverScreen(
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
                                     )
+                                    val metaLine = if (mix.kind == "seasonal") {
+                                        val cc = mix.countryCode?.takeIf { it.isNotBlank() }
+                                        val localPct = mix.localPct
+                                        if (cc != null && localPct != null) {
+                                            "${mix.trackCount} tracks · $localPct% $cc"
+                                        } else {
+                                            "${mix.trackCount} tracks · Seasonal"
+                                        }
+                                    } else {
+                                        "${mix.trackCount} tracks · ${mix.ownedPct}% library"
+                                    }
                                     Text(
-                                        text = "${mix.trackCount} tracks · ${mix.ownedPct}% library",
+                                        text = metaLine,
                                         style = type.monoXs,
                                         color = colors.textMuted,
                                     )

@@ -896,6 +896,30 @@ impl CalendarWindow {
             format!("{xy:04}-{xm:02}-{xd:02}"),
         ))
     }
+
+    /// Inclusive length of this calendar window in days (non-leap year reference).
+    /// Used to prioritize narrow holiday/event windows (e.g. Valentine's, Halloween, Midsummer)
+    /// ahead of broad multi-month seasonal mixes in hero slots.
+    pub fn span_days(&self) -> u32 {
+        if !self.is_valid() {
+            return 365;
+        }
+        let start = day_of_year(u32::from(self.start_month), u32::from(self.start_day));
+        let end = day_of_year(u32::from(self.end_month), u32::from(self.end_day));
+        if start <= end {
+            end - start + 1
+        } else {
+            (365 - start + 1) + end
+        }
+    }
+}
+
+fn day_of_year(month: u32, day: u32) -> u32 {
+    let mut total = 0u32;
+    for m in 1..month {
+        total += days_in_month(2026, m);
+    }
+    total + day.min(days_in_month(2026, month))
 }
 
 fn is_leap_year(year: i32) -> bool {
@@ -961,6 +985,49 @@ impl HourWindow {
     }
 }
 
+/// Ordering mode for library tracks inside a contextual/smart mix before daily tier jitter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MixSortOrder {
+    #[default]
+    RatingThenPlays,
+    OldestPlayedFirst,
+    NewestAddedFirst,
+}
+
+/// Optional structured selection filters for smart/library-rule contextual mixes
+/// (e.g. Forgotten Gems, Fresh Arrivals, Decade Capsules).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MixSelectionRules {
+    /// Inclusive release year range (e.g. `(1980, 1989)` for 80s Wave).
+    #[serde(default)]
+    pub year_range: Option<(u16, u16)>,
+    /// Minimum user rating (1..=5) for favorite qualification.
+    /// When `min_rating` and/or `min_play_count` are set, a song qualifies as a favorite if it is
+    /// starred OR meets either configured threshold (so starred, rated, and heavily-played tracks
+    /// all surface cleanly).
+    #[serde(default)]
+    pub min_rating: Option<u8>,
+    /// Minimum play count for favorite qualification (ORed with `min_rating` and starred status).
+    #[serde(default)]
+    pub min_play_count: Option<u32>,
+    /// Maximum play count (e.g. `Some(1)` for Fresh Arrivals / unheard tracks).
+    #[serde(default)]
+    pub max_play_count: Option<u32>,
+    /// Require the song to have been last played at least N days ago (Forgotten Gems).
+    #[serde(default)]
+    pub not_played_days: Option<u32>,
+    /// Require the song to have been added to the library within the last N days (Fresh Arrivals).
+    #[serde(default)]
+    pub added_within_days: Option<u32>,
+    /// When true, never fall back to unrelated library tracks if filters yield zero matches.
+    #[serde(default)]
+    pub strict_match: bool,
+    /// Primary ordering before daily deterministic tier jitter.
+    #[serde(default)]
+    pub sort_order: MixSortOrder,
+}
+
 /// Extensible, data-driven contextual mix definition (seasonal pack or moment/mood mix).
 /// Built-in definitions leave `custom_name` / `custom_description` as `None` so every client
 /// localizes labels cleanly from `i18n_key` + typed metadata.
@@ -993,6 +1060,10 @@ pub struct ContextualMixDefinition {
     /// Active hour range for time-of-day moment mixes.
     #[serde(default)]
     pub hour_window: Option<HourWindow>,
+    /// Active ISO weekdays (`1` = Monday .. `7` = Sunday) for day-of-week moment mixes.
+    /// Empty means active on every day of the week.
+    #[serde(default)]
+    pub days_of_week: Vec<u8>,
     /// Always surface this mix regardless of time-of-day (e.g. Drive Mix).
     #[serde(default)]
     pub always_surfaced: bool,
@@ -1016,6 +1087,9 @@ pub struct ContextualMixDefinition {
     /// Whether to materialize/sync this mix as a Navidrome playlist.
     #[serde(default = "default_true")]
     pub sync_to_navidrome: bool,
+    /// Optional structured library selection rules (decades, forgotten gems, fresh arrivals).
+    #[serde(default)]
+    pub selection_rules: Option<MixSelectionRules>,
 }
 
 fn default_true() -> bool {
@@ -1062,6 +1136,7 @@ impl ContextualMixDefinition {
         month: u32,
         day: u32,
         hour: u32,
+        weekday: Option<u32>,
         effective_country: Option<&str>,
         explicitly_enabled_by_user: bool,
     ) -> bool {
@@ -1077,11 +1152,17 @@ impl ContextualMixDefinition {
                 in_window && (explicitly_enabled_by_user || self.matches_country(effective_country))
             }
             ContextualMixKind::Moment => {
-                self.always_surfaced
-                    || self
-                        .hour_window
-                        .as_ref()
-                        .is_none_or(|w| w.is_active(hour))
+                if self.always_surfaced {
+                    return true;
+                }
+                let day_ok = self.days_of_week.is_empty()
+                    || weekday
+                        .is_some_and(|w| self.days_of_week.iter().any(|&d| u32::from(d) == w));
+                let hour_ok = self
+                    .hour_window
+                    .as_ref()
+                    .is_none_or(|w| w.is_active(hour));
+                day_ok && hour_ok
             }
             ContextualMixKind::Rolling => true,
         }
@@ -1092,205 +1173,143 @@ impl ContextualMixDefinition {
 /// Admins and users can add, edit, or disable mixes at runtime without recompiling.
 pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
     let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+    let seasonal = |slug: &str,
+                    tags: &[&str],
+                    queries: &[&str],
+                    window: CalendarWindow,
+                    local_ratio: f32,
+                    target_tracks: u32| ContextualMixDefinition {
+        slug: slug.into(),
+        owner_user_id: None,
+        kind: ContextualMixKind::Seasonal,
+        i18n_key: format!("mix.seasonal.{slug}"),
+        custom_name: None,
+        custom_description: None,
+        built_in: true,
+        enabled: true,
+        theme_tags: s(tags),
+        international_queries: s(queries),
+        calendar_window: Some(window),
+        hour_window: None,
+        days_of_week: vec![],
+        always_surfaced: false,
+        countries: vec![],
+        owned_ratio: 0.0,
+        default_local_ratio: Some(local_ratio),
+        exclude_from_core_taste: true,
+        offline_priority: false,
+        target_tracks,
+        sync_to_navidrome: true,
+        selection_rules: None,
+    };
+
     vec![
-        ContextualMixDefinition {
-            slug: "winter_holiday".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.winter_holiday".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["christmas", "holiday", "winter"]),
-            international_queries: s(&["Christmas Hits", "Winter Holiday Classics"]),
-            calendar_window: Some(CalendarWindow::new(11, 20, 12, 27, 9)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.45),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "new_years_eve".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.new_years_eve".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["dance", "party", "disco", "funk", "electronic"]),
-            international_queries: s(&["Party Hits", "Dance Floor Classics"]),
-            calendar_window: Some(CalendarWindow::new(12, 28, 1, 2, 6)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.45),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "lunar_new_year".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.lunar_new_year".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["mandopop", "cantopop", "k-pop", "c-pop", "festive"]),
-            international_queries: s(&["Lunar New Year", "Asian Pop Hits"]),
-            calendar_window: Some(CalendarWindow::new(1, 20, 2, 20, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: s(&["CN", "TW", "HK", "SG", "VN", "KR", "MY"]),
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.55),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "carnival".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.carnival".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["samba", "salsa", "cumbia", "afrobeats", "dance"]),
-            international_queries: s(&["Carnival Hits", "Samba Party"]),
-            calendar_window: Some(CalendarWindow::new(2, 1, 3, 5, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: s(&["BR", "CO", "TT", "DE", "IT"]),
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.55),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "spring".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.spring".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["spring", "indie pop", "dream pop", "soul", "bossa nova"]),
-            international_queries: s(&["Fresh Indie", "Spring Acoustic"]),
-            calendar_window: Some(CalendarWindow::new(3, 20, 5, 31, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.45),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "summer".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.summer".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["summer", "tropical", "reggae", "indie", "pop"]),
-            international_queries: s(&["Summer Anthems", "Sun-Soaked Indie"]),
-            calendar_window: Some(CalendarWindow::new(6, 1, 8, 31, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.45),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "autumn".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.autumn".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["autumn", "acoustic", "folk", "jazz", "chill"]),
-            international_queries: s(&["Autumn Chill", "Cozy Acoustic"]),
-            calendar_window: Some(CalendarWindow::new(9, 22, 11, 19, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.45),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "halloween".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.halloween".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["halloween", "darkwave", "post-punk", "synthwave"]),
-            international_queries: s(&["Halloween Classics", "Darkwave Night"]),
-            calendar_window: Some(CalendarWindow::new(10, 15, 11, 1, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: vec![],
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.40),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
-        ContextualMixDefinition {
-            slug: "diwali".into(),
-            owner_user_id: None,
-            kind: ContextualMixKind::Seasonal,
-            i18n_key: "mix.seasonal.diwali".into(),
-            custom_name: None,
-            custom_description: None,
-            built_in: true,
-            enabled: true,
-            theme_tags: s(&["indian", "bollywood", "bhangra", "indie", "festive"]),
-            international_queries: s(&["Diwali Celebration", "Indian Festive Hits"]),
-            calendar_window: Some(CalendarWindow::new(10, 15, 11, 15, 7)),
-            hour_window: None,
-            always_surfaced: false,
-            countries: s(&["IN", "SG", "MY", "GB", "CA"]),
-            owned_ratio: 0.0,
-            default_local_ratio: Some(0.55),
-            exclude_from_core_taste: true,
-            offline_priority: false,
-            target_tracks: 25,
-            sync_to_navidrome: true,
-        },
+        // --- Seasonal Mixes ---
+        seasonal(
+            "winter_holiday",
+            &["christmas", "holiday", "winter"],
+            &["Christmas Hits", "Winter Holiday Classics"],
+            CalendarWindow::new(11, 20, 12, 27, 9),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "new_years_eve",
+            &["dance", "party", "disco", "funk", "electronic"],
+            &["Party Hits", "Dance Floor Classics"],
+            CalendarWindow::new(12, 28, 1, 2, 6),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "cozy_winter",
+            &["winter", "folk", "ambient", "indie folk", "acoustic"],
+            &["Winter Acoustic", "Cozy Winter"],
+            CalendarWindow::new(1, 3, 2, 6, 5),
+            0.40,
+            25,
+        ),
+        seasonal(
+            "lunar_new_year",
+            &["mandopop", "cantopop", "k-pop", "c-pop", "festive"],
+            &["Lunar New Year", "Asian Pop Hits"],
+            CalendarWindow::new(1, 20, 2, 20, 7),
+            0.55,
+            20,
+        ),
+        seasonal(
+            "valentines",
+            &["soul", "r&b", "jazz", "chanson", "romance"],
+            &["Valentine", "Love Songs"],
+            CalendarWindow::new(2, 7, 2, 15, 4),
+            0.45,
+            20,
+        ),
+        seasonal(
+            "carnival",
+            &["samba", "salsa", "cumbia", "afrobeats", "carnival"],
+            &["Carnival Hits", "Samba Party"],
+            CalendarWindow::new(2, 1, 3, 5, 7),
+            0.55,
+            20,
+        ),
+        seasonal(
+            "celtic_spring",
+            &["celtic", "irish", "celtic folk", "irish folk", "celtic punk"],
+            &["Irish Folk", "St Patrick"],
+            CalendarWindow::new(3, 10, 3, 19, 4),
+            0.45,
+            20,
+        ),
+        seasonal(
+            "spring",
+            &["spring", "indie pop", "dream pop", "soul", "bossa nova"],
+            &["Fresh Indie", "Spring Acoustic"],
+            CalendarWindow::new(3, 20, 5, 31, 7),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "summer",
+            &["summer", "tropical", "reggae", "indie", "pop"],
+            &["Summer Anthems", "Sun-Soaked Indie"],
+            CalendarWindow::new(6, 1, 8, 31, 7),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "summer_solstice",
+            &["indie", "electro", "french touch", "folk", "festival"],
+            &["Midsummer", "Summer Solstice"],
+            CalendarWindow::new(6, 15, 6, 24, 4),
+            0.45,
+            20,
+        ),
+        seasonal(
+            "late_summer_reset",
+            &["indie pop", "dream pop", "shoegaze", "synthpop", "alternative"],
+            &["Late Summer", "Indie September"],
+            CalendarWindow::new(9, 1, 9, 21, 5),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "autumn",
+            &["autumn", "acoustic", "folk", "jazz", "chill"],
+            &["Autumn Chill", "Cozy Acoustic"],
+            CalendarWindow::new(9, 22, 11, 19, 7),
+            0.45,
+            25,
+        ),
+        seasonal(
+            "halloween",
+            &["halloween", "darkwave", "post-punk", "synthwave"],
+            &["Halloween Classics", "Darkwave Night"],
+            CalendarWindow::new(10, 15, 11, 1, 7),
+            0.40,
+            25,
+        ),
+        // --- Time-of-Day & Activity Moment Mixes ---
         ContextualMixDefinition {
             slug: "drive".into(),
             owner_user_id: None,
@@ -1304,6 +1323,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             international_queries: vec![],
             calendar_window: None,
             hour_window: None,
+            days_of_week: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1312,6 +1332,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             offline_priority: true,
             target_tracks: 25,
             sync_to_navidrome: false,
+            selection_rules: None,
         },
         ContextualMixDefinition {
             slug: "morning".into(),
@@ -1325,7 +1346,8 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             theme_tags: s(&["pop", "indie pop", "funk", "soul", "bossa nova"]),
             international_queries: vec![],
             calendar_window: None,
-            hour_window: Some(HourWindow::new(6, 10)),
+            hour_window: Some(HourWindow::new(5, 10)),
+            days_of_week: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1334,6 +1356,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             offline_priority: false,
             target_tracks: 25,
             sync_to_navidrome: false,
+            selection_rules: None,
         },
         ContextualMixDefinition {
             slug: "focus".into(),
@@ -1348,6 +1371,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             international_queries: vec![],
             calendar_window: None,
             hour_window: Some(HourWindow::new(11, 17)),
+            days_of_week: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1356,6 +1380,55 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             offline_priority: false,
             target_tracks: 25,
             sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "evening_unwind".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.evening_unwind".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["soul", "jazz", "r&b", "indie", "folk", "acoustic"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(18, 21)),
+            days_of_week: vec![],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "dinner_groove".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.dinner_groove".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&["funk", "disco", "soul", "bossa nova", "nu-disco", "jazz"]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(18, 22)),
+            days_of_week: vec![],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.80,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
         },
         ContextualMixDefinition {
             slug: "late_night".into(),
@@ -1370,6 +1443,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             international_queries: vec![],
             calendar_window: None,
             hour_window: Some(HourWindow::new(22, 4)),
+            days_of_week: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1378,6 +1452,249 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             offline_priority: false,
             target_tracks: 25,
             sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "rainy_day".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.rainy_day".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "acoustic",
+                "folk",
+                "singer-songwriter",
+                "indie folk",
+                "piano",
+                "ambient",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        // --- Day-of-Week Moment Mixes ---
+        ContextualMixDefinition {
+            slug: "friday_night".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.friday_night".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "electronic",
+                "disco",
+                "funk",
+                "house",
+                "hip hop",
+                "synthpop",
+                "indie rock",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(18, 23)),
+            days_of_week: vec![5, 6],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "sunday_morning".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.sunday_morning".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "acoustic",
+                "jazz",
+                "soul",
+                "folk",
+                "bossa nova",
+                "chanson",
+                "ambient",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: Some(HourWindow::new(7, 12)),
+            days_of_week: vec![7],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.85,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        // --- Library-Rule Smart Mixes (hidden cleanly when library has 0 matching tracks) ---
+        ContextualMixDefinition {
+            slug: "forgotten_gems".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.forgotten_gems".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: vec![],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                min_rating: Some(4),
+                min_play_count: Some(5),
+                not_played_days: Some(180),
+                strict_match: true,
+                sort_order: MixSortOrder::OldestPlayedFirst,
+                ..Default::default()
+            }),
+        },
+        ContextualMixDefinition {
+            slug: "fresh_arrivals".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.fresh_arrivals".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: vec![],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                added_within_days: Some(60),
+                max_play_count: Some(1),
+                strict_match: true,
+                sort_order: MixSortOrder::NewestAddedFirst,
+                ..Default::default()
+            }),
+        },
+        ContextualMixDefinition {
+            slug: "decade_80s".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.decade_80s".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: vec![],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                year_range: Some((1980, 1989)),
+                strict_match: true,
+                ..Default::default()
+            }),
+        },
+        ContextualMixDefinition {
+            slug: "decade_90s".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.decade_90s".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: vec![],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                year_range: Some((1990, 1999)),
+                strict_match: true,
+                ..Default::default()
+            }),
+        },
+        ContextualMixDefinition {
+            slug: "decade_2000s".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.decade_2000s".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: vec![],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                year_range: Some((2000, 2009)),
+                strict_match: true,
+                ..Default::default()
+            }),
         },
     ]
 }
@@ -1402,17 +1719,31 @@ pub fn canonical_mix_title(
                 Some("Christmas Mix")
             }
             "mix.seasonal.new_years_eve" | "new_years_eve" | "nye" => Some("New Year's Eve"),
+            "mix.seasonal.cozy_winter" | "cozy_winter" => Some("Cozy Winter"),
             "mix.seasonal.lunar_new_year" | "lunar_new_year" => Some("Lunar New Year"),
+            "mix.seasonal.valentines" | "valentines" => Some("Date Night"),
             "mix.seasonal.carnival" | "carnival" => Some("Carnival Beats"),
+            "mix.seasonal.celtic_spring" | "celtic_spring" => Some("Celtic Folk"),
             "mix.seasonal.spring" | "spring" => Some("Spring Awakening"),
             "mix.seasonal.summer" | "summer" => Some("Summer Anthems"),
+            "mix.seasonal.summer_solstice" | "summer_solstice" => Some("Midsummer Solstice"),
+            "mix.seasonal.late_summer_reset" | "late_summer_reset" => Some("Late Summer Reset"),
             "mix.seasonal.autumn" | "autumn" => Some("Autumn Sessions"),
             "mix.seasonal.halloween" | "halloween" => Some("Darkwave Halloween"),
-            "mix.seasonal.diwali" | "diwali" => Some("Diwali Celebration"),
             "mix.moment.drive" | "drive" => Some("Drive Mix"),
             "mix.moment.morning" | "morning" => Some("Morning Lift"),
             "mix.moment.focus" | "focus" => Some("Deep Focus"),
+            "mix.moment.evening_unwind" | "evening_unwind" => Some("Evening Unwind"),
+            "mix.moment.dinner_groove" | "dinner_groove" => Some("Dinner Groove"),
             "mix.moment.late_night" | "late_night" => Some("Late Night"),
+            "mix.moment.rainy_day" | "rainy_day" => Some("Rainy Day"),
+            "mix.moment.friday_night" | "friday_night" => Some("Friday Night Warmup"),
+            "mix.moment.sunday_morning" | "sunday_morning" => Some("Sunday Morning Coffee"),
+            "mix.moment.forgotten_gems" | "forgotten_gems" => Some("Forgotten Gems"),
+            "mix.moment.fresh_arrivals" | "fresh_arrivals" => Some("Fresh Arrivals"),
+            "mix.moment.decade_80s" | "decade_80s" => Some("80s Wave"),
+            "mix.moment.decade_90s" | "decade_90s" => Some("90s Mix"),
+            "mix.moment.decade_2000s" | "decade_2000s" => Some("2000s Mix"),
             "mix.rolling.conservative" | "mix.rolling.comfort" | "conservative" | "comfort" => {
                 Some("Comfort Zone")
             }
@@ -1557,6 +1888,8 @@ pub struct UpsertContextualMixRequest {
     #[serde(default)]
     pub hour_window: Option<HourWindow>,
     #[serde(default)]
+    pub days_of_week: Vec<u8>,
+    #[serde(default)]
     pub always_surfaced: bool,
     #[serde(default)]
     pub countries: Vec<String>,
@@ -1572,6 +1905,8 @@ pub struct UpsertContextualMixRequest {
     pub target_tracks: u32,
     #[serde(default = "default_true")]
     pub sync_to_navidrome: bool,
+    #[serde(default)]
+    pub selection_rules: Option<MixSelectionRules>,
 }
 
 /// Per-user toggle to enable or disable any mix definition without modifying global state.

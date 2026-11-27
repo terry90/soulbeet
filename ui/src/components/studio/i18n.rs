@@ -36,11 +36,20 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
         "mix.seasonal.new_years_eve" => {
             "High-energy dance floor staples and regional party picks to close the year.".to_string()
         }
+        "mix.seasonal.cozy_winter" => {
+            "Fireside folk, gentle ambient, and acoustic warmth for cold winter days.".to_string()
+        }
         "mix.seasonal.lunar_new_year" => {
             "Celebratory regional pop and fresh festive picks for the new lunar cycle.".to_string()
         }
+        "mix.seasonal.valentines" => {
+            "Smooth soul, jazz, R&B, and romantic classics set for an intimate evening.".to_string()
+        }
         "mix.seasonal.carnival" => {
             "Percussive rhythms, samba, funk, and vibrant carnival energy.".to_string()
+        }
+        "mix.seasonal.celtic_spring" => {
+            "Spirited Irish trad, Celtic folk, and lively acoustic pub anthems.".to_string()
         }
         "mix.seasonal.spring" => {
             "Fresh indie, acoustic warmth, and bright new-season discoveries.".to_string()
@@ -48,14 +57,17 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
         "mix.seasonal.summer" => {
             "Sun-soaked grooves, upbeat pop, and warm-weather classics.".to_string()
         }
+        "mix.seasonal.summer_solstice" => {
+            "Golden-hour indie, festival electro, and long-evening summer sounds.".to_string()
+        }
+        "mix.seasonal.late_summer_reset" => {
+            "Hazy dream pop, indie grooves, and bittersweet September transitions.".to_string()
+        }
         "mix.seasonal.autumn" => {
             "Cozy acoustic textures, folk, jazz, and mellow indie cuts.".to_string()
         }
         "mix.seasonal.halloween" => {
             "Atmospheric darkwave, post-punk, and nocturnal synth textures.".to_string()
-        }
-        "mix.seasonal.diwali" => {
-            "Festive Indian classics, indie gems, and celebratory rhythms.".to_string()
         }
         "mix.moment.drive" => {
             "Offline-prioritized favorites and upbeat momentum built for the road.".to_string()
@@ -66,8 +78,39 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
         "mix.moment.focus" => {
             "Steady ambient, instrumental, and downtempo cuts for uninterrupted flow.".to_string()
         }
+        "mix.moment.evening_unwind" => {
+            "Warm soul, acoustic folk, and mellow cuts to ease out of the day.".to_string()
+        }
+        "mix.moment.dinner_groove" => {
+            "Feel-good funk, bossa nova, and nu-disco grooves for cooking and company.".to_string()
+        }
         "mix.moment.late_night" => {
             "Low-lit dream pop, trip hop, and midnight library favorites.".to_string()
+        }
+        "mix.moment.rainy_day" => {
+            "Soft acoustic folk, piano, and reflective melodies made for gray skies.".to_string()
+        }
+        "mix.moment.friday_night" => {
+            "Upbeat electro, disco, and indie energy to kick off the weekend.".to_string()
+        }
+        "mix.moment.sunday_morning" => {
+            "Unrushed jazz, warm soul, and acoustic favorites for a slow start.".to_string()
+        }
+        "mix.moment.forgotten_gems" => {
+            "Top-rated favorites from your library that you have not spun in months.".to_string()
+        }
+        "mix.moment.fresh_arrivals" => {
+            "Recently added tracks in your library waiting for their first proper listen."
+                .to_string()
+        }
+        "mix.moment.decade_80s" => {
+            "Your library's finest 1980s synth, new wave, and classic cuts.".to_string()
+        }
+        "mix.moment.decade_90s" => {
+            "Standout 1990s records and golden-era favorites from your collection.".to_string()
+        }
+        "mix.moment.decade_2000s" => {
+            "Essential 2000s indie, electronic, and throwback tracks from your library.".to_string()
         }
         "mix.rolling.conservative" | "mix.rolling.comfort" => {
             "High-rotation favorites and trusted genres from your library.".to_string()
@@ -367,6 +410,140 @@ mod tests {
             let summary = sample_summary("rolling", ContextualMixKind::Rolling, key, None);
             assert_eq!(format_mix_title(&summary), expected, "key={key}");
         }
+    }
+
+    #[test]
+    fn formats_expanded_seasonal_moment_and_smart_mix_titles_and_subtitles() {
+        let cases = [
+            (
+                "cozy_winter",
+                ContextualMixKind::Seasonal,
+                "mix.seasonal.cozy_winter",
+                "Cozy Winter",
+                "Fireside folk, gentle ambient, and acoustic warmth for cold winter days.",
+            ),
+            (
+                "valentines",
+                ContextualMixKind::Seasonal,
+                "mix.seasonal.valentines",
+                "Date Night",
+                "Smooth soul, jazz, R&B, and romantic classics set for an intimate evening.",
+            ),
+            (
+                "celtic_spring",
+                ContextualMixKind::Seasonal,
+                "mix.seasonal.celtic_spring",
+                "Celtic Folk",
+                "Spirited Irish trad, Celtic folk, and lively acoustic pub anthems.",
+            ),
+            (
+                "summer_solstice",
+                ContextualMixKind::Seasonal,
+                "mix.seasonal.summer_solstice",
+                "Midsummer Solstice",
+                "Golden-hour indie, festival electro, and long-evening summer sounds.",
+            ),
+            (
+                "late_summer_reset",
+                ContextualMixKind::Seasonal,
+                "mix.seasonal.late_summer_reset",
+                "Late Summer Reset",
+                "Hazy dream pop, indie grooves, and bittersweet September transitions.",
+            ),
+            (
+                "evening_unwind",
+                ContextualMixKind::Moment,
+                "mix.moment.evening_unwind",
+                "Evening Unwind",
+                "Warm soul, acoustic folk, and mellow cuts to ease out of the day.",
+            ),
+            (
+                "dinner_groove",
+                ContextualMixKind::Moment,
+                "mix.moment.dinner_groove",
+                "Dinner Groove",
+                "Feel-good funk, bossa nova, and nu-disco grooves for cooking and company.",
+            ),
+            (
+                "rainy_day",
+                ContextualMixKind::Moment,
+                "mix.moment.rainy_day",
+                "Rainy Day",
+                "Soft acoustic folk, piano, and reflective melodies made for gray skies.",
+            ),
+            (
+                "friday_night",
+                ContextualMixKind::Moment,
+                "mix.moment.friday_night",
+                "Friday Night Warmup",
+                "Upbeat electro, disco, and indie energy to kick off the weekend.",
+            ),
+            (
+                "sunday_morning",
+                ContextualMixKind::Moment,
+                "mix.moment.sunday_morning",
+                "Sunday Morning Coffee",
+                "Unrushed jazz, warm soul, and acoustic favorites for a slow start.",
+            ),
+            (
+                "forgotten_gems",
+                ContextualMixKind::Moment,
+                "mix.moment.forgotten_gems",
+                "Forgotten Gems",
+                "Top-rated favorites from your library that you have not spun in months.",
+            ),
+            (
+                "fresh_arrivals",
+                ContextualMixKind::Moment,
+                "mix.moment.fresh_arrivals",
+                "Fresh Arrivals",
+                "Recently added tracks in your library waiting for their first proper listen.",
+            ),
+            (
+                "decade_80s",
+                ContextualMixKind::Moment,
+                "mix.moment.decade_80s",
+                "80s Wave",
+                "Your library's finest 1980s synth, new wave, and classic cuts.",
+            ),
+            (
+                "decade_90s",
+                ContextualMixKind::Moment,
+                "mix.moment.decade_90s",
+                "90s Mix",
+                "Standout 1990s records and golden-era favorites from your collection.",
+            ),
+            (
+                "decade_2000s",
+                ContextualMixKind::Moment,
+                "mix.moment.decade_2000s",
+                "2000s Mix",
+                "Essential 2000s indie, electronic, and throwback tracks from your library.",
+            ),
+        ];
+
+        for (slug, kind, key, expected_title, expected_subtitle) in cases {
+            let summary = sample_summary(slug, kind, key, None);
+            assert_eq!(format_mix_title(&summary), expected_title, "slug={slug}");
+            assert_eq!(
+                format_mix_subtitle(&summary),
+                expected_subtitle,
+                "slug={slug}"
+            );
+        }
+
+        // Removed diwali built-in now falls back to generic seasonal subtitle.
+        let removed_diwali = sample_summary(
+            "diwali",
+            ContextualMixKind::Seasonal,
+            "mix.seasonal.diwali",
+            None,
+        );
+        assert_eq!(format_mix_title(&removed_diwali), "Diwali");
+        assert_eq!(
+            format_mix_subtitle(&removed_diwali),
+            "Seasonal discovery blend isolated from your core taste profile."
+        );
     }
 
     #[test]

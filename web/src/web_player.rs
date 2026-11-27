@@ -2361,16 +2361,11 @@ pub fn WebStudioProvider(children: Element) -> Element {
             }
 
             // 2. Discovery 2.0 parallel bootstrap (contextual mixes, triage, culture, upgrades, config)
-            let local_hour = Some(
-                chrono::Local::now()
-                    .format("%H")
-                    .to_string()
-                    .parse::<u8>()
-                    .unwrap_or(12),
-            );
+            let local_hour = local_browser_hour();
+            let local_weekday = local_browser_weekday();
             let (mix_res, triage_res, culture_res, archival_res, cfg_res) =
                 futures::future::join5(
-                    auth.call(api::list_active_contextual_mixes(local_hour)),
+                    auth.call(api::list_active_contextual_mixes(local_hour, local_weekday)),
                     auth.call(api::list_triage_queue()),
                     auth.call(api::get_culture_profile()),
                     auth.call(api::list_archival_upgrades()),
@@ -3035,6 +3030,40 @@ fn apply_remote_connect_command(
     }
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn js_day_to_iso_weekday(js_day: u32) -> u8 {
+    if js_day == 0 {
+        7
+    } else {
+        js_day as u8
+    }
+}
+
+/// Returns the browser's current local hour (`0..=23`) on WASM, or `None` on non-WASM targets.
+pub fn local_browser_hour() -> Option<u8> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(js_sys::Date::new_0().get_hours() as u8)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Returns the browser's current local ISO weekday (`1` = Monday .. `7` = Sunday) on WASM,
+/// or `None` on non-WASM targets.
+pub fn local_browser_weekday() -> Option<u8> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(js_day_to_iso_weekday(js_sys::Date::new_0().get_day()))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 fn load_or_create_device_id() -> String {
     #[cfg(feature = "web")]
     {
@@ -3141,5 +3170,16 @@ mod tests {
         let mut active_changed = base.clone();
         active_changed.is_active = false;
         assert!(!connect_devices_visibly_equal(&[base], &[active_changed]));
+    }
+
+    #[test]
+    fn js_day_to_iso_weekday_maps_sunday_to_seven_and_mon_to_sat_directly() {
+        assert_eq!(js_day_to_iso_weekday(0), 7);
+        assert_eq!(js_day_to_iso_weekday(1), 1);
+        assert_eq!(js_day_to_iso_weekday(2), 2);
+        assert_eq!(js_day_to_iso_weekday(3), 3);
+        assert_eq!(js_day_to_iso_weekday(4), 4);
+        assert_eq!(js_day_to_iso_weekday(5), 5);
+        assert_eq!(js_day_to_iso_weekday(6), 6);
     }
 }

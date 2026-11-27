@@ -16,6 +16,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
@@ -428,12 +429,14 @@ class SoulbeetApiClient(
     suspend fun fetchContextualMixes(
         config: PersistedAppConfig,
         localHour: Int,
+        localWeekday: Int = currentIsoWeekday(),
     ): Result<List<ContextualMixUi>> = withContext(Dispatchers.IO) {
         runCatching {
             val base = normalizeBaseUrl(config.serverUrl)
             val url = "$base/api/discovery/contextual-mixes".toHttpUrlOrNull()
                 ?.newBuilder()
                 ?.addQueryParameter("local_hour", localHour.coerceIn(0, 23).toString())
+                ?.addQueryParameter("local_weekday", localWeekday.coerceIn(1, 7).toString())
                 ?.build()
                 ?: throw IOException("Invalid Soulbeet server URL")
 
@@ -829,6 +832,20 @@ class SoulbeetApiClient(
             }.getOrNull() ?: trimmed.take(160)
         }
 
+        internal fun calendarDayOfWeekToIso(dayOfWeek: Int): Int = when (dayOfWeek) {
+            Calendar.MONDAY -> 1
+            Calendar.TUESDAY -> 2
+            Calendar.WEDNESDAY -> 3
+            Calendar.THURSDAY -> 4
+            Calendar.FRIDAY -> 5
+            Calendar.SATURDAY -> 6
+            Calendar.SUNDAY -> 7
+            else -> 1
+        }
+
+        internal fun currentIsoWeekday(): Int =
+            calendarDayOfWeekToIso(Calendar.getInstance().get(Calendar.DAY_OF_WEEK))
+
         internal fun defaultMixCopy(slug: String, i18nKey: String): Pair<String, String> {
             fun lookup(raw: String): Pair<String, String>? =
                 when (raw.trim().lowercase(Locale.ROOT)) {
@@ -836,28 +853,56 @@ class SoulbeetApiClient(
                         "Christmas Mix" to "Christmas favorites and festive classics, blended to your taste."
                     "mix.seasonal.new_years_eve", "new_years_eve", "nye" ->
                         "New Year's Eve" to "High-energy dance floor staples and regional party picks to close the year."
+                    "mix.seasonal.cozy_winter", "cozy_winter" ->
+                        "Cozy Winter" to "Fireside folk, gentle ambient, and acoustic warmth for cold winter days."
                     "mix.seasonal.lunar_new_year", "lunar_new_year" ->
                         "Lunar New Year" to "Celebratory regional pop and fresh festive picks for the new lunar cycle."
+                    "mix.seasonal.valentines", "valentines" ->
+                        "Date Night" to "Smooth soul, jazz, R&B, and romantic classics set for an intimate evening."
                     "mix.seasonal.carnival", "carnival" ->
                         "Carnival Beats" to "Percussive rhythms, samba, funk, and vibrant carnival energy."
+                    "mix.seasonal.celtic_spring", "celtic_spring" ->
+                        "Celtic Folk" to "Spirited Irish trad, Celtic folk, and lively acoustic pub anthems."
                     "mix.seasonal.spring", "spring" ->
                         "Spring Awakening" to "Fresh indie, acoustic warmth, and bright new-season discoveries."
                     "mix.seasonal.summer", "summer" ->
                         "Summer Anthems" to "Sun-soaked grooves, upbeat pop, and warm-weather classics."
+                    "mix.seasonal.summer_solstice", "summer_solstice" ->
+                        "Midsummer Solstice" to "Golden-hour indie, festival electro, and long-evening summer sounds."
+                    "mix.seasonal.late_summer_reset", "late_summer_reset" ->
+                        "Late Summer Reset" to "Hazy dream pop, indie grooves, and bittersweet September transitions."
                     "mix.seasonal.autumn", "autumn" ->
                         "Autumn Sessions" to "Cozy acoustic textures, folk, jazz, and mellow indie cuts."
                     "mix.seasonal.halloween", "halloween" ->
                         "Darkwave Halloween" to "Atmospheric darkwave, post-punk, and nocturnal synth textures."
-                    "mix.seasonal.diwali", "diwali" ->
-                        "Diwali Celebration" to "Festive Indian classics, indie gems, and celebratory rhythms."
                     "mix.moment.drive", "drive" ->
                         "Drive Mix" to "Offline-prioritized favorites and upbeat momentum built for the road."
                     "mix.moment.morning", "morning" ->
                         "Morning Lift" to "Bright grooves and familiar lifts to ease into the day."
                     "mix.moment.focus", "focus" ->
                         "Deep Focus" to "Steady ambient, instrumental, and downtempo cuts for uninterrupted flow."
+                    "mix.moment.evening_unwind", "evening_unwind" ->
+                        "Evening Unwind" to "Warm soul, acoustic folk, and mellow cuts to ease out of the day."
+                    "mix.moment.dinner_groove", "dinner_groove" ->
+                        "Dinner Groove" to "Feel-good funk, bossa nova, and nu-disco grooves for cooking and company."
                     "mix.moment.late_night", "late_night" ->
                         "Late Night" to "Low-lit dream pop, trip hop, and midnight library favorites."
+                    "mix.moment.rainy_day", "rainy_day" ->
+                        "Rainy Day" to "Soft acoustic folk, piano, and reflective melodies made for gray skies."
+                    "mix.moment.friday_night", "friday_night" ->
+                        "Friday Night Warmup" to "Upbeat electro, disco, and indie energy to kick off the weekend."
+                    "mix.moment.sunday_morning", "sunday_morning" ->
+                        "Sunday Morning Coffee" to "Unrushed jazz, warm soul, and acoustic favorites for a slow start."
+                    "mix.moment.forgotten_gems", "forgotten_gems" ->
+                        "Forgotten Gems" to "Top-rated favorites from your library that you have not spun in months."
+                    "mix.moment.fresh_arrivals", "fresh_arrivals" ->
+                        "Fresh Arrivals" to "Recently added tracks in your library waiting for their first proper listen."
+                    "mix.moment.decade_80s", "decade_80s" ->
+                        "80s Wave" to "Your library's finest 1980s synth, new wave, and classic cuts."
+                    "mix.moment.decade_90s", "decade_90s" ->
+                        "90s Mix" to "Standout 1990s records and golden-era favorites from your collection."
+                    "mix.moment.decade_2000s", "decade_2000s" ->
+                        "2000s Mix" to "Essential 2000s indie, electronic, and throwback tracks from your library."
                     "mix.rolling.conservative", "mix.rolling.comfort", "conservative", "comfort" ->
                         "Comfort Zone" to "High-rotation favorites and trusted genres from your library."
                     "mix.rolling.balanced", "mix.rolling.weekly_radar", "balanced", "weekly_radar" ->

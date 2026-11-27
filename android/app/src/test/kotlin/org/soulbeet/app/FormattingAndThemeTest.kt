@@ -1,5 +1,6 @@
 package org.soulbeet.app
 
+import java.util.Calendar
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -345,17 +346,31 @@ class FormattingAndThemeTest {
         val cases = listOf(
             Triple("winter_holiday", "mix.seasonal.winter_holiday", "Christmas Mix"),
             Triple("new_years_eve", "mix.seasonal.new_years_eve", "New Year's Eve"),
+            Triple("cozy_winter", "mix.seasonal.cozy_winter", "Cozy Winter"),
             Triple("lunar_new_year", "mix.seasonal.lunar_new_year", "Lunar New Year"),
+            Triple("valentines", "mix.seasonal.valentines", "Date Night"),
             Triple("carnival", "mix.seasonal.carnival", "Carnival Beats"),
+            Triple("celtic_spring", "mix.seasonal.celtic_spring", "Celtic Folk"),
             Triple("spring", "mix.seasonal.spring", "Spring Awakening"),
             Triple("summer", "mix.seasonal.summer", "Summer Anthems"),
+            Triple("summer_solstice", "mix.seasonal.summer_solstice", "Midsummer Solstice"),
+            Triple("late_summer_reset", "mix.seasonal.late_summer_reset", "Late Summer Reset"),
             Triple("autumn", "mix.seasonal.autumn", "Autumn Sessions"),
             Triple("halloween", "mix.seasonal.halloween", "Darkwave Halloween"),
-            Triple("diwali", "mix.seasonal.diwali", "Diwali Celebration"),
             Triple("drive", "mix.moment.drive", "Drive Mix"),
             Triple("morning", "mix.moment.morning", "Morning Lift"),
             Triple("focus", "mix.moment.focus", "Deep Focus"),
+            Triple("evening_unwind", "mix.moment.evening_unwind", "Evening Unwind"),
+            Triple("dinner_groove", "mix.moment.dinner_groove", "Dinner Groove"),
             Triple("late_night", "mix.moment.late_night", "Late Night"),
+            Triple("rainy_day", "mix.moment.rainy_day", "Rainy Day"),
+            Triple("friday_night", "mix.moment.friday_night", "Friday Night Warmup"),
+            Triple("sunday_morning", "mix.moment.sunday_morning", "Sunday Morning Coffee"),
+            Triple("forgotten_gems", "mix.moment.forgotten_gems", "Forgotten Gems"),
+            Triple("fresh_arrivals", "mix.moment.fresh_arrivals", "Fresh Arrivals"),
+            Triple("decade_80s", "mix.moment.decade_80s", "80s Wave"),
+            Triple("decade_90s", "mix.moment.decade_90s", "90s Mix"),
+            Triple("decade_2000s", "mix.moment.decade_2000s", "2000s Mix"),
             Triple("conservative", "mix.rolling.conservative", "Comfort Zone"),
             Triple("comfort", "mix.rolling.comfort", "Comfort Zone"),
             Triple("balanced", "mix.rolling.balanced", "Fresh Picks"),
@@ -369,7 +384,25 @@ class FormattingAndThemeTest {
             Triple("___", "...", "Curated Mix"),
         )
         for ((slug, key, expected) in cases) {
-            assertEquals("slug=$slug key=$key", expected, SoulbeetApiClient.defaultMixCopy(slug, key).first)
+            val (title, subtitle) = SoulbeetApiClient.defaultMixCopy(slug, key)
+            assertEquals("slug=$slug key=$key", expected, title)
+            assertTrue("slug=$slug subtitle should be non-blank", subtitle.isNotBlank())
         }
+
+        // Removed diwali mix falls back to humanized title and generic subtitle.
+        val (diwaliTitle, diwaliSub) = SoulbeetApiClient.defaultMixCopy("diwali", "mix.seasonal.diwali")
+        assertEquals("Diwali", diwaliTitle)
+        assertEquals("Contextual Soulbeet mix", diwaliSub)
+    }
+
+    @Test
+    fun calendarDayOfWeekMapsToIsoWeekdayOneThroughSeven() {
+        assertEquals(1, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.MONDAY))
+        assertEquals(2, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.TUESDAY))
+        assertEquals(3, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.WEDNESDAY))
+        assertEquals(4, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.THURSDAY))
+        assertEquals(5, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.FRIDAY))
+        assertEquals(6, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SATURDAY))
+        assertEquals(7, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SUNDAY))
     }
 }

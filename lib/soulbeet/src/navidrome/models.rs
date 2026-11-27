@@ -247,6 +247,12 @@ pub struct BrowseAlbumList2 {
 
 // Core data types
 
+/// OpenSubsonic multi-genre tag entry (`{"name": "Electronic"}`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubsonicNamedGenre {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubsonicSong {
@@ -260,12 +266,21 @@ pub struct SubsonicSong {
     pub album_id: Option<String>,
     #[serde(default)]
     pub genre: Option<String>,
+    /// OpenSubsonic multi-genre tags (populated alongside primary `genre`).
+    #[serde(default)]
+    pub genres: Vec<SubsonicNamedGenre>,
     #[serde(default)]
     pub duration: Option<u32>,
     #[serde(default)]
     pub user_rating: Option<u8>,
     #[serde(default)]
     pub play_count: Option<u32>,
+    /// When this song was added to the library (RFC3339).
+    #[serde(default)]
+    pub created: Option<String>,
+    /// When this user last played the song (RFC3339); absent if never played.
+    #[serde(default)]
+    pub played: Option<String>,
     /// When this user starred the song; absent when not starred.
     #[serde(default)]
     pub starred: Option<String>,
@@ -286,6 +301,19 @@ pub struct SubsonicSong {
     pub track: Option<u32>,
     #[serde(default)]
     pub path: Option<String>,
+}
+
+impl SubsonicSong {
+    /// Iterates over every non-empty genre tag attached to this song (primary `genre` plus
+    /// OpenSubsonic multi-genre `genres`).
+    pub fn all_genres(&self) -> impl Iterator<Item = &str> {
+        self.genre
+            .as_deref()
+            .into_iter()
+            .chain(self.genres.iter().map(|g| g.name.as_str()))
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

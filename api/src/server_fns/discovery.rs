@@ -311,9 +311,10 @@ pub async fn update_culture_profile(
         .map_err(failure_error)
 }
 
-#[get("/api/discovery/contextual-mixes?local_hour", auth: AuthSession)]
+#[get("/api/discovery/contextual-mixes?local_hour&local_weekday", auth: AuthSession)]
 pub async fn list_active_contextual_mixes(
     local_hour: Option<u8>,
+    local_weekday: Option<u8>,
 ) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
     crate::core::contextual::list_active_contextual_mixes_in(
         &crate::db::DB,
@@ -322,6 +323,7 @@ pub async fn list_active_contextual_mixes(
         &auth.0,
         chrono::Utc::now(),
         local_hour,
+        local_weekday,
     )
     .await
     .map_err(failure_error)
