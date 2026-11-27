@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.ContainerDetailUi
 import org.soulbeet.app.LibraryCategory
+import org.soulbeet.app.TriageCardItem
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
@@ -77,6 +78,7 @@ fun LibraryScreen(
     onOpenArtist: (FfiArtist) -> Unit,
     onTogglePin: (target: FfiPinTarget, label: String) -> Unit,
     onPlayQueue: (tracks: List<FfiTrack>, startIndex: Int, sourceLabel: String) -> Unit,
+    onPlayTriageCard: (TriageCardItem) -> Unit,
     onStarTrack: (FfiTrack) -> Unit,
     onRemoveTrack: (FfiTrack) -> Unit,
     onKeepDiscovery: (FfiDiscoveryTrack) -> Unit,
@@ -406,7 +408,7 @@ fun LibraryScreen(
                             isPendingDiscovery = true,
                             discoveryExpiryLabel = FormattingUtils.formatExpiryCountdown(disc.expiresAt),
                             onClick = {
-                                card.track?.let { onPlayQueue(listOf(it), 0, "Discovery") }
+                                onPlayTriageCard(card)
                             },
                             onKeepClick = { onKeepDiscovery(disc) },
                             onDropClick = { onDropDiscovery(disc) },

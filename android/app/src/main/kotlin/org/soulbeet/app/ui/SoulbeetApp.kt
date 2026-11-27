@@ -269,9 +269,7 @@ private fun MainStudioShell(
                     onPlayMix = viewModel::playContextualMix,
                     onTogglePin = viewModel::togglePin,
                     onSteerMix = viewModel::steerSeasonalPack,
-                    onPreviewTriageCard = { card ->
-                        card.track?.let { viewModel.playTrack(it, sourceLabel = "Discovery Triage") }
-                    },
+                    onPreviewTriageCard = viewModel::playTriageFrom,
                     onKeepTriageCard = { card ->
                         val songId = card.discovery.songId ?: return@DiscoverScreen
                         viewModel.keepDiscoveryTrack(songId, card.discovery.id, card.discovery.title)
@@ -322,6 +320,7 @@ private fun MainStudioShell(
                     onOpenArtist = viewModel::openArtistDetail,
                     onTogglePin = viewModel::togglePin,
                     onPlayQueue = viewModel::playQueue,
+                    onPlayTriageCard = viewModel::playTriageFrom,
                     onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
                     onRemoveTrack = { track ->
                         viewModel.requestLibraryTrackRemoval(track.id, track.title, track.artistName)
