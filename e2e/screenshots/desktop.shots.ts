@@ -11,7 +11,7 @@ test('search, album, downloads, dashboard and settings', async ({ page }) => {
   const outside = await showSearch(page);
   // The search form at the top leaves room for its status line and three results.
   await page
-    .locator('form', { has: page.getByRole('searchbox') })
+    .locator('form', { has: page.locator('#search-query') })
     .evaluate((form) => {
       // Room for the form's glow under the header.
       form.style.scrollMarginTop = '24px';
@@ -19,18 +19,26 @@ test('search, album, downloads, dashboard and settings', async ({ page }) => {
     });
   await save(page, 'search');
 
-  const results = page.locator('section', { has: page.getByRole('heading', { name: 'Search Results' }) });
+  const results = page.locator('section', {
+    has: page.getByRole('heading', { name: 'Catalog', exact: true }),
+  });
   const album = results.getByRole('listitem').first();
   await album.getByRole('paragraph').first().click();
   // The album has one Download button, and then one per track.
   await expect(album.getByRole('button', { name: 'Download' }).nth(1)).toBeVisible({ timeout: 45_000 });
   // Brings the results to the top so the picture shows the tracks, not the search box.
-  await page.getByRole('heading', { name: 'Search Results' }).evaluate((heading) => heading.scrollIntoView({ block: 'start' }));
+  await page
+    .getByRole('heading', { name: 'Catalog', exact: true })
+    .evaluate((heading) => heading.scrollIntoView({ block: 'start' }));
   await save(page, 'album');
 
-  const title = await album.getByRole('paragraph').nth(0).innerText();
-  const artist = await album.getByRole('paragraph').nth(1).innerText();
-  showTransfers(artist, title, await album.locator('span.flex-grow').allTextContents());
+  const title = await album.getByRole('paragraph').first().innerText();
+  const artist = await album.locator('div.flex-grow > button').first().innerText();
+  showTransfers(
+    artist,
+    title,
+    await album.locator('ul li div.flex-grow > span:first-child').allTextContents(),
+  );
   await openDownloadsPanel(page);
   await expect(page.getByText('LIB', { exact: true }).first()).toBeVisible();
   await save(page, 'downloads');

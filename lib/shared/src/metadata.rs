@@ -125,6 +125,217 @@ pub struct AlbumWithTracks {
     pub tracks: Vec<Track>,
 }
 
+/// Which remote catalog provider served a unified search or detail lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogProvider {
+    Deezer,
+    Musicbrainz,
+}
+
+impl CatalogProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deezer => "deezer",
+            Self::Musicbrainz => "musicbrainz",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Deezer => "Deezer",
+            Self::Musicbrainz => "MusicBrainz",
+        }
+    }
+}
+
+/// A remote catalog track returned by unified search, album detail, or artist top tracks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogTrack {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_mbid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_label: Option<String>,
+    pub provider: CatalogProvider,
+}
+
+impl CatalogTrack {
+    pub fn to_track(&self) -> Track {
+        Track {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            album_id: self.album_id.clone(),
+            album_title: self.album_title.clone(),
+            release_date: self.release_date.clone(),
+            duration: self.duration.clone().or_else(|| {
+                self.duration_secs.map(|s| format!("{:02}:{:02}", s / 60, s % 60))
+            }),
+            mbid: self.mbid.clone(),
+            release_mbid: self.release_mbid.clone(),
+        }
+    }
+
+    pub fn from_mb_track(track: Track, variant_label: Option<String>) -> Self {
+        let duration_secs = track.duration_secs();
+        let cover_url = track.release_mbid.as_ref().map(|rmbid| {
+            format!("https://coverartarchive.org/release/{rmbid}/front-250")
+        });
+        Self {
+            id: track.id,
+            title: track.title,
+            artist: track.artist,
+            artist_id: None,
+            album_id: track.album_id,
+            album_title: track.album_title,
+            release_date: track.release_date,
+            duration: track.duration,
+            duration_secs,
+            mbid: track.mbid,
+            release_mbid: track.release_mbid,
+            cover_url,
+            variant_label,
+            provider: CatalogProvider::Musicbrainz,
+        }
+    }
+}
+
+/// A remote catalog album returned by unified search or an artist's discography.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogAlbum {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_release_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_types: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_count: Option<u32>,
+    pub provider: CatalogProvider,
+}
+
+impl CatalogAlbum {
+    pub fn to_album(&self) -> Album {
+        Album {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            artist: self.artist.clone(),
+            release_date: self.release_date.clone(),
+            mbid: self.mbid.clone(),
+            cover_url: self.cover_url.clone(),
+            release_types: self.release_types.clone(),
+            first_release_date: self.first_release_date.clone(),
+        }
+    }
+
+    pub fn from_mb_album(album: Album) -> Self {
+        let cover_url = album.cover_url.or_else(|| {
+            album
+                .mbid
+                .as_ref()
+                .map(|m| format!("https://coverartarchive.org/release/{m}/front-250"))
+        });
+        Self {
+            id: album.id,
+            title: album.title,
+            artist: album.artist,
+            artist_id: None,
+            release_date: album.release_date,
+            first_release_date: album.first_release_date,
+            cover_url,
+            mbid: album.mbid,
+            release_types: album.release_types,
+            track_count: None,
+            provider: CatalogProvider::Musicbrainz,
+        }
+    }
+}
+
+/// A remote catalog artist returned by unified search or disambiguation lists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogArtist {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disambiguation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mbid: Option<String>,
+    pub provider: CatalogProvider,
+}
+
+/// Response for `POST /api/metadata/search/unified`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnifiedCatalogSearch {
+    pub query: String,
+    pub provider: CatalogProvider,
+    /// True when the primary provider returned nothing or failed and MusicBrainz served the result.
+    #[serde(default)]
+    pub fallback_used: bool,
+    #[serde(default)]
+    pub tracks: Vec<CatalogTrack>,
+    #[serde(default)]
+    pub albums: Vec<CatalogAlbum>,
+    #[serde(default)]
+    pub artists: Vec<CatalogArtist>,
+}
+
+/// Full remote album detail (album metadata + ordered tracklist).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogAlbumDetail {
+    pub album: CatalogAlbum,
+    #[serde(default)]
+    pub tracks: Vec<CatalogTrack>,
+}
+
+/// Full remote artist detail (artist info + top tracks + discography).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtistCatalog {
+    pub artist: CatalogArtist,
+    pub provider: CatalogProvider,
+    #[serde(default)]
+    pub others: Vec<CatalogArtist>,
+    #[serde(default)]
+    pub top_tracks: Vec<CatalogTrack>,
+    #[serde(default)]
+    pub albums: Vec<CatalogAlbum>,
+    #[serde(default)]
+    pub albums_complete: bool,
+    #[serde(default)]
+    pub singles_complete: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

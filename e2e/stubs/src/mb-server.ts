@@ -82,16 +82,22 @@ function weakHit(hit: RecordingHit): RecordingHit {
  */
 const RELEASE_TO_SHOW = 'NOT (status:* AND NOT status:official)';
 
+function unescapeLucene(value: string): string {
+  return value.replace(/\\(.)/g, '$1').toLowerCase().trim();
+}
+
 /**
  * Parses the Lucene subset the two clients emit: `field:"phrase"` pairs
- * whose `"` and `\` are escaped (Soulful) and `field:(escaped terms)`
- * groups (beets), joined with AND or whitespace. Soulful's artist filter is
- * `(name:"phrase" OR arid:"mbid" ...)`; every `arid` is kept in `arids`.
- * Soulful's discography search is `arid:"mbid" AND (primarytype:album OR
- * primarytype:ep) AND [NOT ]secondarytype:*` or `arid:"mbid" AND
- * primarytype:single`, then `AND RELEASE_TO_SHOW`: every `primarytype` is
- * kept in `primaryTypes`, `secondarytype:*` sets `hasSecondaryType`, false
- * after NOT, and RELEASE_TO_SHOW sets `releaseToShow`.
+ * whose `"` and `\` are escaped (Soulful), single-box multi-word OR queries
+ * `(field:"phrase"^8 OR ((field:"t1" OR artist:"t1") AND ...))` (Soulful),
+ * and `field:(escaped terms)` groups (beets), joined with AND or whitespace.
+ * Soulful's artist filter is `(name:"phrase" OR arid:"mbid" ...)`; every
+ * `arid` is kept in `arids`. Soulful's discography search is `arid:"mbid" AND
+ * (primarytype:album OR primarytype:ep) AND [NOT ]secondarytype:*` or
+ * `arid:"mbid" AND primarytype:single`, then `AND RELEASE_TO_SHOW`: every
+ * `primarytype` is kept in `primaryTypes`, `secondarytype:*` sets
+ * `hasSecondaryType`, false after NOT, and RELEASE_TO_SHOW sets
+ * `releaseToShow`.
  */
 function parseLucene(query: string): {
   fields: Map<string, string>;
@@ -100,14 +106,47 @@ function parseLucene(query: string): {
   hasSecondaryType: boolean | undefined;
   releaseToShow: boolean;
   freeText: string[];
+  multiWordExact: string | undefined;
+  multiWordTokens: string[];
 } {
   const fields = new Map<string, string>();
   const arids: string[] = [];
   const primaryTypes: string[] = [];
   let hasSecondaryType: boolean | undefined;
   const releaseToShow = query.includes(RELEASE_TO_SHOW);
-  // The rest, parsed field by field.
-  const clauses = query.replace(RELEASE_TO_SHOW, ' ');
+  // Strip discography status clause and video exclusion before field parsing.
+  const clauses = query
+    .replace(RELEASE_TO_SHOW, ' ')
+    .replace(/\bAND\s+NOT\s+video:true\b/gi, ' ')
+    .trim();
+
+  // Single-box multi-word query: `(field:"phrase"^8 OR ((field:"t1" OR name:"t1") AND ...))`
+  const multiWordMatch =
+    /^\((?:recording|releasegroup):"((?:[^"\\]|\\.)*)"\^8\s+OR\s+\((.+)\)\)$/i.exec(clauses);
+  if (multiWordMatch) {
+    const multiWordExact = unescapeLucene(multiWordMatch[1] ?? '');
+    const tokenPattern =
+      /\((?:recording|releasegroup):"((?:[^"\\]|\\.)*)"\s+OR\s+(?:artistname|artist):"((?:[^"\\]|\\.)*)"\)/gi;
+    const multiWordTokens: string[] = [];
+    let tokenMatch: RegExpExecArray | null;
+    while ((tokenMatch = tokenPattern.exec(multiWordMatch[2] ?? '')) !== null) {
+      const token = unescapeLucene(tokenMatch[1] ?? '');
+      if (token.length > 0) {
+        multiWordTokens.push(token);
+      }
+    }
+    return {
+      fields,
+      arids,
+      primaryTypes,
+      hasSecondaryType,
+      releaseToShow,
+      freeText: [],
+      multiWordExact,
+      multiWordTokens,
+    };
+  }
+
   const fieldPattern = /([a-z]+):(?:"((?:[^"\\]|\\.)*)"|\(([^)]*)\)|([^\s()]+))/gi;
   let match: RegExpExecArray | null;
   const consumed: string[] = [];
@@ -116,7 +155,7 @@ function parseLucene(query: string): {
     const value = match[2] ?? match[3] ?? match[4] ?? '';
     // beets escapes Lucene metacharacters, and Soulful a phrase's quote and
     // backslash, with backslashes; undo that.
-    const text = value.replace(/\\(.)/g, '$1').toLowerCase().trim();
+    const text = unescapeLucene(value);
     if (key === 'arid') {
       arids.push(text);
     } else if (key === 'primarytype') {
@@ -137,7 +176,16 @@ function parseLucene(query: string): {
     .toLowerCase()
     .split(/\s+/)
     .filter((t) => t.length > 0);
-  return { fields, arids, primaryTypes, hasSecondaryType, releaseToShow, freeText };
+  return {
+    fields,
+    arids,
+    primaryTypes,
+    hasSecondaryType,
+    releaseToShow,
+    freeText,
+    multiWordExact: undefined,
+    multiWordTokens: [],
+  };
 }
 
 /**
@@ -183,8 +231,37 @@ interface RecordingHit {
   track: FixtureTrack;
 }
 
+function matchesMultiWord(
+  itemTitle: string,
+  artistName: string,
+  exactPhrase: string,
+  tokens: string[],
+): boolean {
+  if (exactPhrase.length > 0 && matchesText(itemTitle, exactPhrase)) {
+    return true;
+  }
+  if (tokens.length === 0) {
+    return false;
+  }
+  return tokens.every(
+    (token) => matchesText(itemTitle, token) || matchesText(artistName, token),
+  );
+}
+
 function searchRecordings(query: string): RecordingHit[] {
-  const { fields, arids, freeText } = parseLucene(query);
+  const { fields, arids, freeText, multiWordExact, multiWordTokens } = parseLucene(query);
+  if (multiWordExact !== undefined) {
+    const hits: RecordingHit[] = [];
+    for (const release of releases) {
+      for (const track of release.tracks) {
+        if (matchesMultiWord(track.title, release.artist, multiWordExact, multiWordTokens)) {
+          hits.push({ release, track });
+        }
+      }
+    }
+    return hits;
+  }
+
   const title = fields.get('recording') ?? fields.get('recordingaccent');
   const artist = fields.get('artistname') ?? fields.get('artist');
   const free = freeText.join(' ');
@@ -223,8 +300,22 @@ function releaseStatus(release: FixtureRelease): ReleaseStatus | null {
  * its releases have no status; each fixture group holds one release.
  */
 function searchReleaseGroups(query: string): FixtureRelease[] {
-  const { fields, arids, primaryTypes, hasSecondaryType, releaseToShow, freeText } =
-    parseLucene(query);
+  const {
+    fields,
+    arids,
+    primaryTypes,
+    hasSecondaryType,
+    releaseToShow,
+    freeText,
+    multiWordExact,
+    multiWordTokens,
+  } = parseLucene(query);
+  if (multiWordExact !== undefined) {
+    return releases.filter((release) =>
+      matchesMultiWord(release.title, release.artist, multiWordExact, multiWordTokens),
+    );
+  }
+
   const title =
     fields.get('releasegroup') ?? fields.get('releasegroupaccent') ?? fields.get('release');
   const artist = fields.get('artist') ?? fields.get('artistname');

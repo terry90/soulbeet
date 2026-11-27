@@ -46,5 +46,5 @@ test('returns to search results from the options view', async ({ context, page }
   await expect(page.getByText('Download Options')).toBeVisible();
 
   await page.getByRole('button', { name: 'Back' }).click();
-  await expect(page.getByText('Search Results')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Catalog', exact: true })).toBeVisible();
 });

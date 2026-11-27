@@ -3,6 +3,7 @@ pub mod archive;
 pub mod audio;
 pub mod backend_error;
 pub mod beets;
+pub mod catalog_rank;
 pub mod deezer;
 pub mod engine;
 pub mod error;

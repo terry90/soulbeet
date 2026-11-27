@@ -32,7 +32,10 @@ use crate::globals::{cleanup_stale_channels, USER_CHANNELS};
 pub mod acquire_play;
 pub use acquire_play::{acquire_and_play, list_archival_upgrades, trigger_archival_upgrade};
 pub mod auto_download;
-pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
+pub use auto_download::{
+    auto_download, download_catalog_album, AutoDownloadRequest, AutoDownloadResult,
+    DownloadCatalogAlbumRequest,
+};
 pub mod diagnostics;
 pub use diagnostics::get_job_diagnostics;
 

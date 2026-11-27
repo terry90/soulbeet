@@ -9,6 +9,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,6 +47,8 @@ import org.soulbeet.core.FfiConnectEvent
 import org.soulbeet.core.FfiConnectState
 import org.soulbeet.core.FfiDiscoveryTrack
 import org.soulbeet.core.FfiDrainReport
+import org.soulbeet.core.FfiOnlineAlbumMatch
+import org.soulbeet.core.FfiOnlineArtistMatch
 import org.soulbeet.core.FfiOnlineTrackMatch
 import org.soulbeet.core.FfiOutboxMutation
 import org.soulbeet.core.FfiOutboxSummary
@@ -53,6 +56,9 @@ import org.soulbeet.core.FfiPinState
 import org.soulbeet.core.FfiPinTarget
 import org.soulbeet.core.FfiPlaybackSnapshot
 import org.soulbeet.core.FfiPlaylist
+import org.soulbeet.core.FfiRemoteAlbumDetail
+import org.soulbeet.core.FfiRemoteArtistDetail
+import org.soulbeet.core.FfiRemoteCatalogResults
 import org.soulbeet.core.FfiSearchResults
 import org.soulbeet.core.FfiSyncReport
 import org.soulbeet.core.FfiTrack
@@ -79,11 +85,9 @@ enum class AppTab(val label: String) {
 
 enum class SearchFilter(val label: String) {
     ALL("All"),
-    IN_LIBRARY("In Library"),
-    CATALOG("Catalog"),
-    ARTISTS("Artists"),
+    TRACKS("Tracks"),
     ALBUMS("Albums"),
-    PLAYLISTS("Playlists"),
+    ARTISTS("Artists"),
 }
 
 enum class LibraryCategory(val label: String) {
@@ -119,6 +123,24 @@ data class ContainerDetailUi(
     val tracks: List<FfiTrack>,
 )
 
+data class RemoteAlbumDetailUi(
+    val album: FfiOnlineAlbumMatch,
+    val tracks: List<FfiOnlineTrackMatch> = emptyList(),
+    val isLoading: Boolean = true,
+    val error: String? = null,
+    val isDownloading: Boolean = false,
+    val downloadMessage: String? = null,
+    val downloadIsError: Boolean = false,
+    val returnToArtist: FfiOnlineArtistMatch? = null,
+)
+
+data class RemoteArtistDetailUi(
+    val artist: FfiOnlineArtistMatch,
+    val detail: FfiRemoteArtistDetail? = null,
+    val isLoading: Boolean = true,
+    val error: String? = null,
+)
+
 data class AppUiState(
     val isBooting: Boolean = true,
     val config: PersistedAppConfig = PersistedAppConfig(),
@@ -146,6 +168,8 @@ data class AppUiState(
     val searchFilter: SearchFilter = SearchFilter.ALL,
     val searchResults: FfiSearchResults? = null,
     val isSearching: Boolean = false,
+    val isSearchingRemote: Boolean = false,
+    val remoteSearchError: String? = null,
     val acquiringStages: Map<String, String> = emptyMap(),
     // Library
     val libraryCategory: LibraryCategory = LibraryCategory.PLAYLISTS,
@@ -173,6 +197,8 @@ data class AppUiState(
     val showSettingsSheet: Boolean = false,
     val showCultureEditor: Boolean = false,
     val selectedContainer: ContainerDetailUi? = null,
+    val remoteAlbumDetail: RemoteAlbumDetailUi? = null,
+    val remoteArtistDetail: RemoteArtistDetailUi? = null,
     val guardSheetPreview: DeleteGuardPreviewUi? = null,
     val isLoadingGuard: Boolean = false,
     val pendingDrop: PendingDropAction? = null,
@@ -236,7 +262,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val hiddenTriageIds = MutableStateFlow<Set<String>>(emptySet())
     private val inFlightTriageIds: MutableSet<String> = mutableSetOf()
-    private var searchJob: Job? = null
+    private var localSearchJob: Job? = null
+    private var remoteSearchJob: Job? = null
+    private val localSearchGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private val remoteSearchGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var remoteAlbumJob: Job? = null
+    private val remoteAlbumGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var remoteArtistJob: Job? = null
+    private val remoteArtistGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var downloadAlbumJob: Job? = null
+    private val downloadAlbumGen = java.util.concurrent.atomic.AtomicLong(0L)
     private var bannerClearJob: Job? = null
     private var contextualMixesJob: Job? = null
     private val contextualMixesGen = java.util.concurrent.atomic.AtomicLong(0L)
@@ -495,6 +530,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun disconnectSession() {
         val currentConfig = _uiState.value.config
         viewModelScope.launch {
+            localSearchJob?.cancel()
+            localSearchGen.incrementAndGet()
+            remoteSearchJob?.cancel()
+            remoteSearchGen.incrementAndGet()
+            remoteAlbumJob?.cancel()
+            remoteAlbumGen.incrementAndGet()
+            remoteArtistJob?.cancel()
+            remoteArtistGen.incrementAndGet()
+            downloadAlbumJob?.cancel()
+            downloadAlbumGen.incrementAndGet()
             _uiState.update { it.copy(showSettingsSheet = false, showNowPlayingSheet = false) }
             undoController.undo()
             mediaBridge.stopAndClear()
@@ -562,6 +607,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleOfflineOnly() {
         val next = !_uiState.value.config.offlineOnly
+        if (next) {
+            remoteSearchJob?.cancel()
+            remoteSearchGen.incrementAndGet()
+            remoteAlbumJob?.cancel()
+            remoteAlbumGen.incrementAndGet()
+            remoteArtistJob?.cancel()
+            remoteArtistGen.incrementAndGet()
+            downloadAlbumJob?.cancel()
+            downloadAlbumGen.incrementAndGet()
+        }
+        _uiState.update { state ->
+            state.copy(
+                config = state.config.copy(offlineOnly = next),
+                connectState = if (next) null else state.connectState,
+                isSearchingRemote = if (next) false else state.isSearchingRemote,
+                remoteSearchError = if (next) null else state.remoteSearchError,
+                remoteAlbumDetail = if (next) null else state.remoteAlbumDetail,
+                remoteArtistDetail = if (next) null else state.remoteArtistDetail,
+            )
+        }
         viewModelScope.launch {
             prefsStore.setOfflineOnly(next)
             val core = SoulbeetCoreProvider.getOrNull()
@@ -572,15 +637,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     runCatching { core?.disconnectWs() }
                 }
-                _uiState.update { it.copy(connectState = null) }
             } else if (core != null) {
                 connectWsIfOnline(core)
                 SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
             }
 
             refreshLibrarySnapshot()
-            if (_uiState.value.searchQuery.isNotBlank()) {
-                runUnifiedSearch(_uiState.value.searchQuery)
+            val activeQuery = _uiState.value.searchQuery.trim()
+            if (activeQuery.isNotEmpty()) {
+                launchSplitSearch(query = activeQuery, localDelayMs = 0L, remoteDelayMs = 0L, isOfflineOnly = next)
             }
             showNotice(if (next) "Offline Only mode active" else "Back online")
         }
@@ -1377,29 +1442,60 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // =========================================================================
-    // Unified Search & 1-Tap Acquire & Play (Live WebSocket Stage Tracking)
+    // Unified Search, Remote Drill-Down & 1-Tap Acquire & Play
     // =========================================================================
 
     fun onSearchQueryChanged(query: String) {
         _uiState.update { it.copy(searchQuery = query) }
-        searchJob?.cancel()
-        if (query.isBlank()) {
-            _uiState.update { it.copy(searchResults = null, isSearching = false) }
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) {
+            localSearchJob?.cancel()
+            remoteSearchJob?.cancel()
+            localSearchGen.incrementAndGet()
+            remoteSearchGen.incrementAndGet()
+            _uiState.update {
+                it.copy(
+                    searchResults = null,
+                    isSearching = false,
+                    isSearchingRemote = false,
+                    remoteSearchError = null,
+                )
+            }
             return
         }
-        searchJob = viewModelScope.launch {
-            delay(160L)
-            runUnifiedSearch(query)
-        }
+        launchSplitSearch(
+            query = trimmed,
+            localDelayMs = LOCAL_SEARCH_DEBOUNCE_MS,
+            remoteDelayMs = REMOTE_SEARCH_DEBOUNCE_MS,
+            isOfflineOnly = _uiState.value.config.offlineOnly,
+        )
     }
 
-    fun submitSearch(query: String) {
+    fun submitSearch(query: String = _uiState.value.searchQuery) {
         val trimmed = query.trim()
         _uiState.update { it.copy(searchQuery = trimmed) }
-        if (trimmed.isEmpty()) return
+        if (trimmed.isEmpty()) {
+            localSearchJob?.cancel()
+            remoteSearchJob?.cancel()
+            localSearchGen.incrementAndGet()
+            remoteSearchGen.incrementAndGet()
+            _uiState.update {
+                it.copy(
+                    searchResults = null,
+                    isSearching = false,
+                    isSearchingRemote = false,
+                    remoteSearchError = null,
+                )
+            }
+            return
+        }
         viewModelScope.launch { prefsStore.addRecentSearch(trimmed) }
-        searchJob?.cancel()
-        searchJob = viewModelScope.launch { runUnifiedSearch(trimmed) }
+        launchSplitSearch(
+            query = trimmed,
+            localDelayMs = 0L,
+            remoteDelayMs = 0L,
+            isOfflineOnly = _uiState.value.config.offlineOnly,
+        )
     }
 
     fun clearRecentSearches() {
@@ -1410,13 +1506,382 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(searchFilter = filter) }
     }
 
-    private suspend fun runUnifiedSearch(query: String) {
-        val core = SoulbeetCoreProvider.getOrNull() ?: return
-        _uiState.update { it.copy(isSearching = true) }
-        val results = withContext(Dispatchers.IO) {
-            runCatching { core.search(query = query, limit = 30u) }.getOrNull()
+    fun searchDeepCatalogMusicBrainz() {
+        val trimmed = _uiState.value.searchQuery.trim()
+        if (trimmed.isEmpty()) return
+        if (_uiState.value.config.offlineOnly) {
+            showNotice("Connect online to search MusicBrainz")
+            return
         }
-        _uiState.update { it.copy(searchResults = results, isSearching = false) }
+        remoteSearchJob?.cancel()
+        val rGen = remoteSearchGen.incrementAndGet()
+        _uiState.update { it.copy(isSearchingRemote = true, remoteSearchError = null) }
+        remoteSearchJob = viewModelScope.launch {
+            runRemoteSearch(query = trimmed, provider = "musicbrainz", gen = rGen, isOfflineOnly = false)
+        }
+    }
+
+    private fun launchSplitSearch(
+        query: String,
+        localDelayMs: Long,
+        remoteDelayMs: Long,
+        isOfflineOnly: Boolean,
+    ) {
+        localSearchJob?.cancel()
+        remoteSearchJob?.cancel()
+        val lGen = localSearchGen.incrementAndGet()
+        val rGen = remoteSearchGen.incrementAndGet()
+
+        _uiState.update {
+            it.copy(
+                isSearching = true,
+                isSearchingRemote = !isOfflineOnly,
+                remoteSearchError = null,
+            )
+        }
+
+        localSearchJob = viewModelScope.launch {
+            if (localDelayMs > 0L) delay(localDelayMs)
+            runLocalSearch(query = query, gen = lGen, isOfflineOnly = isOfflineOnly)
+        }
+
+        if (!isOfflineOnly) {
+            remoteSearchJob = viewModelScope.launch {
+                if (remoteDelayMs > 0L) delay(remoteDelayMs)
+                runRemoteSearch(query = query, provider = null, gen = rGen, isOfflineOnly = false)
+            }
+        }
+    }
+
+    private suspend fun runLocalSearch(query: String, gen: Long, isOfflineOnly: Boolean) {
+        val core = SoulbeetCoreProvider.getOrNull()
+        if (core == null) {
+            if (localSearchGen.get() == gen) {
+                _uiState.update { it.copy(isSearching = false) }
+            }
+            return
+        }
+        val local = try {
+            withContext(Dispatchers.IO) {
+                core.searchLocal(query = query, limit = 30u)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        if (localSearchGen.get() != gen || !_uiState.value.searchQuery.trim().equals(query, ignoreCase = true)) {
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                searchResults = if (local != null) {
+                    mergeLocalSearchResults(
+                        current = state.searchResults,
+                        local = local,
+                        isOfflineOnly = isOfflineOnly,
+                    )
+                } else {
+                    state.searchResults
+                },
+                isSearching = false,
+            )
+        }
+    }
+
+    private suspend fun runRemoteSearch(query: String, provider: String?, gen: Long, isOfflineOnly: Boolean) {
+        val core = SoulbeetCoreProvider.getOrNull()
+        if (core == null || isOfflineOnly) {
+            if (remoteSearchGen.get() == gen) {
+                _uiState.update { it.copy(isSearchingRemote = false) }
+            }
+            return
+        }
+        try {
+            val remote = withContext(Dispatchers.IO) {
+                core.searchRemote(query = query, provider = provider, limit = 20u)
+            }
+            if (remoteSearchGen.get() != gen || !_uiState.value.searchQuery.trim().equals(query, ignoreCase = true)) {
+                return
+            }
+            _uiState.update { state ->
+                state.copy(
+                    searchResults = mergeRemoteCatalogResults(
+                        current = state.searchResults,
+                        query = query,
+                        remote = remote,
+                    ),
+                    isSearchingRemote = false,
+                    remoteSearchError = null,
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (remoteSearchGen.get() != gen) return
+            _uiState.update {
+                it.copy(
+                    isSearchingRemote = false,
+                    remoteSearchError = e.localizedMessage ?: "Catalog search failed",
+                )
+            }
+        }
+    }
+
+    fun openRemoteAlbum(album: FfiOnlineAlbumMatch, returnToArtist: FfiOnlineArtistMatch? = null) {
+        if (_uiState.value.config.offlineOnly) {
+            showNotice("Connect online to view catalog album")
+            return
+        }
+        remoteAlbumJob?.cancel()
+        downloadAlbumJob?.cancel()
+        downloadAlbumGen.incrementAndGet()
+        val gen = remoteAlbumGen.incrementAndGet()
+        _uiState.update {
+            it.copy(
+                remoteAlbumDetail = RemoteAlbumDetailUi(
+                    album = album,
+                    tracks = emptyList(),
+                    isLoading = true,
+                    error = null,
+                    isDownloading = false,
+                    downloadMessage = null,
+                    downloadIsError = false,
+                    returnToArtist = returnToArtist,
+                ),
+            )
+        }
+        remoteAlbumJob = viewModelScope.launch {
+            val core = SoulbeetCoreProvider.getOrNull()
+            if (core == null) {
+                if (remoteAlbumGen.get() == gen) {
+                    _uiState.update { state ->
+                        state.copy(
+                            remoteAlbumDetail = state.remoteAlbumDetail?.copy(
+                                isLoading = false,
+                                error = "Core client is not initialized",
+                            ),
+                        )
+                    }
+                }
+                return@launch
+            }
+            try {
+                val detail: FfiRemoteAlbumDetail = withContext(Dispatchers.IO) {
+                    core.getRemoteAlbum(album.id)
+                }
+                if (remoteAlbumGen.get() != gen) return@launch
+                _uiState.update { state ->
+                    val current = state.remoteAlbumDetail ?: return@update state
+                    state.copy(
+                        remoteAlbumDetail = current.copy(
+                            album = detail.album,
+                            tracks = detail.tracks,
+                            isLoading = false,
+                            error = null,
+                        ),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (remoteAlbumGen.get() != gen) return@launch
+                _uiState.update { state ->
+                    val current = state.remoteAlbumDetail ?: return@update state
+                    state.copy(
+                        remoteAlbumDetail = current.copy(
+                            isLoading = false,
+                            error = e.localizedMessage ?: "Failed to load album tracks",
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun closeRemoteAlbum() {
+        remoteAlbumJob?.cancel()
+        remoteAlbumGen.incrementAndGet()
+        downloadAlbumJob?.cancel()
+        downloadAlbumGen.incrementAndGet()
+        val returnArtist = _uiState.value.remoteAlbumDetail?.returnToArtist
+        val currentArtistSheet = _uiState.value.remoteArtistDetail
+        _uiState.update { it.copy(remoteAlbumDetail = null) }
+        if (returnArtist != null && currentArtistSheet == null) {
+            openRemoteArtist(returnArtist)
+        }
+    }
+
+    fun downloadRemoteAlbum(album: FfiOnlineAlbumMatch) {
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            _uiState.update { state ->
+                val current = state.remoteAlbumDetail ?: return@update state
+                if (current.album.id != album.id) return@update state
+                state.copy(
+                    remoteAlbumDetail = current.copy(
+                        isDownloading = false,
+                        downloadMessage = "Connect online to download albums",
+                        downloadIsError = true,
+                    ),
+                )
+            }
+            return
+        }
+        val activeDetail = _uiState.value.remoteAlbumDetail
+        if (activeDetail != null && activeDetail.album.id == album.id && activeDetail.isDownloading) {
+            return
+        }
+        downloadAlbumJob?.cancel()
+        val gen = downloadAlbumGen.incrementAndGet()
+        _uiState.update { state ->
+            val current = state.remoteAlbumDetail ?: return@update state
+            if (current.album.id != album.id) return@update state
+            state.copy(
+                remoteAlbumDetail = current.copy(
+                    isDownloading = true,
+                    downloadMessage = null,
+                    downloadIsError = false,
+                ),
+            )
+        }
+        downloadAlbumJob = viewModelScope.launch {
+            val core = SoulbeetCoreProvider.getOrNull()
+            if (core == null) {
+                if (downloadAlbumGen.get() != gen) return@launch
+                _uiState.update { state ->
+                    val current = state.remoteAlbumDetail ?: return@update state
+                    if (current.album.id != album.id) return@update state
+                    state.copy(
+                        remoteAlbumDetail = current.copy(
+                            isDownloading = false,
+                            downloadMessage = "Core client is not initialized",
+                            downloadIsError = true,
+                        ),
+                    )
+                }
+                return@launch
+            }
+            try {
+                withContext(Dispatchers.IO) {
+                    core.downloadRemoteAlbum(album)
+                }
+                if (downloadAlbumGen.get() != gen) return@launch
+                val displayMsg = formatDownloadAlbumQueuedMessage(album.title)
+                _uiState.update { state ->
+                    val current = state.remoteAlbumDetail ?: return@update state
+                    if (current.album.id != album.id) return@update state
+                    state.copy(
+                        remoteAlbumDetail = current.copy(
+                            isDownloading = false,
+                            downloadMessage = displayMsg,
+                            downloadIsError = false,
+                        ),
+                    )
+                }
+                showNotice(displayMsg)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (downloadAlbumGen.get() != gen) return@launch
+                val errMsg = e.localizedMessage ?: "Failed to queue album download"
+                _uiState.update { state ->
+                    val current = state.remoteAlbumDetail ?: return@update state
+                    if (current.album.id != album.id) return@update state
+                    state.copy(
+                        remoteAlbumDetail = current.copy(
+                            isDownloading = false,
+                            downloadMessage = errMsg,
+                            downloadIsError = true,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun openRemoteArtist(artist: FfiOnlineArtistMatch) {
+        if (_uiState.value.config.offlineOnly) {
+            showNotice("Connect online to view catalog artist")
+            return
+        }
+        remoteAlbumJob?.cancel()
+        remoteAlbumGen.incrementAndGet()
+        downloadAlbumJob?.cancel()
+        downloadAlbumGen.incrementAndGet()
+        remoteArtistJob?.cancel()
+        val gen = remoteArtistGen.incrementAndGet()
+        _uiState.update {
+            it.copy(
+                remoteAlbumDetail = null,
+                remoteArtistDetail = RemoteArtistDetailUi(
+                    artist = artist,
+                    detail = null,
+                    isLoading = true,
+                    error = null,
+                ),
+            )
+        }
+        remoteArtistJob = viewModelScope.launch {
+            val core = SoulbeetCoreProvider.getOrNull()
+            if (core == null) {
+                if (remoteArtistGen.get() == gen) {
+                    _uiState.update { state ->
+                        state.copy(
+                            remoteArtistDetail = state.remoteArtistDetail?.copy(
+                                isLoading = false,
+                                error = "Core client is not initialized",
+                            ),
+                        )
+                    }
+                }
+                return@launch
+            }
+            try {
+                val detail = withContext(Dispatchers.IO) {
+                    core.getRemoteArtist(artistId = artist.id, name = artist.name)
+                }
+                if (remoteArtistGen.get() != gen) return@launch
+                _uiState.update { state ->
+                    val current = state.remoteArtistDetail ?: return@update state
+                    if (detail != null) {
+                        state.copy(
+                            remoteArtistDetail = current.copy(
+                                artist = detail.artist,
+                                detail = detail,
+                                isLoading = false,
+                                error = null,
+                            ),
+                        )
+                    } else {
+                        state.copy(
+                            remoteArtistDetail = current.copy(
+                                isLoading = false,
+                                error = "Artist details were not found in the catalog",
+                            ),
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (remoteArtistGen.get() != gen) return@launch
+                _uiState.update { state ->
+                    val current = state.remoteArtistDetail ?: return@update state
+                    state.copy(
+                        remoteArtistDetail = current.copy(
+                            isLoading = false,
+                            error = e.localizedMessage ?: "Failed to load artist details",
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun closeRemoteArtist() {
+        remoteArtistJob?.cancel()
+        _uiState.update { it.copy(remoteArtistDetail = null) }
     }
 
     fun acquireAndPlayTrack(match: FfiOnlineTrackMatch) {
@@ -1425,7 +1890,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Acquire & Play requires an online connection")
             return
         }
-        val key = acquireTrackKey(match.mbid, match.artist, match.title, match.album)
+        val key = acquireTrackKey(match)
         if (_uiState.value.acquiringStages.containsKey(key)) return
 
         viewModelScope.launch {
@@ -1434,9 +1899,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 config = cfg,
                 artist = match.artist,
                 title = match.title,
-                album = match.album,
-                recordingMbid = match.mbid,
-                durationSecs = match.durationSecs?.toLong(),
+                album = match.album.trim().takeIf { it.isNotEmpty() },
+                recordingMbid = match.mbid.trim().takeIf { it.isNotEmpty() },
+                durationSecs = match.durationSecs.toLong().takeIf { it > 0L },
             )
             when (outcome) {
                 is AcquireAndPlayOutcome.AlreadyOwned -> {
@@ -2133,26 +2598,142 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val IMMEDIATE_PIN_DOWNLOAD_CAP = 25
         private const val WORK_IMMEDIATE_AUTO_CACHE = "soulbeet_immediate_auto_cache"
+        private const val LOCAL_SEARCH_DEBOUNCE_MS = 60L
+        private const val REMOTE_SEARCH_DEBOUNCE_MS = 250L
     }
 }
 
 /**
  * Stable per-row key for tracking in-flight Acquire & Play progress on catalog search results.
- * Prefers the MusicBrainz recording MBID so distinct recordings with identical artist and title
- * (for example studio vs live or compilation releases) never share a loading indicator.
+ * Prefers a non-empty MusicBrainz recording MBID, then a non-empty provider track ID (so Deezer
+ * tracks without MBIDs remain collision-free), and finally falls back to Unicode `Locale.ROOT`
+ * `artist::title::album`.
  */
 internal fun acquireTrackKey(
     mbid: String?,
     artist: String,
     title: String,
     album: String? = null,
+    trackId: String? = null,
 ): String {
     val trimmedMbid = mbid?.trim().orEmpty()
     if (trimmedMbid.isNotEmpty()) {
         return "mbid:${trimmedMbid.lowercase(java.util.Locale.ROOT)}"
     }
+    val trimmedTrackId = trackId?.trim().orEmpty()
+    if (trimmedTrackId.isNotEmpty()) {
+        return "id:${trimmedTrackId.lowercase(java.util.Locale.ROOT)}"
+    }
     val normArtist = artist.trim().lowercase(java.util.Locale.ROOT)
     val normTitle = title.trim().lowercase(java.util.Locale.ROOT)
     val normAlbum = album?.trim().orEmpty().lowercase(java.util.Locale.ROOT)
     return "$normArtist::$normTitle::$normAlbum"
+}
+
+internal fun acquireTrackKey(match: FfiOnlineTrackMatch): String = acquireTrackKey(
+    mbid = match.mbid,
+    artist = match.artist,
+    title = match.title,
+    album = match.album,
+    trackId = match.id,
+)
+
+internal fun mergeLocalSearchResults(
+    current: FfiSearchResults?,
+    local: FfiSearchResults,
+    isOfflineOnly: Boolean,
+): FfiSearchResults {
+    val preserveRemote = !isOfflineOnly &&
+        current != null &&
+        current.query.trim().equals(local.query.trim(), ignoreCase = true)
+    return if (preserveRemote) {
+        local.copy(
+            offlineOnly = false,
+            onlineTracks = current!!.onlineTracks,
+            onlineAlbums = current.onlineAlbums,
+            onlineArtists = current.onlineArtists,
+            remoteProvider = current.remoteProvider,
+            remoteFallbackUsed = current.remoteFallbackUsed,
+        )
+    } else {
+        local.copy(offlineOnly = isOfflineOnly)
+    }
+}
+
+internal fun mergeRemoteCatalogResults(
+    current: FfiSearchResults?,
+    query: String,
+    remote: FfiRemoteCatalogResults,
+): FfiSearchResults {
+    val base = current?.takeIf { it.query.trim().equals(query.trim(), ignoreCase = true) }
+        ?: FfiSearchResults(
+            query = query,
+            offlineOnly = false,
+            elapsedMs = 0uL,
+            localTracks = emptyList(),
+            localAlbums = emptyList(),
+            localArtists = emptyList(),
+            onlineTracks = emptyList(),
+            onlineAlbums = emptyList(),
+            onlineArtists = emptyList(),
+            remoteProvider = null,
+            remoteFallbackUsed = false,
+        )
+    return base.copy(
+        offlineOnly = false,
+        onlineTracks = remote.tracks,
+        onlineAlbums = remote.albums,
+        onlineArtists = remote.artists,
+        remoteProvider = remote.provider,
+        remoteFallbackUsed = remote.fallbackUsed,
+    )
+}
+
+internal fun formatFanCount(fanCount: ULong?): String? {
+    val count = fanCount ?: return null
+    if (count == 0uL) return null
+    return when {
+        count >= 1_000_000uL -> {
+            val millions = count.toDouble() / 1_000_000.0
+            val formatted = String.format(java.util.Locale.ROOT, "%.1f", millions).removeSuffix(".0")
+            "${formatted}M fans"
+        }
+        count >= 1_000uL -> {
+            val thousands = count.toDouble() / 1_000.0
+            val formatted = String.format(java.util.Locale.ROOT, "%.1f", thousands).removeSuffix(".0")
+            "${formatted}K fans"
+        }
+        count == 1uL -> "1 fan"
+        else -> "$count fans"
+    }
+}
+
+internal fun formatReleaseYear(releaseDate: String?): String? {
+    val trimmed = releaseDate?.trim().orEmpty()
+    if (trimmed.length < 4) return null
+    val prefix = trimmed.substring(0, 4)
+    return if (prefix.all { it.isDigit() }) prefix else null
+}
+
+internal fun formatRemoteAlbumMeta(album: FfiOnlineAlbumMatch): String {
+    val parts = mutableListOf<String>()
+    formatReleaseYear(album.releaseDate)?.let { parts.add(it) }
+    val types = album.releaseTypes.map { it.trim() }.filter { it.isNotEmpty() }
+    if (types.isNotEmpty()) {
+        parts.add(types.joinToString(" / "))
+    }
+    val trackCount = album.trackCount
+    if (trackCount != null && trackCount > 0u) {
+        parts.add(if (trackCount == 1u) "1 track" else "$trackCount tracks")
+    }
+    return parts.joinToString(" · ")
+}
+
+internal fun formatDownloadAlbumQueuedMessage(albumTitle: String): String {
+    val trimmed = albumTitle.trim()
+    return if (trimmed.isNotEmpty()) {
+        "Queued \"$trimmed\" for download"
+    } else {
+        "Queued album for download"
+    }
 }

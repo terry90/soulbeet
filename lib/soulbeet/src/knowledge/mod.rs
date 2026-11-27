@@ -23,6 +23,8 @@ pub const TTL_RECORDINGS: Duration = Duration::from_secs(30 * 86_400);
 pub const TTL_MBID: Duration = Duration::from_secs(30 * 86_400);
 pub const TTL_DEEZER_ARTIST: Duration = Duration::from_secs(30 * 86_400);
 pub const TTL_DEEZER_RADIO: Duration = Duration::from_secs(7 * 86_400);
+pub const TTL_DEEZER_SEARCH: Duration = Duration::from_secs(6 * 3_600);
+pub const TTL_DEEZER_DETAIL: Duration = Duration::from_secs(24 * 3_600);
 
 #[derive(Error, Debug)]
 #[error("{0}")]

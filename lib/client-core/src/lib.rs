@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
+use shared::metadata::CatalogProvider;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
@@ -30,7 +31,8 @@ use crate::models::{
     ConnectCommandDto, DrainReport, LibraryStats, LocalAlbum, LocalArtist, LocalDiscoveryTrack,
     LocalPlaylist, LocalTrack, NavidromeCredentials, OfflineTrackEntry, OutboxMutation, OutboxRow,
     OutboxSummary, PersistedPlaybackSession, PinRecord, PinTarget, PlaybackSnapshotDto,
-    PlaybackSource, SearchResults, SoulbeetAuth, SyncReport, VoiceMatchResult,
+    PlaybackSource, RemoteAlbumDetail, RemoteArtistDetail, RemoteCatalogAlbum,
+    RemoteCatalogResults, SearchResults, SoulbeetAuth, SyncReport, VoiceMatchResult,
 };
 use crate::outbox::MutationOutbox;
 use crate::search::SearchEngine;
@@ -392,6 +394,55 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn search_local(&self, query: &str, limit: usize) -> CoreResult<SearchResults> {
+        self.search
+            .search_local(query, limit, self.is_offline_only())
+            .await
+    }
+
+    pub async fn search_remote(
+        &self,
+        query: &str,
+        provider: Option<&str>,
+        limit: usize,
+    ) -> CoreResult<RemoteCatalogResults> {
+        let parsed_provider = parse_catalog_provider(provider)?;
+        self.search
+            .search_remote(query, parsed_provider, limit, self.is_offline_only())
+            .await
+    }
+
+    pub async fn get_remote_album(&self, album_id: &str) -> CoreResult<RemoteAlbumDetail> {
+        if self.is_offline_only() {
+            return Err(CoreError::Offline(
+                "remote album detail disabled in offline_only mode".into(),
+            ));
+        }
+        self.search.get_remote_album(album_id).await
+    }
+
+    pub async fn get_remote_artist(
+        &self,
+        artist_id: &str,
+        name: Option<&str>,
+    ) -> CoreResult<Option<RemoteArtistDetail>> {
+        if self.is_offline_only() {
+            return Err(CoreError::Offline(
+                "remote artist detail disabled in offline_only mode".into(),
+            ));
+        }
+        self.search.get_remote_artist(artist_id, name).await
+    }
+
+    pub async fn download_remote_album(&self, album: &RemoteCatalogAlbum) -> CoreResult<String> {
+        if self.is_offline_only() {
+            return Err(CoreError::Offline(
+                "remote album download disabled in offline_only mode".into(),
+            ));
+        }
+        self.search.download_remote_album(album).await
+    }
+
     pub fn auto_root_tabs(&self) -> Vec<AutoBrowseNode> {
         self.auto_browse.root_tabs()
     }
@@ -467,5 +518,20 @@ impl SoulbeetCore {
         self.connect
             .transfer_playback_to(target_device_id, snapshot)
             .await
+    }
+}
+
+fn parse_catalog_provider(provider: Option<&str>) -> CoreResult<Option<CatalogProvider>> {
+    let Some(raw) = provider.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.eq_ignore_ascii_case("deezer") {
+        Ok(Some(CatalogProvider::Deezer))
+    } else if raw.eq_ignore_ascii_case("musicbrainz") {
+        Ok(Some(CatalogProvider::Musicbrainz))
+    } else {
+        Err(CoreError::InvalidInput(format!(
+            "unsupported catalog provider: {raw}"
+        )))
     }
 }

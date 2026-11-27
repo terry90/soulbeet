@@ -26,6 +26,132 @@ pub struct DeezerPlaylist {
     pub tracks: Vec<DeezerPlaylistTrack>,
 }
 
+/// Artist reference embedded inside Deezer track and album payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerTrackArtist {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub picture_medium: Option<String>,
+}
+
+/// Album reference embedded inside Deezer track payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerTrackAlbum {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub cover_medium: Option<String>,
+    #[serde(default)]
+    pub cover_big: Option<String>,
+}
+
+/// A track hit from `/search/track` or `/artist/{id}/top`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerSearchTrack {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub title_short: Option<String>,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub rank: u64,
+    pub artist: DeezerTrackArtist,
+    pub album: DeezerTrackAlbum,
+}
+
+/// An album hit from `/search/album`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerSearchAlbum {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub cover_medium: Option<String>,
+    #[serde(default)]
+    pub cover_big: Option<String>,
+    #[serde(default)]
+    pub nb_tracks: Option<u32>,
+    #[serde(default)]
+    pub record_type: Option<String>,
+    pub artist: DeezerTrackArtist,
+}
+
+/// An artist hit from `/search/artist`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerSearchArtist {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub picture_medium: Option<String>,
+    #[serde(default)]
+    pub picture_big: Option<String>,
+    #[serde(default)]
+    pub nb_fan: Option<u64>,
+    #[serde(default)]
+    pub nb_album: Option<u32>,
+}
+
+/// A track inside a Deezer `/album/{id}` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerAlbumTrack {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub duration: u32,
+    pub artist: DeezerTrackArtist,
+}
+
+/// Full album metadata and tracklist from `/album/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerAlbumDetail {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub cover_medium: Option<String>,
+    #[serde(default)]
+    pub cover_big: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub record_type: Option<String>,
+    #[serde(default)]
+    pub nb_tracks: Option<u32>,
+    pub artist: DeezerTrackArtist,
+    #[serde(default)]
+    pub tracks: Vec<DeezerAlbumTrack>,
+}
+
+/// Artist metadata from `/artist/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerArtistDetail {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub picture_medium: Option<String>,
+    #[serde(default)]
+    pub picture_big: Option<String>,
+    #[serde(default)]
+    pub nb_fan: Option<u64>,
+    #[serde(default)]
+    pub nb_album: Option<u32>,
+}
+
+/// An album entry from `/artist/{id}/albums`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeezerArtistAlbum {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub cover_medium: Option<String>,
+    #[serde(default)]
+    pub cover_big: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub record_type: Option<String>,
+}
+
 /// Deezer answers errors with HTTP 200 and an `error` object.
 #[derive(Debug, Deserialize)]
 pub(super) struct Envelope<T> {
@@ -55,6 +181,60 @@ pub(super) struct RadioTrack {
 #[derive(Debug, Deserialize)]
 pub(super) struct RadioArtist {
     pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AlbumTrackItem {
+    pub id: u64,
+    pub title: String,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub artist: Option<DeezerTrackArtist>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AlbumTracksEnvelope {
+    #[serde(default)]
+    pub data: Vec<AlbumTrackItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AlbumDetailResponse {
+    pub id: Option<u64>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub cover_medium: Option<String>,
+    #[serde(default)]
+    pub cover_big: Option<String>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub record_type: Option<String>,
+    #[serde(default)]
+    pub nb_tracks: Option<u32>,
+    #[serde(default)]
+    pub artist: Option<DeezerTrackArtist>,
+    #[serde(default)]
+    pub tracks: Option<AlbumTracksEnvelope>,
+    #[serde(default)]
+    pub error: Option<ApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ArtistDetailResponse {
+    pub id: Option<u64>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub picture_medium: Option<String>,
+    #[serde(default)]
+    pub picture_big: Option<String>,
+    #[serde(default)]
+    pub nb_fan: Option<u64>,
+    #[serde(default)]
+    pub nb_album: Option<u32>,
+    #[serde(default)]
+    pub error: Option<ApiError>,
 }
 
 #[derive(Debug, Deserialize)]

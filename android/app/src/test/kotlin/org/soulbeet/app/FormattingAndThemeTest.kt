@@ -802,34 +802,200 @@ class FormattingAndThemeTest {
     }
 
     @Test
-    fun acquireTrackKeyPrefersMbidAndDisambiguatesSameTitleRecordings() {
-        val studio = acquireTrackKey(
-            mbid = "11111111-1111-1111-1111-111111111111",
-            artist = "Blue Öyster Cult",
-            title = "(Don't Fear) The Reaper",
-            album = "Agents of Fortune",
-        )
-        val live = acquireTrackKey(
-            mbid = "22222222-2222-2222-2222-222222222222",
-            artist = "Blue Öyster Cult",
-            title = "(Don't Fear) The Reaper",
-            album = "Some Enchanted Evening",
-        )
-        assertNotEquals(studio, live)
-        assertEquals("mbid:11111111-1111-1111-1111-111111111111", studio)
+    fun acquireTrackKeyPrefersMbidThenTrackIdThenNormalizedMetadata() {
+        val prev = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"))
 
-        val fallbackA = acquireTrackKey(
-            mbid = "  ",
-            artist = "Blue Öyster Cult",
-            title = "(Don't Fear) The Reaper",
-            album = "Agents of Fortune",
+            val studio = acquireTrackKey(
+                mbid = "11111111-1111-1111-1111-111111111111",
+                artist = "Blue Öyster Cult",
+                title = "(Don't Fear) The Reaper",
+                album = "Agents of Fortune",
+                trackId = "dz-100",
+            )
+            val live = acquireTrackKey(
+                mbid = "22222222-2222-2222-2222-222222222222",
+                artist = "Blue Öyster Cult",
+                title = "(Don't Fear) The Reaper",
+                album = "Some Enchanted Evening",
+                trackId = "dz-200",
+            )
+            assertNotEquals(studio, live)
+            assertEquals("mbid:11111111-1111-1111-1111-111111111111", studio)
+
+            // Deezer tracks have empty mbid; non-empty trackId must keep them collision-free.
+            val deezerStudio = org.soulbeet.core.FfiOnlineTrackMatch(
+                id = "DEEZER:12345",
+                mbid = "",
+                releaseMbid = null,
+                title = "Instant Crush",
+                artist = "Daft Punk",
+                artistId = "27",
+                album = "Random Access Memories",
+                albumId = "6575789",
+                durationSecs = 337u,
+                year = 2013u,
+                coverUrl = null,
+                variantLabel = null,
+                provider = "deezer",
+            )
+            val deezerRadioEdit = deezerStudio.copy(id = "DEEZER:67890")
+            assertEquals("id:deezer:12345", acquireTrackKey(deezerStudio))
+            assertNotEquals(acquireTrackKey(deezerStudio), acquireTrackKey(deezerRadioEdit))
+
+            // Fallback to Unicode Locale.ROOT artist::title::album when both mbid and trackId are blank.
+            val fallbackA = acquireTrackKey(
+                mbid = "  ",
+                artist = "Iggy Pop",
+                title = "INSTANT",
+                album = "Agents of Fortune",
+                trackId = "  ",
+            )
+            val fallbackB = acquireTrackKey(
+                mbid = null,
+                artist = "Iggy Pop",
+                title = "INSTANT",
+                album = "Greatest Hits",
+                trackId = null,
+            )
+            assertEquals("iggy pop::instant::agents of fortune", fallbackA)
+            assertNotEquals(fallbackA, fallbackB)
+        } finally {
+            Locale.setDefault(prev)
+        }
+    }
+
+    @Test
+    fun mergeSearchResultsPreservesBothLocalAndRemoteWithoutStaleOverwrite() {
+        val localTrack = org.soulbeet.core.FfiTrack(
+            id = "loc-1",
+            title = "Get Lucky",
+            artistId = "ar-1",
+            artistName = "Daft Punk",
+            albumId = "al-1",
+            albumName = "Random Access Memories",
+            trackNumber = 8L,
+            discNumber = 1L,
+            durationSecs = 369L,
+            year = 2013L,
+            genre = "Electronic",
+            bitRate = 320L,
+            suffix = "flac",
+            contentType = "audio/flac",
+            sizeBytes = null,
+            coverArtId = null,
+            path = null,
+            starred = false,
+            userRating = 0L,
+            playCount = 0L,
+            lastPlayedAt = null,
+            musicbrainzId = null,
+            isDiscovery = false,
+            updatedAt = 0L,
         )
-        val fallbackB = acquireTrackKey(
+        val local = org.soulbeet.core.FfiSearchResults(
+            query = "daft punk",
+            offlineOnly = false,
+            elapsedMs = 2uL,
+            localTracks = listOf(localTrack),
+            localAlbums = emptyList(),
+            localArtists = emptyList(),
+            onlineTracks = emptyList(),
+            onlineAlbums = emptyList(),
+            onlineArtists = emptyList(),
+            remoteProvider = null,
+            remoteFallbackUsed = false,
+        )
+        val remoteTrack = org.soulbeet.core.FfiOnlineTrackMatch(
+            id = "dz-999",
+            mbid = "",
+            releaseMbid = null,
+            title = "Instant Crush",
+            artist = "Daft Punk",
+            artistId = "27",
+            album = "Random Access Memories",
+            albumId = "6575789",
+            durationSecs = 337u,
+            year = 2013u,
+            coverUrl = "https://example.com/cover.jpg",
+            variantLabel = "Live",
+            provider = "deezer",
+        )
+        val remote = org.soulbeet.core.FfiRemoteCatalogResults(
+            query = "daft punk",
+            provider = "deezer",
+            fallbackUsed = false,
+            tracks = listOf(remoteTrack),
+            albums = emptyList(),
+            artists = emptyList(),
+        )
+
+        // Local arrives first, then remote merges in while keeping local tracks.
+        val mergedAfterRemote = mergeRemoteCatalogResults(local, "daft punk", remote)
+        assertEquals(1, mergedAfterRemote.localTracks.size)
+        assertEquals(1, mergedAfterRemote.onlineTracks.size)
+        assertEquals("deezer", mergedAfterRemote.remoteProvider)
+        assertFalse(mergedAfterRemote.remoteFallbackUsed)
+
+        // If local completes after remote for the same query, online results remain intact.
+        val mergedAfterLateLocal = mergeLocalSearchResults(mergedAfterRemote, local, isOfflineOnly = false)
+        assertEquals(1, mergedAfterLateLocal.localTracks.size)
+        assertEquals(1, mergedAfterLateLocal.onlineTracks.size)
+        assertEquals("deezer", mergedAfterLateLocal.remoteProvider)
+
+        // Switching to a new query drops previous remote results cleanly.
+        val newQueryLocal = local.copy(query = "boards of canada", localTracks = emptyList())
+        val afterNewQuery = mergeLocalSearchResults(mergedAfterRemote, newQueryLocal, isOfflineOnly = false)
+        assertTrue(afterNewQuery.onlineTracks.isEmpty())
+        assertNull(afterNewQuery.remoteProvider)
+    }
+
+    @Test
+    fun remoteCatalogFormattingHelpersHandleFansYearsAndAlbumMeta() {
+        assertNull(formatFanCount(null))
+        assertNull(formatFanCount(0uL))
+        assertEquals("1 fan", formatFanCount(1uL))
+        assertEquals("842 fans", formatFanCount(842uL))
+        assertEquals("12K fans", formatFanCount(12_000uL))
+        assertEquals("48.5K fans", formatFanCount(48_500uL))
+        assertEquals("2M fans", formatFanCount(2_000_000uL))
+        assertEquals("4.3M fans", formatFanCount(4_300_000uL))
+
+        assertEquals("2013", formatReleaseYear("2013-05-17"))
+        assertEquals("1997", formatReleaseYear("1997"))
+        assertNull(formatReleaseYear("  "))
+        assertNull(formatReleaseYear("abcd-01-01"))
+
+        val album = org.soulbeet.core.FfiOnlineAlbumMatch(
+            id = "al-1",
+            title = "Random Access Memories",
+            artist = "Daft Punk",
+            artistId = "27",
+            releaseDate = "2013-05-17",
+            coverUrl = null,
             mbid = null,
-            artist = "Blue Öyster Cult",
-            title = "(Don't Fear) The Reaper",
-            album = "Greatest Hits",
+            releaseTypes = listOf("Album"),
+            trackCount = 13u,
+            provider = "deezer",
         )
-        assertNotEquals(fallbackA, fallbackB)
+        assertEquals("2013 · Album · 13 tracks", formatRemoteAlbumMeta(album))
+        assertEquals("2013 · 1 track", formatRemoteAlbumMeta(album.copy(releaseTypes = emptyList(), trackCount = 1u)))
+    }
+
+    @Test
+    fun downloadAlbumQueuedMessageUsesHumanReadableTitleWithoutRawBatchId() {
+        assertEquals(
+            "Queued \"Random Access Memories\" for download",
+            formatDownloadAlbumQueuedMessage("Random Access Memories"),
+        )
+        assertEquals(
+            "Queued \"Agents of Fortune\" for download",
+            formatDownloadAlbumQueuedMessage("  Agents of Fortune  "),
+        )
+        assertEquals(
+            "Queued album for download",
+            formatDownloadAlbumQueuedMessage("   "),
+        )
     }
 }

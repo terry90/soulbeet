@@ -16,8 +16,9 @@ use crate::models::{
     DevicePlatform, DrainReport, LibraryStats, LocalAlbum, LocalArtist, LocalDiscoveryTrack,
     LocalPlaylist, LocalTrack, NavidromeCredentials, OfflineTrackEntry, OutboxMutation, OutboxRow,
     OutboxSummary, PersistedPlaybackSession, PinRecord, PinTarget, PlaybackSnapshotDto,
-    PlaybackSource, RemoteCatalogTrack, SearchResults, SoulbeetAuth, SyncReport, VoiceMatchKind,
-    VoiceMatchResult,
+    PlaybackSource, RemoteAlbumDetail, RemoteArtistDetail, RemoteCatalogAlbum, RemoteCatalogArtist,
+    RemoteCatalogResults, RemoteCatalogTrack, SearchResults, SoulbeetAuth, SyncReport,
+    VoiceMatchKind, VoiceMatchResult,
 };
 use crate::SoulbeetCore;
 
@@ -883,23 +884,169 @@ impl From<DrainReport> for FfiDrainReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiOnlineTrackMatch {
-    pub mbid: Option<String>,
+    pub id: String,
+    pub mbid: String,
+    pub release_mbid: Option<String>,
     pub title: String,
     pub artist: String,
-    pub album: Option<String>,
-    pub duration_secs: Option<u64>,
-    pub year: Option<i32>,
+    pub artist_id: Option<String>,
+    pub album: String,
+    pub album_id: Option<String>,
+    pub duration_secs: u32,
+    pub year: Option<u32>,
+    pub cover_url: Option<String>,
+    pub variant_label: Option<String>,
+    pub provider: String,
 }
 
 impl From<RemoteCatalogTrack> for FfiOnlineTrackMatch {
     fn from(v: RemoteCatalogTrack) -> Self {
         Self {
+            id: v.id,
             mbid: v.mbid,
+            release_mbid: v.release_mbid,
             title: v.title,
             artist: v.artist,
+            artist_id: v.artist_id,
             album: v.album,
+            album_id: v.album_id,
             duration_secs: v.duration_secs,
             year: v.year,
+            cover_url: v.cover_url,
+            variant_label: v.variant_label,
+            provider: v.provider,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiOnlineAlbumMatch {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub artist_id: Option<String>,
+    pub release_date: Option<String>,
+    pub cover_url: Option<String>,
+    pub mbid: Option<String>,
+    pub release_types: Vec<String>,
+    pub track_count: Option<u32>,
+    pub provider: String,
+}
+
+impl From<RemoteCatalogAlbum> for FfiOnlineAlbumMatch {
+    fn from(v: RemoteCatalogAlbum) -> Self {
+        Self {
+            id: v.id,
+            title: v.title,
+            artist: v.artist,
+            artist_id: v.artist_id,
+            release_date: v.release_date,
+            cover_url: v.cover_url,
+            mbid: v.mbid,
+            release_types: v.release_types,
+            track_count: v.track_count,
+            provider: v.provider,
+        }
+    }
+}
+
+impl From<FfiOnlineAlbumMatch> for RemoteCatalogAlbum {
+    fn from(v: FfiOnlineAlbumMatch) -> Self {
+        Self {
+            id: v.id,
+            title: v.title,
+            artist: v.artist,
+            artist_id: v.artist_id,
+            release_date: v.release_date,
+            cover_url: v.cover_url,
+            mbid: v.mbid,
+            release_types: v.release_types,
+            track_count: v.track_count,
+            provider: v.provider,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiOnlineArtistMatch {
+    pub id: String,
+    pub name: String,
+    pub disambiguation: Option<String>,
+    pub picture_url: Option<String>,
+    pub fan_count: Option<u64>,
+    pub mbid: Option<String>,
+    pub provider: String,
+}
+
+impl From<RemoteCatalogArtist> for FfiOnlineArtistMatch {
+    fn from(v: RemoteCatalogArtist) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            disambiguation: v.disambiguation,
+            picture_url: v.picture_url,
+            fan_count: v.fan_count,
+            mbid: v.mbid,
+            provider: v.provider,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRemoteCatalogResults {
+    pub query: String,
+    pub provider: String,
+    pub fallback_used: bool,
+    pub tracks: Vec<FfiOnlineTrackMatch>,
+    pub albums: Vec<FfiOnlineAlbumMatch>,
+    pub artists: Vec<FfiOnlineArtistMatch>,
+}
+
+impl From<RemoteCatalogResults> for FfiRemoteCatalogResults {
+    fn from(v: RemoteCatalogResults) -> Self {
+        Self {
+            query: v.query,
+            provider: v.provider,
+            fallback_used: v.fallback_used,
+            tracks: v.tracks.into_iter().map(Into::into).collect(),
+            albums: v.albums.into_iter().map(Into::into).collect(),
+            artists: v.artists.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRemoteAlbumDetail {
+    pub album: FfiOnlineAlbumMatch,
+    pub tracks: Vec<FfiOnlineTrackMatch>,
+}
+
+impl From<RemoteAlbumDetail> for FfiRemoteAlbumDetail {
+    fn from(v: RemoteAlbumDetail) -> Self {
+        Self {
+            album: v.album.into(),
+            tracks: v.tracks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRemoteArtistDetail {
+    pub artist: FfiOnlineArtistMatch,
+    pub provider: String,
+    pub others: Vec<FfiOnlineArtistMatch>,
+    pub top_tracks: Vec<FfiOnlineTrackMatch>,
+    pub albums: Vec<FfiOnlineAlbumMatch>,
+}
+
+impl From<RemoteArtistDetail> for FfiRemoteArtistDetail {
+    fn from(v: RemoteArtistDetail) -> Self {
+        Self {
+            artist: v.artist.into(),
+            provider: v.provider,
+            others: v.others.into_iter().map(Into::into).collect(),
+            top_tracks: v.top_tracks.into_iter().map(Into::into).collect(),
+            albums: v.albums.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -913,6 +1060,10 @@ pub struct FfiSearchResults {
     pub local_albums: Vec<FfiAlbum>,
     pub local_artists: Vec<FfiArtist>,
     pub online_tracks: Vec<FfiOnlineTrackMatch>,
+    pub online_albums: Vec<FfiOnlineAlbumMatch>,
+    pub online_artists: Vec<FfiOnlineArtistMatch>,
+    pub remote_provider: Option<String>,
+    pub remote_fallback_used: bool,
 }
 
 impl From<SearchResults> for FfiSearchResults {
@@ -925,6 +1076,10 @@ impl From<SearchResults> for FfiSearchResults {
             local_albums: v.local_albums.into_iter().map(Into::into).collect(),
             local_artists: v.local_artists.into_iter().map(Into::into).collect(),
             online_tracks: v.remote_tracks.into_iter().map(Into::into).collect(),
+            online_albums: v.remote_albums.into_iter().map(Into::into).collect(),
+            online_artists: v.remote_artists.into_iter().map(Into::into).collect(),
+            remote_provider: v.remote_provider,
+            remote_fallback_used: v.remote_fallback_used,
         }
     }
 }
@@ -2220,6 +2375,84 @@ impl SoulbeetCoreHandle {
                 .await
                 .map_err(FfiError::from)?;
             Ok(res.into())
+        })
+        .await
+    }
+
+    pub async fn search_local(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> Result<FfiSearchResults, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let res = core
+                .search_local(&query, limit as usize)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(res.into())
+        })
+        .await
+    }
+
+    pub async fn search_remote(
+        &self,
+        query: String,
+        provider: Option<String>,
+        limit: u32,
+    ) -> Result<FfiRemoteCatalogResults, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let res = core
+                .search_remote(&query, provider.as_deref(), limit as usize)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(res.into())
+        })
+        .await
+    }
+
+    pub async fn get_remote_album(
+        &self,
+        album_id: String,
+    ) -> Result<FfiRemoteAlbumDetail, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let res = core
+                .get_remote_album(&album_id)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(res.into())
+        })
+        .await
+    }
+
+    pub async fn get_remote_artist(
+        &self,
+        artist_id: String,
+        name: Option<String>,
+    ) -> Result<Option<FfiRemoteArtistDetail>, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let res = core
+                .get_remote_artist(&artist_id, name.as_deref())
+                .await
+                .map_err(FfiError::from)?;
+            Ok(res.map(Into::into))
+        })
+        .await
+    }
+
+    pub async fn download_remote_album(
+        &self,
+        album: FfiOnlineAlbumMatch,
+    ) -> Result<String, FfiError> {
+        let core = self.core.clone();
+        let native_album: RemoteCatalogAlbum = album.into();
+        self.run_async(async move {
+            core.download_remote_album(&native_album)
+                .await
+                .map_err(FfiError::from)
         })
         .await
     }

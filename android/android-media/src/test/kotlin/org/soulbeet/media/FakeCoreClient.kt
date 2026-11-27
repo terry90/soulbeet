@@ -17,6 +17,7 @@ import org.soulbeet.core.FfiDrainReport
 import org.soulbeet.core.FfiException
 import org.soulbeet.core.FfiLibraryStats
 import org.soulbeet.core.FfiNavidromeCredentials
+import org.soulbeet.core.FfiOnlineAlbumMatch
 import org.soulbeet.core.FfiOutboxMutation
 import org.soulbeet.core.FfiOutboxRow
 import org.soulbeet.core.FfiOutboxSummary
@@ -26,6 +27,9 @@ import org.soulbeet.core.FfiPinTarget
 import org.soulbeet.core.FfiPlaybackSnapshot
 import org.soulbeet.core.FfiPlaybackSource
 import org.soulbeet.core.FfiPlaylist
+import org.soulbeet.core.FfiRemoteAlbumDetail
+import org.soulbeet.core.FfiRemoteArtistDetail
+import org.soulbeet.core.FfiRemoteCatalogResults
 import org.soulbeet.core.FfiSearchResults
 import org.soulbeet.core.FfiSoulbeetAuth
 import org.soulbeet.core.FfiSyncReport
@@ -164,6 +168,21 @@ open class FakeCoreClient : CoreClient {
         isWifi: Boolean,
     ): List<String> = emptyList()
     override suspend fun search(query: String, limit: UInt): FfiSearchResults =
+        throw UnsupportedOperationException()
+    override suspend fun searchLocal(query: String, limit: UInt): FfiSearchResults =
+        throw UnsupportedOperationException()
+    override suspend fun searchRemote(
+        query: String,
+        provider: String?,
+        limit: UInt,
+    ): FfiRemoteCatalogResults = throw UnsupportedOperationException()
+    override suspend fun getRemoteAlbum(albumId: String): FfiRemoteAlbumDetail =
+        throw UnsupportedOperationException()
+    override suspend fun getRemoteArtist(
+        artistId: String,
+        name: String?,
+    ): FfiRemoteArtistDetail? = null
+    override suspend fun downloadRemoteAlbum(album: FfiOnlineAlbumMatch): String =
         throw UnsupportedOperationException()
     override suspend fun setCachePolicy(policy: FfiCachePolicy) = Unit
     override fun setEventListener(listener: CoreEventListener) = Unit

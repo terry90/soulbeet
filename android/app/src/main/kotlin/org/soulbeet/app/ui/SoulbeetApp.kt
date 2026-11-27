@@ -73,11 +73,14 @@ import org.soulbeet.app.ui.components.SeamLightBar
 import org.soulbeet.app.ui.components.SoulbeetPixelLogo
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.UndoDropSnackbar
+import org.soulbeet.app.ui.screens.ContainerDetailSheet
 import org.soulbeet.app.ui.screens.DiscoverScreen
 import org.soulbeet.app.ui.screens.HomeScreen
 import org.soulbeet.app.ui.screens.LibraryScreen
 import org.soulbeet.app.ui.screens.NowPlayingSheet
 import org.soulbeet.app.ui.screens.OnboardingScreen
+import org.soulbeet.app.ui.screens.RemoteAlbumDetailSheet
+import org.soulbeet.app.ui.screens.RemoteArtistDetailSheet
 import org.soulbeet.app.ui.screens.SearchScreen
 import org.soulbeet.app.ui.screens.SettingsSheet
 import kotlin.math.abs
@@ -311,6 +314,9 @@ private fun MainStudioShell(
                     onOpenArtist = viewModel::openArtistDetail,
                     onOpenPlaylist = viewModel::openPlaylistDetail,
                     onAcquireTrack = viewModel::acquireAndPlayTrack,
+                    onOpenRemoteAlbum = { album -> viewModel.openRemoteAlbum(album) },
+                    onOpenRemoteArtist = viewModel::openRemoteArtist,
+                    onSearchDeepCatalog = viewModel::searchDeepCatalogMusicBrainz,
                 )
 
                 AppTab.LIBRARY -> LibraryScreen(
@@ -337,7 +343,6 @@ private fun MainStudioShell(
                         val songId = disc.songId ?: return@LibraryScreen
                         viewModel.dropDiscoveryTrackWithUndo(songId, disc.title, disc.artist, disc.id)
                     },
-                    onCloseContainerDetail = viewModel::closeContainerDetail,
                 )
             }
         }
@@ -410,6 +415,50 @@ private fun MainStudioShell(
             onTriggerSync = { viewModel.triggerManualSync() },
             onDrainOutbox = viewModel::drainOutboxNow,
             onSignOut = viewModel::disconnectSession,
+        )
+    }
+
+    state.selectedContainer?.let { detail ->
+        ContainerDetailSheet(
+            detail = detail,
+            state = state,
+            artAuthority = viewModel.artAuthority,
+            onDismiss = viewModel::closeContainerDetail,
+            onPlayAll = { viewModel.playQueue(detail.tracks, 0, detail.title) },
+            onPlayIndex = { idx -> viewModel.playQueue(detail.tracks, idx, detail.title) },
+            onTogglePin = {
+                detail.pinTarget?.let { target -> viewModel.togglePin(target, detail.title) }
+            },
+            onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
+            onRemoveTrack = { track ->
+                viewModel.requestLibraryTrackRemoval(track.id, track.title, track.artistName)
+            },
+        )
+    }
+
+    val remoteAlbum = state.remoteAlbumDetail
+    val remoteArtist = state.remoteArtistDetail
+    if (remoteAlbum != null) {
+        RemoteAlbumDetailSheet(
+            detail = remoteAlbum,
+            state = state,
+            onDismiss = viewModel::closeRemoteAlbum,
+            onBackToArtist = if (remoteAlbum.returnToArtist != null) viewModel::closeRemoteAlbum else null,
+            onOpenArtist = viewModel::openRemoteArtist,
+            onDownloadAlbum = { viewModel.downloadRemoteAlbum(remoteAlbum.album) },
+            onAcquireTrack = viewModel::acquireAndPlayTrack,
+        )
+    } else if (remoteArtist != null) {
+        RemoteArtistDetailSheet(
+            detail = remoteArtist,
+            state = state,
+            onDismiss = viewModel::closeRemoteArtist,
+            onSelectDisambiguationArtist = viewModel::openRemoteArtist,
+            onAcquireTrack = viewModel::acquireAndPlayTrack,
+            onOpenAlbum = { album ->
+                val currentArtist = remoteArtist.detail?.artist ?: remoteArtist.artist
+                viewModel.openRemoteAlbum(album, returnToArtist = currentArtist)
+            },
         )
     }
 

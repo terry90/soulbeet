@@ -652,6 +652,7 @@ fn ManualSourceChoiceModal(
 
     let acquire_state_key = crate::web_player::acquire_key(
         state.recording_mbid.as_deref(),
+        state.catalog_id.as_deref(),
         &state.artist,
         &state.title,
     );
