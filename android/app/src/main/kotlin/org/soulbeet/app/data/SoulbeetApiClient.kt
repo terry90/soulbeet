@@ -20,6 +20,7 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.math.roundToInt
 
 data class LoginResult(
     val authKind: StoredAuthKind,
@@ -66,6 +67,7 @@ data class ContextualMixUi(
     val navidromePlaylistId: String?,
     val trackCount: Int,
     val targetTracks: Int,
+    val weatherBadge: String? = null,
 )
 
 data class ContextualMixTrackUi(
@@ -86,6 +88,7 @@ data class UserCultureProfileUi(
     val localCultureRatio: Float,
     val inferredAreaWeights: List<Pair<String, Float>>,
     val inferredLocalTags: List<String>,
+    val weatherCity: String? = null,
 )
 
 data class ListenerProtectionUi(
@@ -572,12 +575,16 @@ class SoulbeetApiClient(
         config: PersistedAppConfig,
         homeCountry: String?,
         localCultureRatio: Float,
+        weatherCity: String? = null,
     ): Result<UserCultureProfileUi> = withContext(Dispatchers.IO) {
         runCatching {
             val base = normalizeBaseUrl(config.serverUrl)
             val inner = JSONObject()
                 .put("home_country", homeCountry.orEmpty().trim().uppercase())
                 .put("local_culture_ratio", localCultureRatio.coerceIn(0f, 1f).toDouble())
+            if (weatherCity != null) {
+                inner.put("weather_city", weatherCity.trim())
+            }
             val payload = JSONObject().put("req", inner).toString()
 
             val request = Request.Builder()
@@ -610,13 +617,14 @@ class SoulbeetApiClient(
         return this
     }
 
-    private fun parseContextualMix(obj: JSONObject): ContextualMixUi {
+    internal fun parseContextualMix(obj: JSONObject): ContextualMixUi {
         val slug = obj.optNonNullString("slug").orEmpty()
         val i18nKey = obj.optNonNullString("i18n_key").orEmpty()
         val customName = obj.optNonNullString("custom_name")
         val customDesc = obj.optNonNullString("custom_description")
         val country = obj.optNonNullString("country_code")
         val localPct = if (obj.has("local_pct") && !obj.isNull("local_pct")) obj.optInt("local_pct") else null
+        val weatherBadge = formatWeatherBadge(obj.optJSONObject("weather_badge"))
         val (fallbackTitle, fallbackSub) = defaultMixCopy(slug, i18nKey)
         return ContextualMixUi(
             slug = slug,
@@ -636,6 +644,7 @@ class SoulbeetApiClient(
             navidromePlaylistId = obj.optNonNullString("navidrome_playlist_id"),
             trackCount = obj.optInt("track_count", 0),
             targetTracks = obj.optInt("target_tracks", 25),
+            weatherBadge = weatherBadge,
         )
     }
 
@@ -670,6 +679,7 @@ class SoulbeetApiClient(
             localCultureRatio = obj.optDouble("local_culture_ratio", 0.45).toFloat().coerceIn(0f, 1f),
             inferredAreaWeights = weights,
             inferredLocalTags = tags,
+            weatherCity = obj.optNonNullString("weather_city"),
         )
     }
 
@@ -846,6 +856,22 @@ class SoulbeetApiClient(
         internal fun currentIsoWeekday(): Int =
             calendarDayOfWeekToIso(Calendar.getInstance().get(Calendar.DAY_OF_WEEK))
 
+        internal fun formatWeatherBadge(obj: JSONObject?): String? {
+            if (obj == null) return null
+            val label = when (obj.optNonNullString("condition")?.lowercase(Locale.ROOT)) {
+                "rainy" -> "RAINY"
+                "snowy" -> "SNOW"
+                "stormy" -> "STORM"
+                "sunny" -> "SUNNY"
+                else -> return null
+            }
+            val temp = obj.optDouble("temperature_c", Double.NaN)
+            if (temp.isNaN() || temp.isInfinite()) return label
+            // Match Rust `f32::round()` (half away from zero) for negative temperatures like -1.5.
+            val rounded = if (temp < 0.0) -(-temp).roundToInt() else temp.roundToInt()
+            return "$label · ${rounded}°C"
+        }
+
         internal fun defaultMixCopy(slug: String, i18nKey: String): Pair<String, String> {
             fun lookup(raw: String): Pair<String, String>? =
                 when (raw.trim().lowercase(Locale.ROOT)) {
@@ -888,7 +914,13 @@ class SoulbeetApiClient(
                     "mix.moment.late_night", "late_night" ->
                         "Late Night" to "Low-lit dream pop, trip hop, and midnight library favorites."
                     "mix.moment.rainy_day", "rainy_day" ->
-                        "Rainy Day" to "Soft acoustic folk, piano, and reflective melodies made for gray skies."
+                        "Rainy Day" to "Soft acoustic folk, piano, and warm reflective melodies for rainy weather."
+                    "mix.moment.snow_day", "snow_day" ->
+                        "Snow Day" to "Hushed Nordic folk, gentle piano, and ambient warmth for snowy skies."
+                    "mix.moment.storm_night", "storm_night" ->
+                        "Storm & Thunder" to "Brooding post-rock, shoegaze, and moody trip hop built for stormy weather."
+                    "mix.moment.sunny_day", "sunny_day" ->
+                        "Sunny Vibes" to "Bright funk, soul, indie pop, and sun-drenched grooves for clear skies."
                     "mix.moment.friday_night", "friday_night" ->
                         "Friday Night Warmup" to "Upbeat electro, disco, and indie energy to kick off the weekend."
                     "mix.moment.sunday_morning", "sunday_morning" ->

@@ -105,6 +105,8 @@ pub fn DiscoverView() -> Element {
         local_culture_ratio: effective_ratio,
         inferred_area_weights: Vec::new(),
         inferred_local_tags: Vec::new(),
+        weather_city: boot_culture.as_ref().and_then(|c| c.weather_city.clone()),
+        ..Default::default()
     };
 
     rsx! {

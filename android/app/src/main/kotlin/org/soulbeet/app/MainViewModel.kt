@@ -1295,17 +1295,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun updateCultureProfile(homeCountry: String?, localCultureRatio: Float) {
+    fun updateCultureProfile(
+        homeCountry: String?,
+        localCultureRatio: Float,
+        weatherCity: String? = null,
+    ) {
         val cfg = _uiState.value.config
         if (cfg.offlineOnly || !cfg.isConfigured) {
             showNotice("Connect online to edit Taste DNA")
             return
         }
         viewModelScope.launch {
-            apiClient.updateCultureProfile(cfg, homeCountry, localCultureRatio).fold(
+            apiClient.updateCultureProfile(cfg, homeCountry, localCultureRatio, weatherCity).fold(
                 onSuccess = { updated ->
                     _uiState.update { it.copy(cultureProfile = updated, showCultureEditor = false) }
                     showNotice("Updated Taste DNA")
+                    val hour = LocalTime.now().hour
+                    apiClient.fetchContextualMixes(cfg, hour)
+                        .getOrNull()
+                        ?.filterNot { it.kind == "seasonal" && it.trackCount == 0 }
+                        ?.let { refreshedMixes ->
+                            _uiState.update { it.copy(contextualMixes = refreshedMixes) }
+                        }
                 },
                 onFailure = { err ->
                     showNotice(err.localizedMessage ?: "Failed to update Taste DNA")

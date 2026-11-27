@@ -114,6 +114,7 @@ pub fn DiscoverPage() -> Element {
     let mut editing_culture = use_signal(|| false);
     let mut country_input = use_signal(String::new);
     let mut langs_input = use_signal(String::new);
+    let mut weather_city_input = use_signal(String::new);
     let mut ratio_pct = use_signal(|| 45u8);
     let mut saving_culture = use_signal(|| false);
 
@@ -295,6 +296,7 @@ pub fn DiscoverPage() -> Element {
         move |_| {
             country_input.set(culture.home_country.clone().unwrap_or_default());
             langs_input.set(culture.preferred_languages.join(", "));
+            weather_city_input.set(culture.weather_city.clone().unwrap_or_default());
             ratio_pct.set((culture.local_culture_ratio.clamp(0.0, 1.0) * 100.0).round() as u8);
             editing_culture.set(true);
         }
@@ -309,10 +311,23 @@ pub fn DiscoverPage() -> Element {
             .filter(|s| !s.is_empty())
             .collect();
         let ratio = f32::from(ratio_pct()) / 100.0;
+        let weather_city_trimmed = weather_city_input().trim().to_string();
+        let existing_city = studio
+            .culture_profile
+            .peek()
+            .weather_city
+            .clone()
+            .unwrap_or_default();
+        let weather_city = if weather_city_trimmed.eq_ignore_ascii_case(existing_city.trim()) {
+            None
+        } else {
+            Some(weather_city_trimmed)
+        };
         let req = UpdateCultureProfileRequest {
             home_country: (!country.is_empty()).then_some(country),
             preferred_languages: Some(languages),
             local_culture_ratio: Some(ratio),
+            weather_city,
         };
         spawn(async move {
             match auth.call(api::update_culture_profile(req)).await {
@@ -792,6 +807,23 @@ pub fn DiscoverPage() -> Element {
                                         class: "w-full h-9 px-3 rounded-[8px] bg-beet-sunken border border-beet-border-default text-[13px] text-beet-text-primary outline-none",
                                         oninput: move |evt| langs_input.set(evt.value()),
                                     }
+                                }
+                            }
+
+                            label { class: "space-y-1 block",
+                                span { class: "text-[11px] tabular-nums-mono uppercase tracking-wider text-beet-text-tertiary",
+                                    "Weather City (optional)"
+                                }
+                                input {
+                                    r#type: "text",
+                                    maxlength: "100",
+                                    placeholder: "Auto (by IP) or city, e.g. Lyon",
+                                    value: "{weather_city_input}",
+                                    class: "w-full h-9 px-3 rounded-[8px] bg-beet-sunken border border-beet-border-default text-[13px] text-beet-text-primary outline-none",
+                                    oninput: move |evt| weather_city_input.set(evt.value()),
+                                }
+                                p { class: "text-[11px] text-beet-text-tertiary",
+                                    "Used for Rainy / Snow / Storm / Sunny mixes. Leave blank for automatic IP weather."
                                 }
                             }
 

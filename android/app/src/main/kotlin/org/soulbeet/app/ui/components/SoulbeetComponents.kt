@@ -697,7 +697,8 @@ fun SeasonalHeroCard(
                         shape = SoulbeetShapes.full,
                     ) {
                         Text(
-                            text = if (mix.kind == "seasonal") "SEASONAL PACK" else "CONTEXTUAL MIX",
+                            text = mix.weatherBadge
+                                ?: if (mix.kind == "seasonal") "SEASONAL PACK" else "CONTEXTUAL MIX",
                             style = type.monoXs,
                             color = colors.accentText,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),

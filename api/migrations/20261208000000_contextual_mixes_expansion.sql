@@ -4,6 +4,11 @@
 
 ALTER TABLE contextual_mix_definitions ADD COLUMN days_of_week TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE contextual_mix_definitions ADD COLUMN selection_rules TEXT;
+ALTER TABLE contextual_mix_definitions ADD COLUMN weather_conditions TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE user_culture_profiles ADD COLUMN weather_city TEXT;
+ALTER TABLE user_culture_profiles ADD COLUMN weather_lat REAL;
+ALTER TABLE user_culture_profiles ADD COLUMN weather_lon REAL;
 
 DELETE FROM contextual_mix_definitions WHERE slug = 'diwali' AND built_in = 1;
 DELETE FROM contextual_mix_states

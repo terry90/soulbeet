@@ -364,6 +364,9 @@ class FormattingAndThemeTest {
             Triple("dinner_groove", "mix.moment.dinner_groove", "Dinner Groove"),
             Triple("late_night", "mix.moment.late_night", "Late Night"),
             Triple("rainy_day", "mix.moment.rainy_day", "Rainy Day"),
+            Triple("snow_day", "mix.moment.snow_day", "Snow Day"),
+            Triple("storm_night", "mix.moment.storm_night", "Storm & Thunder"),
+            Triple("sunny_day", "mix.moment.sunny_day", "Sunny Vibes"),
             Triple("friday_night", "mix.moment.friday_night", "Friday Night Warmup"),
             Triple("sunday_morning", "mix.moment.sunday_morning", "Sunday Morning Coffee"),
             Triple("forgotten_gems", "mix.moment.forgotten_gems", "Forgotten Gems"),
@@ -393,6 +396,80 @@ class FormattingAndThemeTest {
         val (diwaliTitle, diwaliSub) = SoulbeetApiClient.defaultMixCopy("diwali", "mix.seasonal.diwali")
         assertEquals("Diwali", diwaliTitle)
         assertEquals("Contextual Soulbeet mix", diwaliSub)
+
+        // Weather-reactive mix subtitles match Rust UI i18n copy verbatim.
+        assertEquals(
+            "Soft acoustic folk, piano, and warm reflective melodies for rainy weather.",
+            SoulbeetApiClient.defaultMixCopy("rainy_day", "mix.moment.rainy_day").second,
+        )
+        assertEquals(
+            "Hushed Nordic folk, gentle piano, and ambient warmth for snowy skies.",
+            SoulbeetApiClient.defaultMixCopy("snow_day", "mix.moment.snow_day").second,
+        )
+        assertEquals(
+            "Brooding post-rock, shoegaze, and moody trip hop built for stormy weather.",
+            SoulbeetApiClient.defaultMixCopy("storm_night", "mix.moment.storm_night").second,
+        )
+        assertEquals(
+            "Bright funk, soul, indie pop, and sun-drenched grooves for clear skies.",
+            SoulbeetApiClient.defaultMixCopy("sunny_day", "mix.moment.sunny_day").second,
+        )
+    }
+
+    @Test
+    fun weatherBadgeFormattingAndParsingCoverAllConditions() {
+        assertEquals(
+            "RAINY · 11°C",
+            SoulbeetApiClient.formatWeatherBadge(
+                JSONObject("""{"condition":"rainy","temperature_c":11.4,"weather_code":61,"is_day":true}"""),
+            ),
+        )
+        assertEquals(
+            "SNOW · -2°C",
+            SoulbeetApiClient.formatWeatherBadge(
+                JSONObject("""{"condition":"snowy","temperature_c":-1.5,"weather_code":73,"is_day":false}"""),
+            ),
+        )
+        assertEquals(
+            "STORM · 16°C",
+            SoulbeetApiClient.formatWeatherBadge(
+                JSONObject("""{"condition":"stormy","temperature_c":16.0,"weather_code":95,"is_day":false}"""),
+            ),
+        )
+        assertEquals(
+            "SUNNY · 25°C",
+            SoulbeetApiClient.formatWeatherBadge(
+                JSONObject("""{"condition":"sunny","temperature_c":24.6,"weather_code":0,"is_day":true}"""),
+            ),
+        )
+        assertNull(SoulbeetApiClient.formatWeatherBadge(null))
+        assertNull(SoulbeetApiClient.formatWeatherBadge(JSONObject("""{"condition":"cloudy","temperature_c":14.0}""")))
+
+        val client = SoulbeetApiClient()
+        val parsed = client.parseContextualMix(
+            JSONObject(
+                """
+                {
+                    "slug": "snow_day",
+                    "kind": "moment",
+                    "i18n_key": "mix.moment.snow_day",
+                    "owned_pct": 75,
+                    "exclude_from_core_taste": false,
+                    "track_count": 20,
+                    "target_tracks": 25,
+                    "weather_badge": {
+                        "condition": "snowy",
+                        "temperature_c": -2.1,
+                        "weather_code": 75,
+                        "is_day": true,
+                        "location_label": "Oslo, NO"
+                    }
+                }
+                """.trimIndent(),
+            ),
+        )
+        assertEquals("Snow Day", parsed.title)
+        assertEquals("SNOW · -2°C", parsed.weatherBadge)
     }
 
     @Test

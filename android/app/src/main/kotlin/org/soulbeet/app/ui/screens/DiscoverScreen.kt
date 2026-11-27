@@ -82,7 +82,7 @@ fun DiscoverScreen(
     onDropTriageCard: (TriageCardItem) -> Unit,
     onOpenCultureEditor: () -> Unit,
     onDismissCultureEditor: () -> Unit,
-    onSaveCultureProfile: (homeCountry: String?, ratio: Float) -> Unit,
+    onSaveCultureProfile: (homeCountry: String?, ratio: Float, weatherCity: String?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalSoulbeetColors.current
@@ -146,7 +146,7 @@ fun DiscoverScreen(
                                         shape = SoulbeetShapes.full,
                                     ) {
                                         Text(
-                                            text = mix.kind.uppercase(),
+                                            text = mix.weatherBadge ?: mix.kind.uppercase(),
                                             style = type.monoXs,
                                             color = colors.leafText,
                                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
@@ -592,6 +592,15 @@ private fun TasteDnaCard(
                 color = colors.textSecondary,
             )
 
+            val weatherLabel = profile?.weatherCity?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { "Weather: $it" }
+                ?: "Weather: Auto (IP)"
+            Text(
+                text = weatherLabel,
+                style = type.monoXs,
+                color = colors.textMuted,
+            )
+
             if (!profile?.inferredLocalTags.isNullOrEmpty()) {
                 Text(
                     text = profile!!.inferredLocalTags.take(5).joinToString(" · "),
@@ -607,11 +616,12 @@ private fun TasteDnaCard(
 private fun CultureProfileEditorDialog(
     initial: UserCultureProfileUi?,
     onDismiss: () -> Unit,
-    onSave: (homeCountry: String?, ratio: Float) -> Unit,
+    onSave: (homeCountry: String?, ratio: Float, weatherCity: String?) -> Unit,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     var country by remember(initial?.homeCountry) { mutableStateOf(initial?.homeCountry ?: "") }
+    var weatherCity by remember(initial?.weatherCity) { mutableStateOf(initial?.weatherCity ?: "") }
     var ratio by remember(initial?.localCultureRatio) {
         mutableFloatStateOf(initial?.localCultureRatio ?: 0.45f)
     }
@@ -628,6 +638,14 @@ private fun CultureProfileEditorDialog(
                     value = country,
                     onValueChange = { country = it.take(2).uppercase() },
                     label = { Text("Home Country (ISO-2, e.g. FR, US, JP)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = weatherCity,
+                    onValueChange = { weatherCity = it.take(100) },
+                    label = { Text("Weather City (blank = auto by IP)") },
+                    placeholder = { Text("e.g. Lyon") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -651,7 +669,17 @@ private fun CultureProfileEditorDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onSave(country.takeIf { it.isNotBlank() }, ratio) }) {
+            TextButton(
+                onClick = {
+                    val trimmedCity = weatherCity.trim()
+                    val existingCity = initial?.weatherCity?.trim().orEmpty()
+                    onSave(
+                        country.takeIf { it.isNotBlank() },
+                        ratio,
+                        if (trimmedCity.equals(existingCity, ignoreCase = true)) null else trimmedCity,
+                    )
+                },
+            ) {
                 Text("Save", color = colors.leafText)
             }
         },

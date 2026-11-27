@@ -153,6 +153,14 @@ pub fn TasteDnaBar(
         8,
     );
 
+    let weather_label = profile
+        .weather_city
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|city| format!("Weather: {city}"))
+        .unwrap_or_else(|| "Weather: Auto (IP)".to_string());
+
     let bar_aria_label = if !area_segments.is_empty() {
         area_segments
             .iter()
@@ -176,6 +184,9 @@ pub fn TasteDnaBar(
                     }
                     p { class: "tabular-nums-mono text-[11px] font-semibold tracking-wider text-beet-text-tertiary mt-0.5",
                         "{local_pct}% {local_code} · {intl_pct}% INTL"
+                    }
+                    p { class: "text-[11px] text-beet-text-tertiary mt-0.5",
+                        "{weather_label}"
                     }
                 }
 
@@ -301,6 +312,7 @@ mod tests {
             local_culture_ratio: 0.45,
             inferred_area_weights: vec![("fr".into(), 1.0), ("us".into(), 1.0), ("jp".into(), 1.0)],
             inferred_local_tags: vec!["french house".into()],
+            ..Default::default()
         };
         let segs = normalize_taste_segments(&profile);
         assert_eq!(segs.len(), 3);
@@ -374,6 +386,7 @@ mod tests {
                 ("JP".into(), 20.0),
             ],
             inferred_local_tags: vec!["French House".into(), "Ambient".into()],
+            ..Default::default()
         };
         let mut dom = VirtualDom::new_with_props(
             |profile: UserCultureProfile| {
@@ -392,7 +405,24 @@ mod tests {
         assert!(html.contains("width: 30%;"), "{html}");
         assert!(html.contains("width: 20%;"), "{html}");
         assert!(html.contains("bg-beet-gold"), "{html}");
+        assert!(html.contains("Weather: Auto (IP)"), "{html}");
         assert_eq!(html.matches(">FR</span>").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn renders_explicit_weather_city_in_taste_dna_card() {
+        let profile = UserCultureProfile {
+            home_country: Some("FR".into()),
+            weather_city: Some("Lyon, FR".into()),
+            ..Default::default()
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |profile: UserCultureProfile| rsx! { TasteDnaBar { profile } },
+            profile,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Weather: Lyon, FR"), "{html}");
     }
 
     #[test]

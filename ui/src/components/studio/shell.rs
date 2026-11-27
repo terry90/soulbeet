@@ -637,6 +637,7 @@ mod tests {
             active_until: None,
             expires_at: None,
             navidrome_playlist_id: Some(id.into()),
+            weather_badge: None,
             track_count: 10,
             target_tracks: 10,
         }

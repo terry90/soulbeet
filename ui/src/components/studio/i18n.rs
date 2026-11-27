@@ -88,7 +88,16 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
             "Low-lit dream pop, trip hop, and midnight library favorites.".to_string()
         }
         "mix.moment.rainy_day" => {
-            "Soft acoustic folk, piano, and reflective melodies made for gray skies.".to_string()
+            "Soft acoustic folk, piano, and warm reflective melodies for rainy weather.".to_string()
+        }
+        "mix.moment.snow_day" => {
+            "Hushed Nordic folk, gentle piano, and ambient warmth for snowy skies.".to_string()
+        }
+        "mix.moment.storm_night" => {
+            "Brooding post-rock, shoegaze, and moody trip hop built for stormy weather.".to_string()
+        }
+        "mix.moment.sunny_day" => {
+            "Bright funk, soul, indie pop, and sun-drenched grooves for clear skies.".to_string()
         }
         "mix.moment.friday_night" => {
             "Upbeat electro, disco, and indie energy to kick off the weekend.".to_string()
@@ -140,6 +149,16 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
 
 /// Formats the compact schedule/window badge shown atop [`crate::SeasonalHeroCard`].
 pub fn format_mix_window_badge(summary: &ContextualMixSummary) -> Option<String> {
+    if let Some(ref weather) = summary.weather_badge {
+        if !weather.temperature_c.is_finite() {
+            return Some(weather.condition.badge_label().to_string());
+        }
+        return Some(format!(
+            "{} · {}°C",
+            weather.condition.badge_label(),
+            weather.temperature_c.round() as i32
+        ));
+    }
     match (&summary.active_from, &summary.active_until) {
         (Some(from), Some(until)) => {
             let from_lbl = format_short_iso_date(from);
@@ -358,6 +377,7 @@ mod tests {
             active_until: Some("2026-12-27".into()),
             expires_at: Some("2027-01-05".into()),
             navidrome_playlist_id: None,
+            weather_badge: None,
             track_count: 25,
             target_tracks: 25,
         }
@@ -395,6 +415,35 @@ mod tests {
             format_mix_window_badge(&fr_noel).as_deref(),
             Some("NOV 20 – DEC 27 · AUTO-CLEANS JAN 5")
         );
+    }
+
+    #[test]
+    fn formats_weather_window_badge_for_all_conditions() {
+        use shared::recommendation::{WeatherCondition, WeatherSnapshot};
+
+        let cases = [
+            (WeatherCondition::Rainy, 11.4, "RAINY · 11°C"),
+            (WeatherCondition::Snowy, -1.8, "SNOW · -2°C"),
+            (WeatherCondition::Stormy, 16.0, "STORM · 16°C"),
+            (WeatherCondition::Sunny, 24.6, "SUNNY · 25°C"),
+        ];
+
+        for (condition, temperature_c, expected) in cases {
+            let mut summary = sample_summary(
+                "rainy_day",
+                ContextualMixKind::Moment,
+                "mix.moment.rainy_day",
+                None,
+            );
+            summary.weather_badge = Some(WeatherSnapshot {
+                condition,
+                temperature_c,
+                weather_code: 61,
+                is_day: true,
+                location_label: Some("Lyon, FR".into()),
+            });
+            assert_eq!(format_mix_window_badge(&summary).as_deref(), Some(expected));
+        }
     }
 
     #[test]
@@ -469,7 +518,28 @@ mod tests {
                 ContextualMixKind::Moment,
                 "mix.moment.rainy_day",
                 "Rainy Day",
-                "Soft acoustic folk, piano, and reflective melodies made for gray skies.",
+                "Soft acoustic folk, piano, and warm reflective melodies for rainy weather.",
+            ),
+            (
+                "snow_day",
+                ContextualMixKind::Moment,
+                "mix.moment.snow_day",
+                "Snow Day",
+                "Hushed Nordic folk, gentle piano, and ambient warmth for snowy skies.",
+            ),
+            (
+                "storm_night",
+                ContextualMixKind::Moment,
+                "mix.moment.storm_night",
+                "Storm & Thunder",
+                "Brooding post-rock, shoegaze, and moody trip hop built for stormy weather.",
+            ),
+            (
+                "sunny_day",
+                ContextualMixKind::Moment,
+                "mix.moment.sunny_day",
+                "Sunny Vibes",
+                "Bright funk, soul, indie pop, and sun-drenched grooves for clear skies.",
             ),
             (
                 "friday_night",

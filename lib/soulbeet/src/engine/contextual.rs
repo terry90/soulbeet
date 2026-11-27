@@ -644,6 +644,9 @@ pub async fn infer_culture_profile(
         local_culture_ratio: local_culture_ratio.clamp(0.0, 1.0),
         inferred_area_weights,
         inferred_local_tags,
+        weather_city: None,
+        weather_lat: None,
+        weather_lon: None,
     }
 }
 
@@ -1751,6 +1754,7 @@ mod tests {
             local_culture_ratio: 0.45,
             inferred_area_weights: vec![("JP".into(), 0.78), ("GB".into(), 0.22)],
             inferred_local_tags: vec!["city pop".into()],
+            ..Default::default()
         };
 
         let run_with = |steering: CultureSteering| {

@@ -23,6 +23,9 @@ pub struct UserCultureProfileRow {
     pub local_culture_ratio: f64,
     pub inferred_area_weights: String,
     pub inferred_local_tags: String,
+    pub weather_city: Option<String>,
+    pub weather_lat: Option<f64>,
+    pub weather_lon: Option<f64>,
     pub updated_at: String,
 }
 
@@ -36,6 +39,9 @@ impl From<UserCultureProfileRow> for UserCultureProfile {
             inferred_area_weights: serde_json::from_str(&row.inferred_area_weights)
                 .unwrap_or_default(),
             inferred_local_tags: serde_json::from_str(&row.inferred_local_tags).unwrap_or_default(),
+            weather_city: row.weather_city,
+            weather_lat: row.weather_lat,
+            weather_lon: row.weather_lon,
         }
     }
 }
@@ -72,14 +78,18 @@ impl UserCultureProfileRow {
         let row = sqlx::query_as::<_, UserCultureProfileRow>(
             "INSERT INTO user_culture_profiles \
                 (user_id, home_country, preferred_languages, local_culture_ratio, \
-                 inferred_area_weights, inferred_local_tags, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+                 inferred_area_weights, inferred_local_tags, weather_city, weather_lat, \
+                 weather_lon, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
              ON CONFLICT(user_id) DO UPDATE SET \
                 home_country = excluded.home_country, \
                 preferred_languages = excluded.preferred_languages, \
                 local_culture_ratio = excluded.local_culture_ratio, \
                 inferred_area_weights = excluded.inferred_area_weights, \
                 inferred_local_tags = excluded.inferred_local_tags, \
+                weather_city = excluded.weather_city, \
+                weather_lat = excluded.weather_lat, \
+                weather_lon = excluded.weather_lon, \
                 updated_at = CURRENT_TIMESTAMP \
              RETURNING *",
         )
@@ -89,11 +99,55 @@ impl UserCultureProfileRow {
         .bind(ratio)
         .bind(&areas)
         .bind(&local_tags)
+        .bind(profile.weather_city.as_deref())
+        .bind(profile.weather_lat)
+        .bind(profile.weather_lon)
         .fetch_one(db)
         .await
         .map_err(|e| e.to_string())?;
 
         Ok(row.into())
+    }
+
+    /// Inserts an auto-inferred profile ONLY if no row exists yet (`INSERT OR IGNORE`), then
+    /// reads back the stored row. Prevents background culture inference from clobbering a
+    /// concurrently saved Taste DNA update (including `weather_city` / coordinates).
+    pub async fn insert_if_missing_in(
+        db: &SqlitePool,
+        user_id: &str,
+        profile: &UserCultureProfile,
+    ) -> Result<UserCultureProfile, String> {
+        let langs = serde_json::to_string(&profile.preferred_languages)
+            .map_err(|e| e.to_string())?;
+        let areas = serde_json::to_string(&profile.inferred_area_weights)
+            .map_err(|e| e.to_string())?;
+        let local_tags =
+            serde_json::to_string(&profile.inferred_local_tags).map_err(|e| e.to_string())?;
+        let ratio = f64::from(profile.local_culture_ratio.clamp(0.0, 1.0));
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_culture_profiles \
+                (user_id, home_country, preferred_languages, local_culture_ratio, \
+                 inferred_area_weights, inferred_local_tags, weather_city, weather_lat, \
+                 weather_lon, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(user_id)
+        .bind(profile.home_country.as_deref())
+        .bind(&langs)
+        .bind(ratio)
+        .bind(&areas)
+        .bind(&local_tags)
+        .bind(profile.weather_city.as_deref())
+        .bind(profile.weather_lat)
+        .bind(profile.weather_lon)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        Ok(Self::get_in(db, user_id)
+            .await?
+            .unwrap_or_else(|| profile.clone()))
     }
 }
 
@@ -113,6 +167,7 @@ pub struct ContextualMixDefinitionRow {
     pub calendar_window: Option<String>,
     pub hour_window: Option<String>,
     pub days_of_week: String,
+    pub weather_conditions: String,
     pub always_surfaced: i64,
     pub countries: String,
     pub owned_ratio: f64,
@@ -148,6 +203,7 @@ impl From<ContextualMixDefinitionRow> for ContextualMixDefinition {
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<HourWindow>(s).ok()),
             days_of_week: serde_json::from_str(&row.days_of_week).unwrap_or_default(),
+            weather_conditions: serde_json::from_str(&row.weather_conditions).unwrap_or_default(),
             always_surfaced: row.always_surfaced != 0,
             countries: serde_json::from_str(&row.countries).unwrap_or_default(),
             owned_ratio: (row.owned_ratio as f32).clamp(0.0, 1.0),
@@ -204,6 +260,8 @@ impl ContextualMixDefinitionRow {
                 .map_err(|e| e.to_string())?;
             let days_of_week =
                 serde_json::to_string(&def.days_of_week).map_err(|e| e.to_string())?;
+            let weather_conditions =
+                serde_json::to_string(&def.weather_conditions).map_err(|e| e.to_string())?;
             let countries = serde_json::to_string(&def.countries).map_err(|e| e.to_string())?;
             let selection_rules = def
                 .selection_rules
@@ -216,10 +274,10 @@ impl ContextualMixDefinitionRow {
                 "INSERT OR IGNORE INTO contextual_mix_definitions \
                     (slug, owner_user_id, kind, i18n_key, custom_name, custom_description, \
                      built_in, enabled, theme_tags, international_queries, calendar_window, \
-                     hour_window, days_of_week, always_surfaced, countries, owned_ratio, \
-                     default_local_ratio, exclude_from_core_taste, offline_priority, \
+                     hour_window, days_of_week, weather_conditions, always_surfaced, countries, \
+                     owned_ratio, default_local_ratio, exclude_from_core_taste, offline_priority, \
                      target_tracks, sync_to_navidrome, selection_rules) \
-                 VALUES (?, NULL, ?, ?, NULL, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, NULL, ?, ?, NULL, NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&def.slug)
             .bind(def.kind.as_str())
@@ -230,6 +288,7 @@ impl ContextualMixDefinitionRow {
             .bind(cal.as_deref())
             .bind(hour.as_deref())
             .bind(&days_of_week)
+            .bind(&weather_conditions)
             .bind(i64::from(def.always_surfaced))
             .bind(&countries)
             .bind(f64::from(def.owned_ratio))
@@ -316,6 +375,8 @@ impl ContextualMixDefinitionRow {
             .transpose()
             .map_err(|e| e.to_string())?;
         let days_of_week = serde_json::to_string(&def.days_of_week).map_err(|e| e.to_string())?;
+        let weather_conditions =
+            serde_json::to_string(&def.weather_conditions).map_err(|e| e.to_string())?;
         let countries = serde_json::to_string(&def.countries).map_err(|e| e.to_string())?;
         let selection_rules = def
             .selection_rules
@@ -328,10 +389,10 @@ impl ContextualMixDefinitionRow {
             "INSERT INTO contextual_mix_definitions \
                 (slug, owner_user_id, kind, i18n_key, custom_name, custom_description, \
                  built_in, enabled, theme_tags, international_queries, calendar_window, \
-                 hour_window, days_of_week, always_surfaced, countries, owned_ratio, \
-                 default_local_ratio, exclude_from_core_taste, offline_priority, target_tracks, \
-                 sync_to_navidrome, selection_rules, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
+                 hour_window, days_of_week, weather_conditions, always_surfaced, countries, \
+                 owned_ratio, default_local_ratio, exclude_from_core_taste, offline_priority, \
+                 target_tracks, sync_to_navidrome, selection_rules, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) \
              ON CONFLICT(slug) DO UPDATE SET \
                 owner_user_id = excluded.owner_user_id, \
                 kind = excluded.kind, \
@@ -344,6 +405,7 @@ impl ContextualMixDefinitionRow {
                 calendar_window = excluded.calendar_window, \
                 hour_window = excluded.hour_window, \
                 days_of_week = excluded.days_of_week, \
+                weather_conditions = excluded.weather_conditions, \
                 always_surfaced = excluded.always_surfaced, \
                 countries = excluded.countries, \
                 owned_ratio = excluded.owned_ratio, \
@@ -369,6 +431,7 @@ impl ContextualMixDefinitionRow {
         .bind(cal.as_deref())
         .bind(hour.as_deref())
         .bind(&days_of_week)
+        .bind(&weather_conditions)
         .bind(i64::from(def.always_surfaced))
         .bind(&countries)
         .bind(f64::from(def.owned_ratio))

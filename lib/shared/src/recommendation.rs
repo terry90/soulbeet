@@ -686,6 +686,57 @@ impl CultureBucket {
     }
 }
 
+/// Coarse live weather condition used to activate weather-reactive contextual mixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeatherCondition {
+    Rainy,
+    Snowy,
+    Stormy,
+    Sunny,
+}
+
+impl WeatherCondition {
+    pub const fn badge_label(self) -> &'static str {
+        match self {
+            WeatherCondition::Rainy => "RAINY",
+            WeatherCondition::Snowy => "SNOW",
+            WeatherCondition::Stormy => "STORM",
+            WeatherCondition::Sunny => "SUNNY",
+        }
+    }
+}
+
+/// Live weather snapshot attached to weather-triggered contextual mix summaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WeatherSnapshot {
+    pub condition: WeatherCondition,
+    pub temperature_c: f32,
+    pub weather_code: u16,
+    pub is_day: bool,
+    #[serde(default)]
+    pub location_label: Option<String>,
+}
+
+/// Maps an Open-Meteo WMO weather interpretation code + temperature + daytime flag into
+/// a Soulbeet [`WeatherCondition`]. Returns `None` for neutral weather (overcast, mild clear,
+/// clear night, etc.) so weather mixes only appear when the weather genuinely matches.
+pub fn classify_wmo_weather(
+    weather_code: u16,
+    temperature_c: f32,
+    is_day: bool,
+) -> Option<WeatherCondition> {
+    match weather_code {
+        95 | 96 | 99 => Some(WeatherCondition::Stormy),
+        71 | 73 | 75 | 77 | 85 | 86 => Some(WeatherCondition::Snowy),
+        51 | 53 | 55 | 56 | 57 | 61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => {
+            Some(WeatherCondition::Rainy)
+        }
+        0 | 1 if is_day && temperature_c >= 20.0 => Some(WeatherCondition::Sunny),
+        _ => None,
+    }
+}
+
 /// User cultural & linguistic listening profile combining zero-config inference with explicit
 /// preferences.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -703,6 +754,16 @@ pub struct UserCultureProfile {
     /// Auto-inferred local sub-genres (e.g. "french electro", "chanson").
     #[serde(default)]
     pub inferred_local_tags: Vec<String>,
+    /// Optional explicit city label for weather-reactive mixes (e.g. "Lyon, FR").
+    /// When `None`, the server falls back to automatic zero-permission IP geolocation.
+    #[serde(default)]
+    pub weather_city: Option<String>,
+    /// Optional resolved latitude for `weather_city`.
+    #[serde(default)]
+    pub weather_lat: Option<f64>,
+    /// Optional resolved longitude for `weather_city`.
+    #[serde(default)]
+    pub weather_lon: Option<f64>,
 }
 
 fn default_local_culture_ratio() -> f32 {
@@ -717,6 +778,9 @@ impl Default for UserCultureProfile {
             local_culture_ratio: default_local_culture_ratio(),
             inferred_area_weights: Vec::new(),
             inferred_local_tags: Vec::new(),
+            weather_city: None,
+            weather_lat: None,
+            weather_lon: None,
         }
     }
 }
@@ -1064,6 +1128,9 @@ pub struct ContextualMixDefinition {
     /// Empty means active on every day of the week.
     #[serde(default)]
     pub days_of_week: Vec<u8>,
+    /// Live weather conditions that activate this mix (empty = not weather-gated).
+    #[serde(default)]
+    pub weather_conditions: Vec<WeatherCondition>,
     /// Always surface this mix regardless of time-of-day (e.g. Drive Mix).
     #[serde(default)]
     pub always_surfaced: bool,
@@ -1131,12 +1198,14 @@ impl ContextualMixDefinition {
             .any(|c| c.eq_ignore_ascii_case(code))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn is_active_at(
         &self,
         month: u32,
         day: u32,
         hour: u32,
         weekday: Option<u32>,
+        weather: Option<WeatherCondition>,
         effective_country: Option<&str>,
         explicitly_enabled_by_user: bool,
     ) -> bool {
@@ -1152,6 +1221,22 @@ impl ContextualMixDefinition {
                 in_window && (explicitly_enabled_by_user || self.matches_country(effective_country))
             }
             ContextualMixKind::Moment => {
+                if !self.weather_conditions.is_empty() {
+                    let weather_ok =
+                        weather.is_some_and(|w| self.weather_conditions.contains(&w));
+                    if !weather_ok {
+                        return false;
+                    }
+                    let day_ok = self.days_of_week.is_empty()
+                        || weekday.is_some_and(|w| {
+                            self.days_of_week.iter().any(|&d| u32::from(d) == w)
+                        });
+                    let hour_ok = self
+                        .hour_window
+                        .as_ref()
+                        .is_none_or(|w| w.is_active(hour));
+                    return day_ok && hour_ok;
+                }
                 if self.always_surfaced {
                     return true;
                 }
@@ -1192,6 +1277,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
         calendar_window: Some(window),
         hour_window: None,
         days_of_week: vec![],
+        weather_conditions: vec![],
         always_surfaced: false,
         countries: vec![],
         owned_ratio: 0.0,
@@ -1324,6 +1410,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1348,6 +1435,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(5, 10)),
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1372,6 +1460,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(11, 17)),
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1396,6 +1485,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(18, 21)),
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1420,6 +1510,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(18, 22)),
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.80,
@@ -1444,6 +1535,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(22, 4)),
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1454,6 +1546,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             sync_to_navidrome: false,
             selection_rules: None,
         },
+        // --- Weather-Reactive Moment Mixes (only shown when live local weather matches) ---
         ContextualMixDefinition {
             slug: "rainy_day".into(),
             owner_user_id: None,
@@ -1475,7 +1568,106 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
-            always_surfaced: true,
+            weather_conditions: vec![WeatherCondition::Rainy],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "snow_day".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.snow_day".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "ambient",
+                "folk",
+                "nordic",
+                "classical",
+                "piano",
+                "jazz",
+                "indie folk",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            weather_conditions: vec![WeatherCondition::Snowy],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "storm_night".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.storm_night".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "post-rock",
+                "trip hop",
+                "shoegaze",
+                "dark ambient",
+                "blues",
+                "alternative",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            weather_conditions: vec![WeatherCondition::Stormy],
+            always_surfaced: false,
+            countries: vec![],
+            owned_ratio: 0.75,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 25,
+            sync_to_navidrome: false,
+            selection_rules: None,
+        },
+        ContextualMixDefinition {
+            slug: "sunny_day".into(),
+            owner_user_id: None,
+            kind: ContextualMixKind::Moment,
+            i18n_key: "mix.moment.sunny_day".into(),
+            custom_name: None,
+            custom_description: None,
+            built_in: true,
+            enabled: true,
+            theme_tags: s(&[
+                "funk",
+                "soul",
+                "disco",
+                "indie pop",
+                "bossa nova",
+                "reggae",
+                "pop",
+            ]),
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            weather_conditions: vec![WeatherCondition::Sunny],
+            always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
             default_local_ratio: None,
@@ -1508,6 +1700,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(18, 23)),
             days_of_week: vec![5, 6],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.75,
@@ -1540,6 +1733,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: Some(HourWindow::new(7, 12)),
             days_of_week: vec![7],
+            weather_conditions: vec![],
             always_surfaced: false,
             countries: vec![],
             owned_ratio: 0.85,
@@ -1565,6 +1759,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 1.0,
@@ -1596,6 +1791,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 1.0,
@@ -1626,6 +1822,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 1.0,
@@ -1654,6 +1851,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 1.0,
@@ -1682,6 +1880,7 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
             calendar_window: None,
             hour_window: None,
             days_of_week: vec![],
+            weather_conditions: vec![],
             always_surfaced: true,
             countries: vec![],
             owned_ratio: 1.0,
@@ -1737,6 +1936,9 @@ pub fn canonical_mix_title(
             "mix.moment.dinner_groove" | "dinner_groove" => Some("Dinner Groove"),
             "mix.moment.late_night" | "late_night" => Some("Late Night"),
             "mix.moment.rainy_day" | "rainy_day" => Some("Rainy Day"),
+            "mix.moment.snow_day" | "snow_day" => Some("Snow Day"),
+            "mix.moment.storm_night" | "storm_night" => Some("Storm & Thunder"),
+            "mix.moment.sunny_day" | "sunny_day" => Some("Sunny Vibes"),
             "mix.moment.friday_night" | "friday_night" => Some("Friday Night Warmup"),
             "mix.moment.sunday_morning" | "sunday_morning" => Some("Sunday Morning Coffee"),
             "mix.moment.forgotten_gems" | "forgotten_gems" => Some("Forgotten Gems"),
@@ -1833,6 +2035,9 @@ pub struct ContextualMixSummary {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub navidrome_playlist_id: Option<String>,
+    /// Live local weather snapshot when this mix was activated by weather conditions.
+    #[serde(default)]
+    pub weather_badge: Option<WeatherSnapshot>,
     pub track_count: u32,
     pub target_tracks: u32,
 }
@@ -1889,6 +2094,8 @@ pub struct UpsertContextualMixRequest {
     pub hour_window: Option<HourWindow>,
     #[serde(default)]
     pub days_of_week: Vec<u8>,
+    #[serde(default)]
+    pub weather_conditions: Vec<WeatherCondition>,
     #[serde(default)]
     pub always_surfaced: bool,
     #[serde(default)]
@@ -1957,6 +2164,10 @@ pub struct UpdateCultureProfileRequest {
     pub preferred_languages: Option<Vec<String>>,
     #[serde(default)]
     pub local_culture_ratio: Option<f32>,
+    /// Optional city name for weather-reactive mixes (e.g. `"Lyon"`).
+    /// Pass `Some("")` to clear and return to automatic IP geolocation; `None` leaves unchanged.
+    #[serde(default)]
+    pub weather_city: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

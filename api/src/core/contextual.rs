@@ -19,7 +19,8 @@ use shared::recommendation::{
     ContextualMixDefinition, ContextualMixKind, ContextualMixPlaylist, ContextualMixSummary,
     ContextualMixTrack, CultureBucket, CultureSteering, DiscoveryProfile, MixSelectionRules,
     MixSortOrder, SeedRadioRequest, SeedRadioResponse, SeedRadioTrack, SetMixEnabledRequest,
-    UpdateCultureProfileRequest, UpsertContextualMixRequest, UserCultureProfile,
+    UpdateCultureProfileRequest, UpsertContextualMixRequest, UserCultureProfile, WeatherCondition,
+    WeatherSnapshot,
 };
 use soulbeet::engine::contextual::MAX_TRACKS_PER_ARTIST;
 use soulbeet::navidrome::models::SubsonicSong;
@@ -59,6 +60,23 @@ pub(crate) async fn update_culture_profile_in(
     user_id: &str,
     req: UpdateCultureProfileRequest,
 ) -> Result<UserCultureProfile, Failure> {
+    update_culture_profile_with_geocoder_in(db, user_id, req, |query, preferred| async move {
+        crate::core::weather::geocode_city(&query, preferred.as_deref()).await
+    })
+    .await
+}
+
+/// Inner implementation of [`update_culture_profile_in`] with an injectable geocoder for offline tests.
+pub(crate) async fn update_culture_profile_with_geocoder_in<F, Fut>(
+    db: &SqlitePool,
+    user_id: &str,
+    req: UpdateCultureProfileRequest,
+    geocode: F,
+) -> Result<UserCultureProfile, Failure>
+where
+    F: FnOnce(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::core::weather::WeatherLocation, Failure>>,
+{
     let mut current = get_culture_profile_in(db, user_id).await?;
     if let Some(country) = req.home_country {
         let trimmed = country.trim();
@@ -85,6 +103,55 @@ pub(crate) async fn update_culture_profile_in(
             ));
         }
         current.local_culture_ratio = ratio;
+    }
+    if let Some(city_raw) = req.weather_city {
+        let trimmed = city_raw.trim();
+        if trimmed.is_empty() {
+            current.weather_city = None;
+            current.weather_lat = None;
+            current.weather_lon = None;
+        } else {
+            if trimmed.chars().count() > crate::core::weather::MAX_WEATHER_CITY_CHARS {
+                return Err(Failure::new(
+                    FailureCode::InvalidInput,
+                    Stage::Input,
+                    RetryAdvice::NotRetryable,
+                    format!(
+                        "weather_city must be at most {} characters",
+                        crate::core::weather::MAX_WEATHER_CITY_CHARS
+                    ),
+                ));
+            }
+            let already_resolved = current
+                .weather_city
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(trimmed))
+                && current.weather_lat.is_some_and(|lat| {
+                    lat.is_finite() && (-90.0..=90.0).contains(&lat)
+                })
+                && current.weather_lon.is_some_and(|lon| {
+                    lon.is_finite() && (-180.0..=180.0).contains(&lon)
+                });
+            if !already_resolved {
+                let preferred_country = current.effective_country().map(str::to_string);
+                let loc = geocode(trimmed.to_string(), preferred_country).await?;
+                if !loc.lat.is_finite()
+                    || !loc.lon.is_finite()
+                    || !(-90.0..=90.0).contains(&loc.lat)
+                    || !(-180.0..=180.0).contains(&loc.lon)
+                {
+                    return Err(Failure::new(
+                        FailureCode::InvalidInput,
+                        Stage::Input,
+                        RetryAdvice::NotRetryable,
+                        "Geocoded coordinates are out of valid range",
+                    ));
+                }
+                current.weather_city = Some(loc.label.unwrap_or_else(|| trimmed.to_string()));
+                current.weather_lat = Some(loc.lat);
+                current.weather_lon = Some(loc.lon);
+            }
+        }
     }
 
     UserCultureProfileRow::upsert_in(db, user_id, &current)
@@ -754,6 +821,13 @@ pub(crate) async fn upsert_mix_definition_in(
         .enabled
         .unwrap_or_else(|| existing.as_ref().is_none_or(|e| e.enabled));
 
+    let mut weather_conditions: Vec<WeatherCondition> = Vec::new();
+    for cond in req.weather_conditions {
+        if !weather_conditions.contains(&cond) {
+            weather_conditions.push(cond);
+        }
+    }
+
     let def = ContextualMixDefinition {
         slug,
         owner_user_id,
@@ -784,6 +858,7 @@ pub(crate) async fn upsert_mix_definition_in(
         calendar_window: req.calendar_window,
         hour_window: req.hour_window,
         days_of_week,
+        weather_conditions,
         always_surfaced: req.always_surfaced,
         countries: req
             .countries
@@ -1763,6 +1838,7 @@ fn build_contextual_mix_tracks(
     tracks
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize_definition(
     user_id: &str,
     def: &ContextualMixDefinition,
@@ -1772,6 +1848,7 @@ fn summarize_definition(
     library: Option<&[SubsonicSong]>,
     now: chrono::DateTime<Utc>,
     precomputed_track_count: Option<u32>,
+    weather: Option<&WeatherSnapshot>,
 ) -> ContextualMixSummary {
     let steering = state
         .map(|s| CultureSteering::parse(&s.steering))
@@ -1791,6 +1868,13 @@ fn summarize_definition(
     };
     let track_count = precomputed_track_count
         .unwrap_or_else(|| build_contextual_mix_tracks(user_id, def, library, pending, now).len() as u32);
+    let weather_badge = if !def.weather_conditions.is_empty() {
+        weather
+            .filter(|w| def.weather_conditions.contains(&w.condition))
+            .cloned()
+    } else {
+        None
+    };
 
     ContextualMixSummary {
         slug: def.slug.clone(),
@@ -1810,6 +1894,7 @@ fn summarize_definition(
         active_until,
         expires_at,
         navidrome_playlist_id: state.and_then(|s| s.navidrome_playlist_id.clone()),
+        weather_badge,
         track_count,
         target_tracks: def.target_tracks,
     }
@@ -1908,6 +1993,7 @@ fn summarize_rolling_profile(
         active_until: None,
         expires_at: None,
         navidrome_playlist_id,
+        weather_badge: None,
         track_count,
         target_tracks: target,
     }
@@ -1950,6 +2036,7 @@ pub(crate) async fn list_calendar_active_seasonal_defs_in(
             now.day(),
             now.hour(),
             Some(now.weekday().number_from_monday()),
+            None,
             effective_country.as_deref(),
             explicitly_enabled,
         ) {
@@ -1962,8 +2049,10 @@ pub(crate) async fn list_calendar_active_seasonal_defs_in(
 /// Lists active contextual mixes for `ctx` as pure structured client-i18n summaries:
 /// 1. Active calendar Seasonal Packs that currently have at least one playable track (staged or owned),
 ///    sorted by narrowest calendar window first so event packs lead broad seasons
-/// 2. Active Moment Mixes (always-surfaced + matching current hour/weekday window, hiding empty strict-rule mixes)
+/// 2. Active Moment Mixes (always-surfaced + live weather + matching current hour/weekday window,
+///    hiding empty strict-rule mixes)
 /// 3. Enabled Rolling Discovery profiles (`mix.rolling.conservative` / `balanced` / `adventurous`)
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_active_contextual_mixes_in(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -1972,6 +2061,7 @@ pub(crate) async fn list_active_contextual_mixes_in(
     now: chrono::DateTime<Utc>,
     local_hour: Option<u8>,
     local_weekday: Option<u8>,
+    weather: Option<WeatherSnapshot>,
 ) -> Result<Vec<ContextualMixSummary>, Failure> {
     let hour = match local_hour {
         Some(h) if h <= 23 => u32::from(h),
@@ -2014,6 +2104,7 @@ pub(crate) async fn list_active_contextual_mixes_in(
         states.iter().map(|s| (s.slug.as_str(), s)).collect();
 
     let effective_country = culture.effective_country();
+    let weather_condition = weather.as_ref().map(|w| w.condition);
     let mut active_defs: Vec<(&ContextualMixDefinition, Option<&ContextualMixStateRow>)> =
         Vec::new();
 
@@ -2029,6 +2120,7 @@ pub(crate) async fn list_active_contextual_mixes_in(
             now.day(),
             hour,
             Some(weekday),
+            weather_condition,
             effective_country,
             explicitly_enabled,
         ) {
@@ -2086,6 +2178,7 @@ pub(crate) async fn list_active_contextual_mixes_in(
             library.as_deref(),
             now,
             None,
+            weather.as_ref(),
         );
         match def.kind {
             ContextualMixKind::Seasonal => {
@@ -2107,17 +2200,19 @@ pub(crate) async fn list_active_contextual_mixes_in(
                 }
                 let sort_key: (u8, u16) = if def.offline_priority {
                     (0, 0)
-                } else if def.hour_window.is_some() || !def.days_of_week.is_empty() {
+                } else if !def.weather_conditions.is_empty() {
                     (1, 0)
-                } else if def.selection_rules.is_none() {
+                } else if def.hour_window.is_some() || !def.days_of_week.is_empty() {
                     (2, 0)
+                } else if def.selection_rules.is_none() {
+                    (3, 0)
                 } else if let Some((start_year, _)) =
                     def.selection_rules.as_ref().and_then(|r| r.year_range)
                 {
                     // Keep decade mixes in chronological order (80s Wave < 90s Mix < 2000s Mix).
-                    (4, start_year)
+                    (5, start_year)
                 } else {
-                    (3, 0)
+                    (4, 0)
                 };
                 moments.push((sort_key, summary));
             }
@@ -2130,8 +2225,8 @@ pub(crate) async fn list_active_contextual_mixes_in(
         span_a.cmp(span_b).then_with(|| sum_a.slug.cmp(&sum_b.slug))
     });
 
-    // Put Drive / offline_priority moments first, then scheduled time/day moments, then mood
-    // moments, then library-rule smart mixes, then chronological decade capsules.
+    // Put Drive / offline_priority moments first, then live weather mixes, then scheduled time/day
+    // moments, then mood moments, then library-rule smart mixes, then chronological decade capsules.
     moments.sort_by(|(key_a, sum_a), (key_b, sum_b)| {
         key_a.cmp(key_b).then_with(|| sum_a.slug.cmp(&sum_b.slug))
     });
@@ -2235,6 +2330,7 @@ pub(crate) async fn steer_seasonal_pack_in(
         library.as_deref(),
         now,
         None,
+        None,
     ))
 }
 
@@ -2273,6 +2369,7 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
                 now.day(),
                 now.hour(),
                 Some(now.weekday().number_from_monday()),
+                None,
                 culture.effective_country(),
                 explicitly_enabled,
             );
@@ -2675,6 +2772,7 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
         library.as_deref(),
         now,
         Some(tracks.len() as u32),
+        None,
     );
 
     Ok(ContextualMixPlaylist {
@@ -2947,6 +3045,7 @@ mod tests {
                 home_country: Some("jp".into()),
                 preferred_languages: Some(vec!["JA".into(), "EN".into()]),
                 local_culture_ratio: Some(0.50),
+                weather_city: None,
             },
         )
         .await
@@ -2980,7 +3079,7 @@ mod tests {
         // Empty seasonal mixes (0 staged + 0 owned tracks) are hidden from list_active_contextual_mixes_in,
         // while list_calendar_active_seasonal_defs_in still surfaces them for the generator.
         let empty_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None, None)
+            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None, None, None)
                 .await
                 .unwrap();
         assert!(!empty_mixes.iter().any(|m| m.slug == "winter_holiday"));
@@ -3008,9 +3107,10 @@ mod tests {
         .await
         .unwrap();
 
-        let mixes = list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None, None)
-            .await
-            .unwrap();
+        let mixes =
+            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None, None, None)
+                .await
+                .unwrap();
         assert_eq!(mixes[0].kind, ContextualMixKind::Seasonal);
         assert_eq!(mixes[0].slug, "winter_holiday");
         assert_eq!(mixes[0].i18n_key, "mix.seasonal.winter_holiday");
@@ -3021,10 +3121,18 @@ mod tests {
         assert!(mixes.iter().any(|m| m.slug == "focus"));
 
         // local_hour overrides UTC hour for Moment windows (morning = 5..=10, late_night = 22..=4)
-        let morning_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, Some(8), None)
-                .await
-                .unwrap();
+        let morning_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            dec,
+            Some(8),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(morning_mixes.iter().any(|m| m.slug == "morning"));
         assert!(!morning_mixes.iter().any(|m| m.slug == "focus"));
 
@@ -3070,6 +3178,7 @@ mod tests {
                 calendar_window: Some(CalendarWindow::new(6, 18, 6, 26, 5)),
                 hour_window: None,
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.0,
@@ -3103,6 +3212,7 @@ mod tests {
                 calendar_window: Some(CalendarWindow::new(2, 31, 3, 1, 5)),
                 hour_window: None,
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.0,
@@ -3133,6 +3243,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: Some(HourWindow::new(25, 4)),
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.5,
@@ -3164,6 +3275,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: Some(HourWindow::new(18, 21)),
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.75,
@@ -3195,6 +3307,7 @@ mod tests {
                 calendar_window: Some(CalendarWindow::new(6, 18, 6, 26, 5)),
                 hour_window: None,
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.0,
@@ -3227,6 +3340,7 @@ mod tests {
                 calendar_window: Some(CalendarWindow::new(6, 18, 6, 26, 5)),
                 hour_window: None,
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.0,
@@ -3272,7 +3386,7 @@ mod tests {
         .unwrap();
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
         let mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, dec, None, None)
+            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, dec, None, None, None)
                 .await
                 .unwrap();
         assert!(!mixes.iter().any(|m| m.slug == "winter_holiday"));
@@ -3284,10 +3398,18 @@ mod tests {
             .await
             .unwrap();
         assert!(june_cal.iter().any(|(d, _)| d.slug == "midsummer"));
-        let june_empty =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, june, None, None)
-                .await
-                .unwrap();
+        let june_empty = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &alice,
+            june,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!june_empty.iter().any(|m| m.slug == "midsummer"));
 
         let folder_id = crate::models::folder::Folder::get_all_by_user_in(&db, "alice")
@@ -3308,10 +3430,18 @@ mod tests {
         .await
         .unwrap();
 
-        let june_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, june, None, None)
-                .await
-                .unwrap();
+        let june_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &alice,
+            june,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(june_mixes.iter().any(|m| m.slug == "midsummer" && m.track_count == 1));
 
         delete_mix_definition_in(&db, &admin, "midsummer")
@@ -4020,6 +4150,7 @@ mod tests {
             now,
             Some(19),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4230,10 +4361,18 @@ mod tests {
         .unwrap();
 
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
-        let mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, Some(14), None)
-                .await
-                .unwrap();
+        let mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            dec,
+            Some(14),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let winter_summary = mixes.iter().find(|m| m.slug == "winter_holiday").unwrap();
         assert_eq!(
@@ -4319,6 +4458,7 @@ mod tests {
             &ctx,
             dec,
             Some(14),
+            None,
             None,
         )
         .await
@@ -4698,10 +4838,18 @@ mod tests {
 
         // In October (Oct 20): halloween (18d) must come before autumn (59d)
         let oct = Utc.with_ymd_and_hms(2026, 10, 20, 14, 0, 0).unwrap();
-        let oct_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, oct, Some(14), None)
-                .await
-                .unwrap();
+        let oct_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            oct,
+            Some(14),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let oct_seasonal: Vec<&str> = oct_mixes
             .iter()
             .filter(|m| m.kind == ContextualMixKind::Seasonal)
@@ -4711,10 +4859,18 @@ mod tests {
 
         // In June (Jun 20): summer_solstice (10d) must come before summer (92d)
         let jun = Utc.with_ymd_and_hms(2026, 6, 20, 14, 0, 0).unwrap();
-        let jun_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, jun, Some(14), None)
-                .await
-                .unwrap();
+        let jun_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            jun,
+            Some(14),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let jun_seasonal: Vec<&str> = jun_mixes
             .iter()
             .filter(|m| m.kind == ContextualMixKind::Seasonal)
@@ -4732,35 +4888,67 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
 
         // Friday 20:00 (weekday 5): friday_night active
-        let fri_eve =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, now, Some(20), Some(5))
-                .await
-                .unwrap();
+        let fri_eve = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(20),
+            Some(5),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(fri_eve.iter().any(|m| m.slug == "friday_night"));
         assert!(fri_eve.iter().any(|m| m.slug == "evening_unwind"));
         assert!(fri_eve.iter().any(|m| m.slug == "dinner_groove"));
 
         // Tuesday 20:00 (weekday 2): friday_night hidden
-        let tue_eve =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, now, Some(20), Some(2))
-                .await
-                .unwrap();
+        let tue_eve = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(20),
+            Some(2),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!tue_eve.iter().any(|m| m.slug == "friday_night"));
         assert!(tue_eve.iter().any(|m| m.slug == "evening_unwind"));
 
         // Sunday 09:00 (weekday 7): sunday_morning active
-        let sun_am =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, now, Some(9), Some(7))
-                .await
-                .unwrap();
+        let sun_am = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(9),
+            Some(7),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(sun_am.iter().any(|m| m.slug == "sunday_morning"));
         assert!(sun_am.iter().any(|m| m.slug == "morning"));
 
         // Monday 09:00 (weekday 1): sunday_morning hidden
-        let mon_am =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, now, Some(9), Some(1))
-                .await
-                .unwrap();
+        let mon_am = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(9),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!mon_am.iter().any(|m| m.slug == "sunday_morning"));
 
         // Upsert validates days_of_week and selection_rules
@@ -4779,6 +4967,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: None,
                 days_of_week: vec![0, 5],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 0.8,
@@ -4809,6 +4998,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: None,
                 days_of_week: vec![6, 5, 6],
+                weather_conditions: vec![],
                 always_surfaced: true,
                 countries: vec![],
                 owned_ratio: 1.0,
@@ -4842,6 +5032,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: None,
                 days_of_week: vec![5],
+                weather_conditions: vec![],
                 always_surfaced: true,
                 countries: vec![],
                 owned_ratio: 1.0,
@@ -4876,6 +5067,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: None,
                 days_of_week: vec![7, 6, 7],
+                weather_conditions: vec![],
                 always_surfaced: false,
                 countries: vec![],
                 owned_ratio: 1.0,
@@ -4910,10 +5102,18 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 15, 14, 0, 0).unwrap();
 
         // With no library linked, all strict_match smart mixes are hidden.
-        let empty_mixes =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, now, Some(14), Some(1))
-                .await
-                .unwrap();
+        let empty_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(14),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
         for slug in [
             "forgotten_gems",
             "fresh_arrivals",
@@ -4970,6 +5170,7 @@ mod tests {
             now,
             Some(14),
             Some(1),
+            None,
         )
         .await
         .unwrap();
@@ -5208,9 +5409,17 @@ mod tests {
         let ctx = test_ctx("alice");
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 12, 0, 0).unwrap();
 
-        let bad_weekday =
-            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, Some(12), Some(0))
-                .await;
+        let bad_weekday = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            dec,
+            Some(12),
+            Some(0),
+            None,
+        )
+        .await;
         assert!(bad_weekday.is_err());
 
         let bad_days = upsert_mix_definition_in(
@@ -5228,6 +5437,7 @@ mod tests {
                 calendar_window: None,
                 hour_window: None,
                 days_of_week: vec![],
+                weather_conditions: vec![],
                 always_surfaced: true,
                 countries: vec![],
                 owned_ratio: 1.0,
@@ -5277,5 +5487,173 @@ mod tests {
                 .is_none(),
             "retired contextual_mix_states row should be removed after Navidrome cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn weather_gated_mixes_activate_only_on_matching_live_weather_and_attach_badge() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 14, 0, 0).unwrap();
+        let all_weather_slugs = ["rainy_day", "snow_day", "storm_night", "sunny_day"];
+
+        // When weather is None, all 4 weather mixes are hidden.
+        let none_mixes = list_active_contextual_mixes_in(
+            &db,
+            &NoNavidrome,
+            None,
+            &ctx,
+            now,
+            Some(14),
+            Some(1),
+            None,
+        )
+        .await
+        .unwrap();
+        for slug in all_weather_slugs {
+            assert!(
+                !none_mixes.iter().any(|m| m.slug == slug),
+                "{slug} must stay hidden when weather is None"
+            );
+        }
+        assert!(none_mixes.iter().all(|m| m.weather_badge.is_none()));
+
+        // Each WeatherCondition activates ONLY its matching mix with weather_badge attached,
+        // keeps non-weather mixes badge-free, and sorts the weather mix in bucket 1
+        // (right after drive/offline_priority, ahead of scheduled time moments like focus).
+        for (cond, expected_slug, temp_c, code, is_day) in [
+            (WeatherCondition::Rainy, "rainy_day", 13.5, 61, true),
+            (WeatherCondition::Snowy, "snow_day", -2.0, 73, true),
+            (WeatherCondition::Stormy, "storm_night", 18.0, 95, false),
+            (WeatherCondition::Sunny, "sunny_day", 26.0, 0, true),
+        ] {
+            let snap = WeatherSnapshot {
+                condition: cond,
+                temperature_c: temp_c,
+                weather_code: code,
+                is_day,
+                location_label: Some("Lyon, FR".into()),
+            };
+            let mixes = list_active_contextual_mixes_in(
+                &db,
+                &NoNavidrome,
+                None,
+                &ctx,
+                now,
+                Some(14),
+                Some(1),
+                Some(snap.clone()),
+            )
+            .await
+            .unwrap();
+
+            for slug in all_weather_slugs {
+                let found = mixes.iter().find(|m| m.slug == slug);
+                if slug == expected_slug {
+                    let m = found.expect("matching weather mix must surface");
+                    assert_eq!(m.weather_badge.as_ref(), Some(&snap));
+                } else {
+                    assert!(
+                        found.is_none(),
+                        "{slug} must stay hidden when weather is {cond:?}"
+                    );
+                }
+            }
+
+            // Non-weather mixes must NOT carry weather_badge
+            let drive = mixes.iter().find(|m| m.slug == "drive").unwrap();
+            assert_eq!(drive.weather_badge, None);
+            let focus = mixes.iter().find(|m| m.slug == "focus").unwrap();
+            assert_eq!(focus.weather_badge, None);
+
+            // Ordering: drive (bucket 0) < weather mix (bucket 1) < focus (bucket 2)
+            let pos = |slug: &str| mixes.iter().position(|m| m.slug == slug).unwrap();
+            assert!(pos("drive") < pos(expected_slug));
+            assert!(pos(expected_slug) < pos("focus"));
+        }
+    }
+
+    #[tokio::test]
+    async fn culture_profile_weather_city_geocodes_preserves_and_clears() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+
+        // Setting home_country + weather_city passes effective_country to geocoder and persists coords.
+        let saved = update_culture_profile_with_geocoder_in(
+            &db,
+            "alice",
+            UpdateCultureProfileRequest {
+                home_country: Some("fr".into()),
+                preferred_languages: None,
+                local_culture_ratio: None,
+                weather_city: Some("Lyon".into()),
+            },
+            |query, preferred| async move {
+                assert_eq!(query, "Lyon");
+                assert_eq!(preferred.as_deref(), Some("FR"));
+                Ok(crate::core::weather::WeatherLocation {
+                    lat: 45.7485,
+                    lon: 4.8467,
+                    label: Some("Lyon, FR".into()),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.weather_city.as_deref(), Some("Lyon, FR"));
+        assert_eq!(saved.weather_lat, Some(45.7485));
+        assert_eq!(saved.weather_lon, Some(4.8467));
+
+        // Passing weather_city: None preserves existing city and coordinates without calling geocoder.
+        let preserved = update_culture_profile_with_geocoder_in(
+            &db,
+            "alice",
+            UpdateCultureProfileRequest {
+                home_country: None,
+                preferred_languages: Some(vec!["fr".into()]),
+                local_culture_ratio: None,
+                weather_city: None,
+            },
+            |_, _| async { panic!("geocoder must not be called when weather_city is None") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(preserved.weather_city.as_deref(), Some("Lyon, FR"));
+        assert_eq!(preserved.weather_lat, Some(45.7485));
+        assert_eq!(preserved.weather_lon, Some(4.8467));
+
+        // Passing overly long weather_city fails with InvalidInput before geocoding.
+        let too_long = update_culture_profile_with_geocoder_in(
+            &db,
+            "alice",
+            UpdateCultureProfileRequest {
+                home_country: None,
+                preferred_languages: None,
+                local_culture_ratio: None,
+                weather_city: Some("a".repeat(101)),
+            },
+            |_, _| async { panic!("geocoder must not be called for >100 char city") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(too_long.code, FailureCode::InvalidInput);
+
+        // Passing empty / whitespace-only weather_city clears city and coordinates back to auto IP geo.
+        let cleared = update_culture_profile_with_geocoder_in(
+            &db,
+            "alice",
+            UpdateCultureProfileRequest {
+                home_country: None,
+                preferred_languages: None,
+                local_culture_ratio: None,
+                weather_city: Some("   ".into()),
+            },
+            |_, _| async { panic!("geocoder must not be called when clearing weather_city") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.weather_city, None);
+        assert_eq!(cleared.weather_lat, None);
+        assert_eq!(cleared.weather_lon, None);
     }
 }
