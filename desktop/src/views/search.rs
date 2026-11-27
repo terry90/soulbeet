@@ -1195,7 +1195,7 @@ pub fn SearchView() -> Element {
                                         }
 
                                         // Deep Catalog Footer
-                                        if remote_fallback_used || remote_provider == "deezer" || (remote_provider == "musicbrainz" && !remote_fallback_used) {
+                                        if remote_fallback_used || remote_provider == "deezer" || remote_provider == "musicbrainz" {
                                             div { class: "pt-2 border-t border-beet-border-subtle flex flex-wrap items-center justify-between gap-3",
                                                 if remote_fallback_used {
                                                     p { class: "text-[12px] text-beet-text-tertiary",
