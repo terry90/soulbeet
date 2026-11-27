@@ -1,6 +1,8 @@
 //! Studio Library view: Playlists browser, Albums grid, Starred list,
 //! Pending Discovery tracks, and Library Stats overview.
 
+use std::collections::HashSet;
+
 use dioxus::prelude::*;
 use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
@@ -11,10 +13,55 @@ use ui::{
 
 use crate::auth::use_auth;
 use crate::navidrome_web::{
-    fetch_album_tracks, fetch_playlist_tracks, fetch_playlists, SubsonicPlaylistSummary,
+    fetch_album_list, fetch_album_tracks, fetch_playlist_tracks, fetch_playlists, AlbumListSort,
+    SubsonicAlbumSummary, SubsonicPlaylistSummary, ALBUM_LIST_PAGE_SIZE,
 };
 use crate::web_player::use_studio;
 use crate::Route;
+
+/// Merges a fetched `getAlbumList2` page into `existing`, deduplicating album IDs
+/// while advancing the server offset by the raw page length returned by Navidrome.
+fn merge_album_page(
+    existing: &mut Vec<SubsonicAlbumSummary>,
+    page: Vec<SubsonicAlbumSummary>,
+    offset: u32,
+    page_size: u32,
+) -> (u32, bool) {
+    let raw_len = page.len() as u32;
+    let has_more = raw_len >= page_size && page_size > 0;
+    let next_offset = offset.saturating_add(raw_len);
+    let mut seen: HashSet<String> = existing.iter().map(|a| a.id.clone()).collect();
+    for alb in page {
+        if seen.insert(alb.id.clone()) {
+            existing.push(alb);
+        }
+    }
+    (next_offset, has_more)
+}
+
+fn albums_badge_text(count: usize, has_more: bool) -> Option<String> {
+    if count == 0 {
+        None
+    } else if has_more {
+        Some(format!("{count}+"))
+    } else {
+        Some(count.to_string())
+    }
+}
+
+fn empty_albums_message(has_navidrome: bool, offline_only: bool, sort: AlbumListSort) -> &'static str {
+    if offline_only {
+        "Offline Only mode is active. Turn it off to browse albums from Navidrome."
+    } else if !has_navidrome {
+        "Connect Navidrome in Settings to browse your albums."
+    } else if sort == AlbumListSort::Recent {
+        "No recently played albums yet. Play an album or switch to A-Z to see your full library."
+    } else if sort == AlbumListSort::Frequent {
+        "No played albums yet. Switch to A-Z or Newest to see your full library."
+    } else {
+        "No albums found in Navidrome."
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryTab {
@@ -43,7 +90,136 @@ pub fn LibraryPage() -> Element {
     let mut detail_loading = use_signal(|| false);
     let mut detail_req_id = use_signal(|| 0u64);
 
+    let mut album_sort = use_signal(AlbumListSort::default);
+    let mut albums_list = use_signal(Vec::<SubsonicAlbumSummary>::new);
+    let mut albums_next_offset = use_signal(|| 0u32);
+    let mut albums_has_more = use_signal(|| false);
+    let mut albums_loading = use_signal(|| false);
+    let mut albums_loading_more = use_signal(|| false);
+    let mut albums_error = use_signal(|| None::<String>);
+    let mut albums_req_id = use_signal(|| 0u64);
+    let mut loaded_albums_key = use_signal(|| None::<(String, String, AlbumListSort)>);
+
+    let load_albums_page = use_callback(move |(sort, append): (AlbumListSort, bool)| {
+        if player.offline_only() {
+            studio.show_toast("Offline Only mode is active: remote albums cannot be loaded.");
+            return;
+        }
+        let Some(info) = studio.navidrome_info() else {
+            return;
+        };
+        if append && (*albums_loading.peek() || *albums_loading_more.peek()) {
+            return;
+        }
+        let offset = if append { *albums_next_offset.peek() } else { 0 };
+        let req_id = albums_req_id.peek().wrapping_add(1);
+        albums_req_id.set(req_id);
+        if append {
+            albums_loading_more.set(true);
+        } else {
+            albums_loading.set(true);
+            albums_loading_more.set(false);
+            albums_error.set(None);
+            albums_list.set(Vec::new());
+            albums_next_offset.set(0);
+            albums_has_more.set(false);
+        }
+        spawn(async move {
+            let res = fetch_album_list(&info, sort, ALBUM_LIST_PAGE_SIZE, offset).await;
+            if *albums_req_id.peek() != req_id {
+                return;
+            }
+            match res {
+                Ok(page) => {
+                    let mut next = if append {
+                        albums_list.peek().clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let (next_offset, has_more) =
+                        merge_album_page(&mut next, page, offset, ALBUM_LIST_PAGE_SIZE);
+                    albums_list.set(next);
+                    albums_next_offset.set(next_offset);
+                    albums_has_more.set(has_more);
+                    albums_error.set(None);
+                }
+                Err(e) => {
+                    if append {
+                        studio.show_toast(format!("Could not load more albums: {e}"));
+                    } else {
+                        loaded_albums_key.set(None);
+                        albums_error.set(Some(e));
+                    }
+                }
+            }
+            albums_loading.set(false);
+            albums_loading_more.set(false);
+        });
+    });
+
+    // Load the full Navidrome album catalog as soon as bootstrap resolves or sort changes.
+    use_effect(move || {
+        let sort = album_sort();
+        let offline = player.offline_only();
+        let nav = studio
+            .bootstrap
+            .read()
+            .as_ref()
+            .and_then(|b| b.navidrome.clone());
+        match nav {
+            Some(info) if !offline => {
+                let key = (info.base_url.clone(), info.username.clone(), sort);
+                if loaded_albums_key.peek().as_ref() != Some(&key) {
+                    loaded_albums_key.set(Some(key));
+                    load_albums_page.call((sort, false));
+                }
+            }
+            None => {
+                if loaded_albums_key.peek().is_some()
+                    || *albums_loading.peek()
+                    || *albums_loading_more.peek()
+                    || !albums_list.peek().is_empty()
+                {
+                    let next_req = albums_req_id.peek().wrapping_add(1);
+                    albums_req_id.set(next_req);
+                    loaded_albums_key.set(None);
+                    albums_list.set(Vec::new());
+                    albums_next_offset.set(0);
+                    albums_has_more.set(false);
+                    albums_error.set(None);
+                    albums_loading.set(false);
+                    albums_loading_more.set(false);
+                }
+            }
+            Some(_) => {
+                // Offline Only toggled on: cancel any in-flight album fetch cleanly.
+                if *albums_loading.peek() || *albums_loading_more.peek() {
+                    let was_initial = *albums_loading.peek();
+                    let next_req = albums_req_id.peek().wrapping_add(1);
+                    albums_req_id.set(next_req);
+                    albums_loading.set(false);
+                    albums_loading_more.set(false);
+                    if was_initial {
+                        loaded_albums_key.set(None);
+                    }
+                }
+            }
+        }
+    });
+
     let offline_only = player.offline_only();
+    let bootstrap_pending = studio.bootstrap.read().is_none();
+    let nav_info = studio.navidrome_info();
+    let has_navidrome = nav_info.is_some();
+    let current_album_key = nav_info
+        .as_ref()
+        .map(|info| (info.base_url.clone(), info.username.clone(), album_sort()));
+    let albums_load_pending = !offline_only
+        && albums_error.read().is_none()
+        && (bootstrap_pending
+            || current_album_key
+                .as_ref()
+                .is_some_and(|key| loaded_albums_key.read().as_ref() != Some(key)));
     let playlists: Vec<_> = studio
         .playlists
         .read()
@@ -51,7 +227,7 @@ pub fn LibraryPage() -> Element {
         .filter(|p| !(p.category == PlaylistCategory::Seasonal && p.song_count == 0))
         .cloned()
         .collect();
-    let albums = studio.recent_albums.read().clone();
+    let albums = albums_list.read().clone();
     let starred: Vec<_> = studio
         .starred_tracks
         .read()
@@ -145,10 +321,26 @@ pub fn LibraryPage() -> Element {
             div { class: "flex flex-wrap items-center justify-between gap-3",
                 div { class: "flex flex-wrap items-center gap-2",
                     for (tab, label, badge) in [
-                        (LibraryTab::Playlists, "Playlists", (!playlists.is_empty()).then_some(playlists.len())),
-                        (LibraryTab::Albums, "Albums", (!albums.is_empty()).then_some(albums.len())),
-                        (LibraryTab::Starred, "Starred", (!starred.is_empty()).then_some(starred.len())),
-                        (LibraryTab::Discovery, "Discovery", (!triage.is_empty()).then_some(triage.len())),
+                        (
+                            LibraryTab::Playlists,
+                            "Playlists",
+                            (!playlists.is_empty()).then(|| playlists.len().to_string()),
+                        ),
+                        (
+                            LibraryTab::Albums,
+                            "Albums",
+                            albums_badge_text(albums.len(), albums_has_more()),
+                        ),
+                        (
+                            LibraryTab::Starred,
+                            "Starred",
+                            (!starred.is_empty()).then(|| starred.len().to_string()),
+                        ),
+                        (
+                            LibraryTab::Discovery,
+                            "Discovery",
+                            (!triage.is_empty()).then(|| triage.len().to_string()),
+                        ),
                         (LibraryTab::Stats, "Stats", None),
                     ] {
                         {
@@ -350,36 +542,142 @@ pub fn LibraryPage() -> Element {
                         }
                     },
                     LibraryTab::Albums => rsx! {
-                        if albums.is_empty() {
-                            div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-8 text-center text-[13px] text-beet-text-secondary",
-                                "No albums loaded from Navidrome yet."
+                        div { class: "space-y-4",
+                            div { class: "flex flex-wrap items-center justify-between gap-2",
+                                div { class: "flex flex-wrap items-center gap-1.5",
+                                    for sort in AlbumListSort::ALL {
+                                        {
+                                            let active = album_sort() == sort;
+                                            let cls = if active {
+                                                "bg-beet-surface-highest border-beet-border-default text-beet-text-primary font-semibold"
+                                            } else {
+                                                "bg-beet-surface border-beet-border-subtle text-beet-text-secondary hover:text-beet-text-primary font-medium"
+                                            };
+                                            rsx! {
+                                                button {
+                                                    key: "alb-sort-{sort.as_subsonic_type()}",
+                                                    r#type: "button",
+                                                    disabled: offline_only,
+                                                    class: "h-8 px-3 rounded-full border text-[12px] disabled:opacity-40 transition-colors cursor-pointer {cls}",
+                                                    onclick: move |_| {
+                                                        if album_sort() != sort {
+                                                            album_sort.set(sort);
+                                                        } else if albums_error().is_some() {
+                                                            if let Some(info) = studio.navidrome_info() {
+                                                                loaded_albums_key.set(Some((
+                                                                    info.base_url.clone(),
+                                                                    info.username.clone(),
+                                                                    sort,
+                                                                )));
+                                                            }
+                                                            load_albums_page.call((sort, false));
+                                                        }
+                                                    },
+                                                    "{sort.label()}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if has_navidrome {
+                                    button {
+                                        r#type: "button",
+                                        disabled: albums_loading() || albums_loading_more() || offline_only,
+                                        class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default text-[12px] font-medium text-beet-text-secondary hover:text-beet-text-primary disabled:opacity-40 transition-colors cursor-pointer",
+                                        onclick: move |_| {
+                                            if let Some(info) = studio.navidrome_info() {
+                                                loaded_albums_key.set(Some((
+                                                    info.base_url.clone(),
+                                                    info.username.clone(),
+                                                    album_sort(),
+                                                )));
+                                            }
+                                            load_albums_page.call((album_sort(), false));
+                                        },
+                                        IconRefreshCw {
+                                            size: 12,
+                                            class: if albums_loading() { "animate-spin motion-reduce:animate-none".to_string() } else { String::new() },
+                                        }
+                                        span { "Refresh" }
+                                    }
+                                }
                             }
-                        } else {
-                            div { class: "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4",
-                                for alb in albums.iter() {
-                                    {
-                                        let aid = alb.id.clone();
-                                        let name = alb.name.clone();
-                                        rsx! {
-                                            button {
-                                                key: "lib-alb-{alb.id}",
-                                                r#type: "button",
-                                                class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle p-3 text-left transition-colors cursor-pointer space-y-2.5",
-                                                onclick: move |_| load_album.call((aid.clone(), name.clone())),
-                                                div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
-                                                    if let Some(url) = alb.cover_art_url.as_deref() {
-                                                        img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
-                                                    } else {
-                                                        IconDisc3 { size: 28, class: "text-beet-text-disabled".to_string() }
+
+                            if (albums_loading() || albums_load_pending) && albums.is_empty() {
+                                div { class: "py-10 flex items-center justify-center gap-2 text-beet-text-tertiary text-[13px]",
+                                    IconLoader { size: 16 }
+                                    span { "Loading albums…" }
+                                }
+                            } else if let Some(err) = albums_error() {
+                                div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-6 text-center space-y-3",
+                                    p { class: "text-[13px] text-beet-text-secondary",
+                                        "Could not load albums from Navidrome: {err}"
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        disabled: albums_loading() || offline_only,
+                                        class: "inline-flex items-center gap-1.5 h-8 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] font-medium text-beet-text-primary hover:bg-beet-surface-highest disabled:opacity-50 transition-colors cursor-pointer",
+                                        onclick: move |_| {
+                                            if let Some(info) = studio.navidrome_info() {
+                                                loaded_albums_key.set(Some((
+                                                    info.base_url.clone(),
+                                                    info.username.clone(),
+                                                    album_sort(),
+                                                )));
+                                            }
+                                            load_albums_page.call((album_sort(), false));
+                                        },
+                                        IconRefreshCw { size: 13 }
+                                        span { "Retry" }
+                                    }
+                                }
+                            } else if albums.is_empty() {
+                                div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-8 text-center text-[13px] text-beet-text-secondary",
+                                    "{empty_albums_message(has_navidrome, offline_only, album_sort())}"
+                                }
+                            } else {
+                                div { class: "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4",
+                                    for alb in albums.iter() {
+                                        {
+                                            let aid = alb.id.clone();
+                                            let name = alb.name.clone();
+                                            rsx! {
+                                                button {
+                                                    key: "lib-alb-{alb.id}",
+                                                    r#type: "button",
+                                                    class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle p-3 text-left transition-colors cursor-pointer space-y-2.5",
+                                                    onclick: move |_| load_album.call((aid.clone(), name.clone())),
+                                                    div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
+                                                        if let Some(url) = alb.cover_art_url.as_deref() {
+                                                            img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
+                                                        } else {
+                                                            IconDisc3 { size: 28, class: "text-beet-text-disabled".to_string() }
+                                                        }
+                                                        span { class: "absolute bottom-2 right-2 w-9 h-9 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-lg",
+                                                            IconPlay { size: 15, filled: true }
+                                                        }
                                                     }
-                                                    span { class: "absolute bottom-2 right-2 w-9 h-9 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-lg",
-                                                        IconPlay { size: 15, filled: true }
+                                                    div {
+                                                        p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{alb.name}" }
+                                                        p { class: "text-[12px] text-beet-text-secondary truncate", "{alb.artist}" }
                                                     }
                                                 }
-                                                div {
-                                                    p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{alb.name}" }
-                                                    p { class: "text-[12px] text-beet-text-secondary truncate", "{alb.artist}" }
-                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if albums_has_more() {
+                                    div { class: "flex justify-center pt-2",
+                                        button {
+                                            r#type: "button",
+                                            disabled: albums_loading_more() || offline_only,
+                                            class: "inline-flex items-center gap-1.5 h-9 px-5 rounded-full bg-beet-surface-high hover:bg-beet-surface-highest border border-beet-border-default text-[13px] font-medium text-beet-text-primary disabled:opacity-50 transition-colors cursor-pointer",
+                                            onclick: move |_| load_albums_page.call((album_sort(), true)),
+                                            if albums_loading_more() {
+                                                IconLoader { size: 14 }
+                                                span { "Loading more…" }
+                                            } else {
+                                                span { "Load more albums" }
                                             }
                                         }
                                     }
@@ -688,5 +986,66 @@ fn LibraryStatsPanel() -> Element {
                 span { "Loading library stats…" }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn album(id: &str, name: &str) -> SubsonicAlbumSummary {
+        SubsonicAlbumSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            artist: "Artist".to_string(),
+            song_count: 10,
+            year: Some(2024),
+            cover_art_url: None,
+        }
+    }
+
+    #[test]
+    fn merge_album_page_deduplicates_and_tracks_pagination() {
+        let mut albums = Vec::new();
+        let page1 = vec![album("a1", "Alpha"), album("a2", "Beta")];
+        let (next, has_more) = merge_album_page(&mut albums, page1, 0, 2);
+        assert_eq!(next, 2);
+        assert!(has_more);
+        assert_eq!(albums.len(), 2);
+
+        // Overlapping duplicate from offset shift still advances offset by raw page size
+        let page2 = vec![album("a2", "Beta"), album("a3", "Gamma")];
+        let (next, has_more) = merge_album_page(&mut albums, page2, next, 2);
+        assert_eq!(next, 4);
+        assert!(has_more);
+        assert_eq!(
+            albums.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["a1", "a2", "a3"]
+        );
+
+        // Short page terminates pagination
+        let page3 = vec![album("a4", "Delta")];
+        let (next, has_more) = merge_album_page(&mut albums, page3, next, 2);
+        assert_eq!(next, 5);
+        assert!(!has_more);
+        assert_eq!(albums.len(), 4);
+    }
+
+    #[test]
+    fn albums_badge_text_formats_counts_and_more_indicator() {
+        assert_eq!(albums_badge_text(0, false), None);
+        assert_eq!(albums_badge_text(11, false), Some("11".to_string()));
+        assert_eq!(albums_badge_text(200, true), Some("200+".to_string()));
+    }
+
+    #[test]
+    fn empty_albums_message_guides_user_when_recent_is_empty() {
+        assert!(empty_albums_message(true, true, AlbumListSort::AlphabeticalByName)
+            .contains("Offline Only"));
+        assert!(empty_albums_message(false, false, AlbumListSort::AlphabeticalByName)
+            .contains("Connect Navidrome"));
+        assert!(empty_albums_message(true, false, AlbumListSort::Recent).contains("A-Z"));
+        assert!(empty_albums_message(true, false, AlbumListSort::AlphabeticalByName)
+            .contains("No albums found"));
     }
 }
