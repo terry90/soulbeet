@@ -506,8 +506,8 @@ struct Run {
     user: UserId,
     purpose: SearchFor,
     holds_turn: bool,
-    /// The backend's id of the search and the backend, once the task started it.
-    started: Option<(String, Arc<dyn DownloadBackend>)>,
+    /// Backend search IDs and handles once the task started them.
+    started: Vec<(String, Arc<dyn DownloadBackend>)>,
     /// `Searches::stop` asked for it: it never takes the turn, or is stopped at the backend.
     stop: bool,
 }
@@ -581,7 +581,7 @@ impl Searches {
         line.runs
             .iter()
             .find(|run| run.id == id)
-            .and_then(|run| run.started.as_ref().map(|(search, _)| search.clone()))
+            .and_then(|run| run.started.first().map(|(search, _)| search.clone()))
     }
 
     /// D9: stops search `id` of a cancelled job when it is the job's own. One waiting for the
@@ -615,7 +615,7 @@ impl Searches {
         // A search waiting for the turn looks again, and leaves.
         self.left.notify_waiters();
         // One still starting is stopped by its task once the backend named it (`started`).
-        if let Some((search, backend)) = started {
+        for (search, backend) in started {
             stop_at_backend(&backend, &search).await;
         }
         true
@@ -651,7 +651,7 @@ impl Searches {
             user,
             purpose,
             holds_turn: false,
-            started: None,
+            started: Vec::new(),
             stop,
         });
         Place {
@@ -690,11 +690,21 @@ impl Searches {
         let mut line = self.line.lock().unwrap();
         match line.runs.iter_mut().find(|run| run.id == id) {
             Some(run) => {
-                run.started = Some((backend_search.to_string(), backend.clone()));
+                run.started
+                    .push((backend_search.to_string(), backend.clone()));
                 run.stop
             }
             None => false,
         }
+    }
+
+    fn is_stopped(&self, id: &str) -> bool {
+        self.line
+            .lock()
+            .unwrap()
+            .runs
+            .iter()
+            .any(|run| run.id == id && run.stop)
     }
 
     /// Takes the turn with a search of its own until the returned place is dropped, so searches
@@ -756,6 +766,133 @@ pub enum FindRefused {
     TooManyWaiting(Vec<String>),
     /// Recording the search failed.
     Failed(Failure),
+}
+
+/// Records a job's search `run.id` for `ctx` across `usable` backends and runs it in its own task
+/// once it holds the turn, trying `usable.primary` first and falling back to `usable.last_resort`
+/// only when no primary group meets `min_score` (and `lossless_only` is false).
+pub async fn start_stored_multi(
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    usable: Usable,
+    run: SearchRun,
+    min_score: f64,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let place = searches.enter(&run.id, ctx.id());
+    run_usable_in_line(place, searches, ledger, ctx, usable, run, min_score).await
+}
+
+/// Runs a single tier of backends in parallel, registering each started search with `searches`
+/// so cancellation stops all active backend searches and ensuring every returned item carries
+/// its backend id.
+async fn search_tier_tracked(
+    searches: &Searches,
+    search_id: &str,
+    tier: &[Searched],
+    spec: &SearchSpec,
+) -> Found {
+    let results = futures::future::join_all(tier.iter().map(|(name, backend)| async move {
+        let (mut groups, stop) = match start_backend_search(name, backend, spec).await {
+            Ok(backend_search) => {
+                if searches.started(search_id, &backend_search, backend) {
+                    stop_at_backend(backend, &backend_search).await;
+                }
+                poll_backend_search(name, backend, &backend_search).await
+            }
+            Err(stop) => (Vec::new(), stop),
+        };
+        for group in &mut groups {
+            for item in &mut group.items {
+                if item.backend.is_empty() {
+                    item.backend = name.clone();
+                }
+            }
+        }
+        (groups, stop)
+    }))
+    .await;
+    let (groups, stops): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let mut groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
+    best_first(&mut groups);
+    Found { groups, stops }
+}
+
+async fn run_usable_in_line(
+    place: Place,
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    usable: Usable,
+    run: SearchRun,
+    min_score: f64,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let SearchRun { id, query, spec } = run;
+    let total_backends = usable.primary.len() + usable.last_resort.len();
+    let single_backend = if total_backends == 1 {
+        usable
+            .primary
+            .first()
+            .or_else(|| usable.last_resort.first())
+            .map(|(name, _)| name.clone())
+    } else {
+        None
+    };
+    ledger
+        .record_search(NewSearch {
+            id: id.clone(),
+            user: ctx.id(),
+            backend: single_backend,
+            query: query.clone(),
+            spec: Some(spec.clone()),
+        })
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    let (searches, ledger) = (searches.clone(), ledger.clone());
+    Ok(tokio::spawn(async move {
+        let _place = place;
+        if !searches.take_turn(&id).await {
+            let outcome = Err((search_stopped(), None));
+            return ended(&ledger, &id, outcome).await;
+        }
+        let search = SearchSpec {
+            album: query.album,
+            tracks: query.tracks,
+            text: spec.text,
+            keep_below_floor: spec.keep_below_floor,
+        };
+        let mut found = if usable.primary.is_empty() {
+            Found::default()
+        } else {
+            search_tier_tracked(&searches, &id, &usable.primary, &search).await
+        };
+        let has_qualifying_primary = found
+            .groups
+            .iter()
+            .any(|g| g.score >= min_score && !g.items.iter().any(|i| i.below_floor));
+        if !has_qualifying_primary
+            && !usable.last_resort.is_empty()
+            && !spec.filters.lossless_only
+            && !searches.is_stopped(&id)
+        {
+            let last = search_tier_tracked(&searches, &id, &usable.last_resort, &search).await;
+            found = found.then(last);
+        }
+        let stats = if found.stops.len() == 1 {
+            match &found.stops[0] {
+                SearchStop::Finished { stats } => Some(stats.clone()),
+                SearchStop::TimedOut | SearchStop::Failed(_) => None,
+            }
+        } else {
+            None
+        };
+        let outcome = if found.groups.is_empty() {
+            Err((found.failure(), stats))
+        } else {
+            Ok((found.groups, stats))
+        };
+        ended(&ledger, &id, outcome).await
+    }))
 }
 
 /// Records a job's search `run.id` for `ctx` on the default backend and runs it in its own task

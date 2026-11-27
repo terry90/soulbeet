@@ -1101,10 +1101,28 @@ impl Shared {
         // An automatic run of the importer finds what can be picked. A chosen
         // run keeps it, so a pick that failed still offers the others, and so
         // does a run the importer never got (broken, unavailable, panicked).
-        let choices = match (&job.choice, outcome.ran) {
+        let mut choices = match (&job.choice, outcome.ran) {
             (DriverChoice::Auto, true) => outcome.result.choices.clone().map(Arc::new),
             _ => job.choices.clone(),
         };
+        if matches!(
+            outcome.result.outcome,
+            ImportOutcome::Failed {
+                kind: FailKind::AsIsMissingTags,
+                ..
+            }
+        ) {
+            let mut updated = choices.as_deref().cloned().unwrap_or(MatchChoices {
+                kind: match job.mode {
+                    ImportMode::Album => shared::download::MatchKind::Album,
+                    ImportMode::Singleton => shared::download::MatchKind::Track,
+                },
+                candidates: vec![],
+                missing_tags: true,
+            });
+            updated.missing_tags = true;
+            choices = Some(Arc::new(updated));
+        }
         let last_run = match outcome.ran {
             true => Some(Arc::new(last_run(job, &outcome.result))),
             false => job.last_run.clone(),

@@ -9,7 +9,7 @@ use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
 use crate::core::library::{find, MatchKind, Reference};
 use crate::core::sources::{self, Candidate, RECENT_FAILURES_SECS};
-use crate::core::{backend_unavailable, database_failure};
+use crate::core::database_failure;
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
 use crate::ledger::{
     Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
@@ -17,7 +17,7 @@ use crate::ledger::{
 };
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
-use crate::services::{NavidromeLookupError, DEFAULT_DOWNLOAD_BACKEND};
+use crate::services::NavidromeLookupError;
 use runner::{spawn_drive, Acquire};
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableItem, IndexState, JobSlot};
@@ -272,13 +272,38 @@ pub(crate) async fn ensure(
     for_playlist: bool,
     replace: Option<ReplaceConsent>,
 ) -> Result<Ensured, EnsureRefusal> {
+    ensure_with_origin(
+        acquire,
+        navidrome,
+        ctx,
+        folder_id,
+        label,
+        items,
+        options,
+        for_playlist,
+        replace,
+        BatchOrigin::Mcp,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ensure_with_origin(
+    acquire: &Arc<Acquire>,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
+    folder_id: Option<&str>,
+    label: Option<String>,
+    items: Vec<Wanted>,
+    options: JobOptions,
+    for_playlist: bool,
+    replace: Option<ReplaceConsent>,
+    origin: BatchOrigin,
+) -> Result<Ensured, EnsureRefusal> {
     if let Some(failure) = acquire.effects.importer_blocked().await {
         return Err(failure.into());
     }
-    (acquire.effects.backends())
-        .get(DEFAULT_DOWNLOAD_BACKEND)
-        .await
-        .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
+    acquire.effects.usable_backends(ctx).await?;
     let previewed = match &replace {
         Some(ReplaceConsent { app, secret }) => {
             let expect = Some(DeletionReason::Replaced);
@@ -380,7 +405,7 @@ pub(crate) async fn ensure(
             id: uuid::Uuid::new_v4().to_string(),
             user: ctx.id(),
             label,
-            origin: BatchOrigin::Mcp,
+            origin,
             for_playlist,
         };
         let id = batch.id.clone();
@@ -783,7 +808,7 @@ impl RetryMode {
 /// source.
 pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> bool {
     let job = &view.job;
-    if job.origin != BatchOrigin::Mcp || !mode.states().contains(&job.state) {
+    if !job.origin.uses_job_runner() || !mode.states().contains(&job.state) {
         return false;
     }
     let failure = job_failure(view);

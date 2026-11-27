@@ -458,6 +458,7 @@ fn origin_named(name: &str) -> Result<BatchOrigin, sqlx::Error> {
     match name {
         "mcp" => Ok(BatchOrigin::Mcp),
         "ui" => Ok(BatchOrigin::Ui),
+        "import" => Ok(BatchOrigin::Import),
         other => Err(sqlx::Error::Decode(
             format!("unknown batch origin {other:?}").into(),
         )),
@@ -498,9 +499,10 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
         "SELECT id FROM searches \
          WHERE spec IS NOT NULL AND candidates IS NULL AND failure IS NULL \
          AND id NOT IN (SELECT j.search_id FROM jobs j JOIN batches b ON b.id = j.batch_id \
-                        WHERE b.origin = ? AND j.state = ? AND j.search_id IS NOT NULL)",
+                        WHERE b.origin IN (?, ?) AND j.state = ? AND j.search_id IS NOT NULL)",
     )
     .bind(BatchOrigin::Mcp.as_str())
+    .bind(BatchOrigin::Import.as_str())
     .bind(JobState::Searching.as_str())
     .fetch_all(db)
     .await?;

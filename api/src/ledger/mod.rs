@@ -178,7 +178,7 @@ impl DuplicateRule {
         match (origin, options.and_then(|o| o.replace.clone())) {
             (_, Some(set)) => DuplicateRule::Replace(set),
             (BatchOrigin::Ui, None) => DuplicateRule::Guarded,
-            (BatchOrigin::Mcp, None) => DuplicateRule::Skip,
+            (BatchOrigin::Mcp | BatchOrigin::Import, None) => DuplicateRule::Skip,
         }
     }
 
@@ -403,14 +403,21 @@ impl JobKind {
 pub enum BatchOrigin {
     Ui,
     Mcp,
+    Import,
 }
 
 impl BatchOrigin {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             BatchOrigin::Ui => "ui",
             BatchOrigin::Mcp => "mcp",
+            BatchOrigin::Import => "import",
         }
+    }
+
+    /// True for batch origins whose jobs are driven by `core::jobs::runner`.
+    pub fn uses_job_runner(self) -> bool {
+        matches!(self, BatchOrigin::Mcp | BatchOrigin::Import)
     }
 }
 
