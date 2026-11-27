@@ -457,14 +457,69 @@ pub async fn fetch_playlist_tracks(
     Ok(Vec::new())
 }
 
+/// Supported Navidrome OpenSubsonic `getAlbumList2` sort orders for the Library Albums view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlbumListSort {
+    #[default]
+    AlphabeticalByName,
+    AlphabeticalByArtist,
+    Newest,
+    Recent,
+    Frequent,
+}
+
+impl AlbumListSort {
+    pub const ALL: [Self; 5] = [
+        Self::AlphabeticalByName,
+        Self::AlphabeticalByArtist,
+        Self::Newest,
+        Self::Recent,
+        Self::Frequent,
+    ];
+
+    pub fn as_subsonic_type(self) -> &'static str {
+        match self {
+            Self::AlphabeticalByName => "alphabeticalByName",
+            Self::AlphabeticalByArtist => "alphabeticalByArtist",
+            Self::Newest => "newest",
+            Self::Recent => "recent",
+            Self::Frequent => "frequent",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlphabeticalByName => "A-Z",
+            Self::AlphabeticalByArtist => "Artist",
+            Self::Newest => "Newest",
+            Self::Recent => "Recently Played",
+            Self::Frequent => "Most Played",
+        }
+    }
+}
+
+/// Page size for paginated `getAlbumList2` requests (well within Navidrome's 500-item server cap).
+pub const ALBUM_LIST_PAGE_SIZE: u32 = 200;
+
 #[cfg(feature = "web")]
-pub async fn fetch_recent_albums(
+pub async fn fetch_album_list(
     info: &NavidromeSessionInfo,
+    sort: AlbumListSort,
     size: u32,
+    offset: u32,
 ) -> Result<Vec<SubsonicAlbumSummary>, String> {
-    let size_s = size.to_string();
-    let data: AlbumList2Data =
-        fetch_subsonic(info, "getAlbumList2", &[("type", "recent"), ("size", &size_s)]).await?;
+    let size_s = size.clamp(1, 500).to_string();
+    let offset_s = offset.to_string();
+    let data: AlbumList2Data = fetch_subsonic(
+        info,
+        "getAlbumList2",
+        &[
+            ("type", sort.as_subsonic_type()),
+            ("size", &size_s),
+            ("offset", &offset_s),
+        ],
+    )
+    .await?;
     Ok(data
         .album_list2
         .map(|a| a.album)
@@ -475,11 +530,20 @@ pub async fn fetch_recent_albums(
 }
 
 #[cfg(not(feature = "web"))]
-pub async fn fetch_recent_albums(
+pub async fn fetch_album_list(
     _info: &NavidromeSessionInfo,
+    _sort: AlbumListSort,
     _size: u32,
+    _offset: u32,
 ) -> Result<Vec<SubsonicAlbumSummary>, String> {
     Ok(Vec::new())
+}
+
+pub async fn fetch_recent_albums(
+    info: &NavidromeSessionInfo,
+    size: u32,
+) -> Result<Vec<SubsonicAlbumSummary>, String> {
+    fetch_album_list(info, AlbumListSort::Recent, size, 0).await
 }
 
 #[cfg(feature = "web")]
@@ -593,5 +657,21 @@ mod tests {
         assert!(detect_is_smart_playlist("Favorites", "Auto smart playlist"));
         assert!(detect_is_smart_playlist("Weekly Discovery", ""));
         assert!(!detect_is_smart_playlist("Road Trip", "Songs for the highway"));
+    }
+
+    #[test]
+    fn album_list_sort_defaults_to_full_catalog_and_maps_exact_subsonic_types() {
+        assert_eq!(AlbumListSort::default(), AlbumListSort::AlphabeticalByName);
+        assert_eq!(
+            AlbumListSort::AlphabeticalByName.as_subsonic_type(),
+            "alphabeticalByName"
+        );
+        assert_eq!(
+            AlbumListSort::AlphabeticalByArtist.as_subsonic_type(),
+            "alphabeticalByArtist"
+        );
+        assert_eq!(AlbumListSort::Newest.as_subsonic_type(), "newest");
+        assert_eq!(AlbumListSort::Recent.as_subsonic_type(), "recent");
+        assert_eq!(AlbumListSort::Frequent.as_subsonic_type(), "frequent");
     }
 }
