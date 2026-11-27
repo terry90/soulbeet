@@ -9,6 +9,10 @@ use super::error::ArchiveError;
 use super::query::Target;
 use crate::audio::AUDIO_EXTENSIONS;
 use crate::matching::assign::assign_tracks;
+use crate::matching::diagnostics::{
+    RejectionCollector, REASON_BELOW_THRESHOLD, REASON_DURATION_DELTA, REASON_TITLE_MISMATCH,
+    REASON_VERSION_VETO,
+};
 use crate::matching::duration::{duration_score, DURATION_WEIGHT};
 use crate::matching::path::WantedTrack;
 use crate::matching::score::{group_score, MIN_SCORE_THRESHOLD};
@@ -387,16 +391,46 @@ pub(crate) fn item_url(identifier: &str) -> String {
     )
 }
 
-/// One item as a group of the wanted tracks it has, and how many of its offered files scored
-/// under the floor. A file under the floor is left out, or kept and flagged `below_floor` when
-/// `keep_below_floor`; so is the whole group for an album search when it has less than half
-/// the album. None when no file is kept.
-pub(crate) fn group(
+/// Why `score_as` returned `None` (pure diagnostics; scoring logic unchanged).
+fn score_miss_reason(
+    file: &Original,
+    index: usize,
+    track: &WantedTrack,
+    wanted: &Wanted,
+) -> &'static str {
+    let named = file.title.clone().unwrap_or_else(|| file.stem_title());
+    if version_veto(&named, &track.title) {
+        return REASON_VERSION_VETO;
+    }
+    let lengths = track.duration_s.zip(file.length_secs());
+    if lengths.is_some_and(|(w, f)| w.abs_diff(f) >= LENGTH_LIMIT_S) {
+        return REASON_DURATION_DELTA;
+    }
+    let wanted_title = CleanedText::new(&track.title);
+    let tag = file
+        .title
+        .as_deref()
+        .map_or(0.0, |t| title_score(t, &wanted_title));
+    let stem = title_score(&file.stem_title(), &wanted_title);
+    let number_agrees = wanted.is_album() && file.track == u32::try_from(index + 1).ok();
+    if tag.max(stem) == 0.0
+        && !(number_agrees && lengths.is_some_and(|(w, f)| w.abs_diff(f) <= NUMBER_ONLY_LENGTH_S))
+    {
+        return REASON_TITLE_MISMATCH;
+    }
+    REASON_BELOW_THRESHOLD
+}
+
+/// One item as a group of the wanted tracks it has, how many of its offered files scored
+/// under the floor, and bounded rejection diagnostics. A file under the floor is left out, or
+/// kept and flagged `below_floor` when `keep_below_floor`; so is the whole group for an album
+/// search when it has less than half the album. None when no file is kept.
+pub(crate) fn group_with_diagnostics(
     found: &Found,
     sorted: &Sorted,
     wanted: &Wanted,
     keep_below_floor: bool,
-) -> (Option<DownloadableGroup>, u32) {
+) -> (Option<DownloadableGroup>, u32, RejectionCollector) {
     let doc = &found.doc;
     let item_title = doc.title.get().unwrap_or(&doc.identifier).to_string();
     let creators = &doc.creator.0;
@@ -411,10 +445,37 @@ pub(crate) fn group(
         })
         .collect();
     let under = |s: f64| s < MIN_SCORE_THRESHOLD;
-    let below_floor = scores
-        .iter()
-        .filter(|per_track| !per_track.iter().flatten().any(|s| !under(*s)))
-        .count() as u32;
+    let mut below_floor = 0u32;
+    let mut rejections = RejectionCollector::default();
+    for (file_idx, per_track) in scores.iter().enumerate() {
+        if !per_track.iter().flatten().any(|s| !under(*s)) {
+            below_floor += 1;
+            let file = &files[file_idx];
+            let best_score = per_track
+                .iter()
+                .flatten()
+                .copied()
+                .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+            let (score, reason) = match best_score {
+                Some(s) => (Some(s as f32), REASON_BELOW_THRESHOLD),
+                None => {
+                    let mut chosen = REASON_TITLE_MISMATCH;
+                    for (i, track) in wanted.tracks.iter().enumerate() {
+                        let r = score_miss_reason(file, i, track, wanted);
+                        if r == REASON_VERSION_VETO {
+                            chosen = r;
+                            break;
+                        }
+                        if r == REASON_DURATION_DELTA {
+                            chosen = r;
+                        }
+                    }
+                    (None, chosen)
+                }
+            };
+            rejections.record(doc.identifier.clone(), file.name.clone(), score, reason);
+        }
+    }
     let indexes: Vec<usize> = (0..files.len()).collect();
     let taken = assign_tracks(
         &wanted.tracks,
@@ -426,12 +487,12 @@ pub(crate) fn group(
         .filter_map(|(t, took)| took.map(|(f, s)| (t, indexes[f], s)))
         .collect();
     if picked.is_empty() || wanted.tracks.is_empty() {
-        return (None, below_floor);
+        return (None, below_floor, rejections);
     }
     let completeness = picked.len() as f64 / wanted.tracks.len() as f64;
     let short = wanted.is_album() && picked.len() * 2 < wanted.tracks.len();
     if short && !keep_below_floor {
-        return (None, below_floor);
+        return (None, below_floor, rejections);
     }
 
     let of = ItemOf {
@@ -475,7 +536,19 @@ pub(crate) fn group(
             items,
         }),
         below_floor,
+        rejections,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn group(
+    found: &Found,
+    sorted: &Sorted,
+    wanted: &Wanted,
+    keep_below_floor: bool,
+) -> (Option<DownloadableGroup>, u32) {
+    let (group, below_floor, _) = group_with_diagnostics(found, sorted, wanted, keep_below_floor);
+    (group, below_floor)
 }
 
 /// What the items of one group share: its item and what is known of it.

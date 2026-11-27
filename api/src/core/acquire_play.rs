@@ -473,6 +473,7 @@ async fn try_enqueue_picked(
         target,
         import_mode: ImportMode::Singleton,
         duplicates,
+        verify_policy: soulbeet::VerifyPolicy::Fast,
     };
     let acquisition = Acquisition {
         job: job_id.to_string(),
@@ -1390,6 +1391,9 @@ async fn finalize_ready(
 ) -> AcquireAndPlayStage {
     let mut navidrome_song_id = None;
     let mut listed_codec = None;
+    let mut listed_duration_s = None;
+    let mut listed_recording_mbid = None;
+    let mut imported_as_is = false;
     let mut already_in_library = already_in_library_hint;
 
     for attempt in 0..FINALIZE_FLUSH_RETRIES {
@@ -1402,18 +1406,29 @@ async fn finalize_ready(
                 already_in_library = true;
                 break;
             }
-            if let Some((song_id, format)) = tracks.into_iter().find_map(|t| match t.result {
-                Some(SlotResult::Imported {
-                    listed: Some(songs),
-                    ..
-                }) => songs
-                    .into_iter()
-                    .next()
-                    .map(|song| (Some(song.song_id), song.format)),
-                _ => None,
-            }) {
+            if let Some((song_id, format, duration_s, recording_mbid, untagged)) =
+                tracks.into_iter().find_map(|t| match t.result {
+                    Some(SlotResult::Imported {
+                        untagged,
+                        listed: Some(songs),
+                        ..
+                    }) => songs.into_iter().next().map(|song| {
+                        (
+                            Some(song.song_id),
+                            song.format,
+                            song.duration_s,
+                            song.recording_mbid,
+                            untagged,
+                        )
+                    }),
+                    _ => None,
+                })
+            {
                 navidrome_song_id = song_id;
                 listed_codec = format;
+                listed_duration_s = duration_s;
+                listed_recording_mbid = recording_mbid;
+                imported_as_is = untagged;
                 break;
             }
         }
@@ -1461,6 +1476,16 @@ async fn finalize_ready(
 
     let is_lossy = relay.backend_lossy_only || codec.as_deref().is_some_and(is_lossy_format);
 
+    let resolved_mbid = if imported_as_is {
+        None
+    } else {
+        relay
+            .recording_mbid
+            .as_deref()
+            .or(listed_recording_mbid.as_deref())
+    };
+    let resolved_duration_s = listed_duration_s.or(relay.duration_s);
+
     if let Err(f) = record_fast_acquisition_in(
         db,
         NewFastAcquisition {
@@ -1471,10 +1496,12 @@ async fn finalize_ready(
             artist: &relay.artist,
             title: &relay.title,
             album: relay.album.as_deref(),
-            recording_mbid: relay.recording_mbid.as_deref(),
+            recording_mbid: resolved_mbid,
             backend_id: &relay.backend_id,
             codec: codec.as_deref().unwrap_or("unknown"),
             is_lossy,
+            duration_s: resolved_duration_s,
+            imported_as_is,
         },
     )
     .await

@@ -240,8 +240,10 @@ async fn search(
         let sorted = matching_ia::originals(&files);
         stats.file_count += sorted.audio;
         stats.not_audio += sorted.not_audio;
-        let (group, below_floor) = matching_ia::group(item, &sorted, wanted, keep_below_floor);
+        let (group, below_floor, rejections) =
+            matching_ia::group_with_diagnostics(item, &sorted, wanted, keep_below_floor);
         stats.below_floor += below_floor;
+        rejections.merge_into(&mut stats);
         if let Some(group) = group {
             run.add(group);
         }

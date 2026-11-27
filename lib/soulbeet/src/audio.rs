@@ -9,16 +9,16 @@ pub fn is_audio_path(path: &Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|a| a.eq_ignore_ascii_case(ext)))
 }
 
-/// Audio files among `sources`. A file counts when it has an audio extension,
-/// a directory is walked recursively (symlinked directories are not followed).
-/// Unreadable entries count as 0.
-pub async fn count_audio_files(sources: &[&Path]) -> usize {
-    let mut count = 0;
+/// Collects all audio file paths among `sources`. A file is included when it has an audio
+/// extension, and directories are walked recursively (symlinked directories are not followed).
+/// Results are sorted deterministically.
+pub async fn collect_audio_files(sources: &[&Path]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for source in sources {
         match tokio::fs::metadata(source).await {
             Ok(meta) if meta.is_dir() => dirs.push(source.to_path_buf()),
-            Ok(_) if is_audio_path(source) => count += 1,
+            Ok(_) if is_audio_path(source) => files.push(source.to_path_buf()),
             _ => {}
         }
     }
@@ -30,12 +30,20 @@ pub async fn count_audio_files(sources: &[&Path]) -> usize {
             let path = entry.path();
             match entry.file_type().await {
                 Ok(kind) if kind.is_dir() => dirs.push(path),
-                Ok(_) if is_audio_path(&path) => count += 1,
+                Ok(kind) if !kind.is_symlink() && is_audio_path(&path) => files.push(path),
                 _ => {}
             }
         }
     }
-    count
+    files.sort();
+    files
+}
+
+/// Audio files among `sources`. A file counts when it has an audio extension,
+/// a directory is walked recursively (symlinked directories are not followed).
+/// Unreadable entries count as 0.
+pub async fn count_audio_files(sources: &[&Path]) -> usize {
+    collect_audio_files(sources).await.len()
 }
 
 #[cfg(test)]

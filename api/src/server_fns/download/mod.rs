@@ -33,6 +33,8 @@ pub mod acquire_play;
 pub use acquire_play::{acquire_and_play, list_archival_upgrades, trigger_archival_upgrade};
 pub mod auto_download;
 pub use auto_download::{auto_download, AutoDownloadRequest, AutoDownloadResult};
+pub mod diagnostics;
+pub use diagnostics::get_job_diagnostics;
 
 #[cfg(feature = "server")]
 pub mod enqueue;

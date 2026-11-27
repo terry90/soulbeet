@@ -9,7 +9,7 @@ use super::facts::{candidate_document, job_filters_dropped};
 use crate::core::deletion::SONGS_PER_TOKEN;
 use crate::core::jobs::decide::kept_imports;
 use crate::core::jobs::{allowed, job_failure, slot_failure, JobView, RetryMode, Untried};
-use crate::ledger::{BatchOrigin, JobState, SlotResult, Transition};
+use crate::ledger::{JobState, SlotResult, Transition};
 
 /// How many untried candidates a job waiting for a source choice offers as download_source calls.
 const CHOICES_OFFERED: usize = 3;
@@ -33,7 +33,7 @@ pub(crate) fn next_calls(
     use JobState::*;
     let job = &view.job;
     let id = &job.id;
-    let mcp = job.origin == BatchOrigin::Mcp;
+    let mcp = job.origin.uses_job_runner();
     let mut next = Vec::new();
     if !view.stranded && job.state.moves_on_its_own() {
         next.push(NextCall::new(
@@ -480,5 +480,16 @@ mod tests {
                 all[SONGS_PER_TOKEN..].to_vec()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_import_origin_job_uses_job_runner_next_calls() {
+        let (acq, _) = Acquire::for_alice().await;
+        let job = choosing_track_job(&acq).await;
+        let (mut view, untried) = read(&acq, &job).await;
+        view.job.origin = crate::ledger::BatchOrigin::Import;
+        let next = next_calls(&view, &untried, false);
+        assert!(next.iter().any(|c| c.tool == "download_source"), "{next:?}");
+        assert!(next.iter().any(|c| c.tool == "cancel_job"), "{next:?}");
     }
 }

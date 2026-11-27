@@ -2,18 +2,20 @@
 //! retried without the client naming any path. Kept in memory per user;
 //! after a restart the ledger's kept imports are restored.
 
-use super::choice::{files_gone, nothing_to_retry, resolve};
-use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
+use super::choice::{files_gone, nothing_to_retry, resolve, validate_tag_overrides};
+use super::{Duplicates, ImportHandle, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::core::discovery::Replace;
 use crate::ledger::{self, JobEvent};
 use shared::download::{
-    DownloadProgress, ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind,
+    AsIsTagOverrides, DownloadProgress, ImportChoice, ImportRefusal, JobSlot, KeptImport,
+    MatchChoices, MatchKind,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
-use soulbeet::{ImportMode, ImportOutcome, SkipReason};
+use soulbeet::tags::{write_tags, WantedTags};
+use soulbeet::{DriverChoice, ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -247,15 +249,24 @@ impl ImportQueue {
         choice: ImportChoice,
         rule: impl FnOnce(Duplicates) -> Duplicates,
     ) -> Result<(), ImportRefusal> {
-        self.resubmit(user, item, |kept| {
-            Ok(ImportJob {
-                choice: resolve(&choice, kept)?,
-                duplicates: rule(kept.duplicates.clone()),
-                // A person's retry gets every automatic run again.
-                lock_retries: 0,
-                ..kept.clone()
-            })
-        })
+        let tag_overrides = match &choice {
+            ImportChoice::AsIsWithTags(overrides) => Some(validate_tag_overrides(overrides)?),
+            _ => None,
+        };
+        self.resubmit_with_tags(
+            user,
+            item,
+            tag_overrides,
+            |kept| {
+                Ok(ImportJob {
+                    choice: resolve(&choice, kept)?,
+                    duplicates: rule(kept.duplicates.clone()),
+                    // A person's retry gets every automatic run again.
+                    lock_retries: 0,
+                    ..kept.clone()
+                })
+            },
+        )
         .await
     }
 
@@ -303,12 +314,22 @@ impl ImportQueue {
         item: &str,
         next: impl FnOnce(&ImportJob) -> Result<ImportJob, ImportRefusal>,
     ) -> Result<(), ImportRefusal> {
-        let job = {
+        self.resubmit_with_tags(user, item, None, next).await
+    }
+
+    async fn resubmit_with_tags(
+        &self,
+        user: &UserId,
+        item: &str,
+        tag_overrides: Option<AsIsTagOverrides>,
+        next: impl FnOnce(&ImportJob) -> Result<ImportJob, ImportRefusal>,
+    ) -> Result<(), ImportRefusal> {
+        let (kept_original, job) = {
             // A finish recording what it kept cannot be split by the take.
             let _emit = self.shared.emit_lock.lock().await;
-            let (_, job, dropped) = self.shared.retries.take(user, item, next)?;
+            let (original, job, dropped) = self.shared.retries.take(user, item, next)?;
             self.shared.dismiss(dropped);
-            job
+            (original, job)
         };
         if !job.holds_audio().await {
             let refusal = files_gone();
@@ -326,7 +347,31 @@ impl ImportQueue {
             }
             return Err(refusal);
         }
-        self.submit(job).await;
+        let is_as_is = job.choice == DriverChoice::AsIs;
+        let user_id = user.to_string();
+        if let Some(ref overrides) = tag_overrides {
+            let fallback_root = crate::config::CONFIG.download_path();
+            if let Err(err_msg) =
+                stamp_tags_on_singleton(&job, overrides, Some(fallback_root.as_path())).await
+            {
+                // Re-keep the job so the user can fix or try another option.
+                let _emit = self.shared.emit_lock.lock().await;
+                let _ = self.shared.retries.record(&kept_original, true);
+                return Err(ImportRefusal {
+                    failure: Failure::new(
+                        FailureCode::ImportChoiceInvalid,
+                        Stage::Import,
+                        RetryAdvice::NeedsDecision,
+                        format!("Could not write tags before as-is import: {err_msg}"),
+                    ),
+                    kept: KeptImport::Kept,
+                });
+            }
+        }
+        let handle = self.submit(job).await;
+        if is_as_is && Arc::ptr_eq(&self.shared, &IMPORT_QUEUE.shared) {
+            tokio::spawn(mark_as_is_on_success(handle, user_id, tag_overrides));
+        }
         Ok(())
     }
 
@@ -372,6 +417,7 @@ impl ImportQueue {
                 ImportMode::Singleton => MatchKind::Track,
             },
             candidates: vec![],
+            missing_tags: false,
         }))
     }
 
@@ -416,6 +462,115 @@ impl ImportQueue {
     }
 }
 
+/// Stamps `overrides` onto the single downloaded file of a singleton `ImportJob`
+/// (with `musicbrainz: None` and `album_artist = artist` so beets' path template stays clean).
+/// Never walks `job.sources`: operates strictly on `job.files[0]` after rejecting albums,
+/// multi-file jobs, symlinks, and any path escaping `job.cleanup_root` (or `fallback_root`).
+async fn stamp_tags_on_singleton(
+    job: &ImportJob,
+    overrides: &AsIsTagOverrides,
+    fallback_root: Option<&Path>,
+) -> Result<(), String> {
+    if job.mode != ImportMode::Singleton || job.files.len() != 1 {
+        return Err(
+            "Tagging and importing as-is is only supported for single-track imports".into(),
+        );
+    }
+    let path = &job.files[0];
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|e| format!("Could not inspect file before tagging: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("Refused to write tags: target is not a regular file".into());
+    }
+    let canonical_file = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| format!("Could not resolve file path before tagging: {e}"))?;
+    let Some(root) = job.cleanup_root.as_deref().or(fallback_root) else {
+        return Err(
+            "Refused to write tags: no download root configured for path containment check".into(),
+        );
+    };
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|e| format!("Could not resolve download root before tagging: {e}"))?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err("Refused to write tags: file is outside the download directory".into());
+    }
+    let wanted = WantedTags {
+        title: overrides.title.clone(),
+        artist: overrides.artist.clone(),
+        album: overrides.album.clone().unwrap_or_default(),
+        album_artist: overrides.artist.clone(),
+        track_no: None,
+        track_total: None,
+        date: None,
+        musicbrainz: None,
+        comment: None,
+    };
+    tokio::task::spawn_blocking(move || {
+        write_tags(&canonical_file, &wanted).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("tag writer panicked: {e}"))?
+}
+
+/// Marks matching `fast_acquisitions` rows as `imported_as_is = 1` so background archival
+/// upgrades never overwrite a track the user explicitly imported as-is.
+pub(crate) async fn mark_fast_acquisitions_as_is_in(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    items: &[(String, String)],
+) {
+    for (artist, title) in items {
+        if artist.trim().is_empty() || title.trim().is_empty() {
+            continue;
+        }
+        if let Err(e) = sqlx::query(
+            "UPDATE fast_acquisitions \
+             SET imported_as_is = 1 \
+             WHERE user_id = ? AND lower(artist) = lower(?) AND lower(title) = lower(?)",
+        )
+        .bind(user_id)
+        .bind(artist)
+        .bind(title)
+        .execute(db)
+        .await
+        {
+            warn!(
+                "Could not mark fast_acquisitions imported_as_is for {} - {}: {e}",
+                artist, title
+            );
+        }
+    }
+}
+
+async fn mark_as_is_on_success(
+    handle: ImportHandle,
+    user_id: String,
+    overrides: Option<AsIsTagOverrides>,
+) {
+    let outcome = handle.wait().await;
+    let ImportOutcome::Imported { items, .. } = outcome.result.outcome else {
+        return;
+    };
+    let mut pairs: Vec<(String, String)> = items
+        .into_iter()
+        .map(|item| (item.artist, item.title))
+        .collect();
+    if let Some(ov) = overrides {
+        if !pairs.iter().any(|(a, t)| {
+            a.eq_ignore_ascii_case(&ov.artist) && t.eq_ignore_ascii_case(&ov.title)
+        }) {
+            pairs.push((ov.artist, ov.title));
+        }
+    }
+    if pairs.is_empty() {
+        return;
+    }
+    mark_fast_acquisitions_as_is_in(&crate::db::DB, &user_id, &pairs).await;
+}
+
 pub async fn retry_import_for(
     user: &UserId,
     item: &str,
@@ -445,7 +600,8 @@ mod tests {
     use crate::import_queue::{ImportJob, ImportMode, ImportQueue};
     use crate::ledger::{JobEvent, JobState as LedgerState};
     use shared::download::{
-        DownloadProgress, DownloadState, ImportChoice, JobSlot, MatchChoices, MatchKind,
+        AsIsTagOverrides, DownloadProgress, DownloadState, ImportChoice, JobSlot, KeptImport,
+        MatchChoices, MatchKind,
     };
     use shared::failure::FailureCode;
     use soulbeet::{DriverChoice, FailKind, ImportResult};
@@ -615,7 +771,8 @@ mod tests {
             queue.import_choices(&alice(), "a"),
             Ok(MatchChoices {
                 kind: MatchKind::Track,
-                candidates: vec![]
+                candidates: vec![],
+                missing_tags: false,
             })
         );
         let pick = ImportChoice::Candidate {
@@ -689,7 +846,8 @@ mod tests {
             queue.import_choices(&alice(), "b"),
             Ok(MatchChoices {
                 kind: MatchKind::Track,
-                candidates: vec![]
+                candidates: vec![],
+                missing_tags: false,
             })
         );
     }
@@ -1186,5 +1344,252 @@ mod tests {
             Err(nothing_to_retry())
         );
         assert_eq!(queue.retry(&alice(), "b", ImportChoice::Auto).await, Ok(()));
+    }
+
+    /// Minimal valid 1-frame silent FLAC for testing tag stamping end-to-end.
+    fn minimal_flac() -> Vec<u8> {
+        let mut out = b"fLaC".to_vec();
+        out.extend([0x80, 0, 0, 34]);
+        out.extend(4096u16.to_be_bytes());
+        out.extend(4096u16.to_be_bytes());
+        out.extend([0; 6]);
+        let packed: u64 = (44_100u64 << 44) | (15 << 36) | 4096;
+        out.extend(packed.to_be_bytes());
+        out.extend([0; 16]);
+        // Frame 0 with valid CRC-8 and CRC-16.
+        let mut frame = vec![0xFF, 0xF8, 0xC9, 0x08, 0];
+        let mut crc8 = 0u8;
+        for &b in &frame {
+            crc8 ^= b;
+            for _ in 0..8 {
+                crc8 = if crc8 & 0x80 != 0 {
+                    (crc8 << 1) ^ 0x07
+                } else {
+                    crc8 << 1
+                };
+            }
+        }
+        frame.push(crc8);
+        frame.extend([0x00, 0x00, 0x00]);
+        let mut crc16 = 0u16;
+        for &b in &frame {
+            crc16 ^= u16::from(b) << 8;
+            for _ in 0..8 {
+                crc16 = if crc16 & 0x8000 != 0 {
+                    (crc16 << 1) ^ 0x8005
+                } else {
+                    crc16 << 1
+                };
+            }
+        }
+        frame.extend(crc16.to_be_bytes());
+        out.extend(frame);
+        out
+    }
+
+    #[tokio::test]
+    async fn as_is_with_tags_validates_stamps_tags_and_runs_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("dl/bootleg.flac");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, minimal_flac()).unwrap();
+
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::AsIsMissingTags,
+            "Import as-is needs artist and title tags".into(),
+        ));
+        let mut failing = owned(job(src.clone(), &tmp.path().join("lib")), &alice(), &["a"]);
+        failing.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(failing).await).await;
+
+        let choices = queue.import_choices(&alice(), "a").unwrap();
+        assert!(choices.missing_tags);
+
+        // Blank artist or title is refused while keeping the job.
+        let refused = queue
+            .retry(
+                &alice(),
+                "a",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "   ".into(),
+                    title: "Dub Edit".into(),
+                    album: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.failure.code, FailureCode::InvalidInput);
+        assert_eq!(refused.kept, KeptImport::Kept);
+
+        // Valid overrides stamp tags onto the FLAC file and invoke DriverChoice::AsIs.
+        queue
+            .retry(
+                &alice(),
+                "a",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "Burial".into(),
+                    title: "Unreleased Edit".into(),
+                    album: Some("White Label".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        until_imported(&deps, "a").await;
+        assert_eq!(
+            stub.choices(),
+            vec![DriverChoice::Auto, DriverChoice::AsIs]
+        );
+    }
+
+    #[tokio::test]
+    async fn as_is_with_tags_rejects_album_and_multi_file_without_modifying_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dl/album");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("01.flac");
+        let f2 = dir.join("02.flac");
+        let bytes = minimal_flac();
+        std::fs::write(&f1, &bytes).unwrap();
+        std::fs::write(&f2, &bytes).unwrap();
+
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::AsIsMissingTags,
+            "Import as-is needs tags".into(),
+        ));
+        let mut album = owned(job(dir.clone(), &tmp.path().join("lib")), &alice(), &["a", "b"]);
+        album.mode = ImportMode::Album;
+        album.files = vec![f1.clone(), f2.clone()];
+        album.cleanup_root = Some(tmp.path().join("dl"));
+        finish(queue.submit(album).await).await;
+
+        let refused = queue
+            .retry(
+                &alice(),
+                "a",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "Artist".into(),
+                    title: "Single Title".into(),
+                    album: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.failure.code, FailureCode::InvalidInput);
+        assert_eq!(refused.kept, KeptImport::Kept);
+        assert_eq!(std::fs::read(&f1).unwrap(), bytes);
+        assert_eq!(std::fs::read(&f2).unwrap(), bytes);
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn as_is_with_tags_rejects_symlinks_and_out_of_root_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dl_root = tmp.path().join("dl");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&dl_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let real_target = outside.join("secret.flac");
+        let bytes = minimal_flac();
+        std::fs::write(&real_target, &bytes).unwrap();
+        let link = dl_root.join("linked.flac");
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+        let (queue, _stub, _) = queue(StubImporter::new());
+        _stub.script(ImportResult::failed(
+            FailKind::AsIsMissingTags,
+            "Import as-is needs tags".into(),
+        ));
+        let mut linked_job = owned(job(link.clone(), &tmp.path().join("lib")), &alice(), &["s"]);
+        linked_job.cleanup_root = Some(dl_root.clone());
+        finish(queue.submit(linked_job).await).await;
+
+        let refused = queue
+            .retry(
+                &alice(),
+                "s",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "Artist".into(),
+                    title: "Title".into(),
+                    album: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.failure.code, FailureCode::ImportChoiceInvalid);
+        assert_eq!(refused.kept, KeptImport::Kept);
+        assert_eq!(std::fs::read(&real_target).unwrap(), bytes);
+
+        // Regular file outside cleanup_root is also rejected.
+        let mut outside_job = owned(
+            job(real_target.clone(), &tmp.path().join("lib")),
+            &alice(),
+            &["o"],
+        );
+        outside_job.cleanup_root = Some(dl_root);
+        let err = super::stamp_tags_on_singleton(
+            &outside_job,
+            &AsIsTagOverrides {
+                artist: "Artist".into(),
+                title: "Title".into(),
+                album: None,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("outside the download directory"), "{err}");
+        assert_eq!(std::fs::read(&real_target).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn mark_fast_acquisitions_as_is_updates_matching_rows() {
+        let pool = crate::db::test_db::migrated().await;
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ('u1', 'alice', 'h', 'user')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', '/music')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::models::archival_upgrade::FastAcquisitionRow::insert_in(
+            &pool,
+            crate::models::archival_upgrade::NewFastAcquisition {
+                user_id: "u1",
+                folder_id: "f1",
+                navidrome_song_id: None,
+                discovery_track_id: None,
+                artist: "Burial",
+                title: "Unreleased Edit",
+                album: None,
+                recording_mbid: None,
+                backend_id: "ytdlp",
+                codec: "opus",
+                is_lossy: true,
+                duration_s: Some(240),
+                imported_as_is: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        super::mark_fast_acquisitions_as_is_in(
+            &pool,
+            "u1",
+            &[("burial".into(), "unreleased edit".into())],
+        )
+        .await;
+
+        let flag: i64 = sqlx::query_scalar(
+            "SELECT imported_as_is FROM fast_acquisitions WHERE user_id = 'u1' AND artist = 'Burial'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(flag, 1);
     }
 }

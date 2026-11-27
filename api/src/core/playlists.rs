@@ -19,6 +19,7 @@ use crate::core::library::{navidrome_failure, SongFacts};
 use crate::core::time;
 
 pub mod fill;
+pub mod import;
 pub mod smart;
 
 /// Most song ids one playlist write takes.

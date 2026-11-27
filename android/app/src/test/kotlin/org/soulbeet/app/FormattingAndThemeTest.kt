@@ -800,4 +800,36 @@ class FormattingAndThemeTest {
             Locale.setDefault(prev)
         }
     }
+
+    @Test
+    fun acquireTrackKeyPrefersMbidAndDisambiguatesSameTitleRecordings() {
+        val studio = acquireTrackKey(
+            mbid = "11111111-1111-1111-1111-111111111111",
+            artist = "Blue Öyster Cult",
+            title = "(Don't Fear) The Reaper",
+            album = "Agents of Fortune",
+        )
+        val live = acquireTrackKey(
+            mbid = "22222222-2222-2222-2222-222222222222",
+            artist = "Blue Öyster Cult",
+            title = "(Don't Fear) The Reaper",
+            album = "Some Enchanted Evening",
+        )
+        assertNotEquals(studio, live)
+        assertEquals("mbid:11111111-1111-1111-1111-111111111111", studio)
+
+        val fallbackA = acquireTrackKey(
+            mbid = "  ",
+            artist = "Blue Öyster Cult",
+            title = "(Don't Fear) The Reaper",
+            album = "Agents of Fortune",
+        )
+        val fallbackB = acquireTrackKey(
+            mbid = null,
+            artist = "Blue Öyster Cult",
+            title = "(Don't Fear) The Reaper",
+            album = "Greatest Hits",
+        )
+        assertNotEquals(fallbackA, fallbackB)
+    }
 }

@@ -41,6 +41,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.SearchFilter
+import org.soulbeet.app.acquireTrackKey
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
@@ -467,7 +468,7 @@ fun SearchScreen(
                         results.onlineTracks,
                         key = { idx, it -> "ol_${idx}_${it.mbid ?: "${it.artist}_${it.title}"}" },
                     ) { _, match ->
-                        val acqKey = "${match.artist.lowercase()}::${match.title.lowercase()}"
+                        val acqKey = acquireTrackKey(match.mbid, match.artist, match.title, match.album)
                         val stageLabel = state.acquiringStages[acqKey]
                         TrackRow(
                             title = match.title,

@@ -8,6 +8,16 @@ use serde_json::Value;
 
 use crate::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
 
+/// Priority class for Soulseek search pacing. Interactive user-initiated searches
+/// take precedence over background discovery or archival upgrade searches and get
+/// reserved rate-limit headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SearchPriority {
+    #[default]
+    Interactive,
+    Background,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub username: String,
@@ -413,6 +423,26 @@ pub fn declared_extension(field: &str) -> Option<String> {
     extension_token(field.strip_prefix('.').unwrap_or(field))
 }
 
+/// Minimum peer upload speed (50 KiB/s) before any speed tiebreaker bonus applies.
+const SPEED_BONUS_MIN_BPS: f64 = 50.0 * 1024.0;
+/// Peer upload speed (500 KiB/s) at which the speed tiebreaker reaches its cap.
+const SPEED_BONUS_MAX_BPS: f64 = 500.0 * 1024.0;
+/// Maximum tiebreaker bonus for peer upload speed.
+const SPEED_BONUS_CAP: f64 = 0.05;
+
+/// Smooth, bounded tiebreaker in `0.0..=0.05` from peer upload speed in bytes/sec.
+fn upload_speed_bonus(upload_speed_bps: i32) -> f64 {
+    let speed = upload_speed_bps as f64;
+    if speed <= SPEED_BONUS_MIN_BPS {
+        0.0
+    } else if speed >= SPEED_BONUS_MAX_BPS {
+        SPEED_BONUS_CAP
+    } else {
+        SPEED_BONUS_CAP * (speed - SPEED_BONUS_MIN_BPS)
+            / (SPEED_BONUS_MAX_BPS - SPEED_BONUS_MIN_BPS)
+    }
+}
+
 impl SearchResult {
     pub fn quality(&self) -> String {
         Path::new(&self.filename)
@@ -430,13 +460,11 @@ impl SearchResult {
         if self.has_free_upload_slot {
             score += 0.1;
         }
-        if self.upload_speed > 100 {
-            score += 0.05;
-        }
+        score += upload_speed_bonus(self.upload_speed);
         if self.queue_length > 10 {
             score -= 0.1;
         }
-        score.min(1.0)
+        score.clamp(0.0, 1.0)
     }
 }
 
@@ -644,6 +672,7 @@ impl FileEntry {
                 .and_then(|place| u32::try_from(place).ok()),
             pending_retry: None,
             job: None,
+            job_id: None,
             request: self.batch_id.as_deref().and_then(request_of_batch),
             index: None,
         };
@@ -1076,7 +1105,8 @@ mod tests {
         );
     }
 
-    /// The score as it was computed before `format_score` held the format part.
+    /// The score as it was computed before `format_score` held the format part,
+    /// using the smooth bounded upload-speed tiebreaker.
     fn score_before_format_score(r: &SearchResult) -> f64 {
         let weights: std::collections::HashMap<&str, f64> = [
             ("flac", 1.0),
@@ -1102,13 +1132,11 @@ mod tests {
         if r.has_free_upload_slot {
             base += 0.1;
         }
-        if r.upload_speed > 100 {
-            base += 0.05;
-        }
+        base += upload_speed_bonus(r.upload_speed);
         if r.queue_length > 10 {
             base -= 0.1;
         }
-        base.min(1.0)
+        base.clamp(0.0, 1.0)
     }
 
     #[test]
@@ -1126,7 +1154,12 @@ mod tests {
                 Some(256),
                 Some(320),
             ] {
-                for (slot, speed, queue) in [(false, 0, 0), (true, 101, 0), (true, 500, 11)] {
+                for (slot, speed, queue) in [
+                    (false, 0, 0),
+                    (true, 101, 0),
+                    (true, 275 * 1024, 0),
+                    (true, 500 * 1024, 11),
+                ] {
                     let r = SearchResult {
                         username: "p".into(),
                         filename: format!("Music\\{name}"),
@@ -1150,6 +1183,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn quality_score_upload_speed_tiebreaker_is_smooth_bounded_and_preserves_format_precedence() {
+        let mp3 = |speed: i32| SearchResult {
+            username: "p".into(),
+            filename: "Music\\track.mp3".into(),
+            size: 5_000_000,
+            bitrate: Some(320),
+            duration: Some(200),
+            sample_rate: None,
+            bit_depth: None,
+            has_free_upload_slot: false,
+            upload_speed: speed,
+            queue_length: 0,
+            variable_bit_rate: None,
+            declared_extension: None,
+            folder_audio_files: 1,
+        };
+        // Below 50 KiB/s (including negative and old 101 B/s threshold): 0 bonus.
+        assert!((mp3(-500).quality_score() - 0.75).abs() < 1e-12);
+        assert!((mp3(101).quality_score() - 0.75).abs() < 1e-12);
+        assert!((mp3(50 * 1024).quality_score() - 0.75).abs() < 1e-12);
+        // Midpoint 275 KiB/s: +0.025 bonus.
+        assert!((mp3(275 * 1024).quality_score() - 0.775).abs() < 1e-12);
+        // At and above 500 KiB/s: capped at +0.05.
+        assert!((mp3(500 * 1024).quality_score() - 0.80).abs() < 1e-12);
+        assert!((mp3(10_000_000).quality_score() - 0.80).abs() < 1e-12);
+        // Monotonic across speeds.
+        assert!(mp3(100 * 1024).quality_score() < mp3(300 * 1024).quality_score());
+        assert!(mp3(300 * 1024).quality_score() < mp3(500 * 1024).quality_score());
+        // Format precedence preserved: fast 320 MP3 (0.80) still below slow WAV (0.85) and FLAC (1.0).
+        let slow_wav = SearchResult {
+            filename: "Music\\track.wav".into(),
+            bitrate: None,
+            ..mp3(0)
+        };
+        let slow_flac = SearchResult {
+            filename: "Music\\track.flac".into(),
+            bitrate: None,
+            ..mp3(0)
+        };
+        assert!(mp3(10_000_000).quality_score() < slow_wav.quality_score());
+        assert!(slow_wav.quality_score() < slow_flac.quality_score());
+        // Clamped at lower bound 0.0 for low-bitrate unknown format with long queue.
+        let terrible = SearchResult {
+            filename: "Music\\track.unknown".into(),
+            bitrate: Some(64),
+            queue_length: 50,
+            ..mp3(0)
+        };
+        assert_eq!(terrible.quality_score(), 0.0);
     }
 
     #[test]

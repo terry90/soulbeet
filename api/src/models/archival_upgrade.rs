@@ -18,6 +18,8 @@ pub struct FastAcquisitionRow {
     pub backend_id: String,
     pub codec: String,
     pub is_lossy: i64,
+    pub duration_s: Option<i64>,
+    pub imported_as_is: i64,
     pub created_at: String,
 }
 
@@ -34,6 +36,8 @@ pub struct NewFastAcquisition<'a> {
     pub backend_id: &'a str,
     pub codec: &'a str,
     pub is_lossy: bool,
+    pub duration_s: Option<u32>,
+    pub imported_as_is: bool,
 }
 
 #[cfg(feature = "server")]
@@ -46,8 +50,8 @@ impl FastAcquisitionRow {
         sqlx::query(
             "INSERT INTO fast_acquisitions \
              (id, user_id, folder_id, navidrome_song_id, discovery_track_id, artist, title, album, \
-              recording_mbid, backend_id, codec, is_lossy) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              recording_mbid, backend_id, codec, is_lossy, duration_s, imported_as_is) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(item.user_id)
@@ -61,6 +65,8 @@ impl FastAcquisitionRow {
         .bind(item.backend_id)
         .bind(item.codec)
         .bind(if item.is_lossy { 1_i64 } else { 0_i64 })
+        .bind(item.duration_s.map(i64::from))
+        .bind(if item.imported_as_is { 1_i64 } else { 0_i64 })
         .execute(db)
         .await
         .map_err(|e| e.to_string())?;
@@ -183,6 +189,7 @@ pub struct ArchivalUpgradeRow {
     pub recording_mbid: Option<String>,
     pub original_codec: String,
     pub original_backend: String,
+    pub original_duration_s: Option<i64>,
     pub trigger_reason: String,
     pub status: String,
     pub job_id: Option<String>,
@@ -206,6 +213,10 @@ impl From<ArchivalUpgradeRow> for ArchivalUpgradeJob {
             recording_mbid: row.recording_mbid,
             original_codec: row.original_codec,
             original_backend: row.original_backend,
+            original_duration_s: row
+                .original_duration_s
+                .and_then(|s| u32::try_from(s).ok())
+                .filter(|&s| s > 0),
             trigger_reason: row.trigger_reason,
             status: ArchivalUpgradeStatus::parse(&row.status),
             job_id: row.job_id,
@@ -228,6 +239,7 @@ pub struct NewArchivalUpgrade<'a> {
     pub recording_mbid: Option<&'a str>,
     pub original_codec: &'a str,
     pub original_backend: &'a str,
+    pub original_duration_s: Option<u32>,
     pub trigger_reason: &'a str,
 }
 
@@ -279,8 +291,8 @@ impl ArchivalUpgradeRow {
         sqlx::query(
             "INSERT INTO archival_upgrade_jobs \
              (id, user_id, folder_id, navidrome_song_id, artist, title, album, recording_mbid, \
-              original_codec, original_backend, trigger_reason, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')",
+              original_codec, original_backend, original_duration_s, trigger_reason, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')",
         )
         .bind(&id)
         .bind(item.user_id)
@@ -292,6 +304,7 @@ impl ArchivalUpgradeRow {
         .bind(item.recording_mbid)
         .bind(item.original_codec)
         .bind(item.original_backend)
+        .bind(item.original_duration_s.map(i64::from))
         .bind(item.trigger_reason)
         .execute(db)
         .await

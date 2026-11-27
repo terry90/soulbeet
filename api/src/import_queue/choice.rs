@@ -2,7 +2,7 @@
 //! runs, refusing anything the kept job does not allow.
 
 use super::ImportJob;
-use shared::download::{ImportChoice, ImportRefusal, KeptImport};
+use shared::download::{AsIsTagOverrides, ImportChoice, ImportRefusal, KeptImport};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::{DriverChoice, ImportMode};
 
@@ -11,6 +11,9 @@ const FILES_GONE: &str = "The kept files are gone";
 const NO_CHOICES: &str = "This import has no matches to pick from";
 const UNKNOWN_CANDIDATE: &str = "That match is not one beets found for this import";
 const NOT_AN_ID: &str = "That is not a MusicBrainz link or ID";
+const TAG_OVERRIDES_EMPTY: &str = "Artist and title are required to tag and import as-is";
+const TAG_OVERRIDES_SINGLETON_ONLY: &str =
+    "Tagging and importing as-is is only supported for single-track imports";
 
 /// beets' name for its MusicBrainz source.
 const MUSICBRAINZ: &str = "MusicBrainz";
@@ -115,6 +118,50 @@ fn wrong_entity(message: String) -> ImportRefusal {
     )
 }
 
+/// Tag overrides for as-is import are missing artist or title. The job stays kept.
+pub(super) fn tag_overrides_empty() -> ImportRefusal {
+    refusal(
+        FailureCode::InvalidInput,
+        Stage::Input,
+        RetryAdvice::NeedsDecision,
+        TAG_OVERRIDES_EMPTY,
+        KeptImport::Kept,
+    )
+}
+
+/// Tag overrides for as-is import are only valid for single-track jobs. The job stays kept.
+pub(super) fn tag_overrides_singleton_only() -> ImportRefusal {
+    refusal(
+        FailureCode::InvalidInput,
+        Stage::Input,
+        RetryAdvice::NeedsDecision,
+        TAG_OVERRIDES_SINGLETON_ONLY,
+        KeptImport::Kept,
+    )
+}
+
+/// Validates and trims `overrides`, refusing empty artist or title while keeping the job.
+pub(super) fn validate_tag_overrides(
+    overrides: &AsIsTagOverrides,
+) -> Result<AsIsTagOverrides, ImportRefusal> {
+    let artist = overrides.artist.trim().to_string();
+    let title = overrides.title.trim().to_string();
+    if artist.is_empty() || title.is_empty() {
+        return Err(tag_overrides_empty());
+    }
+    let album = overrides
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
+    Ok(AsIsTagOverrides {
+        artist,
+        title,
+        album,
+    })
+}
+
 /// The importer's choice for `choice` on `job`. As-is and a MusicBrainz link
 /// work on any kept job; a listed match needs the matches of a skipped
 /// automatic run and must be one of them.
@@ -126,6 +173,13 @@ pub(super) fn resolve(
     match choice {
         ImportChoice::Auto => Ok(DriverChoice::Auto),
         ImportChoice::AsIs => Ok(DriverChoice::AsIs),
+        ImportChoice::AsIsWithTags(overrides) => {
+            if job.mode != ImportMode::Singleton || job.files.len() != 1 {
+                return Err(tag_overrides_singleton_only());
+            }
+            validate_tag_overrides(overrides)?;
+            Ok(DriverChoice::AsIs)
+        }
         ImportChoice::Candidate { data_source, id } => {
             let found = choices()?
                 .candidates
@@ -217,7 +271,11 @@ mod tests {
         };
         ImportJob {
             mode,
-            choices: Some(Arc::new(MatchChoices { kind, candidates })),
+            choices: Some(Arc::new(MatchChoices {
+                kind,
+                candidates,
+                missing_tags: false,
+            })),
             ..job(PathBuf::from("/dl/a.flac"), Path::new("/music"))
         }
     }
@@ -465,6 +523,14 @@ mod tests {
                 "That is not a MusicBrainz link or ID",
                 KeptImport::Kept,
             ),
+            (
+                tag_overrides_singleton_only(),
+                InvalidInput,
+                Stage::Input,
+                NeedsDecision,
+                TAG_OVERRIDES_SINGLETON_ONLY,
+                KeptImport::Kept,
+            ),
         ] {
             let f = &refusal.failure;
             assert_eq!(
@@ -472,5 +538,32 @@ mod tests {
                 (code, stage, retry, message, kept)
             );
         }
+    }
+
+    #[test]
+    fn as_is_with_tags_rejects_album_and_multi_file_jobs() {
+        let overrides = AsIsTagOverrides {
+            artist: "Burial".into(),
+            title: "Archangel".into(),
+            album: Some("Untrue".into()),
+        };
+        let album = job_without_choices(ImportMode::Album);
+        assert_eq!(
+            resolve(&ImportChoice::AsIsWithTags(overrides.clone()), &album),
+            Err(tag_overrides_singleton_only())
+        );
+
+        let mut multi_file = job_without_choices(ImportMode::Singleton);
+        multi_file.files.push(PathBuf::from("/dl/b.flac"));
+        assert_eq!(
+            resolve(&ImportChoice::AsIsWithTags(overrides.clone()), &multi_file),
+            Err(tag_overrides_singleton_only())
+        );
+
+        let singleton = job_without_choices(ImportMode::Singleton);
+        assert_eq!(
+            resolve(&ImportChoice::AsIsWithTags(overrides), &singleton),
+            Ok(DriverChoice::AsIs)
+        );
     }
 }

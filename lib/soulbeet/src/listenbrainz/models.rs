@@ -137,6 +137,23 @@ pub struct PlaylistTrack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullPlaylistTrack {
+    pub title: String,
+    pub creator: String,
+    pub album: Option<String>,
+    pub duration_s: Option<u32>,
+    pub recording_mbid: Option<String>,
+    pub artist_mbid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullPlaylist {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub tracks: Vec<FullPlaylistTrack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistSearchHit {
     pub mbid: String,
     pub title: String,
@@ -213,6 +230,10 @@ struct AlgorithmMetadata {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct JspfPlaylist {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub annotation: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub track: Vec<JspfTrack>,
 }
@@ -224,6 +245,10 @@ pub(crate) struct JspfPlaylist {
 pub(crate) struct JspfTrack {
     pub title: Option<String>,
     pub creator: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub duration: Option<u64>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub identifier: Vec<String>,
     #[serde(default)]

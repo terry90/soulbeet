@@ -13,7 +13,7 @@ use crate::transfer_registry::TransferRegistry;
 use serde_json::{Map, Value};
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableGroup, DownloadableItem,
-    IndexState, JobSlot,
+    IndexState, JobSlot, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, Stage};
 use soulbeet::ImportMode;
@@ -25,6 +25,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
 
 pub(super) type Reply<T> = oneshot::Sender<Result<T, LedgerError>>;
+
+/// Maximum unfinished playlist-import jobs allowed per user at one time.
+const IMPORT_UNFINISHED_JOBS_PER_USER: u32 = 500;
 
 /// What the writer reads its writes from, sends its change numbers and freed places on and keeps
 /// the live rows in.
@@ -286,6 +289,18 @@ impl Entry {
     /// The entry a slot in `state` with `row` as its last row shows; None for a state before
     /// its download.
     fn of_slot(slot: u32, state: JobState, row: Option<&DownloadProgress>) -> Option<Entry> {
+        if state == JobState::Downloading {
+            if let Some(row) = row {
+                if let Some(failure) = row.failure.as_ref().filter(|f| f.stage == Stage::Verify) {
+                    return Some(
+                        Entry::at(state, "verify_failed")
+                            .slot(slot)
+                            .item(&row.source, &row.item)
+                            .failure(failure),
+                    );
+                }
+            }
+        }
         let event = match state {
             JobState::Downloading
                 if row.is_some_and(|row| row.state == DownloadState::Completed) =>
@@ -762,6 +777,11 @@ impl Writer {
                         .bind(&job)
                         .execute(&mut *tx)
                         .await?;
+                    let mut entry = Entry::at(state, "failed").failure(&failure);
+                    if failure.stage == Stage::SourceSearch {
+                        attach_search_rejections(&mut tx, &job, &mut entry).await?;
+                    }
+                    append(&mut tx, &job, entry).await?;
                 }
                 self.set_job(&mut tx, &job, state).await?;
             }
@@ -1098,20 +1118,46 @@ impl Writer {
     }
 
     /// Stores how search `id` ended: its candidates and stats, or its failure and the stats it
-    /// has, in one statement. A search that was stored moves the change number on.
+    /// has, in one statement. A search that was stored moves the change number on. When `stats`
+    /// carries rejection diagnostics, also records a `Stage::SourceSearch` event on any job
+    /// linked to `id`.
     async fn search_ended(&mut self, id: &str, outcome: SearchOutcome) -> Result<(), LedgerError> {
         let (candidates, stats, failure) = match outcome {
             Ok((groups, stats)) => (Some(groups), stats, None),
             Err((failure, stats)) => (None, stats, Some(failure)),
         };
+        let mut tx = begin(&self.db).await?;
         let ended =
             sqlx::query("UPDATE searches SET candidates = ?, stats = ?, failure = ? WHERE id = ?")
                 .bind(candidates.map(|c| serde_json::to_string(&c)).transpose()?)
-                .bind(stats.map(|s| serde_json::to_string(&s)).transpose()?)
+                .bind(stats.as_ref().map(serde_json::to_string).transpose()?)
                 .bind(failure.map(|f| serde_json::to_string(&f)).transpose()?)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
+        if let Some(ref s) = stats {
+            if !s.rejection_counts.is_empty() || !s.top_rejected.is_empty() {
+                let job_ids: Vec<String> =
+                    sqlx::query_scalar("SELECT id FROM jobs WHERE search_id = ?")
+                        .bind(id)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                for job_id in job_ids {
+                    let mut entry = Entry {
+                        stage: Stage::SourceSearch,
+                        event: "search_diagnostics",
+                        facts: Map::new(),
+                    }
+                    .fact("search_id", id)
+                    .fact("response_count", s.response_count)
+                    .fact("file_count", s.file_count)
+                    .fact("locked_file_count", s.locked_file_count);
+                    insert_rejection_facts(&mut entry.facts, s);
+                    append(&mut tx, &job_id, entry).await?;
+                }
+            }
+        }
+        tx.commit().await?;
         if ended.rows_affected() > 0 {
             self.next_seq();
         }
@@ -1229,9 +1275,14 @@ impl Writer {
                 });
                 continue;
             }
-            if batch.origin == BatchOrigin::Mcp {
-                let unfinished = unfinished_mcp_jobs(&mut tx, &job.user).await?;
-                if unfinished >= MCP_UNFINISHED_JOBS_PER_USER {
+            if matches!(batch.origin, BatchOrigin::Mcp | BatchOrigin::Import) {
+                let cap = if batch.origin == BatchOrigin::Import {
+                    IMPORT_UNFINISHED_JOBS_PER_USER
+                } else {
+                    MCP_UNFINISHED_JOBS_PER_USER
+                };
+                let unfinished = unfinished_origin_jobs(&mut tx, &job.user, batch.origin).await?;
+                if unfinished >= cap {
                     admitted.push(Admitted::OverLimit { unfinished });
                     continue;
                 }
@@ -1316,13 +1367,16 @@ impl Writer {
         if (change.decided_at()).is_some_and(|read| changed_seq != read) {
             return Ok(Transitioned::Refused { state: from });
         }
-        // Only an MCP job's runner holds a place before it sends, and records the send first: a
-        // queued MCP job without a place and without a recorded send cannot have transfers. A web
-        // UI job's pipeline sends without either.
-        let mcp = origin.as_deref() == Some(BatchOrigin::Mcp.as_str());
+        // Only a job runner batch (MCP or playlist import) holds a place before it sends, and
+        // records the send first: a queued runner job without a place and without a recorded send
+        // cannot have transfers. A web UI job's pipeline sends without either.
+        let runner_job = matches!(
+            origin.as_deref(),
+            Some(o) if o == BatchOrigin::Mcp.as_str() || o == BatchOrigin::Import.as_str()
+        );
         let may_have_transfers = match from {
             JobState::Downloading => true,
-            JobState::Queued => !mcp || gate_held || sent,
+            JobState::Queued => !runner_job || gate_held || sent,
             _ => false,
         };
         // The slots a transition moves are on the timeline as the transition's entries.
@@ -1395,7 +1449,11 @@ impl Writer {
                         .await?;
                 }
                 let to = JobState::Failed;
-                (to, vec![Entry::at(to, "failed").failure(&failure)])
+                let mut entry = Entry::at(to, "failed").failure(&failure);
+                if failure.stage == Stage::SourceSearch {
+                    attach_search_rejections(&mut tx, job, &mut entry).await?;
+                }
+                (to, vec![entry])
             }
             Transition::Search {
                 filters: Some(_), ..
@@ -1899,7 +1957,7 @@ async fn follow_attempt(
     let at = now();
     // An adopted transfer's attempt (a restart found it, its candidate unknown) is followed by
     // the slot's rows, and takes their source.
-    sqlx::query(
+    let updated = sqlx::query(
         "UPDATE job_attempts SET last_row = ?, \
              started_at = CASE WHEN ? THEN COALESCE(started_at, ?) ELSE started_at END, \
              ended_at = CASE WHEN ? THEN ? END, \
@@ -1926,7 +1984,35 @@ async fn follow_attempt(
     .bind(&row.source)
     .bind(&row.item)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        if let Some(failure) = row.failure.as_ref().filter(|f| f.stage == Stage::Verify) {
+            // Post-download verification runs after the transfer already reported
+            // `DownloadState::Completed` (closing the open attempt with `failure = NULL`).
+            // Attach the verification failure to that most recent completed attempt so
+            // job diagnostics reflect why the peer failed instead of showing "downloaded".
+            sqlx::query(
+                "UPDATE job_attempts SET last_row = ?, failure = ? \
+                 WHERE job_id = ? AND slot = ? AND n = ( \
+                     SELECT MAX(n) FROM job_attempts \
+                     WHERE job_id = ? AND slot = ? AND failure IS NULL \
+                     AND ((source = ? AND json_extract(candidate, '$.id') = ?) OR candidate IS NULL) \
+                 )",
+            )
+            .bind(stored_row)
+            .bind(serde_json::to_string(failure)?)
+            .bind(&slot.job)
+            .bind(slot.slot)
+            .bind(&slot.job)
+            .bind(slot.slot)
+            .bind(&row.source)
+            .bind(&row.item)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -1950,6 +2036,41 @@ async fn slot_entry(
     let row: Option<DownloadProgress> =
         (found.and_then(|(_, row)| row)).and_then(|row| serde_json::from_str(&row).ok());
     Ok(Entry::of_slot(slot.slot, state, row.as_ref()))
+}
+
+/// Inserts non-empty `rejection_counts` and `top_rejected` from `stats` into `facts`.
+fn insert_rejection_facts(facts: &mut Map<String, Value>, stats: &SearchStats) {
+    if !stats.rejection_counts.is_empty() {
+        if let Ok(v) = serde_json::to_value(&stats.rejection_counts) {
+            facts.insert("rejection_counts".into(), v);
+        }
+    }
+    if !stats.top_rejected.is_empty() {
+        if let Ok(v) = serde_json::to_value(&stats.top_rejected) {
+            facts.insert("top_rejected".into(), v);
+        }
+    }
+}
+
+/// If `job`'s stored search has rejection diagnostics in `searches.stats`, attach them to `entry`.
+async fn attach_search_rejections(
+    tx: &mut SqliteConnection,
+    job: &str,
+    entry: &mut Entry,
+) -> Result<(), LedgerError> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT s.stats FROM jobs j JOIN searches s ON s.id = j.search_id \
+         WHERE j.id = ? AND s.stats IS NOT NULL",
+    )
+    .bind(job)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(raw) = raw {
+        if let Ok(stats) = serde_json::from_str::<SearchStats>(&raw) {
+            insert_rejection_facts(&mut entry.facts, &stats);
+        }
+    }
+    Ok(())
 }
 
 /// Appends `entry` to `job`'s timeline under its next number. Selected from the job, so a
@@ -2011,34 +2132,39 @@ async fn same_recording(
         .transpose()
 }
 
-/// How many of `user`'s MCP jobs are unfinished.
-async fn unfinished_mcp_jobs(tx: &mut SqliteConnection, user: &UserId) -> Result<u32, LedgerError> {
+/// How many of `user`'s unfinished jobs belong to batches of `origin`.
+async fn unfinished_origin_jobs(
+    tx: &mut SqliteConnection,
+    user: &UserId,
+    origin: BatchOrigin,
+) -> Result<u32, LedgerError> {
     let count: u32 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id = j.batch_id \
          WHERE j.user_id = ? AND b.origin = ? AND j.state NOT IN {TERMINAL_SQL}"
     ))
     .bind(user.to_string())
-    .bind(BatchOrigin::Mcp.as_str())
+    .bind(origin.as_str())
     .fetch_one(&mut *tx)
     .await?;
     Ok(count)
 }
 
-/// D8: whether `job`, queued, holds a download place now, taking one when its user's MCP jobs
-/// hold fewer than `limit`.
+/// D8: whether `job`, queued, holds a download place now, taking one when its user's runner
+/// jobs (MCP and playlist import) hold fewer than `limit`.
 async fn claim_download(db: &SqlitePool, job: &str, limit: u32) -> Result<bool, LedgerError> {
     // A place is only ever held while queued or downloading (`touch`), so one held is still
     // counted in the limit.
     let claimed: Option<String> = sqlx::query_scalar(
         "UPDATE jobs SET gate_held = 1 WHERE id = ? AND state = ? AND (gate_held = 1 OR \
              (SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id = j.batch_id \
-              WHERE j.user_id = jobs.user_id AND b.origin = ? AND j.gate_held = 1 \
+              WHERE j.user_id = jobs.user_id AND b.origin IN (?, ?) AND j.gate_held = 1 \
               AND j.state IN ('queued', 'downloading')) < ?) \
          RETURNING id",
     )
     .bind(job)
     .bind(JobState::Queued.as_str())
     .bind(BatchOrigin::Mcp.as_str())
+    .bind(BatchOrigin::Import.as_str())
     .bind(limit)
     .fetch_optional(db)
     .await?;
@@ -2084,9 +2210,16 @@ async fn store_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{store, JobKind, JobState, Ledger, NewJob, NewSearch};
+    use super::super::{
+        store, Admitted, BatchOrigin, JobEvent, JobKind, JobState, Ledger, NewJob, NewJobBatch,
+        NewSearch,
+    };
+    use super::IMPORT_UNFINISHED_JOBS_PER_USER;
     use crate::auth::UserId;
-    use shared::download::DownloadQuery;
+    use crate::server_fns::download::test_support::item;
+    use shared::download::{DownloadProgress, DownloadQuery, DownloadState, JobSlot};
+    use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
+    use shared::metadata::Track;
     use soulbeet::ImportMode;
 
     #[tokio::test]
@@ -2133,6 +2266,169 @@ mod tests {
         assert_eq!(
             store::job_state(&db, "first").await,
             Some(JobState::NeedsSourceChoice)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_failure_during_failover_records_verify_event_and_updates_completed_attempt() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let picked = item("peer_a", "One", "a/01.flac");
+        let slot = JobSlot {
+            job: "j-verify".into(),
+            slot: 0,
+        };
+        ledger
+            .create(
+                NewJob {
+                    id: slot.job.clone(),
+                    user: UserId::new("alice"),
+                    folder_id: folder,
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Queued,
+                    search_id: None,
+                    picked: vec![(0, picked.clone())],
+                    kind: JobKind::Track,
+                    options: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        // 1. Transfer completes, which closes the open attempt with ended_at != NULL, failure = NULL.
+        let completed = DownloadProgress::queued(
+            "t-1".into(),
+            picked.source.clone(),
+            picked.id.clone(),
+            1024,
+        )
+        .with_state(DownloadState::Completed)
+        .with_job(slot.clone());
+        ledger
+            .record_stored(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![completed.clone()],
+            })
+            .await
+            .unwrap();
+
+        // 2. Post-download verification fails and failover records the failed row
+        //    while the slot stays in JobState::Downloading.
+        let verify_err = Failure::new(
+            FailureCode::AudioCorrupt,
+            Stage::Verify,
+            RetryAdvice::OtherSource,
+            "corrupt audio frames",
+        );
+        let failed = completed.failed_with(verify_err);
+        ledger
+            .record_stored(JobEvent::Slots {
+                state: JobState::Downloading,
+                rows: vec![failed],
+            })
+            .await
+            .unwrap();
+
+        let timeline = store::timeline_of(&db, &slot.job).await.unwrap();
+        let verify_event = timeline
+            .iter()
+            .find(|e| e.stage == Stage::Verify && e.event == "verify_failed")
+            .expect("job_events must record a Stage::Verify verify_failed event during failover");
+        assert_eq!(
+            verify_event.facts.get("code").and_then(|v| v.as_str()),
+            Some("audio_corrupt")
+        );
+
+        let attempt_failure: Option<String> = sqlx::query_scalar(
+            "SELECT failure FROM job_attempts WHERE job_id = ? AND slot = 0 AND n = 1",
+        )
+        .bind(&slot.job)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let parsed: Failure = serde_json::from_str(
+            attempt_failure
+                .as_deref()
+                .expect("completed job_attempt must have verification failure attached"),
+        )
+        .unwrap();
+        assert_eq!(parsed.stage, Stage::Verify);
+        assert_eq!(parsed.code, FailureCode::AudioCorrupt);
+    }
+
+    #[tokio::test]
+    async fn import_origin_batches_enforce_unfinished_job_cap() {
+        let db = crate::db::test_db::migrated().await;
+        let folder = crate::core::folder_of(&db, "alice").await;
+        let ledger = Ledger::start(db.clone());
+        let alice = UserId::new("alice");
+
+        let make_job = |i: u32| {
+            let track = Track {
+                id: format!("t-{i}"),
+                title: format!("Unique Song {i}"),
+                artist: "Import Artist".into(),
+                album_id: None,
+                album_title: None,
+                release_date: None,
+                duration: None,
+                mbid: None,
+                release_mbid: None,
+            };
+            NewJob {
+                id: format!("imp-job-{i}"),
+                user: alice.clone(),
+                folder_id: folder.clone(),
+                wanted: DownloadQuery::new(vec![track]),
+                import_mode: ImportMode::Singleton,
+                state: JobState::Queued,
+                search_id: None,
+                picked: vec![],
+                kind: JobKind::Track,
+                options: None,
+            }
+        };
+
+        let first_batch: Vec<NewJob> = (0..IMPORT_UNFINISHED_JOBS_PER_USER)
+            .map(make_job)
+            .collect();
+        let admitted = ledger
+            .create_batch(
+                NewJobBatch {
+                    id: "imp-batch-1".into(),
+                    user: alice.clone(),
+                    label: Some("Big Playlist".into()),
+                    origin: BatchOrigin::Import,
+                    for_playlist: true,
+                },
+                first_batch,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.len(), IMPORT_UNFINISHED_JOBS_PER_USER as usize);
+        assert!(admitted.iter().all(|a| matches!(a, Admitted::Created)));
+
+        let overflow = ledger
+            .create_batch(
+                NewJobBatch {
+                    id: "imp-batch-2".into(),
+                    user: alice.clone(),
+                    label: Some("Overflow Playlist".into()),
+                    origin: BatchOrigin::Import,
+                    for_playlist: true,
+                },
+                vec![make_job(IMPORT_UNFINISHED_JOBS_PER_USER + 1)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            overflow,
+            vec![Admitted::OverLimit {
+                unfinished: IMPORT_UNFINISHED_JOBS_PER_USER
+            }]
         );
     }
 }

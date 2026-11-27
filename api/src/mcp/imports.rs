@@ -34,8 +34,11 @@ const RESOLVE_IMPORT_ARGS: &[&str] = &[
     "data_source",
     "id",
     "musicbrainz",
+    "tag_overrides",
     "request_key",
 ];
+
+const TAG_OVERRIDES_FIELDS: &[&str] = &["artist", "title", "album"];
 
 /// resolve_import's choices, as the schema lists them.
 const CHOICES: [&str; 5] = ["retry", "as_is", "candidate", "musicbrainz", "discard"];
@@ -60,10 +63,10 @@ pub(crate) const RESOLVE_IMPORT: ToolSpec = ToolSpec {
     title: "Decide an import",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulbeet kept, never a library file, and dismisses the job's slots waiting for it; a file it could not delete stays on disk, listed in files_left as dismiss_job lists it, and the slots are dismissed all the same). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. An import the web page started that would replace an earlier library copy of the music replaces it only with deletion switched on for this app, as this app's deletion (counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history); without the switch the copy stays and the job ends import_already_in_library. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
+        format!("Decides the import a job waiting for an import decision (needs_decision) kept, with choice: retry (beets matches again on its own), as_is (the files are imported with their own tags; optional tag_overrides with required artist and title and optional album stamps tags onto the file before importing as-is, supported for single-track imports only), candidate (one of get_import_choices' candidates, by its data_source and id), musicbrainz (the MusicBrainz recording, for a track job, or release, for an album job, given as an MBID or a musicbrainz.org link), or discard (deletes the downloaded copy Soulbeet kept, never a library file, and dismisses the job's slots waiting for it; a file it could not delete stays on disk, listed in files_left as dismiss_job lists it, and the slots are dismissed all the same). musicbrainz and as_is work without candidates, so a recording found with search_music can always be applied. An import the web page started that would replace an earlier library copy of the music replaces it only with deletion switched on for this app, as this app's deletion (counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history); without the switch the copy stays and the job ends import_already_in_library. slot as get_import_choices takes it. Answers the job's full document, as get_jobs gives it; the import then runs, so follow it with get_jobs. Failure codes: {common}, unknown_handle (no job of this user has this id, or another decision already took the kept import), wrong_job_state (the job is not waiting for an import decision), import_files_gone (the kept files were deleted; the job's slots fail), import_choice_invalid (a candidate beets did not find, a MusicBrainz link to the wrong entity), already_running (a call with this request_key still runs).")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "choice"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}, "choice": {"enum": ["retry", "as_is", "candidate", "musicbrainz", "discard"]}, "data_source": {"type": "string", "minLength": 1}, "id": {"type": "string", "minLength": 1}, "musicbrainz": {"type": "string", "minLength": 1}, "#,
+        r#"{"type": "object", "additionalProperties": false, "required": ["job_id", "choice"], "properties": {"job_id": {"type": "string", "minLength": 1}, "slot": {"type": "integer", "minimum": 0}, "choice": {"enum": ["retry", "as_is", "candidate", "musicbrainz", "discard"]}, "data_source": {"type": "string", "minLength": 1}, "id": {"type": "string", "minLength": 1}, "musicbrainz": {"type": "string", "minLength": 1}, "tag_overrides": {"type": "object", "additionalProperties": false, "required": ["artist", "title"], "properties": {"artist": {"type": "string", "minLength": 1}, "title": {"type": "string", "minLength": 1}, "album": {"type": "string"}}}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -223,18 +226,20 @@ struct ResolveCall {
 impl ResolveCall {
     /// The call's arguments as read, `request_key` left out: what the key is bound to.
     fn value(&self) -> Value {
-        let (data_source, id, musicbrainz) = match &self.decision {
-            Decision::Candidate { data_source, id } => (Some(data_source), Some(id), None),
-            Decision::MusicBrainz(text) => (None, None, Some(text)),
-            Decision::Retry | Decision::AsIs | Decision::Discard => (None, None, None),
+        let (data_source, id, musicbrainz, tag_overrides) = match &self.decision {
+            Decision::Candidate { data_source, id } => (Some(data_source), Some(id), None, None),
+            Decision::MusicBrainz(text) => (None, None, Some(text), None),
+            Decision::AsIsWithTags(overrides) => (None, None, None, Some(overrides)),
+            Decision::Retry | Decision::AsIs | Decision::Discard => (None, None, None, None),
         };
         json!({"job_id": self.job_id, "slot": self.slot, "choice": self.choice,
-            "data_source": data_source, "id": id, "musicbrainz": musicbrainz})
+            "data_source": data_source, "id": id, "musicbrainz": musicbrainz,
+            "tag_overrides": tag_overrides})
     }
 }
 
 /// resolve_import's arguments: `choice` required, `data_source` and `id` given with candidate
-/// only and both, `musicbrainz` with musicbrainz only.
+/// only and both, `musicbrainz` with musicbrainz only, optional `tag_overrides` with as_is only.
 fn read_resolve(args: &Args) -> Result<ResolveCall, ToolError> {
     let job_id = args.string("job_id")?;
     let slot = args.opt_u32("slot", 0, 999)?;
@@ -245,7 +250,19 @@ fn read_resolve(args: &Args) -> Result<ResolveCall, ToolError> {
     let choice = args.opt_choice("choice", &CHOICES)?.ok_or_else(refused)?;
     let decision = match choice {
         "retry" => Decision::Retry,
-        "as_is" => Decision::AsIs,
+        "as_is" => match args.opt_object("tag_overrides", TAG_OVERRIDES_FIELDS)? {
+            Some(obj) => {
+                let artist = obj.string("artist")?;
+                let title = obj.string("title")?;
+                let album = obj.opt_string("album")?;
+                Decision::AsIsWithTags(shared::download::AsIsTagOverrides {
+                    artist,
+                    title,
+                    album,
+                })
+            }
+            None => Decision::AsIs,
+        },
         "candidate" => Decision::Candidate {
             data_source: args.string("data_source")?,
             id: args.string("id")?,
@@ -260,6 +277,9 @@ fn read_resolve(args: &Args) -> Result<ResolveCall, ToolError> {
     }
     if choice != "musicbrainz" {
         args.absent("musicbrainz", "absent unless choice is musicbrainz")?;
+    }
+    if choice != "as_is" {
+        args.absent("tag_overrides", "absent unless choice is as_is")?;
     }
     let key = request_key(args)?;
     args.finish()?;

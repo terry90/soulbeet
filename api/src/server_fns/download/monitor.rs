@@ -10,8 +10,8 @@
 use dioxus::logger::tracing::{debug, info, warn};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::{BackendError, DownloadBackend, ImportMode};
-use std::collections::HashSet;
+use soulbeet::{BackendError, DownloadBackend, ImportMode, VerifyPolicy};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -23,9 +23,9 @@ use tokio::time::Instant;
 use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{Sent, SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{
-    album_jobs, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
+    album_jobs, find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
 };
-use super::utils::{file_id, FileId};
+use super::utils::{file_id, FileId, Unresolved};
 use crate::config::CONFIG;
 use crate::globals::send_user_event;
 use crate::import_queue::IMPORT_QUEUE;
@@ -56,6 +56,35 @@ const REMOTE_QUEUE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// marked failed: never appearing at all, or vanishing after being seen.
 /// Without this, one absent track keeps the whole batch unfinished forever.
 const ABSENT_TRACK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Warmup grace period after entering `InProgress` before rolling throughput
+/// checks begin evaluating slow peers.
+const SPEED_WARMUP_GRACE: Duration = Duration::from_secs(25);
+
+/// Rolling throughput sampling window for low-speed stall detection.
+const SPEED_WINDOW: Duration = Duration::from_secs(60);
+
+/// Rolling throughput threshold (12 KiB/s) below which a transfer fails over
+/// when another source is available in the pool.
+const LOW_SPEED_FAILOVER_BPS: u64 = 12 * 1024;
+
+/// Last-resort dead-trickle threshold (1 KiB/s) when no alternates remain.
+const DEAD_TRICKLE_BPS: u64 = 1024;
+
+/// Total duration a transfer must remain below `DEAD_TRICKLE_BPS` before
+/// aborting without alternates (5 minutes).
+const DEAD_TRICKLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Near-completion percentage guard: never abort slow transfers at or above 85%.
+const NEAR_COMPLETION_PERCENT: f64 = 85.0;
+
+/// Near-completion byte guard: never abort slow transfers with fewer than 512 KiB left.
+const NEAR_COMPLETION_REMAINING_BYTES: u64 = 512 * 1024;
+
+/// Maximum time to defer singleton handoff across polls while waiting for a
+/// completed file with alternates to become visible on disk for pre-handoff
+/// verification.
+const DEFERRED_VERIFY_WAIT: Duration = Duration::from_secs(16);
 
 /// Consecutive backend resolution failures tolerated before giving up.
 const MAX_BACKEND_FAILURES: u32 = 5;
@@ -164,6 +193,33 @@ fn per_track_timeout() -> Failure {
     )
 }
 
+/// A slot whose rolling throughput stayed below `LOW_SPEED_FAILOVER_BPS` for `SPEED_WINDOW`.
+fn low_speed_stall(bps: u64) -> Failure {
+    transfer_failure(
+        FailureCode::TransferTimedOut,
+        RetryAdvice::OtherSource,
+        &format!(
+            "Transfer stalled at {:.1} KiB/s over {}s",
+            bps as f64 / 1024.0,
+            SPEED_WINDOW.as_secs()
+        ),
+    )
+}
+
+/// A slot whose rolling throughput stayed below `DEAD_TRICKLE_BPS` for `DEAD_TRICKLE_WINDOW`
+/// with no alternate sources left.
+fn dead_trickle_stall(bps: u64) -> Failure {
+    transfer_failure(
+        FailureCode::TransferTimedOut,
+        RetryAdvice::OtherSource,
+        &format!(
+            "Transfer trickled at {} B/s for {} minutes",
+            bps,
+            DEAD_TRICKLE_WINDOW.as_secs() / 60
+        ),
+    )
+}
+
 /// A slot that waited past `REMOTE_QUEUE_TIMEOUT` in its source's queue
 /// with no other source left.
 fn stuck_in_remote_queue() -> Failure {
@@ -262,7 +318,43 @@ struct TrackState {
     /// When the track's transfer was first seen as a failed attempt slskd
     /// will retry (`read_pending_retry`).
     retry_pending_since: Option<Instant>,
+    /// When the transfer continuously entered `DownloadState::InProgress`
+    /// (reset whenever queued, pending retry, or restarted).
+    in_progress_since: Option<Instant>,
+    /// Rolling `(Instant, bytes_transferred)` checkpoints collected after
+    /// `SPEED_WARMUP_GRACE` for low-speed stall detection.
+    speed_samples: VecDeque<(Instant, u64)>,
+    /// When rolling speed first dropped below `DEAD_TRICKLE_BPS` across a full
+    /// `SPEED_WINDOW`.
+    dead_trickle_since: Option<Instant>,
+    /// When a completed singleton transfer with alternates was first seen
+    /// completed before its file appeared on disk.
+    completed_since: Option<Instant>,
+    /// Path already resolved and verified for a completed album slot while
+    /// waiting on sibling tracks.
+    verified_path: Option<PathBuf>,
     phase: SlotPhase,
+}
+
+/// Classification of a low-speed throughput stall.
+#[derive(Debug)]
+enum SpeedStall {
+    /// Rolling throughput fell below `LOW_SPEED_FAILOVER_BPS` while alternates
+    /// exist: switch only if an alternate enqueues, otherwise keep the working
+    /// transfer alive.
+    FailoverOnly(Failure),
+    /// Rolling throughput stayed below `DEAD_TRICKLE_BPS` for `DEAD_TRICKLE_WINDOW`:
+    /// fail over if possible, otherwise cancel and time out the slot.
+    DeadTrickle(Failure),
+}
+
+impl SpeedStall {
+    #[cfg(test)]
+    fn failure(&self) -> &Failure {
+        match self {
+            Self::FailoverOnly(f) | Self::DeadTrickle(f) => f,
+        }
+    }
 }
 
 impl TrackState {
@@ -279,8 +371,111 @@ impl TrackState {
             failing_since: None,
             queued_at_source_since: None,
             retry_pending_since: None,
+            in_progress_since: None,
+            speed_samples: VecDeque::new(),
+            dead_trickle_since: None,
+            completed_since: None,
+            verified_path: None,
             phase: SlotPhase::Watching,
         }
+    }
+
+    fn reset_speed_tracking(&mut self) {
+        self.in_progress_since = None;
+        self.speed_samples.clear();
+        self.dead_trickle_since = None;
+    }
+
+    /// Evaluates rolling transfer throughput during active `InProgress` transfers.
+    ///
+    /// - Paused/reset outside `InProgress`, while `queued_at_source`, or while `pending_retry`.
+    /// - Exempt during the initial `SPEED_WARMUP_GRACE` (25s) and when near completion
+    ///   (`percent >= 85%` or remaining bytes `< 512 KiB`).
+    /// - Triggers `SpeedStall::FailoverOnly` when rolling speed over `SPEED_WINDOW` (60s)
+    ///   is below `LOW_SPEED_FAILOVER_BPS` (12 KiB/s) ONLY when `has_next` is true.
+    /// - Triggers `SpeedStall::DeadTrickle` when rolling speed remains below
+    ///   `DEAD_TRICKLE_BPS` (1 KiB/s) for `DEAD_TRICKLE_WINDOW` (5 min) even without alternates.
+    fn check_low_speed_stall(
+        &mut self,
+        download: &DownloadProgress,
+        has_next: bool,
+        now: Instant,
+    ) -> Option<SpeedStall> {
+        if download.state != DownloadState::InProgress
+            || download.queued_at_source
+            || download.pending_retry.is_some()
+        {
+            self.reset_speed_tracking();
+            return None;
+        }
+
+        let remaining = download.size.saturating_sub(download.transferred);
+        if download.percent >= NEAR_COMPLETION_PERCENT
+            || (download.size > 0 && remaining < NEAR_COMPLETION_REMAINING_BYTES)
+        {
+            self.dead_trickle_since = None;
+            return None;
+        }
+
+        // If bytes moved backwards (transfer restarted internally), restart warmup cleanly.
+        if self
+            .speed_samples
+            .back()
+            .is_some_and(|&(_, prev)| download.transferred < prev)
+        {
+            self.in_progress_since = Some(now);
+            self.speed_samples.clear();
+            self.dead_trickle_since = None;
+            return None;
+        }
+
+        let started = *self.in_progress_since.get_or_insert(now);
+        if now.saturating_duration_since(started) < SPEED_WARMUP_GRACE {
+            return None;
+        }
+
+        match self.speed_samples.back_mut() {
+            Some((last_t, last_b)) if *last_t == now => *last_b = download.transferred,
+            _ => self.speed_samples.push_back((now, download.transferred)),
+        }
+
+        // Prune checkpoints older than the rolling window while keeping one anchor
+        // sample at or just before `cutoff` so the span stays >= SPEED_WINDOW.
+        if let Some(cutoff) = now.checked_sub(SPEED_WINDOW) {
+            while self.speed_samples.len() >= 2 && self.speed_samples[1].0 <= cutoff {
+                self.speed_samples.pop_front();
+            }
+        }
+
+        let (oldest_t, oldest_bytes) = *self.speed_samples.front()?;
+        let span = now.saturating_duration_since(oldest_t);
+        if span < SPEED_WINDOW {
+            return None;
+        }
+
+        let delta_bytes = download.transferred.saturating_sub(oldest_bytes);
+        let rolling_bps = (delta_bytes as f64) / span.as_secs_f64();
+
+        if rolling_bps < DEAD_TRICKLE_BPS as f64 {
+            let since = *self.dead_trickle_since.get_or_insert(now);
+            if now.saturating_duration_since(since)
+                >= DEAD_TRICKLE_WINDOW.saturating_sub(SPEED_WINDOW)
+            {
+                return Some(SpeedStall::DeadTrickle(dead_trickle_stall(
+                    rolling_bps as u64,
+                )));
+            }
+        } else {
+            self.dead_trickle_since = None;
+        }
+
+        if has_next && rolling_bps < LOW_SPEED_FAILOVER_BPS as f64 {
+            return Some(SpeedStall::FailoverOnly(low_speed_stall(
+                rolling_bps as u64,
+            )));
+        }
+
+        None
     }
 }
 
@@ -297,6 +492,8 @@ pub struct WatchedTransfer {
     pub adopted: bool,
     /// Every alternate the slot's failover sent before the monitor took it.
     pub sent: Vec<Sent>,
+    /// Expected duration in seconds from metadata/search, when known.
+    pub expected_duration_s: Option<u32>,
 }
 
 impl WatchedTransfer {
@@ -309,6 +506,7 @@ impl WatchedTransfer {
             job,
             adopted: false,
             sent: Vec::new(),
+            expected_duration_s: None,
         }
     }
 }
@@ -328,6 +526,8 @@ struct TrackedFile {
     /// Every alternate the slot's failover sent, kept through every rebind:
     /// the only transfers the slot may adopt (`adoptable`).
     sent: Vec<Sent>,
+    /// Expected duration in seconds for post-download truncation verification.
+    expected_duration_s: Option<u32>,
 }
 
 /// Monitors download progress from slskd and hands finished files to the
@@ -401,6 +601,7 @@ impl DownloadMonitor {
                 destination: (!t.adopted).then(|| batch.destination.clone()),
                 job: t.job,
                 sent: t.sent,
+                expected_duration_s: t.expected_duration_s,
             })
             .collect();
 
@@ -576,6 +777,7 @@ impl DownloadMonitor {
                 destination: Some(self.batch.destination.clone()),
                 job: slot.job,
                 sent: slot.sent,
+                expected_duration_s: slot.expected_duration_s,
             });
             self.track_states.push(TrackState::bound_now());
             self.pool
@@ -687,6 +889,17 @@ impl DownloadMonitor {
         backend: &Arc<dyn DownloadBackend>,
         left: DownloadProgress,
     ) -> bool {
+        self.try_failover_with_abandon(slot, backend, left, true)
+            .await
+    }
+
+    async fn try_failover_with_abandon(
+        &mut self,
+        slot: usize,
+        backend: &Arc<dyn DownloadBackend>,
+        left: DownloadProgress,
+        abandon_current: bool,
+    ) -> bool {
         if !self.pool.has_next(slot) || self.job_cancelled(slot) {
             return false;
         }
@@ -720,7 +933,9 @@ impl DownloadMonitor {
             self.pool.max_sources(slot)
         );
 
-        self.abandon(slot, backend).await;
+        if abandon_current {
+            self.abandon(slot, backend).await;
+        }
         let old_key = self.slot_key(slot, backend.id());
         let new_key = transfer_key(backend.id(), &queued.source, &queued.item);
         TransferRegistry::global().hand_over(&old_key, &new_key, &self.batch.owner);
@@ -730,6 +945,7 @@ impl DownloadMonitor {
         // monitor loses sight of it.
         let job = self.tracked_files[slot].job.clone();
         let sent = std::mem::take(&mut self.tracked_files[slot].sent);
+        let expected_duration_s = self.tracked_files[slot].expected_duration_s;
         let previous_item = std::mem::replace(
             &mut self.tracked_files[slot],
             TrackedFile {
@@ -739,6 +955,7 @@ impl DownloadMonitor {
                 destination: Some(self.batch.destination.clone()),
                 job,
                 sent,
+                expected_duration_s,
             },
         )
         .filename;
@@ -1174,6 +1391,7 @@ impl DownloadMonitor {
         self.abandoned
             .push((tracked.source.clone(), tracked.transfer_id.clone()));
         let job = tracked.job.clone();
+        let expected_duration_s = tracked.expected_duration_s;
         let sends = std::mem::take(&mut self.tracked_files[slot].sent);
         let previous_item = std::mem::replace(
             &mut self.tracked_files[slot],
@@ -1185,6 +1403,7 @@ impl DownloadMonitor {
                 destination: Some(self.batch.destination.clone()),
                 job,
                 sent: sends,
+                expected_duration_s,
             },
         )
         .filename;
@@ -1323,6 +1542,38 @@ impl DownloadMonitor {
                 continue;
             }
 
+            if let Some(stall) = self.track_states[slot].check_low_speed_stall(
+                download,
+                self.pool.has_next(slot),
+                Instant::now(),
+            ) {
+                match stall {
+                    SpeedStall::FailoverOnly(failure) => {
+                        let row = DownloadProgress {
+                            queued_at_source: false,
+                            ..download.clone()
+                        }
+                        .failed_with(failure.clone());
+                        if self.try_failover(slot, backend, row).await {
+                            warn!("{}: {}", failure.message, download.item);
+                            continue;
+                        }
+                        // No alternate could be enqueued: keep the working slow transfer
+                        // alive rather than cancelling it (dead_trickle and PER_TRACK_TIMEOUT
+                        // still bound truly stalled transfers).
+                        warn!(
+                            "{} for {}, but no alternate could be enqueued; keeping current transfer",
+                            failure.message, download.item
+                        );
+                    }
+                    SpeedStall::DeadTrickle(failure) => {
+                        warn!("{}: {}", failure.message, download.item);
+                        self.time_out(slot, download, failure, backend).await;
+                        continue;
+                    }
+                }
+            }
+
             // A peer can hold its queue for hours; another source may send
             // the file now. Only the time the peer sends this slskd nothing
             // counts, never the time any file it sends this slskd takes.
@@ -1340,14 +1591,74 @@ impl DownloadMonitor {
                 self.track_states[slot].queued_at_source_since = None;
             }
 
-            // Singleton mode: process completed tracks immediately
+            // Singleton mode: verify completed tracks before transitioning to HandedOff
+            // so corrupt/silent/truncated/fake-lossless files delete and fail over.
             if self.batch.import_mode != ImportMode::Album && is_completed(&download.state) {
-                info!(
-                    "Track completed, processing immediately (singleton mode): {}",
-                    download.item
-                );
-                self.start_hand_off(slot, download, backend);
+                let dest = self.tracked_files[slot].destination.as_deref();
+                match find_on_disk(&download.item, &self.download_base, dest, &self.claimed) {
+                    Ok(path) => {
+                        let policy = self.batch.verify_policy;
+                        let expected_s = self.tracked_files[slot].expected_duration_s;
+                        match verify_downloaded_file(path.clone(), policy, expected_s).await {
+                            Ok(()) => {
+                                info!(
+                                    "Track completed and verified, handing off (singleton mode): {}",
+                                    download.item
+                                );
+                                self.start_hand_off_verified(slot, download, path, backend);
+                            }
+                            Err(failure) => {
+                                self.handle_verify_failure(slot, download, path, failure, backend)
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(Unresolved::NotOnDisk) if self.pool.has_next(slot) => {
+                        let since = *self.track_states[slot]
+                            .completed_since
+                            .get_or_insert_with(Instant::now);
+                        if since.elapsed() >= DEFERRED_VERIFY_WAIT {
+                            info!(
+                                "Track completed, handing off after deferred wait (singleton mode): {}",
+                                download.item
+                            );
+                            self.start_hand_off(slot, download, backend);
+                        }
+                    }
+                    Err(_) => {
+                        info!(
+                            "Track completed, processing immediately (singleton mode): {}",
+                            download.item
+                        );
+                        self.start_hand_off(slot, download, backend);
+                    }
+                }
                 continue;
+            }
+
+            // Album mode: verify completed slots as soon as they appear on disk so
+            // corrupt tracks fail over immediately while sibling tracks download.
+            if self.batch.import_mode == ImportMode::Album
+                && is_completed(&download.state)
+                && self.track_states[slot].verified_path.is_none()
+            {
+                let dest = self.tracked_files[slot].destination.as_deref();
+                if let Ok(path) =
+                    find_on_disk(&download.item, &self.download_base, dest, &self.claimed)
+                {
+                    let policy = self.batch.verify_policy;
+                    let expected_s = self.tracked_files[slot].expected_duration_s;
+                    match verify_downloaded_file(path.clone(), policy, expected_s).await {
+                        Ok(()) => {
+                            self.track_states[slot].verified_path = Some(path);
+                        }
+                        Err(failure) => {
+                            self.handle_verify_failure(slot, download, path, failure, backend)
+                                .await;
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Settle terminal failures (errored/cancelled/aborted), but only
@@ -1421,6 +1732,90 @@ impl DownloadMonitor {
         self.report_settled(vec![self.stamp(slot, row)]);
     }
 
+    /// Deletes a downloaded file that failed verification, removes its slskd
+    /// transfer record, records the typed `Failure`, and fails over to the next
+    /// source if available. Returns `true` when the slot was rebound to an alternate.
+    async fn handle_verify_failure(
+        &mut self,
+        slot: usize,
+        download: &DownloadProgress,
+        path: PathBuf,
+        failure: Failure,
+        backend: &Arc<dyn DownloadBackend>,
+    ) -> bool {
+        warn!(
+            "Post-download verification failed for {} ({}): {}",
+            download.item,
+            failure.code.as_str(),
+            failure.message
+        );
+        if let Some(id) = file_id(&path) {
+            self.claimed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+        let _ = crate::core::acquire::discard_files(&[path], &self.download_base).await;
+        let tracked = &self.tracked_files[slot];
+        if let Err(e) = backend
+            .cancel_download(&tracked.source, &tracked.transfer_id, true)
+            .await
+        {
+            warn!(
+                "Failed to remove bad finished transfer {} from {}: {}",
+                tracked.transfer_id,
+                backend.id(),
+                e
+            );
+        }
+        let failed_row = DownloadProgress {
+            queued_at_source: false,
+            ..download.clone()
+        }
+        .failed_with(failure);
+        // Transfer record was already removed above with `remove = true`; do not
+        // issue a redundant `cancel_download(..., false)` via `abandon`.
+        if self
+            .try_failover_with_abandon(slot, backend, failed_row.clone(), false)
+            .await
+        {
+            return true;
+        }
+        let row = self.write_off(slot, SlotPhase::Settled, backend.id(), failed_row);
+        self.report_settled(vec![self.stamp(slot, row)]);
+        false
+    }
+
+    /// Hand a singleton slot's already-resolved and verified file to the import
+    /// queue. Transitions the slot to `SlotPhase::HandedOff`.
+    fn start_hand_off_verified(
+        &mut self,
+        slot: usize,
+        download: &DownloadProgress,
+        path: PathBuf,
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
+        let row = self.stamp(slot, download.clone());
+        self.report(JobState::Downloading, vec![row.clone()]);
+        self.track_states[slot].phase = SlotPhase::HandedOff;
+        let handoff = Handoff {
+            row,
+            destination: self.tracked_files[slot].destination.clone(),
+            resolved_path: Some(path),
+            verify_policy: self.batch.verify_policy,
+            expected_duration_s: self.tracked_files[slot].expected_duration_s,
+            key: self.slot_key(slot, backend.id()),
+            owner: self.batch.owner.clone(),
+            duplicates: self.batch.duplicates.clone(),
+            target: self.target_path.clone(),
+            download_base: self.download_base.clone(),
+            claimed: Arc::clone(&self.claimed),
+            ledger: self.ledger.clone(),
+        };
+        self.handoffs
+            .push(tokio::spawn(hand_off(handoff, Arc::clone(backend))));
+    }
+
     /// Hand a singleton slot's finished transfer to the import queue. Its
     /// Completed row goes out first: once the queue has the row, only the
     /// queue updates it.
@@ -1436,6 +1831,9 @@ impl DownloadMonitor {
         let handoff = Handoff {
             row,
             destination: self.tracked_files[slot].destination.clone(),
+            resolved_path: None,
+            verify_policy: self.batch.verify_policy,
+            expected_duration_s: self.tracked_files[slot].expected_duration_s,
             key: self.slot_key(slot, backend.id()),
             owner: self.batch.owner.clone(),
             duplicates: self.batch.duplicates.clone(),
@@ -1602,9 +2000,11 @@ impl DownloadMonitor {
     /// for a batch that cannot): its watched slots, the ones joining
     /// requests added, and the files it was handed found.
     ///
-    /// A track is settled when it left `Watching` or its transfer completed
-    /// successfully. Settled must be judged per track: in album mode
-    /// completed tracks stay watched until the whole batch is handled.
+    /// A track is settled when it left `Watching`, or in album mode when its
+    /// transfer completed successfully (completed album slots stay `Watching`
+    /// until the whole batch is handled). Singleton slots stay `Watching` while
+    /// awaiting deferred pre-handoff verification on disk, so they are only
+    /// settled once they leave `Watching`.
     /// Failed states settle through the phase only, after process_tracks
     /// confirms the failure persisted (slskd 0.26 may retry it).
     async fn check_completion(
@@ -1612,12 +2012,25 @@ impl DownloadMonitor {
         matched: &[(usize, DownloadProgress)],
         backend: &Arc<dyn DownloadBackend>,
     ) -> bool {
+        let is_album = self.batch.import_mode == ImportMode::Album;
         let all_settled = (0..self.tracked_files.len())
-            .all(|slot| !self.watching(slot) || self.finished_in(slot, matched));
+            .all(|slot| !self.watching(slot) || (is_album && self.finished_in(slot, matched)));
+
+        if !all_settled {
+            return false;
+        }
+
+        // In album mode, resolve and verify any remaining completed slots before
+        // closing the inbox so a corrupt file can still fail over cleanly.
+        if self.batch.import_mode == ImportMode::Album
+            && self.verify_remaining_album_slots(matched, backend).await
+        {
+            return false;
+        }
 
         // A joining request may still be enqueueing into this batch, or its
         // slots wait to be drained: finishing now would leave them unwatched.
-        if all_settled && self.batch.inbox.close_if_idle() {
+        if self.batch.inbox.close_if_idle() {
             if self.batch.import_mode == ImportMode::Album {
                 self.finish_album(matched, backend).await;
             }
@@ -1628,56 +2041,67 @@ impl DownloadMonitor {
         false
     }
 
-    /// Import every finished slot of an album batch together, with the files
-    /// it was handed found (`with_found`). The slskd records are only removed
-    /// once every file was looked for on disk, and the keys only once the
-    /// imports are done.
-    async fn finish_album(
+    /// Resolves and verifies any completed album slots that did not already have
+    /// `verified_path` populated. Returns `true` if at least one slot failed
+    /// verification and failed over to an alternate peer (meaning the batch is
+    /// still active).
+    async fn verify_remaining_album_slots(
         &mut self,
         matched: &[(usize, DownloadProgress)],
         backend: &Arc<dyn DownloadBackend>,
-    ) {
-        let finished: Vec<(usize, DownloadProgress, Option<String>)> = matched
+    ) -> bool {
+        let pending: Vec<(usize, DownloadProgress, Option<String>)> = matched
             .iter()
             .filter(|(slot, dl)| {
-                self.watching(*slot) && self.is_current(*slot, dl) && is_completed(&dl.state)
+                self.watching(*slot)
+                    && self.is_current(*slot, dl)
+                    && is_completed(&dl.state)
+                    && self.track_states[*slot].verified_path.is_none()
             })
             .map(|(slot, dl)| {
                 (
                     *slot,
-                    self.stamp(*slot, dl.clone()),
+                    dl.clone(),
                     self.tracked_files[*slot].destination.clone(),
                 )
             })
             .collect();
-        if finished.is_empty() && self.found.is_empty() {
-            info!("Album mode: No successful downloads to process");
-            return;
+        if pending.is_empty() {
+            return false;
         }
 
         let base = self.download_base.clone();
         let claimed = Arc::clone(&self.claimed);
-        let paths = futures::future::join_all(finished.iter().map(|(_, row, destination)| {
-            resolve_on_disk(&row.item, &base, destination.as_deref(), &claimed)
+        let resolved_paths = futures::future::join_all(pending.iter().map(|(_, dl, dest)| {
+            resolve_on_disk(&dl.item, &base, dest.as_deref(), &claimed)
         }))
         .await;
 
-        let mut resolved = Vec::new();
-        let mut resolved_slots = Vec::new();
+        let mut retried = false;
         let mut missing = Vec::new();
-        for ((slot, row, destination), path) in finished.into_iter().zip(paths) {
-            match path {
+        for ((slot, dl, _), path_res) in pending.into_iter().zip(resolved_paths) {
+            match path_res {
                 Ok(path) => {
-                    resolved.push(ResolvedSlot {
-                        row,
-                        path,
-                        destination,
-                    });
-                    resolved_slots.push(slot);
+                    let policy = self.batch.verify_policy;
+                    let expected_s = self.tracked_files[slot].expected_duration_s;
+                    match verify_downloaded_file(path.clone(), policy, expected_s).await {
+                        Ok(()) => {
+                            self.track_states[slot].verified_path = Some(path);
+                        }
+                        Err(failure) => {
+                            if self
+                                .handle_verify_failure(slot, &dl, path, failure, backend)
+                                .await
+                            {
+                                retried = true;
+                            }
+                        }
+                    }
                 }
                 Err(why) => {
                     self.settle(slot, SlotPhase::Settled, backend.id());
-                    missing.push(unresolved_row(row, &self.download_base, why));
+                    let stamped = self.stamp(slot, dl);
+                    missing.push(unresolved_row(stamped, &self.download_base, why));
                 }
             }
         }
@@ -1690,6 +2114,129 @@ impl DownloadMonitor {
             self.ledger.record(JobEvent::Slots {
                 state: JobState::Failed,
                 rows: missing,
+            });
+        }
+        retried
+    }
+
+    /// Import every finished slot of an album batch together, with the files
+    /// it was handed found (`with_found`). The slskd records are only removed
+    /// once every file was looked for on disk, and the keys only once the
+    /// imports are done.
+    async fn finish_album(
+        &mut self,
+        matched: &[(usize, DownloadProgress)],
+        backend: &Arc<dyn DownloadBackend>,
+    ) {
+        let finished_slots: Vec<(usize, DownloadProgress, Option<String>)> = matched
+            .iter()
+            .filter(|(slot, dl)| {
+                self.watching(*slot) && self.is_current(*slot, dl) && is_completed(&dl.state)
+            })
+            .map(|(slot, dl)| {
+                (
+                    *slot,
+                    self.stamp(*slot, dl.clone()),
+                    self.tracked_files[*slot].destination.clone(),
+                )
+            })
+            .collect();
+        let finished: Vec<(usize, DownloadProgress, Option<String>, Option<PathBuf>)> =
+            finished_slots
+                .into_iter()
+                .map(|(slot, row, destination)| {
+                    let verified = self.track_states[slot].verified_path.take();
+                    (slot, row, destination, verified)
+                })
+                .collect();
+        if finished.is_empty() && self.found.is_empty() {
+            info!("Album mode: No successful downloads to process");
+            return;
+        }
+
+        let base = self.download_base.clone();
+        let claimed = Arc::clone(&self.claimed);
+        let paths = futures::future::join_all(finished.iter().map(|(_, row, destination, pre)| {
+            let base = base.clone();
+            let claimed = Arc::clone(&claimed);
+            let pre = pre.clone();
+            let item = row.item.clone();
+            let destination = destination.clone();
+            async move {
+                if let Some(p) = pre {
+                    (Ok(p), true)
+                } else {
+                    (
+                        resolve_on_disk(&item, &base, destination.as_deref(), &claimed).await,
+                        false,
+                    )
+                }
+            }
+        }))
+        .await;
+
+        let mut resolved = Vec::new();
+        let mut resolved_slots = Vec::new();
+        let mut failed_rows = Vec::new();
+        for ((slot, row, destination, _), (path_res, already_verified)) in
+            finished.into_iter().zip(paths)
+        {
+            match path_res {
+                Ok(path) => {
+                    if !already_verified {
+                        let policy = self.batch.verify_policy;
+                        let expected_s = self.tracked_files[slot].expected_duration_s;
+                        if let Err(failure) =
+                            verify_downloaded_file(path.clone(), policy, expected_s).await
+                        {
+                            warn!(
+                                "Album post-download verification failed for {} ({}): {}",
+                                row.item,
+                                failure.code.as_str(),
+                                failure.message
+                            );
+                            if let Some(id) = file_id(&path) {
+                                self.claimed
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&id);
+                            }
+                            let _ = crate::core::acquire::discard_files(
+                                &[path],
+                                &self.download_base,
+                            )
+                            .await;
+                            let tracked = &self.tracked_files[slot];
+                            let _ = backend
+                                .cancel_download(&tracked.source, &tracked.transfer_id, true)
+                                .await;
+                            self.settle(slot, SlotPhase::Settled, backend.id());
+                            failed_rows.push(row.failed_with(failure));
+                            continue;
+                        }
+                    }
+                    resolved.push(ResolvedSlot {
+                        row,
+                        path,
+                        destination,
+                    });
+                    resolved_slots.push(slot);
+                }
+                Err(why) => {
+                    self.settle(slot, SlotPhase::Settled, backend.id());
+                    failed_rows.push(unresolved_row(row, &self.download_base, why));
+                }
+            }
+        }
+        if !failed_rows.is_empty() {
+            send_user_event(
+                &self.batch.owner.user_id,
+                DownloadEvent::Progress(failed_rows.clone()),
+            )
+            .await;
+            self.ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: failed_rows,
             });
         }
 
@@ -1758,11 +2305,35 @@ impl Drop for DownloadMonitor {
     }
 }
 
+/// Runs pure-Rust post-download audio verification on the blocking threadpool.
+async fn verify_downloaded_file(
+    path: PathBuf,
+    policy: VerifyPolicy,
+    expected_duration_s: Option<u32>,
+) -> Result<(), Failure> {
+    tokio::task::spawn_blocking(move || {
+        soulbeet::verify_downloaded_audio(&path, policy, expected_duration_s).map(|_| ())
+    })
+    .await
+    .map_err(|e| {
+        Failure::new(
+            FailureCode::AudioCorrupt,
+            Stage::Verify,
+            RetryAdvice::OtherSource,
+            format!("Audio verification task failed: {e}"),
+        )
+    })?
+}
+
 /// A singleton slot's finished transfer on its way to the import queue.
 struct Handoff {
     /// Stamped with its batch.
     row: DownloadProgress,
     destination: Option<String>,
+    /// Already resolved and verified on disk when `Some`.
+    resolved_path: Option<PathBuf>,
+    verify_policy: VerifyPolicy,
+    expected_duration_s: Option<u32>,
     key: TransferKey,
     owner: TransferOwner,
     /// How the import treats earlier copies: the batch's rule.
@@ -1774,22 +2345,56 @@ struct Handoff {
     ledger: Ledger,
 }
 
-/// Find the file on disk, remove its slskd record, import it and free its
-/// key once the import is done. The record is only removed once the file was
-/// found, so slskd has moved it out of its incomplete folder.
+/// Find the file on disk, verify it if not already verified, remove its slskd
+/// record, import it and free its key once the import is done. The record is
+/// only removed once the file was found, so slskd has moved it out of its
+/// incomplete folder.
 async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
     let registry = TransferRegistry::global();
-    let path = match resolve_on_disk(
-        &h.row.item,
-        &h.download_base,
-        h.destination.as_deref(),
-        &h.claimed,
-    )
-    .await
-    {
-        Ok(path) => path,
-        Err(why) => {
-            let row = unresolved_row(h.row, &h.download_base, why);
+    let (path, already_verified) = match h.resolved_path {
+        Some(path) => (path, true),
+        None => match resolve_on_disk(
+            &h.row.item,
+            &h.download_base,
+            h.destination.as_deref(),
+            &h.claimed,
+        )
+        .await
+        {
+            Ok(path) => (path, false),
+            Err(why) => {
+                let row = unresolved_row(h.row, &h.download_base, why);
+                send_user_event(&h.owner.user_id, DownloadEvent::Progress(vec![row.clone()])).await;
+                h.ledger.record(JobEvent::Slots {
+                    state: JobState::Failed,
+                    rows: vec![row],
+                });
+                registry.release(&h.key, &h.owner);
+                return;
+            }
+        },
+    };
+    if !already_verified {
+        if let Err(failure) =
+            verify_downloaded_file(path.clone(), h.verify_policy, h.expected_duration_s).await
+        {
+            warn!(
+                "Deferred post-download verification failed for {} ({}): {}",
+                h.row.item,
+                failure.code.as_str(),
+                failure.message
+            );
+            if let Some(id) = file_id(&path) {
+                h.claimed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+            }
+            let _ = crate::core::acquire::discard_files(&[path], &h.download_base).await;
+            let _ = backend
+                .cancel_download(&h.row.source, &h.row.id, true)
+                .await;
+            let row = h.row.failed_with(failure);
             send_user_event(&h.owner.user_id, DownloadEvent::Progress(vec![row.clone()])).await;
             h.ledger.record(JobEvent::Slots {
                 state: JobState::Failed,
@@ -1798,7 +2403,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
             registry.release(&h.key, &h.owner);
             return;
         }
-    };
+    }
     if let Err(e) = backend
         .cancel_download(&h.row.source, &h.row.id, true)
         .await
@@ -2074,7 +2679,12 @@ mod tests {
             job: slot_of_j1(slot),
             adopted: false,
             sent: Vec::new(),
+            expected_duration_s: None,
         }
+    }
+
+    fn valid_test_audio() -> Vec<u8> {
+        soulbeet::verify::encode_test_wav_pcm16(44_100, &vec![0.25_f32; 4_410])
     }
 
     /// A monitor watching one track with two alternates behind it, plus the
@@ -3076,6 +3686,7 @@ mod tests {
                 max_sources: MAX_SOURCES_PER_TRACK,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
 
@@ -4273,7 +4884,7 @@ mod tests {
         let folder = base.path().join(&m.batch.destination);
         std::fs::create_dir_all(&folder).unwrap();
         for file in on_disk {
-            std::fs::write(folder.join(file), b"x").unwrap();
+            std::fs::write(folder.join(file), valid_test_audio()).unwrap();
         }
         let user_tx = crate::globals::get_or_create_user_channel(user).await;
         m.batch.owner.user_id = user.clone();
@@ -4341,6 +4952,294 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupt_singleton_download_deletes_file_and_fails_over_before_handoff() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let (mut m, base, _imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-verify-failover"),
+            &["bad.flac"],
+            &[],
+        )
+        .await;
+        m.tx = tx;
+        m.batch.import_mode = ImportMode::Singleton;
+        // Write garbage bytes so post-download verification fails with AudioCorrupt.
+        let bad_path = base.path().join(&m.batch.destination).join("bad.flac");
+        std::fs::write(&bad_path, b"not-audio-garbage").unwrap();
+
+        let alt = item("peer_b", "Track", "alt/good.flac");
+        let pool = SourcePool::resumed(vec![(vec![alt], 1, MAX_SOURCES_PER_TRACK)]);
+        m = m.with_failover(pool);
+
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        let mut empty = 0;
+        let done = m
+            .process_poll_result(
+                vec![listed("peer_a", "bad.flac", DownloadState::Completed)],
+                &mut empty,
+                1,
+                &backend,
+            )
+            .await;
+
+        assert!(!done, "monitor must stay running after failover to peer_b");
+        assert!(!bad_path.exists(), "corrupt downloaded file must be deleted");
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(m.tracked_files[0].filename, "alt/good.flac");
+        // Replaced event emitted for the UI.
+        let mut saw_replaced = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, DownloadEvent::Replaced { previous_item, .. } if previous_item == "bad.flac")
+            {
+                saw_replaced = true;
+            }
+        }
+        assert!(saw_replaced, "expected DownloadEvent::Replaced on verify failover");
+    }
+
+    #[test]
+    fn track_state_rolling_speed_stall_guards_and_detection() {
+        let base = Instant::now();
+        let make_dl = |state: DownloadState,
+                       transferred: u64,
+                       size: u64,
+                       percent: f64,
+                       queued_at_source: bool,
+                       pending: bool| DownloadProgress {
+            transferred,
+            size,
+            percent,
+            queued_at_source,
+            pending_retry: pending.then(|| {
+                Failure::new(
+                    FailureCode::TransferConnectionFailed,
+                    Stage::Transfer,
+                    RetryAdvice::OtherSource,
+                    "reset",
+                )
+            }),
+            ..listed("peer_a", "song.flac", state)
+        };
+
+        // 1. Queued / queued_at_source / pending_retry immunity: never triggers and resets clock.
+        let mut ts = TrackState::bound_now();
+        for secs in [0u64, 30, 90, 200] {
+            let t = base + Duration::from_secs(secs);
+            assert!(ts
+                .check_low_speed_stall(
+                    &make_dl(DownloadState::Queued, 0, 10_000_000, 0.0, false, false),
+                    true,
+                    t,
+                )
+                .is_none());
+            assert!(ts
+                .check_low_speed_stall(
+                    &make_dl(DownloadState::InProgress, 0, 10_000_000, 0.0, true, false),
+                    true,
+                    t,
+                )
+                .is_none());
+            assert!(ts
+                .check_low_speed_stall(
+                    &make_dl(DownloadState::InProgress, 0, 10_000_000, 0.0, false, true),
+                    true,
+                    t,
+                )
+                .is_none());
+        }
+
+        // 2. Warmup immunity (first 25s) and full 60s rolling window requirement.
+        let mut ts = TrackState::bound_now();
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(DownloadState::InProgress, 0, 20_000_000, 0.0, false, false),
+                true,
+                base,
+            )
+            .is_none());
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(DownloadState::InProgress, 1024, 20_000_000, 0.0, false, false),
+                true,
+                base + Duration::from_secs(24),
+            )
+            .is_none());
+        // First post-warmup sample at t=25s; at t=84s span is 59s (< 60s) -> still immune.
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(DownloadState::InProgress, 1024, 20_000_000, 0.0, false, false),
+                true,
+                base + Duration::from_secs(25),
+            )
+            .is_none());
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(
+                    DownloadState::InProgress,
+                    1024 + 59 * 2048,
+                    20_000_000,
+                    1.0,
+                    false,
+                    false,
+                ),
+                true,
+                base + Duration::from_secs(84),
+            )
+            .is_none());
+        // At t=85s span is 60s with 2 KiB/s (< 12 KiB/s) and has_next=true -> triggers!
+        let stall = ts.check_low_speed_stall(
+            &make_dl(
+                DownloadState::InProgress,
+                1024 + 60 * 2048,
+                20_000_000,
+                1.0,
+                false,
+                false,
+            ),
+            true,
+            base + Duration::from_secs(85),
+        );
+        assert_eq!(
+            stall.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
+
+        // 3. Fast-then-trickle detection: fast during t=25..55, then 2 KiB/s during t=55..115.
+        let mut ts = TrackState::bound_now();
+        let _ = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 0, 40_000_000, 0.0, false, false),
+            true,
+            base,
+        );
+        let mut bytes = 0u64;
+        for s in (25..=55).step_by(5) {
+            bytes += 5 * 200 * 1024; // 200 KiB/s fast phase
+            assert!(ts
+                .check_low_speed_stall(
+                    &make_dl(DownloadState::InProgress, bytes, 40_000_000, 20.0, false, false),
+                    true,
+                    base + Duration::from_secs(s),
+                )
+                .is_none());
+        }
+        // Now trickle at 2 KiB/s from t=60..110 (still mixed with fast phase in window).
+        for s in (60..=110).step_by(5) {
+            bytes += 5 * 2 * 1024;
+            assert!(ts
+                .check_low_speed_stall(
+                    &make_dl(DownloadState::InProgress, bytes, 40_000_000, 25.0, false, false),
+                    true,
+                    base + Duration::from_secs(s),
+                )
+                .is_none());
+        }
+        // At t=115, the 60s window [55..115] is pure 2 KiB/s -> triggers failover!
+        bytes += 5 * 2 * 1024;
+        let stall = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, bytes, 40_000_000, 25.0, false, false),
+            true,
+            base + Duration::from_secs(115),
+        );
+        assert_eq!(
+            stall.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
+
+        // 4. Near-completion immunity: >= 85% or < 512 KiB remaining never aborts.
+        let mut ts = TrackState::bound_now();
+        let _ = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 0, 20_000_000, 0.0, false, false),
+            true,
+            base,
+        );
+        let _ = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 17_000_000, 20_000_000, 84.0, false, false),
+            true,
+            base + Duration::from_secs(25),
+        );
+        // 85% complete with 0 B/s over 60s -> immune.
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(DownloadState::InProgress, 17_000_000, 20_000_000, 85.0, false, false),
+                true,
+                base + Duration::from_secs(90),
+            )
+            .is_none());
+        // < 512 KiB remaining (even with low reported percent) -> immune.
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(
+                    DownloadState::InProgress,
+                    20_000_000 - 200_000,
+                    20_000_000,
+                    80.0,
+                    false,
+                    false,
+                ),
+                true,
+                base + Duration::from_secs(95),
+            )
+            .is_none());
+
+        // 5. has_next gating: 4 KiB/s (< 12 KiB/s, >= 1 KiB/s) does NOT abort when has_next=false;
+        //    < 1 KiB/s aborts only after 5 full minutes when has_next=false.
+        let mut ts = TrackState::bound_now();
+        let _ = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 0, 20_000_000, 0.0, false, false),
+            false,
+            base,
+        );
+        let _ = ts.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 0, 20_000_000, 0.0, false, false),
+            false,
+            base + Duration::from_secs(25),
+        );
+        // 4 KiB/s over 60s with no alternates -> NOT aborted.
+        assert!(ts
+            .check_low_speed_stall(
+                &make_dl(DownloadState::InProgress, 60 * 4096, 20_000_000, 2.0, false, false),
+                false,
+                base + Duration::from_secs(85),
+            )
+            .is_none());
+
+        // Last-resort dead-trickle (< 1 KiB/s) with has_next=false:
+        let mut dead = TrackState::bound_now();
+        let _ = dead.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 0, 20_000_000, 0.0, false, false),
+            false,
+            base,
+        );
+        // Sample every 30s at 500 B/s: first 60s window completes at t=85s (sets dead_trickle_since),
+        // must survive until t=85+240=325s (5 full minutes below 1 KiB/s).
+        for step in 0..=9 {
+            let t_s = 25 + step * 30;
+            let b = step * 30 * 500;
+            assert!(
+                dead.check_low_speed_stall(
+                    &make_dl(DownloadState::InProgress, b, 20_000_000, 1.0, false, false),
+                    false,
+                    base + Duration::from_secs(t_s),
+                )
+                .is_none(),
+                "aborted too early at t={t_s}s"
+            );
+        }
+        // At t=325s (5 full minutes below 1 KiB/s) -> last-resort abort fires!
+        let aborted = dead.check_low_speed_stall(
+            &make_dl(DownloadState::InProgress, 300 * 500, 20_000_000, 1.0, false, false),
+            false,
+            base + Duration::from_secs(325),
+        );
+        assert_eq!(
+            aborted.map(|s| s.failure().code),
+            Some(FailureCode::TransferTimedOut)
+        );
+    }
+
+    #[tokio::test]
     async fn a_singleton_handoff_removes_the_record_only_once_the_file_is_found() {
         let (mut m, base, _imports, _recorded) = disk_monitor(
             &UserId::new("monitor-singleton-on-disk"),
@@ -4371,7 +5270,7 @@ mod tests {
 
         std::fs::write(
             base.path().join(&m.batch.destination).join("one.flac"),
-            b"x",
+            valid_test_audio(),
         )
         .unwrap();
         m.join_handoffs().await;
@@ -4415,7 +5314,7 @@ mod tests {
             "a record was removed before every file was on disk"
         );
 
-        std::fs::write(folder.join("02.flac"), b"x").unwrap();
+        std::fs::write(folder.join("02.flac"), valid_test_audio()).unwrap();
         let (m, done) = poll.await.unwrap();
 
         assert!(done);
@@ -4477,7 +5376,7 @@ mod tests {
             "imported while 02 still downloads"
         );
 
-        std::fs::write(folder.join("02.flac"), b"x").unwrap();
+        std::fs::write(folder.join("02.flac"), valid_test_audio()).unwrap();
         let done = vec![listed("peer_a", "02.flac", DownloadState::Completed)];
         assert!(m.process_poll_result(done, &mut empty, 2, &backend).await);
 
@@ -4726,6 +5625,8 @@ mod tests {
         let backend: Arc<dyn DownloadBackend> = stub.clone();
         // Startup holds the batch open, then sends 02, which slskd never got, into it.
         let reservation = m.batch.inbox.reserve().expect("open inbox");
+        let mut resumed_item = item("peer_b", "Two", "q\\02.flac");
+        resumed_item.duration = None;
         crate::core::acquire::enqueue_and_watch(
             &m.ledger.clone(),
             &crate::core::test_ctx(&user.to_string()),
@@ -4733,7 +5634,7 @@ mod tests {
             crate::core::acquire::RequestBatch::Running(m.batch.clone(), reservation),
             crate::core::acquire::Acquisition {
                 job: "j1".into(),
-                items: vec![(1, item("peer_b", "Two", "q\\02.flac"))],
+                items: vec![(1, resumed_item)],
                 alternates: vec![],
                 max_sources: MAX_SOURCES_PER_TRACK,
             },
@@ -4757,7 +5658,7 @@ mod tests {
         );
         assert!(import_events(&mut imports).is_empty(), "01 went alone");
 
-        std::fs::write(folder.join("02.flac"), b"x").unwrap();
+        std::fs::write(folder.join("02.flac"), valid_test_audio()).unwrap();
         let done = vec![listed("peer_b", "q\\02.flac", DownloadState::Completed)];
         assert!(m.process_poll_result(done, &mut empty, 2, &backend).await);
 
@@ -5005,6 +5906,7 @@ mod tests {
                 max_sources: MAX_SOURCES_PER_TRACK,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
 
@@ -5047,6 +5949,7 @@ mod tests {
                 max_sources: MAX_SOURCES_PER_TRACK,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
         assert!(m.drain_inbox());
@@ -5096,6 +5999,7 @@ mod tests {
                 max_sources: 2,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
         assert!(m.drain_inbox());
@@ -5179,6 +6083,7 @@ mod tests {
                 max_sources: MAX_SOURCES_PER_TRACK,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
 
@@ -5221,6 +6126,7 @@ mod tests {
                 max_sources: MAX_SOURCES_PER_TRACK,
                 sent: vec![],
                 job: slot_of_j1(1),
+                expected_duration_s: None,
             }])
             .expect("delivered");
 
@@ -5233,5 +6139,131 @@ mod tests {
         assert_eq!(rows[0].id, "t-02");
         assert!(late.deliver(vec![]).is_err(), "a late join is handed back");
         assert!(TransferRegistry::global().may_adopt(&held, &batch("Y").owner));
+    }
+
+    #[tokio::test]
+    async fn deferred_singleton_verification_does_not_exit_monitor_early() {
+        let (mut m, base, _imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-deferred-verify"),
+            &["one.flac"],
+            &[],
+        )
+        .await;
+        m.batch.import_mode = ImportMode::Singleton;
+        m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "One", "one.flac"),
+            item("peer_b", "One", "alt/one.flac"),
+        ]));
+        let stub = StubBackend::new(vec![]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+        let listing = vec![listed("peer_a", "one.flac", DownloadState::Completed)];
+
+        // File is not yet on disk while alternates remain: monitor defers
+        // handoff and MUST NOT report completion while still Watching.
+        let mut empty = 0;
+        let done = m
+            .process_poll_result(listing.clone(), &mut empty, 1, &backend)
+            .await;
+        assert!(!done, "monitor must not exit early during deferred verification");
+        assert_eq!(phase(&m, 0), SlotPhase::Watching);
+        assert!(m.track_states[0].completed_since.is_some());
+
+        let matched = m.find_matching_downloads(&listing, &backend);
+        assert!(
+            !m.check_completion(&matched, &backend).await,
+            "check_completion must return false for Watching singleton slot"
+        );
+
+        // Once the valid audio file appears on disk, verification succeeds and
+        // the slot hands off and completes.
+        std::fs::write(
+            base.path().join(&m.batch.destination).join("one.flac"),
+            valid_test_audio(),
+        )
+        .unwrap();
+        let done = m
+            .process_poll_result(listing, &mut empty, 2, &backend)
+            .await;
+        assert!(done);
+        assert_eq!(phase(&m, 0), SlotPhase::HandedOff);
+        m.join_handoffs().await;
+    }
+
+    #[tokio::test]
+    async fn low_speed_stall_keeps_working_transfer_when_alternates_fail_to_enqueue() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (m, _recorded) = monitor_on(tx, vec!["peer_a"], vec!["dirA/slow.flac"]);
+        let mut m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Slow", "dirA/slow.flac"),
+            item("peer_b", "Slow", "dirB/slow.flac"),
+        ]));
+        // Alternate peer rejects enqueue.
+        let stub = StubBackend::new(vec![ScriptedOutcome::Rejected]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        // Seed speed tracking so rolling speed over 60s is 4 KiB/s (< 12 KiB/s, > 1 KiB/s).
+        let now = Instant::now();
+        m.track_states[0].in_progress_since =
+            Some(now.checked_sub(Duration::from_secs(120)).unwrap());
+        m.track_states[0].speed_samples.push_back((
+            now.checked_sub(Duration::from_secs(65)).unwrap(),
+            100_000,
+        ));
+        let dl = DownloadProgress {
+            transferred: 100_000 + 65 * 4096,
+            size: 20_000_000,
+            percent: 2.0,
+            ..listed("peer_a", "dirA/slow.flac", DownloadState::InProgress)
+        };
+
+        poll_tracks(&mut m, &[dl], &backend).await;
+
+        assert_eq!(
+            phase(&m, 0),
+            SlotPhase::Watching,
+            "working slow transfer must not be written off when alternates fail"
+        );
+        assert_eq!(m.tracked_files[0].source, "peer_a");
+        assert!(
+            stub.cancelled().is_empty(),
+            "working slow transfer must not be cancelled when no alternate enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_failure_failover_does_not_redundantly_cancel_removed_transfer() {
+        let (mut m, base, _imports, _recorded) = disk_monitor(
+            &UserId::new("monitor-verify-no-double-cancel"),
+            &["bad.flac"],
+            &[],
+        )
+        .await;
+        m.batch.import_mode = ImportMode::Singleton;
+        m = m.with_failover(SourcePool::single(vec![
+            item("peer_a", "Bad", "bad.flac"),
+            item("peer_b", "Bad", "alt/bad.flac"),
+        ]));
+        // Write corrupt bytes on disk so post-download verification fails and fails over.
+        std::fs::write(
+            base.path().join(&m.batch.destination).join("bad.flac"),
+            b"<html>corrupt</html>",
+        )
+        .unwrap();
+        let stub = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        let backend: Arc<dyn DownloadBackend> = stub.clone();
+
+        poll_tracks(
+            &mut m,
+            &[listed("peer_a", "bad.flac", DownloadState::Completed)],
+            &backend,
+        )
+        .await;
+
+        assert_eq!(m.tracked_files[0].source, "peer_b");
+        assert_eq!(
+            stub.cancelled(),
+            vec![Cancel::removing("peer_a", &id_of("bad.flac"))],
+            "handle_verify_failure already removed the transfer; try_failover must not call cancel_download(..., false)"
+        );
     }
 }
