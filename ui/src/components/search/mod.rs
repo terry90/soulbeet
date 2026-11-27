@@ -23,6 +23,9 @@ pub use search_bar::SearchBar;
 mod discography_heading;
 pub use discography_heading::DiscographyHeading;
 
+mod direct_escape;
+pub use direct_escape::{direct_track_query, split_artist_title, DirectSearchEscape};
+
 mod download_results;
 pub use download_results::{
     group_backend_id, sort_merged_groups, BackendPollState, BackendSearchStatus, DownloadResults,
@@ -1129,7 +1132,16 @@ pub fn Search() -> Element {
                   }
                 },
                 (Some(_), listing) => rsx! {
-                  div { class: "text-center text-beet-text-tertiary py-10 text-[13px]", "{empty_message(listing.as_ref())}" }
+                  div { class: "text-center text-beet-text-tertiary py-10 text-[13px]",
+                    p { "{empty_message(listing.as_ref())}" }
+                    if search_type() == SearchType::Track && !search().trim().is_empty() && listing.is_none() {
+                      DirectSearchEscape {
+                        query: search(),
+                        artist_hint: artist(),
+                        on_search_sources: move |q: DownloadQuery| open_source_picker(q),
+                      }
+                    }
+                  }
                 },
                 (None, _) => rsx! {},
             }

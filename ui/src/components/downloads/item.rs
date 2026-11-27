@@ -4,6 +4,7 @@ use std::pin::Pin;
 use dioxus::prelude::*;
 use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState};
 
+use super::diagnostics::JobDiagnosticsPanel;
 use super::picker::{ChoicesLoader, MatchPicker};
 use super::Failure;
 use crate::{Disclosure, IconLoader, IconX, LossyChip, RowAction};
@@ -340,6 +341,13 @@ pub fn DownloadItem(
             span { "Moving and tagging..." }
           }
         }
+        if let Some(ref job_id) = file.job_id {
+          JobDiagnosticsPanel {
+            key: "{job_id}",
+            job_id: job_id.clone(),
+            failed: matches!(state, DownloadState::Failed(_) | DownloadState::ImportSkipped),
+          }
+        }
       }
     }
 }
@@ -543,5 +551,27 @@ mod tests {
             assert!(!html.contains("Import as-is"), "{html}");
             assert!(!html.contains("Show matches"), "{html}");
         }
+    }
+
+    #[test]
+    fn diagnostics_toggle_appears_only_when_job_id_is_present() {
+        let without_job = row(DownloadState::Failed("peer offline".into()), None);
+        let html = render(without_job);
+        assert!(!html.contains("Why?"), "{html}");
+        assert!(!html.contains("Details"), "{html}");
+
+        let failed_with_job = DownloadProgress {
+            job_id: Some("job-123".into()),
+            ..row(DownloadState::Failed("peer offline".into()), None)
+        };
+        let html = render(failed_with_job);
+        assert!(html.contains("Why?"), "{html}");
+
+        let active_with_job = DownloadProgress {
+            job_id: Some("job-456".into()),
+            ..row(DownloadState::InProgress, None)
+        };
+        let html = render(active_with_job);
+        assert!(html.contains("Details"), "{html}");
     }
 }

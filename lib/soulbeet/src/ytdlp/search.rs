@@ -58,6 +58,7 @@ impl Run {
         stats.file_count += counts.weighed;
         stats.not_audio += counts.not_audio;
         stats.below_floor += counts.below_floor;
+        counts.rejections.merge_into(stats);
     }
 
     fn asked(&self, query: &str) {

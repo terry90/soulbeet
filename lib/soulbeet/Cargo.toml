@@ -27,6 +27,8 @@ sha2 = "0.10"
 libc = "0.2.175"
 # Pinned: writes the tags beets reads, which a minor release may change.
 lofty = "=0.25.5"
+symphonia = { version = "0.5", default-features = false, features = ["flac", "mp3", "aac", "alac", "isomp4", "ogg", "vorbis", "wav", "pcm"] }
+rustfft = "6"
 uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]

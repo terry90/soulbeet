@@ -8,6 +8,10 @@
 use super::error::YtDlpError;
 use super::protocol::{AlbumHit, AlbumPage, AlbumTrack, Song};
 use crate::matching::assign::assign_tracks;
+use crate::matching::diagnostics::{
+    RejectionCollector, REASON_BELOW_THRESHOLD, REASON_DURATION_DELTA, REASON_TITLE_MISMATCH,
+    REASON_VERSION_VETO,
+};
 use crate::matching::duration::{duration_score, DURATION_WEIGHT};
 use crate::matching::path::WantedTrack as MatchTrack;
 use crate::matching::score::{group_score, MIN_SCORE_THRESHOLD};
@@ -221,14 +225,28 @@ fn score_as(candidate: &Candidate, index: usize, wanted: &Wanted) -> Option<Scor
     })
 }
 
+/// Why `score_as` returned `None` (pure diagnostics; scoring logic unchanged).
+fn score_miss_reason(candidate: &Candidate, index: usize, wanted: &Wanted) -> &'static str {
+    let track = &wanted.tracks[index];
+    if title_score(candidate.title, &track.title) == 0.0 {
+        return REASON_TITLE_MISMATCH;
+    }
+    let lengths = track.duration_secs().zip(candidate.duration_s);
+    if lengths.is_some_and(|(w, c)| w.abs_diff(c) >= LENGTH_LIMIT_S) {
+        return REASON_DURATION_DELTA;
+    }
+    REASON_BELOW_THRESHOLD
+}
+
 /// What a search read, for its stats.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Counts {
     /// Tracks weighed against the wanted ones.
     pub weighed: u32,
     /// Videos and uploads left out, and tracks YouTube Music does not play.
     pub not_audio: u32,
     pub below_floor: u32,
+    pub rejections: RejectionCollector,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -236,6 +254,7 @@ impl std::ops::AddAssign for Counts {
         self.weighed += other.weighed;
         self.not_audio += other.not_audio;
         self.below_floor += other.below_floor;
+        self.rejections.extend(other.rejections);
     }
 }
 
@@ -411,6 +430,7 @@ pub(crate) fn album_group(
         weighed: playable.len() as u32,
         not_audio: (page.tracks.len() - playable.len()) as u32,
         below_floor: 0,
+        rejections: RejectionCollector::default(),
     };
     let scores: Vec<Vec<Option<Scored>>> = (playable.iter())
         .map(|t| {
@@ -425,9 +445,42 @@ pub(crate) fn album_group(
                 .collect()
         })
         .collect();
-    counts.below_floor = (scores.iter())
-        .filter(|per_track| !per_track.iter().flatten().any(|s| !s.under()))
-        .count() as u32;
+    let album_source = source_of(Some(&hit.browse_id), "");
+    for (idx, per_track) in scores.iter().enumerate() {
+        if !per_track.iter().flatten().any(|s| !s.under()) {
+            counts.below_floor += 1;
+            let track_ref = playable[idx];
+            let best_scored = per_track.iter().flatten().max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let (score, reason) = match best_scored {
+                Some(s) if s.vetoed => (Some(s.score as f32), REASON_VERSION_VETO),
+                Some(s) => (Some(s.score as f32), REASON_BELOW_THRESHOLD),
+                None => {
+                    let candidate = Candidate {
+                        title: &track_ref.title,
+                        artists: artists_of(track_ref, page),
+                        album: Some(&page.title),
+                        duration_s: track_ref.duration_s,
+                    };
+                    let mut reason = REASON_TITLE_MISMATCH;
+                    for i in 0..wanted.tracks.len() {
+                        let r = score_miss_reason(&candidate, i, wanted);
+                        if r == REASON_DURATION_DELTA {
+                            reason = r;
+                            break;
+                        }
+                    }
+                    (None, reason)
+                }
+            };
+            counts
+                .rejections
+                .record(album_source.clone(), track_ref.title.clone(), score, reason);
+        }
+    }
     let indexes: Vec<usize> = (0..playable.len()).collect();
     let taken = assign_tracks(
         &wanted_tracks(wanted),
@@ -507,17 +560,30 @@ pub(crate) fn song_groups(
             album: album.map(|a| a.name.as_str()),
             duration_s: song.duration_s,
         };
+        let browse_id = album.and_then(|a| a.browse_id.as_deref());
+        let src = source_of(browse_id, &song.video_id);
         let Some(scored) = score_as(&candidate, index, wanted) else {
             counts.below_floor += 1;
+            let reason = score_miss_reason(&candidate, index, wanted);
+            counts
+                .rejections
+                .record(src, song.title.clone(), None, reason);
             continue;
         };
         if scored.under() {
             counts.below_floor += 1;
+            let reason = if scored.vetoed {
+                REASON_VERSION_VETO
+            } else {
+                REASON_BELOW_THRESHOLD
+            };
+            counts
+                .rejections
+                .record(src, song.title.clone(), Some(scored.score as f32), reason);
             if !keep_below_floor {
                 continue;
             }
         }
-        let browse_id = album.and_then(|a| a.browse_id.as_deref());
         let of = Of {
             wanted,
             browse_id,
@@ -681,7 +747,8 @@ pub(crate) mod tests {
             Counts {
                 weighed: 6,
                 not_audio: 0,
-                below_floor: 0
+                below_floor: 0,
+                ..Counts::default()
             }
         );
         let first = &group.items[0];

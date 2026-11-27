@@ -16,6 +16,7 @@ pub mod metadata_error;
 pub mod musicbrainz;
 pub mod navidrome;
 pub mod partial;
+pub mod playlist_import;
 pub mod polite;
 pub mod process;
 pub mod slskd;
@@ -24,6 +25,7 @@ pub mod tags;
 pub(crate) mod test_http;
 pub mod traits;
 pub mod transfer_book;
+pub mod verify;
 pub mod ytdlp;
 
 pub use backend_error::{BackendError, BackendFault, BackendResult, PeerAsk};
@@ -38,3 +40,4 @@ pub use traits::{
     TimeoutKind, WantedRemoval,
 };
 pub use transfer_book::{BookEntry, BookError, TransferBook};
+pub use verify::{audio_duration_secs, verify_downloaded_audio, VerifiedAudio, VerifyPolicy};

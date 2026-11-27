@@ -250,6 +250,7 @@ pub enum Stage {
     Enqueue,
     Transfer,
     FileLookup,
+    Verify,
     Import,
     Index,
     Playlist,
@@ -400,6 +401,16 @@ failure_codes! {
     FileNotFoundAfterDownload => "file_not_found_after_download",
     /// The disk a backend writes downloads to is full.
     DownloadDiskFull => "download_disk_full",
+    /// The downloaded audio file is empty, unreadable, or fails container/packet decoding.
+    AudioCorrupt => "audio_corrupt",
+    /// The downloaded audio file is digitally silent across its interior.
+    AudioSilent => "audio_silent",
+    /// The downloaded audio file is far shorter than expected (for example a 30s preview).
+    AudioTruncated => "audio_truncated",
+    /// A lossless archival candidate has a sharp spectral brickwall cutoff typical of a lossy transcode.
+    AudioFakeLossless => "audio_fake_lossless",
+    /// A replacement import's duration differs too much from the existing library copy to safely delete the original.
+    ReplacementDurationMismatch => "replacement_duration_mismatch",
     ImportNoMatch => "import_no_match",
     ImportAlreadyInLibrary => "import_already_in_library",
     ImportNothingToImport => "import_nothing_to_import",
@@ -477,7 +488,7 @@ mod tests {
     /// `download_disk_full`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 94] = [
+    const NAMES: [&str; 99] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -527,6 +538,11 @@ mod tests {
         "transfer_list_unreadable",
         "file_not_found_after_download",
         "download_disk_full",
+        "audio_corrupt",
+        "audio_silent",
+        "audio_truncated",
+        "audio_fake_lossless",
+        "replacement_duration_mismatch",
         "import_no_match",
         "import_already_in_library",
         "import_nothing_to_import",

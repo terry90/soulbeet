@@ -9,7 +9,7 @@ use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
 use crate::core::library::{find, MatchKind, Reference};
 use crate::core::sources::{self, Candidate, RECENT_FAILURES_SECS};
-use crate::core::{backend_unavailable, database_failure};
+use crate::core::database_failure;
 use crate::ledger::store::{self, AttemptRecord, JobRecord, StoredSearch, TimelineEntry};
 use crate::ledger::{
     Admitted, BatchOrigin, IndexWait, JobKind, JobOptions, JobState, Ledger, NewJob, NewJobBatch,
@@ -17,7 +17,8 @@ use crate::ledger::{
 };
 use crate::models::folder::Folder;
 use crate::models::user_settings::UserSettings;
-use crate::services::{NavidromeLookupError, DEFAULT_DOWNLOAD_BACKEND};
+use crate::services::NavidromeLookupError;
+use futures::StreamExt;
 use runner::{spawn_drive, Acquire};
 use serde_json::{json, Map, Value};
 use shared::download::{DownloadProgress, DownloadQuery, DownloadableItem, IndexState, JobSlot};
@@ -272,13 +273,38 @@ pub(crate) async fn ensure(
     for_playlist: bool,
     replace: Option<ReplaceConsent>,
 ) -> Result<Ensured, EnsureRefusal> {
+    ensure_with_origin(
+        acquire,
+        navidrome,
+        ctx,
+        folder_id,
+        label,
+        items,
+        options,
+        for_playlist,
+        replace,
+        BatchOrigin::Mcp,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn ensure_with_origin(
+    acquire: &Arc<Acquire>,
+    navidrome: &dyn NavidromeOf,
+    ctx: &UserCtx,
+    folder_id: Option<&str>,
+    label: Option<String>,
+    items: Vec<Wanted>,
+    options: JobOptions,
+    for_playlist: bool,
+    replace: Option<ReplaceConsent>,
+    origin: BatchOrigin,
+) -> Result<Ensured, EnsureRefusal> {
     if let Some(failure) = acquire.effects.importer_blocked().await {
         return Err(failure.into());
     }
-    (acquire.effects.backends())
-        .get(DEFAULT_DOWNLOAD_BACKEND)
-        .await
-        .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
+    acquire.effects.usable_backends(ctx).await?;
     let previewed = match &replace {
         Some(ReplaceConsent { app, secret }) => {
             let expect = Some(DeletionReason::Replaced);
@@ -309,17 +335,48 @@ pub(crate) async fn ensure(
             }
         },
     };
+    // Run Navidrome lookups with bounded concurrency, then process in exact input order so
+    // replacement-token claiming and output ordering stay deterministic.
+    const ENSURE_LOOKUP_CONCURRENCY: usize = 8;
+    let lookups: Vec<(usize, Option<Result<crate::core::library::Found, Failure>>)> =
+        if let Some(ref navi) = navi {
+            let lookup_inputs: Vec<(usize, Option<Reference>)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    Wanted::Track(reference) => (i, Some(reference.clone())),
+                    Wanted::Album(_) => (i, None),
+                })
+                .collect();
+            let mut out: Vec<_> = futures::stream::iter(lookup_inputs.into_iter().map(|(i, reference)| {
+                let navi = navi.clone();
+                async move {
+                    match reference {
+                        Some(reference) => (i, Some(find(&navi, &reference).await)),
+                        None => (i, None),
+                    }
+                }
+            }))
+            .buffer_unordered(ENSURE_LOOKUP_CONCURRENCY)
+            .collect()
+            .await;
+            out.sort_by_key(|(i, _)| *i);
+            out
+        } else {
+            (0..items.len()).map(|i| (i, None)).collect()
+        };
+
     // Each item's result, None while it waits for its job; and the items that get one, with
     // their fuzzy matches and the token songs they replace.
     let mut results: Vec<Option<EnsureItem>> = Vec::with_capacity(items.len());
     let mut wanting: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let (Some(navi), Wanted::Track(reference)) = (&navi, item) else {
+    for (i, lookup) in lookups {
+        let Some(lookup) = lookup else {
             results.push(None);
             wanting.push((i, vec![], vec![]));
             continue;
         };
-        match find(navi, reference).await {
+        match lookup {
             Ok(found) => {
                 let (owned, fuzzy): (Vec<_>, Vec<_>) =
                     (found.matches.into_iter()).partition(|m| m.how.kind != MatchKind::Fuzzy);
@@ -340,7 +397,7 @@ pub(crate) async fn ensure(
                     results.push(Some(EnsureItem::InLibrary { song_ids }));
                 }
             }
-            Err(failure) => results.push(Some(EnsureItem::Refused(failure, item.facts()))),
+            Err(failure) => results.push(Some(EnsureItem::Refused(failure, items[i].facts()))),
         }
     }
     let library_checked = navi.is_some();
@@ -380,7 +437,7 @@ pub(crate) async fn ensure(
             id: uuid::Uuid::new_v4().to_string(),
             user: ctx.id(),
             label,
-            origin: BatchOrigin::Mcp,
+            origin,
             for_playlist,
         };
         let id = batch.id.clone();
@@ -783,7 +840,7 @@ impl RetryMode {
 /// source.
 pub(crate) fn allowed(view: &JobView, untried: &Untried, mode: RetryMode) -> bool {
     let job = &view.job;
-    if job.origin != BatchOrigin::Mcp || !mode.states().contains(&job.state) {
+    if !job.origin.uses_job_runner() || !mode.states().contains(&job.state) {
         return false;
     }
     let failure = job_failure(view);

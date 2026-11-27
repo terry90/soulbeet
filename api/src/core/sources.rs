@@ -18,11 +18,12 @@ use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
 use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
-    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchResult, SearchSpec,
+    DownloadQuery, DownloadableGroup, FileFacts, SearchPriority, SearchResult, SearchSpec,
     SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
+use soulbeet::matching::diagnostics::{RejectionCollector, REASON_FORMAT_FILTERED};
 use soulbeet::DownloadBackend;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -377,6 +378,20 @@ impl Found {
         self
     }
 
+    /// Merged stats across all backends that finished; None when none finished.
+    pub(crate) fn stats(&self) -> Option<SearchStats> {
+        let mut merged: Option<SearchStats> = None;
+        for stop in &self.stops {
+            if let SearchStop::Finished { stats } = stop {
+                match &mut merged {
+                    Some(acc) => acc.merge(stats),
+                    None => merged = Some(stats.clone()),
+                }
+            }
+        }
+        merged
+    }
+
     /// Why nothing was found: the failure the stops give, the first backend's first.
     pub(crate) fn failure(&self) -> Failure {
         match self.stops.split_first() {
@@ -391,13 +406,24 @@ impl Found {
     }
 }
 
-/// Searches every backend of `tier` at once: all groups found, best score first.
+/// Searches every backend of `tier` at once with `SearchPriority::Interactive`:
+/// all groups found, best score first.
 pub(crate) async fn search_tier(
     tier: &[Searched],
     album: Option<&Album>,
     tracks: &[Track],
 ) -> Found {
-    let spec = SearchSpec::of(album.cloned(), tracks.to_vec());
+    search_tier_with_priority(tier, album, tracks, SearchPriority::Interactive).await
+}
+
+/// Searches every backend of `tier` at once using `priority`: all groups found, best score first.
+pub(crate) async fn search_tier_with_priority(
+    tier: &[Searched],
+    album: Option<&Album>,
+    tracks: &[Track],
+    priority: SearchPriority,
+) -> Found {
+    let spec = SearchSpec::of(album.cloned(), tracks.to_vec()).with_priority(priority);
     let results = futures::future::join_all(
         tier.iter()
             .map(|(id, backend)| search_backend(id, backend, &spec)),
@@ -506,8 +532,8 @@ struct Run {
     user: UserId,
     purpose: SearchFor,
     holds_turn: bool,
-    /// The backend's id of the search and the backend, once the task started it.
-    started: Option<(String, Arc<dyn DownloadBackend>)>,
+    /// Backend search IDs and handles once the task started them.
+    started: Vec<(String, Arc<dyn DownloadBackend>)>,
     /// `Searches::stop` asked for it: it never takes the turn, or is stopped at the backend.
     stop: bool,
 }
@@ -581,7 +607,7 @@ impl Searches {
         line.runs
             .iter()
             .find(|run| run.id == id)
-            .and_then(|run| run.started.as_ref().map(|(search, _)| search.clone()))
+            .and_then(|run| run.started.first().map(|(search, _)| search.clone()))
     }
 
     /// D9: stops search `id` of a cancelled job when it is the job's own. One waiting for the
@@ -615,7 +641,7 @@ impl Searches {
         // A search waiting for the turn looks again, and leaves.
         self.left.notify_waiters();
         // One still starting is stopped by its task once the backend named it (`started`).
-        if let Some((search, backend)) = started {
+        for (search, backend) in started {
             stop_at_backend(&backend, &search).await;
         }
         true
@@ -651,7 +677,7 @@ impl Searches {
             user,
             purpose,
             holds_turn: false,
-            started: None,
+            started: Vec::new(),
             stop,
         });
         Place {
@@ -690,11 +716,21 @@ impl Searches {
         let mut line = self.line.lock().unwrap();
         match line.runs.iter_mut().find(|run| run.id == id) {
             Some(run) => {
-                run.started = Some((backend_search.to_string(), backend.clone()));
+                run.started
+                    .push((backend_search.to_string(), backend.clone()));
                 run.stop
             }
             None => false,
         }
+    }
+
+    fn is_stopped(&self, id: &str) -> bool {
+        self.line
+            .lock()
+            .unwrap()
+            .runs
+            .iter()
+            .any(|run| run.id == id && run.stop)
     }
 
     /// Takes the turn with a search of its own until the returned place is dropped, so searches
@@ -756,6 +792,138 @@ pub enum FindRefused {
     TooManyWaiting(Vec<String>),
     /// Recording the search failed.
     Failed(Failure),
+}
+
+/// Records a job's search `run.id` for `ctx` across `usable` backends and runs it in its own task
+/// once it holds the turn, trying `usable.primary` first and falling back to `usable.last_resort`
+/// only when no primary group passes `run.spec.filters`, `excluded`, and `failures` with score at
+/// least `min_score` (and `lossless_only` is false).
+#[allow(clippy::too_many_arguments)]
+pub async fn start_stored_multi(
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    usable: Usable,
+    run: SearchRun,
+    min_score: f64,
+    excluded: Vec<String>,
+    failures: HashMap<String, u32>,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let place = searches.enter(&run.id, ctx.id());
+    run_usable_in_line(
+        place, searches, ledger, ctx, usable, run, min_score, excluded, failures,
+    )
+    .await
+}
+
+/// Runs a single tier of backends in parallel, registering each started search with `searches`
+/// so cancellation stops all active backend searches and ensuring every returned item carries
+/// its backend id.
+async fn search_tier_tracked(
+    searches: &Searches,
+    search_id: &str,
+    tier: &[Searched],
+    spec: &SearchSpec,
+) -> Found {
+    let results = futures::future::join_all(tier.iter().map(|(name, backend)| async move {
+        let (mut groups, stop) = match start_backend_search(name, backend, spec).await {
+            Ok(backend_search) => {
+                if searches.started(search_id, &backend_search, backend) {
+                    stop_at_backend(backend, &backend_search).await;
+                }
+                poll_backend_search(name, backend, &backend_search).await
+            }
+            Err(stop) => (Vec::new(), stop),
+        };
+        for group in &mut groups {
+            for item in &mut group.items {
+                if item.backend.is_empty() {
+                    item.backend = name.clone();
+                }
+            }
+        }
+        (groups, stop)
+    }))
+    .await;
+    let (groups, stops): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let mut groups: Vec<DownloadableGroup> = groups.into_iter().flatten().collect();
+    best_first(&mut groups);
+    Found { groups, stops }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_usable_in_line(
+    place: Place,
+    searches: &Arc<Searches>,
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    usable: Usable,
+    run: SearchRun,
+    min_score: f64,
+    excluded: Vec<String>,
+    failures: HashMap<String, u32>,
+) -> Result<JoinHandle<SearchProgress>, Failure> {
+    let SearchRun { id, query, spec } = run;
+    let total_backends = usable.primary.len() + usable.last_resort.len();
+    let single_backend = if total_backends == 1 {
+        usable
+            .primary
+            .first()
+            .or_else(|| usable.last_resort.first())
+            .map(|(name, _)| name.clone())
+    } else {
+        None
+    };
+    ledger
+        .record_search(NewSearch {
+            id: id.clone(),
+            user: ctx.id(),
+            backend: single_backend,
+            query: query.clone(),
+            spec: Some(spec.clone()),
+        })
+        .await
+        .map_err(|e| database_failure(Stage::SourceSearch, e))?;
+    let (searches, ledger) = (searches.clone(), ledger.clone());
+    Ok(tokio::spawn(async move {
+        let _place = place;
+        if !searches.take_turn(&id).await {
+            let outcome = Err((search_stopped(), None));
+            return ended(&ledger, &id, outcome).await;
+        }
+        let search = SearchSpec {
+            album: query.album,
+            tracks: query.tracks,
+            text: spec.text,
+            keep_below_floor: spec.keep_below_floor,
+            priority: SearchPriority::Background,
+        };
+        let mut found = if usable.primary.is_empty() {
+            Found::default()
+        } else {
+            search_tier_tracked(&searches, &id, &usable.primary, &search).await
+        };
+        let primary_view = view(&id, &found.groups, &spec.filters, &failures, &excluded);
+        let has_qualifying_primary = primary_view
+            .candidates
+            .iter()
+            .any(|c| c.automatic() && c.group.score >= min_score);
+        if !has_qualifying_primary
+            && !usable.last_resort.is_empty()
+            && !spec.filters.lossless_only
+            && !searches.is_stopped(&id)
+        {
+            let last = search_tier_tracked(&searches, &id, &usable.last_resort, &search).await;
+            found = found.then(last);
+        }
+        let stats = found.stats();
+        let outcome = if found.groups.is_empty() {
+            Err((found.failure(), stats))
+        } else {
+            Ok((found.groups, stats))
+        };
+        ended(&ledger, &id, outcome).await
+    }))
 }
 
 /// Records a job's search `run.id` for `ctx` on the default backend and runs it in its own task
@@ -826,6 +994,7 @@ async fn run_in_line(
             tracks: query.tracks,
             text: spec.text,
             keep_below_floor: spec.keep_below_floor,
+            priority: SearchPriority::Interactive,
         };
         let name = DEFAULT_DOWNLOAD_BACKEND;
         let (mut groups, stop) = match start_backend_search(name, &backend, &search).await {
@@ -911,6 +1080,7 @@ pub struct DroppedByFilter {
 pub struct CandidateView {
     pub candidates: Vec<Candidate>,
     pub dropped_by_filter: DroppedByFilter,
+    pub filter_rejections: RejectionCollector,
 }
 
 impl CandidateView {
@@ -922,37 +1092,46 @@ impl CandidateView {
             .map(|c| c.group.clone())
             .collect()
     }
+
+    /// Merge filter-stage rejection counts and top rejected candidates into `stats`.
+    pub fn merge_rejections_into(&self, stats: &mut SearchStats) {
+        self.filter_rejections.merge_into(stats);
+    }
 }
 
 /// D6: extensions that are always lossless. `m4a` holds AAC or ALAC alike, so it is not one.
 const LOSSLESS: [&str; 6] = ["flac", "wav", "aiff", "aif", "ape", "wv"];
 
 /// Whether a file with `facts` passes `filters`; one that does not is counted in `dropped`
-/// under the first filter it fails. What the source did not report fails the filter that asks
-/// for it.
-fn passes(facts: &FileFacts, filters: &SourceFilters, dropped: &mut DroppedByFilter) -> bool {
+/// under the first filter it fails and returns a machine-readable rejection reason. What the
+/// source did not report fails the filter that asks for it.
+fn filter_rejection(
+    facts: &FileFacts,
+    filters: &SourceFilters,
+    dropped: &mut DroppedByFilter,
+) -> Option<&'static str> {
     let extension = facts.extension.as_deref();
-    let failed = if !filters.formats.is_empty()
+    let (failed, reason) = if !filters.formats.is_empty()
         && !extension.is_some_and(|e| filters.formats.iter().any(|f| f == e))
     {
-        &mut dropped.format
+        (&mut dropped.format, REASON_FORMAT_FILTERED)
     } else if filters
         .min_bitrate_kbps
         .is_some_and(|min| !facts.bitrate_kbps.is_some_and(|kbps| kbps >= min))
     {
-        &mut dropped.bitrate
+        (&mut dropped.bitrate, "bitrate_filtered")
     } else if filters.lossless_only && !extension.is_some_and(|e| LOSSLESS.contains(&e)) {
-        &mut dropped.not_lossless
+        (&mut dropped.not_lossless, REASON_FORMAT_FILTERED)
     } else if filters
         .max_queue_length
         .is_some_and(|max| !facts.source_queue_length.is_some_and(|queue| queue <= max))
     {
-        &mut dropped.queue_length
+        (&mut dropped.queue_length, "queue_length")
     } else {
-        return true;
+        return None;
     };
     *failed += 1;
-    false
+    Some(reason)
 }
 
 /// The stored groups of search `search_id` that pass `filters` (D6) and whose source is not in
@@ -966,18 +1145,37 @@ pub fn view(
     excluded: &[String],
 ) -> CandidateView {
     let mut dropped = DroppedByFilter::default();
+    let mut filter_rejections = RejectionCollector::default();
     let mut candidates = Vec::new();
     for (index, group) in groups.iter().enumerate() {
         if excluded.contains(&group.source) {
             dropped.excluded += 1;
+            let label = if group.title.trim().is_empty() {
+                group.group_id.clone()
+            } else {
+                group.title.clone()
+            };
+            filter_rejections.record(
+                group.source.clone(),
+                label,
+                Some(group.score as f32),
+                "excluded_source",
+            );
             continue;
         }
-        let items: Vec<DownloadableItem> = group
-            .items
-            .iter()
-            .filter(|item| passes(&item.facts, filters, &mut dropped))
-            .cloned()
-            .collect();
+        let mut items = Vec::with_capacity(group.items.len());
+        for item in &group.items {
+            if let Some(reason) = filter_rejection(&item.facts, filters, &mut dropped) {
+                filter_rejections.record(
+                    item.source.clone(),
+                    item.id.clone(),
+                    Some(item.match_score as f32),
+                    reason,
+                );
+            } else {
+                items.push(item.clone());
+            }
+        }
         if items.is_empty() {
             continue;
         }
@@ -1000,6 +1198,7 @@ pub fn view(
     CandidateView {
         candidates,
         dropped_by_filter: dropped,
+        filter_rejections,
     }
 }
 

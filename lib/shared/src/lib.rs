@@ -9,6 +9,7 @@ pub mod gdstudio;
 pub mod metadata;
 pub mod navidrome;
 pub mod oauth;
+pub mod playlist_import;
 pub mod recommendation;
 pub mod slskd;
 pub mod system;

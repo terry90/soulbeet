@@ -1,11 +1,13 @@
 use crate::audio::is_audio_path;
 use crate::matching::assign::assign_tracks;
+use crate::matching::diagnostics::{classify_path_rejection, RejectionCollector, REASON_LOCKED_ONLY};
 use crate::matching::path::{rank_match, release_folder, remote_folder, Ranked, WantedTrack};
 use crate::matching::score::{group_score, MIN_SCORE_THRESHOLD};
 use crate::slskd::models::SearchResponse;
 use itertools::Itertools;
+use shared::download::RejectedCandidateSummary;
 use shared::slskd::{declared_extension, AlbumResult, MatchResult, SearchResult, TrackResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 /// The albums of a search's responses, and what was left out or flagged.
@@ -15,6 +17,10 @@ pub struct Processed {
     pub not_audio: u32,
     /// Audio files scored below the floor, kept or not.
     pub below_floor: u32,
+    /// Machine-readable rejection counts across pre-enqueue filtering.
+    pub rejection_counts: BTreeMap<String, u32>,
+    /// Up to 5 closest rejected candidates with the reason each was dropped.
+    pub top_rejected: Vec<RejectedCandidateSummary>,
 }
 
 /// Processing keeps a file as audio when its name has no extension or an audio one.
@@ -43,6 +49,7 @@ pub fn process_search_responses(
 ) -> Processed {
     let mut not_audio = 0;
     let mut below_floor = 0;
+    let mut rejections = RejectionCollector::default();
     let mut scored_files: Vec<(Vec<Candidate>, SearchResult)> = Vec::new();
     // A file that shares no word with any wanted title is none of them,
     // whatever its folder and length say. Every ranking of a file has the
@@ -52,6 +59,14 @@ pub fn process_search_responses(
             || (r.track.is_some() && r.result.track_score == 0.0)
     };
     for resp in responses {
+        if resp.files.is_empty() && resp.locked_file_count > 0 {
+            rejections.record(
+                resp.username.clone(),
+                format!("{} locked files", resp.locked_file_count),
+                None,
+                REASON_LOCKED_ONLY,
+            );
+        }
         let mut folder_audio_files: HashMap<&str, u32> = HashMap::new();
         for file in resp.files.iter().filter(|f| kept_as_audio(&f.filename)) {
             *folder_audio_files
@@ -76,6 +91,19 @@ pub fn process_search_responses(
             let flagged = under(&ranked[0]);
             if flagged {
                 below_floor += 1;
+                let reason = classify_path_rejection(
+                    &file.filename,
+                    &ranked[0],
+                    Some(searched_artist),
+                    expected_tracks,
+                    file.length,
+                );
+                rejections.record(
+                    resp.username.clone(),
+                    file.filename.clone(),
+                    Some(ranked[0].result.total_score as f32),
+                    reason,
+                );
                 if !keep_below_floor {
                     continue;
                 }
@@ -117,6 +145,8 @@ pub fn process_search_responses(
         albums: find_best_albums(&scored_files, expected_tracks),
         not_audio,
         below_floor,
+        rejection_counts: rejections.rejection_counts,
+        top_rejected: rejections.top_rejected,
     }
 }
 
@@ -440,5 +470,71 @@ mod tests {
         files.sort();
         files.dedup();
         assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn records_bounded_rejection_reasons_and_locked_only_peers() {
+        use crate::matching::diagnostics::{
+            REASON_DURATION_DELTA, REASON_LOCKED_ONLY, REASON_TITLE_MISMATCH,
+        };
+        use shared::download::MAX_TOP_REJECTED;
+
+        let mk_file = |name: &str, length: Option<i32>| SearchResponseFile {
+            filename: name.into(),
+            size: 1,
+            bit_rate: None,
+            length,
+            sample_rate: None,
+            bit_depth: None,
+            extension: None,
+            is_variable_bit_rate: None,
+        };
+        let responses = vec![
+            SearchResponse {
+                username: "locked_peer".into(),
+                files: vec![],
+                has_free_upload_slot: false,
+                upload_speed: 0,
+                queue_length: 0,
+                locked_file_count: 4,
+            },
+            SearchResponse {
+                username: "bad_peer".into(),
+                files: vec![
+                    mk_file("Music/Other/01 - Interview.flac", Some(263)),
+                    mk_file("Music/Other/02 - Commentary.flac", Some(263)),
+                    mk_file("Music/Other/03 - Outro.flac", Some(263)),
+                    mk_file("Music/Other/04 - Skit.flac", Some(263)),
+                    mk_file("Music/Other/05 - Bonus.flac", Some(263)),
+                    mk_file("Music/Other/06 - O Holy Night.flac", Some(450)),
+                ],
+                has_free_upload_slot: true,
+                upload_speed: 1,
+                queue_length: 0,
+                locked_file_count: 0,
+            },
+        ];
+        let tracks = wanted(&[("O Holy Night", 263)]);
+        let processed = process_search_responses(
+            &responses,
+            "Marrow Choir",
+            Some("Winter Songs"),
+            &tracks,
+            false,
+        );
+        assert!(processed.albums.is_empty());
+        assert_eq!(processed.rejection_counts.get(REASON_LOCKED_ONLY), Some(&1));
+        assert_eq!(
+            processed.rejection_counts.get(REASON_TITLE_MISMATCH),
+            Some(&5)
+        );
+        assert_eq!(
+            processed.rejection_counts.get(REASON_DURATION_DELTA),
+            Some(&1)
+        );
+        assert_eq!(processed.top_rejected.len(), MAX_TOP_REJECTED);
+        // Closest candidate (matched title, wrong duration) ranks first.
+        assert_eq!(processed.top_rejected[0].reason, REASON_DURATION_DELTA);
+        assert_eq!(processed.top_rejected[0].source, "bad_peer");
     }
 }

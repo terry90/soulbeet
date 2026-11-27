@@ -326,7 +326,7 @@ impl StubBackend {
 /// is asked for. While held, every lookup waits for `release`.
 #[derive(Default)]
 pub struct StubBackends {
-    stubs: HashMap<String, Arc<StubBackend>>,
+    stubs: Mutex<HashMap<String, Arc<StubBackend>>>,
     failures: Mutex<HashMap<String, BackendLookupError>>,
     asked: Mutex<Vec<String>>,
     held: watch::Sender<bool>,
@@ -335,9 +335,14 @@ pub struct StubBackends {
 
 impl StubBackends {
     /// These lookups with `stub` registered under `id`.
-    pub fn with(mut self, id: &str, stub: Arc<StubBackend>) -> Self {
-        self.stubs.insert(id.to_string(), stub);
+    pub fn with(self, id: &str, stub: Arc<StubBackend>) -> Self {
+        self.insert(id, stub);
         self
+    }
+
+    /// Registers `stub` under `id` dynamically.
+    pub fn insert(&self, id: &str, stub: Arc<StubBackend>) {
+        self.stubs.lock().unwrap().insert(id.to_string(), stub);
     }
 
     /// Makes every lookup of `id` answer `e`.
@@ -378,7 +383,7 @@ impl Backends for StubBackends {
         if let Some(e) = self.failures.lock().unwrap().get(id) {
             return Err(e.clone());
         }
-        match self.stubs.get(id) {
+        match self.stubs.lock().unwrap().get(id) {
             Some(stub) => Ok(stub.clone()),
             None => Err(BackendLookupError::Unknown(id.to_string())),
         }

@@ -764,6 +764,7 @@ mod tests {
                 job: "j1".to_string(),
                 slot: 1,
             },
+            expected_duration_s: None,
         };
         assert!(deliver(reservation, vec![slot.clone()], &backend, &running)
             .await
@@ -1016,6 +1017,7 @@ mod tests {
                 job: "j1".to_string(),
                 slot: 0,
             },
+            expected_duration_s: None,
         };
 
         let lost = deliver(reservation, vec![slot], &backend, &running).await;

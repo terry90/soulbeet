@@ -8,22 +8,24 @@ use crate::core::acquire::{
     Acquisition, NewBatch,
 };
 use crate::core::sources::{
-    no_candidate_passed, start_stored, view, Candidate, CandidateView, SearchProgress, SearchRun,
-    Searches, RECENT_FAILURES_SECS,
+    no_candidate_passed, start_stored_multi, usable_backends as server_usable_backends, view,
+    Candidate, CandidateView, SearchProgress, SearchRun, Searches, Usable, RECENT_FAILURES_SECS,
 };
 use crate::core::{
-    backend_unavailable, backend_unavailable_at, database_failure, logged, metadata,
+    backend_unavailable_at, database_failure, logged, metadata, settings,
 };
 use crate::import_queue::{ImportQueue, IMPORT_QUEUE};
 use crate::importer_health::blocking_failure;
 use crate::ledger::store::{self, JobRecord, StoredSearch};
 use crate::ledger::{
-    BatchOrigin, DuplicateRule, JobKind, JobOptions, JobState, Ledger, LedgerError, Pick,
-    StoredSpec, Transition, Transitioned, LEDGER,
+    DuplicateRule, JobKind, JobOptions, JobState, Ledger, LedgerError, Pick, StoredSpec,
+    Transition, Transitioned, LEDGER,
 };
+use crate::models::user_settings::LossyFallback;
 use crate::server_fns::download::enqueue::nothing_enqueued;
-use crate::services::{Backends, Registry, DEFAULT_DOWNLOAD_BACKEND};
+use crate::services::{Backends, Registry};
 use async_trait::async_trait;
+use shared::backends::{delivery, Delivery};
 use shared::download::{DownloadQuery, DownloadableGroup, DownloadableItem, QueuedDownload};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::{DownloadBackend, ImportMode};
@@ -40,6 +42,9 @@ use tracing::{error, info, warn};
 pub(crate) trait Effects: Send + Sync {
     /// Where download backends are looked up.
     fn backends(&self) -> &dyn Backends;
+    /// Enabled download backends available for `ctx`, grouped by delivery tier and honoring
+    /// the user's `lossy_fallback` preference.
+    async fn usable_backends(&self, ctx: &UserCtx) -> Result<Usable, Failure>;
     /// The failure an import would end with because the importer is broken; None when nothing
     /// blocks imports.
     async fn importer_blocked(&self) -> Option<Failure>;
@@ -166,6 +171,11 @@ impl Effects for LiveEffects {
         &Registry
     }
 
+    async fn usable_backends(&self, ctx: &UserCtx) -> Result<Usable, Failure> {
+        let lossy = settings::get(ctx).await?.lossy_fallback;
+        server_usable_backends(lossy).await
+    }
+
     async fn importer_blocked(&self) -> Option<Failure> {
         blocking_failure().await
     }
@@ -201,14 +211,44 @@ pub(crate) enum Picked {
 /// D4, on `view`'s candidates, best first (never empty: drive fails a job whose view is empty
 /// first): the best one at or above `min_score` a job may take without the assistant naming it,
 /// neither flagged nor below the floor (`Candidate::automatic`).
+#[cfg(test)]
 pub(crate) fn pick(candidates: &[Candidate], options: &JobOptions) -> Picked {
+    pick_with_lossy(candidates, options, LossyFallback::Auto)
+}
+
+fn is_lossy_candidate(c: &Candidate) -> bool {
+    c.group
+        .items
+        .first()
+        .is_some_and(|item| delivery(&item.backend) == Delivery::LossyOnly)
+}
+
+/// Like `pick`, respecting `lossy` for lossy-only backend candidates: primary (as-found)
+/// candidates are preferred first, and a lossy-only candidate is only auto-picked when
+/// `lossy == LossyFallback::Auto`.
+pub(crate) fn pick_with_lossy(
+    candidates: &[Candidate],
+    options: &JobOptions,
+    lossy: LossyFallback,
+) -> Picked {
     if options.pick == Pick::Review {
         return Picked::Choose;
     }
-    candidates
+    if let Some(pos) = candidates
         .iter()
-        .position(|c| c.automatic() && c.group.score >= options.min_score)
-        .map_or(Picked::Choose, Picked::Auto)
+        .position(|c| !is_lossy_candidate(c) && c.automatic() && c.group.score >= options.min_score)
+    {
+        return Picked::Auto(pos);
+    }
+    if lossy == LossyFallback::Auto {
+        if let Some(pos) = candidates
+            .iter()
+            .position(|c| c.automatic() && c.group.score >= options.min_score)
+        {
+            return Picked::Auto(pos);
+        }
+    }
+    Picked::Choose
 }
 
 /// Takes job `id` of `ctx` on from its state: searching (hydrate an album, search or read its
@@ -471,10 +511,32 @@ impl Runner<'_> {
             }
         };
         if view.candidates.is_empty() {
+            if !view.filter_rejections.rejection_counts.is_empty()
+                || !view.filter_rejections.top_rejected.is_empty()
+            {
+                if let Ok(Some(stored)) =
+                    store::search_of(&self.acquire.db, &search_id, &self.ctx.id()).await
+                {
+                    let mut stats = stored.stats.unwrap_or_default();
+                    view.merge_rejections_into(&mut stats);
+                    let _ = self
+                        .acquire
+                        .ledger
+                        .search_ended(&search_id, Ok((groups, Some(stats))))
+                        .await;
+                }
+            }
             self.fail(no_candidate_passed(), Some(search_id)).await;
             return None;
         }
-        match pick(&view.candidates, self.options) {
+        let lossy = self
+            .acquire
+            .effects
+            .usable_backends(self.ctx)
+            .await
+            .map(|u| u.lossy)
+            .unwrap_or(LossyFallback::Never);
+        match pick_with_lossy(&view.candidates, self.options, lossy) {
             Picked::Choose => {
                 self.transition(Transition::AwaitChoice { search_id }).await;
                 None
@@ -564,21 +626,25 @@ impl Runner<'_> {
                 (query, spec())
             }
         };
-        let backend = (self.acquire.effects.backends())
-            .get(DEFAULT_DOWNLOAD_BACKEND)
+        let usable = self.acquire.effects.usable_backends(self.ctx).await?;
+        let since = chrono::Utc::now().timestamp() - RECENT_FAILURES_SECS;
+        let failures = store::recent_failures(&self.acquire.db, since)
             .await
-            .map_err(|e| backend_unavailable(Stage::SourceSearch, &e))?;
+            .unwrap_or_default();
         let run = SearchRun {
             id: id.to_string(),
             query,
             spec,
         };
-        let task = start_stored(
+        let task = start_stored_multi(
             &self.acquire.searches,
             &self.acquire.ledger,
             self.ctx,
-            backend,
+            usable,
             run,
+            self.options.min_score,
+            self.job.excluded_sources.clone(),
+            failures,
         )
         .await?;
         task.await.map_err(|e| {
@@ -684,7 +750,7 @@ impl Runner<'_> {
             .await
             .map_err(|e| backend_unavailable_at(Stage::Enqueue, &e))?;
         let target = prepare_target(&self.job.folder).await?;
-        let duplicates = DuplicateRule::for_job(BatchOrigin::Mcp, Some(self.options))
+        let duplicates = DuplicateRule::for_job(self.job.origin, Some(self.options))
             .for_delivery(shared::backends::delivery(&routed));
         let fresh = NewBatch {
             batch_id: uuid::Uuid::new_v4().to_string(),
@@ -696,6 +762,7 @@ impl Runner<'_> {
                 JobKind::Album => ImportMode::Album,
             },
             duplicates,
+            verify_policy: soulbeet::VerifyPolicy::Standard,
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),
@@ -738,7 +805,8 @@ mod test_effects {
     use crate::importer_health::blocking_failure_of;
     use crate::ledger::JobEvent;
     use crate::server_fns::download::test_support::{StubBackend, StubBackends};
-    use crate::services::BackendLookupError;
+    use crate::services::{BackendLookupError, DEFAULT_DOWNLOAD_BACKEND};
+    use shared::backends::{BackendMeta, SLSKD};
     use shared::download::EnqueueStatus;
     use shared::metadata::{AlbumWithTracks, SearchResult, Track};
     use soulbeet::{MetadataError, MetadataProvider};
@@ -756,6 +824,8 @@ mod test_effects {
             let effects = Arc::new(TestEffects {
                 ledger: ledger.clone(),
                 backends: StubBackends::default().with(DEFAULT_DOWNLOAD_BACKEND, stub.clone()),
+                enabled_backends: Mutex::new(vec![&SLSKD]),
+                lossy_fallback: Mutex::new(LossyFallback::Never),
                 stub,
                 importer: importer.clone(),
                 downloads: tempfile::tempdir().expect("a test download folder"),
@@ -796,6 +866,8 @@ mod test_effects {
         ledger: Ledger,
         stub: Arc<StubBackend>,
         backends: StubBackends,
+        enabled_backends: Mutex<Vec<&'static BackendMeta>>,
+        lossy_fallback: Mutex<LossyFallback>,
         importer: Arc<StubImporter>,
         /// The download folder of the `Acquire` made with it.
         downloads: tempfile::TempDir,
@@ -837,6 +909,16 @@ mod test_effects {
             self.backends.fail(DEFAULT_DOWNLOAD_BACKEND, e);
         }
 
+        /// Configures which backends `usable_backends` sees in tests.
+        pub(crate) fn set_enabled_backends(&self, list: Vec<&'static BackendMeta>) {
+            *self.enabled_backends.lock().unwrap() = list;
+        }
+
+        /// Configures the user's `LossyFallback` preference seen by `usable_backends`.
+        pub(crate) fn set_lossy_fallback(&self, lossy: LossyFallback) {
+            *self.lossy_fallback.lock().unwrap() = lossy;
+        }
+
         /// Every enqueue, in order.
         pub(crate) fn enqueued(&self) -> Vec<(NewBatch, Acquisition)> {
             self.enqueued.lock().unwrap().clone()
@@ -847,6 +929,12 @@ mod test_effects {
     impl Effects for TestEffects {
         fn backends(&self) -> &dyn Backends {
             &self.backends
+        }
+
+        async fn usable_backends(&self, _ctx: &UserCtx) -> Result<Usable, Failure> {
+            let enabled = self.enabled_backends.lock().unwrap().clone();
+            let lossy = *self.lossy_fallback.lock().unwrap();
+            crate::core::sources::usable_from(&self.backends, &enabled, lossy).await
         }
 
         async fn importer_blocked(&self) -> Option<Failure> {
@@ -936,11 +1024,11 @@ mod tests {
     use crate::core::jobs::test_support::{
         mcp_album_job, mcp_track_job, queued_track_jobs, record_failures,
     };
-    use crate::core::sources::no_candidate_passed;
+    use crate::core::sources::{no_candidate_passed, start_stored};
     use crate::core::test_ctx;
     use crate::ledger::{JobEvent, SourceFilters};
     use crate::server_fns::download::test_support::{group, item, search_result, track};
-    use crate::services::BackendLookupError;
+    use crate::services::{BackendLookupError, DEFAULT_DOWNLOAD_BACKEND};
     use shared::download::{FileFacts, SearchResult, SearchState};
     use shared::failure::{FailureCode, RetryAdvice, Service};
     use soulbeet::error::{MissingSetting, SoulseekError};
@@ -1007,6 +1095,7 @@ mod tests {
         let view = CandidateView {
             candidates,
             dropped_by_filter: Default::default(),
+            filter_rejections: Default::default(),
         };
         let standing_by: Vec<String> = (view.automatic_groups().into_iter())
             .map(|g| g.source)
@@ -1818,5 +1907,122 @@ mod tests {
         );
         let enqueued = effects.enqueued();
         assert_eq!(enqueued[0].1.items[0].1.source, "peer_b");
+    }
+
+    #[tokio::test]
+    async fn runner_falls_back_to_secondary_and_lossy_backends_when_configured() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let ytdlp_stub = crate::server_fns::download::test_support::StubBackend::new(vec![]);
+        effects
+            .stub_backends()
+            .insert(shared::ytdlp::BACKEND_ID, ytdlp_stub.clone());
+        effects.set_enabled_backends(vec![&shared::backends::SLSKD, &shared::backends::YTDLP]);
+        effects.set_lossy_fallback(LossyFallback::Auto);
+
+        // Primary (slskd) returns no results; lossy-only (ytdlp) returns a confident match.
+        effects.stub().script_polls(found(vec![]));
+        let mut ytm_item = item("youtube", "O Holy Night", "ytm/01.opus");
+        ytm_item.backend = shared::ytdlp::BACKEND_ID.into();
+        ytdlp_stub.script_polls(found(vec![group("youtube", vec![ytm_item], 0.9)]));
+
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto(0.7)).await;
+        drive(&acq, &alice(), &job).await;
+
+        let enqueued = effects.enqueued();
+        assert_eq!(enqueued.len(), 1);
+        assert_eq!(enqueued[0].0.backend, shared::ytdlp::BACKEND_ID);
+        assert_eq!(enqueued[0].1.items[0].1.source, "youtube");
+    }
+
+    #[tokio::test]
+    async fn runner_never_uses_lossy_backend_when_user_disables_lossy_fallback() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let ytdlp_stub = crate::server_fns::download::test_support::StubBackend::new(vec![]);
+        effects
+            .stub_backends()
+            .insert(shared::ytdlp::BACKEND_ID, ytdlp_stub.clone());
+        effects.set_enabled_backends(vec![&shared::backends::SLSKD, &shared::backends::YTDLP]);
+        effects.set_lossy_fallback(LossyFallback::Never);
+
+        effects.stub().script_polls(found(vec![]));
+        let mut ytm_item = item("youtube", "O Holy Night", "ytm/01.opus");
+        ytm_item.backend = shared::ytdlp::BACKEND_ID.into();
+        ytdlp_stub.script_polls(found(vec![group("youtube", vec![ytm_item], 0.9)]));
+
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", auto(0.7)).await;
+        drive(&acq, &alice(), &job).await;
+
+        assert!(effects.enqueued().is_empty());
+        let rec = store::job_record(&acq.db, &job, &alice().id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, JobState::Failed);
+    }
+
+    #[tokio::test]
+    async fn runner_falls_back_to_last_resort_when_primary_candidates_fail_filters() {
+        let (acq, effects) = Acquire::for_alice().await;
+        let ytdlp_stub = crate::server_fns::download::test_support::StubBackend::new(vec![]);
+        effects
+            .stub_backends()
+            .insert(shared::ytdlp::BACKEND_ID, ytdlp_stub.clone());
+        effects.set_enabled_backends(vec![&shared::backends::SLSKD, &shared::backends::YTDLP]);
+        effects.set_lossy_fallback(LossyFallback::Auto);
+
+        // Primary returns a high-scoring mp3, but job filters require opus or flac.
+        let mut slsk_item = item("peer_a", "O Holy Night", "dir/01.mp3");
+        slsk_item.facts.extension = Some("mp3".into());
+        effects
+            .stub()
+            .script_polls(found(vec![group("peer_a", vec![slsk_item], 0.95)]));
+
+        let mut ytm_item = item("youtube", "O Holy Night", "ytm/01.opus");
+        ytm_item.backend = shared::ytdlp::BACKEND_ID.into();
+        ytm_item.facts.extension = Some("opus".into());
+        ytdlp_stub.script_polls(found(vec![group("youtube", vec![ytm_item], 0.9)]));
+
+        let mut opts = auto(0.7);
+        opts.filters.formats = vec!["flac".into(), "opus".into()];
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", opts).await;
+        drive(&acq, &alice(), &job).await;
+
+        let enqueued = effects.enqueued();
+        assert_eq!(enqueued.len(), 1);
+        assert_eq!(enqueued[0].0.backend, shared::ytdlp::BACKEND_ID);
+    }
+
+    #[tokio::test]
+    async fn runner_records_filter_rejections_in_search_stats_and_timeline_when_all_filtered() {
+        let (acq, effects) = Acquire::for_alice().await;
+
+        let mut slsk_item = item("peer_a", "O Holy Night", "dir/01.mp3");
+        slsk_item.facts.extension = Some("mp3".into());
+        effects
+            .stub()
+            .script_polls(found(vec![group("peer_a", vec![slsk_item], 0.95)]));
+
+        let mut opts = auto(0.7);
+        opts.filters.lossless_only = true;
+        let job = mcp_track_job(&acq, "Marrow Choir", "O Holy Night", opts).await;
+        drive(&acq, &alice(), &job).await;
+
+        let rec = store::job_record(&acq.db, &job, &alice().id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.state, JobState::Failed);
+        assert_eq!(
+            rec.failure.as_ref().map(|f| f.code),
+            Some(FailureCode::SearchAllFiltered)
+        );
+        let stored = store::search_of(&acq.db, rec.search_id.as_deref().unwrap(), &alice().id())
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = stored.stats.expect("filter rejections merged into stats");
+        assert!(stats.rejection_counts.get("format_filtered").copied().unwrap_or(0) >= 1);
+        let timeline = store::timeline_of(&acq.db, &job).await.unwrap();
+        assert!(timeline.iter().any(|e| e.event == "search_diagnostics"));
     }
 }

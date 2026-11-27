@@ -34,7 +34,8 @@ use shared::download::{
     QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::{BackendError, DownloadBackend, ImportMode};
+use soulbeet::{BackendError, DownloadBackend, ImportMode, VerifyPolicy};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -94,6 +95,7 @@ pub struct NewBatch {
     pub target: PathBuf,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
+    pub verify_policy: VerifyPolicy,
 }
 
 /// The batch a request's files go into.
@@ -126,7 +128,9 @@ impl NewBatch {
             self.import_mode,
             self.backend,
         );
-        batch.with_duplicates(self.duplicates)
+        batch
+            .with_duplicates(self.duplicates)
+            .with_verify_policy(self.verify_policy)
     }
 }
 
@@ -192,12 +196,27 @@ pub(crate) async fn enqueue_and_watch(
     batch: impl Into<RequestBatch>,
     acquisition: Acquisition,
 ) -> Result<Vec<QueuedDownload>, Failure> {
-    tokio::spawn(queue_and_watch(
+    enqueue_and_watch_with_durations(ledger, ctx, backend, batch, acquisition, HashMap::new()).await
+}
+
+/// Like [`enqueue_and_watch`], but accepts caller-supplied per-slot wanted/original
+/// track durations (`slot -> duration_s`) that take precedence over peer-reported
+/// `DownloadableItem::duration` during post-download truncation verification.
+pub(crate) async fn enqueue_and_watch_with_durations(
+    ledger: &Ledger,
+    ctx: &UserCtx,
+    backend: Arc<dyn DownloadBackend>,
+    batch: impl Into<RequestBatch>,
+    acquisition: Acquisition,
+    expected_durations: HashMap<u32, u32>,
+) -> Result<Vec<QueuedDownload>, Failure> {
+    tokio::spawn(queue_and_watch_with_durations(
         ledger.clone(),
         ctx.clone(),
         backend,
         batch.into(),
         acquisition,
+        expected_durations,
     ))
     .await
     .map_err(|e| request_stopped(&e))?
@@ -210,6 +229,17 @@ pub(super) async fn queue_and_watch(
     backend: Arc<dyn DownloadBackend>,
     batch: RequestBatch,
     acquisition: Acquisition,
+) -> Result<Vec<QueuedDownload>, Failure> {
+    queue_and_watch_with_durations(ledger, ctx, backend, batch, acquisition, HashMap::new()).await
+}
+
+async fn queue_and_watch_with_durations(
+    ledger: Ledger,
+    ctx: UserCtx,
+    backend: Arc<dyn DownloadBackend>,
+    batch: RequestBatch,
+    acquisition: Acquisition,
+    expected_durations: HashMap<u32, u32>,
 ) -> Result<Vec<QueuedDownload>, Failure> {
     let Acquisition {
         job,
@@ -412,6 +442,10 @@ pub(super) async fn queue_and_watch(
                         max_sources,
                         sent: std::mem::take(&mut sent[at]),
                         job: slot(n),
+                        expected_duration_s: expected_durations
+                            .get(&n)
+                            .copied()
+                            .or(picked[at].1.duration),
                     }
                 })
                 .collect();
@@ -442,6 +476,10 @@ pub(super) async fn queue_and_watch(
             let transfers = (enqueued.iter())
                 .map(|(at, n, q)| WatchedTransfer {
                     sent: std::mem::take(&mut sent[*at]),
+                    expected_duration_s: expected_durations
+                        .get(n)
+                        .copied()
+                        .or(picked[*at].1.duration),
                     ..WatchedTransfer::enqueued(q, slot(*n))
                 })
                 .collect();
@@ -641,6 +679,7 @@ mod tests {
             target,
             import_mode: running.import_mode,
             duplicates: DuplicateRule::Guarded,
+            verify_policy: VerifyPolicy::Standard,
         }
     }
 
@@ -665,6 +704,7 @@ mod tests {
             target: PathBuf::from("/music"),
             import_mode: ImportMode::Singleton,
             duplicates: DuplicateRule::Guarded,
+            verify_policy: VerifyPolicy::Standard,
         }
     }
 

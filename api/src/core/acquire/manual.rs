@@ -151,6 +151,7 @@ async fn start_manual(
         target,
         import_mode,
         duplicates,
+        verify_policy: soulbeet::VerifyPolicy::Standard,
     };
     let acquisition = Acquisition {
         job,

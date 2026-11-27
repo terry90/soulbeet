@@ -9,9 +9,11 @@ use shared::download::{
     DownloadProgress, DownloadState, ImportChoice, ImportRefusal, KeptImport, MatchChoices,
 };
 
+mod diagnostics;
 mod item;
 mod picker;
 use api::CancelDownloadRequest;
+pub use diagnostics::JobDiagnosticsPanel;
 use item::DownloadItem;
 
 use crate::{friendly_error, IconDownload, IconX};
@@ -271,11 +273,13 @@ fn focus(element: Option<Rc<MountedData>>) {
     }
 }
 
-/// Picks and match loads come from the picker; Retry and as-is from the row.
+/// Picks, tagged as-is, and match loads come from the picker; Retry and bare as-is from the row.
 fn sent_by_picker(choice: &ImportChoice) -> bool {
     matches!(
         choice,
-        ImportChoice::Candidate { .. } | ImportChoice::MusicBrainz(_)
+        ImportChoice::Candidate { .. }
+            | ImportChoice::MusicBrainz(_)
+            | ImportChoice::AsIsWithTags(_)
     )
 }
 
