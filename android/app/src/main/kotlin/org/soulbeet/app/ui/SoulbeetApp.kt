@@ -292,6 +292,9 @@ private fun MainStudioShell(
                     onOpenCultureEditor = { viewModel.setShowCultureEditor(true) },
                     onDismissCultureEditor = { viewModel.setShowCultureEditor(false) },
                     onSaveCultureProfile = viewModel::updateCultureProfile,
+                    liveWeatherLocationEnabled = state.liveWeatherLocationEnabled,
+                    onToggleLiveWeatherLocation = viewModel::setLiveWeatherLocationEnabled,
+                    onShowMessage = viewModel::showMessage,
                 )
 
                 AppTab.SEARCH -> SearchScreen(

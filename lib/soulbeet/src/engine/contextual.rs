@@ -423,11 +423,21 @@ fn localized_playlist_terms(slug: &str, languages: &[String]) -> Vec<&'static st
             ("winter_holiday", "sv" | "no" | "da") => Some("jul"),
             ("winter_holiday", "nl") => Some("kerst"),
             ("winter_holiday", "pl") => Some("swieta"),
+            ("cozy_winter", "fr") => Some("hiver"),
+            ("cozy_winter", "de") => Some("winter"),
+            ("cozy_winter", "es") => Some("invierno"),
+            ("valentines", "fr") => Some("saint valentin"),
+            ("valentines", "es") => Some("san valentin"),
+            ("valentines", "it") => Some("san valentino"),
             ("carnival", "pt" | "es" | "fr") => Some("carnaval"),
             ("summer", "fr") => Some("ete"),
             ("summer", "es") => Some("verano"),
             ("summer", "pt") => Some("verao"),
             ("summer", "de") => Some("sommer"),
+            ("summer_solstice", "fr") => Some("fete de la musique"),
+            ("summer_solstice", "sv") => Some("midsommar"),
+            ("summer_solstice", "de") => Some("sommer"),
+            ("late_summer_reset", "fr") => Some("rentree"),
             ("autumn", "fr") => Some("automne"),
             ("autumn", "de") => Some("herbst"),
             ("autumn", "es") => Some("otono"),
@@ -634,6 +644,9 @@ pub async fn infer_culture_profile(
         local_culture_ratio: local_culture_ratio.clamp(0.0, 1.0),
         inferred_area_weights,
         inferred_local_tags,
+        weather_city: None,
+        weather_lat: None,
+        weather_lon: None,
     }
 }
 
@@ -1741,6 +1754,7 @@ mod tests {
             local_culture_ratio: 0.45,
             inferred_area_weights: vec![("JP".into(), 0.78), ("GB".into(), 0.22)],
             inferred_local_tags: vec!["city pop".into()],
+            ..Default::default()
         };
 
         let run_with = |steering: CultureSteering| {

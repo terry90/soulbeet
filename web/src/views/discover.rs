@@ -18,7 +18,10 @@ use ui::{
 };
 
 use crate::auth::use_auth;
-use crate::web_player::use_studio;
+use crate::web_player::{
+    fetch_browser_coarse_coords, fetch_contextual_mixes_with_context, local_browser_hour,
+    local_browser_weekday, use_studio,
+};
 use crate::Route;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +117,11 @@ pub fn DiscoverPage() -> Element {
     let mut editing_culture = use_signal(|| false);
     let mut country_input = use_signal(String::new);
     let mut langs_input = use_signal(String::new);
+    let mut weather_city_input = use_signal(String::new);
     let mut ratio_pct = use_signal(|| 45u8);
     let mut saving_culture = use_signal(|| false);
+    let mut toggling_live_loc = use_signal(|| false);
+    let mut live_loc_reset_gen = use_signal(|| 0u32);
 
     // Discover header refresh + progress polling
     let mut discovery_cfg =
@@ -181,24 +187,21 @@ pub fn DiscoverPage() -> Element {
                     .unwrap_or(0);
                 discovery_cfg.restart();
                 spawn(async move {
-                    let local_hour = Some(
-                        chrono::Local::now()
-                            .format("%H")
-                            .to_string()
-                            .parse::<u8>()
-                            .unwrap_or(12),
-                    );
-                    let (triage_res, mixes_res) = futures::future::join(
+                    let gen = studio.next_contextual_mixes_gen();
+                    let live_location = *studio.live_weather_location.peek();
+                    let (triage_res, (mixes_res, perm_denied)) = futures::future::join(
                         auth.call(api::list_triage_queue()),
-                        auth.call(api::list_active_contextual_mixes(local_hour)),
+                        fetch_contextual_mixes_with_context(&auth, live_location),
                     )
                     .await;
+                    if perm_denied {
+                        studio.set_live_weather_location(false);
+                    }
                     if let Ok(triage) = triage_res {
                         studio.triage_tracks.set(triage);
                     }
                     if let Ok(refreshed_mixes) = mixes_res {
-                        studio.contextual_mixes.set(refreshed_mixes);
-                        studio.reclassify_playlists();
+                        studio.apply_contextual_mixes_if_current(gen, refreshed_mixes);
                     }
                     let noun = if total_new == 1 { "track" } else { "tracks" };
                     studio.show_toast(format!("Discovery refreshed: {total_new} new {noun}"));
@@ -277,9 +280,13 @@ pub fn DiscoverPage() -> Element {
         .iter()
         .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
+    let hero_slug = seasonal.as_ref().map(|h| h.slug.as_str());
     let other_mixes: Vec<_> = mixes
         .iter()
-        .filter(|m| m.kind != ContextualMixKind::Seasonal)
+        .filter(|m| {
+            Some(m.slug.as_str()) != hero_slug
+                && !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0)
+        })
         .cloned()
         .collect();
 
@@ -296,6 +303,7 @@ pub fn DiscoverPage() -> Element {
         move |_| {
             country_input.set(culture.home_country.clone().unwrap_or_default());
             langs_input.set(culture.preferred_languages.join(", "));
+            weather_city_input.set(culture.weather_city.clone().unwrap_or_default());
             ratio_pct.set((culture.local_culture_ratio.clamp(0.0, 1.0) * 100.0).round() as u8);
             editing_culture.set(true);
         }
@@ -310,10 +318,23 @@ pub fn DiscoverPage() -> Element {
             .filter(|s| !s.is_empty())
             .collect();
         let ratio = f32::from(ratio_pct()) / 100.0;
+        let weather_city_trimmed = weather_city_input().trim().to_string();
+        let existing_city = studio
+            .culture_profile
+            .peek()
+            .weather_city
+            .clone()
+            .unwrap_or_default();
+        let weather_city = if weather_city_trimmed.eq_ignore_ascii_case(existing_city.trim()) {
+            None
+        } else {
+            Some(weather_city_trimmed)
+        };
         let req = UpdateCultureProfileRequest {
             home_country: (!country.is_empty()).then_some(country),
             preferred_languages: Some(languages),
             local_culture_ratio: Some(ratio),
+            weather_city,
         };
         spawn(async move {
             match auth.call(api::update_culture_profile(req)).await {
@@ -321,18 +342,15 @@ pub fn DiscoverPage() -> Element {
                     studio.culture_profile.set(updated);
                     editing_culture.set(false);
                     studio.show_toast("Taste DNA updated");
-                    let local_hour = Some(
-                        chrono::Local::now()
-                            .format("%H")
-                            .to_string()
-                            .parse::<u8>()
-                            .unwrap_or(12),
-                    );
-                    if let Ok(refreshed) = auth
-                        .call(api::list_active_contextual_mixes(local_hour))
-                        .await
-                    {
-                        studio.contextual_mixes.set(refreshed);
+                    let gen = studio.next_contextual_mixes_gen();
+                    let live_location = *studio.live_weather_location.peek();
+                    let (mixes_res, perm_denied) =
+                        fetch_contextual_mixes_with_context(&auth, live_location).await;
+                    if perm_denied {
+                        studio.set_live_weather_location(false);
+                    }
+                    if let Ok(refreshed) = mixes_res {
+                        studio.apply_contextual_mixes_if_current(gen, refreshed);
                     }
                 }
                 Err(e) => {
@@ -340,6 +358,62 @@ pub fn DiscoverPage() -> Element {
                 }
             }
             saving_culture.set(false);
+        });
+    };
+
+    let live_loc = (studio.live_weather_location)();
+
+    let on_toggle_live_location = move |evt: FormEvent| {
+        if *toggling_live_loc.peek() {
+            return;
+        }
+        let want_enabled = evt.checked();
+        toggling_live_loc.set(true);
+        spawn(async move {
+            let gen = studio.next_contextual_mixes_gen();
+            let local_hour = local_browser_hour();
+            let local_weekday = local_browser_weekday();
+            if want_enabled {
+                match fetch_browser_coarse_coords(true).await {
+                    crate::web_player::BrowserGeoResult::Coords(lat, lon) => {
+                        studio.set_live_weather_location(true);
+                        if let Ok(refreshed) = auth
+                            .call(api::list_active_contextual_mixes(
+                                local_hour,
+                                local_weekday,
+                                Some(lat),
+                                Some(lon),
+                            ))
+                            .await
+                        {
+                            studio.apply_contextual_mixes_if_current(gen, refreshed);
+                        }
+                        studio.show_toast("Live approximate weather enabled");
+                    }
+                    crate::web_player::BrowserGeoResult::PermissionDenied
+                    | crate::web_player::BrowserGeoResult::Unavailable => {
+                        studio.set_live_weather_location(false);
+                        live_loc_reset_gen += 1;
+                        studio.show_toast(
+                            "Location unavailable; using saved city or IP weather",
+                        );
+                    }
+                }
+            } else {
+                studio.set_live_weather_location(false);
+                if let Ok(refreshed) = auth
+                    .call(api::list_active_contextual_mixes(
+                        local_hour,
+                        local_weekday,
+                        None,
+                        None,
+                    ))
+                    .await
+                {
+                    studio.apply_contextual_mixes_if_current(gen, refreshed);
+                }
+            }
+            toggling_live_loc.set(false);
         });
     };
 
@@ -756,6 +830,7 @@ pub fn DiscoverPage() -> Element {
                 div { class: "space-y-3",
                     TasteDnaBar {
                         profile: culture.clone(),
+                        live_weather_location: live_loc,
                         on_edit: open_culture_editor,
                     }
 
@@ -797,6 +872,42 @@ pub fn DiscoverPage() -> Element {
                                         value: "{langs_input}",
                                         class: "w-full h-9 px-3 rounded-[8px] bg-beet-sunken border border-beet-border-default text-[13px] text-beet-text-primary outline-none",
                                         oninput: move |evt| langs_input.set(evt.value()),
+                                    }
+                                }
+                            }
+
+                            label { class: "space-y-1 block",
+                                span { class: "text-[11px] tabular-nums-mono uppercase tracking-wider text-beet-text-tertiary",
+                                    "Weather City (optional)"
+                                }
+                                input {
+                                    r#type: "text",
+                                    maxlength: "100",
+                                    placeholder: "Auto (by IP) or city, e.g. Lyon",
+                                    value: "{weather_city_input}",
+                                    class: "w-full h-9 px-3 rounded-[8px] bg-beet-sunken border border-beet-border-default text-[13px] text-beet-text-primary outline-none",
+                                    oninput: move |evt| weather_city_input.set(evt.value()),
+                                }
+                                p { class: "text-[11px] text-beet-text-tertiary",
+                                    "Used for Rainy / Snow / Storm / Sunny mixes. Leave blank for automatic IP weather."
+                                }
+                            }
+
+                            label { class: "flex items-start gap-2.5 rounded-[8px] bg-beet-sunken border border-beet-border-default px-3 py-2.5 cursor-pointer",
+                                input {
+                                    key: "live-loc-{live_loc_reset_gen()}",
+                                    r#type: "checkbox",
+                                    checked: live_loc,
+                                    disabled: toggling_live_loc(),
+                                    class: "mt-0.5 h-4 w-4 rounded accent-beet-leaf-solid cursor-pointer disabled:opacity-50",
+                                    onchange: on_toggle_live_location,
+                                }
+                                div { class: "space-y-0.5",
+                                    span { class: "block text-[13px] font-medium text-beet-text-primary",
+                                        "Live approximate location"
+                                    }
+                                    p { class: "text-[11px] text-beet-text-tertiary",
+                                        "Follows your local weather as you travel (~11 km city accuracy, never stores exact GPS)"
                                     }
                                 }
                             }
@@ -884,7 +995,7 @@ pub fn DiscoverPage() -> Element {
             if !other_mixes.is_empty() {
                 section { class: "space-y-3",
                     h2 { class: "text-[18px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                        "Moment & Rolling Mixes"
+                        "Curated Mixes"
                     }
                     div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
                         for mix in other_mixes.iter() {

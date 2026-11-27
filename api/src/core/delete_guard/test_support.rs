@@ -321,9 +321,12 @@ impl Listeners for FakeNavidrome {
                 album: Some(song.album),
                 album_id: (!s.minimal.contains(&user)).then_some(album_id),
                 genre: None,
+                genres: vec![],
                 duration: None,
                 user_rating: (song.rating > 0).then_some(song.rating),
                 play_count: None,
+                created: None,
+                played: None,
                 starred: s
                     .stars
                     .contains(&pair)
@@ -364,10 +367,13 @@ impl Listeners for FakeNavidrome {
                     album: Some(song.album.clone()),
                     album_id: Some(album_id.clone()),
                     genre: None,
+                    genres: vec![],
                     duration: Some(song.duration as u32),
                     user_rating: (s.rating(&user, song_id) > 0)
                         .then(|| s.rating(&user, song_id)),
                     play_count: Some(song.play_count as u32),
+                    created: None,
+                    played: None,
                     starred: s
                         .stars
                         .contains(&(user.clone(), song_id.clone()))

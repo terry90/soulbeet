@@ -1,5 +1,7 @@
 package org.soulbeet.app
 
+import java.util.Calendar
+import java.util.Locale
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -10,6 +12,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.soulbeet.app.data.AcquireWsEvent
+import org.soulbeet.app.data.CoarseLocationProvider
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.SoulbeetApiClient
 import org.soulbeet.app.data.StoredAuthKind
@@ -345,17 +348,34 @@ class FormattingAndThemeTest {
         val cases = listOf(
             Triple("winter_holiday", "mix.seasonal.winter_holiday", "Christmas Mix"),
             Triple("new_years_eve", "mix.seasonal.new_years_eve", "New Year's Eve"),
+            Triple("cozy_winter", "mix.seasonal.cozy_winter", "Cozy Winter"),
             Triple("lunar_new_year", "mix.seasonal.lunar_new_year", "Lunar New Year"),
+            Triple("valentines", "mix.seasonal.valentines", "Date Night"),
             Triple("carnival", "mix.seasonal.carnival", "Carnival Beats"),
+            Triple("celtic_spring", "mix.seasonal.celtic_spring", "Celtic Folk"),
             Triple("spring", "mix.seasonal.spring", "Spring Awakening"),
             Triple("summer", "mix.seasonal.summer", "Summer Anthems"),
+            Triple("summer_solstice", "mix.seasonal.summer_solstice", "Midsummer Solstice"),
+            Triple("late_summer_reset", "mix.seasonal.late_summer_reset", "Late Summer Reset"),
             Triple("autumn", "mix.seasonal.autumn", "Autumn Sessions"),
             Triple("halloween", "mix.seasonal.halloween", "Darkwave Halloween"),
-            Triple("diwali", "mix.seasonal.diwali", "Diwali Celebration"),
             Triple("drive", "mix.moment.drive", "Drive Mix"),
             Triple("morning", "mix.moment.morning", "Morning Lift"),
             Triple("focus", "mix.moment.focus", "Deep Focus"),
+            Triple("evening_unwind", "mix.moment.evening_unwind", "Evening Unwind"),
+            Triple("dinner_groove", "mix.moment.dinner_groove", "Dinner Groove"),
             Triple("late_night", "mix.moment.late_night", "Late Night"),
+            Triple("rainy_day", "mix.moment.rainy_day", "Rainy Day"),
+            Triple("snow_day", "mix.moment.snow_day", "Snow Day"),
+            Triple("storm_night", "mix.moment.storm_night", "Storm & Thunder"),
+            Triple("sunny_day", "mix.moment.sunny_day", "Sunny Vibes"),
+            Triple("friday_night", "mix.moment.friday_night", "Friday Night Warmup"),
+            Triple("sunday_morning", "mix.moment.sunday_morning", "Sunday Morning Coffee"),
+            Triple("forgotten_gems", "mix.moment.forgotten_gems", "Forgotten Gems"),
+            Triple("fresh_arrivals", "mix.moment.fresh_arrivals", "Fresh Arrivals"),
+            Triple("decade_80s", "mix.moment.decade_80s", "80s Wave"),
+            Triple("decade_90s", "mix.moment.decade_90s", "90s Mix"),
+            Triple("decade_2000s", "mix.moment.decade_2000s", "2000s Mix"),
             Triple("conservative", "mix.rolling.conservative", "Comfort Zone"),
             Triple("comfort", "mix.rolling.comfort", "Comfort Zone"),
             Triple("balanced", "mix.rolling.balanced", "Fresh Picks"),
@@ -369,7 +389,174 @@ class FormattingAndThemeTest {
             Triple("___", "...", "Curated Mix"),
         )
         for ((slug, key, expected) in cases) {
-            assertEquals("slug=$slug key=$key", expected, SoulbeetApiClient.defaultMixCopy(slug, key).first)
+            val (title, subtitle) = SoulbeetApiClient.defaultMixCopy(slug, key)
+            assertEquals("slug=$slug key=$key", expected, title)
+            assertTrue("slug=$slug subtitle should be non-blank", subtitle.isNotBlank())
+        }
+
+        // Removed diwali mix falls back to humanized title and generic subtitle.
+        val (diwaliTitle, diwaliSub) = SoulbeetApiClient.defaultMixCopy("diwali", "mix.seasonal.diwali")
+        assertEquals("Diwali", diwaliTitle)
+        assertEquals("Contextual Soulbeet mix", diwaliSub)
+
+        // Weather-reactive mix subtitles match Rust UI i18n copy verbatim.
+        assertEquals(
+            "Soft acoustic folk, piano, and warm reflective melodies for rainy weather.",
+            SoulbeetApiClient.defaultMixCopy("rainy_day", "mix.moment.rainy_day").second,
+        )
+        assertEquals(
+            "Hushed Nordic folk, gentle piano, and ambient warmth for snowy skies.",
+            SoulbeetApiClient.defaultMixCopy("snow_day", "mix.moment.snow_day").second,
+        )
+        assertEquals(
+            "Brooding post-rock, shoegaze, and moody trip hop built for stormy weather.",
+            SoulbeetApiClient.defaultMixCopy("storm_night", "mix.moment.storm_night").second,
+        )
+        assertEquals(
+            "Bright funk, soul, indie pop, and sun-drenched grooves for clear skies.",
+            SoulbeetApiClient.defaultMixCopy("sunny_day", "mix.moment.sunny_day").second,
+        )
+    }
+
+    @Test
+    fun weatherMixParsesCleanlyWhenWeatherPayloadIsPresent() {
+        val client = SoulbeetApiClient()
+        val parsed = client.parseContextualMix(
+            JSONObject(
+                """
+                {
+                    "slug": "snow_day",
+                    "kind": "moment",
+                    "i18n_key": "mix.moment.snow_day",
+                    "owned_pct": 75,
+                    "exclude_from_core_taste": false,
+                    "track_count": 20,
+                    "target_tracks": 25,
+                    "weather_badge": {
+                        "condition": "snowy",
+                        "temperature_c": -2.1,
+                        "weather_code": 75,
+                        "is_day": true,
+                        "location_label": "Oslo, NO"
+                    }
+                }
+                """.trimIndent(),
+            ),
+        )
+        assertEquals("Snow Day", parsed.title)
+        assertEquals("moment", parsed.kind)
+        assertEquals(20, parsed.trackCount)
+    }
+
+    @Test
+    fun calendarDayOfWeekMapsToIsoWeekdayOneThroughSeven() {
+        assertEquals(1, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.MONDAY))
+        assertEquals(2, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.TUESDAY))
+        assertEquals(3, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.WEDNESDAY))
+        assertEquals(4, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.THURSDAY))
+        assertEquals(5, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.FRIDAY))
+        assertEquals(6, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SATURDAY))
+        assertEquals(7, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SUNDAY))
+    }
+
+    @Test
+    fun coarseLocationRoundingAndSanitizationHandleEdgeCases() {
+        assertEquals(45.8, CoarseLocationProvider.roundToTenthDegree(45.764), 0.0)
+        assertEquals(45.7, CoarseLocationProvider.roundToTenthDegree(45.74), 0.0)
+        assertEquals(-33.9, CoarseLocationProvider.roundToTenthDegree(-33.8688), 0.0)
+        assertEquals(0.0, CoarseLocationProvider.roundToTenthDegree(0.0), 0.0)
+
+        // Ensure -0.0 and tiny negative values normalize to positive +0.0 (never "-0.0").
+        val negZero = CoarseLocationProvider.roundToTenthDegree(-0.0)
+        assertEquals(0L, java.lang.Double.doubleToRawLongBits(negZero))
+        val tinyNeg = CoarseLocationProvider.roundToTenthDegree(-0.04)
+        assertEquals(0L, java.lang.Double.doubleToRawLongBits(tinyNeg))
+
+        // Valid coordinates are rounded to 0.1 degree.
+        assertEquals(45.8 to 4.8, CoarseLocationProvider.sanitizeCoarseCoordinates(45.764, 4.8357))
+        assertEquals(-33.9 to 151.2, CoarseLocationProvider.sanitizeCoarseCoordinates(-33.8688, 151.2093))
+        assertEquals(0.0 to 0.1, CoarseLocationProvider.sanitizeCoarseCoordinates(-0.02, 0.09))
+
+        // Invalid, out-of-range, and exact (0.0, 0.0) null-island fixes are rejected.
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(0.0, 0.0))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(Double.NaN, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, Double.NaN))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(Double.POSITIVE_INFINITY, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, Double.NEGATIVE_INFINITY))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(90.1, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(-90.1, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, 180.1))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, -180.1))
+    }
+
+    @Test
+    fun contextualMixesUrlFormatsCoarseCoordsWithRootLocaleAndOmitsInvalidOnes() {
+        val originalLocale = Locale.getDefault()
+        try {
+            // French locale uses comma as decimal separator; URL query params must still use dots.
+            Locale.setDefault(Locale.FRANCE)
+
+            val withCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com/",
+                localHour = 14,
+                localWeekday = 5,
+                lat = 45.764,
+                lon = -0.04,
+            )
+            assertEquals("14", withCoords.queryParameter("local_hour"))
+            assertEquals("5", withCoords.queryParameter("local_weekday"))
+            assertEquals("45.8", withCoords.queryParameter("lat"))
+            assertEquals("0.0", withCoords.queryParameter("lon"))
+
+            val negativeCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 8,
+                localWeekday = 1,
+                lat = -33.8688,
+                lon = -70.6693,
+            )
+            assertEquals("-33.9", negativeCoords.queryParameter("lat"))
+            assertEquals("-70.7", negativeCoords.queryParameter("lon"))
+
+            val withoutCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+            )
+            assertNull(withoutCoords.queryParameter("lat"))
+            assertNull(withoutCoords.queryParameter("lon"))
+
+            val partialCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = 45.8,
+                lon = null,
+            )
+            assertNull(partialCoords.queryParameter("lat"))
+            assertNull(partialCoords.queryParameter("lon"))
+
+            val outOfRangeCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = 95.0,
+                lon = 4.8,
+            )
+            assertNull(outOfRangeCoords.queryParameter("lat"))
+            assertNull(outOfRangeCoords.queryParameter("lon"))
+
+            val nanCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = Double.NaN,
+                lon = 4.8,
+            )
+            assertNull(nanCoords.queryParameter("lat"))
+            assertNull(nanCoords.queryParameter("lon"))
+        } finally {
+            Locale.setDefault(originalLocale)
         }
     }
 }

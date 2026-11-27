@@ -27,9 +27,13 @@ pub fn HomePage() -> Element {
         .iter()
         .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
+    let hero_slug = seasonal.as_ref().map(|h| h.slug.as_str());
     let moment_and_rolling: Vec<_> = mixes
         .iter()
-        .filter(|m| m.kind != ContextualMixKind::Seasonal)
+        .filter(|m| {
+            Some(m.slug.as_str()) != hero_slug
+                && !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0)
+        })
         .cloned()
         .collect();
 

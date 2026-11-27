@@ -50,6 +50,8 @@ pub struct CultureProfileSummary {
     pub home_country: String,
     pub primary_languages: Vec<String>,
     pub local_culture_ratio: f32,
+    #[serde(default)]
+    pub weather_city: Option<String>,
 }
 
 /// Lightweight summary of an active seasonal discovery pack for client bootstrap.

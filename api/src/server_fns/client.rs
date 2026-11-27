@@ -131,6 +131,7 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
         home_country: cp.effective_country().unwrap_or("").to_string(),
         primary_languages: cp.preferred_languages,
         local_culture_ratio: cp.local_culture_ratio,
+        weather_city: cp.weather_city,
     });
 
     // Only surface non-empty active seasonal mixes; fail gracefully to empty if Navidrome is
@@ -142,6 +143,8 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
             crate::config::CONFIG.navidrome_music_path(),
             &auth.0,
             chrono::Utc::now(),
+            None,
+            None,
             None,
         );
         match tokio::time::timeout(std::time::Duration::from_secs(3), mixes_fut).await {
