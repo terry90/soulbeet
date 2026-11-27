@@ -181,7 +181,11 @@ pub fn LibraryView() -> Element {
                                     let mut mix_items: Vec<(&DesktopPlaylist, PlaylistCategory)> = classified
                                         .iter()
                                         .copied()
-                                        .filter(|(_, cat)| cat.is_soulbeet_mix())
+                                        .filter(|(item, cat)| {
+                                            cat.is_soulbeet_mix()
+                                                && !(*cat == PlaylistCategory::Seasonal
+                                                    && item.playlist.song_count <= 0)
+                                        })
                                         .collect();
                                     mix_items.sort_by_key(|(_, cat)| cat.sort_rank());
 

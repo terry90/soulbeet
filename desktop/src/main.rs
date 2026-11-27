@@ -345,6 +345,7 @@ fn DesktopShell() -> Element {
                     },
                     on_keep: move |track| studio.keep_track(player, track),
                     on_drop: move |track| studio.drop_track(player, track),
+                    on_rate: move |(track, rating)| studio.rate_track(player, track, rating),
                     on_start_radio: move |track| studio.start_local_radio(player, track),
                 }
             }

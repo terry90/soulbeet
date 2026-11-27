@@ -104,6 +104,26 @@ pub static DISCOVERY_PROGRESS: LazyLock<
     RwLock<HashMap<String, shared::navidrome::DiscoveryProgress>>,
 > = LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Minimum wait before retrying ASAP seasonal pack generation for a user whose previous attempt
+/// yielded 0 tracks (guards against tight retry loops if upstream services or peers are dry).
+#[cfg(feature = "server")]
+const SEASONAL_RETRY_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+#[cfg(feature = "server")]
+static SEASONAL_LAST_ATTEMPT: LazyLock<RwLock<HashMap<String, tokio::time::Instant>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[cfg(feature = "server")]
+fn seasonal_cooldown_elapsed(
+    last_attempt: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    match last_attempt {
+        None => true,
+        Some(ts) => now.saturating_duration_since(ts) >= SEASONAL_RETRY_COOLDOWN,
+    }
+}
+
 /// Get or create a user channel, returning its sender
 #[cfg(feature = "server")]
 pub async fn get_or_create_user_channel(user: &UserId) -> broadcast::Sender<DownloadEvent> {
@@ -235,7 +255,7 @@ pub fn start_channel_cleanup_task() {
             CHANNEL_CLEANUP_INTERVAL_SECS, CHANNEL_STALE_THRESHOLD_SECS
         );
 
-        // Start the automation task (sync ratings, discovery)
+        // Start the automation task (startup ASAP seasonal check, then sync ratings & discovery)
         tokio::spawn(async {
             // A promote or removal runs to its end once started, so a track can only be left
             // Promoting or Removing by a previous process.
@@ -248,11 +268,15 @@ pub fn start_channel_cleanup_task() {
                 Ok(n) => info!("Reset {n} tracks left Promoting or Removing by a previous run"),
                 Err(e) => warn!("Could not reset tracks left Promoting or Removing: {e}"),
             }
-            // Wait 30s for server to be fully ready
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            // Wait 15s for DB and services to be ready, run the startup ASAP seasonal check
+            // strictly sequenced before the 6h automation loop so GENERATION_LOCKS never collide
+            // and rolling discovery is never starved.
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            run_seasonal_asap_check().await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
             repeat_spaced(Duration::from_secs(6 * 3600), run_automation).await;
         });
-        info!("Started automation task (6h after each run ends)");
+        info!("Started automation task (startup ASAP seasonal check in 15s, then 6h after each run ends)");
 
         tokio::spawn(async {
             let delay = first_recommendation_delay(&mut rand::rng());
@@ -344,6 +368,122 @@ async fn run_recommendations() {
                 user.username,
                 crate::core::logged(&f)
             ),
+        }
+    }
+}
+
+/// Runs once shortly after startup: for every user with discovery enabled, a discovery folder,
+/// and a configured download backend, checks whether any calendar-active seasonal mix has 0
+/// pending staged tracks and kicks off seasonal pack generation ASAP (guarded by the per-user
+/// generation lock and an in-memory retry cooldown).
+#[cfg(feature = "server")]
+async fn run_seasonal_asap_check() {
+    use crate::models::discovery_playlist::DiscoveryTrackRow;
+    use crate::models::folder::Folder;
+    use crate::models::user::User;
+    use crate::models::user_settings::UserSettings;
+    use shared::failure::FailureCode;
+
+    if crate::services::download_backend(None).await.is_err() {
+        info!("Seasonal ASAP check: no download backend configured, skipping");
+        return;
+    }
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        warn!(
+            "Seasonal ASAP check: importer unavailable ({}), skipping",
+            failure.message
+        );
+        return;
+    }
+
+    let connected_users = match User::get_connected_users().await {
+        Ok(users) => users,
+        Err(e) => {
+            warn!("Seasonal ASAP check: failed to list connected users: {}", e);
+            return;
+        }
+    };
+
+    let now_utc = chrono::Utc::now();
+    for user in connected_users {
+        let settings = match UserSettings::get(&user.id).await {
+            Ok(s) if s.discovery_enabled => s,
+            _ => continue,
+        };
+        let Some(ref folder_id) = settings.discovery_folder_id else {
+            continue;
+        };
+        if !matches!(Folder::get_by_id(folder_id).await, Ok(Some(_))) {
+            continue;
+        }
+
+        let now_inst = tokio::time::Instant::now();
+        {
+            let attempts = SEASONAL_LAST_ATTEMPT.read().await;
+            if !seasonal_cooldown_elapsed(attempts.get(&user.id).copied(), now_inst) {
+                continue;
+            }
+        }
+
+        let Ok((_, active_seasonal)) =
+            crate::core::contextual::list_calendar_active_seasonal_defs_in(
+                &crate::db::DB,
+                &user.id,
+                now_utc,
+            )
+            .await
+        else {
+            continue;
+        };
+
+        let mut empty_slugs = Vec::new();
+        for (def, _) in &active_seasonal {
+            let count = DiscoveryTrackRow::get_pending_by_folder_and_pack_in(
+                &crate::db::DB,
+                folder_id,
+                &def.slug,
+            )
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
+            if count == 0 {
+                empty_slugs.push(def.slug.as_str());
+            }
+        }
+        if empty_slugs.is_empty() {
+            continue;
+        }
+
+        {
+            let mut attempts = SEASONAL_LAST_ATTEMPT.write().await;
+            attempts.insert(user.id.clone(), now_inst);
+        }
+
+        info!(
+            "Seasonal ASAP check: building active empty seasonal mix(es) [{}] for user {}",
+            empty_slugs.join(", "),
+            user.username
+        );
+        match crate::server_fns::discovery::generate_seasonal_packs_for_user(&user.id).await {
+            Ok(imported) => {
+                info!(
+                    "Seasonal ASAP check: imported {} seasonal tracks for user {}",
+                    imported, user.username
+                );
+            }
+            Err(f) if f.code == FailureCode::AlreadyRunning => {
+                info!(
+                    "Seasonal ASAP check: discovery already running for user {}, skipping",
+                    user.username
+                );
+            }
+            Err(f) => {
+                warn!(
+                    "Seasonal ASAP check: seasonal generation failed for {}: {}",
+                    user.username,
+                    crate::core::logged(&f)
+                );
+            }
         }
     }
 }
@@ -523,5 +663,20 @@ mod tests {
             *starts.lock().unwrap(),
             vec![Duration::ZERO, 13 * hour, 20 * hour]
         );
+    }
+
+    #[test]
+    fn seasonal_asap_retry_cooldown_blocks_tight_loops() {
+        let now = tokio::time::Instant::now();
+        assert!(seasonal_cooldown_elapsed(None, now));
+        assert!(!seasonal_cooldown_elapsed(Some(now), now));
+        assert!(!seasonal_cooldown_elapsed(
+            Some(now),
+            now + Duration::from_secs(60)
+        ));
+        assert!(seasonal_cooldown_elapsed(
+            Some(now),
+            now + SEASONAL_RETRY_COOLDOWN
+        ));
     }
 }

@@ -1,25 +1,107 @@
-//! Discover 2.0 view: Active Seasonal Hero with live steering, interactive Fast Triage Deck
-//! (Card Stack & List modes with 5-second Undo), Contextual & Rolling Mixes, Seed Radio starter,
-//! Taste DNA editor (`UserCultureProfile`), and Discovery playlist generation controls.
+//! Discover 2.0 view: Clean Discover header with on-demand refresh & progress,
+//! Active Seasonal Hero with live steering, interactive Fast Triage Deck
+//! (Card Stack & List modes with 5-second Undo), Contextual & Rolling Mixes,
+//! Seed Radio starter, and Taste DNA editor (`UserCultureProfile`).
 
 use dioxus::prelude::*;
+use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase};
 use shared::recommendation::{
     ContextualMixKind, CultureSteering, SeedRadioRequest, UpdateCultureProfileRequest,
 };
+use shared::system::NavidromeStatus;
 use ui::{
-    discovery::DiscoveryOverview, format_discovery_badge, format_mix_subtitle, format_mix_title,
-    format_mix_window_badge, friendly_error, subsonic_cover_art_url, use_player, IconCheck,
-    IconHeart, IconLoader, IconMusic, IconPause, IconPlay, IconRadio, IconSparkles, IconThumbsDown,
-    PlayerTrack, SeasonalHeroCard, TasteDnaBar, TrackRow, TrackRowState,
+    format_discovery_badge, format_mix_subtitle, format_mix_title, format_mix_window_badge,
+    friendly_error, subsonic_cover_art_url, use_player, IconCheck, IconHeart, IconLoader,
+    IconMusic, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSettings, IconSparkles,
+    IconThumbsDown, PlayerTrack, SeasonalHeroCard, StarStrip, StarStripSize, TasteDnaBar,
+    TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
 use crate::web_player::use_studio;
+use crate::Route;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TriageLayout {
     Deck,
     List,
+}
+
+fn format_relative_time(ts: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| naive.and_utc().fixed_offset())
+    }) else {
+        return ts.to_string();
+    };
+    let delta = chrono::Utc::now().signed_duration_since(parsed);
+    let mins = delta.num_minutes();
+    if mins < 1 {
+        return "just now".to_string();
+    }
+    if mins < 60 {
+        return format!("{mins}m ago");
+    }
+    let hours = delta.num_hours();
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = delta.num_days();
+    format!("{days}d ago")
+}
+
+fn discovery_progress_summary(progress: &DiscoveryProgress) -> (String, u32) {
+    if progress.profiles.is_empty() {
+        return ("Preparing recommendations...".to_string(), 8);
+    }
+    let total_profiles = progress.profiles.len() as f64;
+    let mut completed_units = 0.0f64;
+    let mut active_label: Option<String> = None;
+
+    for pp in &progress.profiles {
+        match pp.phase {
+            ProfilePhase::Done | ProfilePhase::Skipped => {
+                completed_units += 1.0;
+            }
+            ProfilePhase::Waiting => {}
+            _ => {
+                let frac = if pp.total > 0 {
+                    (pp.current as f64 / pp.total as f64).clamp(0.0, 1.0)
+                } else {
+                    0.25
+                };
+                completed_units += frac;
+                if active_label.is_none() {
+                    if pp.total > 0 {
+                        active_label =
+                            Some(format!("{}: {} ({}/{})", pp.profile, pp.phase, pp.current, pp.total));
+                    } else {
+                        active_label = Some(format!("{}: {}", pp.profile, pp.phase));
+                    }
+                }
+            }
+        }
+    }
+
+    let pct = ((completed_units / total_profiles) * 100.0)
+        .round()
+        .clamp(6.0, 98.0) as u32;
+    let label = active_label.unwrap_or_else(|| "Generating fresh discovery tracks...".to_string());
+    (label, pct)
+}
+
+/// Returns true when `progress` is a terminal snapshot belonging to a newly triggered run
+/// (never a stale `Complete`/`Error` left over from before the user clicked Refresh Discovery).
+fn is_fresh_terminal_progress(
+    progress: &DiscoveryProgress,
+    observed_running: bool,
+    awaiting_new_run: bool,
+    pre_click_started_at: Option<&str>,
+) -> bool {
+    if !progress.is_terminal() {
+        return false;
+    }
+    observed_running || (awaiting_new_run && progress.started_at.as_deref() != pre_click_started_at)
 }
 
 #[component]
@@ -34,16 +116,166 @@ pub fn DiscoverPage() -> Element {
     let mut langs_input = use_signal(String::new);
     let mut ratio_pct = use_signal(|| 45u8);
     let mut saving_culture = use_signal(|| false);
-    let mut show_engine_controls = use_signal(|| false);
+
+    // Discover header refresh + progress polling
+    let mut discovery_cfg =
+        use_resource(move || async move { auth.call(api::get_discovery_config()).await });
+    let mut poll_tick = use_signal(|| 0u32);
+    let progress_res = use_resource(move || {
+        let _ = poll_tick();
+        async move { auth.call(api::get_discovery_progress()).await.ok().flatten() }
+    });
+    let mut starting_refresh = use_signal(|| false);
+    let mut awaiting_new_run = use_signal(|| false);
+    let mut pre_click_started_at = use_signal(|| None::<String>);
+    let mut observed_running = use_signal(|| false);
+    let mut refresh_error = use_signal(|| None::<String>);
+
+    // Poll every 2.5s while a generation is active (also catches an already-running job on mount)
+    use_future(move || async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(2500).await;
+            let server_running = progress_res
+                .peek()
+                .as_ref()
+                .and_then(|p| p.as_ref())
+                .is_some_and(|p| p.status == GenerationStatus::Running);
+            if server_running || *starting_refresh.peek() || *awaiting_new_run.peek() {
+                poll_tick += 1;
+            }
+        }
+    });
+
+    // React to server progress transitions (Running -> Complete / Error), ignoring any stale
+    // terminal snapshot cached from a prior run before Refresh Discovery was clicked.
+    use_effect(move || {
+        let current = progress_res.read().as_ref().and_then(|p| p.clone());
+        let fresh_terminal = current.as_ref().is_some_and(|p| {
+            is_fresh_terminal_progress(
+                p,
+                *observed_running.peek(),
+                *awaiting_new_run.peek(),
+                pre_click_started_at.peek().as_deref(),
+            )
+        });
+        match current.as_ref().map(|p| &p.status) {
+            Some(GenerationStatus::Running) => {
+                if !*observed_running.peek() {
+                    observed_running.set(true);
+                }
+                if *awaiting_new_run.peek() {
+                    awaiting_new_run.set(false);
+                }
+                if *starting_refresh.peek() {
+                    starting_refresh.set(false);
+                }
+            }
+            Some(GenerationStatus::Complete) if fresh_terminal => {
+                observed_running.set(false);
+                awaiting_new_run.set(false);
+                starting_refresh.set(false);
+                let total_new = current
+                    .as_ref()
+                    .and_then(|p| p.result.as_ref())
+                    .map(|r| r.total_imported)
+                    .unwrap_or(0);
+                discovery_cfg.restart();
+                spawn(async move {
+                    let local_hour = Some(
+                        chrono::Local::now()
+                            .format("%H")
+                            .to_string()
+                            .parse::<u8>()
+                            .unwrap_or(12),
+                    );
+                    let (triage_res, mixes_res) = futures::future::join(
+                        auth.call(api::list_triage_queue()),
+                        auth.call(api::list_active_contextual_mixes(local_hour)),
+                    )
+                    .await;
+                    if let Ok(triage) = triage_res {
+                        studio.triage_tracks.set(triage);
+                    }
+                    if let Ok(refreshed_mixes) = mixes_res {
+                        studio.contextual_mixes.set(refreshed_mixes);
+                        studio.reclassify_playlists();
+                    }
+                    let noun = if total_new == 1 { "track" } else { "tracks" };
+                    studio.show_toast(format!("Discovery refreshed: {total_new} new {noun}"));
+                });
+            }
+            Some(GenerationStatus::Error) if fresh_terminal => {
+                observed_running.set(false);
+                awaiting_new_run.set(false);
+                starting_refresh.set(false);
+                let msg = current
+                    .as_ref()
+                    .and_then(|p| p.failure.as_ref())
+                    .map(|f| f.message.clone())
+                    .unwrap_or_else(|| "Discovery generation failed".to_string());
+                refresh_error.set(Some(msg));
+            }
+            _ => {}
+        }
+    });
 
     // Seed Radio form
     let mut radio_artist = use_signal(String::new);
     let mut radio_loading = use_signal(|| false);
 
+    let cfg_info = match &*discovery_cfg.read() {
+        Some(Ok(c)) => Some(c.clone()),
+        _ => None,
+    };
+    let current_progress = progress_res.read().as_ref().and_then(|p| p.clone());
+    let is_generating = starting_refresh()
+        || awaiting_new_run()
+        || current_progress
+            .as_ref()
+            .is_some_and(|p| p.status == GenerationStatus::Running);
+    let nav_status = auth.navidrome_status();
+    let nav_unlinked = matches!(
+        nav_status,
+        NavidromeStatus::NotLinked | NavidromeStatus::InvalidCredentials | NavidromeStatus::Unknown
+    );
+    let discovery_disabled = cfg_info.as_ref().is_some_and(|c| !c.enabled);
+    let last_updated_label = cfg_info
+        .as_ref()
+        .and_then(|c| c.last_generated_at.as_deref())
+        .map(|ts| format!("Updated {}", format_relative_time(ts)));
+
+    let handle_refresh_discovery = move |_| {
+        if is_generating || discovery_disabled || nav_unlinked {
+            return;
+        }
+        let prev_started = progress_res
+            .peek()
+            .as_ref()
+            .and_then(|p| p.as_ref())
+            .and_then(|p| p.started_at.clone());
+        pre_click_started_at.set(prev_started);
+        refresh_error.set(None);
+        starting_refresh.set(true);
+        awaiting_new_run.set(true);
+        spawn(async move {
+            match auth.call(api::start_discovery_generation()).await {
+                Ok(()) => {
+                    poll_tick += 1;
+                }
+                Err(e) => {
+                    starting_refresh.set(false);
+                    awaiting_new_run.set(false);
+                    refresh_error.set(Some(friendly_error(&e)));
+                    poll_tick += 1;
+                }
+            }
+        });
+    };
+
     let mixes = studio.contextual_mixes.read().clone();
     let seasonal = mixes
         .iter()
-        .find(|m| m.kind == ContextualMixKind::Seasonal)
+        .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
     let other_mixes: Vec<_> = mixes
         .iter()
@@ -136,7 +368,7 @@ pub fn DiscoverPage() -> Element {
                             let cover = nav
                                 .as_ref()
                                 .map(|i| subsonic_cover_art_url(i, &t.song_id, 256));
-                            PlayerTrack {
+                            let mut pt = PlayerTrack {
                                 id: t.song_id.clone(),
                                 title: t.title,
                                 artist: t.artist,
@@ -144,9 +376,13 @@ pub fn DiscoverPage() -> Element {
                                 cover_art_url: cover,
                                 cover_art_id: Some(t.song_id),
                                 duration_secs: t.duration,
+                                starred: t.starred,
+                                rating: t.rating.unwrap_or(0).min(5),
                                 reason_label: Some(ui::format_candidate_reason(&t.reason)),
                                 ..Default::default()
-                            }
+                            };
+                            studio.apply_curation_overrides(&mut pt);
+                            pt
                         })
                         .collect();
                     if tracks.is_empty() {
@@ -168,6 +404,101 @@ pub fn DiscoverPage() -> Element {
 
     rsx! {
         div { class: "space-y-8",
+            // 0. Discover Header (Refresh Discovery + Last Updated + Settings + Inline Progress)
+            header { class: "space-y-3",
+                div { class: "flex flex-wrap items-center justify-between gap-3",
+                    div { class: "flex flex-wrap items-baseline gap-2.5",
+                        h1 { class: "text-[22px] font-bold tracking-[-0.02em] text-beet-text-primary",
+                            "Discover"
+                        }
+                        if let Some(ref updated) = last_updated_label {
+                            span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                "{updated}"
+                            }
+                        }
+                    }
+
+                    div { class: "flex items-center gap-2",
+                        button {
+                            r#type: "button",
+                            disabled: is_generating || discovery_disabled || nav_unlinked,
+                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer transition-[filter]",
+                            onclick: handle_refresh_discovery,
+                            IconRefreshCw {
+                                size: 14,
+                                class: if is_generating { "animate-spin motion-reduce:animate-none".to_string() } else { String::new() },
+                            }
+                            span {
+                                if is_generating { "Refreshing..." } else { "Refresh Discovery" }
+                            }
+                        }
+                        Link {
+                            to: Route::SettingsPage {},
+                            class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium transition-colors",
+                            IconSettings { size: 14 }
+                            span { "Settings" }
+                        }
+                    }
+                }
+
+                // Inline setup prompt when Navidrome is not linked or Discovery is disabled
+                if nav_unlinked {
+                    div { class: "flex flex-wrap items-center justify-between gap-2 rounded-[10px] bg-beet-accent-surface border border-beet-accent/30 px-3.5 py-2.5 text-[12px] text-beet-accent-text",
+                        span { "Connect your Navidrome account to refresh Discovery playlists and sync your library." }
+                        Link {
+                            to: Route::SettingsPage {},
+                            class: "font-semibold underline underline-offset-2 hover:brightness-110 shrink-0",
+                            "Open Settings"
+                        }
+                    }
+                } else if discovery_disabled {
+                    div { class: "flex flex-wrap items-center justify-between gap-2 rounded-[10px] bg-beet-surface border border-beet-border-subtle px-3.5 py-2.5 text-[12px] text-beet-text-secondary",
+                        span { "Discovery generation is currently turned off in your library preferences." }
+                        Link {
+                            to: Route::SettingsPage {},
+                            class: "font-semibold text-beet-leaf-text hover:underline shrink-0",
+                            "Enable in Settings"
+                        }
+                    }
+                }
+
+                // Compact inline progress bar while discovery generation is running
+                if is_generating {
+                    {
+                        let (status_label, pct) = current_progress
+                            .as_ref()
+                            .filter(|p| p.status == GenerationStatus::Running)
+                            .map(discovery_progress_summary)
+                            .unwrap_or_else(|| ("Starting discovery refresh...".to_string(), 8));
+                        rsx! {
+                            div { class: "rounded-[12px] bg-beet-surface border border-beet-accent/30 px-4 py-3 space-y-2",
+                                div { class: "flex items-center justify-between gap-3 text-[12px]",
+                                    span { class: "inline-flex items-center gap-2 font-medium text-beet-text-primary truncate",
+                                        IconLoader { size: 13 }
+                                        span { class: "truncate", "{status_label}" }
+                                    }
+                                    span { class: "tabular-nums-mono text-[11px] font-semibold text-beet-accent-text shrink-0",
+                                        "{pct}%"
+                                    }
+                                }
+                                div { class: "h-1.5 w-full rounded-full bg-beet-surface-high overflow-hidden",
+                                    div {
+                                        class: "h-full rounded-full bg-beet-leaf-solid transition-[width] duration-300",
+                                        style: "width: {pct}%;",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref err) = refresh_error() {
+                    div { class: "rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-text/30 px-3.5 py-2 text-[12px] text-beet-crimson-text",
+                        "{err}"
+                    }
+                }
+            }
+
             // 1. Seasonal Hero Card
             if let Some(pack) = seasonal {
                 {
@@ -241,7 +572,7 @@ pub fn DiscoverPage() -> Element {
                             "Triage queue is clear"
                         }
                         p { class: "text-[13px] text-beet-text-secondary",
-                            "All staged discovery tracks have been reviewed. Generate a fresh batch below whenever you're ready."
+                            "All staged discovery tracks have been reviewed. Click Refresh Discovery above whenever you are ready for a fresh batch."
                         }
                     }
                 } else if triage_layout() == TriageLayout::Deck {
@@ -264,6 +595,7 @@ pub fn DiscoverPage() -> Element {
                         let t_keep = track.clone();
                         let t_star = track.clone();
                         let t_drop = track.clone();
+                        let t_rate = track.clone();
                         let t_inspect = track.clone();
                         rsx! {
                             div { class: "rounded-[16px] bg-beet-surface border border-beet-border-default p-5 sm:p-6 flex flex-col md:flex-row items-center gap-6",
@@ -327,6 +659,18 @@ pub fn DiscoverPage() -> Element {
                                         }
                                     }
 
+                                    div { class: "flex flex-wrap items-center justify-center md:justify-start gap-2.5",
+                                        span { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                            "Rate"
+                                        }
+                                        StarStrip {
+                                            rating: track.rating,
+                                            size: StarStripSize::Compact,
+                                            on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                            aria_label: format!("Rate {}", track.title),
+                                        }
+                                    }
+
                                     // 1-Tap Verdict Controls (with >= 8px gap between Drop and Keep!)
                                     div { class: "flex flex-wrap items-center justify-center md:justify-start gap-3 pt-1",
                                         button {
@@ -371,6 +715,7 @@ pub fn DiscoverPage() -> Element {
                                 let t_play = track.clone();
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
+                                let t_rate = track.clone();
                                 let t_inspect = track.clone();
                                 rsx! {
                                     TrackRow {
@@ -383,6 +728,7 @@ pub fn DiscoverPage() -> Element {
                                         state: TrackRowState::PendingDiscovery {
                                             days_remaining: track.days_remaining,
                                             reason_label: track.reason_label.clone(),
+                                            rating: track.rating,
                                         },
                                         on_play: move |_| {
                                             studio.play_or_toggle_triage(
@@ -394,6 +740,7 @@ pub fn DiscoverPage() -> Element {
                                         },
                                         on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                         on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
+                                        on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                         on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                     }
                                 }
@@ -577,31 +924,60 @@ pub fn DiscoverPage() -> Element {
                     }
                 }
             }
-
-            // 5. Classic Discovery Engine Generation Controls (collapsible to keep Discover calm)
-            section { class: "rounded-[12px] bg-beet-surface-low border border-beet-border-subtle p-4 space-y-3",
-                div { class: "flex items-center justify-between gap-3",
-                    div {
-                        h2 { class: "text-[15px] font-semibold text-beet-text-primary",
-                            "Discovery Playlist Engine"
-                        }
-                        p { class: "text-[12px] text-beet-text-tertiary",
-                            "Trigger full Last.fm + ListenBrainz playlist generation and inspect run telemetry."
-                        }
-                    }
-                    button {
-                        r#type: "button",
-                        class: "h-8 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer",
-                        onclick: move |_| show_engine_controls.toggle(),
-                        if show_engine_controls() { "Hide Engine" } else { "Show Engine" }
-                    }
-                }
-                if show_engine_controls() {
-                    div { class: "pt-2 border-t border-beet-border-subtle",
-                        DiscoveryOverview {}
-                    }
-                }
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_terminal_progress_is_ignored_until_new_run_is_observed() {
+        let stale_complete = DiscoveryProgress {
+            status: GenerationStatus::Complete,
+            started_at: Some("2026-11-27T08:00:00Z".into()),
+            ..Default::default()
+        };
+        // Prior Complete cached before click must NOT fire when awaiting new run.
+        assert!(!is_fresh_terminal_progress(
+            &stale_complete,
+            false,
+            true,
+            Some("2026-11-27T08:00:00Z"),
+        ));
+
+        let stale_error = DiscoveryProgress {
+            status: GenerationStatus::Error,
+            started_at: Some("2026-11-27T08:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(!is_fresh_terminal_progress(
+            &stale_error,
+            false,
+            true,
+            Some("2026-11-27T08:00:00Z"),
+        ));
+
+        // Instant finish of a NEW run (different started_at) IS accepted while awaiting_new_run.
+        let instant_complete = DiscoveryProgress {
+            status: GenerationStatus::Complete,
+            started_at: Some("2026-11-27T08:02:00Z".into()),
+            ..Default::default()
+        };
+        assert!(is_fresh_terminal_progress(
+            &instant_complete,
+            false,
+            true,
+            Some("2026-11-27T08:00:00Z"),
+        ));
+
+        // Terminal after observing Running is always accepted.
+        assert!(is_fresh_terminal_progress(
+            &stale_complete,
+            true,
+            false,
+            Some("2026-11-27T08:00:00Z"),
+        ));
     }
 }

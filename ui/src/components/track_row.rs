@@ -3,7 +3,7 @@ use shared::download::AcquireAndPlayStage;
 
 use crate::{
     IconCheck, IconHeart, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
-    IconSlidersHorizontal, IconSparkles, IconWifiOff, IconX, StarStrip, StarStripSize,
+    IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -80,6 +80,7 @@ pub enum TrackRowState {
     PendingDiscovery {
         days_remaining: Option<u32>,
         reason_label: Option<String>,
+        rating: u8,
     },
     /// Global catalog track not yet in the library; tappable for `Acquire & Play`.
     UnownedCatalog {
@@ -388,16 +389,31 @@ pub fn TrackRow(
                 match &state {
                     TrackRowState::Owned { starred, rating, .. } => {
                         let is_starred = *starred;
-                        let current_rating = *rating;
+                        let current_rating = (*rating).min(5);
                         rsx! {
                             if let Some(rate_cb) = on_rate {
-                                div { class: "hidden lg:flex items-center",
+                                div { class: "hidden sm:flex items-center",
                                     StarStrip {
                                         rating: current_rating,
                                         size: StarStripSize::Compact,
                                         on_rate: move |next| rate_cb.call(next),
                                         aria_label: format!("Rate {title}"),
                                     }
+                                }
+                                if current_rating > 0 {
+                                    span {
+                                        class: "inline-flex sm:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                        title: format!("Rated {current_rating} out of 5 stars"),
+                                        IconStar { size: 10, filled: true }
+                                        span { "{current_rating}" }
+                                    }
+                                }
+                            } else if current_rating > 0 {
+                                span {
+                                    class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                    title: format!("Rated {current_rating} out of 5 stars"),
+                                    IconStar { size: 10, filled: true }
+                                    span { "{current_rating}" }
                                 }
                             }
                             if let Some(star_cb) = on_star {
@@ -424,8 +440,34 @@ pub fn TrackRow(
                             }
                         }
                     }
-                    TrackRowState::PendingDiscovery { .. } => {
+                    TrackRowState::PendingDiscovery { rating, .. } => {
+                        let current_rating = (*rating).min(5);
                         rsx! {
+                            if let Some(rate_cb) = on_rate {
+                                div { class: "hidden sm:flex items-center",
+                                    StarStrip {
+                                        rating: current_rating,
+                                        size: StarStripSize::Compact,
+                                        on_rate: move |next| rate_cb.call(next),
+                                        aria_label: format!("Rate {title}"),
+                                    }
+                                }
+                                if current_rating > 0 {
+                                    span {
+                                        class: "inline-flex sm:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                        title: format!("Rated {current_rating} out of 5 stars"),
+                                        IconStar { size: 10, filled: true }
+                                        span { "{current_rating}" }
+                                    }
+                                }
+                            } else if current_rating > 0 {
+                                span {
+                                    class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                    title: format!("Rated {current_rating} out of 5 stars"),
+                                    IconStar { size: 10, filled: true }
+                                    span { "{current_rating}" }
+                                }
+                            }
                             div { class: "flex items-center gap-2",
                                 if let Some(keep_cb) = on_keep {
                                     button {
@@ -751,5 +793,48 @@ mod tests {
         dom_pick.rebuild_in_place();
         let html_pick = dioxus_ssr::render(&dom_pick);
         assert!(html_pick.contains("PICK SOURCE</span>"), "{html_pick}");
+    }
+
+    #[test]
+    fn renders_star_ratings_for_owned_and_pending_discovery_rows() {
+        let mut dom_readonly = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Rated Song".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::Owned {
+                        is_offline_cached: false,
+                        starred: false,
+                        rating: 4,
+                    },
+                }
+            }
+        });
+        dom_readonly.rebuild_in_place();
+        let html_readonly = dioxus_ssr::render(&dom_readonly);
+        assert!(
+            html_readonly.contains("Rated 4 out of 5 stars"),
+            "{html_readonly}"
+        );
+
+        let mut dom_disc = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Discovery Gem".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::PendingDiscovery {
+                        days_remaining: Some(5),
+                        reason_label: Some("Similar artist".to_string()),
+                        rating: 5,
+                    },
+                    on_rate: |_| {},
+                }
+            }
+        });
+        dom_disc.rebuild_in_place();
+        let html_disc = dioxus_ssr::render(&dom_disc);
+        assert!(html_disc.contains("hidden sm:flex items-center"), "{html_disc}");
+        assert!(html_disc.contains("Rate Discovery Gem"), "{html_disc}");
+        assert!(html_disc.contains("Rated 5 out of 5 stars"), "{html_disc}");
     }
 }

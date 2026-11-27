@@ -2,7 +2,7 @@
 //! Acquire & Play live handoff manager, OpenSubsonic scrobble tracker, and unified
 //! curation/discovery state context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[cfg(feature = "web")]
@@ -74,6 +74,19 @@ pub struct GuardModalState {
     pub track: PlayerTrack,
     pub preview: DeleteGuardPreview,
     pub busy: bool,
+}
+
+/// Builds all non-empty deduplicated triage guard keys for a track (`discovery_track_id` and `song_id`)
+/// so concurrent actions from different UI surfaces (triage card vs player bar) share the same guard.
+fn triage_guard_keys(disc_id: Option<&str>, song_id: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(did) = disc_id.filter(|s| !s.is_empty()) {
+        keys.push(did.to_string());
+    }
+    if !song_id.is_empty() && !keys.iter().any(|k| k == song_id) {
+        keys.push(song_id.to_string());
+    }
+    keys
 }
 
 /// Normalized lookup key for mapping `Acquire & Play` events back to search/catalog rows.
@@ -148,11 +161,12 @@ impl ScrobbleTracker {
     }
 }
 
-/// Reactive per-session star/rating overrides synced across visible track rows.
+/// Reactive per-session star/rating/discovery overrides synced across visible track rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrackCurationOverride {
     pub starred: Option<bool>,
     pub rating: Option<u8>,
+    pub is_discovery: Option<bool>,
 }
 
 /// Shared reactive Studio state & actions provided to every view inside the authenticated shell.
@@ -169,6 +183,8 @@ pub struct WebStudioContext {
     pub acquire_states: Signal<HashMap<String, AcquireTrackState>>,
     pub manual_choice_modal: Signal<Option<ManualChoiceModalState>>,
     pub pending_drops: Signal<PendingDropQueue>,
+    pub in_flight_triage: Signal<HashSet<String>>,
+    pub optimistic_kept: Signal<HashSet<String>>,
     pub guard_modal: Signal<Option<GuardModalState>>,
     pub inspected_track: Signal<Option<PlayerTrack>>,
     pub drawer_tab: Signal<Option<DrawerTab>>,
@@ -241,24 +257,27 @@ impl WebStudioContext {
             .unwrap_or(14)
     }
 
-    /// Pending discovery tracks excluding any items optimistically hidden in the 5s Undo queue.
+    /// Pending discovery tracks excluding any items optimistically hidden in the 5s Undo queue
+    /// or optimistically kept while awaiting server confirmation.
     pub fn visible_triage_tracks(&self) -> Vec<DiscoveryTrack> {
         let pending = self.pending_drops.read();
+        let kept = self.optimistic_kept.read();
         self.triage_tracks
             .read()
             .iter()
             .filter(|t| {
                 !pending.is_hidden(&t.id)
+                    && !kept.contains(&t.id)
                     && t.song_id
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                        .is_none_or(|sid| !pending.is_hidden(sid))
+                        .is_none_or(|sid| !pending.is_hidden(sid) && !kept.contains(sid))
             })
             .cloned()
             .collect()
     }
 
-    /// Applies reactive star/rating overrides from this session onto a track before rendering.
+    /// Applies reactive star/rating/discovery overrides from this session onto a track before rendering.
     pub fn apply_curation_overrides(&self, track: &mut PlayerTrack) {
         if track.id.is_empty() {
             return;
@@ -270,6 +289,13 @@ impl WebStudioContext {
             if let Some(r) = ov.rating {
                 track.rating = r.min(5);
             }
+            if let Some(is_disc) = ov.is_discovery {
+                track.is_discovery = is_disc;
+                if !is_disc {
+                    track.discovery_track_id = None;
+                    track.days_remaining = None;
+                }
+            }
         }
     }
 
@@ -278,6 +304,16 @@ impl WebStudioContext {
         song_id: &str,
         starred: Option<bool>,
         rating: Option<u8>,
+    ) {
+        self.record_curation_override_with_discovery(song_id, starred, rating, None);
+    }
+
+    fn record_curation_override_with_discovery(
+        &mut self,
+        song_id: &str,
+        starred: Option<bool>,
+        rating: Option<u8>,
+        is_discovery: Option<bool>,
     ) {
         if song_id.is_empty() {
             return;
@@ -289,6 +325,9 @@ impl WebStudioContext {
         }
         if let Some(r) = rating {
             entry.rating = Some(r.min(5));
+        }
+        if let Some(disc) = is_discovery {
+            entry.is_discovery = Some(disc);
         }
         drop(map);
 
@@ -302,6 +341,53 @@ impl WebStudioContext {
                 if let Some(r) = rating {
                     t.rating = r.min(5);
                 }
+                if let Some(disc) = is_discovery {
+                    t.is_discovery = disc;
+                    if !disc {
+                        t.days_remaining = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize_inspected_promoted_discovery(
+        &mut self,
+        effective_id: &str,
+        orig_song_id: &str,
+        discovery_track_id: Option<&str>,
+    ) {
+        let mut inspected = self.inspected_track.write();
+        if let Some(t) = inspected.as_mut() {
+            let matches = (!effective_id.is_empty() && t.id == effective_id)
+                || (!orig_song_id.is_empty() && t.id == orig_song_id)
+                || discovery_track_id
+                    .filter(|d| !d.is_empty())
+                    .is_some_and(|did| t.discovery_track_id.as_deref() == Some(did));
+            if matches {
+                t.is_discovery = false;
+                t.discovery_track_id = None;
+                t.days_remaining = None;
+            }
+        }
+    }
+
+    fn set_triage_rating(
+        &mut self,
+        song_id: &str,
+        discovery_track_id: Option<&str>,
+        rating: u8,
+    ) {
+        let clamped = rating.min(5);
+        let stored = (clamped > 0).then_some(clamped);
+        let mut triage = self.triage_tracks.write();
+        for dt in triage.iter_mut() {
+            let match_song = !song_id.is_empty() && dt.song_id.as_deref() == Some(song_id);
+            let match_disc = discovery_track_id
+                .filter(|d| !d.is_empty())
+                .is_some_and(|did| dt.id == did);
+            if match_song || match_disc {
+                dt.rating = stored;
             }
         }
     }
@@ -368,7 +454,7 @@ impl WebStudioContext {
             discovery_track_id: Some(dt.id.clone()),
             days_remaining: discovery_days_remaining(&dt.created_at, lifetime_days),
             starred: false,
-            rating: dt.rating.unwrap_or(0),
+            rating: dt.rating.unwrap_or(0).min(5),
             codec_badge: None,
             is_offline_cached: false,
             reason_label,
@@ -450,8 +536,8 @@ impl WebStudioContext {
             is_discovery: !ct.owned || ct.discovery_track_id.is_some(),
             discovery_track_id: ct.discovery_track_id.clone(),
             days_remaining: None,
-            starred: false,
-            rating: 0,
+            starred: ct.starred,
+            rating: ct.rating.unwrap_or(0).min(5),
             codec_badge: None,
             is_offline_cached: false,
             reason_label: ct.reason.as_ref().map(format_candidate_reason),
@@ -558,14 +644,74 @@ impl WebStudioContext {
 
     pub fn keep_track(&mut self, auth: Auth, player: PlayerContext, track: PlayerTrack) {
         let mut studio = *self;
-        let req = KeepTrackRequest {
-            song_id: track.id.clone(),
-            discovery_track_id: track.discovery_track_id.clone(),
-            target_folder_id: None,
-        };
         let title = track.title.clone();
         let disc_id = track.discovery_track_id.clone();
         let orig_song_id = track.id.clone();
+        let prev_is_discovery = track.is_discovery;
+        let prev_days_remaining = track.days_remaining;
+        let guard_keys = triage_guard_keys(disc_id.as_deref(), &orig_song_id);
+
+        // Synchronous dual-key in-flight guard blocks rapid double-clicks across surfaces
+        if guard_keys
+            .iter()
+            .any(|k| self.in_flight_triage.peek().contains(k))
+        {
+            return;
+        }
+        if !guard_keys.is_empty() {
+            let mut in_flight = self.in_flight_triage.write();
+            for key in &guard_keys {
+                in_flight.insert(key.clone());
+            }
+        }
+        {
+            let mut kept = self.optimistic_kept.write();
+            for key in &guard_keys {
+                kept.insert(key.clone());
+            }
+        }
+
+        // Immediate optimistic UI update (0ms card removal; never stamps fake star ratings!)
+        // Preserve `discovery_track_id` until server confirmation so rollback can always match.
+        if !orig_song_id.is_empty() {
+            player.state_signal().write().apply_curation_update(
+                &orig_song_id,
+                None,
+                None,
+                true,
+            );
+            self.record_curation_override_with_discovery(
+                &orig_song_id,
+                None,
+                None,
+                Some(false),
+            );
+        }
+        if let Some(ref did) = disc_id {
+            if !did.is_empty() && *did != orig_song_id {
+                player
+                    .state_signal()
+                    .write()
+                    .apply_curation_update(did, None, None, true);
+            }
+        }
+        {
+            let mut inspected = self.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!orig_song_id.is_empty() && t.id == orig_song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.is_discovery = false;
+                    t.days_remaining = None;
+                }
+            }
+        }
+
+        let req = KeepTrackRequest {
+            song_id: orig_song_id.clone(),
+            discovery_track_id: disc_id.clone(),
+            target_folder_id: None,
+        };
 
         spawn(async move {
             match auth.call(api::curation_keep(req)).await {
@@ -580,35 +726,44 @@ impl WebStudioContext {
                     if !effective_id.is_empty() {
                         player.state_signal().write().apply_curation_update(
                             &effective_id,
-                            res.starred,
-                            res.rating,
+                            None,
+                            None,
                             true,
                         );
-                        studio.record_curation_override(&effective_id, res.starred, res.rating);
-                    }
-                    if let Some(ref did) = disc_id {
-                        if !did.is_empty() && *did != effective_id {
-                            player.state_signal().write().apply_curation_update(
-                                did,
-                                res.starred,
-                                res.rating,
-                                true,
-                            );
-                        }
+                        studio.record_curation_override_with_discovery(
+                            &effective_id,
+                            None,
+                            None,
+                            Some(false),
+                        );
                     }
                     {
-                        let mut inspected = studio.inspected_track.write();
-                        if let Some(t) = inspected.as_mut() {
-                            let matches = (!effective_id.is_empty() && t.id == effective_id)
-                                || (disc_id.is_some() && t.discovery_track_id == disc_id);
-                            if matches {
-                                t.is_discovery = false;
-                                t.discovery_track_id = None;
-                                t.days_remaining = None;
-                            }
+                        let mut st = player.state_signal();
+                        let mut w = st.write();
+                        w.finalize_promoted_discovery(&effective_id, disc_id.as_deref());
+                        if !orig_song_id.is_empty() && orig_song_id != effective_id {
+                            w.finalize_promoted_discovery(&orig_song_id, disc_id.as_deref());
                         }
                     }
+                    studio.finalize_inspected_promoted_discovery(
+                        &effective_id,
+                        &orig_song_id,
+                        disc_id.as_deref(),
+                    );
                     studio.prune_triage_entry(&effective_id, disc_id.as_deref());
+                    {
+                        let mut kept = studio.optimistic_kept.write();
+                        for key in &guard_keys {
+                            kept.remove(key);
+                        }
+                        kept.remove(&effective_id);
+                    }
+                    if !guard_keys.is_empty() {
+                        let mut in_flight = studio.in_flight_triage.write();
+                        for key in &guard_keys {
+                            in_flight.remove(key);
+                        }
+                    }
                     if res.archival_upgrade_queued {
                         studio.show_toast(format!(
                             "Kept \"{title}\" in library · archival FLAC upgrade queued"
@@ -618,6 +773,43 @@ impl WebStudioContext {
                     }
                 }
                 Err(e) => {
+                    {
+                        let mut kept = studio.optimistic_kept.write();
+                        for key in &guard_keys {
+                            kept.remove(key);
+                        }
+                    }
+                    if !guard_keys.is_empty() {
+                        let mut in_flight = studio.in_flight_triage.write();
+                        for key in &guard_keys {
+                            in_flight.remove(key);
+                        }
+                    }
+                    if prev_is_discovery {
+                        if !orig_song_id.is_empty() {
+                            studio.record_curation_override_with_discovery(
+                                &orig_song_id,
+                                None,
+                                None,
+                                Some(true),
+                            );
+                        }
+                        player.state_signal().write().restore_discovery_state(
+                            &orig_song_id,
+                            disc_id.as_deref(),
+                            prev_days_remaining,
+                        );
+                        let mut inspected = studio.inspected_track.write();
+                        if let Some(t) = inspected.as_mut() {
+                            let matches = (!orig_song_id.is_empty() && t.id == orig_song_id)
+                                || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                            if matches {
+                                t.is_discovery = true;
+                                t.discovery_track_id = disc_id.clone();
+                                t.days_remaining = prev_days_remaining;
+                            }
+                        }
+                    }
                     studio.show_toast(format!("Keep failed: {}", friendly_error(&e)));
                 }
             }
@@ -636,19 +828,72 @@ impl WebStudioContext {
         let disc_id = track.discovery_track_id.clone();
         let title = track.title.clone();
         let track_for_list = track.clone();
+        let is_disc_promote = starred && track.is_discovery;
+        let prev_days_remaining = track.days_remaining;
+        let guard_keys = triage_guard_keys(disc_id.as_deref(), &song_id);
+
+        if is_disc_promote {
+            if guard_keys
+                .iter()
+                .any(|k| self.in_flight_triage.peek().contains(k))
+            {
+                return;
+            }
+            if !guard_keys.is_empty() {
+                let mut in_flight = self.in_flight_triage.write();
+                for key in &guard_keys {
+                    in_flight.insert(key.clone());
+                }
+            }
+            let mut kept = self.optimistic_kept.write();
+            for key in &guard_keys {
+                kept.insert(key.clone());
+            }
+        }
+
         let req = StarTrackRequest {
             song_id: song_id.clone(),
             starred,
             discovery_track_id: disc_id.clone(),
         };
 
-        // Optimistic UI update across player + visible TrackRows + starred list
+        // Optimistic UI update across player + visible TrackRows + triage deck (never stamps fake stars!)
+        // Preserve `discovery_track_id` until server confirmation so error rollback always matches.
         if !song_id.is_empty() {
-            player
-                .state_signal()
-                .write()
-                .apply_curation_update(&song_id, Some(starred), None, false);
-            studio.record_curation_override(&song_id, Some(starred), None);
+            player.state_signal().write().apply_curation_update(
+                &song_id,
+                Some(starred),
+                None,
+                is_disc_promote,
+            );
+            studio.record_curation_override_with_discovery(
+                &song_id,
+                Some(starred),
+                None,
+                is_disc_promote.then_some(false),
+            );
+        }
+        if is_disc_promote {
+            if let Some(ref did) = disc_id {
+                if !did.is_empty() && *did != song_id {
+                    player.state_signal().write().apply_curation_update(
+                        did,
+                        Some(starred),
+                        None,
+                        true,
+                    );
+                }
+            }
+            let mut inspected = self.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!song_id.is_empty() && t.id == song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.starred = starred;
+                    t.is_discovery = false;
+                    t.days_remaining = None;
+                }
+            }
         }
 
         spawn(async move {
@@ -660,28 +905,105 @@ impl WebStudioContext {
                     } else {
                         song_id.clone()
                     };
+                    let promoted = res.promoted_discovery || is_disc_promote;
                     if !effective_id.is_empty() {
                         player.state_signal().write().apply_curation_update(
                             &effective_id,
                             Some(final_starred),
-                            res.rating,
-                            res.promoted_discovery,
+                            None,
+                            promoted,
                         );
-                        studio.record_curation_override(
+                        studio.record_curation_override_with_discovery(
                             &effective_id,
                             Some(final_starred),
-                            res.rating,
+                            None,
+                            promoted.then_some(false),
                         );
-                        studio.sync_starred_list(&track_for_list, &effective_id, final_starred, res.rating);
+                        studio.sync_starred_list(
+                            &track_for_list,
+                            &effective_id,
+                            final_starred,
+                            None,
+                        );
                     }
-                    if res.promoted_discovery {
+                    if promoted {
+                        {
+                            let mut st = player.state_signal();
+                            let mut w = st.write();
+                            w.finalize_promoted_discovery(&effective_id, disc_id.as_deref());
+                            if !song_id.is_empty() && song_id != effective_id {
+                                w.finalize_promoted_discovery(&song_id, disc_id.as_deref());
+                            }
+                        }
+                        studio.finalize_inspected_promoted_discovery(
+                            &effective_id,
+                            &song_id,
+                            disc_id.as_deref(),
+                        );
                         studio.prune_triage_entry(&effective_id, disc_id.as_deref());
                         studio.show_toast(format!(
-                            "Starred & promoted \"{title}\" into permanent library"
+                            "Favorited & kept \"{title}\" in permanent library"
                         ));
+                    }
+                    if is_disc_promote {
+                        {
+                            let mut kept = studio.optimistic_kept.write();
+                            for key in &guard_keys {
+                                kept.remove(key);
+                            }
+                            kept.remove(&effective_id);
+                        }
+                        if !guard_keys.is_empty() {
+                            let mut in_flight = studio.in_flight_triage.write();
+                            for key in &guard_keys {
+                                in_flight.remove(key);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
+                    if is_disc_promote {
+                        {
+                            let mut kept = studio.optimistic_kept.write();
+                            for key in &guard_keys {
+                                kept.remove(key);
+                            }
+                        }
+                        if !guard_keys.is_empty() {
+                            let mut in_flight = studio.in_flight_triage.write();
+                            for key in &guard_keys {
+                                in_flight.remove(key);
+                            }
+                        }
+                        if song_id.is_empty() {
+                            if let Some(ref did) = disc_id {
+                                if !did.is_empty() {
+                                    player.state_signal().write().apply_curation_update(
+                                        did,
+                                        Some(!starred),
+                                        None,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                        player.state_signal().write().restore_discovery_state(
+                            &song_id,
+                            disc_id.as_deref(),
+                            prev_days_remaining,
+                        );
+                        let mut inspected = studio.inspected_track.write();
+                        if let Some(t) = inspected.as_mut() {
+                            let matches = (!song_id.is_empty() && t.id == song_id)
+                                || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                            if matches {
+                                t.starred = !starred;
+                                t.is_discovery = true;
+                                t.discovery_track_id = disc_id.clone();
+                                t.days_remaining = prev_days_remaining;
+                            }
+                        }
+                    }
                     if !song_id.is_empty() {
                         player.state_signal().write().apply_curation_update(
                             &song_id,
@@ -689,7 +1011,12 @@ impl WebStudioContext {
                             None,
                             false,
                         );
-                        studio.record_curation_override(&song_id, Some(!starred), None);
+                        studio.record_curation_override_with_discovery(
+                            &song_id,
+                            Some(!starred),
+                            None,
+                            is_disc_promote.then_some(true),
+                        );
                     }
                     studio.show_toast(format!("Star failed: {}", friendly_error(&e)));
                 }
@@ -708,7 +1035,6 @@ impl WebStudioContext {
         let song_id = track.id.clone();
         let disc_id = track.discovery_track_id.clone();
         let prev_rating = track.rating;
-        let title = track.title.clone();
         let clamped_rating = rating.min(5);
         let req = RateTrackRequest {
             song_id: song_id.clone(),
@@ -716,6 +1042,7 @@ impl WebStudioContext {
             discovery_track_id: disc_id.clone(),
         };
 
+        // Pure 1-5 star rating everywhere (never promotes or drops discovery tracks!)
         if !song_id.is_empty() {
             player.state_signal().write().apply_curation_update(
                 &song_id,
@@ -724,6 +1051,35 @@ impl WebStudioContext {
                 false,
             );
             studio.record_curation_override(&song_id, None, Some(clamped_rating));
+        } else if let Some(ref did) = disc_id {
+            if !did.is_empty() {
+                player.state_signal().write().apply_curation_update(
+                    did,
+                    None,
+                    Some(clamped_rating),
+                    false,
+                );
+            }
+        }
+        studio.set_triage_rating(&song_id, disc_id.as_deref(), clamped_rating);
+        {
+            let mut stars = studio.starred_tracks.write();
+            if let Some(slot) = stars
+                .iter_mut()
+                .find(|t| !song_id.is_empty() && t.id == song_id)
+            {
+                slot.rating = clamped_rating;
+            }
+        }
+        {
+            let mut inspected = studio.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!song_id.is_empty() && t.id == song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.rating = clamped_rating;
+                }
+            }
         }
 
         spawn(async move {
@@ -734,21 +1090,13 @@ impl WebStudioContext {
                     } else {
                         song_id.clone()
                     };
-                    if res.action == CurationAction::DroppedDiscovery {
-                        studio.prune_triage_entry(&effective_id, disc_id.as_deref());
-                        if !effective_id.is_empty() {
-                            player.remove_track_from_queue(&effective_id);
-                        }
-                        studio.show_toast(res.message);
-                        return;
-                    }
-                    let final_rating = res.rating.unwrap_or(clamped_rating);
+                    let final_rating = res.rating.unwrap_or(clamped_rating).min(5);
                     if !effective_id.is_empty() {
                         player.state_signal().write().apply_curation_update(
                             &effective_id,
                             res.starred,
                             Some(final_rating),
-                            res.promoted_discovery,
+                            false,
                         );
                         studio.record_curation_override(
                             &effective_id,
@@ -763,10 +1111,7 @@ impl WebStudioContext {
                             }
                         }
                     }
-                    if res.promoted_discovery {
-                        studio.prune_triage_entry(&effective_id, disc_id.as_deref());
-                        studio.show_toast(format!("Rated {final_rating}★ & kept \"{title}\""));
-                    }
+                    studio.set_triage_rating(&effective_id, disc_id.as_deref(), final_rating);
                 }
                 Err(e) => {
                     if !song_id.is_empty() {
@@ -777,6 +1122,30 @@ impl WebStudioContext {
                             false,
                         );
                         studio.record_curation_override(&song_id, None, Some(prev_rating));
+                        let mut stars = studio.starred_tracks.write();
+                        if let Some(slot) = stars.iter_mut().find(|t| t.id == song_id) {
+                            slot.rating = prev_rating;
+                        }
+                    } else if let Some(ref did) = disc_id {
+                        if !did.is_empty() {
+                            player.state_signal().write().apply_curation_update(
+                                did,
+                                None,
+                                Some(prev_rating),
+                                false,
+                            );
+                        }
+                    }
+                    studio.set_triage_rating(&song_id, disc_id.as_deref(), prev_rating);
+                    {
+                        let mut inspected = studio.inspected_track.write();
+                        if let Some(t) = inspected.as_mut() {
+                            let matches = (!song_id.is_empty() && t.id == song_id)
+                                || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                            if matches {
+                                t.rating = prev_rating;
+                            }
+                        }
                     }
                     studio.show_toast(format!("Rating failed: {}", friendly_error(&e)));
                 }
@@ -1113,6 +1482,8 @@ impl WebStudioContext {
                                 cover_art_url: cover,
                                 cover_art_id: Some(t.song_id),
                                 duration_secs: t.duration,
+                                starred: t.starred,
+                                rating: t.rating.unwrap_or(0).min(5),
                                 reason_label: Some(format_candidate_reason(&t.reason)),
                                 ..Default::default()
                             };
@@ -1458,6 +1829,8 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let acquire_states = use_signal::<HashMap<String, AcquireTrackState>>(HashMap::new);
     let manual_choice_modal = use_signal(|| None::<ManualChoiceModalState>);
     let pending_drops = use_signal(PendingDropQueue::new);
+    let in_flight_triage = use_signal(HashSet::<String>::new);
+    let optimistic_kept = use_signal(HashSet::<String>::new);
     let guard_modal = use_signal(|| None::<GuardModalState>);
     let inspected_track = use_signal(|| None::<PlayerTrack>);
     let drawer_tab = use_signal(|| None::<DrawerTab>);
@@ -1502,6 +1875,8 @@ pub fn WebStudioProvider(children: Element) -> Element {
         acquire_states,
         manual_choice_modal,
         pending_drops,
+        in_flight_triage,
+        optimistic_kept,
         guard_modal,
         inspected_track,
         drawer_tab,

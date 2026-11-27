@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use shared::metadata::{SearchResult as MetadataSearchResult, Track as MetadataTrack};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Default)]
 struct StubState {
@@ -54,6 +54,13 @@ struct StubState {
     ws_drop_first_connection: AtomicBool,
     ws_send_server_ping: AtomicBool,
     accepted_auth_token: Mutex<String>,
+    song_ratings: Mutex<HashMap<String, i64>>,
+    search3_omit_song_ids: Mutex<HashSet<String>>,
+    search3_entered_notify: Mutex<Option<Arc<Notify>>>,
+    search3_release_notify: Mutex<Option<Arc<Notify>>>,
+    triage_rating: Mutex<Option<u8>>,
+    skip_recent_albums: AtomicBool,
+    album_detail_fetch_count: AtomicUsize,
 }
 
 async fn check_soulbeet_auth(st: &StubState, headers: &HeaderMap) -> bool {
@@ -98,6 +105,7 @@ async fn start_stub_server(state: Arc<StubState>) -> String {
         .route("/rest/getPlaylist", get(handle_get_playlist))
         .route("/rest/getStarred2", get(handle_get_starred2))
         .route("/rest/getGenres", get(handle_get_genres))
+        .route("/rest/search3", get(handle_search3))
         .route("/rest/scrobble", get(handle_scrobble))
         .route("/rest/download", get(handle_download))
         .route("/rest/stream", get(handle_stream))
@@ -155,6 +163,7 @@ async fn handle_triage(
     if !check_soulbeet_auth(&st, &headers).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
     }
+    let triage_rating = *st.triage_rating.lock().await;
     // Real PR #129 DiscoveryTrack wire shape with PascalCase status, path, profile, pack_slug, created_at
     (
         StatusCode::OK,
@@ -168,7 +177,7 @@ async fn handle_triage(
                 "path": "Discovery/Balanced/Justice - DANCE.flac",
                 "folder_id": "f-disc",
                 "profile": "weekly_radar",
-                "rating": null,
+                "rating": triage_rating,
                 "status": "Pending",
                 "created_at": "2026-11-20T09:00:00Z",
                 "exclude_from_core_taste": false,
@@ -380,6 +389,16 @@ async fn handle_get_album_list2(
     State(st): State<Arc<StubState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
+    if q.get("type").map(String::as_str) == Some("recent")
+        && st.skip_recent_albums.load(Ordering::SeqCst)
+    {
+        return Json(json!({
+            "subsonic-response": {
+                "status": "ok",
+                "albumList2": { "album": [] }
+            }
+        }));
+    }
     let mut albums = vec![json!({
         "id": "al1",
         "name": "Random Access Memories",
@@ -416,7 +435,11 @@ async fn handle_get_album_list2(
     }))
 }
 
-async fn handle_get_album(Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+async fn handle_get_album(
+    State(st): State<Arc<StubState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    st.album_detail_fetch_count.fetch_add(1, Ordering::SeqCst);
     let id = q.get("id").map(String::as_str).unwrap_or("");
     let album = match id {
         "al1" => json!({
@@ -632,6 +655,77 @@ async fn handle_get_genres() -> Json<Value> {
             "status": "ok",
             "genres": {
                 "genre": [{ "value": "Electronic", "songCount": 2, "albumCount": 1 }]
+            }
+        }
+    }))
+}
+
+async fn handle_search3(
+    State(st): State<Arc<StubState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let entered = st.search3_entered_notify.lock().await.clone();
+    if let Some(entered) = entered {
+        entered.notify_one();
+    }
+    let release = st.search3_release_notify.lock().await.clone();
+    if let Some(release) = release {
+        release.notified().await;
+    }
+    let offset: usize = q
+        .get("songOffset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let count: usize = q
+        .get("songCount")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
+    let ratings = st.song_ratings.lock().await;
+    let omitted = st.search3_omit_song_ids.lock().await;
+    let mut all_songs = vec![
+        ("s1", "Get Lucky", "Daft Punk", "ar1", "Random Access Memories", "al1", 369),
+        ("s2", "D.A.N.C.E.", "Justice", "ar2", "Cross", "al1", 242),
+    ];
+    if st.new_album_enabled.load(Ordering::SeqCst) {
+        all_songs.push((
+            "s3",
+            "One More Time",
+            "Daft Punk",
+            "ar1",
+            "Discovery",
+            "al2",
+            320,
+        ));
+    }
+    let page: Vec<Value> = all_songs
+        .into_iter()
+        .filter(|(id, ..)| !omitted.contains(*id))
+        .skip(offset)
+        .take(count)
+        .map(|(id, title, artist, artist_id, album, album_id, duration)| {
+            let mut obj = json!({
+                "id": id,
+                "title": title,
+                "artist": artist,
+                "artistId": artist_id,
+                "album": album,
+                "albumId": album_id,
+                "duration": duration,
+            });
+            if let Some(&r) = ratings.get(id) {
+                if r > 0 {
+                    obj["userRating"] = json!(r);
+                }
+            }
+            obj
+        })
+        .collect();
+
+    Json(json!({
+        "subsonic-response": {
+            "status": "ok",
+            "searchResult3": {
+                "song": page
             }
         }
     }))
@@ -1865,4 +1959,341 @@ async fn connect_ws_sends_ping_with_heartbeat_and_auto_reconnects_after_server_d
 
     core.connect_client().disconnect().await;
     assert!(!core.connect_client().state().await.connected);
+}
+
+#[tokio::test]
+async fn incremental_sync_updates_and_clears_navidrome_ratings_without_refetching_albums() {
+    let state = Arc::new(StubState::default());
+    let base_url = start_stub_server(state.clone()).await;
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
+        .await
+        .unwrap();
+
+    // Initial full sync seeds s1 and s2 with user_rating = 0.
+    let initial = core.sync_now(false).await.unwrap();
+    assert!(initial.full_sync);
+    assert_eq!(get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating, 0);
+    assert_eq!(get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating, 0);
+
+    // Rate s1 to 4 stars in Navidrome without changing album created timestamp, recent albums, or starred.
+    state.skip_recent_albums.store(true, Ordering::SeqCst);
+    state.song_ratings.lock().await.insert("s1".to_string(), 4);
+    let fetches_before = state.album_detail_fetch_count.load(Ordering::SeqCst);
+
+    let delta = core.sync_now(false).await.unwrap();
+    assert!(!delta.full_sync);
+    assert!(delta.warnings.is_empty(), "unexpected warnings: {:?}", delta.warnings);
+    assert_eq!(
+        state.album_detail_fetch_count.load(Ordering::SeqCst),
+        fetches_before,
+        "incremental rating refresh must not refetch unchanged albums"
+    );
+    assert_eq!(get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating, 4);
+    assert_eq!(get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating, 0);
+
+    // Unrating s1 in Navidrome clears tracks.user_rating back to 0 on next incremental sync.
+    state.song_ratings.lock().await.remove("s1");
+    let delta2 = core.sync_now(false).await.unwrap();
+    assert!(!delta2.full_sync);
+    assert_eq!(get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating, 0);
+}
+
+#[tokio::test]
+async fn outbox_separates_keep_drop_star_from_ratings_and_hides_empty_seasonal_playlists() {
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, None, 10_000_000))
+        .await
+        .unwrap();
+    let now = now_unix();
+
+    for (id, is_disc) in [("s-keep", true), ("s-star", true), ("s-drop", true), ("s-rate", true)] {
+        upsert_track(
+            core.pool(),
+            &LocalTrack {
+                id: id.to_string(),
+                title: id.to_string(),
+                artist_id: Some("ar-1".to_string()),
+                artist_name: "Artist".to_string(),
+                album_id: Some("al-1".to_string()),
+                album_name: "Album".to_string(),
+                track_number: Some(1),
+                disc_number: Some(1),
+                duration_secs: 180,
+                year: Some(2025),
+                genre: None,
+                bit_rate: None,
+                suffix: Some("flac".to_string()),
+                content_type: None,
+                size_bytes: None,
+                cover_art_id: None,
+                path: Some(format!("Discovery/Balanced/{id}.flac")),
+                starred: false,
+                user_rating: 0,
+                play_count: 0,
+                last_played_at: None,
+                musicbrainz_id: None,
+                is_discovery: is_disc,
+                updated_at: now,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, song_id, artist, title, status, updated_at) VALUES (?, ?, 'Artist', ?, 'pending', ?)",
+        )
+        .bind(format!("disc-{id}"))
+        .bind(id)
+        .bind(id)
+        .bind(now)
+        .execute(core.pool())
+        .await
+        .unwrap();
+    }
+
+    // Keep must promote locally WITHOUT stamping a fake star rating.
+    core.enqueue_mutation(OutboxMutation::Keep {
+        song_id: "s-keep".to_string(),
+        discovery_track_id: Some("disc-s-keep".to_string()),
+        target_folder_id: None,
+    })
+    .await
+    .unwrap();
+    let kept = get_track(core.pool(), "s-keep").await.unwrap().unwrap();
+    assert!(!kept.is_discovery);
+    assert_eq!(kept.user_rating, 0);
+
+    // Star must star + promote locally WITHOUT stamping a star rating.
+    core.enqueue_mutation(OutboxMutation::Star {
+        song_id: "s-star".to_string(),
+        starred: true,
+        discovery_track_id: Some("disc-s-star".to_string()),
+    })
+    .await
+    .unwrap();
+    let starred = get_track(core.pool(), "s-star").await.unwrap().unwrap();
+    assert!(starred.starred);
+    assert!(!starred.is_discovery);
+    assert_eq!(starred.user_rating, 0);
+
+    // Drop must mark discovery track removed WITHOUT stamping user_rating = 1.
+    core.enqueue_mutation(OutboxMutation::Drop {
+        song_id: "s-drop".to_string(),
+        discovery_track_id: Some("disc-s-drop".to_string()),
+        confirm_delete: false,
+    })
+    .await
+    .unwrap();
+    let dropped = get_track(core.pool(), "s-drop").await.unwrap().unwrap();
+    assert!(!dropped.is_discovery);
+    assert_eq!(dropped.user_rating, 0);
+    let dropped_status: String =
+        sqlx::query_scalar("SELECT status FROM discovery_tracks WHERE id = 'disc-s-drop'")
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert_eq!(dropped_status, "removed");
+
+    // Rate must update user_rating purely WITHOUT mutating discovery_tracks.status.
+    core.enqueue_mutation(OutboxMutation::Rate {
+        song_id: "s-rate".to_string(),
+        rating: 5,
+        discovery_track_id: Some("disc-s-rate".to_string()),
+    })
+    .await
+    .unwrap();
+    let rated = get_track(core.pool(), "s-rate").await.unwrap().unwrap();
+    assert_eq!(rated.user_rating, 5);
+    assert!(rated.is_discovery);
+    let rated_status: String =
+        sqlx::query_scalar("SELECT status FROM discovery_tracks WHERE id = 'disc-s-rate'")
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert_eq!(rated_status, "pending");
+
+    // Empty seasonal playlists (song_count = 0, no tracks) must be hidden from list_playlists and Auto browse.
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-seasonal-empty".to_string(),
+            name: "Stale Holiday Pack".to_string(),
+            comment: Some("soulbeet:contextual:stale_holiday".to_string()),
+            owner: Some("alice".to_string()),
+            song_count: 0,
+            duration_secs: 0,
+            cover_art_id: None,
+            is_smart: true,
+            kind: "seasonal".to_string(),
+            slug: Some("stale_holiday".to_string()),
+            changed_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-seasonal-full".to_string(),
+            name: "Active Seasonal Pack".to_string(),
+            comment: Some("soulbeet:contextual:active_seasonal".to_string()),
+            owner: Some("alice".to_string()),
+            song_count: 1,
+            duration_secs: 180,
+            cover_art_id: None,
+            is_smart: true,
+            kind: "seasonal".to_string(),
+            slug: Some("active_seasonal".to_string()),
+            changed_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    replace_playlist_tracks(core.pool(), "pl-seasonal-full", &["s-keep".to_string()])
+        .await
+        .unwrap();
+
+    let playlists = core.list_playlists().await.unwrap();
+    assert!(!playlists.iter().any(|p| p.id == "pl-seasonal-empty"));
+    assert!(playlists.iter().any(|p| p.id == "pl-seasonal-full"));
+
+    let for_you = core
+        .auto_browse()
+        .children(AUTO_TAB_FOR_YOU, false)
+        .await
+        .unwrap();
+    assert!(!for_you.iter().any(|n| n.id == "playlist:pl-seasonal-empty"));
+    assert!(for_you.iter().any(|n| n.id == "playlist:pl-seasonal-full"));
+}
+
+#[tokio::test]
+async fn incremental_rating_sync_preserves_unseen_tracks_and_in_flight_outbox_mutations() {
+    let state = Arc::new(StubState::default());
+    let base_url = start_stub_server(state.clone()).await;
+    let dir = TempDir::new().unwrap();
+    let core = Arc::new(
+        SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
+            .await
+            .unwrap(),
+    );
+
+    // Initial full sync seeds s1 and s2.
+    let initial = core.sync_now(false).await.unwrap();
+    assert!(initial.full_sync);
+
+    // Seed remote ratings for both s1 (4) and s2 (5) via incremental sync.
+    state.skip_recent_albums.store(true, Ordering::SeqCst);
+    {
+        let mut ratings = state.song_ratings.lock().await;
+        ratings.insert("s1".to_string(), 4);
+        ratings.insert("s2".to_string(), 5);
+    }
+    let seeded = core.sync_now(false).await.unwrap();
+    assert!(!seeded.full_sync);
+    assert_eq!(get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating, 4);
+    assert_eq!(get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating, 5);
+
+    // (a) Partial search3 response omits s2 and changes s1 to 3: s2 must keep its local rating (5).
+    state.search3_omit_song_ids.lock().await.insert("s2".to_string());
+    state.song_ratings.lock().await.insert("s1".to_string(), 3);
+    let partial = core.sync_now(false).await.unwrap();
+    assert!(!partial.full_sync);
+    assert!(partial.warnings.is_empty(), "unexpected warnings: {:?}", partial.warnings);
+    assert_eq!(get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating, 3);
+    assert_eq!(
+        get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating,
+        5,
+        "partial search3 page must not wipe ratings on unseen local tracks"
+    );
+    state.search3_omit_song_ids.lock().await.clear();
+
+    // (b) An outbox rating mutation enqueued while search3 is in flight (after sync() took its
+    // initial pre-network pending snapshot, before sync_song_ratings opens its SQLite write tx)
+    // must be preserved and not overwritten by stale remote rating (2).
+    state.song_ratings.lock().await.insert("s1".to_string(), 2);
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *state.search3_entered_notify.lock().await = Some(entered.clone());
+    *state.search3_release_notify.lock().await = Some(release.clone());
+
+    let core_for_sync = core.clone();
+    let sync_handle = tokio::spawn(async move { core_for_sync.sync_now(false).await });
+
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("timed out waiting for search3 request");
+
+    // Enqueue a pending rating mutation for s1 while search3 is paused in flight.
+    core.enqueue_mutation(OutboxMutation::Rate {
+        song_id: "s1".to_string(),
+        rating: 5,
+        discovery_track_id: None,
+    })
+    .await
+    .unwrap();
+
+    // Release search3 and wait for incremental sync to finish.
+    *state.search3_entered_notify.lock().await = None;
+    *state.search3_release_notify.lock().await = None;
+    release.notify_one();
+
+    let delta = sync_handle.await.unwrap().unwrap();
+    assert!(!delta.full_sync);
+    assert!(delta.warnings.is_empty(), "unexpected warnings: {:?}", delta.warnings);
+    assert_eq!(
+        get_track(core.pool(), "s1").await.unwrap().unwrap().user_rating,
+        5,
+        "in-flight pending outbox rating mutation must be preserved inside sync_song_ratings tx"
+    );
+}
+
+#[tokio::test]
+async fn discovery_triage_sync_hydrates_rating_when_present_and_preserves_existing_when_null() {
+    let state = Arc::new(StubState::default());
+    let base_url = start_stub_server(state.clone()).await;
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
+        .await
+        .unwrap();
+
+    // Triage returns rating = 4 for discovery track s2 -> hydrates tracks.user_rating to 4.
+    *state.triage_rating.lock().await = Some(4);
+    let initial = core.sync_now(false).await.unwrap();
+    assert!(initial.full_sync);
+    assert_eq!(
+        get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating,
+        4
+    );
+
+    // Subsequent sync where search3 omits s2 and triage returns rating = null keeps existing rating (4).
+    state.skip_recent_albums.store(true, Ordering::SeqCst);
+    state.search3_omit_song_ids.lock().await.insert("s2".to_string());
+    *state.triage_rating.lock().await = None;
+    let delta = core.sync_now(false).await.unwrap();
+    assert!(!delta.full_sync);
+    assert_eq!(
+        get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating,
+        4,
+        "null triage rating must keep existing tracks.user_rating"
+    );
+
+    // Pending outbox mutation on s2 (rating = 5) must not be clobbered by triage rating = 2.
+    core.enqueue_mutation(OutboxMutation::Rate {
+        song_id: "s2".to_string(),
+        rating: 5,
+        discovery_track_id: Some("disc-1".to_string()),
+    })
+    .await
+    .unwrap();
+    *state.triage_rating.lock().await = Some(2);
+    let delta2 = core.sync_now(false).await.unwrap();
+    assert!(!delta2.full_sync);
+    assert_eq!(
+        get_track(core.pool(), "s2").await.unwrap().unwrap().user_rating,
+        5,
+        "pending outbox rating on discovery track must not be overwritten by triage hydration"
+    );
 }

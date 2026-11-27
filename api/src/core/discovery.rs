@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
 use shared::navidrome::{
     DiscoveryProgress, DiscoveryStatus, DiscoveryTrack, GenerationStatus, LastRun, ProfilePhase,
     ProfileProgress,
 };
-use shared::recommendation::DiscoveryProfile;
+use shared::recommendation::{builtin_contextual_mixes, CalendarWindow, DiscoveryProfile};
 use soulbeet::navidrome::NavidromeClient;
 use soulbeet::ImportedItem;
 use sqlx::SqlitePool;
@@ -29,6 +29,7 @@ use crate::core::folders::folder_not_found;
 use crate::core::index::library_songs;
 use crate::core::library::{known_roots_in, navidrome_failure, place_in, NavidromePlace};
 use crate::import_queue::ImportQueue;
+use crate::models::contextual::{ContextualMixDefinitionRow, ContextualMixStateRow};
 use crate::models::discovery_history::DiscoveryHistoryRow;
 use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::engine_report::EngineReportRow;
@@ -190,20 +191,156 @@ pub(crate) fn current_progress(
     Some(p.clone())
 }
 
-/// The moment the automation expires `track`: its `created_at` (RFC 3339, or SQLite's
-/// "%Y-%m-%d %H:%M:%S" in UTC) plus its profile's lifetime in days, 7 when `lifetime_days` has
-/// none. None when `created_at` does not parse.
+/// Fallback lifetime in days for a seasonal track whose pack slug is unknown or has no calendar
+/// window or persisted expiry timestamp.
+const SEASONAL_FALLBACK_LIFETIME_DAYS: i64 = 30;
+
+fn parse_created_at(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|t| t.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").map(|naive| naive.and_utc())
+        })
+        .ok()
+}
+
+fn parse_expiry_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(trimmed)
+        .map(|t| t.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+                .map(|naive| naive.and_utc())
+        })
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|naive| naive.and_utc())
+        })
+}
+
+fn calendar_window_expiry(
+    window: &CalendarWindow,
+    created: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let (_, _, exp) = window.cycle_dates(created.year(), created.month(), created.day())?;
+    parse_expiry_timestamp(&exp)
+}
+
+/// Preloaded seasonal mix expiry metadata for one user, combining persisted
+/// `contextual_mix_states.expires_at` timestamps with visible `contextual_mix_definitions`
+/// calendar windows.
+#[derive(Debug, Default)]
+pub(crate) struct SeasonalExpiryLookup {
+    state_expiries: HashMap<String, DateTime<Utc>>,
+    windows: HashMap<String, CalendarWindow>,
+}
+
+impl SeasonalExpiryLookup {
+    /// Loads seasonal expiry data for `user_id` when at least one track in `tracks` belongs to a
+    /// seasonal pack (`pack_slug` is non-empty).
+    pub(crate) async fn load_for_tracks_in(
+        db: &SqlitePool,
+        user_id: &str,
+        tracks: &[DiscoveryTrack],
+    ) -> Self {
+        let has_seasonal = tracks
+            .iter()
+            .any(|t| t.pack_slug.as_deref().is_some_and(|s| !s.trim().is_empty()));
+        if !has_seasonal {
+            return Self::default();
+        }
+        let mut state_expiries = HashMap::new();
+        if let Ok(states) = ContextualMixStateRow::list_for_user_in(db, user_id).await {
+            for state in states {
+                if let Some(ts) = state
+                    .expires_at
+                    .as_deref()
+                    .and_then(parse_expiry_timestamp)
+                {
+                    state_expiries.insert(state.slug, ts);
+                }
+            }
+        }
+        let mut windows = HashMap::new();
+        if let Ok(defs) = ContextualMixDefinitionRow::list_visible_for_user_in(db, user_id).await {
+            for def in defs {
+                if let Some(window) = def.calendar_window {
+                    windows.insert(def.slug, window);
+                }
+            }
+        }
+        Self {
+            state_expiries,
+            windows,
+        }
+    }
+
+    fn expires_at_for_slug(
+        &self,
+        slug: &str,
+        created: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        if let Some(&ts) = self.state_expiries.get(slug) {
+            return Some(ts);
+        }
+        let created = created?;
+        if let Some(window) = self.windows.get(slug) {
+            if let Some(ts) = calendar_window_expiry(window, created) {
+                return Some(ts);
+            }
+        }
+        Some(created + Duration::days(SEASONAL_FALLBACK_LIFETIME_DAYS))
+    }
+}
+
+/// The moment the automation expires `track`, accounting for seasonal packs via `seasonal`:
+/// - When `track.pack_slug` is set, uses `contextual_mix_states.expires_at`, then the mix
+///   definition's `CalendarWindow` computed for the track's creation cycle, falling back to 30
+///   days if the slug is unknown.
+/// - Otherwise uses `track.created_at` plus its rolling profile's lifetime in days (default 7).
+pub(crate) fn expires_at_with_seasonal(
+    track: &DiscoveryTrack,
+    lifetime_days: &HashMap<String, u32>,
+    seasonal: &SeasonalExpiryLookup,
+) -> Option<DateTime<Utc>> {
+    if let Some(slug) = track.pack_slug.as_deref().filter(|s| !s.trim().is_empty()) {
+        return seasonal.expires_at_for_slug(slug, parse_created_at(&track.created_at));
+    }
+    let created = parse_created_at(&track.created_at)?;
+    let days = lifetime_of(lifetime_days, &track.profile);
+    Some(created + Duration::days(days.into()))
+}
+
+/// The moment the automation expires `track`:
+/// - For seasonal tracks (`pack_slug` set), derives expiry from the built-in mix's
+///   `CalendarWindow` for `track.created_at`, falling back to 30 days if unknown.
+/// - For rolling tracks, `created_at` (RFC 3339, or SQLite's "%Y-%m-%d %H:%M:%S" in UTC) plus
+///   its profile's lifetime in days (7 when `lifetime_days` has none).
+///
+/// Returns `None` when `created_at` does not parse.
 pub(crate) fn expires_at(
     track: &DiscoveryTrack,
     lifetime_days: &HashMap<String, u32>,
 ) -> Option<DateTime<Utc>> {
-    let created = DateTime::parse_from_rfc3339(&track.created_at)
-        .map(|t| t.with_timezone(&Utc))
-        .or_else(|_| {
-            NaiveDateTime::parse_from_str(&track.created_at, "%Y-%m-%d %H:%M:%S")
-                .map(|naive| naive.and_utc())
-        })
-        .ok()?;
+    let created = parse_created_at(&track.created_at)?;
+    if let Some(slug) = track.pack_slug.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(window) = builtin_contextual_mixes()
+            .into_iter()
+            .find(|def| def.slug == slug)
+            .and_then(|def| def.calendar_window)
+        {
+            if let Some(ts) = calendar_window_expiry(&window, created) {
+                return Some(ts);
+            }
+        }
+        return Some(created + Duration::days(SEASONAL_FALLBACK_LIFETIME_DAYS));
+    }
     let days = lifetime_of(lifetime_days, &track.profile);
     Some(created + Duration::days(days.into()))
 }
@@ -226,12 +363,13 @@ pub(crate) async fn expire_in(
     expirable: &HashSet<String>,
 ) -> Result<u32, String> {
     let pending = DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id).await?;
+    let seasonal = SeasonalExpiryLookup::load_for_tracks_in(db, &folder.user_id, &pending).await;
     let mut expired = 0;
     for track in &pending {
         if !expirable.contains(&track.id) {
             continue;
         }
-        let Some(expires) = expires_at(track, lifetime_days) else {
+        let Some(expires) = expires_at_with_seasonal(track, lifetime_days, &seasonal) else {
             continue;
         };
         if now < expires {
@@ -370,8 +508,9 @@ pub(crate) async fn overview_in(
         None => vec![],
     };
     let lifetimes = settings.parse_lifetime_days();
+    let seasonal = SeasonalExpiryLookup::load_for_tracks_in(db, &ctx.user_id, &pending).await;
     pending.sort_by_key(|t| {
-        let expires = expires_at(t, &lifetimes);
+        let expires = expires_at_with_seasonal(t, &lifetimes, &seasonal);
         (expires.is_none(), expires)
     });
     let run = (effects.current(&ctx.id()).await).and_then(|p| current_progress(&p, Utc::now()));
@@ -1353,5 +1492,113 @@ mod tests {
             NotDone::Claimed(promote_file_gone())
         );
         assert_eq!(lib.track_status("t1").await, "Pending");
+    }
+
+    #[tokio::test]
+    async fn seasonal_tracks_expire_by_seasonal_expiry_not_rolling_lifetime() {
+        let lib = Library::new().await;
+        let folder = Folder::get_by_id_in(&lib.db, "alice-music")
+            .await
+            .unwrap()
+            .unwrap();
+        let make_file = |rel: &str| {
+            let p = lib
+                .root
+                .join("music/alice/Discovery/Seasonal")
+                .join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"audio").unwrap();
+            p
+        };
+
+        // 1. Track created 10 days ago (past 7-day rolling default) with contextual_mix_states.expires_at
+        //    in the future (2027-01-05): must NOT expire on 2026-12-05, MUST expire on 2027-01-05.
+        let future_path = make_file("winter_holiday/01.flac");
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, title, artist, album, path, folder_id, profile, status, created_at, pack_slug) \
+             VALUES ('t-seas-future', 'Snow', 'Choir', 'Winter', ?, 'alice-music', \
+                     'Seasonal:winter_holiday', 'Pending', '2026-11-25 12:00:00', 'winter_holiday')",
+        )
+        .bind(future_path.to_string_lossy().as_ref())
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        ContextualMixStateRow::upsert_playlist_id_in(
+            &lib.db,
+            "alice",
+            "winter_holiday",
+            None,
+            Some("2027-01-05"),
+        )
+        .await
+        .unwrap();
+
+        // 2. Track belonging to an expired seasonal pack (expires_at = 2026-11-08): MUST expire on 2026-12-05.
+        let past_path = make_file("halloween/01.flac");
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, title, artist, album, path, folder_id, profile, status, created_at, pack_slug) \
+             VALUES ('t-seas-past', 'Spooky', 'Ghosts', 'Hallows', ?, 'alice-music', \
+                     'Seasonal:halloween', 'Pending', '2026-10-20 12:00:00', 'halloween')",
+        )
+        .bind(past_path.to_string_lossy().as_ref())
+        .execute(&lib.db)
+        .await
+        .unwrap();
+        ContextualMixStateRow::upsert_playlist_id_in(
+            &lib.db,
+            "alice",
+            "halloween",
+            None,
+            Some("2026-11-08"),
+        )
+        .await
+        .unwrap();
+
+        // 3. Unknown seasonal slug falls back to 30 days (NOT 7 days): created 10 days ago stays pending on Dec 5.
+        let unknown_path = make_file("custom_unknown/01.flac");
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, title, artist, album, path, folder_id, profile, status, created_at, pack_slug) \
+             VALUES ('t-seas-unknown', 'Solstice', 'Folk', 'Mid', ?, 'alice-music', \
+                     'Seasonal:custom_unknown', 'Pending', '2026-11-25 12:00:00', 'custom_unknown')",
+        )
+        .bind(unknown_path.to_string_lossy().as_ref())
+        .execute(&lib.db)
+        .await
+        .unwrap();
+
+        let expirable = HashSet::from([
+            "t-seas-future".to_string(),
+            "t-seas-past".to_string(),
+            "t-seas-unknown".to_string(),
+        ]);
+        let (queue, _stub) = stub_queue();
+        let lifetimes = HashMap::new(); // default rolling = 7 days
+
+        // Dec 5, 2026: 10 days after Nov 25 creation; only the already-expired halloween track expires.
+        let dec_5 = "2026-12-05T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            expire_in(&lib.db, &queue, &folder, &lifetimes, dec_5, &expirable).await,
+            Ok(1)
+        );
+        assert_eq!(lib.track_status("t-seas-past").await, "Removed");
+        assert!(!past_path.exists());
+        assert_eq!(lib.track_status("t-seas-future").await, "Pending");
+        assert!(future_path.exists());
+        assert_eq!(lib.track_status("t-seas-unknown").await, "Pending");
+        assert!(unknown_path.exists());
+
+        // Jan 5, 2027 (at expires_at) + past 30-day fallback for unknown slug: both remaining tracks expire.
+        let jan_5 = "2027-01-05T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            expire_in(&lib.db, &queue, &folder, &lifetimes, jan_5, &expirable).await,
+            Ok(2)
+        );
+        assert_eq!(lib.track_status("t-seas-future").await, "Removed");
+        assert!(!future_path.exists());
+        assert_eq!(lib.track_status("t-seas-unknown").await, "Removed");
+        assert!(!unknown_path.exists());
     }
 }

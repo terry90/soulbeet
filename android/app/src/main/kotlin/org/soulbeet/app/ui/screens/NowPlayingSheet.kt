@@ -424,64 +424,75 @@ fun NowPlayingSheet(
                     // Context-Aware Soulbeet Curation Row (Pending Discovery vs Permanent Library)
                     if (pb.currentTrackId != null) {
                         if (pb.isPendingDiscovery) {
-                            Row(
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Surface(
-                                    color = colors.crimsonSurface,
-                                    shape = SoulbeetShapes.full,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .heightIn(min = 48.dp)
-                                        .clickable(onClick = onDropDiscovery),
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
-                                        horizontalArrangement = Arrangement.Center,
-                                        verticalAlignment = Alignment.CenterVertically,
+                                    Surface(
+                                        color = colors.crimsonSurface,
+                                        shape = SoulbeetShapes.full,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .heightIn(min = 48.dp)
+                                            .clickable(onClick = onDropDiscovery),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                                            horizontalArrangement = Arrangement.Center,
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.ThumbDown,
+                                                contentDescription = "Drop Discovery",
+                                                tint = colors.crimsonText,
+                                                modifier = Modifier.size(18.dp),
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Drop", style = type.body, color = colors.crimsonText)
+                                        }
+                                    }
+
+                                    IconButton(
+                                        onClick = onStarToggle,
+                                        modifier = Modifier
+                                            .size(48.dp)
+                                            .clip(CircleShape)
+                                            .background(colors.accentSurface),
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Filled.ThumbDown,
-                                            contentDescription = "Drop Discovery",
-                                            tint = colors.crimsonText,
-                                            modifier = Modifier.size(18.dp),
+                                            imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                            contentDescription = "Favorite and promote",
+                                            tint = colors.accentText,
                                         )
+                                    }
+
+                                    Button(
+                                        onClick = onKeepDiscovery,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = colors.leafSolid,
+                                            contentColor = colors.leafInk,
+                                        ),
+                                        shape = SoulbeetShapes.full,
+                                        modifier = Modifier
+                                            .weight(1.25f)
+                                            .heightIn(min = 48.dp),
+                                    ) {
+                                        Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                                         Spacer(Modifier.width(6.dp))
-                                        Text("Drop", style = type.body, color = colors.crimsonText)
+                                        Text("KEEP", style = type.body)
                                     }
                                 }
 
-                                IconButton(
-                                    onClick = onStarToggle,
-                                    modifier = Modifier
-                                        .size(48.dp)
-                                        .clip(CircleShape)
-                                        .background(colors.accentSurface),
-                                ) {
-                                    Icon(
-                                        imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                        contentDescription = "Favorite and promote",
-                                        tint = colors.accentText,
-                                    )
-                                }
-
-                                Button(
-                                    onClick = onKeepDiscovery,
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = colors.leafSolid,
-                                        contentColor = colors.leafInk,
-                                    ),
-                                    shape = SoulbeetShapes.full,
-                                    modifier = Modifier
-                                        .weight(1.25f)
-                                        .heightIn(min = 48.dp),
-                                ) {
-                                    Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("KEEP", style = type.body)
-                                }
+                                StarStrip(
+                                    rating = pb.userRating,
+                                    onRate = onRate,
+                                )
                             }
                         } else {
                             // Permanent Library Curation Row: Remove (muted tertiary -> Guard Sheet), Star, 1-5★ Strip, Radio
@@ -876,6 +887,7 @@ private fun UpNextQueueSheet(
                             isPlaying = idx == state.playback.currentIndex,
                             isOfflineCached = state.offlineTrackIds.contains(track.id),
                             isPendingDiscovery = track.isDiscovery,
+                            userRating = track.userRating.toInt(),
                             onClick = { onPlayIndex(idx) },
                         )
                     }

@@ -1507,6 +1507,10 @@ pub struct ContextualMixTrack {
     pub duration_s: Option<u32>,
     pub owned: bool,
     #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
     pub reason: Option<CandidateReason>,
     #[serde(default)]
     pub culture_bucket: Option<CultureBucket>,
@@ -1563,6 +1567,10 @@ pub struct SeedRadioTrack {
     pub album: Option<String>,
     #[serde(default)]
     pub duration: Option<u32>,
+    #[serde(default)]
+    pub rating: Option<u8>,
+    #[serde(default)]
+    pub starred: bool,
     pub reason: CandidateReason,
 }
 

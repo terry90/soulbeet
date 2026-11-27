@@ -25,7 +25,7 @@ pub fn HomePage() -> Element {
     let mixes = studio.contextual_mixes.read().clone();
     let seasonal = mixes
         .iter()
-        .find(|m| m.kind == ContextualMixKind::Seasonal)
+        .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
     let moment_and_rolling: Vec<_> = mixes
         .iter()
@@ -124,6 +124,7 @@ pub fn HomePage() -> Element {
                 .iter()
                 .filter(|pl| {
                     pl.category.is_soulbeet_mix()
+                        && !(pl.category == PlaylistCategory::Seasonal && pl.song_count == 0)
                         && !shown_mix_playlist_ids.contains(&pl.id.as_str())
                 })
                 .take(needed)
@@ -304,6 +305,7 @@ pub fn HomePage() -> Element {
                                 let t_play = track.clone();
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
+                                let t_rate = track.clone();
                                 let t_inspect = track.clone();
                                 rsx! {
                                     TrackRow {
@@ -316,6 +318,7 @@ pub fn HomePage() -> Element {
                                         state: TrackRowState::PendingDiscovery {
                                             days_remaining: track.days_remaining,
                                             reason_label: track.reason_label.clone(),
+                                            rating: track.rating,
                                         },
                                         on_play: move |_| {
                                             studio.play_or_toggle_triage(
@@ -327,6 +330,7 @@ pub fn HomePage() -> Element {
                                         },
                                         on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                         on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
+                                        on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                         on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                     }
                                 }

@@ -181,6 +181,28 @@ impl SubsonicClient {
         Ok(payload.genres.map(|g| g.genre).unwrap_or_default())
     }
 
+    /// Lightweight paginated song-only `search3` lookup (used for incremental rating/annotation refresh).
+    pub async fn search3_songs(
+        &self,
+        query: &str,
+        song_count: usize,
+        song_offset: usize,
+    ) -> CoreResult<Vec<SubsonicSong>> {
+        let payload: Search3Payload = self
+            .get_json(
+                "search3",
+                &[
+                    ("query", query.to_string()),
+                    ("artistCount", "0".to_string()),
+                    ("albumCount", "0".to_string()),
+                    ("songCount", song_count.to_string()),
+                    ("songOffset", song_offset.to_string()),
+                ],
+            )
+            .await?;
+        Ok(payload.search_result3.map(|r| r.song).unwrap_or_default())
+    }
+
     pub async fn scrobble(
         &self,
         song_id: &str,
@@ -583,4 +605,17 @@ pub struct SubsonicGenre {
     pub song_count: i64,
     #[serde(default)]
     pub album_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Search3Payload {
+    #[serde(default)]
+    search_result3: Option<SearchResult3Container>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResult3Container {
+    #[serde(default)]
+    song: Vec<SubsonicSong>,
 }

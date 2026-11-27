@@ -67,6 +67,7 @@ import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.theme.SoulbeetTheme
+import org.soulbeet.app.ui.components.CompactStarBadge
 import org.soulbeet.app.ui.components.MultiListenerGuardSheet
 import org.soulbeet.app.ui.components.SeamLightBar
 import org.soulbeet.app.ui.components.SoulbeetPixelLogo
@@ -666,13 +667,22 @@ private fun FloatingMiniPlayer(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        text = pb.artist,
-                        style = type.bodySm,
-                        color = colors.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = pb.artist,
+                            style = type.bodySm,
+                            color = colors.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        if (pb.userRating > 0) {
+                            CompactStarBadge(rating = pb.userRating)
+                        }
+                    }
                 }
 
                 // 1-Tap Context Action (Keep if Discovery, Favorite if Library)

@@ -89,6 +89,7 @@ pub fn FolderManager() -> Element {
 
     // Library settings state
     let mut auto_delete_enabled = use_signal(|| false);
+    let mut external_rating_sync_enabled = use_signal(|| true);
     let mut discovery_promote_threshold = use_signal(|| "3".to_string());
     let mut lb_username = use_signal(String::new);
     let mut lb_token = use_signal(String::new);
@@ -145,6 +146,7 @@ pub fn FolderManager() -> Element {
     use_effect(move || {
         if let Some(Ok(s)) = &*settings_resource.read() {
             auto_delete_enabled.set(s.auto_delete_enabled);
+            external_rating_sync_enabled.set(s.external_rating_sync_enabled);
             deezer_recommendations.set(s.deezer_recommendations);
             show_lossy(s);
             discovery_enabled.set(s.discovery_enabled);
@@ -637,53 +639,91 @@ pub fn FolderManager() -> Element {
                         }
                     }
 
-                    // Auto-delete toggle
-                    div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
+                    // External Subsonic Client Compatibility
+                    div { class: "pt-2 space-y-3",
                         div {
-                            p { class: "text-sm text-beet-text-primary font-medium", "Auto-delete 1-star tracks" }
-                            p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
-                                "Automatically delete files rated 1 star in Navidrome during sync"
+                            h3 { class: "text-sm font-semibold text-beet-text-primary mb-1",
+                                "External Subsonic Client Compatibility"
+                            }
+                            p { class: "text-xs text-beet-text-secondary leading-relaxed",
+                                "Soulbeet uses Keep and Drop directly and keeps stars as pure 1 to 5 ratings. Enable compatibility sync if you curate Discovery tracks using star ratings in third-party Subsonic clients such as Symfonium or Navidrome Web."
                             }
                         }
-                        Toggle {
-                            on: auto_delete_enabled(),
-                            on_class: "bg-beet-crimson-solid",
-                            onclick: move |_| save_switch(auto_delete_enabled, library_error, |on| {
-                                api::update_user_settings(api::UpdateUserSettings {
-                                    auto_delete_enabled: Some(on),
-                                    ..Default::default()
-                                })
-                            }),
-                        }
-                    }
 
-                    // Discovery promote threshold
-                    div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
-                        div {
-                            p { class: "text-sm text-beet-text-primary font-medium", "Discovery promote threshold" }
-                            p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
-                                "Promote discovery tracks to your library when rated at or above this"
+                        // External star rating sync toggle
+                        div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
+                            div {
+                                p { class: "text-sm text-beet-text-primary font-medium",
+                                    "Sync star ratings from external clients for Discovery"
+                                }
+                                p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
+                                    "Treat 1-star ratings as Drop and threshold-or-higher ratings as Keep when syncing ratings made outside Soulbeet"
+                                }
+                            }
+                            Toggle {
+                                on: external_rating_sync_enabled(),
+                                on_class: "bg-beet-leaf-solid",
+                                onclick: move |_| save_switch(external_rating_sync_enabled, library_error, |on| {
+                                    api::update_user_settings(api::UpdateUserSettings {
+                                        external_rating_sync_enabled: Some(on),
+                                        ..Default::default()
+                                    })
+                                }),
                             }
                         }
-                        input {
-                            class: "w-16 h-9 px-2 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-beet-text-primary tabular-nums-mono text-sm text-center",
-                            value: "{discovery_promote_threshold}",
-                            oninput: move |e| discovery_promote_threshold.set(e.value()),
-                            onchange: move |_| {
-                                let change = typed_number(
-                                    &discovery_promote_threshold(),
-                                    "The discovery promote threshold",
-                                    PROMOTE_THRESHOLDS,
-                                )
-                                .map(|n| api::UpdateUserSettings {
-                                    discovery_promote_threshold: Some(n),
-                                    ..Default::default()
-                                });
-                                saver.save(change, show_threshold)
-                            },
-                            "type": "number",
-                            min: PROMOTE_THRESHOLDS.start().to_string(),
-                            max: PROMOTE_THRESHOLDS.end().to_string(),
+
+                        // Discovery promote threshold (gated under external compat toggle)
+                        if external_rating_sync_enabled() {
+                            div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
+                                div {
+                                    p { class: "text-sm text-beet-text-primary font-medium",
+                                        "External client promote threshold"
+                                    }
+                                    p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
+                                        "Promote pending discovery tracks during sync when rated at or above this in an external Subsonic client"
+                                    }
+                                }
+                                input {
+                                    class: "w-16 h-9 px-2 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-beet-text-primary tabular-nums-mono text-sm text-center",
+                                    value: "{discovery_promote_threshold}",
+                                    oninput: move |e| discovery_promote_threshold.set(e.value()),
+                                    onchange: move |_| {
+                                        let change = typed_number(
+                                            &discovery_promote_threshold(),
+                                            "The discovery promote threshold",
+                                            PROMOTE_THRESHOLDS,
+                                        )
+                                        .map(|n| api::UpdateUserSettings {
+                                            discovery_promote_threshold: Some(n),
+                                            ..Default::default()
+                                        });
+                                        saver.save(change, show_threshold)
+                                    },
+                                    "type": "number",
+                                    min: PROMOTE_THRESHOLDS.start().to_string(),
+                                    max: PROMOTE_THRESHOLDS.end().to_string(),
+                                }
+                            }
+                        }
+
+                        // Auto-delete 1-star toggle
+                        div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
+                            div {
+                                p { class: "text-sm text-beet-text-primary font-medium", "Auto-delete 1-star tracks" }
+                                p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
+                                    "Automatically delete files rated 1 star in Navidrome or external Subsonic clients during sync"
+                                }
+                            }
+                            Toggle {
+                                on: auto_delete_enabled(),
+                                on_class: "bg-beet-crimson-solid",
+                                onclick: move |_| save_switch(auto_delete_enabled, library_error, |on| {
+                                    api::update_user_settings(api::UpdateUserSettings {
+                                        auto_delete_enabled: Some(on),
+                                        ..Default::default()
+                                    })
+                                }),
+                            }
                         }
                     }
                 }

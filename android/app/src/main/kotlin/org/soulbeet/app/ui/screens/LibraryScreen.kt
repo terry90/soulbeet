@@ -237,7 +237,9 @@ fun LibraryScreen(
         when (state.libraryCategory) {
             LibraryCategory.PLAYLISTS -> {
                 val userPlaylists = state.userPlaylists
-                val discoveryAndMixPlaylists = state.playlists.filter { it.kind != "user" }
+                val discoveryAndMixPlaylists = state.playlists.filter { pl ->
+                    pl.kind != "user" && !(pl.kind == "seasonal" && pl.songCount == 0L)
+                }
                 if (userPlaylists.isEmpty() && discoveryAndMixPlaylists.isEmpty()) {
                     item(key = "empty_playlists") { EmptyLibraryNotice("No playlists synced yet.") }
                 } else {
@@ -380,6 +382,7 @@ fun LibraryScreen(
                             isOfflineCached = isCached,
                             isUnavailableOffline = state.config.offlineOnly && !isCached,
                             isStarred = true,
+                            userRating = track.userRating.toInt(),
                             onClick = { onPlayQueue(state.starredTracks, index, "Starred") },
                             onStarClick = { onStarTrack(track) },
                             onRemoveClick = { onRemoveTrack(track) },
@@ -407,6 +410,7 @@ fun LibraryScreen(
                             isUnavailableOffline = state.config.offlineOnly && !isCached,
                             isPendingDiscovery = true,
                             discoveryExpiryLabel = FormattingUtils.formatExpiryCountdown(disc.expiresAt),
+                            userRating = card.track?.userRating?.toInt() ?: 0,
                             onClick = {
                                 onPlayTriageCard(card)
                             },
@@ -433,6 +437,7 @@ fun LibraryScreen(
                             isPlaying = state.playback.currentTrackId == track.id,
                             isOfflineCached = true,
                             isStarred = track.starred,
+                            userRating = track.userRating.toInt(),
                             onClick = { onPlayQueue(state.offlineTracks, index, "Cached") },
                             onStarClick = { onStarTrack(track) },
                             onRemoveClick = { onRemoveTrack(track) },
@@ -739,6 +744,7 @@ private fun ContainerDetailSheet(
                         isUnavailableOffline = state.config.offlineOnly && !isCached,
                         isPendingDiscovery = track.isDiscovery,
                         isStarred = track.starred,
+                        userRating = track.userRating.toInt(),
                         onClick = { onPlayIndex(idx) },
                         onStarClick = { onStarTrack(track) },
                         onRemoveClick = { onRemoveTrack(track) },

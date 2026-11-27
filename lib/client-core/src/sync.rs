@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -24,6 +24,7 @@ const CURSOR_GENRES_JSON: &str = "genres_json";
 pub const CURSOR_PROMOTE_THRESHOLD: &str = "promote_threshold";
 const ALBUM_PAGE_SIZE: usize = 250;
 const DELTA_PAGE_SIZE: usize = 50;
+const RATING_SYNC_PAGE_SIZE: usize = 500;
 
 /// Synchronizes local SQLite mirror from Soulbeet (`/api/client/bootstrap`, Discovery)
 /// and Navidrome OpenSubsonic (`getArtists`, `getAlbumList2`, `getPlaylists`, `getStarred2`, `getGenres`).
@@ -402,6 +403,19 @@ impl SyncEngine {
             }
         }
 
+        // 4b. Incremental rating/annotation refresh via paginated search3 (empty query)
+        // Delta sync skips unchanged albums, so tracks rated in Navidrome would otherwise keep stale user_rating.
+        if !full_sync {
+            if let Err(err) = self
+                .sync_song_ratings(&subsonic, &pending_songs, now)
+                .await
+            {
+                report
+                    .warnings
+                    .push(format!("rating sync failed: {err}"));
+            }
+        }
+
         // 5. Genres snapshot
         match subsonic.get_genres().await {
             Ok(genres) => {
@@ -459,6 +473,83 @@ impl SyncEngine {
         Ok(synced)
     }
 
+    async fn sync_song_ratings(
+        &self,
+        subsonic: &SubsonicClient,
+        pending_songs: &HashSet<String>,
+        now: i64,
+    ) -> CoreResult<usize> {
+        let mut offset = 0usize;
+        let mut remote_songs: Vec<(String, i64, bool)> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        loop {
+            let page = subsonic
+                .search3_songs("", RATING_SYNC_PAGE_SIZE, offset)
+                .await?;
+            let count = page.len();
+            if count == 0 {
+                break;
+            }
+            for song in page {
+                if seen_ids.insert(song.id.clone()) {
+                    remote_songs.push((
+                        song.id,
+                        song.user_rating.unwrap_or(0),
+                        song.starred.is_some(),
+                    ));
+                }
+            }
+            if count < RATING_SYNC_PAGE_SIZE {
+                break;
+            }
+            offset += count;
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let live_pending_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT song_id FROM mutation_outbox WHERE dead_letter = 0",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut protected_songs = pending_songs.clone();
+        protected_songs.extend(live_pending_ids);
+
+        let local_rows: Vec<(String, i64, bool)> =
+            sqlx::query_as("SELECT id, user_rating, starred FROM tracks")
+                .fetch_all(&mut *tx)
+                .await?;
+        let local_map: HashMap<String, (i64, bool)> = local_rows
+            .into_iter()
+            .map(|(id, rating, starred)| (id, (rating, starred)))
+            .collect();
+
+        let mut updated = 0usize;
+
+        for (id, remote_rating, remote_starred) in &remote_songs {
+            if protected_songs.contains(id) {
+                continue;
+            }
+            if let Some(&(local_rating, local_starred)) = local_map.get(id) {
+                if local_rating != *remote_rating || local_starred != *remote_starred {
+                    sqlx::query(
+                        "UPDATE tracks SET user_rating = ?, starred = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(*remote_rating)
+                    .bind(*remote_starred)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                    updated += 1;
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     async fn sync_discovery_triage(
         &self,
         base: &str,
@@ -495,6 +586,8 @@ impl SyncEngine {
             profile: Option<String>,
             #[serde(default, alias = "mix_slug")]
             pack_slug: Option<String>,
+            #[serde(default)]
+            rating: Option<u8>,
             #[serde(default = "default_pending")]
             status: String,
             #[serde(default)]
@@ -512,6 +605,7 @@ impl SyncEngine {
         }
 
         let items: Vec<TriageItem> = resp.json().await?;
+        let live_pending = pending_outbox_song_ids(&self.pool).await?;
         let count = items.len();
         let mut synced_ids = HashSet::with_capacity(count);
 
@@ -520,7 +614,7 @@ impl SyncEngine {
             let preserve = item
                 .song_id
                 .as_deref()
-                .is_some_and(|sid| pending_songs.contains(sid));
+                .is_some_and(|sid| pending_songs.contains(sid) || live_pending.contains(sid));
             let reason_json = item
                 .reason
                 .as_ref()
@@ -530,6 +624,8 @@ impl SyncEngine {
             let album = item.album.filter(|a| !a.is_empty());
             let folder_path = item.path.filter(|p| !p.is_empty());
             let profile_slug = item.profile.filter(|p| !p.is_empty());
+            let song_id_for_rating = item.song_id.clone();
+            let rating = item.rating;
 
             upsert_discovery_track(
                 &self.pool,
@@ -552,6 +648,19 @@ impl SyncEngine {
                 preserve,
             )
             .await?;
+
+            if !preserve {
+                if let (Some(sid), Some(r)) = (song_id_for_rating.as_deref(), rating) {
+                    sqlx::query(
+                        "UPDATE tracks SET user_rating = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(i64::from(r.min(5)))
+                    .bind(now)
+                    .bind(sid)
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
         }
 
         // Prune stale discovery tracks no longer in server triage queue (protecting pending outbox edits).
@@ -565,7 +674,7 @@ impl SyncEngine {
             }
             if song_id
                 .as_deref()
-                .is_some_and(|sid| pending_songs.contains(sid))
+                .is_some_and(|sid| pending_songs.contains(sid) || live_pending.contains(sid))
             {
                 continue;
             }

@@ -188,7 +188,6 @@ object AutoCustomActions {
 
                     val updated = current.copy(
                         isPendingDiscovery = false,
-                        userRating = maxOf(current.userRating, 4),
                         discoveryTrackId = discoveryId,
                     )
                     if (currentTrackContextProvider()?.trackId == current.trackId) {

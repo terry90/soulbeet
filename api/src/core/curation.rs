@@ -9,7 +9,7 @@ use shared::client::{
     ListenerProtection, ListenerProtectionKind, RateTrackRequest, StarTrackRequest,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use shared::navidrome::{DeletionReason, DiscoveryTrack};
+use shared::navidrome::{DeletionReason, DiscoveryStatus, DiscoveryTrack};
 use soulbeet::navidrome::models::SubsonicSong;
 use soulbeet::navidrome::StarTarget;
 use tracing::warn;
@@ -18,7 +18,7 @@ use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::core::delete_guard::{pending_track_of, song_not_found, ForgetVia, Guard, Origin, Verdict};
 use crate::core::discovery::{
-    promote_to, remove_in, track_not_pending, DiscoveryEffects, Replace,
+    is_not_pending, promote_to, remove_in, track_not_pending, DiscoveryEffects, Replace,
 };
 use crate::core::index::ServerNavidrome;
 use crate::core::library::{navidrome_failure, navidrome_for};
@@ -129,9 +129,101 @@ fn effective_song_id(req_song_id: &str, track: &DiscoveryTrack) -> String {
     }
 }
 
-/// Resolves whether `song_id` (or explicit `discovery_track_id`) corresponds to a Pending
-/// discovery track owned by `ctx`.
-async fn find_pending_discovery(
+enum DiscoveryLookup {
+    Pending(DiscoveryTrack),
+    Already(DiscoveryTrack),
+    NotDiscovery,
+}
+
+/// Fetches a discovery track by `(id, user_id)` regardless of status (verifying ownership
+/// through its folder).
+async fn find_user_discovery_by_id(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    track_id: &str,
+) -> Result<Option<DiscoveryTrack>, Failure> {
+    let row = sqlx::query_as::<_, DiscoveryTrackRow>(
+        "SELECT t.* FROM discovery_tracks t \
+         JOIN folders f ON f.id = t.folder_id \
+         WHERE t.id = ? AND f.user_id = ?",
+    )
+    .bind(track_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| database_failure(Stage::LibraryCheck, e))?;
+    Ok(row.map(Into::into))
+}
+
+/// Persists the pure quality rating written directly inside Soulbeet on `discovery_tracks.rating`
+/// so rating sync does not treat it as an external-client promote/drop trigger.
+async fn record_discovery_rating(
+    db: &sqlx::SqlitePool,
+    user_id: &str,
+    track_id: &str,
+    rating: Option<i64>,
+) -> Result<(), Failure> {
+    sqlx::query(
+        "UPDATE discovery_tracks SET rating = ? \
+         WHERE id = ? AND folder_id IN (SELECT id FROM folders WHERE user_id = ?)",
+    )
+    .bind(rating)
+    .bind(track_id)
+    .bind(user_id)
+    .execute(db)
+    .await
+    .map_err(|e| database_failure(Stage::LibraryCheck, e))?;
+    Ok(())
+}
+
+/// Resolves whether `song_id` (or explicit `discovery_track_id`) corresponds to a Pending or
+/// already-transitioned discovery track owned by `ctx`.
+async fn lookup_discovery(
+    guard: &Guard<'_>,
+    ctx: &UserCtx,
+    song_id: &str,
+    explicit_discovery_id: Option<&str>,
+) -> Result<DiscoveryLookup, Failure> {
+    let pending = DiscoveryTrackRow::pending_for_user_in(guard.db, &ctx.user_id)
+        .await
+        .map_err(|e| database_failure(Stage::LibraryCheck, e))?;
+
+    if let Some(track_id) = explicit_discovery_id.filter(|s| !s.is_empty()) {
+        if let Some(track) = pending.into_iter().find(|t| t.id == track_id) {
+            return Ok(DiscoveryLookup::Pending(track));
+        }
+        if let Some(existing) = find_user_discovery_by_id(guard.db, &ctx.user_id, track_id).await? {
+            return Ok(DiscoveryLookup::Already(existing));
+        }
+        return Err(track_not_pending());
+    }
+
+    if pending.is_empty() || song_id.is_empty() {
+        return Ok(DiscoveryLookup::NotDiscovery);
+    }
+
+    if let Some(track) = pending
+        .iter()
+        .find(|t| t.song_id.as_deref() == Some(song_id))
+    {
+        return Ok(DiscoveryLookup::Pending(track.clone()));
+    }
+
+    let user = ctx.id();
+    let Some(native) = guard.read_song(&user, song_id).await? else {
+        return Ok(DiscoveryLookup::NotDiscovery);
+    };
+    Ok(
+        match pending_track_of(guard.db, guard.music_path, &user, &native, &pending).await? {
+            Some(track) => DiscoveryLookup::Pending(track.clone()),
+            None => DiscoveryLookup::NotDiscovery,
+        },
+    )
+}
+
+/// Finds a Pending discovery track matching `song_id` (or `explicit_discovery_id`) for recording
+/// a pure quality rating. Returns `Ok(None)` if the track is not pending.
+async fn find_pending_for_rating(
     guard: &Guard<'_>,
     ctx: &UserCtx,
     song_id: &str,
@@ -142,10 +234,7 @@ async fn find_pending_discovery(
         .map_err(|e| database_failure(Stage::LibraryCheck, e))?;
 
     if let Some(track_id) = explicit_discovery_id.filter(|s| !s.is_empty()) {
-        if let Some(track) = pending.into_iter().find(|t| t.id == track_id) {
-            return Ok(Some(track));
-        }
-        return Err(track_not_pending());
+        return Ok(pending.into_iter().find(|t| t.id == track_id));
     }
 
     if pending.is_empty() || song_id.is_empty() {
@@ -168,6 +257,59 @@ async fn find_pending_discovery(
             .await?
             .cloned(),
     )
+}
+
+/// Builds the `CurationResult` for a promoted (or already-promoted) discovery track without
+/// modifying its Navidrome star rating.
+async fn kept_discovery_result(
+    navi: &dyn CurationNavidrome,
+    ctx: &UserCtx,
+    req_song_id: &str,
+    track: &DiscoveryTrack,
+) -> CurationResult {
+    let song_id = effective_song_id(req_song_id, track);
+    let mut current_rating = track.rating.filter(|r| *r > 0);
+    let mut fetched_starred = None;
+    if !song_id.is_empty() {
+        if let Ok(Some(song)) = navi.get_song(ctx, &song_id).await {
+            fetched_starred = Some(song.starred.is_some());
+            current_rating = song.user_rating.filter(|r| *r > 0);
+        }
+    }
+
+    // PR 1C will plug the On-Keep archival FLAC upgrade worker in here when a track was
+    // fast-acquired in lossy quality.
+    let archival_upgrade_queued = false;
+
+    CurationResult {
+        song_id,
+        action: CurationAction::Kept,
+        promoted_discovery: true,
+        starred: fetched_starred,
+        rating: current_rating,
+        deleted_from_disk: false,
+        archival_upgrade_queued,
+        guard_preview: None,
+        message: format!("Saved '{}' to your library", track.title),
+    }
+}
+
+fn dropped_discovery_result(
+    song_id: &str,
+    track: &DiscoveryTrack,
+    starred: Option<bool>,
+) -> CurationResult {
+    CurationResult {
+        song_id: song_id.to_string(),
+        action: CurationAction::DroppedDiscovery,
+        promoted_discovery: false,
+        starred,
+        rating: None,
+        deleted_from_disk: true,
+        archival_upgrade_queued: false,
+        guard_preview: None,
+        message: format!("Dropped '{}' from Discovery", track.title),
+    }
 }
 
 /// Evaluates Soulbeet's Multi-Listener Delete Guard for `song_id` without mutating anything.
@@ -206,8 +348,9 @@ pub(crate) async fn guard_preview_in(
     }
 }
 
-/// Keeps/promotes a track. Pending Discovery tracks are moved into the permanent library and
-/// rated at least `discovery_promote_threshold`. Permanent tracks are affirmed at the threshold.
+/// Keeps/promotes a track without altering its Navidrome star rating.
+/// Pending Discovery tracks are moved into the permanent library; duplicate calls on an
+/// already-promoted (or currently promoting) discovery track succeed idempotently.
 pub(crate) async fn keep_track_in(
     guard: &Guard<'_>,
     navi: &dyn CurationNavidrome,
@@ -216,90 +359,67 @@ pub(crate) async fn keep_track_in(
     ctx: &UserCtx,
     req: &KeepTrackRequest,
 ) -> Result<CurationResult, Failure> {
-    let settings = UserSettings::get_in(guard.db, &ctx.user_id)
-        .await
-        .map_err(|e| database_failure(Stage::Input, e))?;
-    let threshold = settings.discovery_promote_threshold.clamp(1, 5);
     let user = ctx.id();
 
-    if let Some(track) = find_pending_discovery(
-        guard,
-        ctx,
-        &req.song_id,
-        req.discovery_track_id.as_deref(),
-    )
-    .await?
-    {
-        let song_id = effective_song_id(&req.song_id, &track);
-        let (promoted, _) = promote_to(
-            guard.db,
-            effects,
-            queue,
-            &user,
-            &track.id,
-            req.target_folder_id.as_deref(),
-            Replace::Guarded(Origin::Ui),
-        )
-        .await
-        .map_err(|e| e.into_failure())?;
-
-        let mut applied_rating = None;
-        let mut fetched_starred = None;
-        if !song_id.is_empty() {
-            if let Ok(Some(song)) = navi.get_song(ctx, &song_id).await {
-                fetched_starred = Some(song.starred.is_some());
-                let current = song.user_rating.unwrap_or(0);
-                let target = current.max(threshold);
-                if target > current {
-                    match navi.set_rating(ctx, &song_id, target).await {
-                        Ok(()) => applied_rating = Some(target),
-                        Err(e) => {
-                            warn!(
-                                "Promoted '{}' but could not raise Navidrome rating: {}",
-                                promoted.title, e.message
-                            );
-                            applied_rating = (current > 0).then_some(current);
+    match lookup_discovery(guard, ctx, &req.song_id, req.discovery_track_id.as_deref()).await? {
+        DiscoveryLookup::Pending(track) => {
+            match promote_to(
+                guard.db,
+                effects,
+                queue,
+                &user,
+                &track.id,
+                req.target_folder_id.as_deref(),
+                Replace::Guarded(Origin::Ui),
+            )
+            .await
+            {
+                Ok((promoted, _)) => {
+                    return Ok(kept_discovery_result(navi, ctx, &req.song_id, &promoted).await);
+                }
+                Err(not_done) => {
+                    let failure = not_done.into_failure();
+                    if is_not_pending(&failure) {
+                        if let Some(existing) =
+                            find_user_discovery_by_id(guard.db, &ctx.user_id, &track.id).await?
+                        {
+                            if matches!(
+                                existing.status,
+                                DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
+                            ) {
+                                return Ok(
+                                    kept_discovery_result(navi, ctx, &req.song_id, &existing).await,
+                                );
+                            }
                         }
                     }
-                } else {
-                    applied_rating = Some(current);
+                    return Err(failure);
                 }
             }
         }
-
-        // PR 1C will plug the On-Keep archival FLAC upgrade worker in here when a track was
-        // fast-acquired in lossy quality.
-        let archival_upgrade_queued = false;
-
-        return Ok(CurationResult {
-            song_id,
-            action: CurationAction::Kept,
-            promoted_discovery: true,
-            starred: fetched_starred,
-            rating: applied_rating,
-            deleted_from_disk: false,
-            archival_upgrade_queued,
-            guard_preview: None,
-            message: format!("Saved '{}' to your library", promoted.title),
-        });
+        DiscoveryLookup::Already(track) => {
+            if matches!(
+                track.status,
+                DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
+            ) {
+                return Ok(kept_discovery_result(navi, ctx, &req.song_id, &track).await);
+            }
+            return Err(track_not_pending());
+        }
+        DiscoveryLookup::NotDiscovery => {}
     }
 
     let song = navi
         .get_song(ctx, &req.song_id)
         .await?
         .ok_or_else(song_not_found)?;
-    let current = song.user_rating.unwrap_or(0);
-    let target = current.max(threshold);
-    if target > current {
-        navi.set_rating(ctx, &req.song_id, target).await?;
-    }
 
     Ok(CurationResult {
         song_id: req.song_id.clone(),
         action: CurationAction::Kept,
         promoted_discovery: false,
         starred: Some(song.starred.is_some()),
-        rating: Some(target),
+        rating: song.user_rating.filter(|r| *r > 0),
         deleted_from_disk: false,
         archival_upgrade_queued: false,
         guard_preview: None,
@@ -308,7 +428,8 @@ pub(crate) async fn keep_track_in(
 }
 
 /// Stars or unstars a track. Starring a Pending Discovery track automatically promotes/keeps it
-/// into the permanent library (locked design decision).
+/// into the permanent library without stamping an artificial star rating. Duplicate star+keep
+/// calls on an already-promoted (or currently promoting) discovery track succeed idempotently.
 pub(crate) async fn star_track_in(
     guard: &Guard<'_>,
     navi: &dyn CurationNavidrome,
@@ -317,56 +438,102 @@ pub(crate) async fn star_track_in(
     ctx: &UserCtx,
     req: &StarTrackRequest,
 ) -> Result<CurationResult, Failure> {
-    let song = navi
-        .get_song(ctx, &req.song_id)
-        .await?
-        .ok_or_else(song_not_found)?;
-    navi.set_star(ctx, &req.song_id, req.starred).await?;
+    let discovery_lookup = if req.starred {
+        let lookup =
+            lookup_discovery(guard, ctx, &req.song_id, req.discovery_track_id.as_deref()).await?;
+        if let DiscoveryLookup::Already(ref track) = lookup {
+            if !matches!(
+                track.status,
+                DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
+            ) {
+                return Err(track_not_pending());
+            }
+        }
+        Some(lookup)
+    } else {
+        None
+    };
+
+    let song_id = match &discovery_lookup {
+        Some(DiscoveryLookup::Pending(track) | DiscoveryLookup::Already(track)) => {
+            effective_song_id(&req.song_id, track)
+        }
+        _ => req.song_id.clone(),
+    };
+
+    let song = if song_id.is_empty() {
+        None
+    } else {
+        navi.get_song(ctx, &song_id).await?
+    };
+    let song = match song {
+        Some(song) => song,
+        None => {
+            if let Some(DiscoveryLookup::Already(track)) = discovery_lookup {
+                return Ok(CurationResult {
+                    song_id,
+                    action: CurationAction::Starred,
+                    promoted_discovery: true,
+                    starred: None,
+                    rating: track.rating.filter(|r| *r > 0),
+                    deleted_from_disk: false,
+                    archival_upgrade_queued: false,
+                    guard_preview: None,
+                    message: format!("Starred and saved '{}' to your library", track.title),
+                });
+            }
+            return Err(song_not_found());
+        }
+    };
+    navi.set_star(ctx, &song_id, req.starred).await?;
 
     let mut promoted_discovery = false;
-    let mut applied_rating = song.user_rating.filter(|r| *r > 0);
+    let applied_rating = song.user_rating.filter(|r| *r > 0);
     let archival_upgrade_queued = false;
 
-    if req.starred {
-        if let Some(track) = find_pending_discovery(
-            guard,
-            ctx,
-            &req.song_id,
-            req.discovery_track_id.as_deref(),
-        )
-        .await?
-        {
-            let settings = UserSettings::get_in(guard.db, &ctx.user_id)
+    if let Some(lookup) = discovery_lookup {
+        match lookup {
+            DiscoveryLookup::Pending(track) => {
+                let user = ctx.id();
+                match promote_to(
+                    guard.db,
+                    effects,
+                    queue,
+                    &user,
+                    &track.id,
+                    None,
+                    Replace::Guarded(Origin::Ui),
+                )
                 .await
-                .map_err(|e| database_failure(Stage::Input, e))?;
-            let threshold = settings.discovery_promote_threshold.clamp(1, 5);
-            let user = ctx.id();
-
-            promote_to(
-                guard.db,
-                effects,
-                queue,
-                &user,
-                &track.id,
-                None,
-                Replace::Guarded(Origin::Ui),
-            )
-            .await
-            .map_err(|e| e.into_failure())?;
-            promoted_discovery = true;
-
-            let current = song.user_rating.unwrap_or(0);
-            let target = current.max(threshold);
-            if target > current {
-                if let Err(e) = navi.set_rating(ctx, &req.song_id, target).await {
-                    warn!(
-                        "Starred and promoted '{}' but could not raise rating: {}",
-                        track.title, e.message
-                    );
-                } else {
-                    applied_rating = Some(target);
+                {
+                    Ok(_) => promoted_discovery = true,
+                    Err(not_done) => {
+                        let failure = not_done.into_failure();
+                        if is_not_pending(&failure) {
+                            if let Some(existing) =
+                                find_user_discovery_by_id(guard.db, &ctx.user_id, &track.id).await?
+                            {
+                                if matches!(
+                                    existing.status,
+                                    DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
+                                ) {
+                                    promoted_discovery = true;
+                                } else {
+                                    return Err(failure);
+                                }
+                            } else {
+                                return Err(failure);
+                            }
+                        } else {
+                            return Err(failure);
+                        }
+                    }
                 }
             }
+            DiscoveryLookup::Already(_) => {
+                promoted_discovery = true;
+            }
+            DiscoveryLookup::NotDiscovery => {}
         }
     }
 
@@ -385,7 +552,7 @@ pub(crate) async fn star_track_in(
     };
 
     Ok(CurationResult {
-        song_id: req.song_id.clone(),
+        song_id,
         action,
         promoted_discovery,
         starred: Some(req.starred),
@@ -397,94 +564,78 @@ pub(crate) async fn star_track_in(
     })
 }
 
-/// Sets a 0–5★ rating on a track. On a Pending Discovery track, rating >= promote_threshold
-/// immediately promotes it into the permanent library and rating == 1 drops it from staging.
+/// Sets a pure 0-5 star quality rating on a track everywhere, including Pending Discovery tracks.
+/// Never auto-promotes or auto-deletes pending discovery tracks; records Soulbeet's rating in
+/// `discovery_tracks.rating` so external-client rating sync skips it.
 pub(crate) async fn rate_track_in(
     guard: &Guard<'_>,
     navi: &dyn CurationNavidrome,
-    effects: &Arc<dyn DiscoveryEffects>,
-    queue: &ImportQueue,
+    _effects: &Arc<dyn DiscoveryEffects>,
+    _queue: &ImportQueue,
     ctx: &UserCtx,
     req: &RateTrackRequest,
 ) -> Result<CurationResult, Failure> {
     if req.rating > 5 {
         return Err(invalid_rating());
     }
+    let pending_track = find_pending_for_rating(
+        guard,
+        ctx,
+        &req.song_id,
+        req.discovery_track_id.as_deref(),
+    )
+    .await?;
+
+    let effective_id = match &pending_track {
+        Some(track) => effective_song_id(&req.song_id, track),
+        None => req.song_id.clone(),
+    };
+
     let song = navi
-        .get_song(ctx, &req.song_id)
+        .get_song(ctx, &effective_id)
         .await?
         .ok_or_else(song_not_found)?;
-    navi.set_rating(ctx, &req.song_id, req.rating).await?;
 
-    let settings = UserSettings::get_in(guard.db, &ctx.user_id)
-        .await
-        .map_err(|e| database_failure(Stage::Input, e))?;
-    let threshold = settings.discovery_promote_threshold.clamp(1, 5);
-    let user = ctx.id();
+    let prior_rating = pending_track
+        .as_ref()
+        .and_then(|track| track.rating.map(i64::from));
+    let is_pending_discovery = if let Some(ref track) = pending_track {
+        let stored_rating = (req.rating > 0).then_some(req.rating as i64);
+        record_discovery_rating(guard.db, &ctx.user_id, &track.id, stored_rating).await?;
+        true
+    } else {
+        false
+    };
 
-    if req.rating > 0 {
-        if let Some(track) = find_pending_discovery(
-            guard,
-            ctx,
-            &req.song_id,
-            req.discovery_track_id.as_deref(),
-        )
-        .await?
-        {
-            if req.rating >= threshold {
-                promote_to(
-                    guard.db,
-                    effects,
-                    queue,
-                    &user,
-                    &track.id,
-                    None,
-                    Replace::Guarded(Origin::Ui),
-                )
-                .await
-                .map_err(|e| e.into_failure())?;
-                return Ok(CurationResult {
-                    song_id: req.song_id.clone(),
-                    action: CurationAction::Rated,
-                    promoted_discovery: true,
-                    starred: Some(song.starred.is_some()),
-                    rating: Some(req.rating),
-                    deleted_from_disk: false,
-                    archival_upgrade_queued: false,
-                    guard_preview: None,
-                    message: format!(
-                        "Rated '{}' {}★ and saved to your library",
-                        song.title, req.rating
-                    ),
-                });
-            }
-            if req.rating == 1 {
-                remove_in(guard.db, queue, &user, &track.id)
-                    .await
-                    .map_err(|e| e.into_failure())?;
-                return Ok(CurationResult {
-                    song_id: req.song_id.clone(),
-                    action: CurationAction::DroppedDiscovery,
-                    promoted_discovery: false,
-                    starred: Some(song.starred.is_some()),
-                    rating: Some(1),
-                    deleted_from_disk: true,
-                    archival_upgrade_queued: false,
-                    guard_preview: None,
-                    message: format!("Dropped '{}' from Discovery", song.title),
-                });
+    if let Err(err) = navi.set_rating(ctx, &effective_id, req.rating).await {
+        if let Some(ref track) = pending_track {
+            if let Err(rollback_err) =
+                record_discovery_rating(guard.db, &ctx.user_id, &track.id, prior_rating).await
+            {
+                warn!(
+                    "Could not restore discovery rating for track '{}' after set_rating failure: {}",
+                    track.id, rollback_err.message
+                );
             }
         }
+        return Err(err);
     }
 
-    let guard_preview = if req.rating == 1 && settings.auto_delete_enabled {
-        guard_preview_in(guard, ctx, &req.song_id).await.ok()
+    let guard_preview = if !is_pending_discovery && req.rating == 1 {
+        let settings = UserSettings::get_in(guard.db, &ctx.user_id)
+            .await
+            .map_err(|e| database_failure(Stage::Input, e))?;
+        if settings.auto_delete_enabled {
+            guard_preview_in(guard, ctx, &effective_id).await.ok()
+        } else {
+            None
+        }
     } else {
         None
     };
 
     Ok(CurationResult {
-        song_id: req.song_id.clone(),
+        song_id: effective_id,
         action: CurationAction::Rated,
         promoted_discovery: false,
         starred: Some(song.starred.is_some()),
@@ -501,7 +652,8 @@ pub(crate) async fn rate_track_in(
 }
 
 /// Drops a Pending Discovery track (deleting its staged file + recording negative taste signal)
-/// or handles removal of a Permanent Library track through Soulbeet's Multi-Listener Delete Guard:
+/// without stamping an artificial 1-star rating, or handles removal of a Permanent Library track
+/// through Soulbeet's Multi-Listener Delete Guard:
 /// - Sole owner + `confirm_delete == true`: deletes file via `Guard::carry_out`.
 /// - Sole owner or protected + `confirm_delete == false`: returns `ConfirmationRequired` preview
 ///   without mutating disk or Navidrome.
@@ -517,17 +669,23 @@ pub(crate) async fn drop_track_in(
 ) -> Result<CurationResult, Failure> {
     let user = ctx.id();
 
-    // Direct drop by explicit discovery track id if pending.
-    if let Some(track) = find_pending_discovery(
-        guard,
-        ctx,
-        &req.song_id,
-        req.discovery_track_id.as_deref(),
-    )
-    .await?
-    {
-        let song_id = effective_song_id(&req.song_id, &track);
-        return drop_pending_discovery(guard, navi, queue, ctx, &song_id, track).await;
+    // Direct drop by explicit discovery track id (idempotent if already removed/removing).
+    match lookup_discovery(guard, ctx, &req.song_id, req.discovery_track_id.as_deref()).await? {
+        DiscoveryLookup::Pending(track) => {
+            let song_id = effective_song_id(&req.song_id, &track);
+            return drop_pending_discovery(guard, navi, queue, ctx, &song_id, track).await;
+        }
+        DiscoveryLookup::Already(track) => {
+            if matches!(
+                track.status,
+                DiscoveryStatus::Removed | DiscoveryStatus::Removing
+            ) {
+                let song_id = effective_song_id(&req.song_id, &track);
+                return Ok(dropped_discovery_result(&song_id, &track, None));
+            }
+            return Err(track_not_pending());
+        }
+        DiscoveryLookup::NotDiscovery => {}
     }
 
     match guard.check_song(&user, &req.song_id).await {
@@ -654,12 +812,25 @@ async fn drop_pending_discovery(
     track: DiscoveryTrack,
 ) -> Result<CurationResult, Failure> {
     let user = ctx.id();
-    remove_in(guard.db, queue, &user, &track.id)
-        .await
-        .map_err(|e| e.into_failure())?;
+    if let Err(not_done) = remove_in(guard.db, queue, &user, &track.id).await {
+        let failure = not_done.into_failure();
+        if is_not_pending(&failure) {
+            if let Some(existing) =
+                find_user_discovery_by_id(guard.db, &ctx.user_id, &track.id).await?
+            {
+                if matches!(
+                    existing.status,
+                    DiscoveryStatus::Removed | DiscoveryStatus::Removing
+                ) {
+                    return Ok(dropped_discovery_result(song_id, &existing, None));
+                }
+            }
+        }
+        return Err(failure);
+    }
 
-    let (starred, rating) = if !song_id.is_empty() {
-        let s = match navi.set_star(ctx, song_id, false).await {
+    let starred = if !song_id.is_empty() {
+        match navi.set_star(ctx, song_id, false).await {
             Ok(()) => Some(false),
             Err(e) => {
                 warn!(
@@ -668,33 +839,12 @@ async fn drop_pending_discovery(
                 );
                 None
             }
-        };
-        let r = match navi.set_rating(ctx, song_id, 1).await {
-            Ok(()) => Some(1),
-            Err(e) => {
-                warn!(
-                    "Dropped discovery track '{}' but could not set 1★ in Navidrome: {}",
-                    track.title, e.message
-                );
-                None
-            }
-        };
-        (s, r)
+        }
     } else {
-        (None, None)
+        None
     };
 
-    Ok(CurationResult {
-        song_id: song_id.to_string(),
-        action: CurationAction::DroppedDiscovery,
-        promoted_discovery: false,
-        starred,
-        rating,
-        deleted_from_disk: true,
-        archival_upgrade_queued: false,
-        guard_preview: None,
-        message: format!("Dropped '{}' from Discovery", track.title),
-    })
+    Ok(dropped_discovery_result(song_id, &track, starred))
 }
 
 #[cfg(test)]
@@ -717,6 +867,8 @@ mod tests {
         stars_written: Mutex<Vec<(String, String, bool)>>,
         ratings_written: Mutex<Vec<(String, String, u8)>>,
         fail_set_rating: bool,
+        inspect_db: Option<(sqlx::SqlitePool, String)>,
+        observed_db_rating_on_set: Mutex<Option<Option<u8>>>,
     }
 
     impl FakeCurationNavi {
@@ -726,6 +878,8 @@ mod tests {
                 stars_written: Mutex::new(Vec::new()),
                 ratings_written: Mutex::new(Vec::new()),
                 fail_set_rating: false,
+                inspect_db: None,
+                observed_db_rating_on_set: Mutex::new(None),
             }
         }
     }
@@ -765,6 +919,13 @@ mod tests {
             song_id: &str,
             rating: u8,
         ) -> Result<(), Failure> {
+            if let Some((ref db, ref track_id)) = self.inspect_db {
+                let row = DiscoveryTrackRow::get_by_id_in(db, track_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                *self.observed_db_rating_on_set.lock().unwrap() = Some(row.rating);
+            }
             if self.fail_set_rating {
                 return Err(Failure::new(
                     FailureCode::NavidromeUnreachable,
@@ -876,7 +1037,9 @@ mod tests {
         assert_eq!(res.action, CurationAction::Starred);
         assert!(res.promoted_discovery);
         assert_eq!(res.starred, Some(true));
-        assert_eq!(res.rating, Some(3));
+        // Starring must NOT artificially stamp 3 stars; it preserves the existing rating (1 in Library::new).
+        assert_eq!(res.rating, Some(1));
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
         assert!(!res.deleted_from_disk);
         assert_eq!(effects_inner.imported.lock().unwrap().len(), 1);
         assert!(!staged.exists());
@@ -1027,6 +1190,8 @@ mod tests {
 
         assert_eq!(res.action, CurationAction::DroppedDiscovery);
         assert!(res.deleted_from_disk);
+        assert_eq!(res.rating, None);
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
         assert!(!staged.exists());
         let row = DiscoveryTrackRow::get_by_id_in(&lib.db, "dt-drop")
             .await
@@ -1195,5 +1360,427 @@ mod tests {
         .unwrap();
         assert_eq!(cleared.rating, None);
         assert_eq!(cleared.starred, Some(true));
+    }
+
+    #[tokio::test]
+    async fn keep_promotes_discovery_and_affirms_library_without_stamping_stars() {
+        let lib = Library::new().await;
+        // s2 is an unrated pending discovery track; s3 is an unrated permanent library track.
+        lib.song("s2", "alice/Discovery/Balanced/unrated.flac", b"audio");
+        lib.song("s3", "alice/A/lib.flac", b"audio");
+        let staged =
+            insert_pending_discovery(&lib, "dt-unrated", "s2", "Marrow Choir/unrated.flac").await;
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let effects_inner = Arc::new(StubDiscoveryEffects::default());
+        let effects: Arc<dyn DiscoveryEffects> = effects_inner.clone();
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        let kept_disc = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s2".into(),
+                discovery_track_id: Some("dt-unrated".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept_disc.action, CurationAction::Kept);
+        assert!(kept_disc.promoted_discovery);
+        assert_eq!(kept_disc.rating, None);
+        assert!(!staged.exists());
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
+
+        // Permanent library track: keep does not stamp threshold stars either.
+        let kept_lib = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s3".into(),
+                discovery_track_id: None,
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept_lib.action, CurationAction::Kept);
+        assert!(!kept_lib.promoted_discovery);
+        assert_eq!(kept_lib.rating, None);
+        assert!(navi.ratings_written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_on_pending_discovery_records_rating_without_promoting_or_deleting() {
+        let lib = Library::new().await;
+        let staged =
+            insert_pending_discovery(&lib, "dt-rate", "s1", "Marrow Choir/rate.flac").await;
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let effects_inner = Arc::new(StubDiscoveryEffects::default());
+        let effects: Arc<dyn DiscoveryEffects> = effects_inner.clone();
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        // Rating 5 stars (>= threshold) records rating = 5 and does NOT promote.
+        let r5 = rate_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &RateTrackRequest {
+                song_id: "s1".into(),
+                rating: 5,
+                discovery_track_id: Some("dt-rate".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r5.action, CurationAction::Rated);
+        assert!(!r5.promoted_discovery);
+        assert!(!r5.deleted_from_disk);
+        assert_eq!(r5.rating, Some(5));
+        assert!(staged.exists());
+        assert!(effects_inner.imported.lock().unwrap().is_empty());
+        let row = DiscoveryTrackRow::get_by_id_in(&lib.db, "dt-rate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, DiscoveryStatus::Pending);
+        assert_eq!(row.rating, Some(5));
+
+        // Rating 1 star records rating = 1 and does NOT delete.
+        let r1 = rate_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &RateTrackRequest {
+                song_id: "s1".into(),
+                rating: 1,
+                discovery_track_id: Some("dt-rate".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.action, CurationAction::Rated);
+        assert!(!r1.deleted_from_disk);
+        assert_eq!(r1.rating, Some(1));
+        assert_eq!(r1.guard_preview, None);
+        assert!(staged.exists());
+        let row = DiscoveryTrackRow::get_by_id_in(&lib.db, "dt-rate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, DiscoveryStatus::Pending);
+        assert_eq!(row.rating, Some(1));
+
+        // Clearing rating (0) resets discovery_tracks.rating to NULL.
+        let r0 = rate_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &RateTrackRequest {
+                song_id: "s1".into(),
+                rating: 0,
+                discovery_track_id: Some("dt-rate".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r0.action, CurationAction::Rated);
+        assert_eq!(r0.rating, None);
+        let row = DiscoveryTrackRow::get_by_id_in(&lib.db, "dt-rate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, DiscoveryStatus::Pending);
+        assert_eq!(row.rating, None);
+    }
+
+    #[tokio::test]
+    async fn keep_star_and_drop_are_idempotent_on_duplicate_requests() {
+        let lib = Library::new().await;
+        let _staged = insert_pending_discovery(&lib, "dt-dup", "s1", "Marrow Choir/dup.flac").await;
+        let _staged_drop =
+            insert_pending_discovery(&lib, "dt-dup-drop", "s1", "Marrow Choir/dup2.flac").await;
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let effects_inner = Arc::new(StubDiscoveryEffects::default());
+        let effects: Arc<dyn DiscoveryEffects> = effects_inner.clone();
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        // First keep promotes the track.
+        let first = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.action, CurationAction::Kept);
+        assert!(first.promoted_discovery);
+        assert_eq!(effects_inner.imported.lock().unwrap().len(), 1);
+
+        // Second keep on already-Promoted track succeeds idempotently without re-importing.
+        let second = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.action, CurationAction::Kept);
+        assert!(second.promoted_discovery);
+        assert_eq!(effects_inner.imported.lock().unwrap().len(), 1);
+
+        // Star + Keep on already-Promoted track also succeeds idempotently.
+        let starred = star_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &StarTrackRequest {
+                song_id: "s1".into(),
+                starred: true,
+                discovery_track_id: Some("dt-dup".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(starred.action, CurationAction::Starred);
+        assert!(starred.promoted_discovery);
+        assert_eq!(effects_inner.imported.lock().unwrap().len(), 1);
+
+        // While status is Promoting (in-flight), keep also succeeds idempotently.
+        sqlx::query("UPDATE discovery_tracks SET status = 'Promoting' WHERE id = 'dt-dup'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let in_flight = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(in_flight.action, CurationAction::Kept);
+        assert!(in_flight.promoted_discovery);
+
+        // Explicit drop on a Promoted/Promoting track is still rejected with ExpiredHandle.
+        let err = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup".into()),
+                confirm_delete: false,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::ExpiredHandle);
+
+        // First drop removes dt-dup-drop; duplicate drop succeeds idempotently.
+        let d1 = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup-drop".into()),
+                confirm_delete: false,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(d1.action, CurationAction::DroppedDiscovery);
+        let d2 = drop_track_in(
+            &guard,
+            &navi,
+            &queue,
+            &alice,
+            &DropTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup-drop".into()),
+                confirm_delete: false,
+                reason: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(d2.action, CurationAction::DroppedDiscovery);
+
+        // Keep on a Removed track is still rejected with ExpiredHandle.
+        let err = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s1".into(),
+                discovery_track_id: Some("dt-dup-drop".into()),
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::ExpiredHandle);
+    }
+
+    #[tokio::test]
+    async fn rate_track_writes_db_before_navidrome_and_rolls_back_on_error() {
+        let lib = Library::new().await;
+        let _staged =
+            insert_pending_discovery(&lib, "dt-order", "s1", "Marrow Choir/order.flac").await;
+        sqlx::query("UPDATE discovery_tracks SET rating = 4 WHERE id = 'dt-order'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let mut navi = FakeCurationNavi::new(lib.fake.clone());
+        navi.fail_set_rating = true;
+        navi.inspect_db = Some((lib.db.clone(), "dt-order".into()));
+        let effects: Arc<dyn DiscoveryEffects> = Arc::new(StubDiscoveryEffects::default());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        let err = rate_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &RateTrackRequest {
+                song_id: "s1".into(),
+                rating: 5,
+                discovery_track_id: Some("dt-order".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, FailureCode::NavidromeUnreachable);
+        // SQLite must have already held the new rating (5) when set_rating was called.
+        assert_eq!(
+            *navi.observed_db_rating_on_set.lock().unwrap(),
+            Some(Some(5))
+        );
+        // After set_rating failed, SQLite must have restored the prior rating (4).
+        let row = DiscoveryTrackRow::get_by_id_in(&lib.db, "dt-order")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.rating, Some(4));
+    }
+
+    #[tokio::test]
+    async fn star_track_is_idempotent_when_promoted_track_song_id_was_rescanned() {
+        let lib = Library::new().await;
+        let _staged = insert_pending_discovery(
+            &lib,
+            "dt-moved",
+            "old-gone-song-id",
+            "Marrow Choir/moved.flac",
+        )
+        .await;
+        sqlx::query("UPDATE discovery_tracks SET status = 'Promoted', rating = 4 WHERE id = 'dt-moved'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let effects: Arc<dyn DiscoveryEffects> = Arc::new(StubDiscoveryEffects::default());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        // old-gone-song-id does not exist in FakeNavidrome (simulates Navidrome rescan after move).
+        let res = star_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &StarTrackRequest {
+                song_id: "old-gone-song-id".into(),
+                starred: true,
+                discovery_track_id: Some("dt-moved".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.action, CurationAction::Starred);
+        assert!(res.promoted_discovery);
+        assert_eq!(res.rating, Some(4));
+        assert!(navi.stars_written.lock().unwrap().is_empty());
+
+        // Same for Promoting (in-flight) when old song_id is already gone.
+        sqlx::query("UPDATE discovery_tracks SET status = 'Promoting' WHERE id = 'dt-moved'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
+        let res_promoting = star_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &StarTrackRequest {
+                song_id: "old-gone-song-id".into(),
+                starred: true,
+                discovery_track_id: Some("dt-moved".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res_promoting.action, CurationAction::Starred);
+        assert!(res_promoting.promoted_discovery);
     }
 }

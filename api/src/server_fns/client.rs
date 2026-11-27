@@ -121,6 +121,67 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
     let acquire_and_play = crate::services::is_slskd_configured().await;
     let lyrics_fetch = navidrome.is_some();
 
+    let active_culture_profile = crate::core::contextual::get_culture_profile_in(
+        &crate::db::DB,
+        &auth.0.user_id,
+    )
+    .await
+    .ok()
+    .map(|cp| shared::client::CultureProfileSummary {
+        home_country: cp.effective_country().unwrap_or("").to_string(),
+        primary_languages: cp.preferred_languages,
+        local_culture_ratio: cp.local_culture_ratio,
+    });
+
+    // Only surface non-empty active seasonal mixes; fail gracefully to empty if Navidrome is
+    // unlinked, unreachable, or slow so bootstrap stays fast.
+    let active_seasonal_packs = if navidrome.is_some() {
+        let mixes_fut = crate::core::contextual::list_active_contextual_mixes_in(
+            &crate::db::DB,
+            &ServerNavidrome,
+            crate::config::CONFIG.navidrome_music_path(),
+            &auth.0,
+            chrono::Utc::now(),
+            None,
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(3), mixes_fut).await {
+            Ok(Ok(mixes)) => mixes
+                .into_iter()
+                .filter(|m| {
+                    m.kind == shared::recommendation::ContextualMixKind::Seasonal
+                        && m.track_count > 0
+                })
+                .map(|m| shared::client::SeasonalPackSummary {
+                    title: crate::core::contextual::seasonal_display_title(
+                        &m.slug,
+                        m.custom_name.as_deref(),
+                    ),
+                    slug: m.slug,
+                    subtitle: m.custom_description.unwrap_or_default(),
+                    track_count: m.track_count,
+                    local_ratio: m.local_pct.map(|p| f32::from(p) / 100.0).unwrap_or(0.0),
+                })
+                .collect(),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "Could not load active seasonal packs during bootstrap for user {}: {}",
+                    auth.0.user_id,
+                    crate::core::logged(&e)
+                );
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Timed out loading active seasonal packs during bootstrap for user {}",
+                    auth.0.user_id
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     Ok(ClientBootstrap {
         user_id: auth.0.user_id.clone(),
         username: auth.0.username.clone(),
@@ -136,8 +197,8 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
         promote_threshold: settings.discovery_promote_threshold,
         auto_delete_enabled: settings.auto_delete_enabled,
         discovery_enabled: settings.discovery_enabled,
-        active_culture_profile: None,
-        active_seasonal_packs: Vec::new(),
+        active_culture_profile,
+        active_seasonal_packs,
     })
 }
 

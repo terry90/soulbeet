@@ -305,6 +305,7 @@ fun HomeScreen(
                     isUnavailableOffline = state.config.offlineOnly && !isCached,
                     isPendingDiscovery = track.isDiscovery,
                     isStarred = track.starred,
+                    userRating = track.userRating.toInt(),
                     onClick = { onPlayTrack(track) },
                     onStarClick = { onStarTrack(track) },
                 )

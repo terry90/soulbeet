@@ -91,13 +91,14 @@ fn StudioShellContent() -> Element {
         .contextual_mixes
         .read()
         .iter()
-        .find(|m| m.kind == ContextualMixKind::Seasonal)
+        .find(|m| m.kind == ContextualMixKind::Seasonal && m.track_count > 0)
         .cloned();
 
     let sidebar_playlists: Vec<SidebarPlaylistItem> = studio
         .playlists
         .read()
         .iter()
+        .filter(|p| !(p.category == ui::PlaylistCategory::Seasonal && p.song_count == 0))
         .map(|p| SidebarPlaylistItem {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -226,6 +227,7 @@ fn StudioShellContent() -> Element {
                     on_open_guard_modal: move |track| studio.drop_track(auth, player, track),
                     on_keep: move |track| studio.keep_track(auth, player, track),
                     on_drop: move |track| studio.drop_track(auth, player, track),
+                    on_rate: move |(track, rating)| studio.rate_track(auth, player, track, rating),
                     on_start_radio: move |track| studio.start_radio(auth, player, track),
                 }
             }
@@ -567,7 +569,12 @@ fn build_palette_commands(
         });
     }
 
-    for mix in studio.contextual_mixes.read().iter() {
+    for mix in studio
+        .contextual_mixes
+        .read()
+        .iter()
+        .filter(|m| !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0))
+    {
         cmds.push(PaletteCommand {
             id: format!("mix.{}", mix.slug),
             label: format!("Play {}", format_mix_title(mix)),

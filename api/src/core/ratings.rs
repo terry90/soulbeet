@@ -408,7 +408,8 @@ pub(crate) enum PendingAction<'a> {
 }
 
 /// Promote the pending track of `song` (pending_songs) at `promote_threshold` or above, else
-/// remove it at rating 1.
+/// remove it at rating 1. Skips tracks whose current Navidrome rating matches
+/// `discovery_tracks.rating`, meaning Soulbeet itself wrote it as a pure quality rating.
 pub(crate) fn pending_action<'a>(
     song: &SubsonicSong,
     pending: &HashMap<String, &'a DiscoveryTrack>,
@@ -416,6 +417,9 @@ pub(crate) fn pending_action<'a>(
 ) -> Option<PendingAction<'a>> {
     let rating = song.user_rating?;
     let track = *pending.get(&song.id)?;
+    if track.rating == Some(rating) {
+        return None;
+    }
     if rating >= promote_threshold {
         Some(PendingAction::Promote(track))
     } else if rating == 1 {
@@ -604,23 +608,14 @@ pub(crate) async fn sync_in(
     let unreadable = |e: String| database_failure(Stage::Input, e);
     let settings = (UserSettings::get_in(deps.db, &ctx.user_id).await).map_err(unreadable)?;
     let threshold = settings.discovery_promote_threshold;
+    let external_rating_sync = settings.external_rating_sync_enabled;
     let tracks_of_folder = match &settings.discovery_folder_id {
         Some(fid) => {
             (DiscoveryTrackRow::get_pending_by_folder_in(deps.db, fid).await).map_err(unreadable)?
         }
         None => vec![],
     };
-    let PendingSongs {
-        found: pending,
-        untold,
-    } = pending_songs(deps.guard, &user, &songs, &tracks_of_folder, threshold).await;
-    let mut expirable: HashSet<String> = (tracks_of_folder.iter())
-        .map(|t| t.id.clone())
-        .filter(|id| !untold.contains(id))
-        .collect();
 
-    let mut tracks =
-        remove_disliked_pending_in(deps.db, deps.queue, &songs, &pending, threshold).await;
     let origin = match &permit {
         AutoDeletePermit::Allowed => Some(Origin::Auto),
         AutoDeletePermit::ForApp { grant_id } => Some(Origin::Mcp {
@@ -628,37 +623,60 @@ pub(crate) async fn sync_in(
         }),
         AutoDeletePermit::NotForThisApp => None,
     };
-    let replace = origin.clone().map_or(Replace::Never, Replace::Guarded);
-    for song in &songs {
-        if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
-            let promoted = promote(
-                deps.db,
-                deps.discovery,
-                deps.queue,
-                &user,
-                &track.id,
-                replace.clone(),
-            );
-            let result = promoted.await.map_err(NotDone::into_failure);
-            match &result {
-                Err(e) if is_not_pending(e) => {
-                    info!("Skipped promoting track {}: {}", track.title, e.message)
+
+    let (pending, expirable, mut tracks, mut not_pending) = if external_rating_sync {
+        let PendingSongs {
+            found: pending,
+            untold,
+        } = pending_songs(deps.guard, &user, &songs, &tracks_of_folder, threshold).await;
+        let mut expirable: HashSet<String> = (tracks_of_folder.iter())
+            .map(|t| t.id.clone())
+            .filter(|id| !untold.contains(id))
+            .collect();
+
+        let mut tracks =
+            remove_disliked_pending_in(deps.db, deps.queue, &songs, &pending, threshold).await;
+        let replace = origin.clone().map_or(Replace::Never, Replace::Guarded);
+        for song in &songs {
+            if let Some(PendingAction::Promote(track)) = pending_action(song, &pending, threshold) {
+                let promoted = promote(
+                    deps.db,
+                    deps.discovery,
+                    deps.queue,
+                    &user,
+                    &track.id,
+                    replace.clone(),
+                );
+                let result = promoted.await.map_err(NotDone::into_failure);
+                match &result {
+                    Err(e) if is_not_pending(e) => {
+                        info!("Skipped promoting track {}: {}", track.title, e.message)
+                    }
+                    Err(e) => warn!("Failed to promote track {}: {}", track.title, e.message),
+                    Ok(_) => {}
                 }
-                Err(e) => warn!("Failed to promote track {}: {}", track.title, e.message),
-                Ok(_) => {}
+                // The owner rated it to keep, so a promote that failed leaves it for the next sync.
+                // A file already gone holds nothing to keep, and expiry ends its track.
+                if result.as_ref().err() != Some(&promote_file_gone()) {
+                    expirable.remove(&track.id);
+                }
+                let entry = SyncedTrack::of(song, SyncAction::Promote, Some(track));
+                tracks.push(entry.with_failure(result.err()));
             }
-            // The owner rated it to keep, so a promote that failed leaves it for the next sync.
-            // A file already gone holds nothing to keep, and expiry ends its track.
-            if result.as_ref().err() != Some(&promote_file_gone()) {
-                expirable.remove(&track.id);
-            }
-            let entry = SyncedTrack::of(song, SyncAction::Promote, Some(track));
-            tracks.push(entry.with_failure(result.err()));
         }
-    }
-    let listed = tracks.len();
-    tracks.retain(|t| !t.not_pending());
-    let mut not_pending = (listed - tracks.len()) as u32;
+        let listed = tracks.len();
+        tracks.retain(|t| !t.not_pending());
+        let not_pending = (listed - tracks.len()) as u32;
+        (pending, expirable, tracks, not_pending)
+    } else {
+        info!("External rating sync for discovery is disabled for this user");
+        let pending: HashMap<String, &DiscoveryTrack> = tracks_of_folder
+            .iter()
+            .filter_map(|t| t.song_id.as_ref().map(|sid| (sid.clone(), t)))
+            .collect();
+        let expirable: HashSet<String> = tracks_of_folder.iter().map(|t| t.id.clone()).collect();
+        (pending, expirable, Vec::new(), 0)
+    };
 
     let (mut kept, mut kept_not_stored) = (0, None);
     let auto_delete = match (settings.auto_delete_enabled, &origin) {
@@ -671,8 +689,16 @@ pub(crate) async fn sync_in(
             AutoDeleteRan::NotAllowed
         }
         (true, Some(origin)) => {
-            let mut run =
-                auto_delete_songs(deps.guard, &user, &songs, &pending, deps.queue, origin).await;
+            let mut run = auto_delete_songs_with_options(
+                deps.guard,
+                &user,
+                &songs,
+                &pending,
+                deps.queue,
+                origin,
+                external_rating_sync,
+            )
+            .await;
             let listed = run.len();
             run.retain(|t| !t.not_pending());
             not_pending += (listed - run.len()) as u32;
@@ -795,6 +821,7 @@ pub(crate) async fn remove_disliked_pending_in(
 /// it when one did; a discovery track no longer pending carries track_not_pending, which
 /// sync_in counts as skipped. Once the day's room of an app (Origin::Mcp) is used up, each
 /// further song is kept with that refusal and Navidrome is not read for it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn auto_delete_songs(
     guard: &Guard<'_>,
     actor: &UserId,
@@ -802,6 +829,18 @@ pub(crate) async fn auto_delete_songs(
     pending: &HashMap<String, &DiscoveryTrack>,
     queue: &ImportQueue,
     origin: &Origin,
+) -> Vec<SyncedTrack> {
+    auto_delete_songs_with_options(guard, actor, songs, pending, queue, origin, true).await
+}
+
+async fn auto_delete_songs_with_options(
+    guard: &Guard<'_>,
+    actor: &UserId,
+    songs: &[SubsonicSong],
+    pending: &HashMap<String, &DiscoveryTrack>,
+    queue: &ImportQueue,
+    origin: &Origin,
+    external_rating_sync: bool,
 ) -> Vec<SyncedTrack> {
     let mut run = Vec::new();
     let deleted = match DeletionReviewRow::deleted_files_in(guard.db, &actor.to_string()).await {
@@ -846,19 +885,28 @@ pub(crate) async fn auto_delete_songs(
                 None
             }
             Ok(Verdict::Discovery { track, rating: 1 }) => {
-                let remove = SyncedTrack::of(song, SyncAction::RemoveFromDiscovery, Some(&track));
-                let result = match Folder::get_by_id_in(guard.db, &track.folder_id).await {
-                    Ok(Some(folder)) => {
-                        remove_staged_in(guard.db, queue, &track, &folder, StagedOutcome::Removed)
-                            .await
+                if !external_rating_sync {
+                    skipped("external rating sync for discovery is disabled");
+                    None
+                } else if track.rating == Some(1) {
+                    skipped("rated 1 star directly in Soulbeet");
+                    None
+                } else {
+                    let remove =
+                        SyncedTrack::of(song, SyncAction::RemoveFromDiscovery, Some(&track));
+                    let result = match Folder::get_by_id_in(guard.db, &track.folder_id).await {
+                        Ok(Some(folder)) => {
+                            remove_staged_in(guard.db, queue, &track, &folder, StagedOutcome::Removed)
+                                .await
+                        }
+                        Ok(None) => Err(folder_not_found()),
+                        Err(e) => Err(database_failure(Stage::Delete, e)),
+                    };
+                    if result.as_ref().is_err_and(is_not_pending) {
+                        skipped("no longer pending in discovery");
                     }
-                    Ok(None) => Err(folder_not_found()),
-                    Err(e) => Err(database_failure(Stage::Delete, e)),
-                };
-                if result.as_ref().is_err_and(is_not_pending) {
-                    skipped("no longer pending in discovery");
+                    Some(remove.with_failure(result.err()))
                 }
-                Some(remove.with_failure(result.err()))
             }
             Ok(Verdict::Discovery { .. }) => {
                 skipped("no longer rated 1");
@@ -2341,5 +2389,155 @@ mod tests {
                 "Navidrome not configured for user"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn rating_sync_skips_soulbeet_originated_ratings_but_acts_on_external_ratings() {
+        let lib = Library::new().await;
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-music".into()),
+                auto_delete_enabled: Some(true),
+                external_rating_sync_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+        let explore = lib.root.join("music/alice/Discovery/Explore");
+        std::fs::create_dir_all(&explore).unwrap();
+        let make = |name: &str| {
+            let p = explore.join(name);
+            std::fs::write(&p, b"audio").unwrap();
+            p
+        };
+        let (p1, p2, p3, p4, p5) = (
+            make("01.flac"),
+            make("02.flac"),
+            make("03.flac"),
+            make("04.flac"),
+            make("05.flac"),
+        );
+        // t1: rated 5 in Soulbeet -> skip promote.
+        // t2: rated 1 in Soulbeet -> skip drop AND skip auto-delete.
+        // t3: rating NULL (rated 5 externally) -> promote.
+        // t4: rated 3 in Soulbeet, changed externally to 1 -> remove from discovery.
+        // t5: rated 2 in Soulbeet, changed externally to 5 -> promote.
+        for (id, path, song, stored_rating) in [
+            ("t1", &p1, "s5", Some(5i64)),
+            ("t2", &p2, "s6", Some(1i64)),
+            ("t3", &p3, "s7", None),
+            ("t4", &p4, "s8", Some(3i64)),
+            ("t5", &p5, "s9", Some(2i64)),
+        ] {
+            lib.pending_track(id, "alice-music", "Explore", path, Some(song))
+                .await;
+            if let Some(r) = stored_rating {
+                sqlx::query("UPDATE discovery_tracks SET rating = ? WHERE id = ?")
+                    .bind(r)
+                    .bind(id)
+                    .execute(&lib.db)
+                    .await
+                    .unwrap();
+            }
+        }
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/search3",
+            &[&search3_body(&[
+                ("s5", "Soulbeet Five", 5),
+                ("s6", "Soulbeet One", 1),
+                ("s7", "External Five", 5),
+                ("s8", "External One After Three", 1),
+                ("s9", "External Five After Two", 5),
+            ])],
+        );
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            effects(),
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        assert_eq!(
+            acts(&report.tracks),
+            vec![
+                ("s8", SyncAction::RemoveFromDiscovery, None),
+                ("s7", SyncAction::Promote, None),
+                ("s9", SyncAction::Promote, None),
+            ]
+        );
+        assert_eq!(lib.track_status("t1").await, "Pending");
+        assert_eq!(lib.track_status("t2").await, "Pending");
+        assert_eq!(lib.track_status("t3").await, "Promoted");
+        assert_eq!(lib.track_status("t4").await, "Removed");
+        assert_eq!(lib.track_status("t5").await, "Promoted");
+        assert!(p1.exists() && p2.exists() && !p4.exists());
+    }
+
+    #[tokio::test]
+    async fn rating_sync_skips_discovery_when_external_sync_disabled_but_keeps_library_auto_delete()
+    {
+        let lib = Library::new().await;
+        set(
+            &lib.db,
+            UpdateUserSettings {
+                discovery_folder_id: Some("alice-music".into()),
+                auto_delete_enabled: Some(true),
+                external_rating_sync_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        let explore = lib.root.join("music/alice/Discovery/Explore");
+        std::fs::create_dir_all(&explore).unwrap();
+        let p_promote = explore.join("01.flac");
+        let p_drop_by_id = explore.join("02.flac");
+        std::fs::write(&p_promote, b"audio").unwrap();
+        std::fs::write(&p_drop_by_id, b"audio").unwrap();
+        lib.pending_track("t1", "alice-music", "Explore", &p_promote, Some("s5"))
+            .await;
+        lib.pending_track("t2", "alice-music", "Explore", &p_drop_by_id, Some("s6"))
+            .await;
+        // t3 has no song_id stored, so auto_delete_songs can only spot it via guard.check_song.
+        let rel_unlinked = "alice/Discovery/Explore/03.flac";
+        lib.song("s7", rel_unlinked, b"audio");
+        lib.fake.rates("alice", "s7", 1);
+        let p_unlinked = lib.root.join("music").join(rel_unlinked);
+        lib.pending_track("t3", "alice-music", "Explore", &p_unlinked, None)
+            .await;
+
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/search3",
+            &[&search3_body(&[
+                ("s1", "Library Disliked", 1),
+                ("s5", "External Five", 5),
+                ("s6", "External One", 1),
+                ("s7", "Unlinked External One", 1),
+            ])],
+        );
+        let (of, guard, runs, discovery, queue) = (
+            NavidromeFor(Ok(navi.client())),
+            lib.guard(),
+            SyncRuns::default(),
+            effects(),
+            queue(),
+        );
+        let deps = deps(&lib, &of, &guard, &queue, &discovery, &runs);
+        let report = sync_in(&deps, &test_ctx("alice"), AutoDeletePermit::Allowed)
+            .await
+            .unwrap();
+        // Only the permanent library track s1 is auto-deleted; all pending discovery tracks stay untouched.
+        assert_eq!(acts(&report.tracks), vec![("s1", SyncAction::Delete, None)]);
+        assert!(!lib.root.join("music/alice/A/x.flac").exists());
+        assert_eq!(lib.track_status("t1").await, "Pending");
+        assert_eq!(lib.track_status("t2").await, "Pending");
+        assert_eq!(lib.track_status("t3").await, "Pending");
+        assert!(p_promote.exists() && p_drop_by_id.exists() && p_unlinked.exists());
     }
 }

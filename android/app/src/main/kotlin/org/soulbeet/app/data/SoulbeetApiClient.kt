@@ -74,6 +74,8 @@ data class ContextualMixTrackUi(
     val album: String?,
     val durationSecs: Long?,
     val owned: Boolean,
+    val rating: Int = 0,
+    val starred: Boolean = false,
 )
 
 data class UserCultureProfileUi(
@@ -489,6 +491,12 @@ class SoulbeetApiClient(
                         } else {
                             null
                         }
+                        val rating = if (t.has("rating") && !t.isNull("rating")) {
+                            t.optInt("rating", 0).coerceIn(0, 5)
+                        } else {
+                            0
+                        }
+                        val starred = t.optBoolean("starred", false)
                         add(
                             ContextualMixTrackUi(
                                 songId = songId,
@@ -498,6 +506,8 @@ class SoulbeetApiClient(
                                 album = t.optNonNullString("album"),
                                 durationSecs = dur,
                                 owned = t.optBoolean("owned", true),
+                                rating = rating,
+                                starred = starred,
                             ),
                         )
                     }

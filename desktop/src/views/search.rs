@@ -126,6 +126,7 @@ pub fn SearchView() -> Element {
                                                     TrackRowState::PendingDiscovery {
                                                         days_remaining: track.days_remaining,
                                                         reason_label: track.reason_label.clone(),
+                                                        rating: track.rating,
                                                     }
                                                 } else {
                                                     TrackRowState::Owned {

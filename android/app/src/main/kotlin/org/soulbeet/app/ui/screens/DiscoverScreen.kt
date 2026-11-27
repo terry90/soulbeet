@@ -228,12 +228,15 @@ fun DiscoverScreen(
                         }
                     }
                 } else {
+                    val isCardBusy = topCard.discovery.id in state.inFlightTriageIds ||
+                        (topCard.discovery.songId != null && topCard.discovery.songId in state.inFlightTriageIds)
                     SwipeableTriageCard(
                         item = topCard,
                         artAuthority = artAuthority,
                         isPlaying = topCard.discovery.songId != null &&
                             state.playback.currentTrackId == topCard.discovery.songId &&
                             state.playback.isPlaying,
+                        isActionInFlight = isCardBusy,
                         onPreview = { onPreviewTriageCard(topCard) },
                         onKeep = { onKeepTriageCard(topCard) },
                         onStarAndKeep = { onStarKeepTriageCard(topCard) },
@@ -266,6 +269,7 @@ private fun SwipeableTriageCard(
     item: TriageCardItem,
     artAuthority: String,
     isPlaying: Boolean,
+    isActionInFlight: Boolean,
     onPreview: () -> Unit,
     onKeep: () -> Unit,
     onStarAndKeep: () -> Unit,
@@ -299,7 +303,8 @@ private fun SwipeableTriageCard(
             .fillMaxWidth()
             .offset { IntOffset(dragX.roundToInt(), 0) }
             .rotate((dragX / 45f).coerceIn(-8f, 8f))
-            .pointerInput(item.discovery.id) {
+            .pointerInput(item.discovery.id, isActionInFlight) {
+                if (isActionInFlight) return@pointerInput
                 detectHorizontalDragGestures(
                     onDragEnd = {
                         when {
@@ -436,7 +441,7 @@ private fun SwipeableTriageCard(
                     modifier = Modifier
                         .weight(1f)
                         .heightIn(min = 48.dp)
-                        .clickable(onClick = onDrop),
+                        .clickable(enabled = !isActionInFlight, onClick = onDrop),
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
@@ -456,6 +461,7 @@ private fun SwipeableTriageCard(
 
                 IconButton(
                     onClick = onStarAndKeep,
+                    enabled = !isActionInFlight,
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
@@ -470,6 +476,7 @@ private fun SwipeableTriageCard(
 
                 Button(
                     onClick = onKeep,
+                    enabled = !isActionInFlight,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = colors.leafSolid,
                         contentColor = colors.leafInk,

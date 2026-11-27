@@ -35,7 +35,13 @@ pub fn LibraryPage() -> Element {
     let mut detail_req_id = use_signal(|| 0u64);
 
     let offline_only = player.offline_only();
-    let playlists = studio.playlists.read().clone();
+    let playlists: Vec<_> = studio
+        .playlists
+        .read()
+        .iter()
+        .filter(|p| !(p.category == PlaylistCategory::Seasonal && p.song_count == 0))
+        .cloned()
+        .collect();
     let albums = studio.recent_albums.read().clone();
     let starred: Vec<_> = studio
         .starred_tracks
@@ -421,6 +427,7 @@ pub fn LibraryPage() -> Element {
                                         let t_play = track.clone();
                                         let t_keep = track.clone();
                                         let t_drop = track.clone();
+                                        let t_rate = track.clone();
                                         let t_inspect = track.clone();
                                         rsx! {
                                             TrackRow {
@@ -433,6 +440,7 @@ pub fn LibraryPage() -> Element {
                                                 state: TrackRowState::PendingDiscovery {
                                                     days_remaining: track.days_remaining,
                                                     reason_label: track.reason_label.clone(),
+                                                    rating: track.rating,
                                                 },
                                                 on_play: move |_| {
                                                     studio.play_or_toggle_triage(
@@ -444,6 +452,7 @@ pub fn LibraryPage() -> Element {
                                                 },
                                                 on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                                 on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
+                                                on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                             }
                                         }

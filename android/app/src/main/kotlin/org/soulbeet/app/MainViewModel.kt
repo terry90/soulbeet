@@ -137,6 +137,7 @@ data class AppUiState(
     val cultureProfile: UserCultureProfileUi? = null,
     val steeringInFlight: Boolean = false,
     val triageDeck: List<TriageCardItem> = emptyList(),
+    val inFlightTriageIds: Set<String> = emptySet(),
     val recentTracks: List<FfiTrack> = emptyList(),
     // Search
     val searchQuery: String = "",
@@ -178,10 +179,12 @@ data class AppUiState(
     val activeAcquisitionsCount: Int get() = acquiringStages.size
     val pendingDiscoveryCount: Int get() = triageDeck.size
     val seasonalHeroMix: ContextualMixUi?
-        get() = contextualMixes.firstOrNull { it.kind == "seasonal" }
-            ?: contextualMixes.firstOrNull()
+        get() = contextualMixes.firstOrNull { it.kind == "seasonal" && it.trackCount > 0 }
+            ?: contextualMixes.firstOrNull { !(it.kind == "seasonal" && it.trackCount == 0) }
     val rollingAndMomentMixes: List<ContextualMixUi>
-        get() = contextualMixes.filterNot { it.slug == seasonalHeroMix?.slug }
+        get() = contextualMixes.filterNot {
+            it.slug == seasonalHeroMix?.slug || (it.kind == "seasonal" && it.trackCount == 0)
+        }
     val userPlaylists: List<FfiPlaylist>
         get() = playlists.filter { it.kind == "user" }
     val soulbeetMixPlaylists: List<FfiPlaylist>
@@ -190,14 +193,18 @@ data class AppUiState(
                 .mapNotNull { it.navidromePlaylistId?.takeIf(String::isNotBlank) }
                 .toSet()
             return playlists.filter { pl ->
-                pl.kind in SOULBEET_MIX_KINDS && pl.id !in contextualPlaylistIds
+                pl.kind in SOULBEET_MIX_KINDS &&
+                    !(pl.kind == "seasonal" && pl.songCount == 0L) &&
+                    pl.id !in contextualPlaylistIds
             }
         }
     val homeFallbackMixPlaylists: List<FfiPlaylist>
         get() {
             val heroPlaylistId = seasonalHeroMix?.navidromePlaylistId?.takeIf(String::isNotBlank)
             return playlists.filter { pl ->
-                pl.kind in SOULBEET_MIX_KINDS && pl.id != heroPlaylistId
+                pl.kind in SOULBEET_MIX_KINDS &&
+                    !(pl.kind == "seasonal" && pl.songCount == 0L) &&
+                    pl.id != heroPlaylistId
             }
         }
 
@@ -226,6 +233,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
 
     private val hiddenTriageIds = MutableStateFlow<Set<String>>(emptySet())
+    private val inFlightTriageIds: MutableSet<String> = mutableSetOf()
     private var searchJob: Job? = null
     private var bannerClearJob: Job? = null
     private var connectWsJob: Job? = null
@@ -238,7 +246,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         commitScope = appScope,
         onCommit = { action -> commitDropMutation(action) },
         onUndo = { action ->
-            hiddenTriageIds.update { it - action.trackId - (action.discoveryTrackId ?: "") }
+            val keysToRestore = listOfNotNull(action.trackId, action.discoveryTrackId)
+                .filter { it.isNotBlank() }
+                .toSet()
+            if (keysToRestore.isNotEmpty()) {
+                hiddenTriageIds.update { it - keysToRestore }
+            }
             viewModelScope.launch { refreshLibrarySnapshot() }
             showNotice("Restored \"${action.title}\"")
         },
@@ -506,6 +519,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             hiddenTriageIds.value = emptySet()
+            inFlightTriageIds.clear()
             _uiState.update {
                 AppUiState(
                     isBooting = false,
@@ -838,8 +852,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             sizeBytes = null,
                             coverArtId = null,
                             path = null,
-                            starred = false,
-                            userRating = 0L,
+                            starred = mt.starred,
+                            userRating = mt.rating.toLong(),
                             playCount = 0L,
                             lastPlayedAt = null,
                             musicbrainzId = null,
@@ -875,16 +889,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // =========================================================================
 
     fun keepDiscoveryTrack(trackId: String, discoveryTrackId: String? = null, title: String = "Track") {
+        val guardKeys = listOfNotNull(trackId, discoveryTrackId)
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (guardKeys.isEmpty() || guardKeys.any { it in inFlightTriageIds }) return
+        inFlightTriageIds.addAll(guardKeys)
+
+        val hasTrackId = trackId.isNotBlank()
+        val hasDiscoveryId = !discoveryTrackId.isNullOrBlank()
+        val prevDeck = _uiState.value.triageDeck
+        val prevPlaybackCtx = if (hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+            _uiState.value.playback.toTrackActionContext()
+        } else {
+            null
+        }
+
+        // Synchronous 0ms optimistic UI update before launching IO/MediaController work.
+        hiddenTriageIds.update { it + guardKeys }
+        _uiState.update { state ->
+            state.copy(
+                inFlightTriageIds = state.inFlightTriageIds + guardKeys,
+                triageDeck = state.triageDeck.filterNot {
+                    (hasDiscoveryId && it.discovery.id == discoveryTrackId) ||
+                        (hasTrackId && it.discovery.songId == trackId)
+                },
+                playback = if (hasTrackId && state.playback.currentTrackId == trackId) {
+                    state.playback.copy(isPendingDiscovery = false)
+                } else {
+                    state.playback
+                },
+            )
+        }
+        prevPlaybackCtx?.let { ctx ->
+            SoulbeetMediaRepository.shared.updateTrackContext(
+                ctx.copy(isPendingDiscovery = false),
+            )
+        }
+
         viewModelScope.launch {
-            val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
-            val handledBySession = if (_uiState.value.playback.currentTrackId == trackId) {
-                mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_KEEP_DISCOVERY)
-            } else {
-                false
-            }
-            if (!handledBySession) {
-                withContext(Dispatchers.IO) {
-                    runCatching {
+            try {
+                val core = SoulbeetCoreProvider.getOrNull()
+                    ?: throw IllegalStateException("Core client is not initialized")
+                val handledBySession = if (hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+                    mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_KEEP_DISCOVERY)
+                } else {
+                    false
+                }
+                if (!handledBySession) {
+                    withContext(Dispatchers.IO) {
                         core.enqueueMutation(
                             FfiOutboxMutation.Keep(
                                 songId = trackId,
@@ -894,26 +946,84 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
                     }
-                }
-                if (_uiState.value.playback.currentTrackId == trackId) {
-                    _uiState.value.playback.toTrackActionContext()?.let { ctx ->
-                        SoulbeetMediaRepository.shared.updateTrackContext(
-                            ctx.copy(isPendingDiscovery = false, userRating = maxOf(ctx.userRating, 4)),
-                        )
+                    if (hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+                        _uiState.value.playback.toTrackActionContext()?.let { ctx ->
+                            SoulbeetMediaRepository.shared.updateTrackContext(
+                                ctx.copy(isPendingDiscovery = false),
+                            )
+                        }
                     }
                 }
+                refreshLibrarySnapshot()
+                hiddenTriageIds.update { it - guardKeys.toSet() }
+                showNotice("Kept \"$title\" in Library")
+            } catch (e: Exception) {
+                hiddenTriageIds.update { it - guardKeys.toSet() }
+                _uiState.update { state ->
+                    state.copy(
+                        triageDeck = prevDeck,
+                        playback = if (prevPlaybackCtx != null && hasTrackId && state.playback.currentTrackId == trackId) {
+                            state.playback.copy(isPendingDiscovery = prevPlaybackCtx.isPendingDiscovery)
+                        } else {
+                            state.playback
+                        },
+                    )
+                }
+                if (prevPlaybackCtx != null && hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+                    SoulbeetMediaRepository.shared.updateTrackContext(prevPlaybackCtx)
+                }
+                refreshLibrarySnapshot()
+                showNotice("Failed to keep \"$title\": ${e.localizedMessage ?: "error"}")
+            } finally {
+                inFlightTriageIds.removeAll(guardKeys.toSet())
+                _uiState.update { it.copy(inFlightTriageIds = it.inFlightTriageIds - guardKeys.toSet()) }
             }
-            hiddenTriageIds.update { it + trackId + listOfNotNull(discoveryTrackId) }
-            refreshLibrarySnapshot()
-            showNotice("Kept \"$title\" in Library")
         }
     }
 
     fun starAndKeepDiscoveryTrack(trackId: String, discoveryTrackId: String? = null, title: String = "Track") {
+        val guardKeys = listOfNotNull(trackId, discoveryTrackId)
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (guardKeys.isEmpty() || guardKeys.any { it in inFlightTriageIds }) return
+        inFlightTriageIds.addAll(guardKeys)
+
+        val hasTrackId = trackId.isNotBlank()
+        val hasDiscoveryId = !discoveryTrackId.isNullOrBlank()
+        val prevDeck = _uiState.value.triageDeck
+        val prevPlaybackCtx = if (hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+            _uiState.value.playback.toTrackActionContext()
+        } else {
+            null
+        }
+
+        // Synchronous 0ms optimistic UI update before launching IO work.
+        hiddenTriageIds.update { it + guardKeys }
+        _uiState.update { state ->
+            state.copy(
+                inFlightTriageIds = state.inFlightTriageIds + guardKeys,
+                triageDeck = state.triageDeck.filterNot {
+                    (hasDiscoveryId && it.discovery.id == discoveryTrackId) ||
+                        (hasTrackId && it.discovery.songId == trackId)
+                },
+                playback = if (hasTrackId && state.playback.currentTrackId == trackId) {
+                    state.playback.copy(isPendingDiscovery = false, isStarred = true)
+                } else {
+                    state.playback
+                },
+            )
+        }
+        prevPlaybackCtx?.let { ctx ->
+            SoulbeetMediaRepository.shared.updateTrackContext(
+                ctx.copy(isStarred = true, isPendingDiscovery = false),
+            )
+        }
+
         viewModelScope.launch {
-            val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
-            withContext(Dispatchers.IO) {
-                runCatching {
+            try {
+                val core = SoulbeetCoreProvider.getOrNull()
+                    ?: throw IllegalStateException("Core client is not initialized")
+                withContext(Dispatchers.IO) {
                     core.enqueueMutation(
                         FfiOutboxMutation.Star(
                             songId = trackId,
@@ -922,17 +1032,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
                 }
-            }
-            if (_uiState.value.playback.currentTrackId == trackId) {
-                _uiState.value.playback.toTrackActionContext()?.let { ctx ->
-                    SoulbeetMediaRepository.shared.updateTrackContext(
-                        ctx.copy(isStarred = true, isPendingDiscovery = false),
+                if (hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+                    _uiState.value.playback.toTrackActionContext()?.let { ctx ->
+                        SoulbeetMediaRepository.shared.updateTrackContext(
+                            ctx.copy(isStarred = true, isPendingDiscovery = false),
+                        )
+                    }
+                }
+                refreshLibrarySnapshot()
+                hiddenTriageIds.update { it - guardKeys.toSet() }
+                showNotice("Starred & kept \"$title\"")
+            } catch (e: Exception) {
+                hiddenTriageIds.update { it - guardKeys.toSet() }
+                _uiState.update { state ->
+                    state.copy(
+                        triageDeck = prevDeck,
+                        playback = if (prevPlaybackCtx != null && hasTrackId && state.playback.currentTrackId == trackId) {
+                            state.playback.copy(
+                                isPendingDiscovery = prevPlaybackCtx.isPendingDiscovery,
+                                isStarred = prevPlaybackCtx.isStarred,
+                            )
+                        } else {
+                            state.playback
+                        },
                     )
                 }
+                if (prevPlaybackCtx != null && hasTrackId && _uiState.value.playback.currentTrackId == trackId) {
+                    SoulbeetMediaRepository.shared.updateTrackContext(prevPlaybackCtx)
+                }
+                refreshLibrarySnapshot()
+                showNotice("Failed to star & keep \"$title\": ${e.localizedMessage ?: "error"}")
+            } finally {
+                inFlightTriageIds.removeAll(guardKeys.toSet())
+                _uiState.update { it.copy(inFlightTriageIds = it.inFlightTriageIds - guardKeys.toSet()) }
             }
-            hiddenTriageIds.update { it + trackId + listOfNotNull(discoveryTrackId) }
-            refreshLibrarySnapshot()
-            showNotice("Starred & kept \"$title\"")
         }
     }
 
@@ -943,15 +1076,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         discoveryTrackId: String? = null,
         sourceLabel: String? = "Discovery",
     ) {
-        hiddenTriageIds.update { it + trackId + listOfNotNull(discoveryTrackId) }
+        val guardKeys = listOfNotNull(trackId, discoveryTrackId)
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (guardKeys.isEmpty() || guardKeys.any { it in inFlightTriageIds }) return
+        val hasTrackId = trackId.isNotBlank()
+        val hasDiscoveryId = !discoveryTrackId.isNullOrBlank()
+        hiddenTriageIds.update { it + guardKeys }
         _uiState.update { state ->
             state.copy(
                 triageDeck = state.triageDeck.filterNot {
-                    it.discovery.id == discoveryTrackId || it.discovery.songId == trackId
+                    (hasDiscoveryId && it.discovery.id == discoveryTrackId) ||
+                        (hasTrackId && it.discovery.songId == trackId)
                 },
             )
         }
-        mediaBridge.removeTrackFromQueue(trackId)
+        if (hasTrackId) {
+            mediaBridge.removeTrackFromQueue(trackId)
+        }
         undoController.scheduleDrop(
             PendingDropAction(
                 trackId = trackId,
@@ -1023,10 +1165,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (_uiState.value.playback.currentTrackId == trackId) {
                 _uiState.value.playback.toTrackActionContext()?.let { ctx ->
                     SoulbeetMediaRepository.shared.updateTrackContext(
-                        ctx.copy(
-                            userRating = clamped,
-                            isPendingDiscovery = if (clamped >= 4) false else ctx.isPendingDiscovery,
-                        ),
+                        ctx.copy(userRating = clamped),
                     )
                 }
             }
@@ -1106,15 +1245,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun commitDropMutation(action: PendingDropAction) {
         val core = SoulbeetCoreProvider.getOrNull() ?: return
-        withContext(Dispatchers.IO) {
+        val keysToRelease = listOfNotNull(action.trackId, action.discoveryTrackId)
+            .filter { it.isNotBlank() }
+            .toSet()
+        val enqueued = withContext(Dispatchers.IO) {
             runCatching {
                 for (mutation in action.toMutations()) {
                     core.enqueueMutation(mutation)
                 }
                 SoulbeetWorkScheduler.enqueueImmediateOutboxDrain(appContext)
-            }
+            }.isSuccess
+        }
+        if (!enqueued && keysToRelease.isNotEmpty()) {
+            hiddenTriageIds.update { it - keysToRelease }
         }
         refreshLibrarySnapshot()
+        if (enqueued && keysToRelease.isNotEmpty()) {
+            hiddenTriageIds.update { it - keysToRelease }
+        }
     }
 
     // =========================================================================
@@ -1734,7 +1882,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             val deck = discovery
                 .filterNot { d ->
-                    hidden.contains(d.id) || (d.songId != null && hidden.contains(d.songId))
+                    (d.id.isNotBlank() && hidden.contains(d.id)) ||
+                        (!d.songId.isNullOrBlank() && hidden.contains(d.songId))
                 }
                 .map { d ->
                     val tr = d.songId?.let { triageTrackMap[it] }
@@ -1813,7 +1962,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         if (!cfg.isConfigured || cfg.offlineOnly) return
         val hour = LocalTime.now().hour
-        val mixes = apiClient.fetchContextualMixes(cfg, hour).getOrNull()
+        val mixes = apiClient.fetchContextualMixes(cfg, hour)
+            .getOrNull()
+            ?.filterNot { it.kind == "seasonal" && it.trackCount == 0 }
         val profile = apiClient.fetchCultureProfile(cfg).getOrNull()
         _uiState.update { state ->
             state.copy(

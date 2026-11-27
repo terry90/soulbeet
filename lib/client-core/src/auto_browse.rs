@@ -195,6 +195,11 @@ impl AutoBrowseEngine {
                     p.updated_at
                 FROM playlists p
                 WHERE p.kind IN ('seasonal', 'moment', 'discovery')
+                  AND (
+                      p.kind != 'seasonal'
+                      OR EXISTS (SELECT 1 FROM playlist_tracks pt2 WHERE pt2.playlist_id = p.id)
+                      OR p.song_count > 0
+                  )
                 ORDER BY
                     CASE p.kind WHEN 'seasonal' THEN 0 WHEN 'moment' THEN 1 ELSE 2 END ASC,
                     p.updated_at DESC

@@ -30,6 +30,7 @@ use shared::client::{
 use shared::download::{
     AcquireAndPlayInitialStatus, AcquireAndPlayRequest, AcquireAndPlayResponse,
 };
+use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase};
 use shared::recommendation::{ContextualMixSummary, CultureSteering, SteerSeasonalPackRequest};
 use tokio::sync::{broadcast, mpsc, watch};
 use ui::{
@@ -1321,6 +1322,13 @@ pub struct DesktopStudio {
     pub cache_stats: Signal<Option<CacheStats>>,
     pub playlists: Signal<Vec<DesktopPlaylist>>,
     pub pending_drops: Signal<PendingDropQueue>,
+    pub in_flight_triage: Signal<HashSet<String>>,
+    pub optimistic_kept: Signal<HashSet<String>>,
+    pub discovery_generating: Signal<bool>,
+    pub discovery_progress_label: Signal<Option<String>>,
+    pub discovery_progress_pct: Signal<Option<u8>>,
+    pub discovery_refresh_error: Signal<Option<String>>,
+    pub discovery_poll_gen: Signal<Arc<AtomicU64>>,
     pub acquiring_tracks: Signal<HashMap<String, AcquireStageBadge>>,
     pub connect_devices: Signal<Vec<ConnectDevice>>,
     pub lyrics: Signal<Vec<TrackLyrics>>,
@@ -1342,6 +1350,122 @@ pub struct DesktopStudio {
     pub scrobbler: Signal<Arc<Mutex<ScrobbleTracker>>>,
 }
 
+/// Builds all non-empty deduplicated triage guard keys (`discovery_track_id` and `song_id`).
+fn triage_guard_keys(disc_id: Option<&str>, song_id: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(did) = disc_id.filter(|s| !s.is_empty()) {
+        keys.push(did.to_string());
+    }
+    if !song_id.is_empty() && !keys.iter().any(|k| k == song_id) {
+        keys.push(song_id.to_string());
+    }
+    keys
+}
+
+/// Computes a human-readable status label and completion percentage for `DiscoveryProgress`.
+fn desktop_discovery_progress_summary(progress: &DiscoveryProgress) -> (String, u8) {
+    if progress.profiles.is_empty() {
+        return ("Preparing recommendations...".to_string(), 8);
+    }
+    let total_profiles = progress.profiles.len() as f64;
+    let mut completed_units = 0.0f64;
+    let mut active_label: Option<String> = None;
+
+    for pp in &progress.profiles {
+        match pp.phase {
+            ProfilePhase::Done | ProfilePhase::Skipped => {
+                completed_units += 1.0;
+            }
+            ProfilePhase::Waiting => {}
+            _ => {
+                let frac = if pp.total > 0 {
+                    (pp.current as f64 / pp.total as f64).clamp(0.0, 1.0)
+                } else {
+                    0.25
+                };
+                completed_units += frac;
+                if active_label.is_none() {
+                    if pp.total > 0 {
+                        active_label = Some(format!(
+                            "{}: {} ({}/{})",
+                            pp.profile, pp.phase, pp.current, pp.total
+                        ));
+                    } else {
+                        active_label = Some(format!("{}: {}", pp.profile, pp.phase));
+                    }
+                }
+            }
+        }
+    }
+
+    let pct = ((completed_units / total_profiles) * 100.0)
+        .round()
+        .clamp(6.0, 98.0) as u8;
+    let label = active_label.unwrap_or_else(|| "Generating fresh discovery tracks...".to_string());
+    (label, pct)
+}
+
+/// Parses a Soulbeet server error body (Dioxus `ErrorPayload` JSON or raw text) and flags
+/// `already_running` so callers can attach cleanly to an in-flight discovery run.
+fn parse_server_error_message(body: &str, status: u16) -> (String, bool) {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        let code = val.pointer("/data/code").and_then(|v| v.as_str());
+        let msg = val
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let already_running = code == Some("already_running")
+            || msg.is_some_and(|m| m.to_ascii_lowercase().contains("already in progress"));
+        let display = msg
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("Server returned HTTP {status}"));
+        return (display, already_running);
+    }
+    let trimmed = body.trim();
+    let already_running = trimmed.to_ascii_lowercase().contains("already in progress");
+    let display = if trimmed.is_empty() {
+        format!("Server returned HTTP {status}")
+    } else {
+        format!("HTTP {status}: {trimmed}")
+    };
+    (display, already_running)
+}
+
+/// Fetches `GET {base}/api/discovery/progress` using the configured Soulbeet auth header.
+async fn fetch_discovery_progress(
+    client: &reqwest::Client,
+    base: &str,
+    auth: Option<&SoulbeetAuth>,
+) -> Result<Option<DiscoveryProgress>, String> {
+    let url = format!("{}/api/discovery/progress", base.trim_end_matches('/'));
+    let mut req = client.get(&url);
+    if let Some(a) = auth {
+        let (k, v) = a.header_name_and_value();
+        req = req.header(k, v);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach Soulbeet server: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let (msg, _) = parse_server_error_message(&body, status.as_u16());
+        return Err(msg);
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed reading discovery progress: {e}"))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(None);
+    }
+    serde_json::from_str::<Option<DiscoveryProgress>>(trimmed)
+        .map_err(|e| format!("Invalid discovery progress JSON: {e}"))
+}
+
 pub fn use_desktop_studio() -> DesktopStudio {
     use_context::<DesktopStudio>()
 }
@@ -1352,6 +1476,7 @@ impl DesktopStudio {
         self.library_revision.set(next);
     }
 
+    #[allow(dead_code)]
     pub fn promote_threshold(&self) -> u8 {
         self.bootstrap
             .peek()
@@ -1364,17 +1489,24 @@ impl DesktopStudio {
         self.playlists
             .read()
             .iter()
-            .map(|p| SidebarPlaylistItem {
-                id: p.playlist.id.clone(),
-                name: p.playlist.name.clone(),
-                song_count: u32::try_from(p.playlist.song_count.max(0)).unwrap_or(0),
-                is_smart: p.playlist.is_smart,
-                is_offline_pinned: p.is_pinned,
-                category: classify_local_playlist_category(
+            .filter_map(|p| {
+                let song_count = u32::try_from(p.playlist.song_count.max(0)).unwrap_or(0);
+                let category = classify_local_playlist_category(
                     &p.playlist.kind,
                     p.playlist.comment.as_deref(),
                     p.playlist.is_smart,
-                ),
+                );
+                if category == ui::PlaylistCategory::Seasonal && song_count == 0 {
+                    return None;
+                }
+                Some(SidebarPlaylistItem {
+                    id: p.playlist.id.clone(),
+                    name: p.playlist.name.clone(),
+                    song_count,
+                    is_smart: p.playlist.is_smart,
+                    is_offline_pinned: p.is_pinned,
+                    category,
+                })
             })
             .collect()
     }
@@ -2030,35 +2162,181 @@ impl DesktopStudio {
 
     // --- Offline-First Outbox Curation Actions ---
 
+    fn finalize_inspected_promoted_discovery(
+        &mut self,
+        song_id: &str,
+        discovery_track_id: Option<&str>,
+    ) {
+        let mut inspected = self.inspected_track.write();
+        if let Some(t) = inspected.as_mut() {
+            let matches = (!song_id.is_empty() && t.id == song_id)
+                || discovery_track_id
+                    .filter(|d| !d.is_empty())
+                    .is_some_and(|did| t.discovery_track_id.as_deref() == Some(did));
+            if matches {
+                t.is_discovery = false;
+                t.discovery_track_id = None;
+                t.days_remaining = None;
+            }
+        }
+    }
+
     pub fn keep_track(&mut self, player: PlayerContext, track: PlayerTrack) {
-        player
-            .state_signal()
-            .write()
-            .apply_curation_update(&track.id, None, None, true);
+        let disc_id = track.discovery_track_id.clone();
+        let song_id = track.id.clone();
+        let prev_is_discovery = track.is_discovery;
+        let prev_days = track.days_remaining;
+        let guard_keys = triage_guard_keys(disc_id.as_deref(), &song_id);
+
+        // Synchronous dual-key in-flight guard blocks rapid double-clicks across surfaces
+        if guard_keys
+            .iter()
+            .any(|k| self.in_flight_triage.peek().contains(k))
+        {
+            return;
+        }
+        if !guard_keys.is_empty() {
+            let mut in_flight = self.in_flight_triage.write();
+            for key in &guard_keys {
+                in_flight.insert(key.clone());
+            }
+        }
+        {
+            let mut kept = self.optimistic_kept.write();
+            for key in &guard_keys {
+                kept.insert(key.clone());
+            }
+        }
+
+        // Immediate optimistic UI update (never stamps fake star ratings!)
+        // Preserve `discovery_track_id` until outbox confirmation so rollback always matches.
+        if !song_id.is_empty() {
+            player
+                .state_signal()
+                .write()
+                .apply_curation_update(&song_id, None, None, true);
+        }
+        if let Some(ref did) = disc_id {
+            if !did.is_empty() && *did != song_id {
+                player
+                    .state_signal()
+                    .write()
+                    .apply_curation_update(did, None, None, true);
+            }
+        }
+        {
+            let mut inspected = self.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!song_id.is_empty() && t.id == song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.is_discovery = false;
+                    t.days_remaining = None;
+                }
+            }
+        }
         self.push_mini_snapshot(player);
 
         let Some(core) = self.core.peek().clone() else {
+            {
+                let mut kept = self.optimistic_kept.write();
+                for key in &guard_keys {
+                    kept.remove(key);
+                }
+            }
+            if !guard_keys.is_empty() {
+                let mut in_flight = self.in_flight_triage.write();
+                for key in &guard_keys {
+                    in_flight.remove(key);
+                }
+            }
+            if prev_is_discovery {
+                player.state_signal().write().restore_discovery_state(
+                    &song_id,
+                    disc_id.as_deref(),
+                    prev_days,
+                );
+                let mut inspected = self.inspected_track.write();
+                if let Some(t) = inspected.as_mut() {
+                    let matches = (!song_id.is_empty() && t.id == song_id)
+                        || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                    if matches {
+                        t.is_discovery = true;
+                        t.discovery_track_id = disc_id.clone();
+                        t.days_remaining = prev_days;
+                    }
+                }
+            }
+            self.push_mini_snapshot(player);
             return;
         };
         let mut studio = *self;
         spawn(async move {
             let res = core
                 .enqueue_mutation(OutboxMutation::Keep {
-                    song_id: track.id.clone(),
-                    discovery_track_id: track.discovery_track_id.clone(),
+                    song_id: song_id.clone(),
+                    discovery_track_id: disc_id.clone(),
                     target_folder_id: None,
                 })
                 .await;
             if let Err(err) = res {
+                {
+                    let mut kept = studio.optimistic_kept.write();
+                    for key in &guard_keys {
+                        kept.remove(key);
+                    }
+                }
+                if !guard_keys.is_empty() {
+                    let mut in_flight = studio.in_flight_triage.write();
+                    for key in &guard_keys {
+                        in_flight.remove(key);
+                    }
+                }
+                if prev_is_discovery {
+                    player.state_signal().write().restore_discovery_state(
+                        &song_id,
+                        disc_id.as_deref(),
+                        prev_days,
+                    );
+                    let mut inspected = studio.inspected_track.write();
+                    if let Some(t) = inspected.as_mut() {
+                        let matches = (!song_id.is_empty() && t.id == song_id)
+                            || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                        if matches {
+                            t.is_discovery = true;
+                            t.discovery_track_id = disc_id.clone();
+                            t.days_remaining = prev_days;
+                        }
+                    }
+                }
+                studio.push_mini_snapshot(player);
                 studio.status_toast.set(Some(format!("Keep failed: {err}")));
                 return;
             }
+            player
+                .state_signal()
+                .write()
+                .finalize_promoted_discovery(&song_id, disc_id.as_deref());
+            studio.finalize_inspected_promoted_discovery(&song_id, disc_id.as_deref());
+            studio.push_mini_snapshot(player);
             studio.status_toast.set(Some(format!(
                 "Kept \"{}\" in permanent library",
                 track.title
             )));
             studio.bump_library();
             studio.refresh_outbox_counts().await;
+            {
+                let mut kept = studio.optimistic_kept.write();
+                for key in &guard_keys {
+                    kept.remove(key);
+                }
+            }
+            if !guard_keys.is_empty() {
+                let mut in_flight = studio.in_flight_triage.write();
+                for key in &guard_keys {
+                    in_flight.remove(key);
+                }
+            }
             if !core.is_offline_only() {
                 let _ = core.drain_outbox().await;
                 studio.refresh_outbox_counts().await;
@@ -2068,34 +2346,213 @@ impl DesktopStudio {
 
     pub fn star_track(&mut self, player: PlayerContext, track: PlayerTrack, starred: bool) {
         let promoted = starred && track.is_discovery;
-        player.state_signal().write().apply_curation_update(
-            &track.id,
-            Some(starred),
-            None,
-            promoted,
-        );
+        let disc_id = track.discovery_track_id.clone();
+        let song_id = track.id.clone();
+        let prev_days = track.days_remaining;
+        let guard_keys = triage_guard_keys(disc_id.as_deref(), &song_id);
+
+        if promoted {
+            if guard_keys
+                .iter()
+                .any(|k| self.in_flight_triage.peek().contains(k))
+            {
+                return;
+            }
+            if !guard_keys.is_empty() {
+                let mut in_flight = self.in_flight_triage.write();
+                for key in &guard_keys {
+                    in_flight.insert(key.clone());
+                }
+            }
+            let mut kept = self.optimistic_kept.write();
+            for key in &guard_keys {
+                kept.insert(key.clone());
+            }
+        }
+
+        // Never stamps fake star ratings! Preserve `discovery_track_id` until confirmed.
+        if !song_id.is_empty() {
+            player.state_signal().write().apply_curation_update(
+                &song_id,
+                Some(starred),
+                None,
+                promoted,
+            );
+        }
+        if promoted {
+            if let Some(ref did) = disc_id {
+                if !did.is_empty() && *did != song_id {
+                    player.state_signal().write().apply_curation_update(
+                        did,
+                        Some(starred),
+                        None,
+                        true,
+                    );
+                }
+            }
+        }
+        {
+            let mut inspected = self.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!song_id.is_empty() && t.id == song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.starred = starred;
+                    if promoted {
+                        t.is_discovery = false;
+                        t.days_remaining = None;
+                    }
+                }
+            }
+        }
         self.push_mini_snapshot(player);
 
         let Some(core) = self.core.peek().clone() else {
+            if !song_id.is_empty() {
+                player.state_signal().write().apply_curation_update(
+                    &song_id,
+                    Some(!starred),
+                    None,
+                    false,
+                );
+            } else if let Some(ref did) = disc_id {
+                if !did.is_empty() {
+                    player.state_signal().write().apply_curation_update(
+                        did,
+                        Some(!starred),
+                        None,
+                        false,
+                    );
+                }
+            }
+            if promoted {
+                {
+                    let mut kept = self.optimistic_kept.write();
+                    for key in &guard_keys {
+                        kept.remove(key);
+                    }
+                }
+                if !guard_keys.is_empty() {
+                    let mut in_flight = self.in_flight_triage.write();
+                    for key in &guard_keys {
+                        in_flight.remove(key);
+                    }
+                }
+                player.state_signal().write().restore_discovery_state(
+                    &song_id,
+                    disc_id.as_deref(),
+                    prev_days,
+                );
+            }
+            {
+                let mut inspected = self.inspected_track.write();
+                if let Some(t) = inspected.as_mut() {
+                    let matches = (!song_id.is_empty() && t.id == song_id)
+                        || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                    if matches {
+                        t.starred = !starred;
+                        if promoted {
+                            t.is_discovery = true;
+                            t.discovery_track_id = disc_id.clone();
+                            t.days_remaining = prev_days;
+                        }
+                    }
+                }
+            }
+            self.push_mini_snapshot(player);
             return;
         };
         let mut studio = *self;
         spawn(async move {
             let res = core
                 .enqueue_mutation(OutboxMutation::Star {
-                    song_id: track.id.clone(),
+                    song_id: song_id.clone(),
                     starred,
-                    discovery_track_id: track.discovery_track_id.clone(),
+                    discovery_track_id: disc_id.clone(),
                 })
                 .await;
             if let Err(err) = res {
+                if !song_id.is_empty() {
+                    player.state_signal().write().apply_curation_update(
+                        &song_id,
+                        Some(!starred),
+                        None,
+                        false,
+                    );
+                } else if let Some(ref did) = disc_id {
+                    if !did.is_empty() {
+                        player.state_signal().write().apply_curation_update(
+                            did,
+                            Some(!starred),
+                            None,
+                            false,
+                        );
+                    }
+                }
+                if promoted {
+                    {
+                        let mut kept = studio.optimistic_kept.write();
+                        for key in &guard_keys {
+                            kept.remove(key);
+                        }
+                    }
+                    if !guard_keys.is_empty() {
+                        let mut in_flight = studio.in_flight_triage.write();
+                        for key in &guard_keys {
+                            in_flight.remove(key);
+                        }
+                    }
+                    player.state_signal().write().restore_discovery_state(
+                        &song_id,
+                        disc_id.as_deref(),
+                        prev_days,
+                    );
+                }
+                {
+                    let mut inspected = studio.inspected_track.write();
+                    if let Some(t) = inspected.as_mut() {
+                        let matches = (!song_id.is_empty() && t.id == song_id)
+                            || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                        if matches {
+                            t.starred = !starred;
+                            if promoted {
+                                t.is_discovery = true;
+                                t.discovery_track_id = disc_id.clone();
+                                t.days_remaining = prev_days;
+                            }
+                        }
+                    }
+                }
+                studio.push_mini_snapshot(player);
                 studio
                     .status_toast
                     .set(Some(format!("Star update failed: {err}")));
                 return;
             }
+            if promoted {
+                player
+                    .state_signal()
+                    .write()
+                    .finalize_promoted_discovery(&song_id, disc_id.as_deref());
+                studio.finalize_inspected_promoted_discovery(&song_id, disc_id.as_deref());
+                studio.push_mini_snapshot(player);
+            }
             studio.bump_library();
             studio.refresh_outbox_counts().await;
+            if promoted {
+                {
+                    let mut kept = studio.optimistic_kept.write();
+                    for key in &guard_keys {
+                        kept.remove(key);
+                    }
+                }
+                if !guard_keys.is_empty() {
+                    let mut in_flight = studio.in_flight_triage.write();
+                    for key in &guard_keys {
+                        in_flight.remove(key);
+                    }
+                }
+            }
             if !core.is_offline_only() {
                 let _ = core.drain_outbox().await;
                 studio.refresh_outbox_counts().await;
@@ -2105,28 +2562,76 @@ impl DesktopStudio {
 
     pub fn rate_track(&mut self, player: PlayerContext, track: PlayerTrack, rating: u8) {
         let clamped = rating.min(5);
-        let promoted = track.is_discovery && clamped >= self.promote_threshold();
+        let prev_rating = track.rating;
+        let song_id = track.id.clone();
+        let disc_id = track.discovery_track_id.clone();
+
+        // Pure 1-5 rating everywhere (never promotes or drops discovery tracks!)
         player.state_signal().write().apply_curation_update(
-            &track.id,
+            &song_id,
             None,
             Some(clamped),
-            promoted,
+            false,
         );
+        {
+            let mut inspected = self.inspected_track.write();
+            if let Some(t) = inspected.as_mut() {
+                let matches = (!song_id.is_empty() && t.id == song_id)
+                    || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                if matches {
+                    t.rating = clamped;
+                }
+            }
+        }
         self.push_mini_snapshot(player);
 
         let Some(core) = self.core.peek().clone() else {
+            player.state_signal().write().apply_curation_update(
+                &song_id,
+                None,
+                Some(prev_rating),
+                false,
+            );
+            {
+                let mut inspected = self.inspected_track.write();
+                if let Some(t) = inspected.as_mut() {
+                    let matches = (!song_id.is_empty() && t.id == song_id)
+                        || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                    if matches {
+                        t.rating = prev_rating;
+                    }
+                }
+            }
+            self.push_mini_snapshot(player);
             return;
         };
         let mut studio = *self;
         spawn(async move {
             let res = core
                 .enqueue_mutation(OutboxMutation::Rate {
-                    song_id: track.id.clone(),
+                    song_id: song_id.clone(),
                     rating: clamped,
-                    discovery_track_id: track.discovery_track_id.clone(),
+                    discovery_track_id: disc_id.clone(),
                 })
                 .await;
             if let Err(err) = res {
+                player.state_signal().write().apply_curation_update(
+                    &song_id,
+                    None,
+                    Some(prev_rating),
+                    false,
+                );
+                {
+                    let mut inspected = studio.inspected_track.write();
+                    if let Some(t) = inspected.as_mut() {
+                        let matches = (!song_id.is_empty() && t.id == song_id)
+                            || (disc_id.is_some() && t.discovery_track_id == disc_id);
+                        if matches {
+                            t.rating = prev_rating;
+                        }
+                    }
+                }
+                studio.push_mini_snapshot(player);
                 studio
                     .status_toast
                     .set(Some(format!("Rating update failed: {err}")));
@@ -2548,6 +3053,219 @@ impl DesktopStudio {
                 Err(err) => {
                     tracing::warn!("seasonal steer request failed: {err}");
                 }
+            }
+        });
+    }
+
+    /// Triggers server-side discovery generation (`POST {base}/api/discovery/start-generation`),
+    /// polls `GET {base}/api/discovery/progress` every 2.5s without consuming stale terminal
+    /// snapshots from a prior run, and triggers `sync_now(false)` on completion so newly
+    /// generated discovery tracks and seasonal mixes appear immediately in Desktop.
+    pub fn refresh_discovery(&self) {
+        let mut studio = *self;
+        if *studio.discovery_generating.peek() {
+            return;
+        }
+        let cfg = studio.config.peek().clone();
+        if cfg.offline_only {
+            studio
+                .status_toast
+                .set(Some("Disable Offline Only mode to refresh discovery.".into()));
+            return;
+        }
+        let Some(base) = cfg
+            .soulbeet_base_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+        else {
+            studio.status_toast.set(Some(
+                "Connect a Soulbeet server in Settings to generate new discovery tracks.".into(),
+            ));
+            return;
+        };
+        let auth = cfg.soulbeet_auth();
+        let my_gen = studio.discovery_poll_gen.peek().fetch_add(1, Ordering::SeqCst) + 1;
+        let poll_gen_arc = studio.discovery_poll_gen.peek().clone();
+
+        studio.discovery_generating.set(true);
+        studio.discovery_refresh_error.set(None);
+        studio
+            .discovery_progress_label
+            .set(Some("Starting discovery refresh...".into()));
+        studio.discovery_progress_pct.set(Some(8));
+
+        spawn(async move {
+            let client = match reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(20))
+                .build()
+            {
+                Ok(c) => c,
+                Err(err) => {
+                    if poll_gen_arc.load(Ordering::SeqCst) == my_gen {
+                        let msg = format!("HTTP client error: {err}");
+                        studio.discovery_generating.set(false);
+                        studio.discovery_progress_label.set(None);
+                        studio.discovery_progress_pct.set(None);
+                        studio.discovery_refresh_error.set(Some(msg.clone()));
+                        studio.status_toast.set(Some(msg));
+                    }
+                    return;
+                }
+            };
+
+            // Snapshot any prior terminal run BEFORE starting so we never consume a stale
+            // Complete/Error cached for 5 minutes from a previous run.
+            let initial_progress = fetch_discovery_progress(&client, &base, auth.as_ref())
+                .await
+                .ok()
+                .flatten();
+            let pre_click_started_at = initial_progress
+                .as_ref()
+                .and_then(|p| p.started_at.clone());
+            let mut observed_running = initial_progress
+                .as_ref()
+                .is_some_and(|p| p.status == GenerationStatus::Running);
+
+            if !observed_running {
+                let start_url = format!(
+                    "{}/api/discovery/start-generation",
+                    base.trim_end_matches('/')
+                );
+                let mut req = client.post(&start_url).json(&serde_json::json!({}));
+                if let Some(ref a) = auth {
+                    let (k, v) = a.header_name_and_value();
+                    req = req.header(k, v);
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let body = resp.text().await.unwrap_or_default();
+                        let (msg, already_running) = parse_server_error_message(&body, status);
+                        if already_running {
+                            observed_running = true;
+                        } else {
+                            if poll_gen_arc.load(Ordering::SeqCst) == my_gen {
+                                studio.discovery_generating.set(false);
+                                studio.discovery_progress_label.set(None);
+                                studio.discovery_progress_pct.set(None);
+                                studio.discovery_refresh_error.set(Some(msg.clone()));
+                                studio.status_toast.set(Some(msg));
+                            }
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        if poll_gen_arc.load(Ordering::SeqCst) == my_gen {
+                            let msg = format!("Could not start discovery refresh: {err}");
+                            studio.discovery_generating.set(false);
+                            studio.discovery_progress_label.set(None);
+                            studio.discovery_progress_pct.set(None);
+                            studio.discovery_refresh_error.set(Some(msg.clone()));
+                            studio.status_toast.set(Some(msg));
+                        }
+                        return;
+                    }
+                }
+            }
+
+            let mut consecutive_errors = 0u32;
+            let mut consecutive_idle = 0u32;
+
+            loop {
+                if poll_gen_arc.load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
+                match fetch_discovery_progress(&client, &base, auth.as_ref()).await {
+                    Ok(Some(progress)) => {
+                        consecutive_errors = 0;
+                        match progress.status {
+                            GenerationStatus::Running => {
+                                consecutive_idle = 0;
+                                observed_running = true;
+                                let (label, pct) = desktop_discovery_progress_summary(&progress);
+                                studio.discovery_progress_label.set(Some(label));
+                                studio.discovery_progress_pct.set(Some(pct));
+                            }
+                            GenerationStatus::Complete => {
+                                if observed_running
+                                    || progress.started_at != pre_click_started_at
+                                {
+                                    let total_new = progress
+                                        .result
+                                        .as_ref()
+                                        .map(|r| r.total_imported)
+                                        .unwrap_or(0);
+                                    let noun = if total_new == 1 { "track" } else { "tracks" };
+                                    studio.discovery_generating.set(false);
+                                    studio.discovery_progress_label.set(None);
+                                    studio.discovery_progress_pct.set(None);
+                                    studio.discovery_refresh_error.set(None);
+                                    studio.status_toast.set(Some(format!(
+                                        "Discovery refreshed: {total_new} new {noun}. Syncing library..."
+                                    )));
+                                    studio.sync_now(false);
+                                    return;
+                                }
+                            }
+                            GenerationStatus::Error => {
+                                if observed_running
+                                    || progress.started_at != pre_click_started_at
+                                {
+                                    let msg = progress
+                                        .failure
+                                        .as_ref()
+                                        .map(|f| f.message.clone())
+                                        .unwrap_or_else(|| {
+                                            "Discovery generation failed".to_string()
+                                        });
+                                    studio.discovery_generating.set(false);
+                                    studio.discovery_progress_label.set(None);
+                                    studio.discovery_progress_pct.set(None);
+                                    studio.discovery_refresh_error.set(Some(msg.clone()));
+                                    studio.status_toast.set(Some(msg));
+                                    return;
+                                }
+                            }
+                            GenerationStatus::Idle => {
+                                consecutive_idle += 1;
+                                if observed_running || consecutive_idle >= 3 {
+                                    studio.discovery_generating.set(false);
+                                    studio.discovery_progress_label.set(None);
+                                    studio.discovery_progress_pct.set(None);
+                                    studio.sync_now(false);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        consecutive_errors = 0;
+                        consecutive_idle += 1;
+                        if observed_running || consecutive_idle >= 3 {
+                            studio.discovery_generating.set(false);
+                            studio.discovery_progress_label.set(None);
+                            studio.discovery_progress_pct.set(None);
+                            studio.sync_now(false);
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        consecutive_errors += 1;
+                        tracing::warn!("discovery progress poll failed: {err}");
+                        if consecutive_errors >= 5 {
+                            studio.discovery_generating.set(false);
+                            studio.discovery_progress_label.set(None);
+                            studio.discovery_progress_pct.set(None);
+                            studio.discovery_refresh_error.set(Some(err.clone()));
+                            studio.status_toast.set(Some(err));
+                            return;
+                        }
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(2500)).await;
             }
         });
     }
@@ -3044,6 +3762,13 @@ impl DesktopStudio {
             }
         }
         self.pending_drops.set(PendingDropQueue::new());
+        self.in_flight_triage.write().clear();
+        self.optimistic_kept.write().clear();
+        self.discovery_poll_gen.peek().fetch_add(1, Ordering::SeqCst);
+        self.discovery_generating.set(false);
+        self.discovery_progress_label.set(None);
+        self.discovery_progress_pct.set(None);
+        self.discovery_refresh_error.set(None);
 
         self.connect_gen.peek().fetch_add(1, Ordering::SeqCst);
         if let Some(core) = self.core.peek().clone() {
@@ -3293,6 +4018,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let cache_stats = use_signal(|| None::<CacheStats>);
     let playlists = use_signal(Vec::<DesktopPlaylist>::new);
     let pending_drops = use_signal(PendingDropQueue::new);
+    let in_flight_triage = use_signal(HashSet::<String>::new);
+    let optimistic_kept = use_signal(HashSet::<String>::new);
+    let discovery_generating = use_signal(|| false);
+    let discovery_progress_label = use_signal(|| None::<String>);
+    let discovery_progress_pct = use_signal(|| None::<u8>);
+    let discovery_refresh_error = use_signal(|| None::<String>);
+    let discovery_poll_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
     let acquiring_tracks = use_signal(HashMap::<String, AcquireStageBadge>::new);
     let connect_devices = use_signal(Vec::<ConnectDevice>::new);
     let lyrics = use_signal(Vec::<TrackLyrics>::new);
@@ -3396,6 +4128,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         cache_stats,
         playlists,
         pending_drops,
+        in_flight_triage,
+        optimistic_kept,
+        discovery_generating,
+        discovery_progress_label,
+        discovery_progress_pct,
+        discovery_refresh_error,
+        discovery_poll_gen,
         acquiring_tracks,
         connect_devices,
         lyrics,
@@ -3840,5 +4579,65 @@ mod tests {
         assert_eq!(url, "/cover-art/al-123%2F456");
         assert_eq!(percent_decode("al-123%2F456"), "al-123/456");
         assert_eq!(desktop_cover_art_url(Some("  ")), None);
+    }
+
+    #[test]
+    fn triage_guard_keys_collects_both_non_empty_deduplicated_keys() {
+        assert_eq!(
+            triage_guard_keys(Some("disc-1"), "song-9"),
+            vec!["disc-1".to_string(), "song-9".to_string()]
+        );
+        assert_eq!(
+            triage_guard_keys(Some("same"), "same"),
+            vec!["same".to_string()]
+        );
+        assert_eq!(triage_guard_keys(Some("disc-1"), ""), vec!["disc-1".to_string()]);
+        assert_eq!(triage_guard_keys(None, "song-9"), vec!["song-9".to_string()]);
+        assert!(triage_guard_keys(Some(""), "").is_empty());
+    }
+
+    #[test]
+    fn discovery_progress_summary_and_error_parser_handle_running_and_already_running() {
+        let running = DiscoveryProgress {
+            status: GenerationStatus::Running,
+            profiles: vec![
+                shared::navidrome::ProfileProgress {
+                    profile: "Balanced".into(),
+                    phase: ProfilePhase::Done,
+                    current: 10,
+                    total: 10,
+                },
+                shared::navidrome::ProfileProgress {
+                    profile: "Adventurous".into(),
+                    phase: ProfilePhase::Downloading,
+                    current: 5,
+                    total: 10,
+                },
+            ],
+            ..Default::default()
+        };
+        let (label, pct) = desktop_discovery_progress_summary(&running);
+        assert_eq!(label, "Adventurous: Downloading (5/10)");
+        assert_eq!(pct, 75);
+
+        let already_json = serde_json::json!({
+            "message": "Discovery generation already in progress",
+            "code": 409,
+            "data": { "code": "already_running" }
+        })
+        .to_string();
+        let (msg, already) = parse_server_error_message(&already_json, 409);
+        assert_eq!(msg, "Discovery generation already in progress");
+        assert!(already);
+
+        let other_json = serde_json::json!({
+            "message": "Discovery is not enabled",
+            "code": 409,
+            "data": { "code": "invalid_input" }
+        })
+        .to_string();
+        let (msg, already) = parse_server_error_message(&other_json, 409);
+        assert_eq!(msg, "Discovery is not enabled");
+        assert!(!already);
     }
 }

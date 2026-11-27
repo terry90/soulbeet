@@ -499,6 +499,9 @@ pub async fn list_playlists(pool: &SqlitePool) -> CoreResult<Vec<LocalPlaylist>>
             p.changed_at,
             p.updated_at
         FROM playlists p
+        WHERE p.kind != 'seasonal'
+           OR EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+           OR p.song_count > 0
         ORDER BY p.updated_at DESC, p.name COLLATE NOCASE ASC
         "#,
     )

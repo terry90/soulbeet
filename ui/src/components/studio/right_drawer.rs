@@ -7,7 +7,7 @@ use crate::{
     classify_guard_mode, format_discovery_badge, format_duration, protection_kind_label,
     use_player, GuardModalMode, IconCheck, IconInfo, IconListMusic, IconLoader, IconMic2,
     IconMusic, IconPlay, IconRadio, IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown,
-    IconTrash2, IconX, PlayerTrack,
+    IconTrash2, IconX, PlayerTrack, StarStrip, StarStripSize,
 };
 
 use super::LyricsPanel;
@@ -48,6 +48,7 @@ pub fn StudioRightDrawer(
     on_open_guard_modal: EventHandler<PlayerTrack>,
     on_keep: EventHandler<PlayerTrack>,
     on_drop: EventHandler<PlayerTrack>,
+    on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
 ) -> Element {
     // Hooks MUST run unconditionally before any early return (Dioxus 0.7 Rules of Hooks).
@@ -141,6 +142,7 @@ pub fn StudioRightDrawer(
                             on_open_guard_modal,
                             on_keep,
                             on_drop,
+                            on_rate,
                             on_start_radio,
                         }
                     },
@@ -283,6 +285,7 @@ fn InspectorTabBody(
     on_open_guard_modal: EventHandler<PlayerTrack>,
     on_keep: EventHandler<PlayerTrack>,
     on_drop: EventHandler<PlayerTrack>,
+    on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
 ) -> Element {
     let Some(track) = track else {
@@ -301,6 +304,7 @@ fn InspectorTabBody(
 
     let track_keep = track.clone();
     let track_drop = track.clone();
+    let track_rate = track.clone();
     let track_radio = track.clone();
     let track_modal = track.clone();
     let song_id_refresh = track.id.clone();
@@ -334,6 +338,18 @@ fn InspectorTabBody(
                                 "{alb}"
                             }
                         }
+                    }
+                }
+
+                div { class: "flex items-center justify-between gap-2 pt-2 border-t border-beet-border-subtle",
+                    span { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Rating"
+                    }
+                    StarStrip {
+                        rating: track.rating,
+                        size: StarStripSize::Compact,
+                        on_rate: move |r| on_rate.call((track_rate.clone(), r)),
+                        aria_label: format!("Rate {}", track.title),
                     }
                 }
 

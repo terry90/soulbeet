@@ -653,7 +653,6 @@ impl PlayerState {
             }
             if promoted_discovery {
                 t.is_discovery = false;
-                t.discovery_track_id = None;
                 t.days_remaining = None;
             }
         };
@@ -662,6 +661,76 @@ impl PlayerState {
         }
         for item in &mut self.queue {
             update_one(item);
+        }
+    }
+
+    /// Clears `discovery_track_id` on matching tracks ONLY after server/outbox confirmation
+    /// succeeds, so optimistic Keep / Favorite & Keep rollbacks can always match on
+    /// `discovery_track_id` even when `song_id` is empty.
+    pub fn finalize_promoted_discovery(
+        &mut self,
+        song_id: &str,
+        discovery_track_id: Option<&str>,
+    ) {
+        let has_song = !song_id.trim().is_empty();
+        let has_disc = discovery_track_id.is_some_and(|d| !d.trim().is_empty());
+        if !has_song && !has_disc {
+            return;
+        }
+        let finalize_one = |t: &mut PlayerTrack| {
+            let matches = (has_song && !t.id.is_empty() && t.id == song_id)
+                || (has_disc
+                    && t.discovery_track_id
+                        .as_deref()
+                        .is_some_and(|did| Some(did) == discovery_track_id));
+            if !matches {
+                return;
+            }
+            t.is_discovery = false;
+            t.discovery_track_id = None;
+            t.days_remaining = None;
+        };
+        if let Some(ref mut cur) = self.current_track {
+            finalize_one(cur);
+        }
+        for item in &mut self.queue {
+            finalize_one(item);
+        }
+    }
+
+    /// Restores discovery staging metadata on matching tracks when an optimistic Keep or
+    /// Favorite & Keep mutation fails and must be rolled back.
+    pub fn restore_discovery_state(
+        &mut self,
+        song_id: &str,
+        discovery_track_id: Option<&str>,
+        days_remaining: Option<u32>,
+    ) {
+        let has_song = !song_id.trim().is_empty();
+        let has_disc = discovery_track_id.is_some_and(|d| !d.trim().is_empty());
+        if !has_song && !has_disc {
+            return;
+        }
+        let restore_one = |t: &mut PlayerTrack| {
+            let matches = (has_song && !t.id.is_empty() && t.id == song_id)
+                || (has_disc
+                    && t.discovery_track_id
+                        .as_deref()
+                        .is_some_and(|did| Some(did) == discovery_track_id));
+            if !matches {
+                return;
+            }
+            t.is_discovery = true;
+            if let Some(did) = discovery_track_id.filter(|d| !d.trim().is_empty()) {
+                t.discovery_track_id = Some(did.to_string());
+            }
+            t.days_remaining = days_remaining;
+        };
+        if let Some(ref mut cur) = self.current_track {
+            restore_one(cur);
+        }
+        for item in &mut self.queue {
+            restore_one(item);
         }
     }
 }
@@ -1368,5 +1437,41 @@ mod tests {
         assert_eq!(state.queue_index, Some(0));
         assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
         assert_eq!(state.status, PlaybackStatus::Loading);
+    }
+
+    #[test]
+    fn optimistic_promotion_preserves_discovery_id_for_rollback_until_finalized() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        let mut unindexed = track("", 180);
+        unindexed.is_discovery = true;
+        unindexed.discovery_track_id = Some("disc-42".into());
+        unindexed.days_remaining = Some(7);
+        state.apply_local_command(&PlayerCommand::PlayTrack(unindexed), &mut pos, &mut dur);
+
+        // Optimistic promotion marks non-discovery but keeps discovery_track_id intact.
+        state.apply_curation_update("disc-42", Some(true), None, true);
+        let cur = state.current_track.as_ref().unwrap();
+        assert!(!cur.is_discovery);
+        assert!(cur.starred);
+        assert_eq!(cur.discovery_track_id.as_deref(), Some("disc-42"));
+        assert_eq!(cur.days_remaining, None);
+
+        // Rollback with empty song_id still matches via discovery_track_id.
+        state.apply_curation_update("disc-42", Some(false), None, false);
+        state.restore_discovery_state("", Some("disc-42"), Some(7));
+        let cur = state.current_track.as_ref().unwrap();
+        assert!(cur.is_discovery);
+        assert!(!cur.starred);
+        assert_eq!(cur.discovery_track_id.as_deref(), Some("disc-42"));
+        assert_eq!(cur.days_remaining, Some(7));
+
+        // Confirmed promotion clears discovery_track_id via finalize_promoted_discovery.
+        state.apply_curation_update("disc-42", None, None, true);
+        state.finalize_promoted_discovery("", Some("disc-42"));
+        let cur = state.current_track.as_ref().unwrap();
+        assert!(!cur.is_discovery);
+        assert_eq!(cur.discovery_track_id, None);
+        assert_eq!(cur.days_remaining, None);
     }
 }

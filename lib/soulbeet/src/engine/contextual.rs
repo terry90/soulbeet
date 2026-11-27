@@ -27,7 +27,7 @@ use shared::recommendation::{
 
 use crate::knowledge::KnowledgeError;
 use crate::listenbrainz::client::ListenBrainzClient;
-use crate::traits::{CandidateGenerator, GeneratorOutput, MusicKnowledge, TagOp};
+use crate::traits::{CandidateGenerator, GeneratorOutput, MetadataProvider, MusicKnowledge, TagOp};
 
 use super::merge_signals;
 
@@ -730,11 +730,12 @@ struct ConsensusEntry {
 }
 
 /// Contextual candidate generator supporting any open `ContextualMixDefinition`,
-/// built 100% on ListenBrainz + MusicBrainz.
+/// built on ListenBrainz + MusicBrainz with optional metadata search fallback.
 pub struct ContextualCandidateGenerator {
     spec: ContextSpec,
     knowledge: Arc<dyn MusicKnowledge>,
     pool: Option<Arc<dyn SeasonalPlaylistPool>>,
+    metadata: Option<Arc<dyn MetadataProvider>>,
     rejected_keys: HashSet<String>,
 }
 
@@ -749,8 +750,16 @@ impl ContextualCandidateGenerator {
             spec,
             knowledge,
             pool,
+            metadata: None,
             rejected_keys,
         }
+    }
+
+    /// Attaches a `MetadataProvider` (e.g. MusicBrainz) used only when ListenBrainz
+    /// community consensus and tag radio return fewer than `target_count` tracks.
+    pub fn with_metadata(mut self, metadata: Arc<dyn MetadataProvider>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     fn is_excluded(
@@ -1136,10 +1145,11 @@ impl ContextualCandidateGenerator {
             .collect();
         let mut wildcard_pool = interleave(ordered_wildcard_streams);
 
-        // 3. Sparse custom mix fallback: ONLY when community consensus has fewer than
-        //    SPARSE_CONSENSUS_FLOOR verified tracks (e.g. a niche user-created custom mix),
-        //    supplement via ListenBrainz multi-tag radio — still 100% pure ListenBrainz.
-        if consensus.len() < SPARSE_CONSENSUS_FLOOR {
+        // 3. Sparse / outage fallback: whenever community consensus yielded fewer than
+        //    `target_count.max(SPARSE_CONSENSUS_FLOOR)` candidates, supplement via ListenBrainz
+        //    multi-tag/tag radio and (if still short) the configured `MetadataProvider`.
+        let needed_floor = target_count.max(SPARSE_CONSENSUS_FLOOR);
+        if local_pool.len() + wildcard_pool.len() + intl_pool.len() < needed_floor {
             if let Some(primary_tag) = def.primary_tag() {
                 match self
                     .knowledge
@@ -1173,6 +1183,41 @@ impl ContextualCandidateGenerator {
                         }
                     }
                     Err(e) => errors.record(e.service(), e),
+                }
+
+                // Broaden to full popularity range / single-tag radio if high-pop band was sparse.
+                if local_pool.len() + wildcard_pool.len() + intl_pool.len() < target_count {
+                    let remaining = target_count
+                        .saturating_sub(local_pool.len() + wildcard_pool.len() + intl_pool.len());
+                    match self.knowledge.tag_tracks(primary_tag, remaining.max(15)).await {
+                        Ok(tracks) => {
+                            for (idx, tr) in tracks.into_iter().enumerate() {
+                                if self.is_excluded(
+                                    profile,
+                                    &tr.artist.name,
+                                    &tr.title,
+                                    tr.mbid.as_deref(),
+                                ) {
+                                    continue;
+                                }
+                                let key = CandidateSet::key(&tr.artist.name, &tr.title);
+                                if used_keys.insert(key) {
+                                    intl_pool.push(Self::make_candidate(
+                                        tr.artist.name,
+                                        tr.title,
+                                        tr.mbid,
+                                        tr.artist.mbid,
+                                        0.62 / (1.0 + idx as f64 * 0.08),
+                                        "seasonal_lb_tag_broad_fallback",
+                                        "contextual",
+                                        intl_reason.clone(),
+                                        CultureBucket::International,
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => errors.record(e.service(), e),
+                    }
                 }
             }
             if wildcard_pool.len() < wildcard_quota {
@@ -1217,6 +1262,69 @@ impl ContextualCandidateGenerator {
                             }
                         }
                         Err(e) => errors.record(e.service(), e),
+                    }
+                }
+            }
+
+            // Final fallback: supplement from the configured MetadataProvider (e.g. MusicBrainz)
+            // when ListenBrainz returned sparse results or errored out.
+            if local_pool.len() + wildcard_pool.len() + intl_pool.len() < target_count {
+                if let Some(ref provider) = self.metadata {
+                    let mut fallback_queries: Vec<String> = Vec::new();
+                    for q in def.international_queries.iter().take(2) {
+                        if !q.trim().is_empty() {
+                            fallback_queries.push(q.trim().to_string());
+                        }
+                    }
+                    if let Some(tag) = def.primary_tag() {
+                        if !fallback_queries
+                            .iter()
+                            .any(|q| q.eq_ignore_ascii_case(tag))
+                        {
+                            fallback_queries.push(tag.to_string());
+                        }
+                    }
+
+                    for query in fallback_queries {
+                        let current = local_pool.len() + wildcard_pool.len() + intl_pool.len();
+                        if current >= target_count {
+                            break;
+                        }
+                        let limit = target_count.saturating_sub(current).clamp(10, 25);
+                        match provider.search_tracks(None, &query, limit).await {
+                            Ok(results) => {
+                                for (idx, item) in results.into_iter().enumerate() {
+                                    let shared::metadata::SearchResult::Track(tr) = item else {
+                                        continue;
+                                    };
+                                    if self.is_excluded(
+                                        profile,
+                                        &tr.artist,
+                                        &tr.title,
+                                        tr.mbid.as_deref(),
+                                    ) {
+                                        continue;
+                                    }
+                                    let key = CandidateSet::key(&tr.artist, &tr.title);
+                                    if used_keys.insert(key) {
+                                        let mut cand = Self::make_candidate(
+                                            tr.artist,
+                                            tr.title,
+                                            tr.mbid,
+                                            None,
+                                            0.55 / (1.0 + idx as f64 * 0.08),
+                                            "seasonal_metadata_fallback",
+                                            "contextual",
+                                            intl_reason.clone(),
+                                            CultureBucket::International,
+                                        );
+                                        cand.album = tr.album_title;
+                                        intl_pool.push(cand);
+                                    }
+                                }
+                            }
+                            Err(e) => errors.record("MusicBrainz", e),
+                        }
                     }
                 }
             }
@@ -1749,5 +1857,101 @@ mod tests {
         let tracks = vec![("Winter Song", true), ("Regular Track", false)];
         let core_only = filter_core_taste_tracks(tracks, |(_, excluded)| *excluded);
         assert_eq!(core_only, vec![("Regular Track", false)]);
+    }
+
+    #[tokio::test]
+    async fn sparse_consensus_falls_back_to_tag_radio_and_metadata_provider() {
+        use crate::MetadataError;
+        use shared::metadata::{AlbumWithTracks, SearchResult as MetaSearchResult, Track as MetaTrack};
+
+        struct EmptyPool;
+
+        #[async_trait]
+        impl SeasonalPlaylistPool for EmptyPool {
+            async fn search_public_playlists(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<CommunityPlaylistRef>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn playlist_tracks(
+                &self,
+                _playlist_mbid: &str,
+            ) -> Result<Vec<TrackRef>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn recording_popularity(
+                &self,
+                _recording_mbids: &[String],
+            ) -> Result<HashMap<String, u64>, KnowledgeError> {
+                Ok(HashMap::new())
+            }
+        }
+
+        struct StubMetadata;
+
+        #[async_trait]
+        impl MetadataProvider for StubMetadata {
+            async fn search_albums(
+                &self,
+                _artist: Option<&str>,
+                _query: &str,
+                _limit: usize,
+            ) -> Result<Vec<MetaSearchResult>, MetadataError> {
+                Ok(vec![])
+            }
+
+            async fn search_tracks(
+                &self,
+                _artist: Option<&str>,
+                query: &str,
+                limit: usize,
+            ) -> Result<Vec<MetaSearchResult>, MetadataError> {
+                let mut out = Vec::new();
+                for i in 1..=limit.min(6) {
+                    out.push(MetaSearchResult::Track(MetaTrack {
+                        id: format!("mb-{query}-{i}"),
+                        title: format!("{query} Track {i}"),
+                        artist: format!("Holiday Artist {i}"),
+                        album_id: None,
+                        album_title: Some("Holiday Classics".into()),
+                        release_date: None,
+                        duration: None,
+                        mbid: Some(format!("rec-mb-{i}")),
+                        release_mbid: None,
+                    }));
+                }
+                Ok(out)
+            }
+
+            async fn get_album(&self, _id: &str) -> Result<AlbumWithTracks, MetadataError> {
+                Err(MetadataError::NotFound {
+                    service: shared::failure::Service::Musicbrainz,
+                    status: Some(404),
+                    raw: "unused".into(),
+                })
+            }
+        }
+
+        let kb = Arc::new(FakeKnowledge::default());
+        let gen = ContextualCandidateGenerator::new(
+            ContextSpec {
+                definition: winter_holiday_def(),
+                culture: UserCultureProfile::default(),
+                steering: CultureSteering::Balanced,
+                target_count: 6,
+            },
+            kb,
+            Some(Arc::new(EmptyPool)),
+            HashSet::new(),
+        )
+        .with_metadata(Arc::new(StubMetadata));
+
+        let out = gen.generate(&UserMusicProfile::default(), &balanced()).await;
+        let items = out.candidates.into_vec();
+        assert_eq!(items.len(), 6);
+        assert!(items.iter().all(|c| c.album.as_deref() == Some("Holiday Classics")));
+        assert!(items.iter().all(|c| c.reason.is_some()));
     }
 }

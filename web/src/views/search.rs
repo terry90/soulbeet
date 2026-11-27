@@ -11,6 +11,7 @@ use dioxus::prelude::*;
 use shared::backends::BackendMeta;
 use shared::download::{AcquireAndPlayRequest, AutoDownloadEvent, DownloadQuery};
 use shared::metadata::{AlbumWithTracks, SearchResult, Track};
+use shared::recommendation::ContextualMixKind;
 use ui::{
     album_query, discography_artist, empty_message, format_mix_title, friendly_error, listed_from,
     run_multi_backend_source_search, submit_multi_backend_download, use_player, use_settings,
@@ -686,7 +687,13 @@ pub fn SearchPage() -> Element {
     };
 
     let acquire_map = studio.acquire_states.read().clone();
-    let mixes = studio.contextual_mixes.read().clone();
+    let mixes: Vec<_> = studio
+        .contextual_mixes
+        .read()
+        .iter()
+        .filter(|m| !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0))
+        .cloned()
+        .collect();
     let starred: Vec<_> = studio
         .starred_tracks
         .read()
@@ -874,6 +881,7 @@ pub fn SearchPage() -> Element {
                                         {
                                             let queue = starred.clone();
                                             let t_star = track.clone();
+                                            let t_rate = track.clone();
                                             let t_inspect = track.clone();
                                             let row_state = if offline_only && !track.is_offline_cached {
                                                 TrackRowState::OfflineUnavailable
@@ -896,6 +904,7 @@ pub fn SearchPage() -> Element {
                                                     state: row_state,
                                                     on_play: move |_| player.play_queue(queue.clone(), idx),
                                                     on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
+                                                    on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                                     on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                                 }
                                             }
@@ -999,6 +1008,7 @@ pub fn SearchPage() -> Element {
                                                         let t_play = dt.clone();
                                                         let t_keep = dt.clone();
                                                         let t_drop = dt.clone();
+                                                        let t_rate = dt.clone();
                                                         let t_inspect = dt.clone();
                                                         rsx! {
                                                             TrackRow {
@@ -1011,10 +1021,12 @@ pub fn SearchPage() -> Element {
                                                                 state: TrackRowState::PendingDiscovery {
                                                                     days_remaining: dt.days_remaining,
                                                                     reason_label: dt.reason_label.clone(),
+                                                                    rating: dt.rating,
                                                                 },
                                                                 on_play: move |_| player.play_track(t_play.clone()),
                                                                 on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                                                 on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
+                                                                on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                                             }
                                                         }

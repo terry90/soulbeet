@@ -7,9 +7,7 @@ use shared::system::NavidromeStatus;
 
 use crate::friendly_error;
 use crate::use_auth;
-use crate::{
-    use_open_handler, ConfirmModal, Disclosure, IconCheck, IconSparkles, IconStar, IconX,
-};
+use crate::{ConfirmModal, Disclosure, IconCheck, IconSparkles, IconStar, IconX};
 
 fn format_relative_time(ts: &str) -> String {
     let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts).or_else(|_| {
@@ -208,8 +206,6 @@ pub fn DiscoveryOverview() -> Element {
                     }
                 }
             }
-
-            EngineReportView {}
         }
     }
 }
@@ -333,81 +329,6 @@ fn render_profile_row(pp: &shared::navidrome::ProfileProgress) -> Element {
             if pp.phase == ProfilePhase::Done {
                 span { class: "tabular-nums-mono text-[11px] font-semibold text-beet-leaf-text shrink-0",
                     "100%"
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn EngineReportView() -> Element {
-    let mut entries: Signal<Vec<api::ReportEntry>> = use_signal(Vec::new);
-    let mut expanded_idx: Signal<Option<usize>> = use_signal(|| None);
-
-    let load = use_open_handler(move || async move {
-        match api::get_engine_reports().await {
-            Ok(list) => entries.set(list),
-            Err(e) => entries.set(vec![api::ReportEntry {
-                profile: "Error".to_string(),
-                candidate_count: 0,
-                created_at: String::new(),
-                text: format!("Failed to load reports: {e}"),
-            }]),
-        }
-        true
-    });
-
-    rsx! {
-        Disclosure { class: "pt-2", label: "engine reports", on_open: load,
-            div { class: "mt-2 max-h-96 overflow-y-auto studio-scrollbar border border-beet-border-subtle rounded-[12px] bg-beet-surface-low",
-                if entries().is_empty() {
-                    p { class: "p-4 text-[12px] text-beet-text-tertiary",
-                        "No engine reports available. Run discovery generation first."
-                    }
-                } else {
-                    for (idx, entry) in entries().iter().enumerate() {
-                        {
-                            let is_expanded = expanded_idx() == Some(idx);
-                            let badge_class = profile_badge_class(&entry.profile);
-                            let badge_label = entry.profile.clone();
-                            let date = entry.created_at.clone();
-                            let count = entry.candidate_count;
-                            let text = entry.text.clone();
-                            rsx! {
-                                div { class: "border-b border-beet-border-subtle last:border-b-0",
-                                    button {
-                                        r#type: "button",
-                                        class: "w-full flex items-center gap-2.5 px-3.5 py-2.5 text-left hover:bg-beet-surface-high/60 transition-colors cursor-pointer",
-                                        onclick: move |_| {
-                                            if expanded_idx() == Some(idx) {
-                                                expanded_idx.set(None);
-                                            } else {
-                                                expanded_idx.set(Some(idx));
-                                            }
-                                        },
-                                        span {
-                                            class: "tabular-nums-mono text-[11px] font-semibold px-2 py-0.5 rounded-full border {badge_class}",
-                                            "{badge_label}"
-                                        }
-                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary flex-1 truncate",
-                                            "{date}"
-                                        }
-                                        span { class: "tabular-nums-mono text-[11px] text-beet-text-secondary",
-                                            "{count} candidates"
-                                        }
-                                        span { class: "text-[11px] text-beet-text-tertiary ml-1",
-                                            if is_expanded { "\u{25BC}" } else { "\u{25B6}" }
-                                        }
-                                    }
-                                    if is_expanded {
-                                        pre { class: "px-3.5 pb-3.5 text-[11px] tabular-nums-mono text-beet-text-secondary whitespace-pre-wrap overflow-x-auto",
-                                            "{text}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }

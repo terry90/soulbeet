@@ -57,6 +57,16 @@ impl From<DiscoveryTrackRow> for DiscoveryTrack {
     }
 }
 
+/// Optional contextual/seasonal metadata persisted alongside a staged discovery track.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryTrackContext<'a> {
+    pub exclude_from_core_taste: bool,
+    pub reason_json: Option<&'a str>,
+    pub culture_bucket: Option<&'a str>,
+    pub pack_slug: Option<&'a str>,
+}
+
 #[cfg(feature = "server")]
 impl DiscoveryTrackRow {
     pub async fn create(
@@ -68,10 +78,54 @@ impl DiscoveryTrackRow {
         folder_id: &str,
         profile: &str,
     ) -> Result<DiscoveryTrack, String> {
+        Self::create_with_context(
+            song_id,
+            title,
+            artist,
+            album,
+            path,
+            folder_id,
+            profile,
+            DiscoveryTrackContext::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_context(
+        song_id: Option<&str>,
+        title: &str,
+        artist: &str,
+        album: &str,
+        path: &str,
+        folder_id: &str,
+        profile: &str,
+        ctx: DiscoveryTrackContext<'_>,
+    ) -> Result<DiscoveryTrack, String> {
+        Self::create_with_context_in(
+            &DB, song_id, title, artist, album, path, folder_id, profile, ctx,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_with_context_in(
+        db: &sqlx::SqlitePool,
+        song_id: Option<&str>,
+        title: &str,
+        artist: &str,
+        album: &str,
+        path: &str,
+        folder_id: &str,
+        profile: &str,
+        ctx: DiscoveryTrackContext<'_>,
+    ) -> Result<DiscoveryTrack, String> {
         let id = Uuid::new_v4().to_string();
         let row = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "INSERT INTO discovery_tracks (id, song_id, title, artist, album, path, folder_id, profile)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *"
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, \
+                 exclude_from_core_taste, reason_json, culture_bucket, pack_slug) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
         )
         .bind(&id)
         .bind(song_id)
@@ -81,7 +135,11 @@ impl DiscoveryTrackRow {
         .bind(path)
         .bind(folder_id)
         .bind(profile)
-        .fetch_one(&*DB)
+        .bind(ctx.exclude_from_core_taste)
+        .bind(ctx.reason_json)
+        .bind(ctx.culture_bucket)
+        .bind(ctx.pack_slug)
+        .fetch_one(db)
         .await
         .map_err(|e| e.to_string())?;
         Ok(row.into())
@@ -155,17 +213,39 @@ impl DiscoveryTrackRow {
         Self::get_pending_by_folder_and_profile_in(&DB, folder_id, profile).await
     }
 
-    /// The Pending tracks of `profile` in `folder_id`, oldest first.
+    /// The Pending rolling tracks of `profile` in `folder_id` (excluding seasonal packs), oldest first.
     pub(crate) async fn get_pending_by_folder_and_profile_in(
         db: &sqlx::SqlitePool,
         folder_id: &str,
         profile: &str,
     ) -> Result<Vec<DiscoveryTrack>, String> {
         let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
-            "SELECT * FROM discovery_tracks WHERE folder_id = ? AND profile = ? AND status = ? ORDER BY created_at",
+            "SELECT * FROM discovery_tracks \
+             WHERE folder_id = ? AND profile = ? AND pack_slug IS NULL AND status = ? \
+             ORDER BY created_at",
         )
         .bind(folder_id)
         .bind(profile)
+        .bind(DiscoveryStatus::Pending.to_string())
+        .fetch_all(db)
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Pending tracks staged for a specific seasonal pack (`pack_slug`) in `folder_id`, oldest first.
+    pub(crate) async fn get_pending_by_folder_and_pack_in(
+        db: &sqlx::SqlitePool,
+        folder_id: &str,
+        pack_slug: &str,
+    ) -> Result<Vec<DiscoveryTrack>, String> {
+        let rows = sqlx::query_as::<_, DiscoveryTrackRow>(
+            "SELECT * FROM discovery_tracks \
+             WHERE folder_id = ? AND pack_slug = ? AND status = ? \
+             ORDER BY created_at",
+        )
+        .bind(folder_id)
+        .bind(pack_slug)
         .bind(DiscoveryStatus::Pending.to_string())
         .fetch_all(db)
         .await
