@@ -18,7 +18,7 @@ use crate::globals::{get_or_create_user_channel, send_user_event};
 use crate::import_queue::{ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::ledger::store::{self, SlotRecord, StoredSearch, Unfinished, UnfinishedJob};
 use crate::ledger::{
-    BatchOrigin, DuplicateRule, JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER,
+    DuplicateRule, JobEvent, JobState, Ledger, NewSearch, StoredImport, LEDGER,
 };
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{already_running, held_failure, transfer_key};
@@ -710,7 +710,7 @@ pub(crate) async fn resume_unfinished(
             Some(id) => stored_search(db, id, &user).await,
             None => None,
         };
-        let mcp = job.origin == BatchOrigin::Mcp;
+        let mcp = job.origin.uses_job_runner();
         if job.state == JobState::Searching {
             // Every job searching is made with its search.
             match job.search_id.clone() {

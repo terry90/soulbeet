@@ -15,10 +15,10 @@ use shared::recommendation::ContextualMixKind;
 use ui::{
     album_query, discography_artist, empty_message, format_mix_title, friendly_error, listed_from,
     run_multi_backend_source_search, submit_multi_backend_download, use_player, use_settings,
-    use_system_health, AlbumResult, AutoDownloadSignal, DiscographyHeading, DownloadResults,
-    DownloadRowState, FallbackToast, FallbackToastData, IconDisc3, IconPlay, IconWifiOff, Listed,
-    PlayerTrack, SearchBar, SearchPrefill, SearchReset, SearchType, SourceChoices, SystemStatus,
-    TrackResult, TrackRow, TrackRowState,
+    use_system_health, AlbumResult, AutoDownloadSignal, DirectSearchEscape, DiscographyHeading,
+    DownloadResults, DownloadRowState, FallbackToast, FallbackToastData, IconDisc3, IconPlay,
+    IconWifiOff, Listed, PlayerTrack, SearchBar, SearchPrefill, SearchReset, SearchType,
+    SourceChoices, SystemStatus, TrackResult, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -1282,8 +1282,15 @@ pub fn SearchPage() -> Element {
                                     }
                                 }
                                 (Some(_), listing) => rsx! {
-                                    p { class: "text-center text-beet-text-tertiary py-10 text-[13px]",
-                                        "{empty_message(listing.as_ref())}"
+                                    div { class: "text-center text-beet-text-tertiary py-10 text-[13px]",
+                                        p { "{empty_message(listing.as_ref())}" }
+                                        if search_type() == SearchType::Track && !search().trim().is_empty() && listing.is_none() {
+                                            DirectSearchEscape {
+                                                query: search(),
+                                                artist_hint: artist(),
+                                                on_search_sources: move |q: DownloadQuery| open_source_picker(q),
+                                            }
+                                        }
                                     }
                                 },
                                 (None, _) => rsx! {},

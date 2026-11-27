@@ -245,7 +245,11 @@ impl Report {
                     .into_iter()
                     .map(|c| candidate(kind, c))
                     .collect::<serde_json::Result<_>>()?;
-                Ok(MatchChoices { kind, candidates })
+                Ok(MatchChoices {
+                    kind,
+                    candidates,
+                    missing_tags: false,
+                })
             })
             .collect::<serde_json::Result<_>>()?;
         Ok(Report {
@@ -428,6 +432,7 @@ mod tests {
             parsed.tasks,
             [MatchChoices {
                 kind: MatchKind::Album,
+                missing_tags: false,
                 candidates: vec![MatchCandidate {
                     data_source: "MusicBrainz".into(),
                     id: "6a09041b-0f79-3278-88d9-0552dd28d37f".into(),
@@ -505,6 +510,7 @@ mod tests {
             Some(MatchChoices {
                 kind: MatchKind::Album,
                 candidates: vec![],
+                missing_tags: false,
             })
         );
     }

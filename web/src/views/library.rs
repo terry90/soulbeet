@@ -5,13 +5,16 @@ use dioxus::prelude::*;
 use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
     dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconCompass,
-    IconDisc3, IconListMusic, IconLoader, IconPlay, IconRadio, IconRefreshCw, IconSparkles,
-    PlayerTrack, PlaylistCategory, TrackRow, TrackRowState,
+    IconDisc3, IconListMusic, IconListPlus, IconLoader, IconPlay, IconRadio, IconRefreshCw,
+    IconSparkles, PlayerTrack, PlaylistCategory, PlaylistImportModal, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
-use crate::navidrome_web::{fetch_album_tracks, fetch_playlist_tracks, SubsonicPlaylistSummary};
+use crate::navidrome_web::{
+    fetch_album_tracks, fetch_playlist_tracks, fetch_playlists, SubsonicPlaylistSummary,
+};
 use crate::web_player::use_studio;
+use crate::Route;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryTab {
@@ -27,8 +30,10 @@ pub fn LibraryPage() -> Element {
     let auth = use_auth();
     let player = use_player();
     let mut studio = use_studio();
+    let navigator = use_navigator();
 
     let mut active_tab = use_signal(|| LibraryTab::Playlists);
+    let mut import_modal_open = use_signal(|| false);
     let mut detail_title = use_signal(|| None::<String>);
     let mut detail_tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut detail_loading = use_signal(|| false);
@@ -167,6 +172,15 @@ pub fn LibraryPage() -> Element {
                                 }
                             }
                         }
+                    }
+                }
+                if active_tab() == LibraryTab::Playlists && detail_title().is_none() {
+                    button {
+                        r#type: "button",
+                        class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-accent-surface hover:bg-beet-accent/25 border border-beet-accent/40 text-beet-accent-text text-[13px] font-medium transition-colors cursor-pointer",
+                        onclick: move |_| import_modal_open.set(true),
+                        IconListPlus { size: 15 }
+                        span { "Import Playlist" }
                     }
                 }
             }
@@ -464,6 +478,30 @@ pub fn LibraryPage() -> Element {
                     LibraryTab::Stats => rsx! {
                         LibraryStatsPanel {}
                     },
+                }
+            }
+
+            if import_modal_open() {
+                PlaylistImportModal {
+                    on_close: move |_| import_modal_open.set(false),
+                    on_imported: move |resp: shared::playlist_import::CommitPlaylistImportResponse| {
+                        studio.show_toast(format!(
+                            "Imported \"{}\": {} in library, {} queued.",
+                            resp.playlist_name, resp.already_in_library, resp.queued_for_download
+                        ));
+                        if let Some(info) = studio.navidrome_info() {
+                            spawn(async move {
+                                if let Ok(pls) = fetch_playlists(&info).await {
+                                    studio.playlists.set(pls);
+                                    studio.reclassify_playlists();
+                                }
+                            });
+                        }
+                    },
+                    on_view_activity: Some(EventHandler::new(move |()| {
+                        import_modal_open.set(false);
+                        navigator.push(Route::ActivityPage {});
+                    })),
                 }
             }
         }

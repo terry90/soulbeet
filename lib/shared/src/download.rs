@@ -593,6 +593,15 @@ pub fn apply_snapshot(
     }
 }
 
+/// User-provided tags stamped onto staged audio files before an as-is import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AsIsTagOverrides {
+    pub artist: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+}
+
 /// How a skipped import is run again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportChoice {
@@ -600,6 +609,8 @@ pub enum ImportChoice {
     Auto,
     /// Import with the files' own tags.
     AsIs,
+    /// Stamp minimal artist/title/album tags onto staged audio files, then import as-is.
+    AsIsWithTags(AsIsTagOverrides),
     /// One of the candidates beets found for this import.
     Candidate { data_source: String, id: String },
     /// A MusicBrainz link or ID as the user typed it.
@@ -666,6 +677,9 @@ pub struct TrackFit {
 pub struct MatchChoices {
     pub kind: MatchKind,
     pub candidates: Vec<MatchCandidate>,
+    /// True when the last import failed because the files lacked artist/title tags for as-is import.
+    #[serde(default)]
+    pub missing_tags: bool,
 }
 
 const MAX_LABEL_BYTES: usize = 200;

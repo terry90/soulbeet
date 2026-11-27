@@ -2,18 +2,21 @@
 //! retried without the client naming any path. Kept in memory per user;
 //! after a restart the ledger's kept imports are restored.
 
-use super::choice::{files_gone, nothing_to_retry, resolve};
+use super::choice::{files_gone, nothing_to_retry, resolve, validate_tag_overrides};
 use super::{Duplicates, ImportJob, ImportQueue, IMPORT_QUEUE};
 use crate::auth::UserId;
 use crate::core::discovery::Replace;
 use crate::ledger::{self, JobEvent};
 use shared::download::{
-    DownloadProgress, ImportChoice, ImportRefusal, JobSlot, MatchChoices, MatchKind,
+    AsIsTagOverrides, DownloadProgress, ImportChoice, ImportRefusal, JobSlot, KeptImport,
+    MatchChoices, MatchKind,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage};
+use soulbeet::audio::collect_audio_files;
+use soulbeet::tags::{write_tags, WantedTags};
 use soulbeet::{ImportMode, ImportOutcome, SkipReason};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tracing::{info, warn};
@@ -247,15 +250,24 @@ impl ImportQueue {
         choice: ImportChoice,
         rule: impl FnOnce(Duplicates) -> Duplicates,
     ) -> Result<(), ImportRefusal> {
-        self.resubmit(user, item, |kept| {
-            Ok(ImportJob {
-                choice: resolve(&choice, kept)?,
-                duplicates: rule(kept.duplicates.clone()),
-                // A person's retry gets every automatic run again.
-                lock_retries: 0,
-                ..kept.clone()
-            })
-        })
+        let tag_overrides = match &choice {
+            ImportChoice::AsIsWithTags(overrides) => Some(validate_tag_overrides(overrides)?),
+            _ => None,
+        };
+        self.resubmit_with_tags(
+            user,
+            item,
+            tag_overrides,
+            |kept| {
+                Ok(ImportJob {
+                    choice: resolve(&choice, kept)?,
+                    duplicates: rule(kept.duplicates.clone()),
+                    // A person's retry gets every automatic run again.
+                    lock_retries: 0,
+                    ..kept.clone()
+                })
+            },
+        )
         .await
     }
 
@@ -303,12 +315,22 @@ impl ImportQueue {
         item: &str,
         next: impl FnOnce(&ImportJob) -> Result<ImportJob, ImportRefusal>,
     ) -> Result<(), ImportRefusal> {
-        let job = {
+        self.resubmit_with_tags(user, item, None, next).await
+    }
+
+    async fn resubmit_with_tags(
+        &self,
+        user: &UserId,
+        item: &str,
+        tag_overrides: Option<AsIsTagOverrides>,
+        next: impl FnOnce(&ImportJob) -> Result<ImportJob, ImportRefusal>,
+    ) -> Result<(), ImportRefusal> {
+        let (kept_original, job) = {
             // A finish recording what it kept cannot be split by the take.
             let _emit = self.shared.emit_lock.lock().await;
-            let (_, job, dropped) = self.shared.retries.take(user, item, next)?;
+            let (original, job, dropped) = self.shared.retries.take(user, item, next)?;
             self.shared.dismiss(dropped);
-            job
+            (original, job)
         };
         if !job.holds_audio().await {
             let refusal = files_gone();
@@ -325,6 +347,22 @@ impl ImportQueue {
                 });
             }
             return Err(refusal);
+        }
+        if let Some(overrides) = tag_overrides {
+            if let Err(err_msg) = stamp_tags_on_sources(&job.sources, &overrides).await {
+                // Re-keep the job so the user can fix or try another option.
+                let _emit = self.shared.emit_lock.lock().await;
+                let _ = self.shared.retries.record(&kept_original, true);
+                return Err(ImportRefusal {
+                    failure: Failure::new(
+                        FailureCode::ImportChoiceInvalid,
+                        Stage::Import,
+                        RetryAdvice::NeedsDecision,
+                        format!("Could not write tags before as-is import: {err_msg}"),
+                    ),
+                    kept: KeptImport::Kept,
+                });
+            }
         }
         self.submit(job).await;
         Ok(())
@@ -372,6 +410,7 @@ impl ImportQueue {
                 ImportMode::Singleton => MatchKind::Track,
             },
             candidates: vec![],
+            missing_tags: false,
         }))
     }
 
@@ -416,6 +455,38 @@ impl ImportQueue {
     }
 }
 
+/// Stamps `overrides` onto every audio file under `sources` (with `musicbrainz: None` and
+/// `album_artist = artist` so beets' path template stays clean).
+async fn stamp_tags_on_sources(
+    sources: &[PathBuf],
+    overrides: &AsIsTagOverrides,
+) -> Result<(), String> {
+    let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+    let audio_files = collect_audio_files(&refs).await;
+    if audio_files.is_empty() {
+        return Err("No audio files found to tag".into());
+    }
+    let wanted = WantedTags {
+        title: overrides.title.clone(),
+        artist: overrides.artist.clone(),
+        album: overrides.album.clone().unwrap_or_default(),
+        album_artist: overrides.artist.clone(),
+        track_no: None,
+        track_total: None,
+        date: None,
+        musicbrainz: None,
+        comment: None,
+    };
+    tokio::task::spawn_blocking(move || {
+        for path in audio_files {
+            write_tags(&path, &wanted).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("tag writer panicked: {e}"))?
+}
+
 pub async fn retry_import_for(
     user: &UserId,
     item: &str,
@@ -445,7 +516,8 @@ mod tests {
     use crate::import_queue::{ImportJob, ImportMode, ImportQueue};
     use crate::ledger::{JobEvent, JobState as LedgerState};
     use shared::download::{
-        DownloadProgress, DownloadState, ImportChoice, JobSlot, MatchChoices, MatchKind,
+        AsIsTagOverrides, DownloadProgress, DownloadState, ImportChoice, JobSlot, KeptImport,
+        MatchChoices, MatchKind,
     };
     use shared::failure::FailureCode;
     use soulbeet::{DriverChoice, FailKind, ImportResult};
@@ -615,7 +687,8 @@ mod tests {
             queue.import_choices(&alice(), "a"),
             Ok(MatchChoices {
                 kind: MatchKind::Track,
-                candidates: vec![]
+                candidates: vec![],
+                missing_tags: false,
             })
         );
         let pick = ImportChoice::Candidate {
@@ -689,7 +762,8 @@ mod tests {
             queue.import_choices(&alice(), "b"),
             Ok(MatchChoices {
                 kind: MatchKind::Track,
-                candidates: vec![]
+                candidates: vec![],
+                missing_tags: false,
             })
         );
     }
@@ -1186,5 +1260,100 @@ mod tests {
             Err(nothing_to_retry())
         );
         assert_eq!(queue.retry(&alice(), "b", ImportChoice::Auto).await, Ok(()));
+    }
+
+    /// Minimal valid 1-frame silent FLAC for testing tag stamping end-to-end.
+    fn minimal_flac() -> Vec<u8> {
+        let mut out = b"fLaC".to_vec();
+        out.extend([0x80, 0, 0, 34]);
+        out.extend(4096u16.to_be_bytes());
+        out.extend(4096u16.to_be_bytes());
+        out.extend([0; 6]);
+        let packed: u64 = (44_100u64 << 44) | (15 << 36) | 4096;
+        out.extend(packed.to_be_bytes());
+        out.extend([0; 16]);
+        // Frame 0 with valid CRC-8 and CRC-16.
+        let mut frame = vec![0xFF, 0xF8, 0xC9, 0x08, 0];
+        let mut crc8 = 0u8;
+        for &b in &frame {
+            crc8 ^= b;
+            for _ in 0..8 {
+                crc8 = if crc8 & 0x80 != 0 {
+                    (crc8 << 1) ^ 0x07
+                } else {
+                    crc8 << 1
+                };
+            }
+        }
+        frame.push(crc8);
+        frame.extend([0x00, 0x00, 0x00]);
+        let mut crc16 = 0u16;
+        for &b in &frame {
+            crc16 ^= u16::from(b) << 8;
+            for _ in 0..8 {
+                crc16 = if crc16 & 0x8000 != 0 {
+                    (crc16 << 1) ^ 0x8005
+                } else {
+                    crc16 << 1
+                };
+            }
+        }
+        frame.extend(crc16.to_be_bytes());
+        out.extend(frame);
+        out
+    }
+
+    #[tokio::test]
+    async fn as_is_with_tags_validates_stamps_tags_and_runs_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("dl/bootleg.flac");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, minimal_flac()).unwrap();
+
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::AsIsMissingTags,
+            "Import as-is needs artist and title tags".into(),
+        ));
+        let failing = owned(job(src.clone(), &tmp.path().join("lib")), &alice(), &["a"]);
+        finish(queue.submit(failing).await).await;
+
+        let choices = queue.import_choices(&alice(), "a").unwrap();
+        assert!(choices.missing_tags);
+
+        // Blank artist or title is refused while keeping the job.
+        let refused = queue
+            .retry(
+                &alice(),
+                "a",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "   ".into(),
+                    title: "Dub Edit".into(),
+                    album: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.failure.code, FailureCode::InvalidInput);
+        assert_eq!(refused.kept, KeptImport::Kept);
+
+        // Valid overrides stamp tags onto the FLAC file and invoke DriverChoice::AsIs.
+        queue
+            .retry(
+                &alice(),
+                "a",
+                ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                    artist: "Burial".into(),
+                    title: "Unreleased Edit".into(),
+                    album: Some("White Label".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        until_imported(&deps, "a").await;
+        assert_eq!(
+            stub.choices(),
+            vec![DriverChoice::Auto, DriverChoice::AsIs]
+        );
     }
 }

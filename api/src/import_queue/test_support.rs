@@ -91,6 +91,7 @@ pub fn track_choices(candidates: Vec<MatchCandidate>) -> MatchChoices {
     MatchChoices {
         kind: MatchKind::Track,
         candidates,
+        missing_tags: false,
     }
 }
 

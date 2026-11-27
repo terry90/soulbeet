@@ -1347,13 +1347,16 @@ impl Writer {
         if (change.decided_at()).is_some_and(|read| changed_seq != read) {
             return Ok(Transitioned::Refused { state: from });
         }
-        // Only an MCP job's runner holds a place before it sends, and records the send first: a
-        // queued MCP job without a place and without a recorded send cannot have transfers. A web
-        // UI job's pipeline sends without either.
-        let mcp = origin.as_deref() == Some(BatchOrigin::Mcp.as_str());
+        // Only a job runner batch (MCP or playlist import) holds a place before it sends, and
+        // records the send first: a queued runner job without a place and without a recorded send
+        // cannot have transfers. A web UI job's pipeline sends without either.
+        let runner_job = matches!(
+            origin.as_deref(),
+            Some(o) if o == BatchOrigin::Mcp.as_str() || o == BatchOrigin::Import.as_str()
+        );
         let may_have_transfers = match from {
             JobState::Downloading => true,
-            JobState::Queued => !mcp || gate_held || sent,
+            JobState::Queued => !runner_job || gate_held || sent,
             _ => false,
         };
         // The slots a transition moves are on the timeline as the transition's entries.
@@ -2094,21 +2097,22 @@ async fn unfinished_mcp_jobs(tx: &mut SqliteConnection, user: &UserId) -> Result
     Ok(count)
 }
 
-/// D8: whether `job`, queued, holds a download place now, taking one when its user's MCP jobs
-/// hold fewer than `limit`.
+/// D8: whether `job`, queued, holds a download place now, taking one when its user's runner
+/// jobs (MCP and playlist import) hold fewer than `limit`.
 async fn claim_download(db: &SqlitePool, job: &str, limit: u32) -> Result<bool, LedgerError> {
     // A place is only ever held while queued or downloading (`touch`), so one held is still
     // counted in the limit.
     let claimed: Option<String> = sqlx::query_scalar(
         "UPDATE jobs SET gate_held = 1 WHERE id = ? AND state = ? AND (gate_held = 1 OR \
              (SELECT COUNT(*) FROM jobs j JOIN batches b ON b.id = j.batch_id \
-              WHERE j.user_id = jobs.user_id AND b.origin = ? AND j.gate_held = 1 \
+              WHERE j.user_id = jobs.user_id AND b.origin IN (?, ?) AND j.gate_held = 1 \
               AND j.state IN ('queued', 'downloading')) < ?) \
          RETURNING id",
     )
     .bind(job)
     .bind(JobState::Queued.as_str())
     .bind(BatchOrigin::Mcp.as_str())
+    .bind(BatchOrigin::Import.as_str())
     .bind(limit)
     .fetch_optional(db)
     .await?;

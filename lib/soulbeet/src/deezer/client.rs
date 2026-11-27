@@ -3,7 +3,10 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use shared::recommendation::fold_name;
 
-use super::models::{ArtistHit, DeezerTrack, Envelope, RadioTrack};
+use super::models::{
+    ArtistHit, DeezerPlaylist, DeezerPlaylistTrack, DeezerTrack, Envelope, PlaylistResponse,
+    PlaylistTrackItem, RadioTrack,
+};
 use crate::knowledge::{cached, KnowledgeError, TTL_DEEZER_ARTIST, TTL_DEEZER_RADIO};
 use crate::polite::{Pace, PoliteClient, RemoteError};
 use crate::traits::KnowledgeCache;
@@ -56,6 +59,111 @@ impl DeezerClient {
                 .collect())
         })
         .await
+    }
+
+    /// Reads a public Deezer playlist and paginates `/playlist/{id}/tracks` up to `max_tracks`.
+    pub async fn playlist(
+        &self,
+        id: &str,
+        max_tracks: usize,
+    ) -> Result<Option<DeezerPlaylist>, KnowledgeError> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_EXTRA_PAGES: usize = 10;
+
+        let Some(resp) = self
+            .http
+            .get::<PlaylistResponse>(&format!("/playlist/{id}"))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Some(e) = resp.error {
+            if e.code == NO_DATA {
+                return Ok(None);
+            }
+            return Err(KnowledgeError::Deezer {
+                code: e.code,
+                message: e.message,
+            });
+        }
+        let Some(playlist_id) = resp.id else {
+            return Err(RemoteError::Unreadable {
+                service: "Deezer",
+                detail: "playlist missing id".into(),
+            }
+            .into());
+        };
+        let title = resp.title.unwrap_or_default().trim().to_string();
+        let description = resp
+            .description
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+
+        let mut raw_tracks = Vec::new();
+        let mut has_more = false;
+        if let Some(page) = resp.tracks {
+            has_more = page.next.is_some();
+            raw_tracks.extend(page.data);
+        }
+
+        let mut pages_fetched = 0usize;
+        while raw_tracks.len() < max_tracks
+            && (has_more || raw_tracks.len() < resp.nb_tracks as usize)
+            && pages_fetched < MAX_EXTRA_PAGES
+        {
+            let index = raw_tracks.len();
+            let path = format!("/playlist/{id}/tracks?index={index}&limit={PAGE_SIZE}");
+            let Some(envelope) = self.http.get::<Envelope<PlaylistTrackItem>>(&path).await? else {
+                break;
+            };
+            if let Some(e) = envelope.error {
+                if e.code == NO_DATA {
+                    break;
+                }
+                return Err(KnowledgeError::Deezer {
+                    code: e.code,
+                    message: e.message,
+                });
+            }
+            let page_items = envelope.data.unwrap_or_default();
+            if page_items.is_empty() {
+                break;
+            }
+            has_more = envelope.next.is_some();
+            raw_tracks.extend(page_items);
+            pages_fetched += 1;
+        }
+
+        let tracks = raw_tracks
+            .into_iter()
+            .filter_map(|t| {
+                let title = t.title.trim().to_string();
+                let artist = t.artist.map(|a| a.name.trim().to_string()).unwrap_or_default();
+                if title.is_empty() || artist.is_empty() {
+                    return None;
+                }
+                let album = t
+                    .album
+                    .map(|a| a.title.trim().to_string())
+                    .filter(|a| !a.is_empty());
+                let duration_s = t.duration.filter(|&d| d > 0);
+                Some(DeezerPlaylistTrack {
+                    artist,
+                    title,
+                    album,
+                    duration_s,
+                })
+            })
+            .take(max_tracks)
+            .collect();
+
+        Ok(Some(DeezerPlaylist {
+            id: playlist_id,
+            title,
+            description,
+            nb_tracks: resp.nb_tracks,
+            tracks,
+        }))
     }
 
     async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, KnowledgeError> {

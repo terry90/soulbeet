@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
-use shared::download::{ImportChoice, ImportRefusal, KeptImport, MatchChoices};
+use shared::download::{AsIsTagOverrides, ImportChoice, ImportRefusal, KeptImport, MatchChoices};
 use shared::failure::{Failure, FailureCode, Stage};
 use soulbeet::{ImportMode, SourceFile, TaskCount};
 use tracing::warn;
@@ -87,6 +87,8 @@ pub(crate) enum Decision {
     /// beets decides again, as the first run did.
     Retry,
     AsIs,
+    /// Stamp artist/title/album tags onto staged files, then import as-is.
+    AsIsWithTags(AsIsTagOverrides),
     /// One of the matches beets found.
     Candidate {
         data_source: String,
@@ -205,6 +207,7 @@ pub(crate) async fn resolve(
     let choice = match decision {
         Decision::Retry => Some(ImportChoice::Auto),
         Decision::AsIs => Some(ImportChoice::AsIs),
+        Decision::AsIsWithTags(overrides) => Some(ImportChoice::AsIsWithTags(overrides)),
         Decision::Candidate { data_source, id } => {
             Some(ImportChoice::Candidate { data_source, id })
         }

@@ -126,6 +126,7 @@ pub(crate) mod test_db {
     pub const ITEM_BACKEND: i64 = 20261203000001;
     pub const BACKEND_TRANSFERS: i64 = 20261204000001;
     pub const LOSSY_FALLBACK: i64 = 20261205000002;
+    pub const BATCH_ORIGIN_IMPORT: i64 = 20261209000000;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -1072,5 +1073,65 @@ mod tests {
             .execute(&db)
             .await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_origin_import_preserves_existing_batches_and_jobs() {
+        let db = test_db::migrated_before(test_db::BATCH_ORIGIN_IMPORT).await;
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'alice', 'h')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', '/music')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO batches (id, user_id, created_at, label, origin) \
+             VALUES ('b1', 'u1', 100, 'Existing Batch', 'mcp')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, wanted, import_mode, state, created_at, updated_at, batch_id) \
+             VALUES ('j1', 'u1', 'f1', '{\"tracks\":[]}', 'singleton', 'done', 100, 100, 'b1')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        test_db::apply_from(&db, test_db::BATCH_ORIGIN_IMPORT).await;
+
+        let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE id = 'j1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(job_count, 1, "existing jobs must survive batches rebuild");
+
+        let fk_issues: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert!(fk_issues.is_empty(), "foreign key issues: {fk_issues:?}");
+
+        sqlx::query(
+            "INSERT INTO batches (id, user_id, created_at, label, origin) \
+             VALUES ('b2', 'u1', 200, 'Imported Playlist', 'import')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let bad = sqlx::query(
+            "INSERT INTO batches (id, user_id, created_at, origin) \
+             VALUES ('b3', 'u1', 201, 'other')",
+        )
+        .execute(&db)
+        .await;
+        assert!(bad.is_err());
     }
 }

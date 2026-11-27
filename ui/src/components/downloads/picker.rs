@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use dioxus::prelude::*;
-use shared::download::{ImportChoice, MatchCandidate, MatchChoices, MatchKind};
+use shared::download::{AsIsTagOverrides, ImportChoice, MatchCandidate, MatchChoices, MatchKind};
 
 use super::Failure;
 use crate::{use_open_handler, Choice, ChoiceList, Disclosure, RowAction, TextInput};
@@ -108,6 +108,11 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
     // (data_source, id) of the picked candidate, so a reload keeps the pick.
     let mut picked = use_signal(|| None::<(String, String)>);
     let mut typed = use_signal(String::new);
+    // Inline "Tag & Import As-Is" escape hatch state.
+    let mut tag_form_open = use_signal(|| false);
+    let mut tag_artist = use_signal(String::new);
+    let mut tag_title = use_signal(String::new);
+    let mut tag_album = use_signal(String::new);
 
     let on_load = props.on_load;
     let mut notice = props.notice;
@@ -117,6 +122,9 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
         async move {
             match on_load.call(item).await {
                 Ok(choices) => {
+                    if choices.missing_tags {
+                        tag_form_open.set(true);
+                    }
                     found.set(Some(choices));
                     notice.set(None);
                     true
@@ -192,15 +200,91 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                                         }
                                     },
                                 }
-                                RowAction {
-                                    busy: props.busy,
-                                    disabled: choice.is_none(),
-                                    onclick: move |_| {
-                                        if let Some(choice) = choice.clone() {
-                                            on_choose.call(choice);
+                                div { class: "flex flex-wrap items-center justify-between gap-2",
+                                    RowAction {
+                                        busy: props.busy,
+                                        disabled: choice.is_none(),
+                                        onclick: move |_| {
+                                            if let Some(choice) = choice.clone() {
+                                                on_choose.call(choice);
+                                            }
+                                        },
+                                        "Import with this match"
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "text-[11px] font-medium text-beet-accent-text hover:underline cursor-pointer",
+                                        onclick: move |_| {
+                                            let next = !*tag_form_open.peek();
+                                            tag_form_open.set(next);
+                                        },
+                                        if tag_form_open() { "Hide tag form" } else { "Tag & Import As-Is" }
+                                    }
+                                }
+                                if tag_form_open() {
+                                    {
+                                        let can_stamp = !tag_artist.read().trim().is_empty()
+                                            && !tag_title.read().trim().is_empty();
+                                        let submit_tags = move || {
+                                            let artist = tag_artist.read().trim().to_string();
+                                            let title = tag_title.read().trim().to_string();
+                                            if artist.is_empty() || title.is_empty() {
+                                                return;
+                                            }
+                                            let album = {
+                                                let a = tag_album.read().trim().to_string();
+                                                (!a.is_empty()).then_some(a)
+                                            };
+                                            on_choose.call(ImportChoice::AsIsWithTags(AsIsTagOverrides {
+                                                artist,
+                                                title,
+                                                album,
+                                            }));
+                                        };
+                                        rsx! {
+                                            div { class: "pt-2.5 border-t border-beet-border-subtle space-y-2",
+                                                p { class: "text-[11px] text-beet-text-secondary",
+                                                    if choices.missing_tags {
+                                                        "This file has no artist or title tags. Enter them below to tag and import as-is."
+                                                    } else {
+                                                        "Stamp tags onto the file and import directly without MusicBrainz."
+                                                    }
+                                                }
+                                                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-2",
+                                                    TextInput {
+                                                        class: "text-[12px] rounded-[8px] text-beet-text-primary placeholder:text-beet-text-disabled",
+                                                        placeholder: "Artist (required)",
+                                                        aria_label: "Artist",
+                                                        value: tag_artist(),
+                                                        oninput: move |v: String| tag_artist.set(v),
+                                                        on_enter: move |_| submit_tags(),
+                                                    }
+                                                    TextInput {
+                                                        class: "text-[12px] rounded-[8px] text-beet-text-primary placeholder:text-beet-text-disabled",
+                                                        placeholder: "Title (required)",
+                                                        aria_label: "Title",
+                                                        value: tag_title(),
+                                                        oninput: move |v: String| tag_title.set(v),
+                                                        on_enter: move |_| submit_tags(),
+                                                    }
+                                                }
+                                                TextInput {
+                                                    class: "text-[12px] rounded-[8px] text-beet-text-primary placeholder:text-beet-text-disabled",
+                                                    placeholder: "Album (optional)",
+                                                    aria_label: "Album",
+                                                    value: tag_album(),
+                                                    oninput: move |v: String| tag_album.set(v),
+                                                    on_enter: move |_| submit_tags(),
+                                                }
+                                                RowAction {
+                                                    busy: props.busy,
+                                                    disabled: !can_stamp,
+                                                    onclick: move |_| submit_tags(),
+                                                    "Tag & Import As-Is"
+                                                }
+                                            }
                                         }
-                                    },
-                                    "Import with this match"
+                                    }
                                 }
                             }
                         }
@@ -258,6 +342,7 @@ mod tests {
                         true => Ok(MatchChoices {
                             kind: MatchKind::Track,
                             candidates: vec![track("MusicBrainz", "r1")],
+                            missing_tags: false,
                         }),
                         false => Err(Failure::InPicker(LOAD_FAILED.to_string())),
                     };
@@ -427,5 +512,30 @@ mod tests {
         assert_eq!(chosen(&list, Some(&gone), ""), None);
         let other_source = ("Discogs".to_string(), "r1".to_string());
         assert_eq!(chosen(&list, Some(&other_source), ""), None);
+    }
+
+    #[test]
+    fn missing_tags_opens_inline_tag_and_import_as_is_form() {
+        let mut picker = ToggleDriver::new(VirtualDom::new(|| {
+            let notice = use_signal(|| None::<String>);
+            let on_load: ChoicesLoader = Callback::new(move |_: String| {
+                Box::pin(async move {
+                    Ok(MatchChoices {
+                        kind: MatchKind::Track,
+                        candidates: vec![],
+                        missing_tags: true,
+                    })
+                }) as Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>
+            });
+            rsx! {
+                MatchPicker { item: "bootleg", busy: false, on_load, on_choose: |_| {}, notice }
+            }
+        }));
+        picker.click();
+        let html = picker.html();
+        assert!(html.contains("Artist (required)"), "{html}");
+        assert!(html.contains("Title (required)"), "{html}");
+        assert!(html.contains("Album (optional)"), "{html}");
+        assert!(html.contains("Tag &#38; Import As-Is"), "{html}");
     }
 }

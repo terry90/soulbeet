@@ -163,6 +163,76 @@ impl ListenBrainzClient {
             .collect())
     }
 
+    /// Reads a JSPF playlist with its title, annotation, and full track metadata
+    /// (including album, duration, and recording MBID).
+    pub async fn playlist_full(
+        &self,
+        playlist_mbid: &str,
+    ) -> Result<Option<FullPlaylist>, RemoteError> {
+        let path = format!("/1/playlist/{playlist_mbid}");
+        let Some(page) = self
+            .http
+            .get::<PlaylistEnvelope<JspfPlaylist>>(&path)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let p = page.playlist;
+        let title = p
+            .title
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let description = p
+            .annotation
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let tracks = p
+            .track
+            .into_iter()
+            .filter_map(|t| {
+                let title = t.title?.trim().to_string();
+                let creator = t.creator?.trim().to_string();
+                if title.is_empty() || creator.is_empty() {
+                    return None;
+                }
+                let album = t
+                    .album
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let duration_s = t
+                    .duration
+                    .filter(|&ms| ms > 0)
+                    .and_then(|ms| u32::try_from(ms / 1000).ok())
+                    .filter(|&s| s > 0);
+                let recording_mbid = t
+                    .identifier
+                    .first()
+                    .map(|u| last_segment(u).trim().to_string())
+                    .filter(|id| !id.is_empty());
+                let artist_mbid = t
+                    .extension
+                    .as_ref()
+                    .and_then(|ext| ext.musicbrainz.as_ref())
+                    .and_then(|mb| mb.artist_identifiers.first())
+                    .map(|u| last_segment(u).trim().to_string())
+                    .filter(|id| !id.is_empty());
+                Some(FullPlaylistTrack {
+                    title,
+                    creator,
+                    album,
+                    duration_s,
+                    recording_mbid,
+                    artist_mbid,
+                })
+            })
+            .collect();
+        Ok(Some(FullPlaylist {
+            title,
+            description,
+            tracks,
+        }))
+    }
+
     /// Every recording of the artist alone, at any popularity.
     pub async fn artist_radio(
         &self,
