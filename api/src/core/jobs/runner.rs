@@ -1007,6 +1007,7 @@ mod tests {
         let view = CandidateView {
             candidates,
             dropped_by_filter: Default::default(),
+            filter_rejections: Default::default(),
         };
         let standing_by: Vec<String> = (view.automatic_groups().into_iter())
             .map(|g| g.source)

@@ -167,6 +167,18 @@ pub async fn job_record(
     row.map(job_of).transpose()
 }
 
+/// Any job by `id` without user scoping (for admin diagnostics only).
+pub async fn job_record_by_id(
+    db: &SqlitePool,
+    id: &str,
+) -> Result<Option<JobRecord>, sqlx::Error> {
+    let row: Option<JobRow> = sqlx::query_as(&format!("{JOB_SELECT} WHERE j.id = ?"))
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    row.map(job_of).transpose()
+}
+
 /// `user`'s jobs in creation order: those of `ids` when given (an id that is not one of the
 /// user's is left out), else those of batch `batch_id` when given, else all of them; with
 /// `states` not empty, only those in one of `states`.

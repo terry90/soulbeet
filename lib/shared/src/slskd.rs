@@ -644,6 +644,7 @@ impl FileEntry {
                 .and_then(|place| u32::try_from(place).ok()),
             pending_retry: None,
             job: None,
+            job_id: None,
             request: self.batch_id.as_deref().and_then(request_of_batch),
             index: None,
         };

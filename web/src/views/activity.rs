@@ -4,8 +4,8 @@
 use dioxus::prelude::*;
 use shared::download::{AcquireAndPlayRequest, ArchivalUpgradeStatus};
 use ui::{
-    dashboard::DeletionHistoryTab, use_player, IconActivity, IconDownload, IconRefreshCw,
-    IconSparkles, TrackRow, TrackRowState,
+    dashboard::DeletionHistoryTab, use_player, AcquireStageBadge, IconActivity, IconDownload,
+    IconRefreshCw, IconSparkles, JobDiagnosticsPanel, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -75,27 +75,39 @@ pub fn ActivityPage() -> Element {
                                 let manual = item.manual_choice.clone();
                                 let a = item.artist.clone();
                                 let t = item.title.clone();
+                                let failed = matches!(item.badge, AcquireStageBadge::Failed { .. });
                                 rsx! {
-                                    TrackRow {
+                                    div {
                                         key: "act-acq-{item.artist}-{item.title}",
-                                        title: item.title.clone(),
-                                        artist: item.artist.clone(),
-                                        state: TrackRowState::UnownedCatalog {
-                                            acquiring_stage: Some(item.badge.clone()),
-                                        },
-                                        on_acquire: move |_| {
-                                            studio.trigger_acquire_and_play(auth, player, retry_req.clone());
-                                        },
-                                        on_pick_source: move |_| {
-                                            if let Some((search_id, groups)) = manual.clone() {
-                                                studio.manual_choice_modal.set(Some(ManualChoiceModalState {
-                                                    artist: a.clone(),
-                                                    title: t.clone(),
-                                                    search_id,
-                                                    groups,
-                                                }));
+                                        class: "space-y-1",
+                                        TrackRow {
+                                            title: item.title.clone(),
+                                            artist: item.artist.clone(),
+                                            state: TrackRowState::UnownedCatalog {
+                                                acquiring_stage: Some(item.badge.clone()),
+                                            },
+                                            on_acquire: move |_| {
+                                                studio.trigger_acquire_and_play(auth, player, retry_req.clone());
+                                            },
+                                            on_pick_source: move |_| {
+                                                if let Some((search_id, groups)) = manual.clone() {
+                                                    studio.manual_choice_modal.set(Some(ManualChoiceModalState {
+                                                        artist: a.clone(),
+                                                        title: t.clone(),
+                                                        search_id,
+                                                        groups,
+                                                    }));
+                                                }
+                                            },
+                                        }
+                                        if let Some(ref job_id) = item.job_id {
+                                            div { class: "px-3 pb-1",
+                                                JobDiagnosticsPanel {
+                                                    job_id: job_id.clone(),
+                                                    failed,
+                                                }
                                             }
-                                        },
+                                        }
                                     }
                                 }
                             }
@@ -182,20 +194,28 @@ pub fn ActivityPage() -> Element {
                                 rsx! {
                                     div {
                                         key: "arch-{job.id}",
-                                        class: "rounded-[10px] bg-beet-surface border border-beet-border-subtle p-3.5 flex flex-wrap items-center justify-between gap-3",
-                                        div { class: "min-w-0 flex-1",
-                                            p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
-                                                "{job.title}"
+                                        class: "rounded-[10px] bg-beet-surface border border-beet-border-subtle p-3.5 space-y-2",
+                                        div { class: "flex flex-wrap items-center justify-between gap-3",
+                                            div { class: "min-w-0 flex-1",
+                                                p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
+                                                    "{job.title}"
+                                                }
+                                                p { class: "text-[12px] text-beet-text-secondary truncate",
+                                                    "{job.artist} · {job.original_codec.to_ascii_uppercase()} → FLAC · trigger: {job.trigger_reason}"
+                                                }
+                                                if let Some(ref err) = job.last_error {
+                                                    p { class: "text-[11px] text-beet-crimson-text mt-1", "{err}" }
+                                                }
                                             }
-                                            p { class: "text-[12px] text-beet-text-secondary truncate",
-                                                "{job.artist} · {job.original_codec.to_ascii_uppercase()} → FLAC · trigger: {job.trigger_reason}"
-                                            }
-                                            if let Some(ref err) = job.last_error {
-                                                p { class: "text-[11px] text-beet-crimson-text mt-1", "{err}" }
+                                            span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
+                                                "{status_text}"
                                             }
                                         }
-                                        span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
-                                            "{status_text}"
+                                        if let Some(ref job_id) = job.job_id {
+                                            JobDiagnosticsPanel {
+                                                job_id: job_id.clone(),
+                                                failed: job.status == ArchivalUpgradeStatus::Failed,
+                                            }
                                         }
                                     }
                                 }

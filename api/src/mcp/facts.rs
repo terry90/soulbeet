@@ -214,7 +214,7 @@ pub(crate) fn search_facts(
     spec: &StoredSpec,
     dropped: &DroppedByFilter,
 ) -> Map<String, Value> {
-    let Value::Object(facts) = (match stats {
+    let Value::Object(mut facts) = (match stats {
         Some(s) => json!({
             "query_text_sent": cut(&s.query_text),
             "query_texts_retried": s.retried_texts.iter().map(String::as_str).map(cut).collect::<Vec<_>>(),
@@ -238,6 +238,26 @@ pub(crate) fn search_facts(
     }) else {
         unreachable!("an object literal is an object");
     };
+    if let Some(s) = stats {
+        if !s.rejection_counts.is_empty() {
+            facts.insert("rejection_counts".into(), json!(s.rejection_counts));
+        }
+        if !s.top_rejected.is_empty() {
+            let rejected: Vec<Value> = s
+                .top_rejected
+                .iter()
+                .map(|r| {
+                    json!({
+                        "source": cut(&r.source),
+                        "label": cut(&r.label),
+                        "score": r.score,
+                        "reason": r.reason,
+                    })
+                })
+                .collect();
+            facts.insert("top_rejected".into(), Value::Array(rejected));
+        }
+    }
     facts
 }
 
@@ -658,7 +678,7 @@ fn job_search_read(
     search: &StoredSearch,
 ) -> (Option<SearchStats>, DroppedByFilter) {
     match SearchProgress::of(search) {
-        SearchProgress::Done(groups, stats) => {
+        SearchProgress::Done(groups, mut stats) => {
             let kept = sources::view(
                 &search.id,
                 &groups,
@@ -666,6 +686,9 @@ fn job_search_read(
                 &HashMap::new(),
                 &view.job.excluded_sources,
             );
+            if let Some(ref mut s) = stats {
+                kept.merge_rejections_into(s);
+            }
             (stats, kept.dropped_by_filter)
         }
         SearchProgress::Failed(_, stats) => (stats, DroppedByFilter::default()),

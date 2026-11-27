@@ -5,9 +5,10 @@ use crate::auth::UserCtx;
 use crate::config::CONFIG;
 use crate::core::metadata::hydrate_album_tracks;
 use crate::core::settings;
-use crate::core::sources::{self, Usable};
+use crate::core::sources::{self, Usable, FLAGGED_FAILURES, RECENT_FAILURES_SECS};
 use crate::core::{backend_unavailable, database_failure};
 use crate::globals::get_or_create_user_channel;
+use crate::ledger::store;
 use crate::ledger::{
     DuplicateRule, JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, LEDGER,
 };
@@ -16,7 +17,7 @@ use crate::models::user_settings::LossyFallback;
 use crate::server_fns::download::enqueue::not_enqueued_failure;
 use crate::server_fns::download::failover::MAX_SOURCES_PER_TRACK;
 use crate::services::{Backends, Registry};
-use dioxus::logger::tracing::info;
+use dioxus::logger::tracing::{info, warn};
 use shared::backends::{delivery, Delivery};
 use shared::download::{
     AutoDownloadEvent, DownloadEvent, DownloadQuery, DownloadableGroup, EnqueueStatus,
@@ -24,6 +25,7 @@ use shared::download::{
 };
 use shared::failure::{Failure, Stage};
 use soulbeet::ImportMode;
+use std::collections::HashMap;
 
 use super::{
     backend_of, enqueue_and_watch, manual_batch_label, numbered, prepare_target, request_stopped,
@@ -195,6 +197,24 @@ fn picks_primary(groups: &[DownloadableGroup]) -> bool {
     (groups.iter()).any(|g| !lossy(g) && g.score >= AUTO_SELECT_SCORE_THRESHOLD)
 }
 
+/// Reorders `groups` so sources without repeated recent transfer failures (`< FLAGGED_FAILURES`
+/// in the last 24h) come ahead of repeatedly failing peers within each delivery tier (primary vs
+/// lossy-only), preserving score order within each bucket. Flagged peers are kept at the back of
+/// their tier rather than dropped, so fallback still succeeds if no clean peer exists.
+pub(crate) fn deprioritize_failing_peers(
+    groups: &mut [DownloadableGroup],
+    recent_failures: &HashMap<String, u32>,
+) {
+    if recent_failures.is_empty() || groups.len() <= 1 {
+        return;
+    }
+    groups.sort_by_key(|g| {
+        let failures = recent_failures.get(&g.source).copied().unwrap_or(0);
+        let flagged = failures >= FLAGGED_FAILURES;
+        (lossy(g), flagged, if flagged { failures } else { 0 })
+    });
+}
+
 /// The group the pipeline picks from `groups` without the user: the first of a backend that
 /// delivers files as found that scores well enough, else, only when the user takes lossy files
 /// automatically, the first lossy-only one that does. Else why the user picks: lossy-only when
@@ -304,11 +324,23 @@ pub(crate) async fn run_search(
             }
             if found.groups.is_empty() {
                 info!("Auto-download: no results for '{}'", query_desc);
-                return fail_job(&ledger, &ctx, &run, found.failure()).await;
+                let failure = found.failure();
+                let stats = found.stats();
+                if let Err(e) = ledger
+                    .search_ended(&run.search_id, Err((failure.clone(), stats)))
+                    .await
+                {
+                    warn!(
+                        "Auto-download: could not store failed search stats for '{}': {}",
+                        run.search_id, e
+                    );
+                }
+                return fail_job(&ledger, &ctx, &run, failure).await;
             }
+            let stats = found.stats();
             let groups = found.groups;
             if let Err(e) = ledger
-                .store_candidates(&run.search_id, groups.clone())
+                .search_ended(&run.search_id, Ok((groups.clone(), stats)))
                 .await
             {
                 return fail_job(
@@ -323,7 +355,21 @@ pub(crate) async fn run_search(
         }
     };
 
-    let best_score = all_groups[0].score;
+    if let Some(db) = ledger.db() {
+        let since = chrono::Utc::now().timestamp() - RECENT_FAILURES_SECS;
+        match store::recent_failures(db, since).await {
+            Ok(failures) => deprioritize_failing_peers(&mut all_groups, &failures),
+            Err(e) => warn!(
+                "Auto-download: could not read recent peer failures for '{}': {}",
+                query_desc, e
+            ),
+        }
+    }
+
+    let best_score = all_groups
+        .iter()
+        .map(|g| g.score)
+        .fold(0.0_f64, f64::max);
 
     send(AutoDownloadEvent::ScoringResults {
         batch_id: run.batch_id.clone(),
@@ -1219,5 +1265,202 @@ mod tests {
             Some((vec!["peer_a".to_string()], ManualReason::NoConfidentMatch))
         );
         assert!(youtube.requests().is_empty());
+    }
+
+    #[test]
+    fn deprioritize_failing_peers_prefers_clean_sources_and_keeps_flagged_fallback() {
+        let mut groups = vec![
+            group(
+                "flaky_peer",
+                vec![item_on("slskd", "flaky_peer", "Wake Up", "01.flac")],
+                0.95,
+            ),
+            group(
+                "clean_peer",
+                vec![item_on("slskd", "clean_peer", "Wake Up", "01.flac")],
+                0.82,
+            ),
+            group(
+                "ytm:clean",
+                vec![item_on("ytdlp", "ytm:clean", "Wake Up", "01.opus")],
+                0.88,
+            ),
+        ];
+        let failures = HashMap::from([("flaky_peer".to_string(), FLAGGED_FAILURES)]);
+        deprioritize_failing_peers(&mut groups, &failures);
+
+        let sources: Vec<&str> = groups.iter().map(|g| g.source.as_str()).collect();
+        assert_eq!(sources, vec!["clean_peer", "flaky_peer", "ytm:clean"]);
+        // Auto-pick chooses clean_peer (index 0) ahead of flaky_peer.
+        assert_eq!(pick(&groups, LossyFallback::Ask), Ok(0));
+
+        // When only a flagged peer passes threshold, fallback still picks it.
+        let mut only_flagged = vec![group(
+            "flaky_peer",
+            vec![item_on("slskd", "flaky_peer", "Wake Up", "01.flac")],
+            0.95,
+        )];
+        deprioritize_failing_peers(&mut only_flagged, &failures);
+        assert_eq!(pick(&only_flagged, LossyFallback::Ask), Ok(0));
+    }
+
+    #[tokio::test]
+    async fn web_auto_download_persists_search_stats_and_avoids_recently_failing_peer() {
+        use crate::auth::UserId;
+        use crate::ledger::JobKind;
+        use shared::download::{DownloadProgress, JobSlot, SearchResult, SearchStats};
+
+        let db = crate::db::test_db::migrated().await;
+        let ctx = test_ctx("alice");
+        let dir = tempfile::tempdir().unwrap();
+        let folder_id = crate::core::folder_of(&db, "alice").await;
+        let folder = Folder {
+            id: folder_id.clone(),
+            user_id: ctx.user_id.clone(),
+            name: "Music".into(),
+            path: dir.path().to_string_lossy().into_owned(),
+            shared: false,
+        };
+        let ledger = Ledger::start(db.clone());
+
+        // Seed FLAGGED_FAILURES recent transfer failures for "flaky_peer".
+        for idx in 0..FLAGGED_FAILURES {
+            let job_id = format!("prior-fail-{idx}");
+            ledger
+                .create(
+                    NewJob {
+                        id: job_id.clone(),
+                        user: UserId::new("alice"),
+                        folder_id: folder_id.clone(),
+                        wanted: DownloadQuery::new(vec![]),
+                        import_mode: ImportMode::Singleton,
+                        state: JobState::Queued,
+                        search_id: None,
+                        picked: vec![(0, item_on("slskd", "flaky_peer", "Old", "old.flac"))],
+                        kind: JobKind::Track,
+                        options: None,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let row = DownloadProgress::failed(
+                format!("t-{idx}"),
+                "flaky_peer".into(),
+                "old.flac".into(),
+                Failure::new(
+                    FailureCode::PeerOffline,
+                    Stage::Transfer,
+                    RetryAdvice::OtherSource,
+                    "peer offline",
+                ),
+            )
+            .with_job(JobSlot {
+                job: job_id,
+                slot: 0,
+            });
+            ledger.record(JobEvent::Slots {
+                state: JobState::Failed,
+                rows: vec![row],
+            });
+        }
+        ledger.settled().await;
+
+        // Create the new web auto-download job and search record.
+        ledger
+            .create(
+                NewJob {
+                    id: "auto-job-1".into(),
+                    user: UserId::new("alice"),
+                    folder_id: folder_id.clone(),
+                    wanted: DownloadQuery::new(vec![]),
+                    import_mode: ImportMode::Singleton,
+                    state: JobState::Searching,
+                    search_id: Some("auto-search-1".into()),
+                    picked: vec![],
+                    kind: JobKind::Track,
+                    options: None,
+                },
+                Some(NewSearch {
+                    id: "auto-search-1".into(),
+                    user: UserId::new("alice"),
+                    backend: None,
+                    query: DownloadQuery::new(vec![]),
+                    spec: None,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut scripted_stats = SearchStats {
+            query_text: "Kowloon Wake Up".into(),
+            response_count: 5,
+            file_count: 8,
+            locked_file_count: 1,
+            not_audio: 1,
+            below_floor: 2,
+            ..Default::default()
+        };
+        scripted_stats.record_rejection(
+            "bad_peer",
+            "01 - Wake Up (Live).flac",
+            Some(0.54),
+            "version_veto",
+        );
+
+        let slskd = StubBackend::new(vec![ScriptedOutcome::Enqueued]);
+        slskd.script_polls(vec![Ok(SearchResult {
+            stats: scripted_stats.clone(),
+            ..search_result(
+                "search",
+                SearchState::Completed,
+                vec![
+                    group(
+                        "flaky_peer",
+                        vec![item_on("slskd", "flaky_peer", "Wake Up", "flaky/01.flac")],
+                        0.95,
+                    ),
+                    group(
+                        "clean_peer",
+                        vec![item_on("slskd", "clean_peer", "Wake Up", "clean/01.flac")],
+                        0.82,
+                    ),
+                ],
+            )
+        })]);
+        let backends = StubBackends::default().with("slskd", slskd.clone());
+        let run = AutoRun {
+            batch_id: "b-auto-1".into(),
+            job: "auto-job-1".into(),
+            search_id: "auto-search-1".into(),
+            import_mode: ImportMode::Singleton,
+            found: None,
+        };
+
+        run_search(
+            ledger.clone(),
+            ctx.clone(),
+            folder,
+            DownloadQuery::new(vec![]),
+            usable(vec![("slskd".into(), slskd.clone() as Arc<dyn DownloadBackend>)]),
+            &backends,
+            run,
+        )
+        .await;
+        ledger.settled().await;
+
+        // Verify SearchStats were persisted onto the stored search row.
+        let stored = store::search_of(&db, "auto-search-1", &ctx.id())
+            .await
+            .unwrap()
+            .expect("search stored");
+        assert_eq!(stored.stats, Some(scripted_stats));
+
+        // Verify clean_peer was picked and enqueued instead of higher-scoring flaky_peer.
+        assert_eq!(slskd.requests().len(), 1);
+        let attempts = store::attempts_of(&db, "auto-job-1").await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].1.len(), 1);
+        assert_eq!(attempts[0].1[0].source.as_deref(), Some("clean_peer"));
     }
 }
