@@ -745,6 +745,8 @@ pub struct Ledger {
     changes: watch::Receiver<i64>,
     places: watch::Receiver<u64>,
     live: LiveRows,
+    /// Pool backing this ledger for read-only lookups (None on recording test ledgers).
+    db: Option<SqlitePool>,
     /// The jobs whose failure the database kept refusing, or that their runner could not read
     /// (`strand`), in memory only.
     stranded: Arc<Mutex<HashSet<String>>>,
@@ -764,6 +766,7 @@ impl Ledger {
             changes,
             places,
             live: live.clone(),
+            db: None,
             stranded: Arc::default(),
             #[cfg(test)]
             recording: false,
@@ -777,6 +780,11 @@ impl Ledger {
                 live,
             },
         )
+    }
+
+    /// Pool backing this ledger when started against SQLite; None for a recording test ledger.
+    pub fn db(&self) -> Option<&SqlitePool> {
+        self.db.as_ref()
     }
 
     /// The last row sent for `slot`, while the slot is not terminal ("Live byte counts are read
@@ -840,7 +848,8 @@ impl Ledger {
 
     /// A ledger whose writer runs on `db` (tests, and start_server_ledger).
     pub fn start(db: SqlitePool) -> Ledger {
-        let (ledger, inbox) = Ledger::channel();
+        let (mut ledger, inbox) = Ledger::channel();
+        ledger.db = Some(db.clone());
         writer::spawn(db, inbox, TransferRegistry::global());
         ledger
     }

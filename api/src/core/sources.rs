@@ -18,11 +18,13 @@ use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
 use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
-    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchPriority, SearchResult,
+    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, RejectedCandidateSummary,
+    SearchPriority, SearchResult,
     SearchSpec, SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
+use soulbeet::matching::diagnostics::{RejectionCollector, REASON_FORMAT_FILTERED};
 use soulbeet::DownloadBackend;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -375,6 +377,20 @@ impl Found {
         self.groups.extend(later.groups);
         self.stops.extend(later.stops);
         self
+    }
+
+    /// Merged stats across all backends that finished; None when none finished.
+    pub(crate) fn stats(&self) -> Option<SearchStats> {
+        let mut merged: Option<SearchStats> = None;
+        for stop in &self.stops {
+            if let SearchStop::Finished { stats } = stop {
+                match &mut merged {
+                    Some(acc) => acc.merge(stats),
+                    None => merged = Some(stats.clone()),
+                }
+            }
+        }
+        merged
     }
 
     /// Why nothing was found: the failure the stops give, the first backend's first.
@@ -923,6 +939,7 @@ pub struct DroppedByFilter {
 pub struct CandidateView {
     pub candidates: Vec<Candidate>,
     pub dropped_by_filter: DroppedByFilter,
+    pub filter_rejections: RejectionCollector,
 }
 
 impl CandidateView {
@@ -934,37 +951,46 @@ impl CandidateView {
             .map(|c| c.group.clone())
             .collect()
     }
+
+    /// Merge filter-stage rejection counts and top rejected candidates into `stats`.
+    pub fn merge_rejections_into(&self, stats: &mut SearchStats) {
+        self.filter_rejections.merge_into(stats);
+    }
 }
 
 /// D6: extensions that are always lossless. `m4a` holds AAC or ALAC alike, so it is not one.
 const LOSSLESS: [&str; 6] = ["flac", "wav", "aiff", "aif", "ape", "wv"];
 
 /// Whether a file with `facts` passes `filters`; one that does not is counted in `dropped`
-/// under the first filter it fails. What the source did not report fails the filter that asks
-/// for it.
-fn passes(facts: &FileFacts, filters: &SourceFilters, dropped: &mut DroppedByFilter) -> bool {
+/// under the first filter it fails and returns a machine-readable rejection reason. What the
+/// source did not report fails the filter that asks for it.
+fn filter_rejection(
+    facts: &FileFacts,
+    filters: &SourceFilters,
+    dropped: &mut DroppedByFilter,
+) -> Option<&'static str> {
     let extension = facts.extension.as_deref();
-    let failed = if !filters.formats.is_empty()
+    let (failed, reason) = if !filters.formats.is_empty()
         && !extension.is_some_and(|e| filters.formats.iter().any(|f| f == e))
     {
-        &mut dropped.format
+        (&mut dropped.format, REASON_FORMAT_FILTERED)
     } else if filters
         .min_bitrate_kbps
         .is_some_and(|min| !facts.bitrate_kbps.is_some_and(|kbps| kbps >= min))
     {
-        &mut dropped.bitrate
+        (&mut dropped.bitrate, "bitrate_filtered")
     } else if filters.lossless_only && !extension.is_some_and(|e| LOSSLESS.contains(&e)) {
-        &mut dropped.not_lossless
+        (&mut dropped.not_lossless, REASON_FORMAT_FILTERED)
     } else if filters
         .max_queue_length
         .is_some_and(|max| !facts.source_queue_length.is_some_and(|queue| queue <= max))
     {
-        &mut dropped.queue_length
+        (&mut dropped.queue_length, "queue_length")
     } else {
-        return true;
+        return None;
     };
     *failed += 1;
-    false
+    Some(reason)
 }
 
 /// The stored groups of search `search_id` that pass `filters` (D6) and whose source is not in
@@ -978,18 +1004,37 @@ pub fn view(
     excluded: &[String],
 ) -> CandidateView {
     let mut dropped = DroppedByFilter::default();
+    let mut filter_rejections = RejectionCollector::default();
     let mut candidates = Vec::new();
     for (index, group) in groups.iter().enumerate() {
         if excluded.contains(&group.source) {
             dropped.excluded += 1;
+            let label = if group.title.trim().is_empty() {
+                group.group_id.clone()
+            } else {
+                group.title.clone()
+            };
+            filter_rejections.record(
+                group.source.clone(),
+                label,
+                Some(group.score as f32),
+                "excluded_source",
+            );
             continue;
         }
-        let items: Vec<DownloadableItem> = group
-            .items
-            .iter()
-            .filter(|item| passes(&item.facts, filters, &mut dropped))
-            .cloned()
-            .collect();
+        let mut items = Vec::with_capacity(group.items.len());
+        for item in &group.items {
+            if let Some(reason) = filter_rejection(&item.facts, filters, &mut dropped) {
+                filter_rejections.record(
+                    item.source.clone(),
+                    item.id.clone(),
+                    Some(item.match_score as f32),
+                    reason,
+                );
+            } else {
+                items.push(item.clone());
+            }
+        }
         if items.is_empty() {
             continue;
         }
@@ -1009,9 +1054,11 @@ pub fn view(
             group,
         });
     }
+    let _ = std::marker::PhantomData::<RejectedCandidateSummary>;
     CandidateView {
         candidates,
         dropped_by_filter: dropped,
+        filter_rejections,
     }
 }
 

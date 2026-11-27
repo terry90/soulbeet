@@ -9,9 +9,11 @@ use shared::download::{
     DownloadProgress, DownloadState, ImportChoice, ImportRefusal, KeptImport, MatchChoices,
 };
 
+mod diagnostics;
 mod item;
 mod picker;
 use api::CancelDownloadRequest;
+pub use diagnostics::JobDiagnosticsPanel;
 use item::DownloadItem;
 
 use crate::{friendly_error, IconDownload, IconX};

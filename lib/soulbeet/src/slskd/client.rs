@@ -814,6 +814,8 @@ impl SoulseekClient {
             mut albums,
             not_audio,
             below_floor,
+            rejection_counts,
+            top_rejected,
         } = processing::process_search_responses(
             &responses,
             &context.artist,
@@ -840,6 +842,8 @@ impl SoulseekClient {
                 below_floor,
                 retried_texts: context.retry_texts[..context.retried].to_vec(),
                 unanswered_note: None,
+                rejection_counts,
+                top_rejected,
             },
         })
     }
@@ -2813,6 +2817,16 @@ mod tests {
                 below_floor: 1,
                 retried_texts: vec![],
                 unanswered_note: None,
+                rejection_counts: std::collections::BTreeMap::from([(
+                    "title_mismatch".to_string(),
+                    1
+                )]),
+                top_rejected: vec![shared::download::RejectedCandidateSummary {
+                    source: "erin_shares".into(),
+                    label: "@@pq7\\Share\\Misc\\Jingle Bells Remix.mp3".into(),
+                    score: Some(0.0),
+                    reason: "title_mismatch".into(),
+                }],
             }
         );
         let body: serde_json::Value = serde_json::from_str(&seen.lock().unwrap()[0].body).unwrap();

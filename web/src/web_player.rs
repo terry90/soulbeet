@@ -53,6 +53,7 @@ use shared::download::DownloadEvent;
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcquireTrackState {
     pub request_id: String,
+    pub job_id: Option<String>,
     pub artist: String,
     pub title: String,
     pub badge: AcquireStageBadge,
@@ -1594,6 +1595,7 @@ impl WebStudioContext {
             key.clone(),
             AcquireTrackState {
                 request_id: String::new(),
+                job_id: None,
                 artist: artist.clone(),
                 title: title.clone(),
                 badge: AcquireStageBadge::Acquiring { label: None },
@@ -1627,9 +1629,10 @@ impl WebStudioContext {
                         studio.apply_curation_overrides(&mut pt);
                         player.play_track(pt);
                     }
-                    AcquireAndPlayInitialStatus::Started { .. } => {
+                    AcquireAndPlayInitialStatus::Started { job_id, .. } => {
                         if let Some(slot) = studio.acquire_states.write().get_mut(&key) {
                             slot.request_id = resp.request_id;
+                            slot.job_id = Some(job_id);
                         }
                     }
                 },
@@ -1638,6 +1641,7 @@ impl WebStudioContext {
                         key,
                         AcquireTrackState {
                             request_id: String::new(),
+                            job_id: None,
                             artist,
                             title,
                             badge: AcquireStageBadge::Failed {
@@ -1662,6 +1666,11 @@ pub fn handle_acquire_event(
     ev: AcquireAndPlayEvent,
 ) {
     let key = acquire_key(&ev.artist, &ev.title);
+    let existing_job_id = studio
+        .acquire_states
+        .read()
+        .get(&key)
+        .and_then(|s| s.job_id.clone());
     match ev.stage {
         AcquireAndPlayStage::Ready {
             navidrome_song_id,
@@ -1710,6 +1719,7 @@ pub fn handle_acquire_event(
                 key,
                 AcquireTrackState {
                     request_id: ev.request_id,
+                    job_id: existing_job_id,
                     artist: ev.artist,
                     title: ev.title,
                     badge,
@@ -1723,6 +1733,7 @@ pub fn handle_acquire_event(
                     key,
                     AcquireTrackState {
                         request_id: ev.request_id,
+                        job_id: existing_job_id,
                         artist: ev.artist,
                         title: ev.title,
                         badge,

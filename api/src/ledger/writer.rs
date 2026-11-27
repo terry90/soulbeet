@@ -13,7 +13,7 @@ use crate::transfer_registry::TransferRegistry;
 use serde_json::{Map, Value};
 use shared::download::{
     DownloadProgress, DownloadQuery, DownloadState, DownloadableGroup, DownloadableItem,
-    IndexState, JobSlot,
+    IndexState, JobSlot, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, Stage};
 use soulbeet::ImportMode;
@@ -762,6 +762,11 @@ impl Writer {
                         .bind(&job)
                         .execute(&mut *tx)
                         .await?;
+                    let mut entry = Entry::at(state, "failed").failure(&failure);
+                    if failure.stage == Stage::SourceSearch {
+                        attach_search_rejections(&mut tx, &job, &mut entry).await?;
+                    }
+                    append(&mut tx, &job, entry).await?;
                 }
                 self.set_job(&mut tx, &job, state).await?;
             }
@@ -1098,20 +1103,46 @@ impl Writer {
     }
 
     /// Stores how search `id` ended: its candidates and stats, or its failure and the stats it
-    /// has, in one statement. A search that was stored moves the change number on.
+    /// has, in one statement. A search that was stored moves the change number on. When `stats`
+    /// carries rejection diagnostics, also records a `Stage::SourceSearch` event on any job
+    /// linked to `id`.
     async fn search_ended(&mut self, id: &str, outcome: SearchOutcome) -> Result<(), LedgerError> {
         let (candidates, stats, failure) = match outcome {
             Ok((groups, stats)) => (Some(groups), stats, None),
             Err((failure, stats)) => (None, stats, Some(failure)),
         };
+        let mut tx = begin(&self.db).await?;
         let ended =
             sqlx::query("UPDATE searches SET candidates = ?, stats = ?, failure = ? WHERE id = ?")
                 .bind(candidates.map(|c| serde_json::to_string(&c)).transpose()?)
-                .bind(stats.map(|s| serde_json::to_string(&s)).transpose()?)
+                .bind(stats.as_ref().map(serde_json::to_string).transpose()?)
                 .bind(failure.map(|f| serde_json::to_string(&f)).transpose()?)
                 .bind(id)
-                .execute(&self.db)
+                .execute(&mut *tx)
                 .await?;
+        if let Some(ref s) = stats {
+            if !s.rejection_counts.is_empty() || !s.top_rejected.is_empty() {
+                let job_ids: Vec<String> =
+                    sqlx::query_scalar("SELECT id FROM jobs WHERE search_id = ?")
+                        .bind(id)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                for job_id in job_ids {
+                    let mut entry = Entry {
+                        stage: Stage::SourceSearch,
+                        event: "search_diagnostics",
+                        facts: Map::new(),
+                    }
+                    .fact("search_id", id)
+                    .fact("response_count", s.response_count)
+                    .fact("file_count", s.file_count)
+                    .fact("locked_file_count", s.locked_file_count);
+                    insert_rejection_facts(&mut entry.facts, s);
+                    append(&mut tx, &job_id, entry).await?;
+                }
+            }
+        }
+        tx.commit().await?;
         if ended.rows_affected() > 0 {
             self.next_seq();
         }
@@ -1395,7 +1426,11 @@ impl Writer {
                         .await?;
                 }
                 let to = JobState::Failed;
-                (to, vec![Entry::at(to, "failed").failure(&failure)])
+                let mut entry = Entry::at(to, "failed").failure(&failure);
+                if failure.stage == Stage::SourceSearch {
+                    attach_search_rejections(&mut tx, job, &mut entry).await?;
+                }
+                (to, vec![entry])
             }
             Transition::Search {
                 filters: Some(_), ..
@@ -1950,6 +1985,41 @@ async fn slot_entry(
     let row: Option<DownloadProgress> =
         (found.and_then(|(_, row)| row)).and_then(|row| serde_json::from_str(&row).ok());
     Ok(Entry::of_slot(slot.slot, state, row.as_ref()))
+}
+
+/// Inserts non-empty `rejection_counts` and `top_rejected` from `stats` into `facts`.
+fn insert_rejection_facts(facts: &mut Map<String, Value>, stats: &SearchStats) {
+    if !stats.rejection_counts.is_empty() {
+        if let Ok(v) = serde_json::to_value(&stats.rejection_counts) {
+            facts.insert("rejection_counts".into(), v);
+        }
+    }
+    if !stats.top_rejected.is_empty() {
+        if let Ok(v) = serde_json::to_value(&stats.top_rejected) {
+            facts.insert("top_rejected".into(), v);
+        }
+    }
+}
+
+/// If `job`'s stored search has rejection diagnostics in `searches.stats`, attach them to `entry`.
+async fn attach_search_rejections(
+    tx: &mut SqliteConnection,
+    job: &str,
+    entry: &mut Entry,
+) -> Result<(), LedgerError> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT s.stats FROM jobs j JOIN searches s ON s.id = j.search_id \
+         WHERE j.id = ? AND s.stats IS NOT NULL",
+    )
+    .bind(job)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(raw) = raw {
+        if let Ok(stats) = serde_json::from_str::<SearchStats>(&raw) {
+            insert_rejection_facts(&mut entry.facts, &stats);
+        }
+    }
+    Ok(())
 }
 
 /// Appends `entry` to `job`'s timeline under its next number. Selected from the job, so a

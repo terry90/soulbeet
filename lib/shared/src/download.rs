@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::failure::{Cause, Failure};
+use crate::failure::{Cause, Failure, Stage};
 use crate::metadata::{Album, Track};
+use std::collections::BTreeMap;
+
 pub use crate::slskd::SearchPriority;
 
 #[derive(Serialize, Clone, PartialEq, Deserialize, Debug, Default)]
@@ -132,9 +134,22 @@ impl SearchSpec {
     }
 }
 
+/// Maximum number of closest rejected candidates retained per search for diagnostics.
+pub const MAX_TOP_REJECTED: usize = 5;
+
+/// One rejected search candidate kept for pre-enqueue diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RejectedCandidateSummary {
+    pub source: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    pub reason: String,
+}
+
 /// What a finished search read, so an empty one says why. Stored with each search: a field
 /// added later reads as its default in what was stored before.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchStats {
     pub query_text: String,
@@ -151,6 +166,128 @@ pub struct SearchStats {
     /// Why a search no source answered may have found nothing, in the backend's words; None
     /// when a source answered or the backend has nothing to add.
     pub unanswered_note: Option<String>,
+    /// Pre-enqueue candidate rejection counts keyed by machine-readable reason
+    /// (e.g. "version_veto", "duration_delta", "artist_gate", "title_mismatch",
+    /// "below_threshold", "format_filtered", "locked_only").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rejection_counts: BTreeMap<String, u32>,
+    /// Up to `MAX_TOP_REJECTED` (5) closest rejected candidates with the reason each was dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_rejected: Vec<RejectedCandidateSummary>,
+}
+
+/// Rank score descending, with `Some(finite)` ahead of `None` or non-finite values.
+fn rejected_score_cmp(a: &RejectedCandidateSummary, b: &RejectedCandidateSummary) -> std::cmp::Ordering {
+    let key = |s: Option<f32>| match s {
+        Some(v) if v.is_finite() => (1u8, v),
+        _ => (0u8, f32::NEG_INFINITY),
+    };
+    let (ak, av) = key(a.score);
+    let (bk, bv) = key(b.score);
+    bk.cmp(&ak)
+        .then_with(|| bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+impl SearchStats {
+    /// Record one rejected candidate in `rejection_counts` and maintain `top_rejected`
+    /// bounded to the `MAX_TOP_REJECTED` highest-scoring rejected candidates.
+    pub fn record_rejection(
+        &mut self,
+        source: impl Into<String>,
+        label: impl Into<String>,
+        score: Option<f32>,
+        reason: impl Into<String>,
+    ) {
+        let reason = reason.into();
+        *self.rejection_counts.entry(reason.clone()).or_default() += 1;
+        self.push_top_rejected(RejectedCandidateSummary {
+            source: source.into(),
+            label: label.into(),
+            score: score.filter(|s| s.is_finite()),
+            reason,
+        });
+    }
+
+    /// Insert `summary` into `top_rejected`, keeping at most `MAX_TOP_REJECTED` closest items.
+    pub fn push_top_rejected(&mut self, summary: RejectedCandidateSummary) {
+        self.top_rejected.push(summary);
+        self.top_rejected.sort_by(rejected_score_cmp);
+        self.top_rejected.truncate(MAX_TOP_REJECTED);
+    }
+
+    /// Merge another backend's `SearchStats` into this one (used for multi-backend searches).
+    pub fn merge(&mut self, other: &SearchStats) {
+        if self.query_text.is_empty() && !other.query_text.is_empty() {
+            self.query_text = other.query_text.clone();
+        }
+        self.response_count = self.response_count.saturating_add(other.response_count);
+        self.file_count = self.file_count.saturating_add(other.file_count);
+        self.locked_file_count = self
+            .locked_file_count
+            .saturating_add(other.locked_file_count);
+        self.not_audio = self.not_audio.saturating_add(other.not_audio);
+        self.below_floor = self.below_floor.saturating_add(other.below_floor);
+        for text in &other.retried_texts {
+            if !self.retried_texts.contains(text) {
+                self.retried_texts.push(text.clone());
+            }
+        }
+        if self.unanswered_note.is_none() {
+            self.unanswered_note = other.unanswered_note.clone();
+        }
+        for (reason, count) in &other.rejection_counts {
+            *self.rejection_counts.entry(reason.clone()).or_default() += *count;
+        }
+        for rejected in &other.top_rejected {
+            self.push_top_rejected(rejected.clone());
+        }
+    }
+}
+
+/// One source attempt recorded for a job, exposed in diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticAttempt {
+    pub slot: u32,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+}
+
+/// One stage event in a job's audit timeline, exposed in diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticEvent {
+    pub seq: u32,
+    pub at: i64,
+    pub stage: Stage,
+    pub event: String,
+    #[serde(default)]
+    pub facts: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Full decision audit trail and diagnostics for a single ledger job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobDiagnostics {
+    pub job_id: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_stats: Option<SearchStats>,
+    #[serde(default)]
+    pub attempts: Vec<DiagnosticAttempt>,
+    #[serde(default)]
+    pub timeline: Vec<DiagnosticEvent>,
 }
 
 /// A group of downloadable items (e.g., album from one source)
@@ -282,6 +419,9 @@ pub struct DownloadProgress {
     /// The ledger job slot this row is the file of. Never sent to the browser.
     #[serde(skip)]
     pub job: Option<JobSlot>,
+    /// Public ledger job id associated with this row (used for on-demand diagnostics lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
     /// The id of the backend request (`DownloadBackend::new_request`) that made this transfer;
     /// None for one Soulful did not make. Never sent to the browser.
     #[serde(skip)]
@@ -352,6 +492,7 @@ impl DownloadProgress {
             queue_position: None,
             pending_retry: None,
             job: None,
+            job_id: None,
             request: None,
             index: None,
         }
@@ -407,6 +548,7 @@ impl DownloadProgress {
     }
 
     pub fn with_job(mut self, job: JobSlot) -> Self {
+        self.job_id = Some(job.job.clone());
         self.job = Some(job);
         self
     }
@@ -1395,5 +1537,56 @@ mod tests {
                 "expected not lossy: {ambiguous:?}"
             );
         }
+    }
+
+    #[test]
+    fn search_stats_deserializes_legacy_json_without_rejection_fields() {
+        let legacy = r#"{
+            "query_text": "Marrow Choir O Holy Night",
+            "response_count": 4,
+            "file_count": 9,
+            "locked_file_count": 2,
+            "not_audio": 1,
+            "below_floor": 3,
+            "retried_texts": [],
+            "unanswered_note": null
+        }"#;
+        let parsed: SearchStats = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.query_text, "Marrow Choir O Holy Night");
+        assert_eq!(parsed.response_count, 4);
+        assert_eq!(parsed.file_count, 9);
+        assert_eq!(parsed.locked_file_count, 2);
+        assert_eq!(parsed.not_audio, 1);
+        assert_eq!(parsed.below_floor, 3);
+        assert!(parsed.rejection_counts.is_empty());
+        assert!(parsed.top_rejected.is_empty());
+
+        // Empty diagnostic fields are omitted when serialized.
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(serialized.get("rejection_counts").is_none());
+        assert!(serialized.get("top_rejected").is_none());
+    }
+
+    #[test]
+    fn search_stats_bounds_top_rejected_to_five_closest_candidates() {
+        let mut stats = SearchStats::default();
+        for (i, score) in [0.15, 0.55, 0.42, 0.58, 0.20, 0.51, 0.49].into_iter().enumerate() {
+            stats.record_rejection(
+                format!("peer_{i}"),
+                format!("track_{i}.flac"),
+                Some(score),
+                "below_threshold",
+            );
+        }
+        stats.record_rejection("peer_locked", "3 locked files", None, "locked_only");
+
+        assert_eq!(stats.rejection_counts.get("below_threshold"), Some(&7));
+        assert_eq!(stats.rejection_counts.get("locked_only"), Some(&1));
+        assert_eq!(stats.top_rejected.len(), MAX_TOP_REJECTED);
+        let scores: Vec<Option<f32>> = stats.top_rejected.iter().map(|r| r.score).collect();
+        assert_eq!(
+            scores,
+            vec![Some(0.58), Some(0.55), Some(0.51), Some(0.49), Some(0.42)]
+        );
     }
 }
