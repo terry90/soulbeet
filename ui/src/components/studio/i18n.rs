@@ -2,67 +2,20 @@
 //! and OpenSubsonic media URLs derived from [`NavidromeSessionInfo`].
 
 use shared::client::NavidromeSessionInfo;
-use shared::recommendation::{CandidateReason, ContextualMixKind, ContextualMixSummary};
+use shared::recommendation::{
+    canonical_mix_title, humanize_mix_slug, CandidateReason, ContextualMixKind,
+    ContextualMixSummary,
+};
 
 /// Formats a human-readable title for a [`ContextualMixSummary`].
-/// Honors explicit `custom_name` first; otherwise localizes `i18n_key` (with optional country).
+/// Uses canonical neutral titles (no country-specific title overrides or country suffixes);
+/// regional blend ratios are surfaced via badges and steering controls instead.
 pub fn format_mix_title(summary: &ContextualMixSummary) -> String {
-    if let Some(custom) = summary
-        .custom_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return custom.to_string();
-    }
-
-    let cc = summary
-        .country_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_uppercase);
-
-    let base = match summary.i18n_key.as_str() {
-        "mix.seasonal.winter_holiday" => match cc.as_deref() {
-            Some("FR") => "Noël à la Française",
-            Some("DE") | Some("AT") | Some("CH") => "Weihnachten Mix",
-            Some("ES") | Some("MX") => "Navidad Mix",
-            Some("IT") => "Natale Mix",
-            _ => "Christmas Mix",
-        },
-        "mix.seasonal.new_years_eve" => "New Year's Eve",
-        "mix.seasonal.lunar_new_year" => "Lunar New Year",
-        "mix.seasonal.carnival" => "Carnival Beats",
-        "mix.seasonal.spring" => "Spring Awakening",
-        "mix.seasonal.summer" => "Summer Anthems",
-        "mix.seasonal.autumn" => "Autumn Sessions",
-        "mix.seasonal.halloween" => "Darkwave Halloween",
-        "mix.seasonal.diwali" => "Diwali Celebration",
-        "mix.moment.drive" => "Drive Mix",
-        "mix.moment.morning" => "Morning Lift",
-        "mix.moment.focus" => "Deep Focus",
-        "mix.moment.late_night" => "Late Night",
-        "mix.rolling.conservative" | "mix.rolling.comfort" => "Comfort Zone",
-        "mix.rolling.balanced" | "mix.rolling.weekly_radar" => "Fresh Picks",
-        "mix.rolling.adventurous" | "mix.rolling.deep_cuts" => "Deep Cuts",
-        other => {
-            let tail = other.rsplit('.').next().unwrap_or(&summary.slug);
-            return humanize_slug(tail);
-        }
-    };
-
-    if matches!(summary.kind, ContextualMixKind::Seasonal) {
-        if let Some(code) = cc {
-            if summary.i18n_key != "mix.seasonal.winter_holiday"
-                || !matches!(code.as_str(), "FR" | "DE" | "AT" | "CH" | "ES" | "MX" | "IT")
-            {
-                return format!("{base} · {code}");
-            }
-        }
-    }
-
-    base.to_string()
+    canonical_mix_title(
+        &summary.slug,
+        Some(&summary.i18n_key),
+        summary.custom_name.as_deref(),
+    )
 }
 
 /// Formats a descriptive subtitle for a [`ContextualMixSummary`].
@@ -171,7 +124,7 @@ pub fn format_candidate_reason(reason: &CandidateReason) -> String {
             mix_slug,
             country_code,
         } => {
-            let mix = humanize_slug(mix_slug);
+            let mix = humanize_mix_slug(mix_slug);
             match country_code
                 .as_deref()
                 .map(str::trim)
@@ -182,10 +135,10 @@ pub fn format_candidate_reason(reason: &CandidateReason) -> String {
             }
         }
         CandidateReason::InternationalContextual { mix_slug } => {
-            format!("International pick · {}", humanize_slug(mix_slug))
+            format!("International pick · {}", humanize_mix_slug(mix_slug))
         }
         CandidateReason::TasteWildcard { mix_slug, genre } => {
-            format!("{genre} crossover · {}", humanize_slug(mix_slug))
+            format!("{genre} crossover · {}", humanize_mix_slug(mix_slug))
         }
         CandidateReason::MomentMatch {
             mix_slug,
@@ -196,19 +149,19 @@ pub fn format_candidate_reason(reason: &CandidateReason) -> String {
                 format!("{mood} · {g}")
             }
             (Some(mood), _) if !mood.is_empty() => {
-                format!("{mood} · {}", humanize_slug(mix_slug))
+                format!("{mood} · {}", humanize_mix_slug(mix_slug))
             }
             (_, Some(g)) if !g.is_empty() => {
-                format!("{g} · {}", humanize_slug(mix_slug))
+                format!("{g} · {}", humanize_mix_slug(mix_slug))
             }
-            _ => format!("Matched {}", humanize_slug(mix_slug)),
+            _ => format!("Matched {}", humanize_mix_slug(mix_slug)),
         },
         CandidateReason::LibraryMatch {
             mix_slug,
             matched_genre,
         } => match matched_genre.as_deref().filter(|g| !g.is_empty()) {
             Some(g) => format!("In your library · {g}"),
-            None => format!("In your library · {}", humanize_slug(mix_slug)),
+            None => format!("In your library · {}", humanize_mix_slug(mix_slug)),
         },
         CandidateReason::RadioSeed { seed_artist } => {
             format!("Radio seed · {seed_artist}")
@@ -266,24 +219,6 @@ fn format_short_iso_date(iso: &str) -> String {
     } else {
         iso.to_ascii_uppercase()
     }
-}
-
-fn humanize_slug(slug: &str) -> String {
-    slug.split(['_', '-', '.'])
-        .filter(|part| !part.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => {
-                    let mut out = first.to_uppercase().to_string();
-                    out.push_str(chars.as_str());
-                    out
-                }
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Percent-encodes a query parameter component per RFC 3986 unreserved set.
@@ -393,7 +328,7 @@ mod tests {
             "mix.seasonal.winter_holiday",
             Some("FR"),
         );
-        assert_eq!(format_mix_title(&fr_noel), "Noël à la Française");
+        assert_eq!(format_mix_title(&fr_noel), "Christmas Mix");
 
         let jp_summer = sample_summary(
             "summer",
@@ -401,7 +336,7 @@ mod tests {
             "mix.seasonal.summer",
             Some("jp"),
         );
-        assert_eq!(format_mix_title(&jp_summer), "Summer Anthems · JP");
+        assert_eq!(format_mix_title(&jp_summer), "Summer Anthems");
 
         let mut custom = sample_summary(
             "late_coding",

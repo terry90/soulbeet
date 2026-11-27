@@ -339,4 +339,37 @@ class FormattingAndThemeTest {
         assertEquals("[Chorus: Solo]", parsedPlain.lines[0].text)
         assertEquals("Sing along now", parsedPlain.lines[1].text)
     }
+
+    @Test
+    fun defaultMixCopyUsesNeutralCanonicalTitlesAcrossAllBuiltins() {
+        val cases = listOf(
+            Triple("winter_holiday", "mix.seasonal.winter_holiday", "Christmas Mix"),
+            Triple("new_years_eve", "mix.seasonal.new_years_eve", "New Year's Eve"),
+            Triple("lunar_new_year", "mix.seasonal.lunar_new_year", "Lunar New Year"),
+            Triple("carnival", "mix.seasonal.carnival", "Carnival Beats"),
+            Triple("spring", "mix.seasonal.spring", "Spring Awakening"),
+            Triple("summer", "mix.seasonal.summer", "Summer Anthems"),
+            Triple("autumn", "mix.seasonal.autumn", "Autumn Sessions"),
+            Triple("halloween", "mix.seasonal.halloween", "Darkwave Halloween"),
+            Triple("diwali", "mix.seasonal.diwali", "Diwali Celebration"),
+            Triple("drive", "mix.moment.drive", "Drive Mix"),
+            Triple("morning", "mix.moment.morning", "Morning Lift"),
+            Triple("focus", "mix.moment.focus", "Deep Focus"),
+            Triple("late_night", "mix.moment.late_night", "Late Night"),
+            Triple("conservative", "mix.rolling.conservative", "Comfort Zone"),
+            Triple("comfort", "mix.rolling.comfort", "Comfort Zone"),
+            Triple("balanced", "mix.rolling.balanced", "Fresh Picks"),
+            Triple("weekly_radar", "mix.rolling.weekly_radar", "Fresh Picks"),
+            Triple("adventurous", "mix.rolling.adventurous", "Deep Cuts"),
+            Triple("deep_cuts", "mix.rolling.deep_cuts", "Deep Cuts"),
+            Triple("late_coding", "mix.custom.late_coding", "Late Coding"),
+            Triple("WINTER_HOLIDAY", "MIX.SEASONAL.WINTER_HOLIDAY", "Christmas Mix"),
+            Triple("foo_bar", "custom_vibes", "Custom Vibes"),
+            Triple("  late_coding  ", "", "Late Coding"),
+            Triple("___", "...", "Curated Mix"),
+        )
+        for ((slug, key, expected) in cases) {
+            assertEquals("slug=$slug key=$key", expected, SoulbeetApiClient.defaultMixCopy(slug, key).first)
+        }
+    }
 }

@@ -216,7 +216,7 @@ mod tests {
         let mut dom = VirtualDom::new(|| {
             rsx! {
                 SeasonalHeroCard {
-                    title: "Noël à la Française".to_string(),
+                    title: "Christmas Mix".to_string(),
                     subtitle: "Festive mix".to_string(),
                     track_count: 24,
                     local_ratio: 0.45,

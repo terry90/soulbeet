@@ -15,15 +15,15 @@ use chrono::{Datelike, Timelike, Utc};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::{DiscoveryStatus, DiscoveryTrack};
 use shared::recommendation::{
-    discovery_name, Candidate, CandidateReason, CandidateSet, ContextualMixDefinition,
-    ContextualMixKind, ContextualMixPlaylist, ContextualMixSummary, ContextualMixTrack,
-    CultureBucket, CultureSteering, DiscoveryProfile, SeedRadioRequest, SeedRadioResponse,
-    SeedRadioTrack, SetMixEnabledRequest, UpdateCultureProfileRequest, UpsertContextualMixRequest,
-    UserCultureProfile,
+    canonical_mix_title, discovery_name, Candidate, CandidateReason, CandidateSet,
+    ContextualMixDefinition, ContextualMixKind, ContextualMixPlaylist, ContextualMixSummary,
+    ContextualMixTrack, CultureBucket, CultureSteering, DiscoveryProfile, SeedRadioRequest,
+    SeedRadioResponse, SeedRadioTrack, SetMixEnabledRequest, UpdateCultureProfileRequest,
+    UpsertContextualMixRequest, UserCultureProfile,
 };
 use soulbeet::engine::contextual::MAX_TRACKS_PER_ARTIST;
 use soulbeet::navidrome::models::SubsonicSong;
-use soulbeet::navidrome::{filepath_rules, NavidromeClient, SmartPlaylistChange};
+use soulbeet::navidrome::{filepath_rules, NavidromeClient, PlaylistMeta, SmartPlaylistChange};
 use soulbeet::MusicKnowledge;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -116,42 +116,6 @@ fn canonical_slug(raw: &str) -> Result<String, Failure> {
         "noel" | "holiday" => Ok("winter_holiday".to_string()),
         "nye" => Ok("new_years_eve".to_string()),
         other => normalize_slug(other),
-    }
-}
-
-/// Human-readable title-cased fallback name for Navidrome playlists when `custom_name` is unset
-/// (e.g. `"winter_holiday"` -> `"Winter Holiday"`).
-fn title_case_slug(slug: &str) -> String {
-    slug.split(['_', '-'])
-        .filter(|w| !w.is_empty())
-        .map(|w| {
-            let mut chars = w.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Human-readable display title for a seasonal mix (used by `ClientBootstrap` and discovery
-/// progress labels so raw i18n keys like `"mix.seasonal.winter_holiday"` are never exposed).
-pub(crate) fn seasonal_display_title(slug: &str, custom_name: Option<&str>) -> String {
-    if let Some(name) = custom_name.map(str::trim).filter(|s| !s.is_empty()) {
-        return name.to_string();
-    }
-    match slug {
-        "winter_holiday" => "Christmas Mix".to_string(),
-        "new_years_eve" => "New Year's Eve".to_string(),
-        "lunar_new_year" => "Lunar New Year".to_string(),
-        "carnival" => "Carnival".to_string(),
-        "spring" => "Spring Mix".to_string(),
-        "summer" => "Summer Mix".to_string(),
-        "autumn" => "Autumn Mix".to_string(),
-        "halloween" => "Halloween".to_string(),
-        "diwali" => "Diwali".to_string(),
-        other => title_case_slug(other),
     }
 }
 
@@ -1955,12 +1919,13 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
         if active && has_pending {
             let place = seasonal_root.child(&def.slug);
             let prefix = place.song_prefix();
-            // Navidrome smart playlist name uses custom_name when set, else a readable title-cased
-            // fallback (clients map `navidrome_playlist_id` -> `ContextualMixSummary.i18n_key`).
-            let playlist_name = def
-                .custom_name
-                .clone()
-                .unwrap_or_else(|| format!("Soulbeet: {}", title_case_slug(&def.slug)));
+            // Navidrome smart playlist name uses custom_name when set, else the canonical mix title
+            // so Navidrome, Web, Desktop, Android, and Android Auto always match.
+            let playlist_name = canonical_mix_title(
+                &def.slug,
+                Some(&def.i18n_key),
+                def.custom_name.as_deref(),
+            );
             let comment = format!("soulbeet:contextual:{}", def.slug);
             let expires_at = def
                 .calendar_window
@@ -2234,10 +2199,11 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
     if sync_navidrome && def.kind == ContextualMixKind::Moment && !tracks.is_empty() {
         if let Some(ref navi) = navi_opt {
             let song_ids: Vec<String> = tracks.iter().map(|t| t.song_id.clone()).collect();
-            let playlist_name = def
-                .custom_name
-                .clone()
-                .unwrap_or_else(|| format!("Soulbeet: {}", title_case_slug(&def.slug)));
+            let playlist_name = canonical_mix_title(
+                &def.slug,
+                Some(&def.i18n_key),
+                def.custom_name.as_deref(),
+            );
             let stored_id = state
                 .as_ref()
                 .and_then(|s| s.navidrome_playlist_id.clone());
@@ -2266,6 +2232,18 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
             };
 
             if let Some(pl_id) = updated_id {
+                let comment = format!("soulbeet:contextual:{}", def.slug);
+                let meta = PlaylistMeta {
+                    name: Some(playlist_name.as_str()),
+                    comment: Some(comment.as_str()),
+                    public: None,
+                };
+                if let Err(e) = navi.update_playlist_meta(&pl_id, &meta).await {
+                    warn!(
+                        "Could not update metadata on Navidrome playlist '{}' for mix '{}': {}",
+                        pl_id, def.slug, e
+                    );
+                }
                 if let Ok(updated_state) = ContextualMixStateRow::upsert_playlist_id_in(
                     db,
                     &ctx.user_id,
@@ -2986,9 +2964,10 @@ mod tests {
         stub.answer(
             "/rest/createPlaylist",
             &[&subsonic_ok(
-                r#""playlist":{"id":"pl-drive-1","name":"Soulbeet: Drive","songCount":3,"duration":600,"owner":"alice","created":"2026-06-15T19:00:00Z","changed":"2026-06-15T19:00:00Z"}"#,
+                r#""playlist":{"id":"pl-drive-1","name":"Drive Mix","songCount":3,"duration":600,"owner":"alice","created":"2026-06-15T19:00:00Z","changed":"2026-06-15T19:00:00Z"}"#,
             )],
         );
+        stub.answer("/rest/updatePlaylist", &[&subsonic_ok("")]);
 
         let now = Utc.with_ymd_and_hms(2026, 6, 15, 19, 0, 0).unwrap();
         // sync=false must stay strictly read-only (no createPlaylist call)
@@ -3030,6 +3009,15 @@ mod tests {
         assert_eq!(
             playlist.summary.navidrome_playlist_id.as_deref(),
             Some("pl-drive-1")
+        );
+        let meta_posts = stub.posted("/rest/updatePlaylist");
+        assert!(
+            meta_posts.iter().any(|body| {
+                body.contains("playlistId=pl-drive-1")
+                    && (body.contains("name=Drive+Mix") || body.contains("name=Drive%20Mix"))
+                    && body.contains("comment=soulbeet%3Acontextual%3Adrive")
+            }),
+            "sync=true on Moment mix must sync canonical name and contextual comment via updatePlaylist; posted={meta_posts:?}"
         );
         assert_eq!(playlist.tracks.len(), 3);
         assert_eq!(playlist.tracks.iter().filter(|t| t.owned).count(), 2);
@@ -3078,7 +3066,7 @@ mod tests {
         let stub = NavidromeStub::start();
         stub.answer(
             "/api/playlist",
-            &[r#"{"id":"sp-winter-1","name":"Soulbeet: Winter Holiday","comment":"soulbeet:contextual:winter_holiday","public":false}"#],
+            &[r#"{"id":"sp-winter-1","name":"Christmas Mix","comment":"soulbeet:contextual:winter_holiday","public":false}"#],
         );
 
         let place = NavidromePlace {
@@ -4154,23 +4142,29 @@ mod tests {
     }
 
     #[test]
-    fn seasonal_display_title_returns_human_readable_names() {
+    fn canonical_mix_title_returns_human_readable_names() {
         assert_eq!(
-            seasonal_display_title("winter_holiday", None),
+            canonical_mix_title("winter_holiday", Some("mix.seasonal.winter_holiday"), None),
             "Christmas Mix"
         );
         assert_eq!(
-            seasonal_display_title("new_years_eve", None),
+            canonical_mix_title("new_years_eve", Some("mix.seasonal.new_years_eve"), None),
             "New Year's Eve"
         );
-        assert_eq!(seasonal_display_title("halloween", None), "Halloween");
-        assert_eq!(seasonal_display_title("summer", None), "Summer Mix");
         assert_eq!(
-            seasonal_display_title("winter_holiday", Some("Custom Xmas")),
+            canonical_mix_title("halloween", Some("mix.seasonal.halloween"), None),
+            "Darkwave Halloween"
+        );
+        assert_eq!(
+            canonical_mix_title("summer", Some("mix.seasonal.summer"), None),
+            "Summer Anthems"
+        );
+        assert_eq!(
+            canonical_mix_title("winter_holiday", None, Some("Custom Xmas")),
             "Custom Xmas"
         );
         assert_eq!(
-            seasonal_display_title("midsummer_night", None),
+            canonical_mix_title("midsummer_night", None, None),
             "Midsummer Night"
         );
     }

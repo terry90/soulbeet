@@ -152,8 +152,9 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
                         && m.track_count > 0
                 })
                 .map(|m| shared::client::SeasonalPackSummary {
-                    title: crate::core::contextual::seasonal_display_title(
+                    title: shared::recommendation::canonical_mix_title(
                         &m.slug,
+                        Some(&m.i18n_key),
                         m.custom_name.as_deref(),
                     ),
                     slug: m.slug,

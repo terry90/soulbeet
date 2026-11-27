@@ -257,11 +257,21 @@ impl SyncEngine {
                 None => (pl.song_count, pl.duration),
             };
 
+            let display_name = if (kind == "seasonal" || kind == "moment")
+                && pl.name.starts_with("Soulbeet: ")
+            {
+                slug.as_deref()
+                    .map(|s| shared::recommendation::canonical_mix_title(s, None, None))
+                    .unwrap_or_else(|| pl.name.clone())
+            } else {
+                pl.name.clone()
+            };
+
             upsert_playlist(
                 &self.pool,
                 &LocalPlaylist {
                     id: pl.id.clone(),
-                    name: pl.name.clone(),
+                    name: display_name,
                     comment: pl.comment.clone(),
                     owner: pl.owner.clone(),
                     song_count: initial_song_count,

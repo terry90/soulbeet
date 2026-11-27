@@ -16,6 +16,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
@@ -613,7 +614,7 @@ class SoulbeetApiClient(
         val customDesc = obj.optNonNullString("custom_description")
         val country = obj.optNonNullString("country_code")
         val localPct = if (obj.has("local_pct") && !obj.isNull("local_pct")) obj.optInt("local_pct") else null
-        val (fallbackTitle, fallbackSub) = defaultMixCopy(slug, i18nKey, country)
+        val (fallbackTitle, fallbackSub) = defaultMixCopy(slug, i18nKey)
         return ContextualMixUi(
             slug = slug,
             kind = obj.optNonNullString("kind") ?: "rolling",
@@ -828,38 +829,62 @@ class SoulbeetApiClient(
             }.getOrNull() ?: trimmed.take(160)
         }
 
-        private fun defaultMixCopy(slug: String, i18nKey: String, country: String?): Pair<String, String> =
-            when {
-                slug.contains("noel") || slug.contains("christmas") || i18nKey.contains("winter_holiday") -> {
-                    val title = when (country?.uppercase()) {
-                        "FR" -> "Noël à la Française"
-                        "DE", "AT", "CH" -> "Weihnachten Mix"
-                        "ES", "MX" -> "Navidad Mix"
-                        "IT" -> "Natale Mix"
-                        else -> "Christmas Mix"
-                    }
-                    title to "Christmas favorites · excluded from core taste until kept"
+        internal fun defaultMixCopy(slug: String, i18nKey: String): Pair<String, String> {
+            fun lookup(raw: String): Pair<String, String>? =
+                when (raw.trim().lowercase(Locale.ROOT)) {
+                    "mix.seasonal.winter_holiday", "winter_holiday", "noel", "christmas" ->
+                        "Christmas Mix" to "Christmas favorites and festive classics, blended to your taste."
+                    "mix.seasonal.new_years_eve", "new_years_eve", "nye" ->
+                        "New Year's Eve" to "High-energy dance floor staples and regional party picks to close the year."
+                    "mix.seasonal.lunar_new_year", "lunar_new_year" ->
+                        "Lunar New Year" to "Celebratory regional pop and fresh festive picks for the new lunar cycle."
+                    "mix.seasonal.carnival", "carnival" ->
+                        "Carnival Beats" to "Percussive rhythms, samba, funk, and vibrant carnival energy."
+                    "mix.seasonal.spring", "spring" ->
+                        "Spring Awakening" to "Fresh indie, acoustic warmth, and bright new-season discoveries."
+                    "mix.seasonal.summer", "summer" ->
+                        "Summer Anthems" to "Sun-soaked grooves, upbeat pop, and warm-weather classics."
+                    "mix.seasonal.autumn", "autumn" ->
+                        "Autumn Sessions" to "Cozy acoustic textures, folk, jazz, and mellow indie cuts."
+                    "mix.seasonal.halloween", "halloween" ->
+                        "Darkwave Halloween" to "Atmospheric darkwave, post-punk, and nocturnal synth textures."
+                    "mix.seasonal.diwali", "diwali" ->
+                        "Diwali Celebration" to "Festive Indian classics, indie gems, and celebratory rhythms."
+                    "mix.moment.drive", "drive" ->
+                        "Drive Mix" to "Offline-prioritized favorites and upbeat momentum built for the road."
+                    "mix.moment.morning", "morning" ->
+                        "Morning Lift" to "Bright grooves and familiar lifts to ease into the day."
+                    "mix.moment.focus", "focus" ->
+                        "Deep Focus" to "Steady ambient, instrumental, and downtempo cuts for uninterrupted flow."
+                    "mix.moment.late_night", "late_night" ->
+                        "Late Night" to "Low-lit dream pop, trip hop, and midnight library favorites."
+                    "mix.rolling.conservative", "mix.rolling.comfort", "conservative", "comfort" ->
+                        "Comfort Zone" to "High-rotation favorites and trusted genres from your library."
+                    "mix.rolling.balanced", "mix.rolling.weekly_radar", "balanced", "weekly_radar" ->
+                        "Fresh Picks" to "Fresh recommendations tuned to your recent listening momentum."
+                    "mix.rolling.adventurous", "mix.rolling.deep_cuts", "adventurous", "deep_cuts" ->
+                        "Deep Cuts" to "Hidden gems and adventurous tracks beyond your usual rotation."
+                    else -> null
                 }
-                slug == "comfort" || i18nKey.contains("comfort") ->
-                    "Comfort Mix" to "Your highest-rated favorites & warm repeats"
-                slug == "weekly_radar" || i18nKey.contains("weekly") ->
-                    "Weekly Radar" to "Fresh discoveries tuned to your recent listening"
-                slug == "deep_cuts" || i18nKey.contains("deep") ->
-                    "Deep Cuts" to "Hidden gems from artists in your orbit"
-                slug == "drive" ->
-                    "Drive Mix" to "Upbeat momentum built for the road · offline ready"
-                slug == "morning" ->
-                    "Morning Lift" to "Bright openers to ease into the day"
-                slug == "focus" ->
-                    "Deep Focus" to "Steady ambient, jazz, and downtempo flow"
-                slug == "late_night" ->
-                    "Late Night Studio" to "Nocturnal trip-hop, dream pop & smooth cuts"
-                else ->
-                    slug.replace('_', ' ').replace('-', ' ')
-                        .split(' ')
-                        .joinToString(" ") { part -> part.replaceFirstChar { it.uppercase() } }
-                        .ifBlank { "Curated Mix" } to "Contextual Soulbeet mix"
+
+            val trimmedKey = i18nKey.trim()
+            if (trimmedKey.isNotEmpty()) {
+                lookup(trimmedKey)?.let { return it }
             }
+            lookup(slug)?.let { return it }
+
+            val fallbackSource = trimmedKey
+                .substringAfterLast('.')
+                .trim()
+                .ifBlank { slug }
+            val title = fallbackSource
+                .split('_', '-', '.')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .joinToString(" ") { part -> part.replaceFirstChar { it.titlecase(Locale.ROOT) } }
+                .ifBlank { "Curated Mix" }
+            return title to "Contextual Soulbeet mix"
+        }
     }
 }
 
