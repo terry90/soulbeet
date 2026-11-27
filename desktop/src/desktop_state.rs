@@ -2869,7 +2869,12 @@ impl DesktopStudio {
             ));
             return;
         };
-        let row_key = format!("{}:{}", remote.artist, remote.title);
+        let row_key = remote_acquire_key(
+            remote.mbid.as_deref(),
+            &remote.artist,
+            &remote.title,
+            remote.album.as_deref(),
+        );
         self.acquiring_tracks.write().insert(
             row_key.clone(),
             AcquireStageBadge::Acquiring {
@@ -4383,6 +4388,26 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     }
 }
 
+/// Stable key for tracking per-row Acquire & Play state on Desktop remote catalog results.
+/// Uses the MusicBrainz recording MBID when available so distinct recordings sharing the
+/// same `(artist, title)` never light up together.
+pub fn remote_acquire_key(
+    mbid: Option<&str>,
+    artist: &str,
+    title: &str,
+    album: Option<&str>,
+) -> String {
+    if let Some(m) = mbid.map(str::trim).filter(|m| !m.is_empty()) {
+        return format!("mbid:{}", m.to_ascii_lowercase());
+    }
+    format!(
+        "{}::{}::{}",
+        artist.trim().to_lowercase(),
+        title.trim().to_lowercase(),
+        album.unwrap_or_default().trim().to_lowercase()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4639,5 +4664,37 @@ mod tests {
         let (msg, already) = parse_server_error_message(&other_json, 409);
         assert_eq!(msg, "Discovery is not enabled");
         assert!(!already);
+    }
+
+    #[test]
+    fn remote_acquire_key_prefers_mbid_and_disambiguates_album() {
+        let k1 = remote_acquire_key(
+            Some("11111111-1111-1111-1111-111111111111"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Agents of Fortune"),
+        );
+        let k2 = remote_acquire_key(
+            Some("22222222-2222-2222-2222-222222222222"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Greatest Hits"),
+        );
+        assert_ne!(k1, k2);
+        assert_eq!(k1, "mbid:11111111-1111-1111-1111-111111111111");
+
+        let no_mbid_a = remote_acquire_key(
+            None,
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Agents of Fortune"),
+        );
+        let no_mbid_b = remote_acquire_key(
+            None,
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Greatest Hits"),
+        );
+        assert_ne!(no_mbid_a, no_mbid_b);
     }
 }

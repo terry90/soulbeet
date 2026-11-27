@@ -650,7 +650,11 @@ fn ManualSourceChoiceModal(
     let mut queueing = use_signal(|| false);
     let mut err_msg = use_signal(|| None::<String>);
 
-    let acquire_state_key = crate::web_player::acquire_key(&state.artist, &state.title);
+    let acquire_state_key = crate::web_player::acquire_key(
+        state.recording_mbid.as_deref(),
+        &state.artist,
+        &state.title,
+    );
     let queue_item = use_callback(move |(item, search_id): (DownloadableItem, String)| {
         queueing.set(true);
         err_msg.set(None);

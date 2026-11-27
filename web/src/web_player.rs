@@ -54,6 +54,7 @@ use shared::download::DownloadEvent;
 pub struct AcquireTrackState {
     pub request_id: String,
     pub job_id: Option<String>,
+    pub recording_mbid: Option<String>,
     pub artist: String,
     pub title: String,
     pub badge: AcquireStageBadge,
@@ -63,6 +64,7 @@ pub struct AcquireTrackState {
 /// Active manual source picker modal opened from `AcquireAndPlayStage::NeedsManualChoice`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualChoiceModalState {
+    pub recording_mbid: Option<String>,
     pub artist: String,
     pub title: String,
     pub search_id: String,
@@ -91,11 +93,16 @@ fn triage_guard_keys(disc_id: Option<&str>, song_id: &str) -> Vec<String> {
 }
 
 /// Normalized lookup key for mapping `Acquire & Play` events back to search/catalog rows.
-pub fn acquire_key(artist: &str, title: &str) -> String {
+/// Prefers the MusicBrainz recording MBID when present so distinct recordings sharing the
+/// same `(artist, title)` (for example studio vs live or compilation releases) never collide.
+pub fn acquire_key(recording_mbid: Option<&str>, artist: &str, title: &str) -> String {
+    if let Some(mbid) = recording_mbid.map(str::trim).filter(|m| !m.is_empty()) {
+        return format!("mbid:{}", mbid.to_ascii_lowercase());
+    }
     format!(
         "{}::{}",
-        artist.trim().to_ascii_lowercase(),
-        title.trim().to_ascii_lowercase()
+        artist.trim().to_lowercase(),
+        title.trim().to_lowercase()
     )
 }
 
@@ -1622,7 +1629,8 @@ impl WebStudioContext {
             return;
         }
         let mut studio = *self;
-        let key = acquire_key(&req.artist, &req.title);
+        let recording_mbid = req.recording_mbid.clone();
+        let key = acquire_key(recording_mbid.as_deref(), &req.artist, &req.title);
         let artist = req.artist.clone();
         let title = req.title.clone();
         let album = req.album.clone();
@@ -1633,6 +1641,7 @@ impl WebStudioContext {
             AcquireTrackState {
                 request_id: String::new(),
                 job_id: None,
+                recording_mbid: recording_mbid.clone(),
                 artist: artist.clone(),
                 title: title.clone(),
                 badge: AcquireStageBadge::Acquiring { label: None },
@@ -1679,6 +1688,7 @@ impl WebStudioContext {
                         AcquireTrackState {
                             request_id: String::new(),
                             job_id: None,
+                            recording_mbid,
                             artist,
                             title,
                             badge: AcquireStageBadge::Failed {
@@ -1702,12 +1712,33 @@ pub fn handle_acquire_event(
     player: PlayerContext,
     ev: AcquireAndPlayEvent,
 ) {
-    let key = acquire_key(&ev.artist, &ev.title);
-    let existing_job_id = studio
-        .acquire_states
-        .read()
-        .get(&key)
-        .and_then(|s| s.job_id.clone());
+    let (key, existing_job_id, existing_mbid) = {
+        let states = studio.acquire_states.read();
+        let matched = if !ev.request_id.is_empty() {
+            states
+                .iter()
+                .find(|(_, s)| s.request_id == ev.request_id)
+                .map(|(k, s)| (k.clone(), s.job_id.clone(), s.recording_mbid.clone()))
+        } else {
+            None
+        };
+        matched.unwrap_or_else(|| {
+            let k = acquire_key(ev.recording_mbid.as_deref(), &ev.artist, &ev.title);
+            let existing = states.get(&k);
+            (
+                k,
+                existing.and_then(|s| s.job_id.clone()),
+                existing.and_then(|s| s.recording_mbid.clone()),
+            )
+        })
+    };
+    let recording_mbid = ev
+        .recording_mbid
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or(existing_mbid);
     match ev.stage {
         AcquireAndPlayStage::Ready {
             navidrome_song_id,
@@ -1757,6 +1788,7 @@ pub fn handle_acquire_event(
                 AcquireTrackState {
                     request_id: ev.request_id,
                     job_id: existing_job_id,
+                    recording_mbid,
                     artist: ev.artist,
                     title: ev.title,
                     badge,
@@ -1771,6 +1803,7 @@ pub fn handle_acquire_event(
                     AcquireTrackState {
                         request_id: ev.request_id,
                         job_id: existing_job_id,
+                        recording_mbid,
                         artist: ev.artist,
                         title: ev.title,
                         badge,
@@ -3438,5 +3471,27 @@ mod tests {
         assert_eq!(sanitize_browser_coords(f64::NAN, 2.3), None);
         assert_eq!(sanitize_browser_coords(91.0, 2.3), None);
         assert_eq!(sanitize_browser_coords(45.75, 4.84), Some((45.8, 4.8)));
+    }
+
+    #[test]
+    fn acquire_key_distinguishes_same_title_recordings_by_mbid() {
+        let studio_rec = acquire_key(
+            Some("11111111-1111-1111-1111-111111111111"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+        );
+        let live_rec = acquire_key(
+            Some("22222222-2222-2222-2222-222222222222"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+        );
+        assert_ne!(studio_rec, live_rec);
+        assert_eq!(studio_rec, "mbid:11111111-1111-1111-1111-111111111111");
+
+        // Blank or missing MBID falls back to normalized artist::title
+        assert_eq!(
+            acquire_key(Some("  "), " Blue Öyster Cult ", " (Don't Fear) The Reaper "),
+            acquire_key(None, "blue öyster cult", "(don't fear) the reaper")
+        );
     }
 }

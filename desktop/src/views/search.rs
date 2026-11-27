@@ -214,14 +214,19 @@ pub fn SearchView() -> Element {
                                         "Global MusicBrainz Catalog"
                                     }
                                     div { class: "space-y-1", role: "list",
-                                        for remote in res.remote_tracks.iter() {
+                                        for (idx, remote) in res.remote_tracks.iter().enumerate() {
                                             {
                                                 let remote_clone = remote.clone();
-                                                let row_key = format!("{}:{}", remote.artist, remote.title);
+                                                let row_key = crate::desktop_state::remote_acquire_key(
+                                                    remote.mbid.as_deref(),
+                                                    &remote.artist,
+                                                    &remote.title,
+                                                    remote.album.as_deref(),
+                                                );
                                                 let stage = acquiring_map.get(&row_key).cloned();
                                                 rsx! {
                                                     TrackRow {
-                                                        key: "rem-{remote.artist}-{remote.title}",
+                                                        key: "rem-{idx}-{row_key}",
                                                         title: remote.title.clone(),
                                                         artist: remote.artist.clone(),
                                                         album: remote.album.clone(),

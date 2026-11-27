@@ -1425,7 +1425,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Acquire & Play requires an online connection")
             return
         }
-        val key = "${match.artist.lowercase()}::${match.title.lowercase()}"
+        val key = acquireTrackKey(match.mbid, match.artist, match.title, match.album)
         if (_uiState.value.acquiringStages.containsKey(key)) return
 
         viewModelScope.launch {
@@ -2134,4 +2134,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val IMMEDIATE_PIN_DOWNLOAD_CAP = 25
         private const val WORK_IMMEDIATE_AUTO_CACHE = "soulbeet_immediate_auto_cache"
     }
+}
+
+/**
+ * Stable per-row key for tracking in-flight Acquire & Play progress on catalog search results.
+ * Prefers the MusicBrainz recording MBID so distinct recordings with identical artist and title
+ * (for example studio vs live or compilation releases) never share a loading indicator.
+ */
+internal fun acquireTrackKey(
+    mbid: String?,
+    artist: String,
+    title: String,
+    album: String? = null,
+): String {
+    val trimmedMbid = mbid?.trim().orEmpty()
+    if (trimmedMbid.isNotEmpty()) {
+        return "mbid:${trimmedMbid.lowercase(java.util.Locale.ROOT)}"
+    }
+    val normArtist = artist.trim().lowercase(java.util.Locale.ROOT)
+    val normTitle = title.trim().lowercase(java.util.Locale.ROOT)
+    val normAlbum = album?.trim().orEmpty().lowercase(java.util.Locale.ROOT)
+    return "$normArtist::$normTitle::$normAlbum"
 }

@@ -1134,4 +1134,23 @@ mod tests {
         .await;
         assert!(bad.is_err());
     }
+
+    #[test]
+    fn migrations_have_unique_ascending_versions() {
+        let mut prev: Option<(i64, &str)> = None;
+        for m in super::MIGRATOR.iter() {
+            if let Some((prev_ver, prev_desc)) = prev {
+                assert!(
+                    m.version > prev_ver,
+                    "migration versions must be strictly ascending and unique: \
+                     {} ({}) followed by {} ({})",
+                    prev_ver,
+                    prev_desc,
+                    m.version,
+                    m.description,
+                );
+            }
+            prev = Some((m.version, &m.description));
+        }
+    }
 }
