@@ -20,7 +20,7 @@ use shared::client::{
     DropTrackRequest, KeepTrackRequest, NavidromeSessionInfo, PlaybackSnapshot, RateTrackRequest,
     StarTrackRequest, TrackLyrics,
 };
-#[cfg(feature = "web")]
+#[cfg(any(feature = "web", test))]
 use shared::download::{AcquireAndPlayEvent, AcquireAndPlayStage};
 use shared::download::{
     AcquireAndPlayInitialStatus, AcquireAndPlayRequest, ArchivalUpgradeJob, DownloadProgress,
@@ -55,6 +55,7 @@ pub struct AcquireTrackState {
     pub request_id: String,
     pub job_id: Option<String>,
     pub recording_mbid: Option<String>,
+    pub catalog_id: Option<String>,
     pub artist: String,
     pub title: String,
     pub badge: AcquireStageBadge,
@@ -65,6 +66,7 @@ pub struct AcquireTrackState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualChoiceModalState {
     pub recording_mbid: Option<String>,
+    pub catalog_id: Option<String>,
     pub artist: String,
     pub title: String,
     pub search_id: String,
@@ -93,11 +95,20 @@ fn triage_guard_keys(disc_id: Option<&str>, song_id: &str) -> Vec<String> {
 }
 
 /// Normalized lookup key for mapping `Acquire & Play` events back to search/catalog rows.
-/// Prefers the MusicBrainz recording MBID when present so distinct recordings sharing the
-/// same `(artist, title)` (for example studio vs live or compilation releases) never collide.
-pub fn acquire_key(recording_mbid: Option<&str>, artist: &str, title: &str) -> String {
+/// Prefers the MusicBrainz recording MBID when present, then a catalog track ID (for providers
+/// like Deezer where `mbid` is `None`), and finally normalized `artist::title` so distinct
+/// recordings sharing the same `(artist, title)` never collide.
+pub fn acquire_key(
+    recording_mbid: Option<&str>,
+    catalog_id: Option<&str>,
+    artist: &str,
+    title: &str,
+) -> String {
     if let Some(mbid) = recording_mbid.map(str::trim).filter(|m| !m.is_empty()) {
         return format!("mbid:{}", mbid.to_ascii_lowercase());
+    }
+    if let Some(cid) = catalog_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return format!("id:{}", cid.to_ascii_lowercase());
     }
     format!(
         "{}::{}",
@@ -1623,6 +1634,7 @@ impl WebStudioContext {
         auth: Auth,
         player: PlayerContext,
         req: AcquireAndPlayRequest,
+        catalog_id: Option<String>,
     ) {
         if player.offline_only() {
             self.show_toast("Disable Offline Only mode to acquire catalog tracks.");
@@ -1630,7 +1642,15 @@ impl WebStudioContext {
         }
         let mut studio = *self;
         let recording_mbid = req.recording_mbid.clone();
-        let key = acquire_key(recording_mbid.as_deref(), &req.artist, &req.title);
+        let catalog_id = catalog_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let key = acquire_key(
+            recording_mbid.as_deref(),
+            catalog_id.as_deref(),
+            &req.artist,
+            &req.title,
+        );
         let artist = req.artist.clone();
         let title = req.title.clone();
         let album = req.album.clone();
@@ -1642,6 +1662,7 @@ impl WebStudioContext {
                 request_id: String::new(),
                 job_id: None,
                 recording_mbid: recording_mbid.clone(),
+                catalog_id: catalog_id.clone(),
                 artist: artist.clone(),
                 title: title.clone(),
                 badge: AcquireStageBadge::Acquiring { label: None },
@@ -1689,6 +1710,7 @@ impl WebStudioContext {
                             request_id: String::new(),
                             job_id: None,
                             recording_mbid,
+                            catalog_id,
                             artist,
                             title,
                             badge: AcquireStageBadge::Failed {
@@ -1703,6 +1725,64 @@ impl WebStudioContext {
     }
 }
 
+/// Resolves the `acquire_states` map key and preserved metadata for an incoming WS
+/// `AcquireAndPlayEvent`:
+/// 1. Matches by `ev.request_id` (primary post-response correlation).
+/// 2. Falls back to direct `acquire_key(recording_mbid, None, artist, title)` match.
+/// 3. Falls back to the unique pending (`request_id.is_empty()` and in-flight) entry
+///    without an MBID whose normalized `(artist, title)` matches, covering WS events
+///    that race ahead of the HTTP `Started` response for `catalog_id`-keyed tracks.
+#[cfg(any(feature = "web", test))]
+fn resolve_acquire_event_key(
+    states: &HashMap<String, AcquireTrackState>,
+    ev: &AcquireAndPlayEvent,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    if !ev.request_id.is_empty() {
+        if let Some((k, s)) = states.iter().find(|(_, s)| s.request_id == ev.request_id) {
+            return (
+                k.clone(),
+                s.job_id.clone(),
+                s.recording_mbid.clone(),
+                s.catalog_id.clone(),
+            );
+        }
+    }
+
+    let direct_key = acquire_key(ev.recording_mbid.as_deref(), None, &ev.artist, &ev.title);
+    if let Some(existing) = states.get(&direct_key) {
+        return (
+            direct_key,
+            existing.job_id.clone(),
+            existing.recording_mbid.clone(),
+            existing.catalog_id.clone(),
+        );
+    }
+
+    let ev_artist = ev.artist.trim().to_lowercase();
+    let ev_title = ev.title.trim().to_lowercase();
+    let mut in_flight_matches = states.iter().filter(|(_, s)| {
+        s.request_id.is_empty()
+            && s.badge.is_in_flight()
+            && s.recording_mbid
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .is_none()
+            && s.artist.trim().to_lowercase() == ev_artist
+            && s.title.trim().to_lowercase() == ev_title
+    });
+    if let (Some((k, s)), None) = (in_flight_matches.next(), in_flight_matches.next()) {
+        return (
+            k.clone(),
+            s.job_id.clone(),
+            s.recording_mbid.clone(),
+            s.catalog_id.clone(),
+        );
+    }
+
+    (direct_key, None, None, None)
+}
+
 /// Applies an incoming `DownloadEvent::AcquireAndPlay` to `studio.acquire_states`
 /// and auto-starts playback once `Ready { navidrome_song_id: Some(id), already_owned: false }`
 /// arrives (already-owned tracks already started playback with full metadata via HTTP response).
@@ -1712,25 +1792,9 @@ pub fn handle_acquire_event(
     player: PlayerContext,
     ev: AcquireAndPlayEvent,
 ) {
-    let (key, existing_job_id, existing_mbid) = {
+    let (key, existing_job_id, existing_mbid, existing_catalog_id) = {
         let states = studio.acquire_states.read();
-        let matched = if !ev.request_id.is_empty() {
-            states
-                .iter()
-                .find(|(_, s)| s.request_id == ev.request_id)
-                .map(|(k, s)| (k.clone(), s.job_id.clone(), s.recording_mbid.clone()))
-        } else {
-            None
-        };
-        matched.unwrap_or_else(|| {
-            let k = acquire_key(ev.recording_mbid.as_deref(), &ev.artist, &ev.title);
-            let existing = states.get(&k);
-            (
-                k,
-                existing.and_then(|s| s.job_id.clone()),
-                existing.and_then(|s| s.recording_mbid.clone()),
-            )
-        })
+        resolve_acquire_event_key(&states, &ev)
     };
     let recording_mbid = ev
         .recording_mbid
@@ -1789,6 +1853,7 @@ pub fn handle_acquire_event(
                     request_id: ev.request_id,
                     job_id: existing_job_id,
                     recording_mbid,
+                    catalog_id: existing_catalog_id,
                     artist: ev.artist,
                     title: ev.title,
                     badge,
@@ -1804,6 +1869,7 @@ pub fn handle_acquire_event(
                         request_id: ev.request_id,
                         job_id: existing_job_id,
                         recording_mbid,
+                        catalog_id: existing_catalog_id,
                         artist: ev.artist,
                         title: ev.title,
                         badge,
@@ -3477,21 +3543,121 @@ mod tests {
     fn acquire_key_distinguishes_same_title_recordings_by_mbid() {
         let studio_rec = acquire_key(
             Some("11111111-1111-1111-1111-111111111111"),
+            None,
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
         );
         let live_rec = acquire_key(
             Some("22222222-2222-2222-2222-222222222222"),
+            None,
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
         );
         assert_ne!(studio_rec, live_rec);
         assert_eq!(studio_rec, "mbid:11111111-1111-1111-1111-111111111111");
 
-        // Blank or missing MBID falls back to normalized artist::title
+        // Blank or missing MBID and catalog_id falls back to normalized artist::title
         assert_eq!(
-            acquire_key(Some("  "), " Blue Öyster Cult ", " (Don't Fear) The Reaper "),
-            acquire_key(None, "blue öyster cult", "(don't fear) the reaper")
+            acquire_key(
+                Some("  "),
+                Some("   "),
+                " Blue Öyster Cult ",
+                " (Don't Fear) The Reaper "
+            ),
+            acquire_key(None, None, "blue öyster cult", "(don't fear) the reaper")
         );
+    }
+
+    #[test]
+    fn acquire_key_distinguishes_deezer_tracks_without_mbid_and_correlates_ws_events() {
+        let edition_a = acquire_key(
+            None,
+            Some("deezer:track:111"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+        );
+        let edition_b = acquire_key(
+            None,
+            Some("deezer:track:222"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+        );
+        assert_ne!(edition_a, edition_b);
+        assert_eq!(edition_a, "id:deezer:track:111");
+        assert_eq!(edition_b, "id:deezer:track:222");
+
+        // Pre-response WS event (before HTTP returns request_id) correlates to the unique in-flight entry
+        let mut states = HashMap::new();
+        states.insert(
+            edition_a.clone(),
+            AcquireTrackState {
+                request_id: String::new(),
+                job_id: None,
+                recording_mbid: None,
+                catalog_id: Some("deezer:track:111".to_string()),
+                artist: "Blue Öyster Cult".to_string(),
+                title: "(Don't Fear) The Reaper".to_string(),
+                badge: AcquireStageBadge::Acquiring { label: None },
+                manual_choice: None,
+            },
+        );
+
+        let early_ws = AcquireAndPlayEvent {
+            request_id: "req-111".to_string(),
+            artist: "Blue Öyster Cult".to_string(),
+            title: "(Don't Fear) The Reaper".to_string(),
+            recording_mbid: None,
+            stage: AcquireAndPlayStage::Acquiring {
+                backend_id: "slskd".to_string(),
+                backend_name: "Soulseek".to_string(),
+                source: None,
+                quality: None,
+            },
+        };
+        let (matched_key, _, _, matched_cid) = resolve_acquire_event_key(&states, &early_ws);
+        assert_eq!(matched_key, edition_a);
+        assert_eq!(matched_cid.as_deref(), Some("deezer:track:111"));
+
+        // Once request_id is recorded on edition_a and edition_b starts in parallel,
+        // both correlate independently without colliding.
+        states.get_mut(&edition_a).unwrap().request_id = "req-111".to_string();
+        states.get_mut(&edition_a).unwrap().job_id = Some("job-111".to_string());
+        states.insert(
+            edition_b.clone(),
+            AcquireTrackState {
+                request_id: String::new(),
+                job_id: None,
+                recording_mbid: None,
+                catalog_id: Some("deezer:track:222".to_string()),
+                artist: "Blue Öyster Cult".to_string(),
+                title: "(Don't Fear) The Reaper".to_string(),
+                badge: AcquireStageBadge::Acquiring { label: None },
+                manual_choice: None,
+            },
+        );
+
+        let post_ws_a = AcquireAndPlayEvent {
+            request_id: "req-111".to_string(),
+            artist: "Blue Öyster Cult".to_string(),
+            title: "(Don't Fear) The Reaper".to_string(),
+            recording_mbid: None,
+            stage: AcquireAndPlayStage::Importing,
+        };
+        let (key_a, job_a, _, cid_a) = resolve_acquire_event_key(&states, &post_ws_a);
+        assert_eq!(key_a, edition_a);
+        assert_eq!(job_a.as_deref(), Some("job-111"));
+        assert_eq!(cid_a.as_deref(), Some("deezer:track:111"));
+
+        let early_ws_b = AcquireAndPlayEvent {
+            request_id: "req-222".to_string(),
+            artist: "Blue Öyster Cult".to_string(),
+            title: "(Don't Fear) The Reaper".to_string(),
+            recording_mbid: None,
+            stage: AcquireAndPlayStage::Indexing,
+        };
+        let (key_b, job_b, _, cid_b) = resolve_acquire_event_key(&states, &early_ws_b);
+        assert_eq!(key_b, edition_b);
+        assert_eq!(job_b, None);
+        assert_eq!(cid_b.as_deref(), Some("deezer:track:222"));
     }
 }

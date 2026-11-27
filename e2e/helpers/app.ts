@@ -198,33 +198,64 @@ export async function openConfigTab(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Config', exact: true }).click();
 }
 
+export type SearchFilterType = 'ALL' | 'ALBUM' | 'TRACK' | 'ARTIST';
+
+function filterPillPattern(type: SearchFilterType): RegExp {
+  switch (type) {
+    case 'ALBUM':
+      return /^Albums(?:\s+\d+)?$/;
+    case 'TRACK':
+      return /^Tracks(?:\s+\d+)?$/;
+    case 'ARTIST':
+      return /^Artists(?:\s+\d+)?$/;
+    case 'ALL':
+      return /^All(?:\s+\d+)?$/;
+  }
+}
+
 /**
- * Opens the unified Studio search view (/search), which hosts the MusicBrainz
- * album/track search, multi-backend source picker, and the service status line.
+ * Opens the unified Studio search view (/search), which hosts the single-box
+ * Deezer + MusicBrainz catalog search, multi-backend source picker, and the
+ * service status line.
  */
 export async function openSoulseekSearch(page: Page): Promise<void> {
   if (new URL(page.url()).pathname !== '/search') {
     await page.getByRole('link', { name: 'Search' }).click();
   }
   await expect(page).toHaveURL(/\/search$/);
-  await expect(page.getByRole('radio', { name: 'ALBUM' })).toBeVisible();
+  await expect(page.locator('#search-query')).toBeVisible();
 }
 
 /**
- * Runs a metadata search through the UI and waits for results. The app
- * spaces MusicBrainz requests out (1 req/s by design), so under parallel
- * test load results can take a while to come back.
+ * Runs a unified metadata search through the single search box and waits for
+ * the Catalog section to settle. When `type` is provided, activates the
+ * corresponding filter pill (`All`, `Tracks`, `Albums`, or `Artists`). The app
+ * spaces MusicBrainz requests out (1 req/s by design), so fallback searches
+ * under parallel test load can take a while to come back.
  */
 export async function performSearch(
   page: Page,
   query: string,
-  type: 'ALBUM' | 'TRACK',
+  type: SearchFilterType = 'ALL',
+  artist?: string,
 ): Promise<void> {
   await openSoulseekSearch(page);
-  await page.getByRole('radio', { name: type }).check();
-  await page.getByRole('searchbox').fill(query);
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
-  await expect(page.getByText('Search Results')).toBeVisible({ timeout: 45_000 });
+  await page.getByRole('button', { name: filterPillPattern(type) }).click();
+  const fullQuery = [artist?.trim(), query.trim()].filter(Boolean).join(' ');
+  const input = page.locator('#search-query');
+  const searchDone = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/api/metadata/search/unified' &&
+      response.request().method() === 'POST',
+    { timeout: 45_000 },
+  );
+  await input.fill(fullQuery);
+  await input.press('Enter');
+  await searchDone;
+  await expect(page.getByText('Searching catalog...')).toBeHidden({ timeout: 45_000 });
+  await expect(page.getByRole('heading', { name: 'Catalog', exact: true })).toBeVisible({
+    timeout: 45_000,
+  });
 }
 
 /** Opens the status line under the search bar, which lists each service. */

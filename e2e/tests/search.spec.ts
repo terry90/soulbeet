@@ -1,12 +1,16 @@
-// Metadata search through the UI, served by the MusicBrainz stub.
+// Unified single-box catalog search through the UI, exercising both the
+// primary Deezer stub (canonical ranking, compilation deduplication, karaoke
+// filtering, album tracklists, artist discographies, deep-catalog switch) and
+// automatic MusicBrainz fallback.
 
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
-import { freshSession, openSoulseekSearch } from '../helpers/app.js';
+import { freshSession, performSearch } from '../helpers/app.js';
 import {
   atticSignals,
   collectedDispatches,
   glassAtlas,
+  liveAtTheAnnex,
   liveAtTheExchange,
   maritime,
   morseBloom,
@@ -15,24 +19,8 @@ import {
   wirelessOrchards,
 } from '../fixtures/dataset.js';
 
-async function search(page: Page, query: string, type?: 'ALBUM' | 'TRACK') {
-  await openSoulseekSearch(page);
-  if (type) {
-    await page.getByRole('radio', { name: type }).check();
-  }
-  await page.getByRole('searchbox').fill(query);
-  await page.getByRole('button', { name: 'Search', exact: true }).click();
-}
-
-async function searchByArtist(page: Page, artist: string, query: string, type: 'ALBUM' | 'TRACK') {
-  await openSoulseekSearch(page);
-  await page.getByRole('button', { name: 'Add artist filter' }).click();
-  await page.getByPlaceholder('Artist name').fill(artist);
-  await search(page, query, type);
-}
-
-// The app spaces MusicBrainz requests out (1 req/s by design), so results
-// can queue up behind other workers' searches.
+// The app spaces MusicBrainz requests out (1 req/s by design), so fallback
+// results can queue up behind other workers' searches.
 const RESULT_TIMEOUT = 45_000;
 
 // Orchid Telegraph's releases as the app lists them: studio albums, then
@@ -49,111 +37,206 @@ const discography = [
   { album: pylonSong, facts: '2019 · Single' },
 ];
 
-/** The rows under "Albums by Orchid Telegraph": `discography`, in order. */
-async function expectDiscography(page: Page) {
-  const heading = page.getByRole('heading', { name: `Albums by ${wirelessOrchards.artist}` });
-  await expect(heading).toBeVisible({ timeout: RESULT_TIMEOUT });
-  const rows = page
-    .getByRole('list')
-    .filter({ hasText: wirelessOrchards.title })
-    .getByRole('listitem');
-  await expect(rows).toHaveCount(discography.length);
-  await expect(rows).toContainText(discography.map(({ album }) => album.title));
-  await expect(rows).toContainText(discography.map(({ facts }) => facts));
+function catalogSection(page: Page): Locator {
+  return page.locator('section', {
+    has: page.getByRole('heading', { name: 'Catalog', exact: true }),
+  });
 }
 
-test('finds a track with artist and album metadata', async ({ context, page }) => {
-  await freshSession(context, page, 'search-track');
+test('collapses compilation duplicates and strips karaoke spam for a single-box Deezer query', async ({
+  context,
+  page,
+}) => {
+  await freshSession(context, page, 'search-deezer-reaper');
 
-  await search(page, 'Northern Line', 'TRACK');
+  await performSearch(page, 'Blue oyster the reaper', 'ALL');
 
-  await expect(page.getByText('Search Results')).toBeVisible({ timeout: RESULT_TIMEOUT });
-  await expect(page.getByText('Northern Line')).toBeVisible();
-  await expect(page.getByText(glassAtlas.artist).first()).toBeVisible();
-});
+  const catalog = catalogSection(page);
+  await expect(catalog.getByText('Deezer', { exact: true })).toBeVisible();
+  await expect(page.getByText('Showing deeper catalog results from MusicBrainz')).toHaveCount(0);
 
-test('narrows a track search with the artist field', async ({ context, page }) => {
-  await freshSession(context, page, 'search-artist');
+  // One canonical studio track on Agents of Fortune, zero compilation duplicates,
+  // and zero karaoke/tribute spam.
+  const trackRows = catalog.locator('ul > li');
+  await expect(trackRows).toHaveCount(1);
+  await expect(trackRows.first()).toContainText("(Don't Fear) The Reaper");
+  await expect(trackRows.first()).toContainText('Blue Öyster Cult');
+  await expect(trackRows.first()).toContainText('Agents of Fortune');
 
-  await openSoulseekSearch(page);
-  await page.getByRole('button', { name: 'Add artist filter' }).click();
-  await page.getByPlaceholder('Artist name').fill(maritime.artist);
-  await search(page, 'Maritime', 'TRACK');
+  await expect(catalog.getByText('Greatest Hits')).toHaveCount(0);
+  await expect(catalog.getByText('The Essential Blue Öyster Cult')).toHaveCount(0);
+  await expect(catalog.getByText(/Karaoke/i)).toHaveCount(0);
 
-  await expect(page.getByText(maritime.artist).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
-});
-
-test('finds an album and expands its tracklist', async ({ context, page }) => {
-  await freshSession(context, page, 'search-album');
-
-  await search(page, glassAtlas.title, 'ALBUM');
-
-  const albumCard = page.getByText(glassAtlas.title).first();
-  await expect(albumCard).toBeVisible({ timeout: RESULT_TIMEOUT });
-  await albumCard.click();
-
-  for (const track of glassAtlas.tracks) {
-    await expect(page.getByText(track.title).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
-  }
-});
-
-test('shows the empty state when nothing matches', async ({ context, page }) => {
-  await freshSession(context, page, 'search-empty');
-
-  await search(page, 'definitely not in the catalog', 'TRACK');
-
-  await expect(page.getByText('No signals found in the ether.')).toBeVisible({
+  // Explicit deep-catalog action switches the same query over to MusicBrainz.
+  const deepButton = catalog.getByRole('button', {
+    name: 'Search deeper catalog (MusicBrainz)',
+  });
+  await expect(deepButton).toBeVisible();
+  const deepDone = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/api/metadata/search/unified' &&
+      response.request().method() === 'POST',
+    { timeout: RESULT_TIMEOUT },
+  );
+  await deepButton.click();
+  await deepDone;
+  await expect(catalog.getByText('MusicBrainz', { exact: true })).toBeVisible({
     timeout: RESULT_TIMEOUT,
   });
 });
 
-test('lists the releases of an artist given alone, studio albums first, singles last', async ({
+test('filters by category pill and opens Deezer album tracklists and artist discographies', async ({
+  context,
+  page,
+}) => {
+  await freshSession(context, page, 'search-deezer-drilldown');
+
+  await performSearch(page, 'Blue oyster', 'ALL');
+
+  const catalog = catalogSection(page);
+  await expect(catalog.getByRole('heading', { name: 'Artists', exact: true })).toBeVisible();
+  await expect(catalog.getByRole('heading', { name: 'Tracks', exact: true })).toBeVisible();
+  await expect(catalog.getByRole('heading', { name: 'Albums', exact: true })).toBeVisible();
+  await expect(catalog.getByText(/Tribute Band/i)).toHaveCount(0);
+
+  // Tracks pill shows only tracks.
+  await page.getByRole('button', { name: /^Tracks(?:\s+\d+)?$/ }).click();
+  await expect(catalog.getByRole('heading', { name: 'Tracks', exact: true })).toBeVisible();
+  await expect(catalog.getByRole('heading', { name: 'Albums', exact: true })).toHaveCount(0);
+  await expect(catalog.getByRole('heading', { name: 'Artists', exact: true })).toHaveCount(0);
+
+  // Albums pill shows albums and expands Agents of Fortune's tracklist from Deezer.
+  await page.getByRole('button', { name: /^Albums(?:\s+\d+)?$/ }).click();
+  await expect(catalog.getByRole('heading', { name: 'Albums', exact: true })).toBeVisible();
+  await expect(catalog.getByRole('heading', { name: 'Tracks', exact: true })).toHaveCount(0);
+
+  const albumRow = catalog.locator('ul > li').filter({ hasText: 'Agents of Fortune' }).first();
+  await albumRow.getByText('Agents of Fortune', { exact: true }).click();
+  for (const title of [
+    "This Ain't the Summer of Love",
+    'True Confessions',
+    "(Don't Fear) The Reaper",
+    'E.T.I. (Extra Terrestrial Intelligence)',
+  ]) {
+    await expect(albumRow.getByText(title, { exact: true })).toBeVisible({
+      timeout: RESULT_TIMEOUT,
+    });
+  }
+
+  // Artists pill opens the inline artist catalog with top tracks and releases.
+  await page.getByRole('button', { name: /^Artists(?:\s+\d+)?$/ }).click();
+  await expect(catalog.getByRole('heading', { name: 'Artists', exact: true })).toBeVisible();
+  await catalog.getByRole('button', { name: /Blue Öyster Cult/ }).click();
+
+  await expect(page.getByRole('heading', { name: 'Blue Öyster Cult', exact: true })).toBeVisible({
+    timeout: RESULT_TIMEOUT,
+  });
+  await expect(page.getByRole('heading', { name: 'Top Tracks', exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Albums, EPs & Singles', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText('Agents of Fortune').first()).toBeVisible();
+  await expect(page.getByText('Fire of Unknown Origin').first()).toBeVisible();
+
+  await page.getByRole('button', { name: 'Back to results' }).click();
+  await expect(catalog).toBeVisible();
+});
+
+test('falls back automatically to MusicBrainz and shows track metadata', async ({
+  context,
+  page,
+}) => {
+  await freshSession(context, page, 'search-track');
+
+  await performSearch(page, 'Northern Line', 'TRACK');
+
+  const catalog = catalogSection(page);
+  await expect(catalog.getByText('MusicBrainz', { exact: true })).toBeVisible();
+  await expect(
+    catalog.getByText('Showing deeper catalog results from MusicBrainz'),
+  ).toBeVisible();
+  await expect(catalog.getByText('Northern Line', { exact: true })).toBeVisible();
+  await expect(catalog.getByText(glassAtlas.artist).first()).toBeVisible();
+  await expect(catalog.getByText(glassAtlas.title).first()).toBeVisible();
+});
+
+test('narrows a track search with artist and title in the single box', async ({ context, page }) => {
+  await freshSession(context, page, 'search-artist');
+
+  await performSearch(page, 'Maritime', 'TRACK', maritime.artist);
+
+  const catalog = catalogSection(page);
+  await expect(catalog.getByText(maritime.artist).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
+  await expect(catalog.getByText('Maritime', { exact: true }).first()).toBeVisible();
+});
+
+test('finds a MusicBrainz album and expands its tracklist', async ({ context, page }) => {
+  await freshSession(context, page, 'search-album');
+
+  await performSearch(page, glassAtlas.title, 'ALBUM');
+
+  const albumRow = catalogSection(page)
+    .locator('ul > li')
+    .filter({ hasText: glassAtlas.title })
+    .first();
+  await expect(albumRow).toBeVisible({ timeout: RESULT_TIMEOUT });
+  await albumRow.getByText(glassAtlas.title, { exact: true }).click();
+
+  for (const track of glassAtlas.tracks) {
+    await expect(albumRow.getByText(track.title, { exact: true })).toBeVisible({
+      timeout: RESULT_TIMEOUT,
+    });
+  }
+});
+
+test('shows the empty state when nothing matches in either catalog', async ({ context, page }) => {
+  await freshSession(context, page, 'search-empty');
+
+  const missing = 'definitely not in the catalog';
+  await performSearch(page, missing, 'ALL');
+
+  await expect(catalogSection(page).getByText(`No catalog matches for "${missing}".`)).toBeVisible({
+    timeout: RESULT_TIMEOUT,
+  });
+});
+
+test('opens a MusicBrainz artist discography (studio first, singles last) and expands albums', async ({
   context,
   page,
 }) => {
   await freshSession(context, page, 'search-discography');
 
-  await searchByArtist(page, wirelessOrchards.artist, '', 'ALBUM');
+  await performSearch(page, wirelessOrchards.artist, 'ARTIST');
 
-  await expectDiscography(page);
-});
+  await catalogSection(page)
+    .getByRole('button', { name: new RegExp(wirelessOrchards.artist) })
+    .click();
 
-test('lists the same albums for a title of "*", in a track search too', async ({
-  context,
-  page,
-}) => {
-  await freshSession(context, page, 'search-discography-star');
+  await expect(
+    page.getByRole('heading', { name: wirelessOrchards.artist, exact: true }),
+  ).toBeVisible({ timeout: RESULT_TIMEOUT });
+  await expect(
+    page.getByRole('heading', { name: 'Albums, EPs & Singles', exact: true }),
+  ).toBeVisible();
 
-  await searchByArtist(page, wirelessOrchards.artist, '*', 'TRACK');
+  const releaseRows = page
+    .locator('section ul')
+    .filter({ hasText: wirelessOrchards.title })
+    .locator('> li');
+  await expect(releaseRows).toHaveCount(discography.length);
+  await expect(releaseRows).toContainText(discography.map(({ album }) => album.title));
+  await expect(releaseRows).toContainText(discography.map(({ facts }) => facts));
+  await expect(page.getByText(liveAtTheAnnex.title)).toHaveCount(0);
 
-  await expectDiscography(page);
-});
-
-test('says when no artist carries the name', async ({ context, page }) => {
-  await freshSession(context, page, 'search-discography-nobody');
-
-  await searchByArtist(page, 'Nobody Plays Here', '', 'ALBUM');
-
-  await expect(page.getByText('No artist named “Nobody Plays Here” on MusicBrainz.')).toBeVisible({
-    timeout: RESULT_TIMEOUT,
-  });
-});
-
-test('expands the tracklist of a listed album, one whose release has no status too', async ({
-  context,
-  page,
-}) => {
-  await freshSession(context, page, 'search-discography-album');
-
-  await searchByArtist(page, wirelessOrchards.artist, '', 'ALBUM');
-
+  // Expands both an official release and one whose release has no status.
   for (const album of [wirelessOrchards, atticSignals]) {
-    const albumCard = page.getByText(album.title).first();
-    await expect(albumCard).toBeVisible({ timeout: RESULT_TIMEOUT });
-    await albumCard.click();
+    const albumRow = releaseRows.filter({ hasText: album.title }).first();
+    await albumRow.getByText(album.title, { exact: true }).click();
 
     for (const track of album.tracks) {
-      await expect(page.getByText(track.title).first()).toBeVisible({ timeout: RESULT_TIMEOUT });
+      await expect(albumRow.getByText(track.title, { exact: true })).toBeVisible({
+        timeout: RESULT_TIMEOUT,
+      });
     }
   }
 });

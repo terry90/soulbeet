@@ -23,12 +23,16 @@ use client_core::models::{
     AudioQualityProfile, CachePolicy, ClientConfig, ConnectClientMessageDto, ConnectCommandDto,
     ConnectDeviceDto, ConnectServerEventDto, DevicePlatform, LocalAlbum, LocalArtist,
     LocalPlaylist, LocalTrack, NavidromeCredentials, OutboxMutation, PersistedPlaybackSession,
-    PinTarget, PlaybackSnapshotDto, PlaybackSource, SoulbeetAuth, VoiceMatchKind,
+    PinTarget, PlaybackSnapshotDto, PlaybackSource, RemoteCatalogAlbum, SoulbeetAuth,
+    VoiceMatchKind,
 };
 use client_core::sync::CURSOR_PROMOTE_THRESHOLD;
 use client_core::SoulbeetCore;
 use serde_json::{json, Value};
-use shared::metadata::{SearchResult as MetadataSearchResult, Track as MetadataTrack};
+use shared::metadata::{
+    ArtistCatalog, CatalogAlbum, CatalogAlbumDetail, CatalogArtist, CatalogProvider, CatalogTrack,
+    UnifiedCatalogSearch,
+};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
@@ -61,6 +65,10 @@ struct StubState {
     triage_rating: Mutex<Option<u8>>,
     skip_recent_albums: AtomicBool,
     album_detail_fetch_count: AtomicUsize,
+    last_remote_provider: Mutex<Option<Option<String>>>,
+    last_download_album_req: Mutex<Option<Value>>,
+    download_album_returns_error: AtomicBool,
+    artist_returns_none: AtomicBool,
 }
 
 async fn check_soulbeet_auth(st: &StubState, headers: &HeaderMap) -> bool {
@@ -92,7 +100,10 @@ async fn start_stub_server(state: Arc<StubState>) -> String {
     let app = Router::new()
         .route("/api/client/bootstrap", get(handle_bootstrap))
         .route("/api/discovery/triage", get(handle_triage))
-        .route("/api/metadata/search/track", post(handle_remote_search))
+        .route("/api/metadata/search/unified", post(handle_remote_search))
+        .route("/api/metadata/album/detail", post(handle_remote_album_detail))
+        .route("/api/metadata/artist", post(handle_remote_artist_detail))
+        .route("/api/download/album", post(handle_download_album))
         .route("/api/curation/star", post(handle_curation_star))
         .route("/api/curation/rate", post(handle_curation_rate))
         .route("/api/curation/keep", post(handle_curation_keep))
@@ -195,41 +206,348 @@ async fn handle_remote_search(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !check_soulbeet_auth(&st, &headers).await {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "message": "unauthorized" })));
-    }
-    // Enforce Dioxus 0.7 #[post("/api/metadata/search/track")] `{ "input": { "artist": null, "query": ... } }`
-    if body.get("input").and_then(|i| i.get("query")).and_then(Value::as_str).is_none() {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "message": "expected { input: { artist, query } }" })),
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "message": "unauthorized" })),
         );
     }
+    // Enforce Dioxus 0.7 #[post("/api/metadata/search/unified")] `{ "input": { "query", "provider", "limit" } }`
+    let Some(input) = body.get("input") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "expected { input: { query, provider, limit } }" })),
+        );
+    };
+    let Some(query) = input.get("query").and_then(Value::as_str) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing input.query" })),
+        );
+    };
+    if input.get("limit").and_then(Value::as_u64).is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing input.limit" })),
+        );
+    }
+    let req_provider = input
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    *st.last_remote_provider.lock().await = Some(req_provider.clone());
     st.remote_search_hits.fetch_add(1, Ordering::SeqCst);
-    let results = vec![
-        MetadataSearchResult::Track(MetadataTrack {
-            id: "mb-owned".to_string(),
-            title: "Get Lucky".to_string(),
+
+    let provider = match req_provider.as_deref() {
+        Some("musicbrainz") => CatalogProvider::Musicbrainz,
+        _ => CatalogProvider::Deezer,
+    };
+
+    let payload = UnifiedCatalogSearch {
+        query: query.to_string(),
+        provider,
+        fallback_used: false,
+        tracks: vec![
+            CatalogTrack {
+                id: "dz-owned-get-lucky".to_string(),
+                title: "Get Lucky".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                album_id: Some("dz-al-ram".to_string()),
+                album_title: Some("Random Access Memories".to_string()),
+                release_date: Some("2013-05-17".to_string()),
+                duration: Some("06:09".to_string()),
+                duration_secs: Some(369),
+                mbid: Some("mb-owned".to_string()),
+                release_mbid: None,
+                cover_url: Some("https://cdn.example.com/ram.jpg".to_string()),
+                variant_label: None,
+                provider,
+            },
+            CatalogTrack {
+                id: "dz-unowned-instant-crush".to_string(),
+                title: "Instant Crush".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                album_id: Some("dz-al-ram".to_string()),
+                album_title: Some("Random Access Memories".to_string()),
+                release_date: Some("2013-05-17".to_string()),
+                duration: Some("05:37".to_string()),
+                duration_secs: Some(337),
+                mbid: Some("mb-unowned".to_string()),
+                release_mbid: Some("rel-mb-ram".to_string()),
+                cover_url: Some("https://cdn.example.com/ram.jpg".to_string()),
+                variant_label: None,
+                provider,
+            },
+            CatalogTrack {
+                id: "dz-reaper".to_string(),
+                title: "(Don't Fear) The Reaper".to_string(),
+                artist: "Blue Öyster Cult".to_string(),
+                artist_id: Some("dz-ar-boc".to_string()),
+                album_id: Some("dz-al-aof".to_string()),
+                album_title: Some("Agents of Fortune".to_string()),
+                release_date: Some("1976-05-21".to_string()),
+                duration: Some("05:08".to_string()),
+                duration_secs: Some(308),
+                mbid: None,
+                release_mbid: None,
+                cover_url: None,
+                variant_label: None,
+                provider,
+            },
+            CatalogTrack {
+                id: "dz-whats-up".to_string(),
+                title: "What's Up?".to_string(),
+                artist: "4 Non Blondes".to_string(),
+                artist_id: Some("dz-ar-4nb".to_string()),
+                album_id: Some("dz-al-bbmf".to_string()),
+                album_title: Some("Bigger, Better, Faster, More!".to_string()),
+                release_date: Some("1992-10-13".to_string()),
+                duration: Some("04:55".to_string()),
+                duration_secs: Some(295),
+                mbid: None,
+                release_mbid: None,
+                cover_url: None,
+                variant_label: None,
+                provider,
+            },
+        ],
+        albums: vec![
+            CatalogAlbum {
+                id: "dz-al-ram".to_string(),
+                title: "Random Access Memories".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                release_date: Some("2013-05-17".to_string()),
+                first_release_date: None,
+                cover_url: Some("https://cdn.example.com/ram.jpg".to_string()),
+                mbid: Some("mb-al-ram".to_string()),
+                release_types: Some(vec!["Album".to_string()]),
+                track_count: Some(13),
+                provider,
+            },
+            CatalogAlbum {
+                id: "dz-al-hw".to_string(),
+                title: "Homework".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                release_date: Some("1997-01-20".to_string()),
+                first_release_date: None,
+                cover_url: Some("https://cdn.example.com/hw.jpg".to_string()),
+                mbid: Some("mb-al-hw".to_string()),
+                release_types: Some(vec!["Album".to_string()]),
+                track_count: Some(16),
+                provider,
+            },
+        ],
+        artists: vec![CatalogArtist {
+            id: "dz-ar-dp".to_string(),
+            name: "Daft Punk".to_string(),
+            disambiguation: Some("French electronic duo".to_string()),
+            picture_url: Some("https://cdn.example.com/dp.jpg".to_string()),
+            fan_count: Some(4_500_000),
+            mbid: Some("mb-ar-dp".to_string()),
+            provider,
+        }],
+    };
+    (StatusCode::OK, Json(serde_json::to_value(payload).unwrap()))
+}
+
+async fn handle_remote_album_detail(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "message": "unauthorized" })),
+        );
+    }
+    let Some(album_id) = body
+        .get("input")
+        .and_then(|i| i.get("id"))
+        .and_then(Value::as_str)
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "expected { input: { id } }" })),
+        );
+    };
+    let detail = CatalogAlbumDetail {
+        album: CatalogAlbum {
+            id: album_id.to_string(),
+            title: "Homework".to_string(),
             artist: "Daft Punk".to_string(),
-            album_id: Some("al-mb-1".to_string()),
-            album_title: Some("Random Access Memories".to_string()),
-            release_date: Some("2013-05-17".to_string()),
-            duration: Some("06:09".to_string()),
-            mbid: Some("mb-owned".to_string()),
-            release_mbid: None,
-        }),
-        MetadataSearchResult::Track(MetadataTrack {
-            id: "mb-unowned".to_string(),
+            artist_id: Some("dz-ar-dp".to_string()),
+            release_date: Some("1997-01-20".to_string()),
+            first_release_date: None,
+            cover_url: Some("https://cdn.example.com/hw.jpg".to_string()),
+            mbid: Some("mb-al-hw".to_string()),
+            release_types: Some(vec!["Album".to_string()]),
+            track_count: Some(2),
+            provider: CatalogProvider::Deezer,
+        },
+        tracks: vec![
+            CatalogTrack {
+                id: "dz-t-1".to_string(),
+                title: "Daftendirekt".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                album_id: Some(album_id.to_string()),
+                album_title: Some("Homework".to_string()),
+                release_date: Some("1997-01-20".to_string()),
+                duration: Some("02:44".to_string()),
+                duration_secs: Some(164),
+                mbid: None,
+                release_mbid: None,
+                cover_url: Some("https://cdn.example.com/hw.jpg".to_string()),
+                variant_label: None,
+                provider: CatalogProvider::Deezer,
+            },
+            CatalogTrack {
+                id: "dz-t-2".to_string(),
+                title: "Around the World".to_string(),
+                artist: "Daft Punk".to_string(),
+                artist_id: Some("dz-ar-dp".to_string()),
+                album_id: Some(album_id.to_string()),
+                album_title: Some("Homework".to_string()),
+                release_date: Some("1997-01-20".to_string()),
+                duration: Some("07:09".to_string()),
+                duration_secs: Some(429),
+                mbid: None,
+                release_mbid: None,
+                cover_url: Some("https://cdn.example.com/hw.jpg".to_string()),
+                variant_label: None,
+                provider: CatalogProvider::Deezer,
+            },
+        ],
+    };
+    (StatusCode::OK, Json(serde_json::to_value(detail).unwrap()))
+}
+
+async fn handle_remote_artist_detail(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "message": "unauthorized" })),
+        );
+    }
+    let Some(input) = body.get("input") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "expected { input: { id, name } }" })),
+        );
+    };
+    let Some(artist_id) = input.get("id").and_then(Value::as_str) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing input.id" })),
+        );
+    };
+    if st.artist_returns_none.load(Ordering::SeqCst) {
+        return (StatusCode::OK, Json(Value::Null));
+    }
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("Daft Punk");
+    let catalog = ArtistCatalog {
+        artist: CatalogArtist {
+            id: artist_id.to_string(),
+            name: name.to_string(),
+            disambiguation: Some("French electronic duo".to_string()),
+            picture_url: Some("https://cdn.example.com/dp.jpg".to_string()),
+            fan_count: Some(4_500_000),
+            mbid: Some("mb-ar-dp".to_string()),
+            provider: CatalogProvider::Deezer,
+        },
+        provider: CatalogProvider::Deezer,
+        others: vec![],
+        top_tracks: vec![CatalogTrack {
+            id: "dz-top-1".to_string(),
             title: "Instant Crush".to_string(),
-            artist: "Daft Punk".to_string(),
-            album_id: Some("al-mb-1".to_string()),
+            artist: name.to_string(),
+            artist_id: Some(artist_id.to_string()),
+            album_id: Some("dz-al-ram".to_string()),
             album_title: Some("Random Access Memories".to_string()),
             release_date: Some("2013-05-17".to_string()),
             duration: Some("05:37".to_string()),
-            mbid: Some("mb-unowned".to_string()),
+            duration_secs: Some(337),
+            mbid: None,
             release_mbid: None,
-        }),
-    ];
-    (StatusCode::OK, Json(serde_json::to_value(results).unwrap()))
+            cover_url: Some("https://cdn.example.com/ram.jpg".to_string()),
+            variant_label: None,
+            provider: CatalogProvider::Deezer,
+        }],
+        albums: vec![CatalogAlbum {
+            id: "dz-al-hw".to_string(),
+            title: "Homework".to_string(),
+            artist: name.to_string(),
+            artist_id: Some(artist_id.to_string()),
+            release_date: Some("1997-01-20".to_string()),
+            first_release_date: None,
+            cover_url: Some("https://cdn.example.com/hw.jpg".to_string()),
+            mbid: Some("mb-al-hw".to_string()),
+            release_types: Some(vec!["Album".to_string()]),
+            track_count: Some(16),
+            provider: CatalogProvider::Deezer,
+        }],
+        albums_complete: true,
+        singles_complete: true,
+    };
+    (StatusCode::OK, Json(serde_json::to_value(catalog).unwrap()))
+}
+
+async fn handle_download_album(
+    State(st): State<Arc<StubState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_soulbeet_auth(&st, &headers).await {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "message": "unauthorized" })),
+        );
+    }
+    let Some(req) = body.get("req") else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing Dioxus req wrapper" })),
+        );
+    };
+    if req.get("album").is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "message": "missing req.album" })),
+        );
+    }
+    *st.last_download_album_req.lock().await = Some(req.clone());
+    if st.download_album_returns_error.load(Ordering::SeqCst) {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "Error": {
+                    "code": "no_backends",
+                    "stage": "search",
+                    "message": "No download backends configured",
+                    "retry": "not_retryable"
+                }
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "Accepted": {
+                "batch_id": "batch-album-42"
+            }
+        })),
+    )
 }
 
 async fn handle_curation_star(
@@ -1501,6 +1819,106 @@ async fn fts5_search_is_sub_20ms_handles_diacritics_uses_real_metadata_endpoint_
     }
     tx.commit().await.unwrap();
 
+    // Seed owned tracks whose spellings differ from remote catalog (umlauts, parens, curly quotes)
+    // to verify normalized local-vs-remote deduplication.
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "owned-reaper".to_string(),
+            title: "Don't Fear the Reaper".to_string(),
+            artist_id: Some("ar-boc".to_string()),
+            artist_name: "Blue Oyster Cult".to_string(),
+            album_id: Some("al-aof".to_string()),
+            album_name: "Agents of Fortune".to_string(),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_secs: 308,
+            year: Some(1976),
+            genre: Some("Rock".to_string()),
+            bit_rate: Some(1411),
+            suffix: Some("flac".to_string()),
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: None,
+            path: None,
+            starred: false,
+            user_rating: 0,
+            play_count: 5,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "owned-whatsup".to_string(),
+            title: "What’s Up".to_string(),
+            artist_id: Some("ar-4nb".to_string()),
+            artist_name: "4 Non Blondes".to_string(),
+            album_id: Some("al-4nb".to_string()),
+            album_name: "Bigger, Better, Faster, More!".to_string(),
+            track_number: Some(3),
+            disc_number: Some(1),
+            duration_secs: 295,
+            year: Some(1992),
+            genre: Some("Alternative".to_string()),
+            bit_rate: Some(1411),
+            suffix: Some("flac".to_string()),
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: None,
+            path: None,
+            starred: false,
+            user_rating: 0,
+            play_count: 2,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_artist(
+        core.pool(),
+        &LocalArtist {
+            id: "ar-boc".to_string(),
+            name: "Blue Öyster Cult".to_string(),
+            album_count: 1,
+            cover_art_id: None,
+            starred: false,
+            musicbrainz_id: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_album(
+        core.pool(),
+        &LocalAlbum {
+            id: "al-noel".to_string(),
+            name: "Noël à la Française".to_string(),
+            artist_id: Some("ar-bulk".to_string()),
+            artist_name: "Bulk Artist".to_string(),
+            year: Some(2024),
+            genre: Some("Indie".to_string()),
+            song_count: 1,
+            duration_secs: 210,
+            cover_art_id: None,
+            starred: false,
+            created_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
     // Cache only s1 locally
     let p = dir.path().join("audio_cache");
     tokio::fs::create_dir_all(&p).await.unwrap();
@@ -1511,21 +1929,128 @@ async fn fts5_search_is_sub_20ms_handles_diacritics_uses_real_metadata_endpoint_
         .await
         .unwrap();
 
-    // Online search: hits POST /api/metadata/search/track returning Vec<shared::metadata::SearchResult>
-    // Merges local + deduplicated remote (Instant Crush kept, owned Get Lucky deduplicated!)
+    // Split instant local search makes ZERO HTTP requests and handles diacritics on tracks, albums, and artists!
+    let local_only = core.search_local("Blue Oyster", 20).await.unwrap();
+    assert_eq!(state.remote_search_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(local_only.local_artists.len(), 1);
+    assert_eq!(local_only.local_artists[0].id, "ar-boc");
+    assert!(local_only.remote_tracks.is_empty());
+    assert!(local_only.remote_albums.is_empty());
+    assert!(local_only.remote_artists.is_empty());
+
+    let local_noel = core.search_local("Noel francaise", 10).await.unwrap();
+    assert_eq!(state.remote_search_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(local_noel.local_tracks.len(), 1);
+    assert_eq!(local_noel.local_tracks[0].id, "bulk-42");
+    assert_eq!(local_noel.local_albums.len(), 1);
+    assert_eq!(local_noel.local_albums[0].id, "al-noel");
+    assert!(
+        local_noel.elapsed_ms < 50,
+        "local search took {}ms",
+        local_noel.elapsed_ms
+    );
+
+    // Online unified search: hits POST /api/metadata/search/unified returning UnifiedCatalogSearch.
+    // Owned tracks (Get Lucky, Blue Oyster Cult - Don't Fear the Reaper, 4 Non Blondes - What's Up)
+    // and owned album (Random Access Memories) are deduplicated via canonical normalization!
     let online = core.search("Daft Punk", 20).await.unwrap();
     assert_eq!(online.local_tracks.len(), 1);
+    assert_eq!(online.remote_provider.as_deref(), Some("deezer"));
+    assert!(!online.remote_fallback_used);
     assert_eq!(online.remote_tracks.len(), 1);
+    assert_eq!(online.remote_tracks[0].id, "dz-unowned-instant-crush");
+    assert_eq!(online.remote_tracks[0].mbid, "mb-unowned");
+    assert_eq!(
+        online.remote_tracks[0].release_mbid.as_deref(),
+        Some("rel-mb-ram")
+    );
     assert_eq!(online.remote_tracks[0].title, "Instant Crush");
-    assert_eq!(online.remote_tracks[0].duration_secs, Some(337));
+    assert_eq!(online.remote_tracks[0].album, "Random Access Memories");
+    assert_eq!(online.remote_tracks[0].duration_secs, 337);
     assert_eq!(online.remote_tracks[0].year, Some(2013));
+    assert_eq!(online.remote_tracks[0].provider, "deezer");
+    assert_eq!(online.remote_albums.len(), 1);
+    assert_eq!(online.remote_albums[0].id, "dz-al-hw");
+    assert_eq!(online.remote_albums[0].title, "Homework");
+    assert_eq!(online.remote_artists.len(), 1);
+    assert_eq!(online.remote_artists[0].id, "dz-ar-dp");
+    assert_eq!(online.remote_artists[0].fan_count, Some(4_500_000));
     assert_eq!(state.remote_search_hits.load(Ordering::SeqCst), 1);
+
+    // Explicit provider override via search_remote("...", Some("musicbrainz"), 20)
+    let mb_remote = core
+        .search_remote("Daft Punk", Some("musicbrainz"), 20)
+        .await
+        .unwrap();
+    assert_eq!(mb_remote.provider, "musicbrainz");
+    assert_eq!(
+        *state.last_remote_provider.lock().await,
+        Some(Some("musicbrainz".to_string()))
+    );
+    assert_eq!(mb_remote.tracks.len(), 1);
+    assert_eq!(mb_remote.tracks[0].provider, "musicbrainz");
+    assert_eq!(mb_remote.albums.len(), 1);
+    assert_eq!(mb_remote.artists.len(), 1);
+
+    // Remote album detail, artist discography, and 1-tap remote album download round-trips
+    let album_detail = core.get_remote_album("dz-al-hw").await.unwrap();
+    assert_eq!(album_detail.album.title, "Homework");
+    assert_eq!(album_detail.tracks.len(), 2);
+    assert_eq!(album_detail.tracks[0].title, "Daftendirekt");
+    assert_eq!(album_detail.tracks[1].duration_secs, 429);
+
+    let artist_detail = core
+        .get_remote_artist("dz-ar-dp", Some("Daft Punk"))
+        .await
+        .unwrap()
+        .expect("artist detail should be Some");
+    assert_eq!(artist_detail.artist.name, "Daft Punk");
+    assert_eq!(artist_detail.provider, "deezer");
+    assert_eq!(artist_detail.top_tracks.len(), 1);
+    assert_eq!(artist_detail.albums.len(), 1);
+
+    state.artist_returns_none.store(true, Ordering::SeqCst);
+    assert!(core
+        .get_remote_artist("dz-missing", None)
+        .await
+        .unwrap()
+        .is_none());
+    state.artist_returns_none.store(false, Ordering::SeqCst);
+
+    let batch_id = core
+        .download_remote_album(&album_detail.album)
+        .await
+        .unwrap();
+    assert_eq!(batch_id, "batch-album-42");
+    let dl_req = state
+        .last_download_album_req
+        .lock()
+        .await
+        .clone()
+        .expect("download album request recorded");
+    assert_eq!(dl_req["album"]["id"], "dz-al-hw");
+    assert_eq!(dl_req["album"]["title"], "Homework");
+    assert!(dl_req["folder_id"].is_null());
+
+    state
+        .download_album_returns_error
+        .store(true, Ordering::SeqCst);
+    let dl_err = core
+        .download_remote_album(&album_detail.album)
+        .await
+        .expect_err("Error AutoDownloadResult must return Err");
+    assert!(
+        dl_err.to_string().contains("No download backends configured"),
+        "unexpected error: {dl_err}"
+    );
+    state
+        .download_album_returns_error
+        .store(false, Ordering::SeqCst);
 
     // Diacritic folding + punctuation safety
     let noel = core.search("Noel francaise", 10).await.unwrap();
     assert_eq!(noel.local_tracks.len(), 1);
     assert_eq!(noel.local_tracks[0].id, "bulk-42");
-    assert!(noel.elapsed_ms < 50, "FTS5 search took {}ms", noel.elapsed_ms);
 
     let acdc = core.search("AC/DC", 10).await.unwrap();
     assert_eq!(acdc.local_tracks.len(), 1);
@@ -1533,11 +2058,38 @@ async fn fts5_search_is_sub_20ms_handles_diacritics_uses_real_metadata_endpoint_
 
     // Offline-only mode: ZERO additional network calls and filters strictly to cached tracks!
     let hits_before_offline = state.remote_search_hits.load(Ordering::SeqCst);
-    assert_eq!(hits_before_offline, 3);
     core.set_offline_only(true);
     let offline_hit = core.search("Get Lucky", 10).await.unwrap();
     assert_eq!(offline_hit.local_tracks.len(), 1);
     assert!(offline_hit.remote_tracks.is_empty());
+    assert!(offline_hit.remote_albums.is_empty());
+    assert!(offline_hit.remote_artists.is_empty());
+    let offline_remote = core.search_remote("Daft Punk", None, 10).await.unwrap();
+    assert!(offline_remote.tracks.is_empty());
+    assert!(matches!(
+        core.get_remote_album("dz-al-hw").await,
+        Err(CoreError::Offline(_))
+    ));
+    assert!(matches!(
+        core.get_remote_artist("dz-ar-dp", None).await,
+        Err(CoreError::Offline(_))
+    ));
+    assert!(matches!(
+        core.download_remote_album(&RemoteCatalogAlbum {
+            id: "dz-al-hw".to_string(),
+            title: "Homework".to_string(),
+            artist: "Daft Punk".to_string(),
+            artist_id: None,
+            release_date: None,
+            cover_url: None,
+            mbid: None,
+            release_types: vec![],
+            track_count: None,
+            provider: "deezer".to_string(),
+        })
+        .await,
+        Err(CoreError::Offline(_))
+    ));
     let offline_miss = core.search("Noel francaise", 10).await.unwrap();
     assert!(offline_miss.local_tracks.is_empty());
     assert_eq!(

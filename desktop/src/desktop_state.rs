@@ -14,8 +14,8 @@ use client_core::models::{
     AudioQualityProfile, CachePolicy, CacheStats, ClientConfig, ConnectCommandDto,
     ConnectDeviceDto, ConnectServerEventDto, DevicePlatform as CoreDevicePlatform, LocalAlbum,
     LocalDiscoveryTrack, LocalPlaylist, LocalTrack, NavidromeCredentials, OutboxMutation,
-    PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource, RemoteCatalogTrack,
-    SoulbeetAuth, SyncReport,
+    PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource, RemoteCatalogAlbum,
+    RemoteCatalogTrack, SoulbeetAuth, SyncReport,
 };
 use client_core::SoulbeetCore;
 use directories::ProjectDirs;
@@ -1301,6 +1301,14 @@ pub fn connect_devices_visibly_equal(a: &[ConnectDevice], b: &[ConnectDevice]) -
         })
 }
 
+/// Live UI state for 1-tap remote album downloads triggered from Desktop Search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAlbumDownloadState {
+    Downloading,
+    Queued { batch_id: String },
+    Failed(String),
+}
+
 /// Shared Dioxus context controlling the entire Desktop Studio app.
 #[derive(Clone, Copy)]
 pub struct DesktopStudio {
@@ -1330,6 +1338,7 @@ pub struct DesktopStudio {
     pub discovery_refresh_error: Signal<Option<String>>,
     pub discovery_poll_gen: Signal<Arc<AtomicU64>>,
     pub acquiring_tracks: Signal<HashMap<String, AcquireStageBadge>>,
+    pub downloading_albums: Signal<HashMap<String, RemoteAlbumDownloadState>>,
     pub connect_devices: Signal<Vec<ConnectDevice>>,
     pub lyrics: Signal<Vec<TrackLyrics>>,
     pub lyrics_loading: Signal<bool>,
@@ -2027,6 +2036,8 @@ impl DesktopStudio {
             self.connect_gen.peek().fetch_add(1, Ordering::SeqCst);
             self.sync_status.write().connect_online = false;
             self.connect_devices.set(Vec::new());
+            self.acquiring_tracks.write().clear();
+            self.downloading_albums.write().clear();
             if let Some(core) = core_opt {
                 spawn(async move {
                     core.connect_client().disconnect().await;
@@ -2851,7 +2862,7 @@ impl DesktopStudio {
     }
 
     /// Calls `POST {base}/api/acquire-and-play` (`{"req": AcquireAndPlayRequest}`) to acquire
-    /// an unowned MusicBrainz track and immediately play it once ready!
+    /// an unowned remote catalog track and immediately play it once ready.
     pub fn acquire_and_play_remote(
         &mut self,
         player: PlayerContext,
@@ -2869,12 +2880,15 @@ impl DesktopStudio {
             ));
             return;
         };
-        let row_key = remote_acquire_key(
-            remote.mbid.as_deref(),
-            &remote.artist,
-            &remote.title,
-            remote.album.as_deref(),
-        );
+        let row_key = remote_track_acquire_key(&remote);
+        let album_opt = (!remote.album.trim().is_empty()).then(|| remote.album.clone());
+        let mbid_opt = (!remote.mbid.trim().is_empty()).then(|| remote.mbid.clone());
+        let release_mbid_opt = remote
+            .release_mbid
+            .clone()
+            .filter(|s| !s.trim().is_empty());
+        let duration_opt = (remote.duration_secs > 0).then_some(remote.duration_secs);
+
         self.acquiring_tracks.write().insert(
             row_key.clone(),
             AcquireStageBadge::Acquiring {
@@ -2891,10 +2905,10 @@ impl DesktopStudio {
             let payload = AcquireAndPlayRequest {
                 artist: remote.artist.clone(),
                 title: remote.title.clone(),
-                album: remote.album.clone(),
-                recording_mbid: remote.mbid.clone(),
-                release_mbid: None,
-                duration_s: remote.duration_secs.and_then(|d| u32::try_from(d).ok()),
+                album: album_opt.clone(),
+                recording_mbid: mbid_opt,
+                release_mbid: release_mbid_opt,
+                duration_s: duration_opt,
                 folder_id: None,
                 prefer_fast: true,
             };
@@ -2920,16 +2934,15 @@ impl DesktopStudio {
                                     id: navidrome_song_id,
                                     title: remote.title.clone(),
                                     artist: remote.artist.clone(),
-                                    album: remote.album.clone(),
-                                    duration_secs: remote
-                                        .duration_secs
-                                        .and_then(|d| u32::try_from(d).ok()),
+                                    album: album_opt.clone(),
+                                    cover_art_url: remote.cover_url.clone(),
+                                    duration_secs: duration_opt,
                                     codec_badge: codec,
                                     ..Default::default()
                                 };
                                 player.play_track(track);
                                 studio.status_toast.set(Some(format!(
-                                    "Already in library — playing \"{}\"",
+                                    "Already in library: playing \"{}\"",
                                     remote.title
                                 )));
                             }
@@ -2940,7 +2953,7 @@ impl DesktopStudio {
                                     AcquireStageBadge::Acquiring { label },
                                 );
                                 studio.status_toast.set(Some(format!(
-                                    "Acquiring \"{}\" — will sync when imported",
+                                    "Acquiring \"{}\": will sync when imported",
                                     remote.title
                                 )));
                                 // Background delta sync check to pick up the acquired track cleanly.
@@ -2949,19 +2962,27 @@ impl DesktopStudio {
                                     let q_title = remote.title.clone();
                                     for _ in 0..8 {
                                         tokio::time::sleep(Duration::from_secs(5)).await;
-                                        if core.is_offline_only() {
-                                            break;
+                                        let same_session = studio
+                                            .core
+                                            .peek()
+                                            .as_ref()
+                                            .is_some_and(|active| Arc::ptr_eq(active, &core));
+                                        if !same_session || core.is_offline_only() {
+                                            return;
                                         }
                                         let _ = core.sync_now(false).await;
                                         if let Ok(found) = core
-                                            .search(&format!("{q_artist} {q_title}"), 5)
+                                            .search_local(&format!("{q_artist} {q_title}"), 10)
                                             .await
                                         {
                                             if let Some(local) = found.local_tracks.into_iter().find(
                                                 |t| {
-                                                    t.title.eq_ignore_ascii_case(&q_title)
-                                                        && t.artist_name
-                                                            .eq_ignore_ascii_case(&q_artist)
+                                                    acquired_track_matches(
+                                                        &t.artist_name,
+                                                        &t.title,
+                                                        &q_artist,
+                                                        &q_title,
+                                                    )
                                                 },
                                             ) {
                                                 let cached = load_cached_track_ids(&core).await;
@@ -3007,6 +3028,75 @@ impl DesktopStudio {
                             message: Some(err.to_string()),
                         },
                     );
+                }
+            }
+        });
+    }
+
+    /// Triggers a 1-tap server-side remote album download via `SoulbeetCore::download_remote_album`
+    /// and updates live per-album download feedback state + toast notifications.
+    pub fn download_remote_album(&mut self, album: RemoteCatalogAlbum) {
+        let cfg = self.config.peek().clone();
+        if cfg.offline_only {
+            self.status_toast
+                .set(Some("Disable Offline Only mode to download catalog albums.".into()));
+            return;
+        }
+        let Some(core) = self.core.peek().clone() else {
+            self.status_toast.set(Some(
+                "Connect a Soulbeet server in Settings to download albums.".into(),
+            ));
+            return;
+        };
+        let album_key = remote_album_download_key(&album);
+        if matches!(
+            self.downloading_albums.peek().get(&album_key),
+            Some(RemoteAlbumDownloadState::Downloading)
+        ) {
+            return;
+        }
+
+        self.downloading_albums
+            .write()
+            .insert(album_key.clone(), RemoteAlbumDownloadState::Downloading);
+        let mut studio = *self;
+
+        spawn(async move {
+            let result = core.download_remote_album(&album).await;
+            let same_session = studio
+                .core
+                .peek()
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &core));
+            if !same_session || core.is_offline_only() {
+                return;
+            }
+            match result {
+                Ok(batch_id) => {
+                    let queued_state = RemoteAlbumDownloadState::Queued { batch_id };
+                    studio
+                        .downloading_albums
+                        .write()
+                        .insert(album_key.clone(), queued_state.clone());
+                    studio.status_toast.set(Some(format!(
+                        "Queued \"{}\" in Activity",
+                        album.title
+                    )));
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    let mut map = studio.downloading_albums.write();
+                    if map.get(&album_key) == Some(&queued_state) {
+                        map.remove(&album_key);
+                    }
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    studio.downloading_albums.write().insert(
+                        album_key,
+                        RemoteAlbumDownloadState::Failed(msg.clone()),
+                    );
+                    studio
+                        .status_toast
+                        .set(Some(format!("Album download failed: {msg}")));
                 }
             }
         });
@@ -3667,6 +3757,8 @@ impl DesktopStudio {
             self.bootstrap.set(initial_bootstrap);
         }
         self.core_error.set(None);
+        self.acquiring_tracks.write().clear();
+        self.downloading_albums.write().clear();
         let mut studio = *self;
 
         spawn(async move {
@@ -3769,6 +3861,8 @@ impl DesktopStudio {
         self.pending_drops.set(PendingDropQueue::new());
         self.in_flight_triage.write().clear();
         self.optimistic_kept.write().clear();
+        self.acquiring_tracks.write().clear();
+        self.downloading_albums.write().clear();
         self.discovery_poll_gen.peek().fetch_add(1, Ordering::SeqCst);
         self.discovery_generating.set(false);
         self.discovery_progress_label.set(None);
@@ -4031,6 +4125,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let discovery_refresh_error = use_signal(|| None::<String>);
     let discovery_poll_gen = use_signal(|| Arc::new(AtomicU64::new(0)));
     let acquiring_tracks = use_signal(HashMap::<String, AcquireStageBadge>::new);
+    let downloading_albums = use_signal(HashMap::<String, RemoteAlbumDownloadState>::new);
     let connect_devices = use_signal(Vec::<ConnectDevice>::new);
     let lyrics = use_signal(Vec::<TrackLyrics>::new);
     let lyrics_loading = use_signal(|| false);
@@ -4141,6 +4236,7 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         discovery_refresh_error,
         discovery_poll_gen,
         acquiring_tracks,
+        downloading_albums,
         connect_devices,
         lyrics,
         lyrics_loading,
@@ -4389,10 +4485,11 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
 }
 
 /// Stable key for tracking per-row Acquire & Play state on Desktop remote catalog results.
-/// Uses the MusicBrainz recording MBID when available so distinct recordings sharing the
-/// same `(artist, title)` never light up together.
+/// Prefers non-empty recording MBID, then non-empty provider track ID (e.g. `deezer:track:...`),
+/// then Unicode-lowercased `artist::title::album` so distinct tracks never collide.
 pub fn remote_acquire_key(
     mbid: Option<&str>,
+    track_id: Option<&str>,
     artist: &str,
     title: &str,
     album: Option<&str>,
@@ -4400,11 +4497,50 @@ pub fn remote_acquire_key(
     if let Some(m) = mbid.map(str::trim).filter(|m| !m.is_empty()) {
         return format!("mbid:{}", m.to_ascii_lowercase());
     }
+    if let Some(id) = track_id.map(str::trim).filter(|id| !id.is_empty()) {
+        return format!("id:{}", id.to_lowercase());
+    }
     format!(
         "{}::{}::{}",
         artist.trim().to_lowercase(),
         title.trim().to_lowercase(),
         album.unwrap_or_default().trim().to_lowercase()
+    )
+}
+
+/// Convenience wrapper computing [`remote_acquire_key`] from a [`RemoteCatalogTrack`].
+pub fn remote_track_acquire_key(remote: &RemoteCatalogTrack) -> String {
+    remote_acquire_key(
+        Some(&remote.mbid),
+        Some(&remote.id),
+        &remote.artist,
+        &remote.title,
+        Some(&remote.album),
+    )
+}
+
+/// Matches a newly imported local track against the requested remote track using canonical
+/// Unicode/accent/edition normalization so accents, smart quotes, and `(Remastered)` tags match.
+pub fn acquired_track_matches(
+    local_artist: &str,
+    local_title: &str,
+    remote_artist: &str,
+    remote_title: &str,
+) -> bool {
+    shared::search_norm::track_dedup_key(local_artist, local_title)
+        == shared::search_norm::track_dedup_key(remote_artist, remote_title)
+}
+
+/// Stable key for tracking per-album download state in Desktop Search.
+pub fn remote_album_download_key(album: &RemoteCatalogAlbum) -> String {
+    let trimmed_id = album.id.trim();
+    if !trimmed_id.is_empty() {
+        return trimmed_id.to_lowercase();
+    }
+    format!(
+        "{}::{}",
+        album.artist.trim().to_lowercase(),
+        album.title.trim().to_lowercase()
     )
 }
 
@@ -4667,15 +4803,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_acquire_key_prefers_mbid_and_disambiguates_album() {
+    fn remote_acquire_key_prefers_mbid_then_track_id_then_artist_title_album() {
         let k1 = remote_acquire_key(
             Some("11111111-1111-1111-1111-111111111111"),
+            Some("deezer:track:100"),
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
             Some("Agents of Fortune"),
         );
         let k2 = remote_acquire_key(
             Some("22222222-2222-2222-2222-222222222222"),
+            Some("deezer:track:100"),
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
             Some("Greatest Hits"),
@@ -4683,18 +4821,63 @@ mod tests {
         assert_ne!(k1, k2);
         assert_eq!(k1, "mbid:11111111-1111-1111-1111-111111111111");
 
-        let no_mbid_a = remote_acquire_key(
-            None,
+        let deezer_a = remote_acquire_key(
+            Some(""),
+            Some("deezer:track:101"),
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
             Some("Agents of Fortune"),
         );
-        let no_mbid_b = remote_acquire_key(
+        let deezer_b = remote_acquire_key(
+            None,
+            Some("deezer:track:202"),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Agents of Fortune"),
+        );
+        assert_ne!(deezer_a, deezer_b);
+        assert_eq!(deezer_a, "id:deezer:track:101");
+
+        let fallback_a = remote_acquire_key(
+            None,
+            Some("  "),
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+            Some("Agents of Fortune"),
+        );
+        let fallback_b = remote_acquire_key(
+            None,
             None,
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
             Some("Greatest Hits"),
         );
-        assert_ne!(no_mbid_a, no_mbid_b);
+        assert_ne!(fallback_a, fallback_b);
+        assert_eq!(
+            fallback_a,
+            "blue öyster cult::(don't fear) the reaper::agents of fortune"
+        );
+    }
+
+    #[test]
+    fn acquired_track_matches_normalizes_accents_smart_quotes_and_remaster_tags() {
+        assert!(acquired_track_matches(
+            "Blue Öyster Cult",
+            "(Don’t Fear) The Reaper (Remastered 2001)",
+            "Blue Oyster Cult",
+            "(Don't Fear) The Reaper",
+        ));
+        assert!(acquired_track_matches(
+            "Hermanos Gutiérrez",
+            "El Bueno y el Malo",
+            "Hermanos Gutierrez",
+            "El Bueno y el Malo - 2022 Remaster",
+        ));
+        assert!(!acquired_track_matches(
+            "Blue Öyster Cult",
+            "Godzilla",
+            "Blue Öyster Cult",
+            "(Don't Fear) The Reaper",
+        ));
     }
 }

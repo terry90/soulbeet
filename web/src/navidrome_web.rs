@@ -49,9 +49,18 @@ pub struct SubsonicAlbumSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubsonicArtistSummary {
+    pub id: String,
+    pub name: String,
+    pub album_count: u32,
+    pub cover_art_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NavidromeSearchHits {
     pub songs: Vec<PlayerTrack>,
     pub albums: Vec<SubsonicAlbumSummary>,
+    pub artists: Vec<SubsonicArtistSummary>,
 }
 
 #[cfg(feature = "web")]
@@ -193,6 +202,32 @@ mod wire {
         pub(super) song: Vec<RawSong>,
         #[serde(default)]
         pub(super) album: Vec<RawAlbum>,
+        #[serde(default)]
+        pub(super) artist: Vec<RawArtist>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(super) struct RawArtist {
+        pub(super) id: String,
+        pub(super) name: String,
+        #[serde(rename = "albumCount", default)]
+        pub(super) album_count: u32,
+        #[serde(rename = "coverArt", default)]
+        pub(super) cover_art: Option<String>,
+        #[serde(rename = "artistImageUrl", default)]
+        pub(super) artist_image_url: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct ArtistDetailData {
+        #[serde(default)]
+        pub(super) artist: Option<RawArtistDetail>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct RawArtistDetail {
+        #[serde(default)]
+        pub(super) album: Vec<RawAlbum>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -265,6 +300,22 @@ mod wire {
                 song_count: self.song_count,
                 year: self.year,
                 cover_art_url: Some(subsonic_cover_art_url(info, &cover_id, 300)),
+            }
+        }
+    }
+
+    impl RawArtist {
+        pub(super) fn into_summary(self, info: &NavidromeSessionInfo) -> SubsonicArtistSummary {
+            let cover_art_url = self
+                .cover_art
+                .filter(|c| !c.trim().is_empty())
+                .map(|cid| subsonic_cover_art_url(info, &cid, 256))
+                .or_else(|| self.artist_image_url.filter(|u| !u.trim().is_empty()));
+            SubsonicArtistSummary {
+                id: self.id,
+                name: self.name,
+                album_count: self.album_count,
+                cover_art_url,
             }
         }
     }
@@ -606,7 +657,7 @@ pub async fn search_navidrome(
             ("query", query),
             ("songCount", "24"),
             ("albumCount", "8"),
-            ("artistCount", "0"),
+            ("artistCount", "8"),
         ],
     )
     .await?;
@@ -624,6 +675,11 @@ pub async fn search_navidrome(
             .into_iter()
             .map(|a| a.into_summary(info))
             .collect(),
+        artists: res
+            .artist
+            .into_iter()
+            .map(|a| a.into_summary(info))
+            .collect(),
     })
 }
 
@@ -633,6 +689,29 @@ pub async fn search_navidrome(
     _query: &str,
 ) -> Result<NavidromeSearchHits, String> {
     Ok(NavidromeSearchHits::default())
+}
+
+#[cfg(feature = "web")]
+pub async fn fetch_artist_albums(
+    info: &NavidromeSessionInfo,
+    artist_id: &str,
+) -> Result<Vec<SubsonicAlbumSummary>, String> {
+    let data: ArtistDetailData = fetch_subsonic(info, "getArtist", &[("id", artist_id)]).await?;
+    Ok(data
+        .artist
+        .map(|a| a.album)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.into_summary(info))
+        .collect())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn fetch_artist_albums(
+    _info: &NavidromeSessionInfo,
+    _artist_id: &str,
+) -> Result<Vec<SubsonicAlbumSummary>, String> {
+    Ok(Vec::new())
 }
 
 #[cfg(feature = "web")]

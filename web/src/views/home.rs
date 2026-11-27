@@ -435,7 +435,7 @@ pub fn HomePage() -> Element {
                             "Welcome to Soulbeet Studio"
                         }
                         p { class: "text-[14px] text-beet-text-secondary",
-                            "Connect Navidrome in Settings to stream your library, or jump straight into Search to Acquire & Play any track from MusicBrainz."
+                            "Connect Navidrome in Settings to stream your library, or jump straight into Search to Acquire & Play any track from the catalog."
                         }
                     }
                     div { class: "flex flex-wrap items-center justify-center gap-3 pt-1",

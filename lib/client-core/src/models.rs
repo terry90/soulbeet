@@ -420,12 +420,69 @@ pub struct LibraryStats {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCatalogTrack {
-    pub mbid: Option<String>,
+    pub id: String,
+    pub mbid: String,
+    pub release_mbid: Option<String>,
     pub title: String,
     pub artist: String,
-    pub album: Option<String>,
-    pub duration_secs: Option<u64>,
-    pub year: Option<i32>,
+    pub artist_id: Option<String>,
+    pub album: String,
+    pub album_id: Option<String>,
+    pub duration_secs: u32,
+    pub year: Option<u32>,
+    pub cover_url: Option<String>,
+    pub variant_label: Option<String>,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalogAlbum {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub artist_id: Option<String>,
+    pub release_date: Option<String>,
+    pub cover_url: Option<String>,
+    pub mbid: Option<String>,
+    pub release_types: Vec<String>,
+    pub track_count: Option<u32>,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalogArtist {
+    pub id: String,
+    pub name: String,
+    pub disambiguation: Option<String>,
+    pub picture_url: Option<String>,
+    pub fan_count: Option<u64>,
+    pub mbid: Option<String>,
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCatalogResults {
+    pub query: String,
+    pub provider: String,
+    pub fallback_used: bool,
+    pub tracks: Vec<RemoteCatalogTrack>,
+    pub albums: Vec<RemoteCatalogAlbum>,
+    pub artists: Vec<RemoteCatalogArtist>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAlbumDetail {
+    pub album: RemoteCatalogAlbum,
+    pub tracks: Vec<RemoteCatalogTrack>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteArtistDetail {
+    pub artist: RemoteCatalogArtist,
+    pub provider: String,
+    pub others: Vec<RemoteCatalogArtist>,
+    pub top_tracks: Vec<RemoteCatalogTrack>,
+    pub albums: Vec<RemoteCatalogAlbum>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +494,10 @@ pub struct SearchResults {
     pub local_albums: Vec<LocalAlbum>,
     pub local_artists: Vec<LocalArtist>,
     pub remote_tracks: Vec<RemoteCatalogTrack>,
+    pub remote_albums: Vec<RemoteCatalogAlbum>,
+    pub remote_artists: Vec<RemoteCatalogArtist>,
+    pub remote_provider: Option<String>,
+    pub remote_fallback_used: bool,
 }
 
 // --- Android Auto Bounded Browse & Ignition Resumption ---

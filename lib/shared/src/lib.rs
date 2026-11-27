@@ -11,6 +11,7 @@ pub mod navidrome;
 pub mod oauth;
 pub mod playlist_import;
 pub mod recommendation;
+pub mod search_norm;
 pub mod slskd;
 pub mod system;
 pub mod ytdlp;

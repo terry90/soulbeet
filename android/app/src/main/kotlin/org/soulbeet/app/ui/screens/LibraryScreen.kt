@@ -83,7 +83,6 @@ fun LibraryScreen(
     onRemoveTrack: (FfiTrack) -> Unit,
     onKeepDiscovery: (FfiDiscoveryTrack) -> Unit,
     onDropDiscovery: (FfiDiscoveryTrack) -> Unit,
-    onCloseContainerDetail: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalSoulbeetColors.current
@@ -447,22 +446,6 @@ fun LibraryScreen(
             }
         }
     }
-
-    state.selectedContainer?.let { detail ->
-        ContainerDetailSheet(
-            detail = detail,
-            state = state,
-            artAuthority = artAuthority,
-            onDismiss = onCloseContainerDetail,
-            onPlayAll = { onPlayQueue(detail.tracks, 0, detail.title) },
-            onPlayIndex = { idx -> onPlayQueue(detail.tracks, idx, detail.title) },
-            onTogglePin = {
-                detail.pinTarget?.let { target -> onTogglePin(target, detail.title) }
-            },
-            onStarTrack = onStarTrack,
-            onRemoveTrack = onRemoveTrack,
-        )
-    }
 }
 
 private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
@@ -628,7 +611,7 @@ private fun EmptyLibraryNotice(message: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ContainerDetailSheet(
+internal fun ContainerDetailSheet(
     detail: ContainerDetailUi,
     state: AppUiState,
     artAuthority: String,

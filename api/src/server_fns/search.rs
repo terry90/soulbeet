@@ -2,7 +2,10 @@ use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use shared::{
     download::{DownloadQuery, SearchResult as DownloadSearchResult},
-    metadata::{AlbumWithTracks, Discography, SearchResult},
+    metadata::{
+        AlbumWithTracks, ArtistCatalog, CatalogAlbumDetail, CatalogProvider, Discography,
+        SearchResult, UnifiedCatalogSearch,
+    },
 };
 
 #[cfg(feature = "server")]
@@ -22,12 +25,28 @@ pub struct SearchQuery {
     pub query: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnifiedSearchQuery {
+    pub query: String,
+    #[serde(default)]
+    pub provider: Option<CatalogProvider>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// An artist-only search: the artist's name, and the MBID of the one of that
 /// name to list when it is not the first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiscographyQuery {
     pub artist: String,
     pub mbid: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtistCatalogQuery {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,6 +57,35 @@ pub struct AlbumQuery {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PollQuery {
     pub search_id: String,
+}
+
+#[post("/api/metadata/search/unified", _: AuthSession)]
+pub async fn search_unified(
+    input: UnifiedSearchQuery,
+) -> Result<UnifiedCatalogSearch, ServerFnError> {
+    metadata::search_unified(
+        &input.query,
+        input.provider,
+        input.limit.unwrap_or(metadata::UNIFIED_SEARCH_LIMIT),
+    )
+    .await
+    .map_err(failure_error)
+}
+
+#[post("/api/metadata/album/detail", _: AuthSession)]
+pub async fn find_catalog_album(input: AlbumQuery) -> Result<CatalogAlbumDetail, ServerFnError> {
+    metadata::album_detail(&input.id)
+        .await
+        .map_err(failure_error)
+}
+
+#[post("/api/metadata/artist", _: AuthSession)]
+pub async fn find_catalog_artist(
+    input: ArtistCatalogQuery,
+) -> Result<Option<ArtistCatalog>, ServerFnError> {
+    metadata::artist_catalog(&input.id, input.name.as_deref())
+        .await
+        .map_err(failure_error)
 }
 
 #[post("/api/metadata/search/album", _: AuthSession)]
@@ -138,6 +186,58 @@ mod tests {
             a,
             AlbumQuery {
                 id: "8c1e2b5d-0f3a-4e6b-9d7c-2a1b3c4d5e6f".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unified_search_and_artist_catalog_queries_deserialize_with_defaults() {
+        let minimal: UnifiedSearchQuery =
+            serde_json::from_value(serde_json::json!({"query": "daft punk"})).unwrap();
+        assert_eq!(
+            minimal,
+            UnifiedSearchQuery {
+                query: "daft punk".into(),
+                provider: None,
+                limit: None,
+            }
+        );
+
+        let full: UnifiedSearchQuery = serde_json::from_value(serde_json::json!({
+            "query": "daft punk",
+            "provider": "musicbrainz",
+            "limit": 12
+        }))
+        .unwrap();
+        assert_eq!(
+            full,
+            UnifiedSearchQuery {
+                query: "daft punk".into(),
+                provider: Some(CatalogProvider::Musicbrainz),
+                limit: Some(12),
+            }
+        );
+
+        let artist_id_only: ArtistCatalogQuery =
+            serde_json::from_value(serde_json::json!({"id": "deezer:artist:27"})).unwrap();
+        assert_eq!(
+            artist_id_only,
+            ArtistCatalogQuery {
+                id: "deezer:artist:27".into(),
+                name: None,
+            }
+        );
+
+        let artist_with_name: ArtistCatalogQuery = serde_json::from_value(serde_json::json!({
+            "id": "5b11f4ce-a62d-471e-81fc-a69a8278c7da",
+            "name": "Nirvana"
+        }))
+        .unwrap();
+        assert_eq!(
+            artist_with_name,
+            ArtistCatalogQuery {
+                id: "5b11f4ce-a62d-471e-81fc-a69a8278c7da".into(),
+                name: Some("Nirvana".into()),
             }
         );
     }

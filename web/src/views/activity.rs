@@ -169,7 +169,7 @@ pub fn ActivityPage() -> Element {
 
                 if acquire_items.is_empty() {
                     div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-5 text-[13px] text-beet-text-secondary",
-                        "No active Acquire & Play pipelines. Search for any unowned MusicBrainz track and click Acquire & Play to stream it seamlessly."
+                        "No active Acquire & Play pipelines. Search the catalog for any unowned track and click Acquire & Play to stream it seamlessly."
                     }
                 } else {
                     div { class: "space-y-1", role: "list",
@@ -187,6 +187,8 @@ pub fn ActivityPage() -> Element {
                                 };
                                 let manual = item.manual_choice.clone();
                                 let mbid = item.recording_mbid.clone();
+                                let cid = item.catalog_id.clone();
+                                let cid_retry = item.catalog_id.clone();
                                 let a = item.artist.clone();
                                 let t = item.title.clone();
                                 let failed = matches!(item.badge, AcquireStageBadge::Failed { .. });
@@ -201,12 +203,18 @@ pub fn ActivityPage() -> Element {
                                                 acquiring_stage: Some(item.badge.clone()),
                                             },
                                             on_acquire: move |_| {
-                                                studio.trigger_acquire_and_play(auth, player, retry_req.clone());
+                                                studio.trigger_acquire_and_play(
+                                                    auth,
+                                                    player,
+                                                    retry_req.clone(),
+                                                    cid_retry.clone(),
+                                                );
                                             },
                                             on_pick_source: move |_| {
                                                 if let Some((search_id, groups)) = manual.clone() {
                                                     studio.manual_choice_modal.set(Some(ManualChoiceModalState {
                                                         recording_mbid: mbid.clone(),
+                                                        catalog_id: cid.clone(),
                                                         artist: a.clone(),
                                                         title: t.clone(),
                                                         search_id,
