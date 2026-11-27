@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use chrono::{Datelike, NaiveDate, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::{DiscoveryStatus, DiscoveryTrack};
 use shared::recommendation::{
@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::auth::{UserCtx, UserId};
 use crate::core::database_failure;
-use crate::core::discovery::{expires_at, parse_profiles};
+use crate::core::discovery::{expires_at_with_seasonal, parse_profiles, SeasonalExpiryLookup};
 use crate::core::index::NavidromeOf;
 use crate::core::library::{navidrome_failure, navidrome_for, NavidromePlace};
 use crate::models::contextual::{
@@ -135,10 +135,55 @@ fn title_case_slug(slug: &str) -> String {
         .join(" ")
 }
 
+/// Human-readable display title for a seasonal mix (used by `ClientBootstrap` and discovery
+/// progress labels so raw i18n keys like `"mix.seasonal.winter_holiday"` are never exposed).
+pub(crate) fn seasonal_display_title(slug: &str, custom_name: Option<&str>) -> String {
+    if let Some(name) = custom_name.map(str::trim).filter(|s| !s.is_empty()) {
+        return name.to_string();
+    }
+    match slug {
+        "winter_holiday" => "Christmas Mix".to_string(),
+        "new_years_eve" => "New Year's Eve".to_string(),
+        "lunar_new_year" => "Lunar New Year".to_string(),
+        "carnival" => "Carnival".to_string(),
+        "spring" => "Spring Mix".to_string(),
+        "summer" => "Summer Mix".to_string(),
+        "autumn" => "Autumn Mix".to_string(),
+        "halloween" => "Halloween".to_string(),
+        "diwali" => "Diwali".to_string(),
+        other => title_case_slug(other),
+    }
+}
+
+/// Normalizes a Subsonic/DB rating into `1..=5` (`0` means unrated -> `None`).
+fn normalized_rating(raw: Option<u8>) -> Option<u8> {
+    raw.filter(|&r| (1..=5).contains(&r))
+}
+
 /// True when `path` sits inside a staged `Discovery/` directory.
 fn is_staged_discovery_path(path: &str) -> bool {
     path.split(['/', '\\'])
         .any(|seg| seg.eq_ignore_ascii_case("discovery"))
+}
+
+/// Hydrates `DiscoveryTrack.rating` from Navidrome songs when `song_id` matches,
+/// falling back to the stored DB rating (with `0` normalized to `None`).
+pub(crate) fn hydrate_discovery_ratings(library: &[SubsonicSong], tracks: &mut [DiscoveryTrack]) {
+    if tracks.is_empty() {
+        return;
+    }
+    let rating_by_song_id: HashMap<&str, u8> = library
+        .iter()
+        .filter_map(|s| normalized_rating(s.user_rating).map(|r| (s.id.as_str(), r)))
+        .collect();
+    for track in tracks.iter_mut() {
+        let nav_rating = track
+            .song_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|id| rating_by_song_id.get(id).copied());
+        track.rating = nav_rating.or_else(|| normalized_rating(track.rating));
+    }
 }
 
 /// True when `track` is a pending discovery track missing its Navidrome `song_id`.
@@ -538,6 +583,49 @@ pub(crate) async fn maybe_reconcile_discovery_song_ids_in(
     reconcile_discovery_song_ids_in(db, &library, music_path, tracks).await
 }
 
+/// Reconciles missing `song_id` values on pending `tracks` AND hydrates live `rating` values from
+/// Navidrome (falling back to DB `row.rating`). Gracefully skips when Navidrome is unlinked or
+/// unreachable so listing endpoints never fail.
+pub(crate) async fn reconcile_and_hydrate_discovery_tracks_in(
+    db: &SqlitePool,
+    navidrome: &dyn NavidromeOf,
+    music_path: Option<&Path>,
+    user_id: &str,
+    tracks: &mut [DiscoveryTrack],
+) {
+    if tracks.is_empty() {
+        return;
+    }
+    for track in tracks.iter_mut() {
+        track.rating = normalized_rating(track.rating);
+    }
+    let navi = match navidrome.navidrome_of(&UserId::new(user_id)).await {
+        Ok(client) => client,
+        Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => return,
+        Err(e) => {
+            warn!(
+                "Could not resolve Navidrome client to hydrate discovery tracks for user {}: {}",
+                user_id, e
+            );
+            return;
+        }
+    };
+    let library = match navi.get_all_songs_with_ratings().await {
+        Ok(songs) => songs,
+        Err(e) => {
+            warn!(
+                "Could not fetch Navidrome songs to hydrate discovery tracks for user {}: {}",
+                user_id, e
+            );
+            return;
+        }
+    };
+    if tracks.iter().any(needs_song_id_reconciliation) {
+        reconcile_discovery_song_ids_in(db, &library, music_path, tracks).await;
+    }
+    hydrate_discovery_ratings(&library, tracks);
+}
+
 /// Lists all contextual mix definitions visible to `ctx` (built-ins + global + caller's custom mixes),
 /// with the caller's `enabled_override` applied to `enabled`.
 pub(crate) async fn list_mix_definitions_in(
@@ -761,6 +849,327 @@ pub(crate) async fn set_mix_enabled_in(
     Ok(def)
 }
 
+/// Tokenizes text with diacritic folding and word-boundary splitting (keeping apostrophes joined),
+/// so `"Chants de Noël"` -> `["chants", "de", "noel"]` and `"X-Mas"` -> `["x", "mas"]`.
+fn fold_tokens(s: &str) -> Vec<String> {
+    let folded = shared::recommendation::without_marks(s).to_lowercase();
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    for ch in folded.chars() {
+        if ch.is_alphanumeric() {
+            cur.push(ch);
+        } else if matches!(ch, '\'' | '\u{2018}' | '\u{2019}') {
+            // Keep contractions/possessives joined.
+        } else if !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+fn token_matches_word(token: &str, keyword: &str) -> bool {
+    if token == keyword {
+        return true;
+    }
+    match keyword {
+        "weihnachten" | "weihnacht" => token.starts_with("weihnacht"),
+        "kerst" => token.starts_with("kerst"),
+        "jul" => {
+            let base = token.strip_suffix('s').unwrap_or(token);
+            token.starts_with("jul")
+                && !matches!(
+                    base,
+                    "july" | "julia" | "julian" | "juliet" | "julius" | "jule" | "julie"
+                )
+        }
+        _ => false,
+    }
+}
+
+fn tokens_contain_phrase(haystack: &[String], needle: &[String]) -> bool {
+    if haystack.is_empty() || needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    if needle.len() == 1 {
+        let kw = &needle[0];
+        return haystack.iter().any(|tok| token_matches_word(tok, kw));
+    }
+    haystack.windows(needle.len()).any(|win| win == needle)
+}
+
+/// Generic genre/playlist filler words that must not trigger title/album/artist matching on their own.
+fn is_generic_text_token(word: &str) -> bool {
+    matches!(
+        word,
+        "hits"
+            | "classics"
+            | "classic"
+            | "songs"
+            | "song"
+            | "music"
+            | "mix"
+            | "playlist"
+            | "party"
+            | "celebration"
+            | "fresh"
+            | "anthems"
+            | "chill"
+            | "cozy"
+            | "night"
+            | "floor"
+            | "pop"
+            | "rock"
+            | "indie"
+            | "acoustic"
+            | "dance"
+            | "electronic"
+            | "disco"
+            | "funk"
+            | "jazz"
+            | "folk"
+            | "soul"
+            | "reggae"
+            | "tropical"
+            | "dream"
+            | "post"
+            | "punk"
+            | "synthwave"
+            | "darkwave"
+            | "samba"
+            | "salsa"
+            | "cumbia"
+            | "afrobeats"
+            | "mandopop"
+            | "cantopop"
+            | "kpop"
+            | "cpop"
+            | "asian"
+            | "indian"
+            | "bollywood"
+            | "bhangra"
+            | "festive"
+            | "sun"
+            | "soaked"
+            | "bossa"
+            | "nova"
+            | "and"
+            | "the"
+            | "of"
+            | "de"
+            | "la"
+            | "le"
+            | "du"
+            | "des"
+            | "in"
+            | "for"
+    )
+}
+
+struct SeasonalMatchers {
+    genre_phrases: Vec<(String, Vec<String>)>,
+    text_phrases: Vec<(String, Vec<String>)>,
+    artist_phrases: Vec<(String, Vec<String>)>,
+}
+
+impl SeasonalMatchers {
+    fn for_definition(def: &ContextualMixDefinition) -> Self {
+        let mut genre_phrases: Vec<(String, Vec<String>)> = Vec::new();
+        let mut text_phrases: Vec<(String, Vec<String>)> = Vec::new();
+        let mut artist_phrases: Vec<(String, Vec<String>)> = Vec::new();
+
+        let push_unique = |list: &mut Vec<(String, Vec<String>)>, raw: &str| {
+            let tokens = fold_tokens(raw);
+            if tokens.is_empty() {
+                return;
+            }
+            if !list.iter().any(|(_, existing)| existing == &tokens) {
+                list.push((raw.to_string(), tokens));
+            }
+        };
+
+        for tag in &def.theme_tags {
+            let tokens = fold_tokens(tag);
+            if tokens.is_empty() {
+                continue;
+            }
+            push_unique(&mut genre_phrases, tag);
+            let is_genre_only = tokens.iter().all(|t| is_generic_text_token(t))
+                || matches!(
+                    tag.to_ascii_lowercase().as_str(),
+                    "winter" | "spring" | "summer" | "autumn" | "holiday" | "holidays"
+                );
+            if !is_genre_only {
+                push_unique(&mut text_phrases, tag);
+                push_unique(&mut artist_phrases, tag);
+            }
+        }
+
+        // Extract meaningful non-generic keywords from international_queries (e.g. "Christmas", "Halloween").
+        for query in &def.international_queries {
+            for tok in fold_tokens(query) {
+                if tok.chars().count() >= 4
+                    && !is_generic_text_token(&tok)
+                    && !matches!(tok.as_str(), "winter" | "spring" | "summer" | "autumn")
+                {
+                    push_unique(&mut genre_phrases, &tok);
+                    if !matches!(tok.as_str(), "holiday" | "holidays") {
+                        push_unique(&mut text_phrases, &tok);
+                    }
+                }
+            }
+        }
+
+        let is_winter_holiday = def.slug == "winter_holiday"
+            || def
+                .theme_tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("christmas"));
+        if is_winter_holiday {
+            // Bare "holiday"/"holidays" match genre tags only, never artist/title/album
+            // (prevents false positives like Billie Holiday, The Holidays, Green Day "Holiday",
+            // Madonna "Holiday").
+            const GENRE_ONLY_HOLIDAY: &[&str] = &["holiday", "holidays"];
+            const ARTIST_SAFE_HOLIDAY: &[&str] = &[
+                "christmas",
+                "xmas",
+                "santa",
+                "santa claus",
+                "jingle",
+                "jingle bell",
+                "jingle bells",
+                "silent night",
+                "winter wonderland",
+                "advent",
+                "feliz navidad",
+                "navidad",
+                "weihnachten",
+                "weihnacht",
+                "natale",
+                "kerst",
+                "yuletide",
+                "sleigh ride",
+                "mistletoe",
+                "rudolph",
+                "reindeer",
+                "stille nacht",
+                "white christmas",
+                "frosty the snowman",
+                "papa noel",
+                "chants de noel",
+            ];
+            // Title/album/genre keywords (excluded from bare artist matching to avoid false
+            // positives like "Noel Gallagher", and using specific phrases instead of bare
+            // "carol" / "holiday" to avoid Chuck Berry "Carol" or Green Day "Holiday").
+            const TITLE_ALBUM_HOLIDAY: &[&str] = &[
+                "noel",
+                "christmas carol",
+                "christmas carols",
+                "carol of the bells",
+                "holiday carols",
+                "christmas holiday",
+                "winter holiday",
+                "holiday classics",
+                "holiday music",
+                "holiday favorites",
+                "sleigh",
+                "yule",
+                "nutcracker",
+                "holy night",
+                "deck the halls",
+                "joy to the world",
+                "little drummer boy",
+                "vive le vent",
+                "mon beau sapin",
+                "douce nuit",
+                "auld lang syne",
+            ];
+            for kw in GENRE_ONLY_HOLIDAY {
+                push_unique(&mut genre_phrases, kw);
+            }
+            for kw in ARTIST_SAFE_HOLIDAY {
+                push_unique(&mut genre_phrases, kw);
+                push_unique(&mut text_phrases, kw);
+                push_unique(&mut artist_phrases, kw);
+            }
+            for kw in TITLE_ALBUM_HOLIDAY {
+                push_unique(&mut genre_phrases, kw);
+                push_unique(&mut text_phrases, kw);
+            }
+        } else {
+            let extra: &[&str] = match def.slug.as_str() {
+                "halloween" => &[
+                    "halloween",
+                    "spooky",
+                    "trick or treat",
+                    "monster mash",
+                    "ghostbusters",
+                    "haunted",
+                ],
+                "new_years_eve" => &[
+                    "new year",
+                    "new years",
+                    "auld lang syne",
+                    "bonne annee",
+                ],
+                "lunar_new_year" => &["lunar new year", "chinese new year", "spring festival"],
+                "diwali" => &["diwali", "deepavali"],
+                "carnival" => &["carnival", "carnaval", "mardi gras"],
+                _ => &[],
+            };
+            for kw in extra {
+                push_unique(&mut genre_phrases, kw);
+                push_unique(&mut text_phrases, kw);
+                push_unique(&mut artist_phrases, kw);
+            }
+        }
+
+        Self {
+            genre_phrases,
+            text_phrases,
+            artist_phrases,
+        }
+    }
+
+    /// Returns the matched seasonal keyword/tag if `song` genuinely belongs to this seasonal theme,
+    /// using strict word-boundary matching across genre, title, album, and artist.
+    fn matches(&self, song: &SubsonicSong) -> Option<String> {
+        if let Some(genre) = song.genre.as_deref() {
+            let tokens = fold_tokens(genre);
+            for (label, needle) in &self.genre_phrases {
+                if tokens_contain_phrase(&tokens, needle) {
+                    return Some(label.clone());
+                }
+            }
+        }
+        let title_tokens = fold_tokens(&song.title);
+        for (label, needle) in &self.text_phrases {
+            if tokens_contain_phrase(&title_tokens, needle) {
+                return Some(label.clone());
+            }
+        }
+        if let Some(album) = song.album.as_deref() {
+            let album_tokens = fold_tokens(album);
+            for (label, needle) in &self.text_phrases {
+                if tokens_contain_phrase(&album_tokens, needle) {
+                    return Some(label.clone());
+                }
+            }
+        }
+        if let Some(artist) = song.artist.as_deref() {
+            let artist_tokens = fold_tokens(artist);
+            for (label, needle) in &self.artist_phrases {
+                if tokens_contain_phrase(&artist_tokens, needle) {
+                    return Some(label.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Builds the exact playable blended tracklist for `def` from owned `library` songs and staged
 /// `pending` discovery tracks using the mix's `owned_ratio`, `theme_tags`, and `MAX_TRACKS_PER_ARTIST`
 /// cap. Shared by both `list_active_contextual_mixes_in` (for exact playable `track_count`) and
@@ -771,170 +1180,299 @@ fn build_contextual_mix_tracks(
     pending: &[DiscoveryTrack],
 ) -> Vec<ContextualMixTrack> {
     let target = def.target_tracks as usize;
-    let owned_target = ((target as f32) * def.owned_ratio).round() as usize;
-    let fresh_target = target.saturating_sub(owned_target);
+    let song_by_id: HashMap<&str, &SubsonicSong> = library
+        .map(|songs| songs.iter().map(|s| (s.id.as_str(), s)).collect())
+        .unwrap_or_default();
 
     let mut owned_tracks: Vec<ContextualMixTrack> = Vec::new();
+    let mut fresh_tracks: Vec<ContextualMixTrack> = Vec::new();
     let mut seen_keys: HashSet<String> = HashSet::new();
     let mut artist_counts: HashMap<String, usize> = HashMap::new();
 
-    if owned_target > 0 {
-        if let Some(library) = library {
-            let pending_song_ids: HashSet<&str> = pending
-                .iter()
-                .filter_map(|t| t.song_id.as_deref().filter(|s| !s.is_empty()))
-                .collect();
-            let pending_keys: HashSet<String> = pending
-                .iter()
-                .map(|t| CandidateSet::key(&t.artist, &t.title))
-                .collect();
-
-            let tags_lower: Vec<String> = def
-                .theme_tags
-                .iter()
-                .map(|t| t.to_ascii_lowercase())
-                .collect();
-
-            // Prefer owned library songs matching theme_tags, excluding disliked tracks and
-            // staged Discovery/ or pending discovery_tracks rows.
-            let mut matched = Vec::new();
-            let mut fallback = Vec::new();
-            for song in library {
-                if matches!(song.user_rating, Some(1..=2)) {
-                    continue;
-                }
-                if pending_song_ids.contains(song.id.as_str()) {
-                    continue;
-                }
-                let artist_ref = song.artist.as_deref().unwrap_or("");
-                if pending_keys.contains(&CandidateSet::key(artist_ref, &song.title)) {
-                    continue;
-                }
-                if song.path.as_deref().is_some_and(is_staged_discovery_path) {
-                    continue;
-                }
-                let genre = song.genre.as_deref().unwrap_or("").to_ascii_lowercase();
-                let hit = tags_lower
-                    .iter()
-                    .find(|t| !t.is_empty() && genre.contains(t.as_str()))
-                    .cloned();
-                if let Some(matched_genre) = hit {
-                    matched.push((song, Some(matched_genre)));
-                } else {
-                    fallback.push((song, None));
-                }
+    if def.kind == ContextualMixKind::Seasonal {
+        // Seasonal mixes prioritize staged `pack_slug` discovery tracks and also match owned
+        // holiday/seasonal library tracks strictly (never falling back to unrelated songs),
+        // so users with existing holiday tracks get an immediate playable mix.
+        for dt in pending
+            .iter()
+            .filter(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()))
+        {
+            if fresh_tracks.len() >= target {
+                break;
             }
-
-            // Sort both buckets by user rating desc, play count desc for high hit-rate mixes.
-            let sort_key = |s: &SubsonicSong| {
-                (
-                    std::cmp::Reverse(s.user_rating.unwrap_or(0)),
-                    std::cmp::Reverse(s.play_count.unwrap_or(0)),
-                )
+            let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
+                continue;
             };
-            matched.sort_by_key(|(s, _)| sort_key(s));
-            fallback.sort_by_key(|(s, _)| sort_key(s));
-
-            for (song, matched_genre) in matched.into_iter().chain(fallback) {
-                if owned_tracks.len() >= owned_target {
-                    break;
-                }
-                let artist = song.artist.clone().unwrap_or_default();
-                let key = CandidateSet::key(&artist, &song.title);
-                if !seen_keys.insert(key) {
-                    continue;
-                }
-                let artist_key = discovery_name(&artist);
-                let count = artist_counts.entry(artist_key).or_insert(0);
-                if *count >= MAX_TRACKS_PER_ARTIST {
-                    continue;
-                }
-                *count += 1;
-                owned_tracks.push(ContextualMixTrack {
-                    song_id: song.id.clone(),
-                    discovery_track_id: None,
-                    artist,
-                    title: song.title.clone(),
-                    album: song.album.clone(),
-                    duration_s: song.duration,
-                    owned: true,
-                    reason: Some(CandidateReason::LibraryMatch {
+            let key = CandidateSet::key(&dt.artist, &dt.title);
+            if !seen_keys.insert(key) {
+                continue;
+            }
+            let artist_key = discovery_name(&dt.artist);
+            let count = artist_counts.entry(artist_key).or_insert(0);
+            if *count >= MAX_TRACKS_PER_ARTIST {
+                continue;
+            }
+            *count += 1;
+            let nav_song = song_by_id.get(song_id).copied();
+            let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
+                "local" => Some(CultureBucket::Local),
+                "international" => Some(CultureBucket::International),
+                "taste_wildcard" => Some(CultureBucket::TasteWildcard),
+                _ => None,
+            });
+            fresh_tracks.push(ContextualMixTrack {
+                song_id: song_id.to_string(),
+                discovery_track_id: Some(dt.id.clone()),
+                artist: dt.artist.clone(),
+                title: dt.title.clone(),
+                album: (!dt.album.is_empty()).then(|| dt.album.clone()),
+                duration_s: nav_song.and_then(|s| s.duration.filter(|&d| d > 0)),
+                owned: false,
+                rating: nav_song
+                    .and_then(|s| normalized_rating(s.user_rating))
+                    .or_else(|| normalized_rating(dt.rating)),
+                starred: nav_song.is_some_and(|s| s.starred.is_some()),
+                reason: dt.reason.as_deref().cloned().or_else(|| {
+                    Some(CandidateReason::InternationalContextual {
                         mix_slug: def.slug.clone(),
-                        matched_genre,
-                    }),
-                    culture_bucket: None,
+                    })
+                }),
+                culture_bucket: bucket,
+            });
+        }
+
+        let owned_cap = if def.owned_ratio > 0.0 {
+            ((target as f32) * def.owned_ratio).round() as usize
+        } else {
+            target.saturating_sub(fresh_tracks.len())
+        };
+
+        if owned_cap > 0 {
+            if let Some(library) = library {
+                let pending_song_ids: HashSet<&str> = pending
+                    .iter()
+                    .filter_map(|t| t.song_id.as_deref().filter(|s| !s.is_empty()))
+                    .collect();
+                let pending_keys: HashSet<String> = pending
+                    .iter()
+                    .map(|t| CandidateSet::key(&t.artist, &t.title))
+                    .collect();
+
+                let matchers = SeasonalMatchers::for_definition(def);
+                let mut matched = Vec::new();
+                for song in library {
+                    if matches!(song.user_rating, Some(1..=2)) {
+                        continue;
+                    }
+                    if pending_song_ids.contains(song.id.as_str()) {
+                        continue;
+                    }
+                    let artist_ref = song.artist.as_deref().unwrap_or("");
+                    if pending_keys.contains(&CandidateSet::key(artist_ref, &song.title)) {
+                        continue;
+                    }
+                    if song.path.as_deref().is_some_and(is_staged_discovery_path) {
+                        continue;
+                    }
+                    if let Some(matched_tag) = matchers.matches(song) {
+                        matched.push((song, matched_tag));
+                    }
+                }
+
+                matched.sort_by_key(|(s, _)| {
+                    (
+                        std::cmp::Reverse(normalized_rating(s.user_rating).unwrap_or(0)),
+                        std::cmp::Reverse(s.play_count.unwrap_or(0)),
+                    )
                 });
+
+                for (song, matched_tag) in matched {
+                    if owned_tracks.len() >= owned_cap {
+                        break;
+                    }
+                    let artist = song.artist.clone().unwrap_or_default();
+                    let key = CandidateSet::key(&artist, &song.title);
+                    if !seen_keys.insert(key) {
+                        continue;
+                    }
+                    let artist_key = discovery_name(&artist);
+                    let count = artist_counts.entry(artist_key).or_insert(0);
+                    if *count >= MAX_TRACKS_PER_ARTIST {
+                        continue;
+                    }
+                    *count += 1;
+                    owned_tracks.push(ContextualMixTrack {
+                        song_id: song.id.clone(),
+                        discovery_track_id: None,
+                        artist,
+                        title: song.title.clone(),
+                        album: song.album.clone(),
+                        duration_s: song.duration,
+                        owned: true,
+                        rating: normalized_rating(song.user_rating),
+                        starred: song.starred.is_some(),
+                        reason: Some(CandidateReason::LibraryMatch {
+                            mix_slug: def.slug.clone(),
+                            matched_genre: Some(matched_tag),
+                        }),
+                        culture_bucket: Some(CultureBucket::OwnedLibrary),
+                    });
+                }
             }
         }
-    }
-
-    let duration_by_song_id: HashMap<&str, u32> = library
-        .map(|songs| {
-            songs
-                .iter()
-                .filter_map(|s| s.duration.filter(|&d| d > 0).map(|d| (s.id.as_str(), d)))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Collect staged fresh tracks: exact pack_slug matches first, then general pending discovery tracks
-    // for hybrid moment mixes (never pulling seasonal tracks into non-seasonal mixes!).
-    let mut fresh_tracks: Vec<ContextualMixTrack> = Vec::new();
-    let staged_iter = pending
-        .iter()
-        .filter(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()))
-        .chain(pending.iter().filter(|t| {
-            def.kind == ContextualMixKind::Moment
-                && t.pack_slug.is_none()
-                && !t.exclude_from_core_taste
-        }));
-
-    let fresh_limit = fresh_target.max(if def.kind == ContextualMixKind::Seasonal {
-        target
     } else {
-        0
-    });
+        let owned_target = ((target as f32) * def.owned_ratio).round() as usize;
+        let fresh_target = target.saturating_sub(owned_target);
 
-    for dt in staged_iter {
-        if fresh_tracks.len() >= fresh_limit {
-            break;
+        if owned_target > 0 {
+            if let Some(library) = library {
+                let pending_song_ids: HashSet<&str> = pending
+                    .iter()
+                    .filter_map(|t| t.song_id.as_deref().filter(|s| !s.is_empty()))
+                    .collect();
+                let pending_keys: HashSet<String> = pending
+                    .iter()
+                    .map(|t| CandidateSet::key(&t.artist, &t.title))
+                    .collect();
+
+                let tags_lower: Vec<String> = def
+                    .theme_tags
+                    .iter()
+                    .map(|t| t.to_ascii_lowercase())
+                    .collect();
+
+                // Prefer owned library songs matching theme_tags, excluding disliked tracks and
+                // staged Discovery/ or pending discovery_tracks rows.
+                let mut matched = Vec::new();
+                let mut fallback = Vec::new();
+                for song in library {
+                    if matches!(song.user_rating, Some(1..=2)) {
+                        continue;
+                    }
+                    if pending_song_ids.contains(song.id.as_str()) {
+                        continue;
+                    }
+                    let artist_ref = song.artist.as_deref().unwrap_or("");
+                    if pending_keys.contains(&CandidateSet::key(artist_ref, &song.title)) {
+                        continue;
+                    }
+                    if song.path.as_deref().is_some_and(is_staged_discovery_path) {
+                        continue;
+                    }
+                    let genre = song.genre.as_deref().unwrap_or("").to_ascii_lowercase();
+                    let hit = tags_lower
+                        .iter()
+                        .find(|t| !t.is_empty() && genre.contains(t.as_str()))
+                        .cloned();
+                    if let Some(matched_genre) = hit {
+                        matched.push((song, Some(matched_genre)));
+                    } else {
+                        fallback.push((song, None));
+                    }
+                }
+
+                // Sort both buckets by user rating desc, play count desc for high hit-rate mixes.
+                let sort_key = |s: &SubsonicSong| {
+                    (
+                        std::cmp::Reverse(normalized_rating(s.user_rating).unwrap_or(0)),
+                        std::cmp::Reverse(s.play_count.unwrap_or(0)),
+                    )
+                };
+                matched.sort_by_key(|(s, _)| sort_key(s));
+                fallback.sort_by_key(|(s, _)| sort_key(s));
+
+                for (song, matched_genre) in matched.into_iter().chain(fallback) {
+                    if owned_tracks.len() >= owned_target {
+                        break;
+                    }
+                    let artist = song.artist.clone().unwrap_or_default();
+                    let key = CandidateSet::key(&artist, &song.title);
+                    if !seen_keys.insert(key) {
+                        continue;
+                    }
+                    let artist_key = discovery_name(&artist);
+                    let count = artist_counts.entry(artist_key).or_insert(0);
+                    if *count >= MAX_TRACKS_PER_ARTIST {
+                        continue;
+                    }
+                    *count += 1;
+                    owned_tracks.push(ContextualMixTrack {
+                        song_id: song.id.clone(),
+                        discovery_track_id: None,
+                        artist,
+                        title: song.title.clone(),
+                        album: song.album.clone(),
+                        duration_s: song.duration,
+                        owned: true,
+                        rating: normalized_rating(song.user_rating),
+                        starred: song.starred.is_some(),
+                        reason: Some(CandidateReason::LibraryMatch {
+                            mix_slug: def.slug.clone(),
+                            matched_genre,
+                        }),
+                        culture_bucket: None,
+                    });
+                }
+            }
         }
-        let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let key = CandidateSet::key(&dt.artist, &dt.title);
-        if !seen_keys.insert(key) {
-            continue;
+
+        // Collect staged fresh tracks: exact pack_slug matches first, then general pending discovery tracks
+        // for hybrid moment mixes (never pulling seasonal tracks into non-seasonal mixes!).
+        let staged_iter = pending
+            .iter()
+            .filter(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()))
+            .chain(pending.iter().filter(|t| {
+                def.kind == ContextualMixKind::Moment
+                    && t.pack_slug.is_none()
+                    && !t.exclude_from_core_taste
+            }));
+
+        for dt in staged_iter {
+            if fresh_tracks.len() >= fresh_target {
+                break;
+            }
+            let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let key = CandidateSet::key(&dt.artist, &dt.title);
+            if !seen_keys.insert(key) {
+                continue;
+            }
+            let artist_key = discovery_name(&dt.artist);
+            let count = artist_counts.entry(artist_key).or_insert(0);
+            if *count >= MAX_TRACKS_PER_ARTIST {
+                continue;
+            }
+            *count += 1;
+            let nav_song = song_by_id.get(song_id).copied();
+            let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
+                "local" => Some(CultureBucket::Local),
+                "international" => Some(CultureBucket::International),
+                "taste_wildcard" => Some(CultureBucket::TasteWildcard),
+                _ => None,
+            });
+            fresh_tracks.push(ContextualMixTrack {
+                song_id: song_id.to_string(),
+                discovery_track_id: Some(dt.id.clone()),
+                artist: dt.artist.clone(),
+                title: dt.title.clone(),
+                album: (!dt.album.is_empty()).then(|| dt.album.clone()),
+                duration_s: nav_song.and_then(|s| s.duration.filter(|&d| d > 0)),
+                owned: false,
+                rating: nav_song
+                    .and_then(|s| normalized_rating(s.user_rating))
+                    .or_else(|| normalized_rating(dt.rating)),
+                starred: nav_song.is_some_and(|s| s.starred.is_some()),
+                reason: dt.reason.as_deref().cloned().or_else(|| {
+                    Some(CandidateReason::MomentMatch {
+                        mix_slug: def.slug.clone(),
+                        mood_tag: def.primary_tag().map(str::to_string),
+                        genre: None,
+                    })
+                }),
+                culture_bucket: bucket,
+            });
         }
-        let artist_key = discovery_name(&dt.artist);
-        let count = artist_counts.entry(artist_key).or_insert(0);
-        if *count >= MAX_TRACKS_PER_ARTIST {
-            continue;
-        }
-        *count += 1;
-        let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
-            "local" => Some(CultureBucket::Local),
-            "international" => Some(CultureBucket::International),
-            "taste_wildcard" => Some(CultureBucket::TasteWildcard),
-            _ => None,
-        });
-        fresh_tracks.push(ContextualMixTrack {
-            song_id: song_id.to_string(),
-            discovery_track_id: Some(dt.id.clone()),
-            artist: dt.artist.clone(),
-            title: dt.title.clone(),
-            album: (!dt.album.is_empty()).then(|| dt.album.clone()),
-            duration_s: duration_by_song_id.get(song_id).copied(),
-            owned: false,
-            reason: dt.reason.as_deref().cloned().or_else(|| {
-                Some(CandidateReason::MomentMatch {
-                    mix_slug: def.slug.clone(),
-                    mood_tag: def.primary_tag().map(str::to_string),
-                    genre: None,
-                })
-            }),
-            culture_bucket: bucket,
-        });
     }
 
     // Interleave owned (~3) : fresh (~1) smoothly for hybrid mixes.
@@ -1024,13 +1562,8 @@ fn build_rolling_mix_tracks(
     pending: &[DiscoveryTrack],
 ) -> Vec<ContextualMixTrack> {
     let profile_name = profile.name();
-    let duration_by_song_id: HashMap<&str, u32> = library
-        .map(|songs| {
-            songs
-                .iter()
-                .filter_map(|s| s.duration.filter(|&d| d > 0).map(|d| (s.id.as_str(), d)))
-                .collect()
-        })
+    let song_by_id: HashMap<&str, &SubsonicSong> = library
+        .map(|songs| songs.iter().map(|s| (s.id.as_str(), s)).collect())
         .unwrap_or_default();
 
     let mut seen_keys: HashSet<String> = HashSet::new();
@@ -1046,6 +1579,7 @@ fn build_rolling_mix_tracks(
         if !seen_keys.insert(key) {
             continue;
         }
+        let nav_song = song_by_id.get(song_id).copied();
         let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
             "local" => Some(CultureBucket::Local),
             "international" => Some(CultureBucket::International),
@@ -1058,8 +1592,12 @@ fn build_rolling_mix_tracks(
             artist: dt.artist.clone(),
             title: dt.title.clone(),
             album: (!dt.album.is_empty()).then(|| dt.album.clone()),
-            duration_s: duration_by_song_id.get(song_id).copied(),
+            duration_s: nav_song.and_then(|s| s.duration.filter(|&d| d > 0)),
             owned: false,
+            rating: nav_song
+                .and_then(|s| normalized_rating(s.user_rating))
+                .or_else(|| normalized_rating(dt.rating)),
+            starred: nav_song.is_some_and(|s| s.starred.is_some()),
             reason: dt.reason.as_deref().cloned(),
             culture_bucket: bucket,
         });
@@ -1107,8 +1645,53 @@ fn summarize_rolling_profile(
     }
 }
 
+/// Returns all calendar-active, enabled `ContextualMixKind::Seasonal` definitions for `user_id`
+/// at `now`, regardless of whether they currently have tracks staged or matched.
+/// Used by seasonal pack generation and the ASAP startup check.
+pub(crate) async fn list_calendar_active_seasonal_defs_in(
+    db: &SqlitePool,
+    user_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<(UserCultureProfile, Vec<(ContextualMixDefinition, Option<ContextualMixStateRow>)>), String>
+{
+    let culture = UserCultureProfileRow::get_in(db, user_id)
+        .await?
+        .unwrap_or_default();
+    let defs = ContextualMixDefinitionRow::list_visible_for_user_in(db, user_id).await?;
+    let states = ContextualMixStateRow::list_for_user_in(db, user_id).await?;
+    let state_by_slug: HashMap<String, ContextualMixStateRow> =
+        states.into_iter().map(|s| (s.slug.clone(), s)).collect();
+
+    let effective_country = culture.effective_country().map(str::to_string);
+    let mut active = Vec::new();
+    for def in defs {
+        if def.kind != ContextualMixKind::Seasonal {
+            continue;
+        }
+        let state = state_by_slug.get(&def.slug).cloned();
+        let enabled_override = state
+            .as_ref()
+            .and_then(|s| s.enabled_override)
+            .map(|v| v != 0);
+        if enabled_override == Some(false) {
+            continue;
+        }
+        let explicitly_enabled = enabled_override == Some(true) || !def.built_in;
+        if def.is_active_at(
+            now.month(),
+            now.day(),
+            now.hour(),
+            effective_country.as_deref(),
+            explicitly_enabled,
+        ) {
+            active.push((def, state));
+        }
+    }
+    Ok((culture, active))
+}
+
 /// Lists active contextual mixes for `ctx` as pure structured client-i18n summaries:
-/// 1. Active calendar Seasonal Packs (matching date + user country or explicitly opted in)
+/// 1. Active calendar Seasonal Packs that currently have at least one playable track (staged or owned)
 /// 2. Active Moment Mixes (always-surfaced + matching current hour window, using `local_hour` when supplied)
 /// 3. Enabled Rolling Discovery profiles (`mix.rolling.conservative` / `balanced` / `adventurous`)
 pub(crate) async fn list_active_contextual_mixes_in(
@@ -1170,14 +1753,12 @@ pub(crate) async fn list_active_contextual_mixes_in(
         active_defs.push((def, state));
     }
 
-    let has_active_moment = active_defs
-        .iter()
-        .any(|(def, _)| def.kind == ContextualMixKind::Moment || def.owned_ratio > 0.0);
+    let has_active_contextual = !active_defs.is_empty();
     let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
 
-    // Fetch Navidrome library ONCE for the whole listing call, only when needed to count Moment
-    // mix owned tracks or reconcile missing pending `song_id`s.
-    let library: Option<Vec<SubsonicSong>> = if has_active_moment || needs_reconcile {
+    // Fetch Navidrome library ONCE for the whole listing call, whenever active contextual mixes
+    // (Moment or Seasonal owned matching) or pending `song_id` reconciliation need it.
+    let library: Option<Vec<SubsonicSong>> = if has_active_contextual || needs_reconcile {
         match navidrome.navidrome_of(&ctx.id()).await {
             Ok(navi) => match navi.get_all_songs_with_ratings().await {
                 Ok(songs) => Some(songs),
@@ -1215,7 +1796,12 @@ pub(crate) async fn list_active_contextual_mixes_in(
         let summary =
             summarize_definition(def, &culture, state, &pending, library.as_deref(), now);
         match def.kind {
-            ContextualMixKind::Seasonal => seasonal.push(summary),
+            ContextualMixKind::Seasonal => {
+                // Never surface empty seasonal mixes to clients.
+                if summary.track_count > 0 {
+                    seasonal.push(summary);
+                }
+            }
             ContextualMixKind::Moment => moments.push(summary),
             ContextualMixKind::Rolling => {}
         }
@@ -1289,29 +1875,25 @@ pub(crate) async fn steer_seasonal_pack_in(
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
     let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
-    let library: Option<Vec<SubsonicSong>> = if def.owned_ratio > 0.0 || needs_reconcile {
-        match navidrome.navidrome_of(&ctx.id()).await {
-            Ok(navi) => match navi.get_all_songs_with_ratings().await {
-                Ok(songs) => Some(songs),
-                Err(e) => {
-                    warn!(
-                        "Could not fetch Navidrome songs while steering seasonal pack '{}' for user {}: {}",
-                        def.slug, ctx.user_id, e
-                    );
-                    None
-                }
-            },
-            Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => None,
+    let library: Option<Vec<SubsonicSong>> = match navidrome.navidrome_of(&ctx.id()).await {
+        Ok(navi) => match navi.get_all_songs_with_ratings().await {
+            Ok(songs) => Some(songs),
             Err(e) => {
                 warn!(
-                    "Could not resolve Navidrome client while steering seasonal pack '{}' for user {}: {}",
+                    "Could not fetch Navidrome songs while steering seasonal pack '{}' for user {}: {}",
                     def.slug, ctx.user_id, e
                 );
                 None
             }
+        },
+        Err(NavidromeLookupError::NotLinked | NavidromeLookupError::NoServer) => None,
+        Err(e) => {
+            warn!(
+                "Could not resolve Navidrome client while steering seasonal pack '{}' for user {}: {}",
+                def.slug, ctx.user_id, e
+            );
+            None
         }
-    } else {
-        None
     };
     if let Some(ref songs) = library {
         if needs_reconcile {
@@ -1347,7 +1929,6 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
     let state_by_slug: HashMap<&str, &ContextualMixStateRow> =
         states.iter().map(|s| (s.slug.as_str(), s)).collect();
 
-    let today = now.date_naive();
     let seasonal_root = discovery_place.child("Seasonal");
     let mut reconciled_slugs = Vec::new();
 
@@ -1367,7 +1948,11 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
                 explicitly_enabled,
             );
 
-        if active {
+        let has_pending = pending
+            .iter()
+            .any(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()));
+
+        if active && has_pending {
             let place = seasonal_root.child(&def.slug);
             let prefix = place.song_prefix();
             // Navidrome smart playlist name uses custom_name when set, else a readable title-cased
@@ -1466,16 +2051,10 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
             }
             reconciled_slugs.push(def.slug.clone());
         } else if let Some(st) = state {
-            // Auto-clean expired seasonal smart playlists once past expires_at and no pending tracks remain.
-            let is_expired = st
-                .expires_at
-                .as_deref()
-                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-                .is_some_and(|exp| today > exp);
-            let has_pending = pending
-                .iter()
-                .any(|t| t.pack_slug.as_deref() == Some(def.slug.as_str()));
-            if is_expired && !has_pending {
+            // Never keep an empty seasonal smart playlist in Navidrome: clean up whenever 0
+            // pending staged tracks remain under Discovery/Seasonal/<slug>/ (whether active,
+            // disabled before expires_at, or expired).
+            if !has_pending {
                 if let Some(ref pl_id) = st.navidrome_playlist_id {
                     let gone = match navi.delete_smart_playlist(pl_id).await {
                         Ok(()) => true,
@@ -1484,7 +2063,7 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
                             Ok(None) => true,
                             _ => {
                                 warn!(
-                                    "Could not clean up expired seasonal playlist '{}' ({}) for user {}: {}",
+                                    "Could not clean up empty/expired seasonal playlist '{}' ({}) for user {}: {}",
                                     def.slug, pl_id, user_id, e
                                 );
                                 false
@@ -1493,7 +2072,7 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
                     };
                     if gone {
                         info!(
-                            "Cleaned up expired seasonal Navidrome playlist '{}' ({}) for user {}",
+                            "Cleaned up empty/expired seasonal Navidrome playlist '{}' ({}) for user {}",
                             def.slug, pl_id, user_id
                         );
                         if let Err(e) = ContextualMixStateRow::upsert_playlist_id_in(
@@ -1506,7 +2085,7 @@ pub(crate) async fn reconcile_seasonal_playlists_in(
                         .await
                         {
                             warn!(
-                                "Failed to clear expired seasonal playlist id for '{}' (user {}): {}",
+                                "Failed to clear seasonal playlist id for '{}' (user {}): {}",
                                 def.slug, user_id, e
                             );
                         }
@@ -1552,13 +2131,16 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
                     .await
                     .map_err(|e| database_failure(Stage::Playlist, e))?;
                 let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
-                let library: Option<Vec<SubsonicSong>> = if needs_reconcile {
+                let has_rolling = pending.iter().any(|t| {
+                    t.profile.eq_ignore_ascii_case(profile.name()) && t.pack_slug.is_none()
+                });
+                let library: Option<Vec<SubsonicSong>> = if needs_reconcile || has_rolling {
                     match navidrome.navidrome_of(&ctx.id()).await {
                         Ok(navi) => match navi.get_all_songs_with_ratings().await {
                             Ok(songs) => Some(songs),
                             Err(e) => {
                                 warn!(
-                                    "Could not fetch Navidrome songs to reconcile discovery song_ids for rolling mix '{}' (user {}): {}",
+                                    "Could not fetch Navidrome songs for rolling mix '{}' (user {}): {}",
                                     canonical, ctx.user_id, e
                                 );
                                 None
@@ -1612,7 +2194,11 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
         Err(e) => return Err(e.failure(Stage::Playlist, e.to_string())),
     };
 
-    let library: Option<Vec<SubsonicSong>> = if owned_target > 0 || needs_reconcile {
+    let library: Option<Vec<SubsonicSong>> = if owned_target > 0
+        || def.kind == ContextualMixKind::Seasonal
+        || needs_reconcile
+        || !pending.is_empty()
+    {
         if let Some(ref navi) = navi_opt {
             match navi.get_all_songs_with_ratings().await {
                 Ok(songs) => Some(songs),
@@ -1621,7 +2207,7 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
                 }
                 Err(e) => {
                     warn!(
-                        "Could not fetch Navidrome songs to reconcile discovery song_ids for mix '{}' (user {}): {}",
+                        "Could not fetch Navidrome songs for mix '{}' (user {}): {}",
                         def.slug, ctx.user_id, e
                     );
                     None
@@ -1725,10 +2311,12 @@ pub(crate) async fn list_triage_queue_in(
     let mut pending = DiscoveryTrackRow::pending_for_user_in(db, user_id)
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
-    maybe_reconcile_discovery_song_ids_in(db, navidrome, music_path, user_id, &mut pending).await;
+    reconcile_and_hydrate_discovery_tracks_in(db, navidrome, music_path, user_id, &mut pending)
+        .await;
     let lifetimes = settings.parse_lifetime_days();
+    let seasonal = SeasonalExpiryLookup::load_for_tracks_in(db, user_id, &pending).await;
     pending.sort_by_key(|t| {
-        let exp = expires_at(t, &lifetimes);
+        let exp = expires_at_with_seasonal(t, &lifetimes, &seasonal);
         (exp.is_none(), exp)
     });
     Ok(pending)
@@ -1776,6 +2364,8 @@ pub(crate) async fn start_seed_radio_in(
                 artist: artist_name.clone(),
                 album: song.album,
                 duration: song.duration,
+                rating: normalized_rating(song.user_rating),
+                starred: song.starred.is_some(),
                 reason: CandidateReason::RadioSeed {
                     seed_artist: artist_name,
                 },
@@ -1823,6 +2413,8 @@ pub(crate) async fn start_seed_radio_in(
                     artist: artist_name.to_string(),
                     album: song.album.clone(),
                     duration: song.duration,
+                    rating: normalized_rating(song.user_rating),
+                    starred: song.starred.is_some(),
                     reason: CandidateReason::MoreFromArtist {
                         artist: seed_artist.clone(),
                     },
@@ -1852,6 +2444,8 @@ pub(crate) async fn start_seed_radio_in(
                                 artist: artist_name.to_string(),
                                 album: song.album.clone(),
                                 duration: song.duration,
+                                rating: normalized_rating(song.user_rating),
+                                starred: song.starred.is_some(),
                                 reason: CandidateReason::SimilarArtist {
                                     seed_artist: seed_artist.clone(),
                                     artist: artist_name.to_string(),
@@ -1997,7 +2591,36 @@ mod tests {
         assert_eq!(steered.expires_at.as_deref(), Some("2027-01-05"));
         assert!(steered.exclude_from_core_taste);
 
-        // Active mixes in December carry pure i18n keys + ISO dates, zero hardcoded English titles
+        // Empty seasonal mixes (0 staged + 0 owned tracks) are hidden from list_active_contextual_mixes_in,
+        // while list_calendar_active_seasonal_defs_in still surfaces them for the generator.
+        let empty_mixes = list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None)
+            .await
+            .unwrap();
+        assert!(!empty_mixes.iter().any(|m| m.slug == "winter_holiday"));
+        let (_, cal_defs) = list_calendar_active_seasonal_defs_in(&db, "alice", dec)
+            .await
+            .unwrap();
+        assert!(cal_defs.iter().any(|(d, _)| d.slug == "winter_holiday"));
+
+        // Once a seasonal track is staged and reconciled, winter_holiday surfaces with pure i18n keys
+        let folder_id = crate::models::folder::Folder::get_all_by_user_in(&db, "alice")
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, culture_bucket, pack_slug) \
+             VALUES ('dt-dec-1', 'nd-dec-1', 'Snow Song', 'Winter Act', 'Holiday', \
+                     '/music/alice/Discovery/Seasonal/winter_holiday/01.flac', ?, \
+                     'Seasonal:winter_holiday', 'Pending', 1, 'local', 'winter_holiday')",
+        )
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
         let mixes = list_active_contextual_mixes_in(&db, &NoNavidrome, None, &ctx, dec, None)
             .await
             .unwrap();
@@ -2006,6 +2629,7 @@ mod tests {
         assert_eq!(mixes[0].i18n_key, "mix.seasonal.winter_holiday");
         assert_eq!(mixes[0].custom_name, None);
         assert_eq!(mixes[0].local_pct, Some(75));
+        assert_eq!(mixes[0].track_count, 1);
         assert!(mixes.iter().any(|m| m.slug == "drive" && m.offline_priority));
         assert!(mixes.iter().any(|m| m.slug == "focus"));
 
@@ -2253,13 +2877,42 @@ mod tests {
             .unwrap();
         assert!(!mixes.iter().any(|m| m.slug == "winter_holiday"));
 
-        // Custom mix surfaces during its calendar window and deleting it cleans up contextual_mix_states
+        // Custom seasonal mix is active on calendar in June (found by generator helper), hidden while empty,
+        // and surfaces in list_active_contextual_mixes_in once a track exists.
         let june = Utc.with_ymd_and_hms(2026, 6, 21, 14, 0, 0).unwrap();
+        let (_, june_cal) = list_calendar_active_seasonal_defs_in(&db, "alice", june)
+            .await
+            .unwrap();
+        assert!(june_cal.iter().any(|(d, _)| d.slug == "midsummer"));
+        let june_empty =
+            list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, june, None)
+                .await
+                .unwrap();
+        assert!(!june_empty.iter().any(|m| m.slug == "midsummer"));
+
+        let folder_id = crate::models::folder::Folder::get_all_by_user_in(&db, "alice")
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, culture_bucket, pack_slug) \
+             VALUES ('dt-mid-1', 'nd-mid-1', 'Sunlit Folk', 'Nordic Trio', 'Solstice', \
+                     '/music/alice/Discovery/Seasonal/midsummer/01.flac', ?, \
+                     'Seasonal:midsummer', 'Pending', 1, 'local', 'midsummer')",
+        )
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
         let june_mixes =
             list_active_contextual_mixes_in(&db, &NoNavidrome, None, &alice, june, None)
                 .await
                 .unwrap();
-        assert!(june_mixes.iter().any(|m| m.slug == "midsummer"));
+        assert!(june_mixes.iter().any(|m| m.slug == "midsummer" && m.track_count == 1));
 
         delete_mix_definition_in(&db, &admin, "midsummer")
             .await
@@ -2301,6 +2954,15 @@ mod tests {
         stub.answer(
             "/rest/search3",
             &[
+                &subsonic_ok(
+                    r#""searchResult3":{"song":[
+                        {"id":"nd-own-1","title":"Roadsong","artist":"Synth Act","album":"LP","genre":"Electronic","duration":210,"userRating":5,"playCount":12},
+                        {"id":"nd-own-2","title":"Highway","artist":"Indie Act","album":"LP2","genre":"Indie Rock","duration":195,"userRating":4,"playCount":8},
+                        {"id":"nd-disliked","title":"Bad Tune","artist":"Skip Band","album":"LP","genre":"Electronic","duration":180,"userRating":1,"playCount":1},
+                        {"id":"nd-staged-path","title":"Staged Track","artist":"Staged Band","album":"EP","genre":"Electronic","duration":180,"path":"alice/Discovery/Balanced/Staged.flac"},
+                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200}
+                    ]}"#,
+                ),
                 &subsonic_ok(
                     r#""searchResult3":{"song":[
                         {"id":"nd-own-1","title":"Roadsong","artist":"Synth Act","album":"LP","genre":"Electronic","duration":210,"userRating":5,"playCount":12},
@@ -2400,17 +3062,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seasonal_pl.tracks.len(), 1);
-        assert_eq!(
-            stub.asked().len(),
-            before_calls,
+        assert!(
+            !stub.asked()[before_calls..]
+                .iter()
+                .any(|p| p.contains("createPlaylist")),
             "seasonal mix must never call static Navidrome playlist sync"
         );
     }
 
     #[tokio::test]
-    async fn seasonal_reconciliation_creates_smart_playlist_and_cleans_up_expired_ones() {
+    async fn seasonal_reconciliation_skips_empty_packs_creates_when_populated_and_cleans_up() {
         let db = test_db::migrated().await;
-        folder_of(&db, "alice").await;
+        let folder_id = folder_of(&db, "alice").await;
 
         let stub = NavidromeStub::start();
         stub.answer(
@@ -2423,8 +3086,32 @@ mod tests {
             path: "alice/Discovery".to_string(),
         };
 
-        // In December, winter_holiday smart playlist is created and persisted
+        // In December with 0 pending tracks, NO empty Navidrome smart playlist may be created!
         let dec = Utc.with_ymd_and_hms(2026, 12, 10, 12, 0, 0).unwrap();
+        let skipped =
+            reconcile_seasonal_playlists_in(&db, &stub.client(), "alice", &place, dec)
+                .await
+                .unwrap();
+        assert!(skipped.is_empty());
+        assert!(
+            stub.asked().is_empty(),
+            "empty seasonal pack must not create a Navidrome smart playlist"
+        );
+
+        // Once a pending seasonal track exists, smart playlist IS created and persisted
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, \
+                 exclude_from_core_taste, culture_bucket, pack_slug) \
+             VALUES ('dt-sp-1', 'nd-sp-1', 'Winter Lights', 'Nordic Act', 'Xmas', \
+                     '/music/alice/Discovery/Seasonal/winter_holiday/01.flac', ?, \
+                     'Seasonal:winter_holiday', 'Pending', 1, 'local', 'winter_holiday')",
+        )
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
         let created =
             reconcile_seasonal_playlists_in(&db, &stub.client(), "alice", &place, dec)
                 .await
@@ -2438,7 +3125,12 @@ mod tests {
         assert_eq!(state.navidrome_playlist_id.as_deref(), Some("sp-winter-1"));
         assert_eq!(state.expires_at.as_deref(), Some("2027-01-05"));
 
-        // After expiry (Jan 10, 2027) with no pending tracks, even a 404 (already deleted) clears the stored ID
+        // Remove the pending track -> after expiry (Jan 10, 2027) with no pending tracks,
+        // even a 404 (already deleted) clears the stored ID
+        sqlx::query("DELETE FROM discovery_tracks WHERE id = 'dt-sp-1'")
+            .execute(&db)
+            .await
+            .unwrap();
         stub.answer_when("/api/playlist/sp-winter-1", "", 404, r#"{"error":"not found"}"#);
         let jan = Utc.with_ymd_and_hms(2027, 1, 10, 12, 0, 0).unwrap();
         reconcile_seasonal_playlists_in(&db, &stub.client(), "alice", &place, jan)
@@ -2450,6 +3142,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.navidrome_playlist_id, None);
+
+        // Disabling a seasonal mix before expires_at with 0 pending tracks also cleans up its
+        // empty Navidrome smart playlist.
+        ContextualMixStateRow::upsert_playlist_id_in(
+            &db,
+            "alice",
+            "winter_holiday",
+            Some("sp-winter-2"),
+            Some("2027-01-05"),
+        )
+        .await
+        .unwrap();
+        ContextualMixStateRow::upsert_enabled_override_in(&db, "alice", "winter_holiday", false)
+            .await
+            .unwrap();
+        stub.answer_when("/api/playlist/sp-winter-2", "", 200, r#"{}"#);
+        reconcile_seasonal_playlists_in(&db, &stub.client(), "alice", &place, dec)
+            .await
+            .unwrap();
+        let after_disable = ContextualMixStateRow::get_in(&db, "alice", "winter_holiday")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_disable.navidrome_playlist_id, None);
     }
 
     #[tokio::test]
@@ -2724,26 +3440,30 @@ mod tests {
         assert_eq!(by_id.get("dt-scoped"), Some(&Some("nd-staged-echoes")));
         assert_eq!(stub.asked().len(), 1);
 
-        // Persisted in SQLite: a second call hits SQLite ONLY with zero Navidrome requests!
+        // Persisted in SQLite: `maybe_reconcile_discovery_song_ids_in` hits SQLite ONLY with zero
+        // Navidrome requests on already-reconciled rows!
         let persisted = DiscoveryTrackRow::get_by_id_in(&db, "dt-path")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(persisted.song_id.as_deref(), Some("nd-path-match"));
 
-        let second = list_triage_queue_in(
+        let mut already_reconciled = DiscoveryTrackRow::pending_for_user_in(&db, "alice")
+            .await
+            .unwrap();
+        let second_reconciled = maybe_reconcile_discovery_song_ids_in(
             &db,
             &StubNavidrome(stub.client()),
             Some(Path::new("/local/music")),
             "alice",
+            &mut already_reconciled,
         )
-        .await
-        .unwrap();
-        assert_eq!(second.len(), 2);
+        .await;
+        assert_eq!(second_reconciled, 0);
         assert_eq!(
             stub.asked().len(),
             1,
-            "once reconciled, triage queue must not call Navidrome again"
+            "once reconciled, maybe_reconcile_discovery_song_ids_in must not call Navidrome again"
         );
     }
 
@@ -3135,5 +3855,323 @@ mod tests {
         );
         assert_eq!(balanced_pl.tracks.len(), 1);
         assert_eq!(balanced_pl.tracks[0].song_id, "nd-roll-1");
+    }
+
+    #[tokio::test]
+    async fn owned_holiday_library_tracks_match_winter_holiday_without_false_positives() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        let library_resp = subsonic_ok(
+            r#""searchResult3":{"song":[
+                {"id":"nd-xmas-1","title":"All I Want for Christmas Is You","artist":"Mariah Carey","album":"Merry Christmas","genre":"Pop","duration":241,"userRating":5,"starred":"2026-12-01T00:00:00Z","playCount":20},
+                {"id":"nd-xmas-2","title":"Petit Papa Noël","artist":"Tino Rossi","album":"Chants de Noël","genre":"Chanson","duration":188,"userRating":4,"playCount":10},
+                {"id":"nd-xmas-3","title":"Jingle Bell Rock","artist":"Bobby Helms","album":"Holiday Favorites","genre":"Rock","duration":130,"userRating":0,"playCount":5},
+                {"id":"nd-xmas-4","title":"Silent Night","artist":"Nat King Cole","album":"The Magic of Christmas","genre":"Jazz","duration":165,"playCount":7},
+                {"id":"nd-xmas-5","title":"Winter Wonderland","artist":"Bing Crosby","album":"Classic Winter","genre":"Holiday","duration":150,"playCount":4},
+                {"id":"nd-xmas-6","title":"Carol of the Bells","artist":"Trans-Siberian Orchestra","album":"Christmas Eve","genre":"Rock","duration":205,"playCount":6},
+                {"id":"nd-xmas-7","title":"Snowy Evening","artist":"Cozy Trio","album":"December Nights","genre":"Holiday","duration":180,"playCount":3},
+                {"id":"nd-non-1","title":"Bohemian Rhapsody","artist":"Queen","album":"A Night at the Opera","genre":"Rock","duration":354,"userRating":5,"playCount":50},
+                {"id":"nd-non-2","title":"Wonderwall","artist":"Noel Gallagher","album":"Morning Glory","genre":"Britpop","duration":258,"userRating":5,"playCount":30},
+                {"id":"nd-non-3","title":"Roadsong","artist":"Synth Act","album":"LP","genre":"Electronic","duration":210,"userRating":5,"playCount":25},
+                {"id":"nd-non-4","title":"Strange Fruit","artist":"Billie Holiday","album":"Lady Sings the Blues","genre":"Jazz","duration":185,"userRating":5,"playCount":40},
+                {"id":"nd-non-5","title":"Holiday","artist":"Green Day","album":"American Idiot","genre":"Punk Rock","duration":232,"userRating":5,"playCount":35},
+                {"id":"nd-non-6","title":"Holiday","artist":"Madonna","album":"Madonna","genre":"Pop","duration":368,"userRating":4,"playCount":20},
+                {"id":"nd-non-7","title":"Carol","artist":"Chuck Berry","album":"Berry Is on Top","genre":"Rock","duration":168,"userRating":5,"playCount":18},
+                {"id":"nd-non-8","title":"Oh! Carol","artist":"Neil Sedaka","album":"Rock with Sedaka","genre":"Pop","duration":137,"userRating":4,"playCount":15},
+                {"id":"nd-non-9","title":"Golden Sky","artist":"The Holidays","album":"Post Paradise","genre":"Indie","duration":215,"userRating":4,"playCount":12}
+            ]}"#,
+        );
+
+        let stub = NavidromeStub::start();
+        stub.answer("/rest/search3", &[&library_resp, &library_resp]);
+
+        let dec = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
+        let mixes = list_active_contextual_mixes_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            None,
+            &ctx,
+            dec,
+            Some(14),
+        )
+        .await
+        .unwrap();
+
+        let winter = mixes
+            .iter()
+            .find(|m| m.slug == "winter_holiday")
+            .expect("owned holiday tracks must immediately surface winter_holiday");
+        assert_eq!(winter.track_count, 7);
+
+        let pl = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            None,
+            &ctx,
+            "winter_holiday",
+            false,
+            dec,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pl.tracks.len(), 7);
+        assert!(pl.tracks.iter().all(|t| t.owned));
+        assert!(!pl.tracks.iter().any(|t| t.song_id.starts_with("nd-non-")));
+        assert!(pl.tracks.iter().any(|t| t.song_id == "nd-xmas-6"));
+        assert!(pl.tracks.iter().any(|t| t.song_id == "nd-xmas-7"));
+
+        let mariah = pl.tracks.iter().find(|t| t.song_id == "nd-xmas-1").unwrap();
+        assert_eq!(mariah.rating, Some(5));
+        assert!(mariah.starred);
+
+        let jingle = pl.tracks.iter().find(|t| t.song_id == "nd-xmas-3").unwrap();
+        assert_eq!(jingle.rating, None, "rating 0 must normalize to None");
+        assert!(!jingle.starred);
+    }
+
+    #[tokio::test]
+    async fn contextual_mix_triage_and_seed_radio_hydrate_rating_and_starred() {
+        use shared::recommendation::{Neighbour, RecordingFacts, TrackRef, WeightedTag};
+        use soulbeet::knowledge::KnowledgeError;
+        use soulbeet::traits::TagOp;
+
+        struct EmptyKnowledge;
+
+        #[async_trait]
+        impl MusicKnowledge for EmptyKnowledge {
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+            async fn resolve_artist(&self, _: &str) -> Result<Option<String>, KnowledgeError> {
+                Ok(None)
+            }
+            async fn similar_artists(
+                &self,
+                _: &str,
+                _: &str,
+                _: usize,
+            ) -> Result<Vec<Neighbour>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn artist_top_tracks(
+                &self,
+                _: &str,
+                _: usize,
+            ) -> Result<Vec<TrackRef>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn artist_tags(
+                &self,
+                _: &[String],
+            ) -> Result<HashMap<String, Vec<WeightedTag>>, KnowledgeError> {
+                Ok(HashMap::new())
+            }
+            async fn artist_areas(
+                &self,
+                _: &[String],
+            ) -> Result<HashMap<String, Option<String>>, KnowledgeError> {
+                Ok(HashMap::new())
+            }
+            async fn artist_popularity(
+                &self,
+                _: &[String],
+            ) -> Result<HashMap<String, u64>, KnowledgeError> {
+                Ok(HashMap::new())
+            }
+            async fn popularity_reference(&self) -> Result<u64, KnowledgeError> {
+                Ok(1)
+            }
+            async fn related_tags(&self, _: &str) -> Result<Vec<String>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn tag_tracks(&self, _: &str, _: usize) -> Result<Vec<TrackRef>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn multi_tag_tracks(
+                &self,
+                _: &[&str],
+                _: TagOp,
+                _: Option<(u8, u8)>,
+                _: usize,
+            ) -> Result<Vec<TrackRef>, KnowledgeError> {
+                Ok(vec![])
+            }
+            async fn recordings(
+                &self,
+                _: &[String],
+            ) -> Result<HashMap<String, RecordingFacts>, KnowledgeError> {
+                Ok(HashMap::new())
+            }
+        }
+
+        let db = test_db::migrated().await;
+        let folder_id = folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        // Staged track 1: rated in Navidrome (4) + starred; DB rating NULL
+        // Staged track 2: unrated in Navidrome (0); DB rating 3 (fallback must apply)
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, rating, status) \
+             VALUES ('dt-r1', 'nd-r1', 'Staged Live Rated', 'Artist A', 'EP', \
+                     '/music/alice/Discovery/Balanced/01.flac', ?, 'Balanced', NULL, 'Pending'), \
+                    ('dt-r2', 'nd-r2', 'Staged DB Fallback', 'Artist B', 'EP', \
+                     '/music/alice/Discovery/Balanced/02.flac', ?, 'Balanced', 3, 'Pending')",
+        )
+        .bind(&folder_id)
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let library_resp = subsonic_ok(
+            r#""searchResult3":{"song":[
+                {"id":"nd-r1","title":"Staged Live Rated","artist":"Artist A","album":"EP","duration":200,"userRating":4,"starred":"2026-12-01T00:00:00Z","path":"alice/Discovery/Balanced/01.flac"},
+                {"id":"nd-r2","title":"Staged DB Fallback","artist":"Artist B","album":"EP","duration":180,"userRating":0,"path":"alice/Discovery/Balanced/02.flac"},
+                {"id":"nd-seed","title":"Anchor Song","artist":"Seed Act","album":"LP","duration":210,"userRating":5,"starred":"2026-11-20T00:00:00Z"},
+                {"id":"nd-seed-2","title":"Anchor B","artist":"Seed Act","album":"LP","duration":190,"userRating":0}
+            ]}"#,
+        );
+
+        let stub = NavidromeStub::start();
+        stub.answer("/rest/search3", &[&library_resp, &library_resp, &library_resp]);
+        stub.answer(
+            "/rest/getSong",
+            &[&subsonic_ok(
+                r#""song":{"id":"nd-seed","title":"Anchor Song","artist":"Seed Act","album":"LP","duration":210,"userRating":5,"starred":"2026-11-20T00:00:00Z"}"#,
+            )],
+        );
+
+        // 1. Rolling ContextualMixPlaylist hydrates rating + starred + fallback
+        let now = Utc.with_ymd_and_hms(2026, 12, 10, 14, 0, 0).unwrap();
+        let rolling = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            None,
+            &ctx,
+            "balanced",
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        let t1 = rolling.tracks.iter().find(|t| t.song_id == "nd-r1").unwrap();
+        let t2 = rolling.tracks.iter().find(|t| t.song_id == "nd-r2").unwrap();
+        assert_eq!(t1.rating, Some(4));
+        assert!(t1.starred);
+        assert_eq!(t2.rating, Some(3), "must fall back to DB rating when Navidrome has 0");
+        assert!(!t2.starred);
+
+        // 2. Triage queue hydrates live Navidrome rating with DB fallback
+        let triage = list_triage_queue_in(&db, &StubNavidrome(stub.client()), None, "alice")
+            .await
+            .unwrap();
+        let tr1 = triage.iter().find(|t| t.id == "dt-r1").unwrap();
+        let tr2 = triage.iter().find(|t| t.id == "dt-r2").unwrap();
+        assert_eq!(tr1.rating, Some(4));
+        assert_eq!(tr2.rating, Some(3));
+
+        // 3. SeedRadioTrack hydrates rating + starred
+        let radio = start_seed_radio_in(
+            &StubNavidrome(stub.client()),
+            &EmptyKnowledge,
+            &ctx,
+            &SeedRadioRequest {
+                seed_song_id: Some("nd-seed".into()),
+                seed_artist: None,
+                seed_track: None,
+                seed_artist_mbid: None,
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(radio.owned_tracks[0].song_id, "nd-seed");
+        assert_eq!(radio.owned_tracks[0].rating, Some(5));
+        assert!(radio.owned_tracks[0].starred);
+        assert_eq!(radio.owned_tracks[1].song_id, "nd-seed-2");
+        assert_eq!(radio.owned_tracks[1].rating, None);
+        assert!(!radio.owned_tracks[1].starred);
+    }
+
+    #[tokio::test]
+    async fn discovery_track_create_with_context_persists_seasonal_fields() {
+        use crate::models::discovery_playlist::DiscoveryTrackContext;
+
+        let db = test_db::migrated().await;
+        let folder_id = folder_of(&db, "alice").await;
+        let reason = CandidateReason::RegionalContextual {
+            mix_slug: "winter_holiday".into(),
+            country_code: Some("FR".into()),
+        };
+        let reason_json = serde_json::to_string(&reason).unwrap();
+
+        let created = DiscoveryTrackRow::create_with_context_in(
+            &db,
+            Some("nd-ctx-1"),
+            "Petit Papa Noel",
+            "Tino Rossi",
+            "Chants de Noel",
+            "/music/alice/Discovery/Seasonal/winter_holiday/01.flac",
+            &folder_id,
+            "Seasonal:winter_holiday",
+            DiscoveryTrackContext {
+                exclude_from_core_taste: true,
+                reason_json: Some(&reason_json),
+                culture_bucket: Some("local"),
+                pack_slug: Some("winter_holiday"),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(created.exclude_from_core_taste);
+        assert_eq!(created.pack_slug.as_deref(), Some("winter_holiday"));
+        assert_eq!(created.culture_bucket.as_deref(), Some("local"));
+        assert_eq!(created.reason.as_deref(), Some(&reason));
+
+        // Seasonal pack query finds it; rolling profile query excludes it
+        let pack_tracks = DiscoveryTrackRow::get_pending_by_folder_and_pack_in(
+            &db,
+            &folder_id,
+            "winter_holiday",
+        )
+        .await
+        .unwrap();
+        assert_eq!(pack_tracks.len(), 1);
+        assert_eq!(pack_tracks[0].id, created.id);
+
+        let balanced_tracks = DiscoveryTrackRow::get_pending_by_folder_and_profile_in(
+            &db,
+            &folder_id,
+            "Balanced",
+        )
+        .await
+        .unwrap();
+        assert!(balanced_tracks.is_empty());
+    }
+
+    #[test]
+    fn seasonal_display_title_returns_human_readable_names() {
+        assert_eq!(
+            seasonal_display_title("winter_holiday", None),
+            "Christmas Mix"
+        );
+        assert_eq!(
+            seasonal_display_title("new_years_eve", None),
+            "New Year's Eve"
+        );
+        assert_eq!(seasonal_display_title("halloween", None), "Halloween");
+        assert_eq!(seasonal_display_title("summer", None), "Summer Mix");
+        assert_eq!(
+            seasonal_display_title("winter_holiday", Some("Custom Xmas")),
+            "Custom Xmas"
+        );
+        assert_eq!(
+            seasonal_display_title("midsummer_night", None),
+            "Midsummer Night"
+        );
     }
 }

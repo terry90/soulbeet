@@ -7,13 +7,12 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::db::{get_cursor, now_unix};
+use crate::db::now_unix;
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
     DrainReport, NavidromeCredentials, OutboxMutation, OutboxRow, OutboxSummary, SoulbeetAuth,
 };
 use crate::subsonic::SubsonicClient;
-use crate::sync::CURSOR_PROMOTE_THRESHOLD;
 
 enum DispatchError {
     Retryable {
@@ -75,11 +74,6 @@ impl MutationOutbox {
         let payload_json = serde_json::to_string(&mutation)?;
         let kind = mutation.kind_name();
         let song_id = mutation.song_id().to_string();
-        let promote_threshold: i64 = get_cursor(&self.pool, CURSOR_PROMOTE_THRESHOLD)
-            .await?
-            .and_then(|v| v.parse::<i64>().ok())
-            .map(|v| v.clamp(1, 5))
-            .unwrap_or(4);
 
         let mut tx = self.pool.begin().await?;
 
@@ -141,20 +135,11 @@ impl MutationOutbox {
                 discovery_track_id,
                 ..
             } => {
-                sqlx::query(
-                    r#"
-                    UPDATE tracks
-                    SET is_discovery = 0,
-                        user_rating = MAX(user_rating, ?),
-                        updated_at = ?
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(promote_threshold)
-                .bind(now)
-                .bind(song_id)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE tracks SET is_discovery = 0, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(song_id)
+                    .execute(&mut *tx)
+                    .await?;
 
                 if let Some(disc_id) = discovery_track_id {
                     sqlx::query(

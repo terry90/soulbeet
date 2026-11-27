@@ -71,6 +71,7 @@ pub struct UserSettings {
     pub default_download_folder_id: Option<String>,
     pub deezer_recommendations: bool,
     pub lossy_fallback: LossyFallback,
+    pub external_rating_sync_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -105,6 +106,8 @@ pub struct UpdateUserSettings {
     pub deezer_recommendations: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossy_fallback: Option<LossyFallback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_rating_sync_enabled: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -154,6 +157,7 @@ impl UserSettings {
             default_download_folder_id: None,
             deezer_recommendations: false,
             lossy_fallback: LossyFallback::Ask,
+            external_rating_sync_enabled: true,
         }
     }
 
@@ -207,7 +211,8 @@ impl UserSettings {
             discovery_playlist_name,
             default_download_folder_id,
             deezer_recommendations,
-            lossy_fallback
+            lossy_fallback,
+            external_rating_sync_enabled
         );
         if given.is_empty() {
             insert.push(" ON CONFLICT(user_id) DO NOTHING");
@@ -510,5 +515,39 @@ mod tests {
             serde_json::to_value(LossyFallback::Never).unwrap(),
             serde_json::json!("never")
         );
+    }
+
+    #[tokio::test]
+    async fn external_rating_sync_defaults_to_on_and_can_be_toggled() {
+        let db = test_db::migrated().await;
+        crate::core::folder_of(&db, "alice").await;
+        assert!(
+            UserSettings::get_in(&db, "alice")
+                .await
+                .unwrap()
+                .external_rating_sync_enabled
+        );
+        let s = UserSettings::upsert_in(
+            &db,
+            "alice",
+            UpdateUserSettings {
+                external_rating_sync_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!s.external_rating_sync_enabled);
+        let s = UserSettings::upsert_in(
+            &db,
+            "alice",
+            UpdateUserSettings {
+                external_rating_sync_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(s.external_rating_sync_enabled);
     }
 }

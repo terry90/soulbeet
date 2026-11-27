@@ -517,12 +517,16 @@ pub struct ClientBootstrapDto {
     pub username: String,
     pub is_admin: bool,
     pub navidrome: Option<NavidromeCredentials>,
-    #[serde(default)]
+    #[serde(default = "default_promote_threshold")]
     pub promote_threshold: u8,
     #[serde(default)]
     pub auto_delete_enabled: bool,
     #[serde(default)]
     pub discovery_enabled: bool,
+}
+
+fn default_promote_threshold() -> u8 {
+    3
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

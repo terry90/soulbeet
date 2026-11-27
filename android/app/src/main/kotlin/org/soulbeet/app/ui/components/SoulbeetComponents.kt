@@ -217,6 +217,39 @@ fun OfflineDot(modifier: Modifier = Modifier) {
 }
 
 /**
+ * Compact gold star rating badge (e.g. `★ 4`) displayed on track rows and mini-player when rated.
+ */
+@Composable
+fun CompactStarBadge(
+    rating: Int,
+    modifier: Modifier = Modifier,
+) {
+    if (rating <= 0) return
+    val colors = LocalSoulbeetColors.current
+    val type = LocalSoulbeetTypography.current
+    Row(
+        modifier = modifier
+            .semantics { contentDescription = "Rated $rating out of 5 stars" },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Star,
+            contentDescription = null,
+            tint = colors.gold,
+            modifier = Modifier.size(12.dp),
+        )
+        Text(
+            text = "$rating",
+            style = type.monoXs,
+            color = colors.gold,
+            maxLines = 1,
+            softWrap = false,
+        )
+    }
+}
+
+/**
  * Unified track list row supporting Owned Library, Pending Discovery (with inline Keep/Drop and
  * horizontal swipe triage), and Unowned Catalog (`0.78` opacity + `Acquire & Play` + `seam-light`).
  */
@@ -235,6 +268,7 @@ fun TrackRow(
     isPendingDiscovery: Boolean = false,
     discoveryExpiryLabel: String? = null,
     isStarred: Boolean = false,
+    userRating: Int = 0,
     isUnownedCatalog: Boolean = false,
     isAcquiring: Boolean = false,
     acquiringLabel: String? = null,
@@ -353,6 +387,9 @@ fun TrackRow(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false),
                         )
+                        if (userRating > 0) {
+                            CompactStarBadge(rating = userRating)
+                        }
                         if (isPendingDiscovery) {
                             Surface(
                                 color = colors.accentSurface,

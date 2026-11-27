@@ -11,8 +11,9 @@ use crate::{
     format_discovery_badge, format_duration, use_player, IconCar, IconCheck, IconHeart, IconInfo,
     IconLaptop, IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause,
     IconPictureInPicture2, IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShuffle,
-    IconSkipBack, IconSkipForward, IconSmartphone, IconSparkles, IconThumbsDown, IconTrash2,
-    IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode, StarStrip, StarStripSize,
+    IconSkipBack, IconSkipForward, IconSmartphone, IconSparkles, IconStar, IconThumbsDown,
+    IconTrash2, IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode, StarStrip,
+    StarStripSize,
 };
 
 use super::DrawerTab;
@@ -562,6 +563,14 @@ pub fn StudioPlayerBar(
                                             "{format_discovery_badge(track.days_remaining)}"
                                         }
                                     }
+                                    if track.rating > 0 {
+                                        span {
+                                            class: "inline-flex md:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                            title: format!("Rated {} out of 5 stars", track.rating),
+                                            IconStar { size: 10, filled: true }
+                                            span { "{track.rating}" }
+                                        }
+                                    }
                                 }
                                 p { class: "text-[12px] text-beet-text-secondary truncate mt-0.5",
                                     "{track.artist}"
@@ -593,6 +602,14 @@ pub fn StudioPlayerBar(
                                         onclick: move |_| on_drop.call(track_drop.clone()),
                                         IconThumbsDown { size: 14 }
                                     }
+                                    div { class: "hidden md:flex items-center",
+                                        StarStrip {
+                                            rating: track.rating,
+                                            size: StarStripSize::Compact,
+                                            on_rate: move |r| on_rate.call((track_rate.clone(), r)),
+                                            aria_label: format!("Rate {}", track.title),
+                                        }
+                                    }
                                 } else {
                                     button {
                                         r#type: "button",
@@ -607,7 +624,7 @@ pub fn StudioPlayerBar(
                                         onclick: move |_| on_star.call((track_star.clone(), !is_starred)),
                                         IconHeart { size: 16, filled: is_starred }
                                     }
-                                    div { class: "hidden 2xl:flex items-center",
+                                    div { class: "hidden md:flex items-center",
                                         StarStrip {
                                             rating: track.rating,
                                             size: StarStripSize::Compact,

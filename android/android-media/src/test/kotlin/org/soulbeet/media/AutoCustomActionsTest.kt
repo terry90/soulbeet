@@ -134,6 +134,7 @@ class AutoCustomActionsTest {
         assertFalse("Keep must NOT skip playback", skipped)
         assertEquals(listOf("enqueue", "updateContext", "refreshLayout"), events)
         assertFalse(activeContext!!.isPendingDiscovery)
+        assertEquals("Keep must NOT stamp a star rating", 0, activeContext!!.userRating)
         assertEquals(
             listOf(FfiOutboxMutation.Keep(songId = "song-99", discoveryTrackId = "dt-42", targetFolderId = null)),
             core.enqueuedMutations,

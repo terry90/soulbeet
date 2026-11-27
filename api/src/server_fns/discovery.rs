@@ -34,6 +34,101 @@ async fn update_progress(
 }
 
 #[cfg(feature = "server")]
+fn seasonal_progress_label(def: &shared::recommendation::ContextualMixDefinition) -> String {
+    format!(
+        "Seasonal: {}",
+        crate::core::contextual::seasonal_display_title(&def.slug, def.custom_name.as_deref())
+    )
+}
+
+#[cfg(feature = "server")]
+async fn upsert_progress(
+    user_id: &str,
+    profile: &str,
+    phase: shared::navidrome::ProfilePhase,
+    current: u32,
+    total: u32,
+) {
+    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+    if let Some(progress) = map.get_mut(user_id) {
+        if let Some(pp) = progress.profiles.iter_mut().find(|p| p.profile == profile) {
+            pp.phase = phase;
+            pp.current = current;
+            pp.total = total;
+        } else {
+            progress.profiles.push(shared::navidrome::ProfileProgress {
+                profile: profile.to_string(),
+                phase,
+                current,
+                total,
+            });
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+type SeasonalWorkItem = (
+    shared::recommendation::ContextualMixDefinition,
+    Option<crate::models::contextual::ContextualMixStateRow>,
+    usize,
+);
+
+#[cfg(feature = "server")]
+async fn register_seasonal_progress_profiles(user_id: &str, work: &[SeasonalWorkItem]) {
+    if work.is_empty() {
+        return;
+    }
+    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+    let Some(progress) = map.get_mut(user_id) else {
+        return;
+    };
+    for (def, _, needed) in work {
+        let label = seasonal_progress_label(def);
+        if !progress.profiles.iter().any(|p| p.profile == label) {
+            progress.profiles.push(shared::navidrome::ProfileProgress {
+                profile: label,
+                phase: shared::navidrome::ProfilePhase::Waiting,
+                current: 0,
+                total: *needed as u32,
+            });
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+async fn collect_seasonal_work(
+    user_id: &str,
+    folder_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(shared::recommendation::UserCultureProfile, Vec<SeasonalWorkItem>), Failure> {
+    let (stored_culture, active_seasonal) =
+        crate::core::contextual::list_calendar_active_seasonal_defs_in(
+            &crate::db::DB,
+            user_id,
+            now,
+        )
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+
+    let mut work = Vec::new();
+    for (def, state) in active_seasonal {
+        let existing = DiscoveryTrackRow::get_pending_by_folder_and_pack_in(
+            &crate::db::DB,
+            folder_id,
+            &def.slug,
+        )
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+        let needed = (def.target_tracks as usize).saturating_sub(existing);
+        if needed > 0 {
+            work.push((def, state, needed));
+        }
+    }
+    Ok((stored_culture, work))
+}
+
+#[cfg(feature = "server")]
 use crate::auth::UserId;
 #[cfg(feature = "server")]
 use crate::import_queue::{Duplicates, ImportJob, IMPORT_QUEUE};
@@ -136,7 +231,7 @@ pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError
         let mut tracks = DiscoveryTrackRow::get_by_folder(folder_id)
             .await
             .map_err(server_error)?;
-        crate::core::contextual::maybe_reconcile_discovery_song_ids_in(
+        crate::core::contextual::reconcile_and_hydrate_discovery_tracks_in(
             &crate::db::DB,
             &crate::core::index::ServerNavidrome,
             crate::config::CONFIG.navidrome_music_path(),
@@ -436,6 +531,10 @@ struct QueuedTrack {
     /// from. Each was cancelled at its failover, and `stop_waiting` removes
     /// their records.
     abandoned: Vec<(String, String)>,
+    /// Optional serialized `CandidateReason` for contextual/seasonal tracks.
+    reason_json: Option<String>,
+    /// Optional `CultureBucket` label for contextual/seasonal tracks.
+    culture_bucket: Option<String>,
 }
 
 /// The track's import is done or abandoned once it is dropped, so whoever
@@ -796,6 +895,14 @@ pub async fn generate_discovery_playlist_internal(
     );
     seen.extend(kept_out);
 
+    // Pre-register any calendar-active seasonal packs that need tracks in DISCOVERY_PROGRESS so
+    // the progress bar reflects remaining seasonal work even if rolling profiles are skipped.
+    if let Ok((_, seasonal_work)) =
+        collect_seasonal_work(user_id, folder_id, chrono::Utc::now()).await
+    {
+        register_seasonal_progress_profiles(user_id, &seasonal_work).await;
+    }
+
     let mut total_downloads = 0u32;
     let mut all_profile_stats: Vec<ProfileGenerationStats> = Vec::new();
     // Set when the importer broke during the run and stopped it.
@@ -1067,6 +1174,8 @@ pub async fn generate_discovery_playlist_internal(
                             // rejected in this loop, and must not be retried.
                             pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
                             abandoned: Vec::new(),
+                            reason_json: None,
+                            culture_bucket: None,
                         });
                         DiscoveryCandidateRow::mark_used(
                             user_id,
@@ -1340,59 +1449,41 @@ pub async fn generate_discovery_playlist_internal(
         all_profile_stats.push(stats);
     }
 
+    // Also build/top-up any calendar-active seasonal packs (e.g. Winter Holiday / Christmas)
+    // as part of the same discovery run before scanning and reconciling playlists.
+    if importer_issue.is_none() {
+        match generate_seasonal_packs_unlocked(user_id, &settings, &folder, &backend, &searched)
+            .await
+        {
+            Ok(seasonal_imported) => {
+                if seasonal_imported > 0 {
+                    info!(
+                        "Discovery: imported {} seasonal tracks for user {}",
+                        seasonal_imported, user_id
+                    );
+                    total_downloads += seasonal_imported;
+                }
+            }
+            Err(f) if f.code == FailureCode::ImporterBroken => {
+                importer_issue = Some(f);
+            }
+            Err(f) => {
+                warn!(
+                    "Seasonal pack generation failed during discovery run for user {}: {}",
+                    user_id,
+                    crate::core::logged(&f)
+                );
+            }
+        }
+    }
+
     UserSettings::update_discovery_last_generated(user_id)
         .await
         .map_err(|e| run_database_failure(Stage::Import, e))?;
 
     // Trigger a Navidrome scan then wait for it to finish so playlists can be created.
     if total_downloads > 0 {
-        if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-            let navidrome = crate::core::index::ServerNavidrome;
-            let user = UserId::new(user_id);
-            if scan_imports(&crate::db::DB, &navidrome, &user, &navi, total_downloads).await {
-                // Reconcile pending discovery tracks' Navidrome song_ids immediately now that
-                // the scan completed so Triage & Moment mixes can play them right away.
-                match DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, user_id).await {
-                    Ok(mut pending)
-                        if pending
-                            .iter()
-                            .any(crate::core::contextual::needs_song_id_reconciliation) =>
-                    {
-                        match navi.get_all_songs_with_ratings().await {
-                            Ok(library) => {
-                                let reconciled =
-                                    crate::core::contextual::reconcile_discovery_song_ids_in(
-                                        &crate::db::DB,
-                                        &library,
-                                        crate::config::CONFIG.navidrome_music_path(),
-                                        &mut pending,
-                                    )
-                                    .await;
-                                if reconciled > 0 {
-                                    info!(
-                                        "Reconciled {} discovery track song_ids after scan for user {}",
-                                        reconciled, user_id
-                                    );
-                                }
-                            }
-                            Err(e) => warn!(
-                                "Failed to fetch Navidrome library to reconcile discovery song_ids for user {}: {}",
-                                user_id, e
-                            ),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(
-                        "Failed to load pending discovery tracks for song_id reconciliation (user {}): {}",
-                        user_id, e
-                    ),
-                }
-                // Create/update smart playlists now that tracks are indexed
-                if let Err(e) = reconcile_discovery_playlists(user_id).await {
-                    warn!("Playlist reconciliation after generation failed: {}", e);
-                }
-            }
-        }
+        scan_reconcile_after_imports(user_id, total_downloads).await;
     }
 
     run_outcome(
@@ -1403,6 +1494,803 @@ pub async fn generate_discovery_playlist_internal(
         importer_issue,
         engine_issue,
     )
+}
+
+/// Triggers a Navidrome scan after `imported` discovery tracks are staged, reconciles their
+/// Navidrome `song_id`s in SQLite, and reconciles rolling + seasonal Navidrome smart playlists.
+#[cfg(feature = "server")]
+async fn scan_reconcile_after_imports(user_id: &str, imported: u32) {
+    if imported == 0 {
+        return;
+    }
+    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
+        let navidrome = crate::core::index::ServerNavidrome;
+        let user = UserId::new(user_id);
+        if scan_imports(&crate::db::DB, &navidrome, &user, &navi, imported).await {
+            match DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, user_id).await {
+                Ok(mut pending)
+                    if pending
+                        .iter()
+                        .any(crate::core::contextual::needs_song_id_reconciliation) =>
+                {
+                    match navi.get_all_songs_with_ratings().await {
+                        Ok(library) => {
+                            let reconciled =
+                                crate::core::contextual::reconcile_discovery_song_ids_in(
+                                    &crate::db::DB,
+                                    &library,
+                                    crate::config::CONFIG.navidrome_music_path(),
+                                    &mut pending,
+                                )
+                                .await;
+                            if reconciled > 0 {
+                                info!(
+                                    "Reconciled {} discovery track song_ids after scan for user {}",
+                                    reconciled, user_id
+                                );
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Failed to fetch Navidrome library to reconcile discovery song_ids for user {}: {}",
+                            user_id, e
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "Failed to load pending discovery tracks for song_id reconciliation (user {}): {}",
+                    user_id, e
+                ),
+            }
+            if let Err(e) = reconcile_discovery_playlists(user_id).await {
+                warn!("Playlist reconciliation after generation failed: {}", e);
+            }
+        }
+    }
+}
+
+/// Acquires `user_id`'s discovery generation lock, claims `DISCOVERY_PROGRESS` cleanly when
+/// seasonal work is needed, builds/tops up any calendar-active seasonal mixes (staging under
+/// `Discovery/Seasonal/<slug>/`), and triggers a Navidrome scan and seasonal smart playlist
+/// reconciliation if any tracks were imported.
+#[cfg(feature = "server")]
+pub async fn generate_seasonal_packs_for_user(user_id: &str) -> Result<u32, Failure> {
+    use crate::core::sources::Searched;
+    use crate::services::{download_backend, DEFAULT_DOWNLOAD_BACKEND};
+    use shared::navidrome::{GenerationResult, GenerationStatus, ProfilePhase, ProfileProgress};
+
+    let user_lock = {
+        let mut locks = GENERATION_LOCKS.lock().await;
+        locks
+            .entry(user_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let Ok(_guard) = user_lock.try_lock() else {
+        return Err(generation_running());
+    };
+
+    let settings = UserSettings::get(user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+    if !settings.discovery_enabled {
+        return Err(discovery_disabled());
+    }
+    let folder_id = settings
+        .discovery_folder_id
+        .as_ref()
+        .ok_or_else(discovery_folder_required)?;
+    let folder = Folder::get_by_id(folder_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?
+        .ok_or_else(discovery_folder_not_found)?;
+
+    if let Some(failure) = crate::importer_health::blocking_failure().await {
+        return Err(failure);
+    }
+
+    let now = chrono::Utc::now();
+    let (stored_culture, work) = collect_seasonal_work(user_id, &folder.id, now).await?;
+    if work.is_empty() {
+        return Ok(0);
+    }
+
+    let backend = download_backend(None)
+        .await
+        .map_err(|e| e.failure(Stage::SourceSearch, e.to_string()))?;
+    let searched: Searched = (DEFAULT_DOWNLOAD_BACKEND.to_string(), backend.clone());
+
+    let initial_profiles: Vec<ProfileProgress> = work
+        .iter()
+        .map(|(def, _, needed)| ProfileProgress {
+            profile: seasonal_progress_label(def),
+            phase: ProfilePhase::Waiting,
+            current: 0,
+            total: *needed as u32,
+        })
+        .collect();
+    let progress = DiscoveryProgress {
+        status: GenerationStatus::Running,
+        profiles: initial_profiles,
+        started_at: Some(chrono::Utc::now().to_rfc3339()),
+        ..Default::default()
+    };
+    {
+        let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+        claim_run(&mut map, user_id, progress)?;
+    }
+
+    let outcome = generate_seasonal_packs_with_work(
+        user_id,
+        &settings,
+        &folder,
+        &backend,
+        &searched,
+        now,
+        stored_culture,
+        work,
+    )
+    .await;
+
+    match outcome {
+        Ok(imported) => {
+            if imported > 0 {
+                scan_reconcile_after_imports(user_id, imported).await;
+            }
+            let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+            if let Some(p) = map.get_mut(user_id) {
+                p.status = GenerationStatus::Complete;
+                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                for pp in &mut p.profiles {
+                    if pp.phase != ProfilePhase::Skipped {
+                        pp.phase = ProfilePhase::Done;
+                        pp.current = pp.total;
+                    }
+                }
+                p.result = Some(GenerationResult {
+                    total_imported: imported,
+                    profiles: Vec::new(),
+                });
+            }
+            Ok(imported)
+        }
+        Err(e) => {
+            let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+            if let Some(p) = map.get_mut(user_id) {
+                p.status = GenerationStatus::Error;
+                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                p.failure = Some(e.clone());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Builds and downloads candidates for every calendar-active seasonal mix whose pending
+/// `pack_slug` count is below `target_tracks`. Caller must hold `GENERATION_LOCKS` for `user_id`.
+#[cfg(feature = "server")]
+async fn generate_seasonal_packs_unlocked(
+    user_id: &str,
+    settings: &UserSettings,
+    folder: &Folder,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+    searched: &crate::core::sources::Searched,
+) -> Result<u32, Failure> {
+    let now = chrono::Utc::now();
+    let (stored_culture, work) = collect_seasonal_work(user_id, &folder.id, now).await?;
+    if work.is_empty() {
+        return Ok(0);
+    }
+    generate_seasonal_packs_with_work(
+        user_id,
+        settings,
+        folder,
+        backend,
+        searched,
+        now,
+        stored_culture,
+        work,
+    )
+    .await
+}
+
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn generate_seasonal_packs_with_work(
+    user_id: &str,
+    settings: &UserSettings,
+    folder: &Folder,
+    backend: &Arc<dyn soulbeet::DownloadBackend>,
+    searched: &crate::core::sources::Searched,
+    now: chrono::DateTime<chrono::Utc>,
+    stored_culture: shared::recommendation::UserCultureProfile,
+    work: Vec<SeasonalWorkItem>,
+) -> Result<u32, Failure> {
+    use chrono::Datelike;
+    use shared::recommendation::{
+        ArtistRef, CandidateSet, CultureSteering, DiscoveryProfile, ProfileConfig, TrackRef,
+        UserCultureProfile, UserMusicProfile,
+    };
+    use soulbeet::engine::contextual::{
+        infer_culture_profile, ContextSpec, ContextualCandidateGenerator, ListenBrainzPlaylistPool,
+    };
+    use soulbeet::knowledge::metabrainz::MetaBrainzKnowledge;
+    use soulbeet::listenbrainz::labs::LabsClient;
+    use soulbeet::musicbrainz::MusicBrainzProvider;
+    use soulbeet::CandidateGenerator;
+
+    use crate::models::contextual::{
+        ContextualMixStateRow, DiscoveryRejectionRow, UserCultureProfileRow,
+    };
+    use crate::models::deletion_review::DeletionReviewRow;
+    use crate::models::discovery_history::{seen_key, DiscoveryHistoryRow};
+    use crate::models::discovery_playlist::DiscoveryTrackContext;
+    use crate::models::discovery_search_miss;
+
+    register_seasonal_progress_profiles(user_id, &work).await;
+
+    // Set up MetaBrainz knowledge + ListenBrainz community playlist pool + MusicBrainz fallback.
+    let services = crate::core::recommend::DiscoveryServices::live();
+    let plan = crate::core::recommend::plan_for(settings);
+    let (listenbrainz, _) =
+        crate::core::recommend::listenbrainz_for(&services, plan.listenbrainz_token)
+            .await
+            .map_err(|e| {
+                Failure::new(
+                    FailureCode::MetadataUnavailable,
+                    Stage::Input,
+                    RetryAdvice::SameSourceLater,
+                    e.to_string(),
+                )
+            })?;
+    let labs = LabsClient::new(&services.hosts.labs, services.metabrainz_pace).map_err(|e| {
+        Failure::new(
+            FailureCode::MetadataUnavailable,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            e.to_string(),
+        )
+    })?;
+    let knowledge = Arc::new(MetaBrainzKnowledge::new(
+        listenbrainz.clone(),
+        labs,
+        services.musicbrainz.clone(),
+        services.cache.clone(),
+    ));
+    let pool = Arc::new(ListenBrainzPlaylistPool::new(listenbrainz));
+    let metadata: Arc<dyn soulbeet::MetadataProvider> = Arc::new(MusicBrainzProvider::new());
+
+    // Build user's taste profile + known tracks from Navidrome (best-effort so seasonal packs
+    // still generate even for a fresh library with few or no plays).
+    let mut profile: UserMusicProfile = match crate::services::navidrome_client_for_user(user_id)
+        .await
+    {
+        Ok(navi) => {
+            let excluded_tracks =
+                DiscoveryTrackRow::excluded_from_core_taste_for_user_in(&crate::db::DB, user_id)
+                    .await
+                    .unwrap_or_default();
+            let excluded_song_ids: std::collections::HashSet<String> = excluded_tracks
+                .iter()
+                .filter_map(|t| t.song_id.clone().filter(|s| !s.is_empty()))
+                .collect();
+            let excluded_keys: std::collections::HashSet<String> = excluded_tracks
+                .iter()
+                .map(|t| CandidateSet::key(&t.artist, &t.title))
+                .collect();
+
+            match soulbeet::history::navidrome::read(&navi).await {
+                Ok(lib) => {
+                    let filtered = lib.exclude_from_core_taste(move |song| {
+                        let lower_path = song.path.replace('\\', "/").to_ascii_lowercase();
+                        lower_path.contains("/discovery/seasonal/")
+                            || lower_path.starts_with("discovery/seasonal/")
+                            || excluded_song_ids.contains(&song.id)
+                            || excluded_keys.contains(&CandidateSet::key(&song.artist, &song.title))
+                    });
+                    let histories: Vec<Arc<dyn soulbeet::ListeningHistory>> =
+                        vec![Arc::new(filtered)];
+                    soulbeet::engine::build_profile(&histories, knowledge.as_ref())
+                        .await
+                        .profile
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not read Navidrome history for seasonal generation (user {}): {}",
+                        user_id, e
+                    );
+                    UserMusicProfile::default()
+                }
+            }
+        }
+        Err(_) => UserMusicProfile::default(),
+    };
+
+    // Never re-download tracks already pending in discovery.
+    if let Ok(pending_all) = DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, user_id).await {
+        for dt in pending_all {
+            profile.known.add_track(&TrackRef {
+                artist: ArtistRef {
+                    name: dt.artist,
+                    mbid: None,
+                },
+                title: dt.title,
+                mbid: None,
+            });
+        }
+    }
+
+    // Auto-infer and persist culture profile when the user has no saved row yet.
+    let culture: UserCultureProfile = match UserCultureProfileRow::get_in(&crate::db::DB, user_id)
+        .await
+    {
+        Ok(Some(existing)) => existing,
+        Ok(None) => {
+            let inferred = infer_culture_profile(&profile, knowledge.as_ref(), None, Vec::new(), 0.45)
+                .await;
+            match UserCultureProfileRow::upsert_in(&crate::db::DB, user_id, &inferred).await {
+                Ok(saved) => saved,
+                Err(e) => {
+                    warn!(
+                        "Could not persist inferred culture profile for user {}: {}",
+                        user_id, e
+                    );
+                    inferred
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Could not load culture profile for user {}: {}",
+                user_id, e
+            );
+            stored_culture
+        }
+    };
+
+    // Exclusions: explicit rejections, deleted tracks, and search-miss kept-out tracks.
+    let mut rejected_keys = DiscoveryRejectionRow::keys_for_user_in(&crate::db::DB, user_id)
+        .await
+        .map_err(|e| run_database_failure(Stage::Input, e))?;
+    let mut tried_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(disliked) = DeletionReviewRow::disliked_keys(user_id).await {
+        for k in disliked {
+            tried_keys.insert(k);
+        }
+    }
+    if let Ok(kept_out) = discovery_search_miss::kept_out_keys(user_id).await {
+        for k in kept_out {
+            tried_keys.insert(k);
+        }
+    }
+
+    let download_base = crate::config::CONFIG.download_path().clone();
+    let mut total_seasonal_imported = 0u32;
+
+    for (def, state, needed) in work {
+        if let Some(failure) = crate::importer_health::blocking_failure().await {
+            warn!(
+                "Seasonal pack '{}' for {} skipped: {}",
+                def.slug, user_id, failure.message
+            );
+            return Err(failure);
+        }
+
+        let seasonal_dir = std::path::Path::new(&folder.discovery_path())
+            .join("Seasonal")
+            .join(&def.slug);
+        tokio::fs::create_dir_all(&seasonal_dir).await.map_err(|e| {
+            target_unwritable(
+                &e,
+                format!("Failed to create Discovery/Seasonal/{} dir: {}", def.slug, e),
+            )
+        })?;
+
+        let steering = state
+            .as_ref()
+            .map(|s| CultureSteering::parse(&s.steering))
+            .unwrap_or_default();
+        let seasonal_expires_at = def
+            .calendar_window
+            .as_ref()
+            .and_then(|w| w.cycle_dates(now.year(), now.month(), now.day()))
+            .map(|(_, _, exp)| exp);
+
+        let progress_label = seasonal_progress_label(&def);
+        upsert_progress(
+            user_id,
+            &progress_label,
+            shared::navidrome::ProfilePhase::GeneratingRecommendations,
+            0,
+            needed as u32,
+        )
+        .await;
+
+        let overfetch_target = needed.saturating_mul(3).max(def.target_tracks as usize);
+        let generator = ContextualCandidateGenerator::new(
+            ContextSpec {
+                definition: def.clone(),
+                culture: culture.clone(),
+                steering,
+                target_count: overfetch_target,
+            },
+            knowledge.clone(),
+            Some(pool.clone()),
+            rejected_keys.clone(),
+        )
+        .with_metadata(metadata.clone());
+
+        let output = generator
+            .generate(&profile, &ProfileConfig::from_profile(DiscoveryProfile::Balanced))
+            .await;
+        let mut candidates = output.candidates.into_vec();
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.artist.cmp(&b.artist))
+                .then_with(|| a.track.cmp(&b.track))
+        });
+
+        if candidates.is_empty() {
+            info!(
+                "Seasonal pack '{}': generator returned 0 candidates for user {}",
+                def.slug, user_id
+            );
+            upsert_progress(
+                user_id,
+                &progress_label,
+                shared::navidrome::ProfilePhase::Done,
+                0,
+                needed as u32,
+            )
+            .await;
+            continue;
+        }
+
+        info!(
+            "Seasonal pack '{}': {} candidates ready, need {} tracks for user {}",
+            def.slug,
+            candidates.len(),
+            needed,
+            user_id
+        );
+
+        let profile_label = format!("Seasonal:{}", def.slug);
+        let mut pack_imported = 0usize;
+        let mut cand_cursor = 0usize;
+        let mut searched_count = 0u32;
+
+        for round in 0..2u32 {
+            let remaining = needed.saturating_sub(pack_imported);
+            if remaining == 0 || cand_cursor >= candidates.len() {
+                break;
+            }
+            if let Some(failure) = crate::importer_health::blocking_failure().await {
+                return Err(failure);
+            }
+
+            let queue_target = remaining + remaining.div_ceil(2);
+            let mut queued: Vec<QueuedTrack> = Vec::new();
+
+            while cand_cursor < candidates.len() && queued.len() < queue_target {
+                let candidate = &candidates[cand_cursor];
+                cand_cursor += 1;
+
+                let s_key = seen_key(&candidate.artist, &candidate.track);
+                let c_key = CandidateSet::key(&candidate.artist, &candidate.track);
+                if tried_keys.contains(&s_key) || rejected_keys.contains(&c_key) {
+                    continue;
+                }
+
+                searched_count += 1;
+                upsert_progress(
+                    user_id,
+                    &progress_label,
+                    shared::navidrome::ProfilePhase::SearchingSoulseek,
+                    searched_count,
+                    candidates.len() as u32,
+                )
+                .await;
+
+                let searched_for = search_candidate(
+                    &crate::db::DB,
+                    searched,
+                    user_id,
+                    &candidate.artist,
+                    &candidate.track,
+                    candidate.album.as_deref(),
+                )
+                .await
+                .map_err(|e| run_database_failure(Stage::SourceSearch, e))?;
+
+                let mut ranked_items = match searched_for {
+                    CandidateSearch::Found(items) => items,
+                    CandidateSearch::Missed(_) | CandidateSearch::Failed(_) => {
+                        tried_keys.insert(s_key);
+                        continue;
+                    }
+                };
+                if ranked_items.is_empty() {
+                    tried_keys.insert(s_key);
+                    continue;
+                }
+
+                ranked_items.truncate(failover::MAX_SOURCES_PER_TRACK);
+                let track_batch = BatchRef::new(
+                    TransferOwner {
+                        user_id: UserId::new(user_id),
+                        batch_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    format!("{} - {}", candidate.artist, candidate.track),
+                    seasonal_dir.clone(),
+                    soulbeet::ImportMode::Singleton,
+                    searched.0.clone(),
+                );
+                track_batch.inbox.close();
+
+                let reason_json = candidate
+                    .reason
+                    .as_ref()
+                    .and_then(|r| serde_json::to_string(r).ok());
+                let culture_bucket = candidate.culture_bucket.map(|b| b.as_str().to_string());
+
+                let mut enqueued = false;
+                for item in &ranked_items {
+                    let transfer = transfer_key(backend.id(), &item.source, &item.id);
+                    let claim = TransferRegistry::global()
+                        .claim(std::slice::from_ref(&transfer), &track_batch);
+                    if claim.claimed.is_empty() {
+                        continue;
+                    }
+                    let request = backend.new_request();
+                    let download_results =
+                        match enqueue_claimed(backend, vec![item.clone()], &track_batch, &request)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                    if let Some(dl) = download_results
+                        .iter()
+                        .find(|dl| dl.status == shared::download::EnqueueStatus::Enqueued)
+                    {
+                        tried_keys.insert(s_key.clone());
+                        let attempt_idx = ranked_items
+                            .iter()
+                            .position(|i| i.source == item.source && i.id == item.id)
+                            .unwrap_or(0);
+                        queued.push(QueuedTrack {
+                            artist: candidate.artist.clone(),
+                            track: candidate.track.clone(),
+                            album: candidate.album.clone(),
+                            transfer_id: dl.id.clone(),
+                            key: transfer,
+                            batch: track_batch.clone(),
+                            failing_since: None,
+                            retry_pending_since: None,
+                            pool: SourcePool::single(ranked_items[attempt_idx..].to_vec()),
+                            abandoned: Vec::new(),
+                            reason_json: reason_json.clone(),
+                            culture_bucket: culture_bucket.clone(),
+                        });
+                        enqueued = true;
+                        break;
+                    }
+                }
+                if !enqueued {
+                    tried_keys.insert(s_key);
+                }
+            }
+
+            if queued.is_empty() {
+                break;
+            }
+
+            info!(
+                "Seasonal pack '{}': {} downloads queued (round {}), waiting for completion...",
+                def.slug,
+                queued.len(),
+                round + 1
+            );
+
+            let wait_start = tokio::time::Instant::now();
+            let max_wait = tokio::time::Duration::from_secs(600);
+            let mut pending_ids: std::collections::HashSet<String> =
+                queued.iter().map(|q| q.transfer_id.clone()).collect();
+            let mut failed_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            upsert_progress(
+                user_id,
+                &progress_label,
+                shared::navidrome::ProfilePhase::Downloading,
+                0,
+                queued.len() as u32,
+            )
+            .await;
+
+            while !pending_ids.is_empty() && wait_start.elapsed() < max_wait {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let completed = (queued.len() as u32)
+                    .saturating_sub(pending_ids.len() as u32 + failed_ids.len() as u32);
+                upsert_progress(
+                    user_id,
+                    &progress_label,
+                    shared::navidrome::ProfilePhase::Downloading,
+                    completed,
+                    queued.len() as u32,
+                )
+                .await;
+                let mut sources: Vec<String> = Vec::new();
+                for track in &queued {
+                    if !sources.contains(&track.key.peer) {
+                        sources.push(track.key.peer.clone());
+                    }
+                }
+                let downloads = match backend.get_downloads_for(&sources).await {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                settle_poll(
+                    &mut queued,
+                    &downloads,
+                    &mut pending_ids,
+                    &mut failed_ids,
+                    backend,
+                )
+                .await;
+            }
+            stop_waiting(&queued, &mut pending_ids, backend).await;
+
+            let skip_ids: std::collections::HashSet<&String> =
+                pending_ids.iter().chain(failed_ids.iter()).collect();
+            let importable_count = queued
+                .iter()
+                .filter(|q| !skip_ids.contains(&q.transfer_id))
+                .count()
+                .min(needed.saturating_sub(pack_imported)) as u32;
+            let mut import_idx = 0u32;
+
+            for qt in &queued {
+                if skip_ids.contains(&qt.transfer_id) {
+                    continue;
+                }
+                if pack_imported >= needed {
+                    if let Ok(src) = crate::server_fns::download::process::resolve_on_disk(
+                        &qt.key.filename,
+                        &download_base,
+                        Some(&qt.batch.destination),
+                        &std::sync::Mutex::new(std::collections::HashSet::new()),
+                    )
+                    .await
+                    {
+                        discard_download(&src, &download_base).await;
+                    }
+                    TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                    continue;
+                }
+                import_idx += 1;
+                upsert_progress(
+                    user_id,
+                    &progress_label,
+                    shared::navidrome::ProfilePhase::Importing,
+                    import_idx,
+                    importable_count,
+                )
+                .await;
+                let resolved = crate::server_fns::download::process::resolve_on_disk(
+                    &qt.key.filename,
+                    &download_base,
+                    Some(&qt.batch.destination),
+                    &std::sync::Mutex::new(std::collections::HashSet::new()),
+                )
+                .await;
+                let src = match resolved {
+                    Ok(p) => p,
+                    Err(_) => {
+                        TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                        continue;
+                    }
+                };
+
+                let outcome = IMPORT_QUEUE
+                    .submit(ImportJob {
+                        sources: vec![src.clone()],
+                        files: vec![src.clone()],
+                        target: seasonal_dir.clone(),
+                        mode: soulbeet::ImportMode::Singleton,
+                        owner: None,
+                        snapshot_target: true,
+                        cleanup_root: Some(download_base.clone()),
+                        choice: soulbeet::DriverChoice::Auto,
+                        choices: None,
+                        duplicates: Duplicates::AsConfigured,
+                        last_run: None,
+                        lock_retries: 0,
+                    })
+                    .await
+                    .wait()
+                    .await;
+                TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+
+                match classify_discovery(&outcome.result.outcome) {
+                    DiscoveryImport::Imported => {
+                        info!(
+                            "Imported seasonal '{}' - {} into Discovery/Seasonal/{}",
+                            qt.artist, qt.track, def.slug
+                        );
+                    }
+                    DiscoveryImport::Permanent | DiscoveryImport::Failed => {
+                        warn!(
+                            "Seasonal beets import skipped/failed for '{}' - {}: {}",
+                            qt.artist, qt.track, outcome.result
+                        );
+                        discard_download(&src, &download_base).await;
+                        continue;
+                    }
+                }
+
+                let new_files = &outcome.new_files;
+                if new_files.is_empty() {
+                    continue;
+                }
+                for rel in new_files {
+                    DiscoveryTrackRow::create_with_context(
+                        None,
+                        &qt.track,
+                        &qt.artist,
+                        qt.album.as_deref().unwrap_or(""),
+                        &seasonal_dir.join(rel).to_string_lossy(),
+                        &folder.id,
+                        &profile_label,
+                        DiscoveryTrackContext {
+                            exclude_from_core_taste: def.exclude_from_core_taste,
+                            reason_json: qt.reason_json.as_deref(),
+                            culture_bucket: qt.culture_bucket.as_deref(),
+                            pack_slug: Some(def.slug.as_str()),
+                        },
+                    )
+                    .await
+                    .map_err(|e| run_database_failure(Stage::Import, e))?;
+                }
+                let _ =
+                    DiscoveryHistoryRow::record(user_id, &qt.artist, &qt.track, &profile_label)
+                        .await;
+                rejected_keys.insert(CandidateSet::key(&qt.artist, &qt.track));
+                pack_imported += 1;
+                total_seasonal_imported += 1;
+            }
+        }
+
+        upsert_progress(
+            user_id,
+            &progress_label,
+            shared::navidrome::ProfilePhase::Done,
+            pack_imported as u32,
+            needed as u32,
+        )
+        .await;
+
+        if pack_imported > 0 {
+            if let Err(e) = ContextualMixStateRow::upsert_playlist_id_in(
+                &crate::db::DB,
+                user_id,
+                &def.slug,
+                state.as_ref().and_then(|s| s.navidrome_playlist_id.as_deref()),
+                seasonal_expires_at.as_deref(),
+            )
+            .await
+            {
+                warn!(
+                    "Could not persist seasonal expiry metadata for '{}' (user {}): {}",
+                    def.slug, user_id, e
+                );
+            }
+        }
+    }
+
+    Ok(total_seasonal_imported)
 }
 
 /// What a run returns once its imports are scanned. A broken importer fails it even after
@@ -2182,6 +3070,8 @@ mod tests {
             retry_pending_since: None,
             pool: SourcePool::single(items),
             abandoned: Vec::new(),
+            reason_json: None,
+            culture_bucket: None,
         }
     }
 
@@ -3084,5 +3974,49 @@ mod tests {
             assert!(navi.asked().is_empty(), "{:?}", navi.asked());
             assert_eq!(stored_ids(&db).await, only_advent());
         }
+    }
+
+    #[tokio::test]
+    async fn seasonal_progress_registers_readable_labels_and_updates_phases() {
+        use super::{register_seasonal_progress_profiles, seasonal_progress_label, upsert_progress};
+        use shared::navidrome::{DiscoveryProgress, GenerationStatus, ProfilePhase};
+
+        let def = shared::recommendation::builtin_contextual_mixes()
+            .into_iter()
+            .find(|d| d.slug == "winter_holiday")
+            .unwrap();
+        assert_eq!(seasonal_progress_label(&def), "Seasonal: Christmas Mix");
+
+        let user_id = format!("test-seasonal-prog-{}", uuid::Uuid::new_v4());
+        {
+            let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+            map.insert(
+                user_id.clone(),
+                DiscoveryProgress {
+                    status: GenerationStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+
+        register_seasonal_progress_profiles(&user_id, &[(def.clone(), None, 10)]).await;
+        upsert_progress(
+            &user_id,
+            "Seasonal: Christmas Mix",
+            ProfilePhase::Downloading,
+            4,
+            10,
+        )
+        .await;
+
+        let snapshot = {
+            let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+            map.remove(&user_id).unwrap()
+        };
+        assert_eq!(snapshot.profiles.len(), 1);
+        assert_eq!(snapshot.profiles[0].profile, "Seasonal: Christmas Mix");
+        assert_eq!(snapshot.profiles[0].phase, ProfilePhase::Downloading);
+        assert_eq!(snapshot.profiles[0].current, 4);
+        assert_eq!(snapshot.profiles[0].total, 10);
     }
 }

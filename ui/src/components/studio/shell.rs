@@ -177,6 +177,7 @@ pub fn StudioSidebar(
         StudioNavSection::Settings,
     ];
 
+    let pinned_seasonal = pinned_seasonal.filter(|s| s.track_count > 0);
     let has_pinned_seasonal = pinned_seasonal.is_some();
     let pinned_seasonal_playlist_id = pinned_seasonal
         .as_ref()
@@ -186,6 +187,7 @@ pub fn StudioSidebar(
         .iter()
         .filter(|pl| {
             pl.category.is_soulbeet_mix()
+                && !(pl.category == PlaylistCategory::Seasonal && pl.song_count == 0)
                 && pinned_seasonal_playlist_id != Some(pl.id.as_str())
         })
         .collect();
