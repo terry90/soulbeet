@@ -1,5 +1,8 @@
 package org.soulbeet.app.ui.screens
 
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,7 +24,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -38,6 +43,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -51,11 +58,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.TriageCardItem
+import org.soulbeet.app.data.CoarseLocationProvider
 import org.soulbeet.app.data.ContextualMixUi
 import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.FormattingUtils
@@ -83,10 +92,24 @@ fun DiscoverScreen(
     onOpenCultureEditor: () -> Unit,
     onDismissCultureEditor: () -> Unit,
     onSaveCultureProfile: (homeCountry: String?, ratio: Float, weatherCity: String?) -> Unit,
+    liveWeatherLocationEnabled: Boolean,
+    onToggleLiveWeatherLocation: (Boolean) -> Unit,
+    onShowMessage: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
+    val context = LocalContext.current
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            onToggleLiveWeatherLocation(true)
+        } else {
+            onToggleLiveWeatherLocation(false)
+            onShowMessage("Location permission denied. Using saved city or IP for weather mixes.")
+        }
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -261,6 +284,7 @@ fun DiscoverScreen(
         item(key = "taste_dna") {
             TasteDnaCard(
                 profile = state.cultureProfile,
+                liveWeatherLocationEnabled = liveWeatherLocationEnabled,
                 onEditClick = onOpenCultureEditor,
             )
         }
@@ -269,6 +293,16 @@ fun DiscoverScreen(
     if (state.showCultureEditor) {
         CultureProfileEditorDialog(
             initial = state.cultureProfile,
+            liveWeatherLocationEnabled = liveWeatherLocationEnabled,
+            onToggleLiveWeatherLocation = { enabled ->
+                if (!enabled) {
+                    onToggleLiveWeatherLocation(false)
+                } else if (CoarseLocationProvider.hasCoarseLocationPermission(context)) {
+                    onToggleLiveWeatherLocation(true)
+                } else {
+                    locationPermissionLauncher.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                }
+            },
             onDismiss = onDismissCultureEditor,
             onSave = onSaveCultureProfile,
         )
@@ -513,6 +547,7 @@ private fun SwipeableTriageCard(
 @Composable
 private fun TasteDnaCard(
     profile: UserCultureProfileUi?,
+    liveWeatherLocationEnabled: Boolean,
     onEditClick: () -> Unit,
 ) {
     val colors = LocalSoulbeetColors.current
@@ -592,9 +627,11 @@ private fun TasteDnaCard(
                 color = colors.textSecondary,
             )
 
-            val weatherLabel = profile?.weatherCity?.trim()?.takeIf { it.isNotEmpty() }
-                ?.let { "Weather: $it" }
-                ?: "Weather: Auto (IP)"
+            val weatherLabel = when {
+                liveWeatherLocationEnabled -> "Weather: Live (Approx.)"
+                !profile?.weatherCity.isNullOrBlank() -> "Weather: ${profile!!.weatherCity!!.trim()}"
+                else -> "Weather: Auto (IP)"
+            }
             Text(
                 text = weatherLabel,
                 style = type.monoXs,
@@ -615,6 +652,8 @@ private fun TasteDnaCard(
 @Composable
 private fun CultureProfileEditorDialog(
     initial: UserCultureProfileUi?,
+    liveWeatherLocationEnabled: Boolean,
+    onToggleLiveWeatherLocation: (Boolean) -> Unit,
     onDismiss: () -> Unit,
     onSave: (homeCountry: String?, ratio: Float, weatherCity: String?) -> Unit,
 ) {
@@ -633,7 +672,10 @@ private fun CultureProfileEditorDialog(
             Text(text = "Edit Taste DNA", style = type.titleMd, color = colors.textPrimary)
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
                 OutlinedTextField(
                     value = country,
                     onValueChange = { country = it.take(2).uppercase() },
@@ -649,6 +691,41 @@ private fun CultureProfileEditorDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = "Live Approximate Location",
+                            style = type.body,
+                            color = colors.textPrimary,
+                        )
+                        Text(
+                            text = "Updates Rainy/Snow/Storm/Sunny mixes as you drive (~11 km accuracy, foreground only)",
+                            style = type.bodySm,
+                            color = colors.textSecondary,
+                        )
+                    }
+                    Switch(
+                        checked = liveWeatherLocationEnabled,
+                        onCheckedChange = onToggleLiveWeatherLocation,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = colors.leafInk,
+                            checkedTrackColor = colors.leafSolid,
+                            uncheckedThumbColor = colors.textMuted,
+                            uncheckedTrackColor = colors.surface,
+                        ),
+                    )
+                }
                 Column {
                     val pct = (ratio * 100f).roundToInt()
                     Text(

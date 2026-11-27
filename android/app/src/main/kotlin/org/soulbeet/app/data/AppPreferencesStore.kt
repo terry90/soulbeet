@@ -42,6 +42,7 @@ data class PersistedAppConfig(
     val deviceName: String = "",
     val oledMode: Boolean = false,
     val offlineOnly: Boolean = false,
+    val liveWeatherLocationEnabled: Boolean = false,
     val librarySecondaryAction: LibrarySecondaryAction = LibrarySecondaryAction.DISLIKE_SKIP,
     val qualityProfileKey: String = OfflineSyncWorker.PROFILE_CELLULAR_OPUS_160,
     val recentSearches: List<String> = emptyList(),
@@ -134,6 +135,7 @@ class AppPreferencesStore(private val context: Context) {
             deviceName = prefs[KEY_DEVICE_NAME].orEmpty().ifBlank { defaultDeviceName() },
             oledMode = prefs[KEY_OLED_MODE] ?: false,
             offlineOnly = prefs[KEY_OFFLINE_ONLY] ?: false,
+            liveWeatherLocationEnabled = prefs[KEY_LIVE_WEATHER_LOCATION_ENABLED] ?: false,
             librarySecondaryAction = secondaryAction,
             qualityProfileKey = prefs[KEY_QUALITY_PROFILE]
                 ?: OfflineSyncWorker.PROFILE_CELLULAR_OPUS_160,
@@ -222,6 +224,10 @@ class AppPreferencesStore(private val context: Context) {
         dataStore.edit { it[KEY_OFFLINE_ONLY] = enabled }
     }
 
+    suspend fun setLiveWeatherLocationEnabled(enabled: Boolean) {
+        dataStore.edit { it[KEY_LIVE_WEATHER_LOCATION_ENABLED] = enabled }
+    }
+
     suspend fun setLibrarySecondaryAction(action: LibrarySecondaryAction) {
         dataStore.edit { it[KEY_AUTO_SECONDARY_ACTION] = action.name }
     }
@@ -264,6 +270,7 @@ class AppPreferencesStore(private val context: Context) {
         private val KEY_DEVICE_NAME = stringPreferencesKey("device_name")
         private val KEY_OLED_MODE = booleanPreferencesKey("oled_mode")
         private val KEY_OFFLINE_ONLY = booleanPreferencesKey("offline_only")
+        private val KEY_LIVE_WEATHER_LOCATION_ENABLED = booleanPreferencesKey("live_weather_location_enabled")
         private val KEY_AUTO_SECONDARY_ACTION = stringPreferencesKey("auto_secondary_action")
         private val KEY_QUALITY_PROFILE = stringPreferencesKey("quality_profile")
         private val KEY_RECENT_SEARCHES = stringPreferencesKey("recent_searches")

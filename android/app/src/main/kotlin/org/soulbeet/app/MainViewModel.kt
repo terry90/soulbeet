@@ -24,6 +24,7 @@ import kotlinx.coroutines.withContext
 import org.soulbeet.app.data.AcquireAndPlayOutcome
 import org.soulbeet.app.data.AcquireWsEvent
 import org.soulbeet.app.data.AppPreferencesStore
+import org.soulbeet.app.data.CoarseLocationProvider
 import org.soulbeet.app.data.ContextualMixUi
 import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.data.DeleteGuardPreviewUi
@@ -121,6 +122,7 @@ data class ContainerDetailUi(
 data class AppUiState(
     val isBooting: Boolean = true,
     val config: PersistedAppConfig = PersistedAppConfig(),
+    val liveWeatherLocationEnabled: Boolean = false,
     val isConnecting: Boolean = false,
     val connectError: String? = null,
     val selectedTab: AppTab = AppTab.HOME,
@@ -236,6 +238,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val inFlightTriageIds: MutableSet<String> = mutableSetOf()
     private var searchJob: Job? = null
     private var bannerClearJob: Job? = null
+    private var contextualMixesJob: Job? = null
+    private val contextualMixesGen = java.util.concurrent.atomic.AtomicLong(0L)
     private var connectWsJob: Job? = null
     private var lyricsJob: Job? = null
     private var lyricsFetchSeq: Long = 0L
@@ -263,7 +267,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Observe persisted preferences (OLED, Offline Only, Auto secondary action, recent searches).
         viewModelScope.launch {
             prefsStore.configFlow.collectLatest { cfg ->
-                _uiState.update { it.copy(config = cfg) }
+                _uiState.update {
+                    it.copy(
+                        config = cfg,
+                        liveWeatherLocationEnabled = cfg.liveWeatherLocationEnabled,
+                    )
+                }
                 SoulbeetMediaRepository.shared.setOfflineOnly(cfg.offlineOnly)
                 SoulbeetMediaRepository.shared.setLibrarySecondaryAction(cfg.librarySecondaryAction)
                 SoulbeetMediaRepository.shared.setAudioQualityProfile(cfg.toQualityProfile())
@@ -327,7 +336,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Boot core & load initial data (await persisted config first to avoid cold-start race).
         viewModelScope.launch {
             val snapshotCfg = withContext(Dispatchers.IO) { prefsStore.getSnapshot() }
-            _uiState.update { it.copy(config = snapshotCfg) }
+            _uiState.update {
+                it.copy(
+                    config = snapshotCfg,
+                    liveWeatherLocationEnabled = snapshotCfg.liveWeatherLocationEnabled,
+                )
+            }
             val core = withContext(Dispatchers.IO) { SoulbeetCoreProvider.awaitOrNull() }
             _uiState.update { it.copy(isBooting = false) }
             if (core != null) {
@@ -529,6 +543,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         username = "",
                         navidrome = null,
                     ),
+                    liveWeatherLocationEnabled = it.config.liveWeatherLocationEnabled,
                 )
             }
         }
@@ -1295,6 +1310,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setLiveWeatherLocationEnabled(enabled: Boolean) {
+        val wasEnabled = _uiState.value.liveWeatherLocationEnabled
+        val updatedCfg = _uiState.value.config.copy(liveWeatherLocationEnabled = enabled)
+        _uiState.update {
+            it.copy(
+                config = updatedCfg,
+                liveWeatherLocationEnabled = enabled,
+            )
+        }
+        if (wasEnabled != enabled) {
+            showNotice(
+                if (enabled) {
+                    "Live approximate location enabled for weather mixes"
+                } else {
+                    "Live approximate location disabled"
+                },
+            )
+        }
+        contextualMixesJob?.cancel()
+        val gen = contextualMixesGen.incrementAndGet()
+        contextualMixesJob = viewModelScope.launch {
+            prefsStore.setLiveWeatherLocationEnabled(enabled)
+            if ((wasEnabled != enabled || enabled) && updatedCfg.isConfigured && !updatedCfg.offlineOnly) {
+                fetchContextualMixesWithLocation(updatedCfg)?.let { refreshedMixes ->
+                    if (contextualMixesGen.get() == gen) {
+                        _uiState.update { it.copy(contextualMixes = refreshedMixes) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun showMessage(message: String) {
+        showNotice(message)
+    }
+
     fun updateCultureProfile(
         homeCountry: String?,
         localCultureRatio: Float,
@@ -1310,13 +1361,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 onSuccess = { updated ->
                     _uiState.update { it.copy(cultureProfile = updated, showCultureEditor = false) }
                     showNotice("Updated Taste DNA")
-                    val hour = LocalTime.now().hour
-                    apiClient.fetchContextualMixes(cfg, hour)
-                        .getOrNull()
-                        ?.filterNot { it.kind == "seasonal" && it.trackCount == 0 }
-                        ?.let { refreshedMixes ->
+                    val latestCfg = _uiState.value.config
+                    val gen = contextualMixesGen.incrementAndGet()
+                    fetchContextualMixesWithLocation(latestCfg)?.let { refreshedMixes ->
+                        if (contextualMixesGen.get() == gen) {
                             _uiState.update { it.copy(contextualMixes = refreshedMixes) }
                         }
+                    }
                 },
                 onFailure = { err ->
                     showNotice(err.localizedMessage ?: "Failed to update Taste DNA")
@@ -1968,18 +2019,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun fetchContextualMixesWithLocation(
+        cfg: PersistedAppConfig,
+    ): List<ContextualMixUi>? {
+        val hour = LocalTime.now().hour
+        val coords = if (cfg.liveWeatherLocationEnabled) {
+            if (!CoarseLocationProvider.hasCoarseLocationPermission(appContext)) {
+                // Reconcile persisted flag if permission was revoked in Android Settings.
+                prefsStore.setLiveWeatherLocationEnabled(false)
+                _uiState.update { state ->
+                    state.copy(
+                        config = state.config.copy(liveWeatherLocationEnabled = false),
+                        liveWeatherLocationEnabled = false,
+                    )
+                }
+                null
+            } else {
+                withContext(Dispatchers.IO) {
+                    CoarseLocationProvider.getCoarseCoordinates(appContext)
+                }
+            }
+        } else {
+            null
+        }
+        return apiClient.fetchContextualMixes(
+            config = cfg,
+            localHour = hour,
+            lat = coords?.first,
+            lon = coords?.second,
+        )
+            .getOrNull()
+            ?.filterNot { it.kind == "seasonal" && it.trackCount == 0 }
+    }
+
     private suspend fun refreshRemoteDiscoveryData(
         cfg: PersistedAppConfig = _uiState.value.config,
     ) {
         if (!cfg.isConfigured || cfg.offlineOnly) return
-        val hour = LocalTime.now().hour
-        val mixes = apiClient.fetchContextualMixes(cfg, hour)
-            .getOrNull()
-            ?.filterNot { it.kind == "seasonal" && it.trackCount == 0 }
+        val gen = contextualMixesGen.incrementAndGet()
+        val mixes = fetchContextualMixesWithLocation(cfg)
         val profile = apiClient.fetchCultureProfile(cfg).getOrNull()
         _uiState.update { state ->
             state.copy(
-                contextualMixes = mixes ?: state.contextualMixes,
+                contextualMixes = if (mixes != null && contextualMixesGen.get() == gen) {
+                    mixes
+                } else {
+                    state.contextualMixes
+                },
                 cultureProfile = profile ?: state.cultureProfile,
             )
         }

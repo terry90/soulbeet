@@ -1,12 +1,15 @@
 #![cfg(feature = "server")]
 
-//! Zero-permission local weather resolution for weather-reactive contextual mixes.
+//! Local weather resolution for weather-reactive contextual mixes.
 //!
 //! Location resolution priority:
-//! 1. Saved user city coordinates (`UserCultureProfile.weather_lat` / `weather_lon`),
+//! 1. Live coarse coordinates provided by an opted-in client (`client_coords`), rounded to `0.1`
+//!    degrees, which skips both saved city coordinates and IP geolocation so weather follows a
+//!    moving listener.
+//! 2. Saved user city coordinates (`UserCultureProfile.weather_lat` / `weather_lon`),
 //!    which skips IP geolocation entirely.
-//! 2. Reverse-proxy client public IP (`CF-Connecting-IP` -> leftmost public `X-Forwarded-For`
-//!    -> `X-Real-IP`) resolved via GeoJS (`https://get.geojs.io/v1/ip/geo/{ip}.json`), or
+//! 3. Reverse-proxy client public IP (`X-Real-IP` -> rightmost public `X-Forwarded-For`
+//!    -> `CF-Connecting-IP`) resolved via GeoJS (`https://get.geojs.io/v1/ip/geo/{ip}.json`), or
 //!    server egress IP (`https://get.geojs.io/v1/ip/geo.json`) when on a LAN/private network.
 //!
 //! Live weather is fetched from Open-Meteo with coordinates rounded to `0.1` degrees for
@@ -125,6 +128,24 @@ where
 
 fn valid_coords(lat: f64, lon: f64) -> bool {
     lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+}
+
+/// Validates optional client-supplied coordinates. Both `lat` and `lon` must either be omitted
+/// together or be finite WGS84 coordinates in `[-90, 90]` and `[-180, 180]`.
+pub(crate) fn validate_client_coords(
+    lat: Option<f64>,
+    lon: Option<f64>,
+) -> Result<Option<(f64, f64)>, Failure> {
+    match (lat, lon) {
+        (None, None) => Ok(None),
+        (Some(la), Some(lo)) if valid_coords(la, lo) => Ok(Some((la, lo))),
+        _ => Err(Failure::new(
+            FailureCode::InvalidInput,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            "lat and lon must both be finite coordinates in [-90, 90] and [-180, 180]",
+        )),
+    }
 }
 
 fn format_location_label(city: Option<&str>, country_code: Option<&str>) -> Option<String> {
@@ -437,18 +458,26 @@ fn snapshot_from_raw(raw: RawWeather, label: Option<String>) -> Option<WeatherSn
     })
 }
 
-/// Resolves live local weather for `profile` (using saved city coordinates first, then cached
-/// GeoJS IP geolocation) and classifies it via `classify_wmo_weather`. Enforces a strict
-/// combined `HTTP_TIMEOUT` (2.5s) ceiling across both hops and returns `None` cleanly if
-/// weather is neutral or upstream services are slow/unreachable.
+/// Resolves live local weather for `profile` (using opted-in live `client_coords` first, then
+/// saved city coordinates, then cached GeoJS IP geolocation) and classifies it via
+/// `classify_wmo_weather`. Enforces a strict combined `HTTP_TIMEOUT` (2.5s) ceiling across both
+/// hops and returns `None` cleanly if weather is neutral or upstream services are slow/unreachable.
 pub(crate) async fn resolve_weather_for_profile(
     profile: &UserCultureProfile,
+    client_coords: Option<(f64, f64)>,
     client_ip: Option<IpAddr>,
 ) -> Option<WeatherSnapshot> {
     tokio::time::timeout(HTTP_TIMEOUT, async move {
-        let loc = match saved_profile_location(profile) {
-            Some(saved) => saved,
-            None => cached_geo_location(client_ip).await?,
+        let loc = if let Some((lat, lon)) = client_coords.filter(|&(la, lo)| valid_coords(la, lo)) {
+            WeatherLocation {
+                lat,
+                lon,
+                label: None,
+            }
+        } else if let Some(saved) = saved_profile_location(profile) {
+            saved
+        } else {
+            cached_geo_location(client_ip).await?
         };
         let (lat_tenths, lon_tenths) = round_coords_tenths(loc.lat, loc.lon);
         let raw = cached_raw_weather(lat_tenths, lon_tenths).await?;
@@ -464,13 +493,21 @@ pub(crate) async fn resolve_weather_for_profile(
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn resolve_weather_with_bases(
     profile: &UserCultureProfile,
+    client_coords: Option<(f64, f64)>,
     client_ip: Option<IpAddr>,
     geo_base: &str,
     forecast_base: &str,
 ) -> Option<WeatherSnapshot> {
-    let loc = match saved_profile_location(profile) {
-        Some(saved) => saved,
-        None => fetch_geo_location_from(&WEATHER_HTTP_CLIENT, geo_base, client_ip).await?,
+    let loc = if let Some((lat, lon)) = client_coords.filter(|&(la, lo)| valid_coords(la, lo)) {
+        WeatherLocation {
+            lat,
+            lon,
+            label: None,
+        }
+    } else if let Some(saved) = saved_profile_location(profile) {
+        saved
+    } else {
+        fetch_geo_location_from(&WEATHER_HTTP_CLIENT, geo_base, client_ip).await?
     };
     let (lat_tenths, lon_tenths) = round_coords_tenths(loc.lat, loc.lon);
     let raw =
@@ -797,6 +834,42 @@ mod tests {
         assert_eq!(classify_wmo_weather(45, 12.0, true), None); // fog
     }
 
+    #[test]
+    fn validate_client_coords_checks_pairing_finiteness_and_bounds() {
+        assert_eq!(validate_client_coords(None, None).unwrap(), None);
+        assert_eq!(
+            validate_client_coords(Some(45.75), Some(4.85)).unwrap(),
+            Some((45.75, 4.85))
+        );
+        assert_eq!(
+            validate_client_coords(Some(-90.0), Some(-180.0)).unwrap(),
+            Some((-90.0, -180.0))
+        );
+        assert_eq!(
+            validate_client_coords(Some(90.0), Some(180.0)).unwrap(),
+            Some((90.0, 180.0))
+        );
+
+        for (lat, lon) in [
+            (Some(45.0), None),
+            (None, Some(4.0)),
+            (Some(f64::NAN), Some(4.0)),
+            (Some(45.0), Some(f64::NAN)),
+            (Some(f64::INFINITY), Some(4.0)),
+            (Some(45.0), Some(f64::NEG_INFINITY)),
+            (Some(90.01), Some(0.0)),
+            (Some(-90.01), Some(0.0)),
+            (Some(0.0), Some(180.01)),
+            (Some(0.0), Some(-180.01)),
+        ] {
+            let err = validate_client_coords(lat, lon)
+                .expect_err("invalid client coords should return Failure");
+            assert_eq!(err.code, FailureCode::InvalidInput);
+            assert_eq!(err.stage, Stage::Input);
+            assert_eq!(err.retry, RetryAdvice::NotRetryable);
+        }
+    }
+
     #[tokio::test]
     async fn offline_geojs_string_lat_lon_and_open_meteo_resolution() {
         let geo = StubHttpServer::start(
@@ -812,9 +885,15 @@ mod tests {
 
         let profile = UserCultureProfile::default();
         let ip = IpAddr::from_str("82.64.12.34").unwrap();
-        let snap = resolve_weather_with_bases(&profile, Some(ip), &geo.base_url, &forecast.base_url)
-            .await
-            .expect("rainy snapshot should resolve");
+        let snap = resolve_weather_with_bases(
+            &profile,
+            None,
+            Some(ip),
+            &geo.base_url,
+            &forecast.base_url,
+        )
+        .await
+        .expect("rainy snapshot should resolve");
 
         assert_eq!(snap.condition, WeatherCondition::Rainy);
         assert!((snap.temperature_c - 12.4).abs() < 0.01);
@@ -837,14 +916,19 @@ mod tests {
             r#"{"latitude":45.75,"longitude":4.85,"city":"Lyon","country_code":"fr"}"#,
         )
         .await;
-        let snap_egress =
-            resolve_weather_with_bases(&profile, None, &geo_num.base_url, &forecast.base_url)
-                .await
-                .unwrap();
+        let snap_egress = resolve_weather_with_bases(
+            &profile,
+            None,
+            None,
+            &geo_num.base_url,
+            &forecast.base_url,
+        )
+        .await
+        .unwrap();
         assert_eq!(geo_num.recorded_requests(), vec!["/v1/ip/geo.json"]);
         assert_eq!(snap_egress.location_label.as_deref(), Some("Lyon, FR"));
 
-        // Priority 1: saved weather_lat/weather_lon skips GeoJS completely
+        // Priority 2: saved weather_lat/weather_lon skips GeoJS completely when no live client coords
         let saved_profile = UserCultureProfile {
             weather_city: Some("Chamonix, FR".into()),
             weather_lat: Some(45.9237),
@@ -859,6 +943,7 @@ mod tests {
         .await;
         let snap_saved = resolve_weather_with_bases(
             &saved_profile,
+            None,
             Some(ip),
             &geo_unused.base_url,
             &snow_forecast.base_url,
@@ -873,13 +958,47 @@ mod tests {
         assert!(!snap_saved.is_day);
         assert_eq!(snap_saved.location_label.as_deref(), Some("Chamonix, FR"));
 
+        // Priority 1: live client_coords overrides saved city and bypasses GeoJS, rounding to 0.1 deg
+        let live_forecast = StubHttpServer::start(
+            "200 OK",
+            r#"{"current":{"temperature_2m":26.2,"weather_code":0,"is_day":1}}"#,
+        )
+        .await;
+        let snap_live = resolve_weather_with_bases(
+            &saved_profile,
+            Some((43.2965, 5.3698)),
+            Some(ip),
+            &geo_unused.base_url,
+            &live_forecast.base_url,
+        )
+        .await
+        .unwrap();
+        assert!(
+            geo_unused.recorded_requests().is_empty(),
+            "live client coordinates must not call GeoJS"
+        );
+        assert_eq!(snap_live.condition, WeatherCondition::Sunny);
+        assert!(snap_live.is_day);
+        assert_eq!(snap_live.location_label, None);
+        let live_reqs = live_forecast.recorded_requests();
+        assert_eq!(live_reqs.len(), 1);
+        assert!(
+            live_reqs[0].contains("latitude=43.3") && live_reqs[0].contains("longitude=5.4"),
+            "live client coordinates must override saved city and round to 0.1 deg; got {}",
+            live_reqs[0]
+        );
+
         // Upstream errors degrade cleanly to None
         let broken = StubHttpServer::start("503 Service Unavailable", "").await;
-        assert!(
-            resolve_weather_with_bases(&saved_profile, None, &geo.base_url, &broken.base_url)
-                .await
-                .is_none()
-        );
+        assert!(resolve_weather_with_bases(
+            &saved_profile,
+            None,
+            None,
+            &geo.base_url,
+            &broken.base_url
+        )
+        .await
+        .is_none());
     }
 
     #[tokio::test]

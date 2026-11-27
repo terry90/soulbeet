@@ -197,6 +197,7 @@ pub struct WebStudioContext {
     pub triage_tracks: Signal<Vec<DiscoveryTrack>>,
     pub discovery_lifetimes: Signal<HashMap<String, u32>>,
     pub contextual_mixes: Signal<Vec<ContextualMixSummary>>,
+    pub contextual_mixes_gen: Signal<u64>,
     pub culture_profile: Signal<UserCultureProfile>,
     pub curation_overrides: Signal<HashMap<String, TrackCurationOverride>>,
     pub lyrics: Signal<Vec<TrackLyrics>>,
@@ -212,6 +213,7 @@ pub struct WebStudioContext {
     pub transfer_gen: Signal<u64>,
     pub search_query_override: Signal<Option<String>>,
     pub archival_upgrades: Signal<Vec<ArchivalUpgradeJob>>,
+    pub live_weather_location: Signal<bool>,
 }
 
 pub fn use_studio() -> WebStudioContext {
@@ -224,6 +226,41 @@ impl WebStudioContext {
             .read()
             .as_ref()
             .and_then(|b| b.navidrome.clone())
+    }
+
+    pub fn set_live_weather_location(&self, enabled: bool) {
+        let mut sig = self.live_weather_location;
+        sig.set(enabled);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            if enabled {
+                let _ = storage.set_item(LIVE_WEATHER_LOCATION_KEY, "1");
+            } else {
+                let _ = storage.remove_item(LIVE_WEATHER_LOCATION_KEY);
+            }
+        }
+    }
+
+    pub fn next_contextual_mixes_gen(&self) -> u64 {
+        let mut gen_sig = self.contextual_mixes_gen;
+        let next = (*gen_sig.peek()).wrapping_add(1);
+        gen_sig.set(next);
+        next
+    }
+
+    pub fn apply_contextual_mixes_if_current(
+        &self,
+        gen: u64,
+        mixes: Vec<ContextualMixSummary>,
+    ) -> bool {
+        if *self.contextual_mixes_gen.peek() != gen {
+            return false;
+        }
+        let mut sig = self.contextual_mixes;
+        sig.set(mixes);
+        let mut this = *self;
+        this.reclassify_playlists();
+        true
     }
 
     pub fn has_active_acquisitions(&self) -> bool {
@@ -1843,6 +1880,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let triage_tracks = use_signal(Vec::<DiscoveryTrack>::new);
     let discovery_lifetimes = use_signal::<HashMap<String, u32>>(HashMap::new);
     let contextual_mixes = use_signal(Vec::<ContextualMixSummary>::new);
+    let contextual_mixes_gen = use_signal(|| 0u64);
     let culture_profile = use_signal(UserCultureProfile::default);
     let curation_overrides = use_signal::<HashMap<String, TrackCurationOverride>>(HashMap::new);
     let lyrics = use_signal(Vec::<TrackLyrics>::new);
@@ -1858,6 +1896,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let mut transfer_gen = use_signal(|| 0u64);
     let search_query_override = use_signal(|| None::<String>);
     let archival_upgrades = use_signal(Vec::<ArchivalUpgradeJob>::new);
+    let live_weather_location = use_signal(load_live_weather_location);
 
     #[allow(unused_mut)]
     let mut auto_download_signal = use_signal(|| None::<shared::download::AutoDownloadEvent>);
@@ -1889,6 +1928,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         triage_tracks,
         discovery_lifetimes,
         contextual_mixes,
+        contextual_mixes_gen,
         culture_profile,
         curation_overrides,
         lyrics,
@@ -1903,6 +1943,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         transfer_gen,
         search_query_override,
         archival_upgrades,
+        live_weather_location,
     });
 
     // Browser HTML5 <audio> engine
@@ -2360,61 +2401,70 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 }
             }
 
-            // 2. Discovery 2.0 parallel bootstrap (contextual mixes, triage, culture, upgrades, config)
-            let local_hour = local_browser_hour();
-            let local_weekday = local_browser_weekday();
-            let (mix_res, triage_res, culture_res, archival_res, cfg_res) =
-                futures::future::join5(
-                    auth.call(api::list_active_contextual_mixes(local_hour, local_weekday)),
+            // 2. Discovery 2.0 parallel bootstrap (spawn contextual mixes independently so slow
+            // browser geolocation never blocks triage, culture, archival upgrades, or config).
+            #[cfg_attr(not(feature = "web"), allow(unused_mut))]
+            let mut studio_mix = studio;
+            let auth_mix = auth;
+            spawn(async move {
+                let gen = studio_mix.next_contextual_mixes_gen();
+                let live_location = *studio_mix.live_weather_location.peek();
+                let (mix_res, perm_denied) =
+                    fetch_contextual_mixes_with_context(&auth_mix, live_location).await;
+                if perm_denied {
+                    studio_mix.set_live_weather_location(false);
+                }
+                if let Ok(mixes) = mix_res {
+                    if studio_mix.apply_contextual_mixes_if_current(gen, mixes) {
+                        // If user has > 25 playlists, also resolve live counts for any matched
+                        // contextual mix playlists that weren't resolved during initial `fetch_playlists`.
+                        #[cfg(feature = "web")]
+                        if studio_mix.playlists.peek().len() > 25 {
+                            if let Some(nav) = studio_mix.navidrome_info() {
+                                let mix_ids: Vec<String> = studio_mix
+                                    .playlists
+                                    .peek()
+                                    .iter()
+                                    .filter(|p| p.category.is_soulbeet_mix() && !p.is_smart)
+                                    .map(|p| p.id.clone())
+                                    .collect();
+                                if !mix_ids.is_empty() {
+                                    use futures::stream::{self, StreamExt};
+                                    let resolved: Vec<(String, Option<u32>)> =
+                                        stream::iter(mix_ids.into_iter().map(|pid| {
+                                            let nav = nav.clone();
+                                            async move {
+                                                let cnt =
+                                                    crate::navidrome_web::fetch_playlist_live_count(
+                                                        &nav, &pid,
+                                                    )
+                                                    .await;
+                                                (pid, cnt)
+                                            }
+                                        }))
+                                        .buffer_unordered(6)
+                                        .collect()
+                                        .await;
+                                    for (pid, cnt) in resolved {
+                                        if let Some(count) = cnt {
+                                            studio_mix.sync_playlist_count(&pid, count);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            let (triage_res, culture_res, archival_res, cfg_res) =
+                futures::future::join4(
                     auth.call(api::list_triage_queue()),
                     auth.call(api::get_culture_profile()),
                     auth.call(api::list_archival_upgrades()),
                     auth.call(api::get_discovery_config()),
                 )
                 .await;
-
-            if let Ok(mixes) = mix_res {
-                studio.contextual_mixes.set(mixes);
-                studio.reclassify_playlists();
-
-                // If user has > 25 playlists, also resolve live counts for any matched contextual
-                // mix playlists that weren't resolved during initial `fetch_playlists`.
-                #[cfg(feature = "web")]
-                if studio.playlists.peek().len() > 25 {
-                    if let Some(nav) = studio.navidrome_info() {
-                        let mix_ids: Vec<String> = studio
-                            .playlists
-                            .peek()
-                            .iter()
-                            .filter(|p| p.category.is_soulbeet_mix() && !p.is_smart)
-                            .map(|p| p.id.clone())
-                            .collect();
-                        if !mix_ids.is_empty() {
-                            use futures::stream::{self, StreamExt};
-                            let resolved: Vec<(String, Option<u32>)> =
-                                stream::iter(mix_ids.into_iter().map(|pid| {
-                                    let nav = nav.clone();
-                                    async move {
-                                        let cnt =
-                                            crate::navidrome_web::fetch_playlist_live_count(
-                                                &nav, &pid,
-                                            )
-                                            .await;
-                                        (pid, cnt)
-                                    }
-                                }))
-                                .buffer_unordered(6)
-                                .collect()
-                                .await;
-                            for (pid, cnt) in resolved {
-                                if let Some(count) = cnt {
-                                    studio.sync_playlist_count(&pid, count);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             if let Ok(triage) = triage_res {
                 studio.triage_tracks.set(triage);
             }
@@ -3064,6 +3114,187 @@ pub fn local_browser_weekday() -> Option<u8> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+const LIVE_WEATHER_LOCATION_KEY: &str = "soulbeet_live_weather_location";
+
+fn load_live_weather_location() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(LIVE_WEATHER_LOCATION_KEY).ok().flatten())
+            .is_some_and(|v| v == "1")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// Rounds a coordinate to `0.1` degrees (~11 km city-scale accuracy) and normalizes `-0.0` to `0.0`.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+pub fn round_coord_tenth(v: f64) -> f64 {
+    let rounded = (v * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+/// Validates raw browser coordinates (rejecting NaN, Infinity, out-of-range, and Null Island
+/// `(0.0, 0.0)`) and rounds them to `0.1` degrees before network transmission.
+#[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
+pub fn sanitize_browser_coords(lat: f64, lon: f64) -> Option<(f64, f64)> {
+    if !lat.is_finite()
+        || !lon.is_finite()
+        || !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+        || (lat == 0.0 && lon == 0.0)
+    {
+        return None;
+    }
+    Some((round_coord_tenth(lat), round_coord_tenth(lon)))
+}
+
+/// Result of a coarse browser geolocation request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub enum BrowserGeoResult {
+    Coords(f64, f64),
+    PermissionDenied,
+    Unavailable,
+}
+
+/// Requests coarse (`0.1` degree) browser coordinates via `navigator.geolocation`.
+///
+/// Closure lifetimes are retained in a self-releasing `Rc<RefCell<...>>` holder until the browser
+/// actually invokes either callback (then dropped on the next microtask via `spawn_local`), so a
+/// timeout or cancelled future while the user reads the permission prompt NEVER causes a
+/// `wasm-bindgen` dropped-closure JS exception.
+pub async fn fetch_browser_coarse_coords(interactive_prompt: bool) -> BrowserGeoResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+
+        type GeoClosures = (
+            Closure<dyn FnMut(web_sys::Position)>,
+            Closure<dyn FnMut(web_sys::PositionError)>,
+        );
+
+        let Some(window) = web_sys::window() else {
+            return BrowserGeoResult::Unavailable;
+        };
+        let Ok(geolocation) = window.navigator().geolocation() else {
+            return BrowserGeoResult::Unavailable;
+        };
+        let options = web_sys::PositionOptions::new();
+        options.set_enable_high_accuracy(false);
+        options.set_maximum_age(600_000);
+        let geo_timeout_ms: u32 = if interactive_prompt { 10_000 } else { 2_500 };
+        options.set_timeout(geo_timeout_ms);
+
+        let (tx, rx) = futures::channel::oneshot::channel::<BrowserGeoResult>();
+        let tx_cell = Rc::new(std::cell::RefCell::new(Some(tx)));
+        let closures_holder: Rc<std::cell::RefCell<Option<GeoClosures>>> =
+            Rc::new(std::cell::RefCell::new(None));
+
+        let tx_ok = Rc::clone(&tx_cell);
+        let holder_ok = Rc::clone(&closures_holder);
+        let on_success =
+            Closure::<dyn FnMut(web_sys::Position)>::new(move |pos: web_sys::Position| {
+                let coords = pos.coords();
+                let res = match sanitize_browser_coords(coords.latitude(), coords.longitude()) {
+                    Some((lat, lon)) => BrowserGeoResult::Coords(lat, lon),
+                    None => BrowserGeoResult::Unavailable,
+                };
+                if let Some(sender) = tx_ok.borrow_mut().take() {
+                    let _ = sender.send(res);
+                }
+                if let Some(taken) = holder_ok.borrow_mut().take() {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        drop(taken);
+                    });
+                }
+            });
+
+        let tx_err = Rc::clone(&tx_cell);
+        let holder_err = Rc::clone(&closures_holder);
+        let on_error =
+            Closure::<dyn FnMut(web_sys::PositionError)>::new(move |err: web_sys::PositionError| {
+                let res = if err.code() == web_sys::PositionError::PERMISSION_DENIED {
+                    BrowserGeoResult::PermissionDenied
+                } else {
+                    BrowserGeoResult::Unavailable
+                };
+                if let Some(sender) = tx_err.borrow_mut().take() {
+                    let _ = sender.send(res);
+                }
+                if let Some(taken) = holder_err.borrow_mut().take() {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        drop(taken);
+                    });
+                }
+            });
+
+        let call_res = geolocation.get_current_position_with_error_callback_and_options(
+            on_success.as_ref().unchecked_ref(),
+            Some(on_error.as_ref().unchecked_ref()),
+            &options,
+        );
+        if call_res.is_err() {
+            return BrowserGeoResult::Unavailable;
+        }
+        // Keep closures alive until the browser invokes either callback.
+        *closures_holder.borrow_mut() = Some((on_success, on_error));
+
+        let wait_ms: u32 = if interactive_prompt { 30_000 } else { 2_500 };
+        let timeout = gloo_timers::future::TimeoutFuture::new(wait_ms);
+        futures::pin_mut!(rx);
+        futures::pin_mut!(timeout);
+        match futures::future::select(rx, timeout).await {
+            futures::future::Either::Left((Ok(res), _)) => res,
+            _ => BrowserGeoResult::Unavailable,
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = interactive_prompt;
+        BrowserGeoResult::Unavailable
+    }
+}
+
+/// Fetches active contextual mixes with the browser's local clock and optional coarse location
+/// when the user has opted into live weather location.
+/// Returns `(result, permission_was_denied)` so callers can automatically clear the persisted
+/// live-location preference if the user revoked browser geolocation permission.
+pub async fn fetch_contextual_mixes_with_context(
+    auth: &Auth,
+    live_location: bool,
+) -> (Result<Vec<ContextualMixSummary>, ServerFnError>, bool) {
+    let local_hour = local_browser_hour();
+    let local_weekday = local_browser_weekday();
+    let (lat, lon, perm_denied) = if live_location {
+        match fetch_browser_coarse_coords(false).await {
+            BrowserGeoResult::Coords(la, lo) => (Some(la), Some(lo), false),
+            BrowserGeoResult::PermissionDenied => (None, None, true),
+            BrowserGeoResult::Unavailable => (None, None, false),
+        }
+    } else {
+        (None, None, false)
+    };
+    let res = auth
+        .call(api::list_active_contextual_mixes(
+            local_hour,
+            local_weekday,
+            lat,
+            lon,
+        ))
+        .await;
+    (res, perm_denied)
+}
+
 fn load_or_create_device_id() -> String {
     #[cfg(feature = "web")]
     {
@@ -3181,5 +3412,20 @@ mod tests {
         assert_eq!(js_day_to_iso_weekday(4), 4);
         assert_eq!(js_day_to_iso_weekday(5), 5);
         assert_eq!(js_day_to_iso_weekday(6), 6);
+    }
+
+    #[test]
+    fn round_coord_tenth_rounds_to_nearest_tenth_degree() {
+        assert!((round_coord_tenth(48.8582) - 48.9).abs() < 1e-9);
+        assert!((round_coord_tenth(2.3387) - 2.3).abs() < 1e-9);
+        assert!((round_coord_tenth(-33.8688) - (-33.9)).abs() < 1e-9);
+        assert!((round_coord_tenth(0.04) - 0.0).abs() < 1e-9);
+        assert!((round_coord_tenth(45.75) - 45.8).abs() < 1e-9);
+        assert!(!round_coord_tenth(-0.04).is_sign_negative());
+        assert!(!round_coord_tenth(-0.0).is_sign_negative());
+        assert_eq!(sanitize_browser_coords(0.0, 0.0), None);
+        assert_eq!(sanitize_browser_coords(f64::NAN, 2.3), None);
+        assert_eq!(sanitize_browser_coords(91.0, 2.3), None);
+        assert_eq!(sanitize_browser_coords(45.75, 4.84), Some((45.8, 4.8)));
     }
 }

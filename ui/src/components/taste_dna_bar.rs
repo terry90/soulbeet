@@ -120,6 +120,7 @@ pub fn dedup_case_insensitive<'a>(
 pub fn TasteDnaBar(
     profile: UserCultureProfile,
     #[props(default)] top_genres: Vec<String>,
+    #[props(default)] live_weather_location: bool,
     #[props(default)] on_edit: Option<EventHandler<()>>,
     #[props(default)] class: String,
 ) -> Element {
@@ -153,13 +154,17 @@ pub fn TasteDnaBar(
         8,
     );
 
-    let weather_label = profile
-        .weather_city
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|city| format!("Weather: {city}"))
-        .unwrap_or_else(|| "Weather: Auto (IP)".to_string());
+    let weather_label = if live_weather_location {
+        "Weather: Live (Approx.)".to_string()
+    } else {
+        profile
+            .weather_city
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|city| format!("Weather: {city}"))
+            .unwrap_or_else(|| "Weather: Auto (IP)".to_string())
+    };
 
     let bar_aria_label = if !area_segments.is_empty() {
         area_segments

@@ -15,6 +15,12 @@ js-sys = "0.3"
 web-sys = { version = "0.3.91", features = [
     "Storage",
     "Window",
+    "Navigator",
+    "Geolocation",
+    "Position",
+    "Coordinates",
+    "PositionOptions",
+    "PositionError",
     "Location",
     "Document",
     "Element",

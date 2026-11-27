@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -433,15 +434,17 @@ class SoulbeetApiClient(
         config: PersistedAppConfig,
         localHour: Int,
         localWeekday: Int = currentIsoWeekday(),
+        lat: Double? = null,
+        lon: Double? = null,
     ): Result<List<ContextualMixUi>> = withContext(Dispatchers.IO) {
         runCatching {
-            val base = normalizeBaseUrl(config.serverUrl)
-            val url = "$base/api/discovery/contextual-mixes".toHttpUrlOrNull()
-                ?.newBuilder()
-                ?.addQueryParameter("local_hour", localHour.coerceIn(0, 23).toString())
-                ?.addQueryParameter("local_weekday", localWeekday.coerceIn(1, 7).toString())
-                ?.build()
-                ?: throw IOException("Invalid Soulbeet server URL")
+            val url = buildContextualMixesUrl(
+                serverUrl = config.serverUrl,
+                localHour = localHour,
+                localWeekday = localWeekday,
+                lat = lat,
+                lon = lon,
+            )
 
             val request = Request.Builder()
                 .url(url)
@@ -840,6 +843,29 @@ class SoulbeetApiClient(
                     ?: obj.optNonNullString("error")
                     ?: obj.optNonNullString("detail")
             }.getOrNull() ?: trimmed.take(160)
+        }
+
+        internal fun buildContextualMixesUrl(
+            serverUrl: String,
+            localHour: Int,
+            localWeekday: Int = currentIsoWeekday(),
+            lat: Double? = null,
+            lon: Double? = null,
+        ): HttpUrl {
+            val base = normalizeBaseUrl(serverUrl)
+            val builder = "$base/api/discovery/contextual-mixes".toHttpUrlOrNull()
+                ?.newBuilder()
+                ?.addQueryParameter("local_hour", localHour.coerceIn(0, 23).toString())
+                ?.addQueryParameter("local_weekday", localWeekday.coerceIn(1, 7).toString())
+                ?: throw IOException("Invalid Soulbeet server URL")
+            if (lat != null && lon != null) {
+                val sanitized = CoarseLocationProvider.sanitizeCoarseCoordinates(lat, lon)
+                if (sanitized != null) {
+                    builder.addQueryParameter("lat", String.format(Locale.ROOT, "%.1f", sanitized.first))
+                    builder.addQueryParameter("lon", String.format(Locale.ROOT, "%.1f", sanitized.second))
+                }
+            }
+            return builder.build()
         }
 
         internal fun calendarDayOfWeekToIso(dayOfWeek: Int): Int = when (dayOfWeek) {

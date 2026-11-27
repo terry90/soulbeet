@@ -1,6 +1,7 @@
 package org.soulbeet.app
 
 import java.util.Calendar
+import java.util.Locale
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -11,6 +12,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.soulbeet.app.data.AcquireWsEvent
+import org.soulbeet.app.data.CoarseLocationProvider
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.data.SoulbeetApiClient
 import org.soulbeet.app.data.StoredAuthKind
@@ -481,5 +483,106 @@ class FormattingAndThemeTest {
         assertEquals(5, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.FRIDAY))
         assertEquals(6, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SATURDAY))
         assertEquals(7, SoulbeetApiClient.calendarDayOfWeekToIso(Calendar.SUNDAY))
+    }
+
+    @Test
+    fun coarseLocationRoundingAndSanitizationHandleEdgeCases() {
+        assertEquals(45.8, CoarseLocationProvider.roundToTenthDegree(45.764), 0.0)
+        assertEquals(45.7, CoarseLocationProvider.roundToTenthDegree(45.74), 0.0)
+        assertEquals(-33.9, CoarseLocationProvider.roundToTenthDegree(-33.8688), 0.0)
+        assertEquals(0.0, CoarseLocationProvider.roundToTenthDegree(0.0), 0.0)
+
+        // Ensure -0.0 and tiny negative values normalize to positive +0.0 (never "-0.0").
+        val negZero = CoarseLocationProvider.roundToTenthDegree(-0.0)
+        assertEquals(0L, java.lang.Double.doubleToRawLongBits(negZero))
+        val tinyNeg = CoarseLocationProvider.roundToTenthDegree(-0.04)
+        assertEquals(0L, java.lang.Double.doubleToRawLongBits(tinyNeg))
+
+        // Valid coordinates are rounded to 0.1 degree.
+        assertEquals(45.8 to 4.8, CoarseLocationProvider.sanitizeCoarseCoordinates(45.764, 4.8357))
+        assertEquals(-33.9 to 151.2, CoarseLocationProvider.sanitizeCoarseCoordinates(-33.8688, 151.2093))
+        assertEquals(0.0 to 0.1, CoarseLocationProvider.sanitizeCoarseCoordinates(-0.02, 0.09))
+
+        // Invalid, out-of-range, and exact (0.0, 0.0) null-island fixes are rejected.
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(0.0, 0.0))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(Double.NaN, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, Double.NaN))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(Double.POSITIVE_INFINITY, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, Double.NEGATIVE_INFINITY))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(90.1, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(-90.1, 4.8))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, 180.1))
+        assertNull(CoarseLocationProvider.sanitizeCoarseCoordinates(45.8, -180.1))
+    }
+
+    @Test
+    fun contextualMixesUrlFormatsCoarseCoordsWithRootLocaleAndOmitsInvalidOnes() {
+        val originalLocale = Locale.getDefault()
+        try {
+            // French locale uses comma as decimal separator; URL query params must still use dots.
+            Locale.setDefault(Locale.FRANCE)
+
+            val withCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com/",
+                localHour = 14,
+                localWeekday = 5,
+                lat = 45.764,
+                lon = -0.04,
+            )
+            assertEquals("14", withCoords.queryParameter("local_hour"))
+            assertEquals("5", withCoords.queryParameter("local_weekday"))
+            assertEquals("45.8", withCoords.queryParameter("lat"))
+            assertEquals("0.0", withCoords.queryParameter("lon"))
+
+            val negativeCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 8,
+                localWeekday = 1,
+                lat = -33.8688,
+                lon = -70.6693,
+            )
+            assertEquals("-33.9", negativeCoords.queryParameter("lat"))
+            assertEquals("-70.7", negativeCoords.queryParameter("lon"))
+
+            val withoutCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+            )
+            assertNull(withoutCoords.queryParameter("lat"))
+            assertNull(withoutCoords.queryParameter("lon"))
+
+            val partialCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = 45.8,
+                lon = null,
+            )
+            assertNull(partialCoords.queryParameter("lat"))
+            assertNull(partialCoords.queryParameter("lon"))
+
+            val outOfRangeCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = 95.0,
+                lon = 4.8,
+            )
+            assertNull(outOfRangeCoords.queryParameter("lat"))
+            assertNull(outOfRangeCoords.queryParameter("lon"))
+
+            val nanCoords = SoulbeetApiClient.buildContextualMixesUrl(
+                serverUrl = "https://music.example.com",
+                localHour = 21,
+                localWeekday = 7,
+                lat = Double.NaN,
+                lon = 4.8,
+            )
+            assertNull(nanCoords.queryParameter("lat"))
+            assertNull(nanCoords.queryParameter("lon"))
+        } finally {
+            Locale.setDefault(originalLocale)
+        }
     }
 }

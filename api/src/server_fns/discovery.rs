@@ -311,16 +311,21 @@ pub async fn update_culture_profile(
         .map_err(failure_error)
 }
 
-#[get("/api/discovery/contextual-mixes?local_hour&local_weekday", auth: AuthSession, headers: axum::http::HeaderMap)]
+#[get("/api/discovery/contextual-mixes?local_hour&local_weekday&lat&lon", auth: AuthSession, headers: axum::http::HeaderMap)]
 pub async fn list_active_contextual_mixes(
     local_hour: Option<u8>,
     local_weekday: Option<u8>,
+    lat: Option<f64>,
+    lon: Option<f64>,
 ) -> Result<Vec<shared::recommendation::ContextualMixSummary>, ServerFnError> {
+    let client_coords =
+        crate::core::weather::validate_client_coords(lat, lon).map_err(failure_error)?;
     let culture = crate::core::contextual::get_culture_profile_in(&crate::db::DB, &auth.0.user_id)
         .await
         .unwrap_or_default();
     let client_ip = crate::core::weather::extract_public_client_ip(&headers);
-    let weather = crate::core::weather::resolve_weather_for_profile(&culture, client_ip).await;
+    let weather =
+        crate::core::weather::resolve_weather_for_profile(&culture, client_coords, client_ip).await;
     crate::core::contextual::list_active_contextual_mixes_in(
         &crate::db::DB,
         &crate::core::index::ServerNavidrome,
