@@ -1622,13 +1622,15 @@ impl DesktopStudio {
 
     /// Central handler for `PlayerCommand` dispatched by any shared Studio UI component.
     pub fn handle_player_command(&mut self, mut player: PlayerContext, cmd: PlayerCommand) {
-        let prev_track_id = player
-            .state_signal()
-            .peek()
-            .current_track
-            .as_ref()
-            .map(|t| t.id.clone());
-        let prev_status = player.state_signal().peek().status.clone();
+        let (prev_track_id, prev_queue_index, prev_status) = {
+            let st_sig = player.state_signal();
+            let st = st_sig.peek();
+            (
+                st.current_track.as_ref().map(|t| t.id.clone()),
+                st.queue_index,
+                st.status.clone(),
+            )
+        };
 
         let mut pos = *player.position_signal().peek();
         let mut dur = *player.duration_signal().peek();
@@ -1732,8 +1734,9 @@ impl DesktopStudio {
             | PlayerCommand::EnqueueLast(_) => {
                 self.schedule_gapless_prefetch(player);
             }
-            PlayerCommand::RemoveFromQueue(_) => {
-                if next_track_id != prev_track_id {
+            PlayerCommand::RemoveFromQueue(idx) => {
+                let active_slot_removed = prev_queue_index == Some(idx);
+                if next_track_id != prev_track_id || active_slot_removed {
                     if let Some(track) = next_track {
                         self.load_current_track_in_mpv(
                             player,
@@ -1744,6 +1747,37 @@ impl DesktopStudio {
                     } else {
                         self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
                         self.send_mpv(MpvCommand::Stop);
+                        if let Ok(mut sc) = self.scrobbler.peek().lock() {
+                            sc.reset();
+                        }
+                        if let Ok(mut mc) = self.media_controls.peek().lock() {
+                            mc.update_playback(&PlaybackStatus::Idle, 0.0);
+                        }
+                    }
+                } else {
+                    self.schedule_gapless_prefetch(player);
+                }
+            }
+            PlayerCommand::RemoveTrackFromQueue(ref track_id) => {
+                let active_slot_removed =
+                    !track_id.is_empty() && prev_track_id.as_deref() == Some(track_id.as_str());
+                if next_track_id != prev_track_id || active_slot_removed {
+                    if let Some(track) = next_track {
+                        self.load_current_track_in_mpv(
+                            player,
+                            track,
+                            !next_state.status.is_active(),
+                            None,
+                        );
+                    } else {
+                        self.load_gen.peek().fetch_add(1, Ordering::SeqCst);
+                        self.send_mpv(MpvCommand::Stop);
+                        if let Ok(mut sc) = self.scrobbler.peek().lock() {
+                            sc.reset();
+                        }
+                        if let Ok(mut mc) = self.media_controls.peek().lock() {
+                            mc.update_playback(&PlaybackStatus::Idle, 0.0);
+                        }
                     }
                 } else {
                     self.schedule_gapless_prefetch(player);
@@ -2120,8 +2154,8 @@ impl DesktopStudio {
             if let Some(prev) = displaced {
                 self.commit_pending_drop_item(prev);
             }
-            if player.is_track_current(&track.id) {
-                player.next();
+            if !track.id.is_empty() {
+                player.remove_track_from_queue(&track.id);
             }
         } else {
             self.guard_preview.set(Some(fail_closed_guard_preview(

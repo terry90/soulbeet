@@ -9,7 +9,7 @@ use shared::recommendation::{
 use ui::{
     discovery::DiscoveryOverview, format_discovery_badge, format_mix_subtitle, format_mix_title,
     format_mix_window_badge, friendly_error, subsonic_cover_art_url, use_player, IconCheck,
-    IconHeart, IconLoader, IconMusic, IconPlay, IconRadio, IconSparkles, IconThumbsDown,
+    IconHeart, IconLoader, IconMusic, IconPause, IconPlay, IconRadio, IconSparkles, IconThumbsDown,
     PlayerTrack, SeasonalHeroCard, TasteDnaBar, TrackRow, TrackRowState,
 };
 
@@ -246,9 +246,20 @@ pub fn DiscoverPage() -> Element {
                     }
                 } else if triage_layout() == TriageLayout::Deck {
                     {
-                        let first_dt = visible_triage[0].clone();
-                        let track = studio.track_from_discovery(&first_dt);
+                        let active_track_id = player.current_track().map(|t| t.id);
+                        let active_dt = active_track_id
+                            .as_deref()
+                            .filter(|id| !id.is_empty())
+                            .and_then(|id| {
+                                visible_triage
+                                    .iter()
+                                    .find(|dt| dt.song_id.as_deref() == Some(id))
+                            })
+                            .unwrap_or(&visible_triage[0])
+                            .clone();
+                        let track = studio.track_from_discovery(&active_dt);
                         let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
+                        let triage_for_play = visible_triage.clone();
                         let t_play = track.clone();
                         let t_keep = track.clone();
                         let t_star = track.clone();
@@ -256,11 +267,19 @@ pub fn DiscoverPage() -> Element {
                         let t_inspect = track.clone();
                         rsx! {
                             div { class: "rounded-[16px] bg-beet-surface border border-beet-border-default p-5 sm:p-6 flex flex-col md:flex-row items-center gap-6",
-                                // Artwork + Play Trigger
+                                // Artwork + Play/Pause Trigger (enqueues full pending triage list)
                                 button {
                                     r#type: "button",
+                                    aria_label: if is_playing { "Pause triage track" } else { "Play triage queue" },
                                     class: "relative w-36 h-36 sm:w-44 sm:h-44 rounded-[12px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle hover:border-beet-border-default shrink-0 flex items-center justify-center group cursor-pointer transition-colors",
-                                    onclick: move |_| player.play_track(t_play.clone()),
+                                    onclick: move |_| {
+                                        studio.play_or_toggle_triage(
+                                            player,
+                                            &triage_for_play,
+                                            &t_play,
+                                            true,
+                                        )
+                                    },
                                     if let Some(url) = track.cover_art_url.as_deref() {
                                         img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
                                     } else {
@@ -268,7 +287,11 @@ pub fn DiscoverPage() -> Element {
                                     }
                                     span { class: "absolute inset-0 bg-beet-canvas/55 flex items-center justify-center opacity-90 group-hover:opacity-100 transition-opacity",
                                         span { class: "w-12 h-12 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shadow-lg group-hover:scale-105 transition-transform",
-                                            IconPlay { size: 20, filled: true, class: "ml-0.5".to_string() }
+                                            if is_playing {
+                                                IconPause { size: 20 }
+                                            } else {
+                                                IconPlay { size: 20, filled: true, class: "ml-0.5".to_string() }
+                                            }
                                         }
                                     }
                                 }
@@ -344,6 +367,7 @@ pub fn DiscoverPage() -> Element {
                             {
                                 let track = studio.track_from_discovery(dt);
                                 let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
+                                let triage_for_row = visible_triage.clone();
                                 let t_play = track.clone();
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
@@ -360,7 +384,14 @@ pub fn DiscoverPage() -> Element {
                                             days_remaining: track.days_remaining,
                                             reason_label: track.reason_label.clone(),
                                         },
-                                        on_play: move |_| player.play_track(t_play.clone()),
+                                        on_play: move |_| {
+                                            studio.play_or_toggle_triage(
+                                                player,
+                                                &triage_for_row,
+                                                &t_play,
+                                                false,
+                                            )
+                                        },
                                         on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                         on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
                                         on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),

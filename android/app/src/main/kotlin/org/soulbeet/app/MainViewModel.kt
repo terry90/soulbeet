@@ -727,6 +727,55 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    /**
+     * Enqueues the full pending discovery triage deck starting at [card], or toggles play/pause
+     * if [card] is already active inside the Discovery Triage queue so playback resumes in place.
+     */
+    fun playTriageFrom(card: TriageCardItem) {
+        val selected = card.track ?: run {
+            showNotice("Track is not indexed in Navidrome yet.")
+            return
+        }
+        val currentState = _uiState.value
+        val offlineIds = currentState.offlineTrackIds
+        val allDeck = currentState.triageDeck.mapNotNull { it.track }
+        val playableDeck = if (currentState.config.offlineOnly) {
+            allDeck.filter { offlineIds.contains(it.id) }
+        } else {
+            allDeck
+        }
+        if (currentState.playback.currentTrackId == selected.id) {
+            if (currentState.playback.isPlaying) {
+                mediaBridge.togglePlayPause()
+                return
+            }
+            if (currentState.playback.sourceLabel == "Discovery Triage" &&
+                (currentState.queueTracks.size > 1 || playableDeck.size <= 1)
+            ) {
+                mediaBridge.togglePlayPause()
+                return
+            }
+        }
+        if (playableDeck.isEmpty()) {
+            if (currentState.config.offlineOnly) {
+                showNotice("No offline-cached tracks in this list")
+            } else {
+                playTrack(selected, sourceLabel = "Discovery Triage")
+            }
+            return
+        }
+        val startIndex = playableDeck.indexOfFirst { it.id == selected.id }
+        if (startIndex < 0) {
+            playTrack(selected, sourceLabel = "Discovery Triage")
+            return
+        }
+        playQueue(
+            tracks = playableDeck,
+            startIndex = startIndex,
+            sourceLabel = "Discovery Triage",
+        )
+    }
+
     fun playContainer(mediaId: String, title: String? = null) {
         mediaBridge.playContainer(mediaId, title)
     }
@@ -902,9 +951,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 },
             )
         }
-        if (_uiState.value.playback.currentTrackId == trackId) {
-            mediaBridge.skipNext()
-        }
+        mediaBridge.removeTrackFromQueue(trackId)
         undoController.scheduleDrop(
             PendingDropAction(
                 trackId = trackId,

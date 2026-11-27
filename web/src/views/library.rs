@@ -417,6 +417,7 @@ pub fn LibraryPage() -> Element {
                                 for dt in triage.iter() {
                                     {
                                         let track = studio.track_from_discovery(dt);
+                                        let triage_for_row = triage.clone();
                                         let t_play = track.clone();
                                         let t_keep = track.clone();
                                         let t_drop = track.clone();
@@ -433,7 +434,14 @@ pub fn LibraryPage() -> Element {
                                                     days_remaining: track.days_remaining,
                                                     reason_label: track.reason_label.clone(),
                                                 },
-                                                on_play: move |_| player.play_track(t_play.clone()),
+                                                on_play: move |_| {
+                                                    studio.play_or_toggle_triage(
+                                                        player,
+                                                        &triage_for_row,
+                                                        &t_play,
+                                                        false,
+                                                    )
+                                                },
                                                 on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                                 on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),

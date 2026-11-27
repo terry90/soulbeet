@@ -103,6 +103,9 @@ pub enum PlayerCommand {
     EnqueueNext(PlayerTrack),
     EnqueueLast(PlayerTrack),
     RemoveFromQueue(usize),
+    /// Atomically removes every occurrence of the given track ID from the queue,
+    /// advancing playback once when the active track was removed.
+    RemoveTrackFromQueue(String),
     ClearQueue,
     SetOfflineOnly(bool),
 }
@@ -346,41 +349,42 @@ impl PlayerState {
                 self.sync_shuffle_order();
             }
             PlayerCommand::RemoveFromQueue(idx) => {
-                if *idx >= self.queue.len() {
+                self.remove_queue_index(*idx, position_secs, duration_secs);
+            }
+            PlayerCommand::RemoveTrackFromQueue(track_id) => {
+                if track_id.is_empty() {
                     return;
                 }
-                self.queue.remove(*idx);
-                if self.queue.is_empty() {
-                    self.clear_playback(position_secs, duration_secs);
+                let matching: Vec<usize> = self
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, t)| (t.id == *track_id).then_some(i))
+                    .collect();
+                if matching.is_empty() {
+                    if self
+                        .current_track
+                        .as_ref()
+                        .is_some_and(|t| t.id == *track_id)
+                    {
+                        self.clear_playback(position_secs, duration_secs);
+                    }
                     return;
                 }
-                let Some(cur) = self.queue_index else {
-                    self.sync_shuffle_order();
-                    return;
-                };
-                if *idx < cur {
-                    self.queue_index = Some(cur - 1);
-                } else if *idx == cur {
-                    let next_status = if self.status.is_active() {
-                        PlaybackStatus::Loading
-                    } else {
-                        self.status.clone()
-                    };
-                    if *idx < self.queue.len() {
-                        self.select_queue_index(*idx, next_status, position_secs, duration_secs);
-                    } else if self.repeat == RepeatMode::All {
-                        self.select_queue_index(0, next_status, position_secs, duration_secs);
-                    } else {
-                        // Removed the last track under Repeat::Off / Repeat::One: stop cleanly
-                        // without jumping backwards or unexpectedly auto-playing an earlier track.
-                        self.current_track = None;
-                        self.queue_index = None;
-                        self.status = PlaybackStatus::Idle;
-                        *position_secs = 0.0;
-                        *duration_secs = 0.0;
+                // Phase 1: remove all non-current duplicates in descending order so the active
+                // track advances at most once and never lands on another copy of the dropped ID.
+                let cur_initial = self.queue_index;
+                for idx in matching.into_iter().rev() {
+                    if Some(idx) != cur_initial {
+                        self.remove_queue_index(idx, position_secs, duration_secs);
                     }
                 }
-                self.sync_shuffle_order();
+                // Phase 2: remove the (possibly shifted) active track last.
+                if let Some(cur) = self.queue_index {
+                    if self.queue.get(cur).is_some_and(|t| t.id == *track_id) {
+                        self.remove_queue_index(cur, position_secs, duration_secs);
+                    }
+                }
             }
             PlayerCommand::ClearQueue => {
                 self.clear_playback(position_secs, duration_secs);
@@ -388,6 +392,96 @@ impl PlayerState {
             PlayerCommand::SetOfflineOnly(enabled) => {
                 self.offline_only = *enabled;
             }
+        }
+    }
+
+    fn remove_queue_index(
+        &mut self,
+        idx: usize,
+        position_secs: &mut f64,
+        duration_secs: &mut f64,
+    ) {
+        if idx >= self.queue.len() {
+            return;
+        }
+        let had_shuffle_order = self.shuffle && !self.shuffle_order.is_empty();
+        let shuffle_next_after_removal = if had_shuffle_order && self.queue_index == Some(idx) {
+            let cur_pos = self.shuffle_cursor.unwrap_or(0);
+            let orig_target = if cur_pos + 1 < self.shuffle_order.len() {
+                Some(self.shuffle_order[cur_pos + 1])
+            } else if self.repeat == RepeatMode::All {
+                self.shuffle_order.iter().copied().find(|&i| i != idx)
+            } else {
+                None
+            };
+            orig_target.map(|orig| if orig > idx { orig - 1 } else { orig })
+        } else {
+            None
+        };
+
+        self.queue.remove(idx);
+        if self.queue.is_empty() {
+            self.clear_playback(position_secs, duration_secs);
+            return;
+        }
+
+        // Preserve existing shuffle order and history in place instead of reshuffling already-played tracks.
+        if had_shuffle_order {
+            self.shuffle_order.retain(|&i| i != idx);
+            for entry in &mut self.shuffle_order {
+                if *entry > idx {
+                    *entry -= 1;
+                }
+            }
+        }
+
+        let Some(cur) = self.queue_index else {
+            if had_shuffle_order {
+                self.shuffle_cursor = None;
+            } else {
+                self.sync_shuffle_order();
+            }
+            return;
+        };
+
+        if idx < cur {
+            self.queue_index = Some(cur - 1);
+        } else if idx == cur {
+            let next_status = if self.status.is_active() {
+                PlaybackStatus::Loading
+            } else if matches!(self.status, PlaybackStatus::Error(_)) {
+                PlaybackStatus::Paused
+            } else {
+                self.status.clone()
+            };
+            let target_idx = if had_shuffle_order {
+                shuffle_next_after_removal.filter(|&t| t < self.queue.len())
+            } else if idx < self.queue.len() {
+                Some(idx)
+            } else if self.repeat == RepeatMode::All {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(next_idx) = target_idx {
+                self.select_queue_index(next_idx, next_status, position_secs, duration_secs);
+            } else {
+                // Removed the last track under Repeat::Off / Repeat::One: stop cleanly
+                // without jumping backwards or unexpectedly auto-playing an earlier track.
+                self.current_track = None;
+                self.queue_index = None;
+                self.status = PlaybackStatus::Idle;
+                *position_secs = 0.0;
+                *duration_secs = 0.0;
+            }
+        }
+
+        if had_shuffle_order {
+            self.shuffle_cursor = self
+                .queue_index
+                .and_then(|q| self.shuffle_order.iter().position(|&i| i == q));
+        } else {
+            self.sync_shuffle_order();
         }
     }
 
@@ -668,6 +762,10 @@ impl PlayerContext {
         self.state.read().queue.clone()
     }
 
+    pub fn queue_len(&self) -> usize {
+        self.state.read().queue.len()
+    }
+
     pub fn queue_index(&self) -> Option<usize> {
         self.state.read().queue_index
     }
@@ -786,6 +884,16 @@ impl PlayerContext {
 
     pub fn remove_from_queue(&self, index: usize) {
         self.dispatch(PlayerCommand::RemoveFromQueue(index));
+    }
+
+    /// Atomically removes every occurrence of `track_id` from the playback queue.
+    /// When `track_id` is the active track, removing it immediately advances to the next
+    /// queued track (or stops cleanly if it was the last track under `Repeat::Off`).
+    pub fn remove_track_from_queue(&self, track_id: &str) {
+        if track_id.is_empty() {
+            return;
+        }
+        self.dispatch(PlayerCommand::RemoveTrackFromQueue(track_id.to_string()));
     }
 
     pub fn clear_queue(&self) {
@@ -1154,5 +1262,111 @@ mod tests {
         assert_eq!(state.status, PlaybackStatus::Loading);
         assert_eq!(state.queue_index, Some(0));
         assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn remove_from_queue_advances_on_drop_clears_error_and_respects_shuffle() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+
+        // 1. Removing active playing track skips immediately to next and removes it from queue
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 120), track("b", 180), track("c", 200)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Playing;
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(0), &mut pos, &mut dur);
+        assert_eq!(state.queue.len(), 2);
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+        assert_eq!(state.status, PlaybackStatus::Loading);
+
+        // 2. Removing an upcoming track leaves current playback undisturbed
+        state.status = PlaybackStatus::Playing;
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(1), &mut pos, &mut dur);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+
+        // 3. Removing an errored current track resets next track to Paused instead of carrying Error
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("x", 100), track("y", 150)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Error("stream failed".into());
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(0), &mut pos, &mut dur);
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("y"));
+        assert_eq!(state.status, PlaybackStatus::Paused);
+
+        // 4. Removing current track under shuffle advances to next shuffled track, preserves
+        // already-played shuffle history (does not replay played tracks), and stops cleanly at end.
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 100), track("c", 100), track("d", 100)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.apply_local_command(&PlayerCommand::ToggleShuffle, &mut pos, &mut dur);
+        let original_order_ids: Vec<String> = state
+            .shuffle_order
+            .iter()
+            .map(|&i| state.queue[i].id.clone())
+            .collect();
+        // Advance through 2 tracks (keep them), then drop the 3rd track (cursor = 2).
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(
+            state.current_track.as_ref().map(|t| t.id.as_str()),
+            Some(original_order_ids[2].as_str())
+        );
+        state.status = PlaybackStatus::Playing;
+        let dropped_idx = state.queue_index.unwrap();
+        state.apply_local_command(&PlayerCommand::RemoveFromQueue(dropped_idx), &mut pos, &mut dur);
+        assert_eq!(
+            state.current_track.as_ref().map(|t| t.id.as_str()),
+            Some(original_order_ids[3].as_str())
+        );
+        assert_eq!(state.status, PlaybackStatus::Loading);
+        assert!(!state.queue.iter().any(|t| t.id == original_order_ids[2]));
+        // Advancing past the final shuffled track under Repeat::Off must stop, not replay 0 or 1.
+        state.apply_local_command(&PlayerCommand::Next, &mut pos, &mut dur);
+        assert_eq!(state.status, PlaybackStatus::Paused);
+        assert_eq!(
+            state.current_track.as_ref().map(|t| t.id.as_str()),
+            Some(original_order_ids[3].as_str())
+        );
+
+        // 5. Atomic RemoveTrackFromQueue removes earlier duplicates before advancing active track.
+        state.apply_local_command(&PlayerCommand::ToggleShuffle, &mut pos, &mut dur); // shuffle off
+        state.repeat = RepeatMode::All;
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 100), track("a", 100)],
+                start_index: 2,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Playing;
+        state.apply_local_command(
+            &PlayerCommand::RemoveTrackFromQueue("a".into()),
+            &mut pos,
+            &mut dur,
+        );
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.queue[0].id, "b");
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+        assert_eq!(state.status, PlaybackStatus::Loading);
     }
 }

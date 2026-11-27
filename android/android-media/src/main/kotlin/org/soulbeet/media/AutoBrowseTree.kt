@@ -3,8 +3,10 @@ package org.soulbeet.media
 import android.net.Uri
 import android.os.Bundle
 import androidx.annotation.OptIn
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaConstants
 import org.soulbeet.core.FfiAutoBrowseNode
@@ -397,6 +399,59 @@ object AutoBrowseTree {
 
     fun extractTrackId(mediaId: String): String =
         parseContextualTrackId(mediaId)?.trackId ?: mediaId.removePrefix(PREFIX_TRACK)
+
+    /** Resolves the canonical Navidrome track ID from a Media3 [MediaItem]. */
+    fun resolveTrackId(item: MediaItem): String =
+        item.mediaMetadata.extras?.getString(EXTRA_TRACK_ID)?.takeIf { it.isNotBlank() }
+            ?: extractTrackId(item.mediaId)
+
+    /**
+     * Removes every occurrence of [trackId] from [player]'s queue.
+     *
+     * Phase 1 removes all non-current duplicates in descending order so advancing from the
+     * active track never lands on another copy of [trackId]. Phase 2 handles the active track:
+     * if another distinct track is reachable next (respecting shuffle/repeat, while guarding
+     * against single-item `REPEAT_MODE_ALL` self-loops), seeks to it, removes the dropped index,
+     * and resumes playback (preparing first if `STATE_IDLE` after an error). Otherwise pauses
+     * and removes the dropped index cleanly.
+     *
+     * Returns `true` if playback advanced to another queued track, `false` otherwise.
+     */
+    fun removeTrackFromQueue(player: Player, trackId: String): Boolean {
+        if (trackId.isBlank()) return false
+
+        val initialCurrent = player.currentMediaItemIndex
+        for (i in player.mediaItemCount - 1 downTo 0) {
+            if (i != initialCurrent && resolveTrackId(player.getMediaItemAt(i)) == trackId) {
+                player.removeMediaItem(i)
+            }
+        }
+
+        val curIdx = player.currentMediaItemIndex
+        if (curIdx !in 0 until player.mediaItemCount ||
+            resolveTrackId(player.getMediaItemAt(curIdx)) != trackId
+        ) {
+            return false
+        }
+
+        val nextIdx = player.nextMediaItemIndex
+        return if (player.mediaItemCount > 1 && nextIdx != C.INDEX_UNSET && nextIdx != curIdx) {
+            val wasPlaying = player.playWhenReady || player.isPlaying
+            player.seekToNextMediaItem()
+            player.removeMediaItem(curIdx)
+            if (wasPlaying) {
+                if (player.playbackState == Player.STATE_IDLE) {
+                    player.prepare()
+                }
+                player.play()
+            }
+            true
+        } else {
+            player.pause()
+            player.removeMediaItem(curIdx)
+            false
+        }
+    }
 
     private fun artworkUriOrNull(artAuthority: String, coverArtId: String?): Uri? {
         val cleanId = coverArtId?.trim()?.takeIf { it.isNotEmpty() } ?: return null

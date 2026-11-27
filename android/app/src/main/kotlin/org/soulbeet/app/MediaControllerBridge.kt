@@ -229,6 +229,24 @@ class MediaControllerBridge(
         }
     }
 
+    /**
+     * Removes every occurrence of [trackId] from the active Media3 queue.
+     * When [trackId] is currently playing, advances to the next queued item first (respecting
+     * shuffle and repeat) before removing the dropped track, or pauses cleanly if it was the
+     * final item in the queue.
+     */
+    fun removeTrackFromQueue(trackId: String) {
+        if (trackId.isEmpty()) return
+        val active = controller ?: return
+        val wasCurrent = active.currentMediaItem?.let {
+            AutoBrowseTree.resolveTrackId(it) == trackId
+        } ?: false
+        AutoBrowseTree.removeTrackFromQueue(active, trackId)
+        if (wasCurrent) {
+            _playbackPositionMs.value = 0L
+        }
+    }
+
     fun skipPrevious() {
         val active = controller ?: return
         if (active.currentPosition > 3_000L) {

@@ -870,7 +870,10 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
                 },
                 onSkipToNext = {
                     val p = player
-                    if (p != null && p.hasNextMediaItem()) {
+                    val droppedId = currentTrackContext?.trackId
+                    if (p != null && !droppedId.isNullOrBlank()) {
+                        AutoBrowseTree.removeTrackFromQueue(p, droppedId)
+                    } else if (p != null && p.mediaItemCount > 1 && p.hasNextMediaItem()) {
                         p.seekToNextMediaItem()
                         true
                     } else {
@@ -1222,10 +1225,7 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
         if (count <= 0) return emptyList()
         val ids = ArrayList<String>(count)
         for (i in 0 until count) {
-            val item = currentPlayer.getMediaItemAt(i)
-            val id = item.mediaMetadata.extras?.getString(AutoBrowseTree.EXTRA_TRACK_ID)
-                ?.takeIf { it.isNotBlank() }
-                ?: AutoBrowseTree.extractTrackId(item.mediaId)
+            val id = AutoBrowseTree.resolveTrackId(currentPlayer.getMediaItemAt(i))
             if (id.isNotBlank()) {
                 ids.add(id)
             }

@@ -377,6 +377,62 @@ impl WebStudioContext {
         track
     }
 
+    /// Maps all currently visible pending discovery tracks with a playable Navidrome song ID
+    /// into a continuous triage playback queue.
+    pub fn triage_queue_tracks(&self, visible: &[DiscoveryTrack]) -> Vec<PlayerTrack> {
+        visible
+            .iter()
+            .map(|dt| self.track_from_discovery(dt))
+            .filter(|t| !t.id.is_empty())
+            .collect()
+    }
+
+    /// Enqueues the full pending triage list starting at `selected` (or toggles play/pause when
+    /// `selected` is already active inside the triage queue so pausing/resuming never restarts).
+    pub fn play_or_toggle_triage(
+        &self,
+        player: PlayerContext,
+        visible: &[DiscoveryTrack],
+        selected: &PlayerTrack,
+        allow_toggle_pause: bool,
+    ) {
+        if selected.id.is_empty() {
+            player.play_track(selected.clone());
+            return;
+        }
+        let queue = self.triage_queue_tracks(visible);
+        if allow_toggle_pause {
+            if player.is_track_playing(&selected.id) {
+                player.toggle_play_pause();
+                return;
+            }
+            let is_paused_in_triage_queue = {
+                let st_sig = player.state_signal();
+                let st = st_sig.read();
+                st.current_track
+                    .as_ref()
+                    .is_some_and(|t| t.id == selected.id)
+                    && st.queue_index.is_some_and(|idx| {
+                        let upcoming = st.queue.get(idx..).unwrap_or(&[]);
+                        let all_upcoming_in_triage = !upcoming.is_empty()
+                            && upcoming
+                                .iter()
+                                .all(|q| queue.iter().any(|tq| tq.id == q.id));
+                        all_upcoming_in_triage && (st.queue.len() > 1 || queue.len() <= 1)
+                    })
+            };
+            if is_paused_in_triage_queue {
+                player.toggle_play_pause();
+                return;
+            }
+        }
+        if let Some(start_index) = queue.iter().position(|t| t.id == selected.id) {
+            player.play_queue(queue, start_index);
+        } else {
+            player.play_track(selected.clone());
+        }
+    }
+
     pub fn track_from_contextual(&self, ct: &ContextualMixTrack) -> PlayerTrack {
         let nav = self.navidrome_info();
         let cover_art_url = nav
@@ -680,8 +736,8 @@ impl WebStudioContext {
                     };
                     if res.action == CurationAction::DroppedDiscovery {
                         studio.prune_triage_entry(&effective_id, disc_id.as_deref());
-                        if !effective_id.is_empty() && player.is_track_current(&effective_id) {
-                            player.next();
+                        if !effective_id.is_empty() {
+                            player.remove_track_from_queue(&effective_id);
                         }
                         studio.show_toast(res.message);
                         return;
@@ -776,8 +832,8 @@ impl WebStudioContext {
     /// - Permanent Library: loads `curation_guard_preview` and opens `MultiListenerGuardModal`.
     pub fn drop_track(&mut self, auth: Auth, player: PlayerContext, track: PlayerTrack) {
         if track.is_discovery {
-            if !track.id.is_empty() && player.is_track_current(&track.id) {
-                player.next();
+            if !track.id.is_empty() {
+                player.remove_track_from_queue(&track.id);
             }
             let displaced = self.pending_drops.write().stage_drop(
                 track.id.clone(),
@@ -970,8 +1026,8 @@ impl WebStudioContext {
                                     &track.id,
                                     track.discovery_track_id.as_deref(),
                                 );
-                                if !track.id.is_empty() && player.is_track_current(&track.id) {
-                                    player.next();
+                                if !track.id.is_empty() {
+                                    player.remove_track_from_queue(&track.id);
                                 }
                                 studio.show_toast(res.message);
                             }
@@ -979,9 +1035,7 @@ impl WebStudioContext {
                                 studio.guard_modal.set(None);
                                 if !track.id.is_empty() {
                                     studio.starred_tracks.write().retain(|t| t.id != track.id);
-                                    if player.is_track_current(&track.id) {
-                                        player.next();
-                                    }
+                                    player.remove_track_from_queue(&track.id);
                                 }
                                 studio.show_toast(res.message);
                             }
@@ -1687,11 +1741,14 @@ pub fn WebStudioProvider(children: Element) -> Element {
     #[cfg(feature = "web")]
     let audio_for_cmd = Rc::clone(&audio_handle);
     let dispatcher = use_callback(move |cmd: PlayerCommand| {
-        let prev_track_id = player_state
-            .peek()
-            .current_track
-            .as_ref()
-            .map(|t| t.id.clone());
+        #[cfg(feature = "web")]
+        let (prev_track_id, prev_queue_index) = {
+            let st = player_state.peek();
+            (
+                st.current_track.as_ref().map(|t| t.id.clone()),
+                st.queue_index,
+            )
+        };
 
         let mut pos = *position_secs.peek();
         let mut dur = *duration_secs.peek();
@@ -1718,6 +1775,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 | PlayerCommand::LoadQueue { .. }
                 | PlayerCommand::ClearQueue
                 | PlayerCommand::RemoveFromQueue(_)
+                | PlayerCommand::RemoveTrackFromQueue(_)
                 | PlayerCommand::EnqueueNext(_)
                 | PlayerCommand::EnqueueLast(_)
         ) {
@@ -1730,7 +1788,16 @@ pub fn WebStudioProvider(children: Element) -> Element {
             let audio = &engine.audio;
             let next_state = player_state.peek().clone();
             let next_track_id = next_state.current_track.as_ref().map(|t| t.id.clone());
+            let active_slot_removed = matches!(
+                &cmd,
+                PlayerCommand::RemoveFromQueue(idx) if prev_queue_index == Some(*idx)
+            ) || matches!(
+                &cmd,
+                PlayerCommand::RemoveTrackFromQueue(id)
+                    if !id.is_empty() && prev_track_id.as_deref() == Some(id.as_str())
+            );
             let track_changed = next_track_id != prev_track_id
+                || active_slot_removed
                 || matches!(
                     cmd,
                     PlayerCommand::PlayTrack(_)
@@ -1841,9 +1908,6 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 }
             }
         }
-
-        #[cfg(not(feature = "web"))]
-        let _ = prev_track_id;
     });
 
     // Attach `ended` listener with explicit Drop guard and active Dioxus Runtime scope.

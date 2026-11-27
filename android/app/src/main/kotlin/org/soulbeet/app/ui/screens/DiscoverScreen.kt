@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
@@ -198,7 +199,9 @@ fun DiscoverScreen(
                     )
                 }
 
-                val topCard = state.triageDeck.firstOrNull()
+                val topCard = state.playback.currentTrackId?.let { curId ->
+                    state.triageDeck.firstOrNull { it.discovery.songId == curId }
+                } ?: state.triageDeck.firstOrNull()
                 if (topCard == null) {
                     Surface(
                         color = colors.surface,
@@ -228,7 +231,9 @@ fun DiscoverScreen(
                     SwipeableTriageCard(
                         item = topCard,
                         artAuthority = artAuthority,
-                        isPlaying = state.playback.currentTrackId == topCard.discovery.songId && state.playback.isPlaying,
+                        isPlaying = topCard.discovery.songId != null &&
+                            state.playback.currentTrackId == topCard.discovery.songId &&
+                            state.playback.isPlaying,
                         onPreview = { onPreviewTriageCard(topCard) },
                         onKeep = { onKeepTriageCard(topCard) },
                         onStarAndKeep = { onStarKeepTriageCard(topCard) },
@@ -364,8 +369,8 @@ private fun SwipeableTriageCard(
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
-                                imageVector = Icons.Filled.PlayArrow,
-                                contentDescription = if (isPlaying) "Playing preview" else "Play preview",
+                                imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause triage track" else "Play triage queue",
                                 tint = if (isPlaying) colors.leafGlow else colors.textPrimary,
                                 modifier = Modifier.size(26.dp),
                             )
