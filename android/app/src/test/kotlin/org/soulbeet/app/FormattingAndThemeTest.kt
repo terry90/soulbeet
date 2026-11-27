@@ -419,34 +419,7 @@ class FormattingAndThemeTest {
     }
 
     @Test
-    fun weatherBadgeFormattingAndParsingCoverAllConditions() {
-        assertEquals(
-            "RAINY · 11°C",
-            SoulbeetApiClient.formatWeatherBadge(
-                JSONObject("""{"condition":"rainy","temperature_c":11.4,"weather_code":61,"is_day":true}"""),
-            ),
-        )
-        assertEquals(
-            "SNOW · -2°C",
-            SoulbeetApiClient.formatWeatherBadge(
-                JSONObject("""{"condition":"snowy","temperature_c":-1.5,"weather_code":73,"is_day":false}"""),
-            ),
-        )
-        assertEquals(
-            "STORM · 16°C",
-            SoulbeetApiClient.formatWeatherBadge(
-                JSONObject("""{"condition":"stormy","temperature_c":16.0,"weather_code":95,"is_day":false}"""),
-            ),
-        )
-        assertEquals(
-            "SUNNY · 25°C",
-            SoulbeetApiClient.formatWeatherBadge(
-                JSONObject("""{"condition":"sunny","temperature_c":24.6,"weather_code":0,"is_day":true}"""),
-            ),
-        )
-        assertNull(SoulbeetApiClient.formatWeatherBadge(null))
-        assertNull(SoulbeetApiClient.formatWeatherBadge(JSONObject("""{"condition":"cloudy","temperature_c":14.0}""")))
-
+    fun weatherMixParsesCleanlyWhenWeatherPayloadIsPresent() {
         val client = SoulbeetApiClient()
         val parsed = client.parseContextualMix(
             JSONObject(
@@ -471,7 +444,8 @@ class FormattingAndThemeTest {
             ),
         )
         assertEquals("Snow Day", parsed.title)
-        assertEquals("SNOW · -2°C", parsed.weatherBadge)
+        assertEquals("moment", parsed.kind)
+        assertEquals(20, parsed.trackCount)
     }
 
     @Test

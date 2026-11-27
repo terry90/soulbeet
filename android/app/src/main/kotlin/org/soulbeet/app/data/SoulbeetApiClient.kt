@@ -21,7 +21,6 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
-import kotlin.math.roundToInt
 
 data class LoginResult(
     val authKind: StoredAuthKind,
@@ -68,7 +67,6 @@ data class ContextualMixUi(
     val navidromePlaylistId: String?,
     val trackCount: Int,
     val targetTracks: Int,
-    val weatherBadge: String? = null,
 )
 
 data class ContextualMixTrackUi(
@@ -627,7 +625,6 @@ class SoulbeetApiClient(
         val customDesc = obj.optNonNullString("custom_description")
         val country = obj.optNonNullString("country_code")
         val localPct = if (obj.has("local_pct") && !obj.isNull("local_pct")) obj.optInt("local_pct") else null
-        val weatherBadge = formatWeatherBadge(obj.optJSONObject("weather_badge"))
         val (fallbackTitle, fallbackSub) = defaultMixCopy(slug, i18nKey)
         return ContextualMixUi(
             slug = slug,
@@ -647,7 +644,6 @@ class SoulbeetApiClient(
             navidromePlaylistId = obj.optNonNullString("navidrome_playlist_id"),
             trackCount = obj.optInt("track_count", 0),
             targetTracks = obj.optInt("target_tracks", 25),
-            weatherBadge = weatherBadge,
         )
     }
 
@@ -881,22 +877,6 @@ class SoulbeetApiClient(
 
         internal fun currentIsoWeekday(): Int =
             calendarDayOfWeekToIso(Calendar.getInstance().get(Calendar.DAY_OF_WEEK))
-
-        internal fun formatWeatherBadge(obj: JSONObject?): String? {
-            if (obj == null) return null
-            val label = when (obj.optNonNullString("condition")?.lowercase(Locale.ROOT)) {
-                "rainy" -> "RAINY"
-                "snowy" -> "SNOW"
-                "stormy" -> "STORM"
-                "sunny" -> "SUNNY"
-                else -> return null
-            }
-            val temp = obj.optDouble("temperature_c", Double.NaN)
-            if (temp.isNaN() || temp.isInfinite()) return label
-            // Match Rust `f32::round()` (half away from zero) for negative temperatures like -1.5.
-            val rounded = if (temp < 0.0) -(-temp).roundToInt() else temp.roundToInt()
-            return "$label · ${rounded}°C"
-        }
 
         internal fun defaultMixCopy(slug: String, i18nKey: String): Pair<String, String> {
             fun lookup(raw: String): Pair<String, String>? =

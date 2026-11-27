@@ -147,18 +147,10 @@ pub fn format_mix_subtitle(summary: &ContextualMixSummary) -> String {
     }
 }
 
-/// Formats the compact schedule/window badge shown atop [`crate::SeasonalHeroCard`].
+/// Formats the compact schedule/window badge shown atop [`crate::SeasonalHeroCard`]
+/// and curated mix cards. Weather-reactive mixes intentionally omit raw temperature
+/// or forecast readouts so their appearance feels ambient rather than like a weather widget.
 pub fn format_mix_window_badge(summary: &ContextualMixSummary) -> Option<String> {
-    if let Some(ref weather) = summary.weather_badge {
-        if !weather.temperature_c.is_finite() {
-            return Some(weather.condition.badge_label().to_string());
-        }
-        return Some(format!(
-            "{} · {}°C",
-            weather.condition.badge_label(),
-            weather.temperature_c.round() as i32
-        ));
-    }
     match (&summary.active_from, &summary.active_until) {
         (Some(from), Some(until)) => {
             let from_lbl = format_short_iso_date(from);
@@ -418,23 +410,24 @@ mod tests {
     }
 
     #[test]
-    fn formats_weather_window_badge_for_all_conditions() {
+    fn weather_mixes_omit_temperature_readout_from_badge() {
         use shared::recommendation::{WeatherCondition, WeatherSnapshot};
 
-        let cases = [
-            (WeatherCondition::Rainy, 11.4, "RAINY · 11°C"),
-            (WeatherCondition::Snowy, -1.8, "SNOW · -2°C"),
-            (WeatherCondition::Stormy, 16.0, "STORM · 16°C"),
-            (WeatherCondition::Sunny, 24.6, "SUNNY · 25°C"),
-        ];
-
-        for (condition, temperature_c, expected) in cases {
+        for (condition, temperature_c) in [
+            (WeatherCondition::Rainy, 11.4),
+            (WeatherCondition::Snowy, -1.8),
+            (WeatherCondition::Stormy, 16.0),
+            (WeatherCondition::Sunny, 24.6),
+        ] {
             let mut summary = sample_summary(
                 "rainy_day",
                 ContextualMixKind::Moment,
                 "mix.moment.rainy_day",
                 None,
             );
+            summary.active_from = None;
+            summary.active_until = None;
+            summary.expires_at = None;
             summary.weather_badge = Some(WeatherSnapshot {
                 condition,
                 temperature_c,
@@ -442,7 +435,10 @@ mod tests {
                 is_day: true,
                 location_label: Some("Lyon, FR".into()),
             });
-            assert_eq!(format_mix_window_badge(&summary).as_deref(), Some(expected));
+            assert_eq!(
+                format_mix_window_badge(&summary).as_deref(),
+                Some("MOMENT MIX")
+            );
         }
     }
 

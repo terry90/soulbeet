@@ -169,7 +169,7 @@ fun DiscoverScreen(
                                         shape = SoulbeetShapes.full,
                                     ) {
                                         Text(
-                                            text = mix.weatherBadge ?: mix.kind.uppercase(),
+                                            text = mix.kind.uppercase(),
                                             style = type.monoXs,
                                             color = colors.leafText,
                                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
