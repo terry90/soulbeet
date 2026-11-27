@@ -125,7 +125,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "api"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "chrono",
  "client-core",
@@ -6007,7 +6007,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "percent-encoding",
  "serde",
@@ -6168,7 +6168,7 @@ dependencies = [
 
 [[package]]
 name = "soulbeet"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7246,7 +7246,7 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 
 [[package]]
 name = "ui"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "api",
  "chrono",
@@ -7681,7 +7681,7 @@ dependencies = [
 
 [[package]]
 name = "web"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 dependencies = [
  "api",
  "axum",

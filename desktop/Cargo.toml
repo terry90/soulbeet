@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "1.0.0-alpha-0"
+version = "1.0.0-alpha-1"
 edition = "2021"
 description = "Soulbeet Refined Midnight Studio native desktop player for Linux and Windows (dioxus-desktop + libmpv + souvlaki + in-process client-core)."
 
