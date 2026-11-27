@@ -37,7 +37,11 @@ async fn update_progress(
 fn seasonal_progress_label(def: &shared::recommendation::ContextualMixDefinition) -> String {
     format!(
         "Seasonal: {}",
-        crate::core::contextual::seasonal_display_title(&def.slug, def.custom_name.as_deref())
+        shared::recommendation::canonical_mix_title(
+            &def.slug,
+            Some(&def.i18n_key),
+            def.custom_name.as_deref(),
+        )
     )
 }
 

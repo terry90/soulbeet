@@ -1382,6 +1382,94 @@ pub fn builtin_contextual_mixes() -> Vec<ContextualMixDefinition> {
     ]
 }
 
+/// Canonical, neutral display title for built-in and custom contextual mixes.
+///
+/// Honors a non-empty `custom_name` first, then matches `i18n_key` (or `slug`) against the
+/// canonical catalog without injecting country-specific phrasing or country suffixes into the
+/// title. Regional blend ratios belong in the mix metadata/badges rather than the title.
+pub fn canonical_mix_title(
+    slug: &str,
+    i18n_key: Option<&str>,
+    custom_name: Option<&str>,
+) -> String {
+    if let Some(custom) = custom_name.map(str::trim).filter(|s| !s.is_empty()) {
+        return custom.to_string();
+    }
+
+    let lookup = |raw: &str| -> Option<&'static str> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mix.seasonal.winter_holiday" | "winter_holiday" | "noel" | "christmas" => {
+                Some("Christmas Mix")
+            }
+            "mix.seasonal.new_years_eve" | "new_years_eve" | "nye" => Some("New Year's Eve"),
+            "mix.seasonal.lunar_new_year" | "lunar_new_year" => Some("Lunar New Year"),
+            "mix.seasonal.carnival" | "carnival" => Some("Carnival Beats"),
+            "mix.seasonal.spring" | "spring" => Some("Spring Awakening"),
+            "mix.seasonal.summer" | "summer" => Some("Summer Anthems"),
+            "mix.seasonal.autumn" | "autumn" => Some("Autumn Sessions"),
+            "mix.seasonal.halloween" | "halloween" => Some("Darkwave Halloween"),
+            "mix.seasonal.diwali" | "diwali" => Some("Diwali Celebration"),
+            "mix.moment.drive" | "drive" => Some("Drive Mix"),
+            "mix.moment.morning" | "morning" => Some("Morning Lift"),
+            "mix.moment.focus" | "focus" => Some("Deep Focus"),
+            "mix.moment.late_night" | "late_night" => Some("Late Night"),
+            "mix.rolling.conservative" | "mix.rolling.comfort" | "conservative" | "comfort" => {
+                Some("Comfort Zone")
+            }
+            "mix.rolling.balanced" | "mix.rolling.weekly_radar" | "balanced" | "weekly_radar" => {
+                Some("Fresh Picks")
+            }
+            "mix.rolling.adventurous" | "mix.rolling.deep_cuts" | "adventurous" | "deep_cuts" => {
+                Some("Deep Cuts")
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(key) = i18n_key.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(title) = lookup(key) {
+            return title.to_string();
+        }
+    }
+    if let Some(title) = lookup(slug) {
+        return title.to_string();
+    }
+
+    let fallback = i18n_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|k| k.rsplit('.').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(slug);
+    let humanized = humanize_mix_slug(fallback);
+    if humanized.is_empty() {
+        "Curated Mix".to_string()
+    } else {
+        humanized
+    }
+}
+
+/// Converts a snake/kebab/dot mix identifier into a Title Case fallback label.
+pub fn humanize_mix_slug(slug: &str) -> String {
+    slug.split(['_', '-', '.'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = first.to_uppercase().to_string();
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Pure structured i18n mix card returned by `GET /api/discovery/contextual-mixes`.
 /// Clients render all localized titles, subtitles, ratio badges, and expiry text using
 /// `i18n_key` + typed metadata (or `custom_name` / `custom_description` for custom mixes).
@@ -1746,5 +1834,46 @@ mod tests {
         assert_ne!(fold_name("Fishmans+"), fold_name("Fishmans"));
         assert_eq!(fold_name("  Guns N’ Roses "), "guns n' roses");
         assert_eq!(fold_name("Fèqadu  Amdè‐Mesqel"), "fèqadu amdè-mesqel");
+    }
+
+    #[test]
+    fn canonical_mix_title_is_neutral_and_consistent() {
+        assert_eq!(
+            canonical_mix_title("winter_holiday", Some("mix.seasonal.winter_holiday"), None),
+            "Christmas Mix"
+        );
+        assert_eq!(
+            canonical_mix_title("summer", Some("mix.seasonal.summer"), None),
+            "Summer Anthems"
+        );
+        assert_eq!(
+            canonical_mix_title("halloween", None, None),
+            "Darkwave Halloween"
+        );
+        assert_eq!(
+            canonical_mix_title("late_night", Some("mix.moment.late_night"), None),
+            "Late Night"
+        );
+        assert_eq!(
+            canonical_mix_title("rolling", Some("mix.rolling.balanced"), None),
+            "Fresh Picks"
+        );
+        assert_eq!(
+            canonical_mix_title("winter_holiday", Some("mix.seasonal.winter_holiday"), Some("Custom Xmas")),
+            "Custom Xmas"
+        );
+        assert_eq!(
+            canonical_mix_title("midsummer_night", None, None),
+            "Midsummer Night"
+        );
+        assert_eq!(
+            canonical_mix_title("foo_bar", Some("custom_vibes"), None),
+            "Custom Vibes"
+        );
+        assert_eq!(
+            canonical_mix_title("  late_coding  ", None, None),
+            "Late Coding"
+        );
+        assert_eq!(canonical_mix_title("___", Some("..."), None), "Curated Mix");
     }
 }

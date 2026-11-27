@@ -194,15 +194,36 @@ pub fn DiscoverView() -> Element {
                         .clone()
                         .unwrap_or_else(|| seasonal.playlist.id.clone());
                     let slug_steer = slug.clone();
-                    let title = seasonal.playlist.name.clone();
+                    let title = if seasonal.playlist.name.starts_with("Soulbeet: ") {
+                        seasonal
+                            .playlist
+                            .slug
+                            .as_deref()
+                            .map(|s| shared::recommendation::canonical_mix_title(s, None, None))
+                            .unwrap_or_else(|| seasonal.playlist.name.clone())
+                    } else {
+                        seasonal.playlist.name.clone()
+                    };
                     let title_play = title.clone();
                     let title_pin = title.clone();
                     let is_pinned = seasonal.is_pinned;
                     let count = u32::try_from(seasonal.playlist.song_count.max(0)).unwrap_or(0);
+                    let subtitle = seasonal
+                        .playlist
+                        .comment
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|c| {
+                            !c.is_empty() && !c.to_ascii_lowercase().starts_with("soulbeet:")
+                        })
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            "Curated seasonal discovery pack mirrored offline.".to_string()
+                        });
                     rsx! {
                         SeasonalHeroCard {
                             title,
-                            subtitle: seasonal.playlist.comment.clone().unwrap_or_else(|| "Curated seasonal discovery pack mirrored offline.".to_string()),
+                            subtitle,
                             window_badge: Some("SEASONAL PACK · AUTO-EXPIRES".to_string()),
                             track_count: count,
                             local_ratio: effective_ratio,
@@ -255,7 +276,7 @@ pub fn DiscoverView() -> Element {
                     };
                     rsx! {
                         SeasonalHeroCard {
-                            title: "Weekly Discovery Radar".to_string(),
+                            title: "Fresh Picks".to_string(),
                             subtitle: "Keep your favorites in permanent lossless storage or drop them with 1 click (5-second Undo safety).".to_string(),
                             window_badge: Some("DISCOVERY TRIAGE · OFFLINE READY".to_string()),
                             track_count: radar_count,
@@ -266,19 +287,19 @@ pub fn DiscoverView() -> Element {
                             exclude_from_core_taste: false,
                             on_play: move |_| {
                                 if !tracks_play.is_empty() {
-                                    studio.play_collection(player, tracks_play.clone(), 0, "Weekly Radar");
+                                    studio.play_collection(player, tracks_play.clone(), 0, "Fresh Picks");
                                 } else if let (Some(pid), Some(core)) = (radar_id.clone(), studio.core.peek().clone()) {
                                     spawn(async move {
                                         let tracks = load_tracks_for_playlist(&core, &pid).await;
-                                        studio.play_collection(player, tracks, 0, "Weekly Radar");
+                                        studio.play_collection(player, tracks, 0, "Fresh Picks");
                                     });
                                 }
                             },
                             on_pin_offline: move |_| {
                                 if is_pinned {
-                                    studio.unpin_target_offline(PinTarget::WeeklyRadar, "Weekly Radar".into());
+                                    studio.unpin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
                                 } else {
-                                    studio.pin_target_offline(PinTarget::WeeklyRadar, "Weekly Radar".into());
+                                    studio.pin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
                                 }
                             },
                             on_steer: move |next| steering.set(next),
@@ -321,7 +342,7 @@ pub fn DiscoverView() -> Element {
                             "All caught up: no pending discovery tracks awaiting review."
                         }
                         p { class: "text-[12px] text-beet-text-tertiary",
-                            "Click Refresh Discovery above after Soulbeet generates your next Weekly Radar."
+                            "Click Refresh Discovery above after Soulbeet generates your next Fresh Picks."
                         }
                     }
                 } else {
