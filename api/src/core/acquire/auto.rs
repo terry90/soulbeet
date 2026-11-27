@@ -404,6 +404,7 @@ pub(crate) async fn run_search(
         target,
         import_mode: run.import_mode,
         duplicates,
+        verify_policy: soulbeet::VerifyPolicy::Standard,
     };
     let items = numbered(picked.items);
     ledger.record(JobEvent::Picked {

@@ -34,7 +34,7 @@ use shared::download::{
     QueuedDownload,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
-use soulbeet::{BackendError, DownloadBackend, ImportMode};
+use soulbeet::{BackendError, DownloadBackend, ImportMode, VerifyPolicy};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -94,6 +94,7 @@ pub struct NewBatch {
     pub target: PathBuf,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
+    pub verify_policy: VerifyPolicy,
 }
 
 /// The batch a request's files go into.
@@ -126,7 +127,9 @@ impl NewBatch {
             self.import_mode,
             self.backend,
         );
-        batch.with_duplicates(self.duplicates)
+        batch
+            .with_duplicates(self.duplicates)
+            .with_verify_policy(self.verify_policy)
     }
 }
 
@@ -412,6 +415,7 @@ pub(super) async fn queue_and_watch(
                         max_sources,
                         sent: std::mem::take(&mut sent[at]),
                         job: slot(n),
+                        expected_duration_s: picked[at].1.duration,
                     }
                 })
                 .collect();
@@ -442,6 +446,7 @@ pub(super) async fn queue_and_watch(
             let transfers = (enqueued.iter())
                 .map(|(at, n, q)| WatchedTransfer {
                     sent: std::mem::take(&mut sent[*at]),
+                    expected_duration_s: picked[*at].1.duration,
                     ..WatchedTransfer::enqueued(q, slot(*n))
                 })
                 .collect();
@@ -641,6 +646,7 @@ mod tests {
             target,
             import_mode: running.import_mode,
             duplicates: DuplicateRule::Guarded,
+            verify_policy: VerifyPolicy::Standard,
         }
     }
 
@@ -665,6 +671,7 @@ mod tests {
             target: PathBuf::from("/music"),
             import_mode: ImportMode::Singleton,
             duplicates: DuplicateRule::Guarded,
+            verify_policy: VerifyPolicy::Standard,
         }
     }
 

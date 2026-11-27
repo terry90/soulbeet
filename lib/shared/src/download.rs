@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::failure::{Cause, Failure};
 use crate::metadata::{Album, Track};
+pub use crate::slskd::SearchPriority;
 
 #[derive(Serialize, Clone, PartialEq, Deserialize, Debug, Default)]
 pub struct DownloadQuery {
@@ -107,6 +108,9 @@ pub struct SearchSpec {
     /// Keep files scored below the backend's floor, each flagged `below_floor`.
     #[serde(default)]
     pub keep_below_floor: bool,
+    /// Pacing priority for rate-limited backends such as slskd.
+    #[serde(default)]
+    pub priority: SearchPriority,
 }
 
 impl SearchSpec {
@@ -117,7 +121,14 @@ impl SearchSpec {
             tracks,
             text: None,
             keep_below_floor: false,
+            priority: SearchPriority::Interactive,
         }
+    }
+
+    /// Sets the pacing priority for this search.
+    pub fn with_priority(mut self, priority: SearchPriority) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -856,6 +867,8 @@ pub struct ArchivalUpgradeJob {
     pub recording_mbid: Option<String>,
     pub original_codec: String,
     pub original_backend: String,
+    #[serde(default)]
+    pub original_duration_s: Option<u32>,
     pub trigger_reason: String,
     pub status: ArchivalUpgradeStatus,
     pub job_id: Option<String>,
@@ -877,6 +890,9 @@ pub struct TriggerArchivalUpgradeRequest {
     pub folder_id: Option<String>,
     /// Reported codec of the kept track (e.g., "opus", "mp3", "flac"), when known.
     pub codec: Option<String>,
+    /// Known duration of the kept track in seconds, when available.
+    #[serde(default)]
+    pub duration_s: Option<u32>,
     /// Reason that gated this upgrade (`"keep"`, `"star"`, `"promote"`, `"manual"`).
     pub trigger_reason: String,
 }
@@ -891,6 +907,9 @@ pub enum ArchivalUpgradeOutcome {
     NotFastAcquired,
     /// Track is still a pending (unpromoted) discovery track, so it cannot be upgraded yet.
     SkippedNotKept,
+    /// Track lacks a verified MusicBrainz recording ID or was imported as-is, so auto-upgrading
+    /// could overwrite a bootleg, live cut, or custom edit with a studio release.
+    SkippedUnmatched,
 }
 
 fn has_format_token(input: &str, tokens: &[&str]) -> bool {

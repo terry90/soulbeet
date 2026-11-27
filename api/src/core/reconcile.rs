@@ -214,6 +214,7 @@ pub(crate) async fn resume_downloads(
             job: slot.clone(),
             adopted,
             sent: Vec::new(),
+            expected_duration_s: None,
         };
         let destination = (!adopted).then(|| batch.destination.clone());
         match backend.get_download(&row.source, &row.id).await {
@@ -1161,6 +1162,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: Arc<dyn DownloadBackend>, qu
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
         duplicates,
+        verify_policy: soulbeet::VerifyPolicy::Standard,
     };
     resume
         .enqueue(&job.ctx, backend, fresh.into(), acquisition)

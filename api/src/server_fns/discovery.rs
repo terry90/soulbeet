@@ -778,8 +778,13 @@ async fn search_candidate(
         mbid: None,
         release_mbid: None,
     }];
-    let found =
-        crate::core::sources::search_tier(std::slice::from_ref(searched), None, &wanted).await;
+    let found = crate::core::sources::search_tier_with_priority(
+        std::slice::from_ref(searched),
+        None,
+        &wanted,
+        shared::slskd::SearchPriority::Background,
+    )
+    .await;
     if !found.groups.is_empty() {
         clear_in(db, user_id, artist, track).await?;
         return Ok(CandidateSearch::Found(
@@ -1347,6 +1352,42 @@ pub async fn generate_discovery_playlist_internal(
                         continue;
                     }
                 };
+
+                let verify_path = src.clone();
+                let verified = tokio::task::spawn_blocking(move || {
+                    soulbeet::verify_downloaded_audio(
+                        &verify_path,
+                        soulbeet::VerifyPolicy::Standard,
+                        None,
+                    )
+                })
+                .await;
+                match verified {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(failure)) => {
+                        warn!(
+                            "Post-download verification failed for '{}' - {} ({}): {}",
+                            qt.artist,
+                            qt.track,
+                            failure.code.as_str(),
+                            failure.message
+                        );
+                        discard_download(&src, &download_base).await;
+                        TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                        stats.imports_failed += 1;
+                        continue;
+                    }
+                    Err(join_err) => {
+                        warn!(
+                            "Post-download verification task failed for '{}' - {}: {}",
+                            qt.artist, qt.track, join_err
+                        );
+                        discard_download(&src, &download_base).await;
+                        TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                        stats.imports_failed += 1;
+                        continue;
+                    }
+                }
 
                 let outcome = IMPORT_QUEUE
                     .submit(ImportJob {
@@ -2197,6 +2238,40 @@ async fn generate_seasonal_packs_with_work(
                         continue;
                     }
                 };
+
+                let verify_path = src.clone();
+                let verified = tokio::task::spawn_blocking(move || {
+                    soulbeet::verify_downloaded_audio(
+                        &verify_path,
+                        soulbeet::VerifyPolicy::Standard,
+                        None,
+                    )
+                })
+                .await;
+                match verified {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(failure)) => {
+                        warn!(
+                            "Seasonal post-download verification failed for '{}' - {} ({}): {}",
+                            qt.artist,
+                            qt.track,
+                            failure.code.as_str(),
+                            failure.message
+                        );
+                        discard_download(&src, &download_base).await;
+                        TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                        continue;
+                    }
+                    Err(join_err) => {
+                        warn!(
+                            "Seasonal post-download verification task failed for '{}' - {}: {}",
+                            qt.artist, qt.track, join_err
+                        );
+                        discard_download(&src, &download_base).await;
+                        TransferRegistry::global().release(&qt.key, &qt.batch.owner);
+                        continue;
+                    }
+                }
 
                 let outcome = IMPORT_QUEUE
                     .submit(ImportJob {

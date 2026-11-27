@@ -25,6 +25,78 @@ const OVERLAPS: &str = "this import already replaced or added one of these files
 /// Why the files after one whose removal did not report are kept.
 const AFTER_UNCONFIRMED: &str = "an earlier removal of this import stopped before it reported";
 
+/// Minimum tolerance (15 seconds) for replacement duration guard before the
+/// 10% relative threshold dominates.
+const DURATION_GUARD_MIN_TOLERANCE_S: u32 = 15;
+
+/// A removal refused because the newly imported file's duration differs too far
+/// from the existing library file.
+fn replacement_duration_mismatch(new_s: u32, old_s: u32) -> Failure {
+    Failure::new(
+        FailureCode::ReplacementDurationMismatch,
+        Stage::Delete,
+        RetryAdvice::NotRetryable,
+        format!(
+            "Replacement duration ({new_s}s) differs too much from existing copy ({old_s}s)"
+        ),
+    )
+}
+
+/// Compares the newly imported file(s) against the existing library file(s)
+/// before deleting any existing copy. If both durations are known (> 0) and
+/// `|new_s - old_s| > max(15s, old_s / 10)`, returns `ReplacementDurationMismatch`.
+async fn check_replacement_durations(
+    checked: &[Checked],
+    imported: &[(u64, PathBuf)],
+    target: &Path,
+) -> Result<(), Failure> {
+    let existing_inputs: Vec<(PathBuf, Option<u32>)> = checked
+        .iter()
+        .map(|c| {
+            let navidrome_s = (c.song.duration.is_finite() && c.song.duration >= 1.0)
+                .then(|| c.song.duration.round() as u32);
+            (c.path.clone(), navidrome_s)
+        })
+        .collect();
+    let imported_paths: Vec<PathBuf> = imported.iter().map(|(_, rel)| target.join(rel)).collect();
+
+    tokio::task::spawn_blocking(move || {
+        let old_durations: Vec<Option<u32>> = existing_inputs
+            .iter()
+            .map(|(path, fallback)| soulbeet::audio_duration_secs(path).or(*fallback))
+            .collect();
+        let new_durations: Vec<Option<u32>> = imported_paths
+            .iter()
+            .map(|path| soulbeet::audio_duration_secs(path))
+            .collect();
+
+        if old_durations.len() == new_durations.len() {
+            for (old_s, new_s) in old_durations.into_iter().zip(new_durations) {
+                if let (Some(old_s), Some(new_s)) = (old_s, new_s) {
+                    if old_s > 0 && new_s > 0 {
+                        let tolerance = DURATION_GUARD_MIN_TOLERANCE_S.max(old_s / 10);
+                        if new_s.abs_diff(old_s) > tolerance {
+                            return Err(replacement_duration_mismatch(new_s, old_s));
+                        }
+                    }
+                }
+            }
+        } else if old_durations.iter().all(|d| d.is_some_and(|s| s > 0))
+            && new_durations.iter().all(|d| d.is_some_and(|s| s > 0))
+        {
+            let old_total: u32 = old_durations.into_iter().flatten().sum();
+            let new_total: u32 = new_durations.into_iter().flatten().sum();
+            let tolerance = DURATION_GUARD_MIN_TOLERANCE_S.max(old_total / 10);
+            if new_total.abs_diff(old_total) > tolerance {
+                return Err(replacement_duration_mismatch(new_total, old_total));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .unwrap_or(Ok(()))
+}
+
 /// A removal refused because it overlaps an earlier one of its run (OVERLAPS): the run itself
 /// holds one of its files.
 fn overlapping() -> Failure {
@@ -258,6 +330,15 @@ impl Run<'_> {
                     return kept(&f);
                 }
             }
+        }
+        if let Err(f) = check_replacement_durations(&checked, &removal.imported, target).await {
+            warn!(
+                "Kept the earlier copy {} of an import into {}: {}",
+                earlier[0].display(),
+                target.display(),
+                logged(&f)
+            );
+            return kept(&f);
         }
         let mut warnings = Vec::new();
         let mut removed = Vec::new();
@@ -523,6 +604,87 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(reasons, vec![("ui".into(), "replaced".into())]);
+    }
+
+    #[tokio::test]
+    async fn replacement_duration_mismatch_keeps_existing_file_and_records_failure() {
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        // Write a real 200s WAV as the existing copy and a 120s WAV as the newly imported copy
+        // (diff = 80s > max(15, 20) = 20s -> refused!).
+        let wav_old = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 200]);
+        let wav_new = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 120]);
+        lib.song("s2", "alice/A/real.flac", &wav_old);
+        lib.fake.rates("alice", "s2", 1);
+        let new_rel = new_copy(7, 3).1;
+        let new_abs = target.join(&new_rel);
+        std::fs::create_dir_all(new_abs.parent().unwrap()).unwrap();
+        std::fs::write(&new_abs, &wav_new).unwrap();
+
+        let result = imported_with(vec![removal("A/real.flac", vec![new_copy(7, 3)])]);
+        let settled = settle_removals(
+            &lib.guard(),
+            &stub,
+            &lib.alice(),
+            Removals::Guarded(&Origin::Ui),
+            &[],
+            &target,
+            result,
+        )
+        .await;
+
+        assert!(
+            target.join("A/real.flac").exists(),
+            "existing copy must be kept"
+        );
+        assert!(stub.forgets().is_empty() && stub.relocations().is_empty());
+        assert_eq!(settled.replaced.len(), 1);
+        match &settled.replaced[0].outcome {
+            ReplacementOutcome::Kept { failure } => {
+                assert_eq!(failure.code, FailureCode::ReplacementDurationMismatch);
+                assert_eq!(failure.stage, Stage::Delete);
+            }
+            other => panic!("expected Kept with ReplacementDurationMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_duration_within_tolerance_allows_replacement() {
+        let lib = Library::new().await;
+        let stub = StubImporter::new();
+        let target = lib.root.join("music/alice");
+        // 200s existing vs 208s new (diff = 8s <= max(15, 20) = 20s -> allowed!).
+        let wav_old = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 200]);
+        let wav_new = soulbeet::verify::encode_test_wav_pcm16(8_000, &vec![0.1; 8_000 * 208]);
+        lib.song("s2", "alice/A/real.flac", &wav_old);
+        lib.fake.rates("alice", "s2", 1);
+        let new_rel = new_copy(7, 3).1;
+        let new_abs = target.join(&new_rel);
+        std::fs::create_dir_all(new_abs.parent().unwrap()).unwrap();
+        std::fs::write(&new_abs, &wav_new).unwrap();
+
+        let result = imported_with(vec![removal("A/real.flac", vec![new_copy(7, 3)])]);
+        let settled = settle_removals(
+            &lib.guard(),
+            &stub,
+            &lib.alice(),
+            Removals::Guarded(&Origin::Ui),
+            &[],
+            &target,
+            result,
+        )
+        .await;
+
+        assert!(
+            !target.join("A/real.flac").exists(),
+            "existing copy should be replaced"
+        );
+        assert_eq!(settled.replaced.len(), 1);
+        assert!(matches!(
+            settled.replaced[0].outcome,
+            ReplacementOutcome::Replaced
+        ));
     }
 
     #[tokio::test]

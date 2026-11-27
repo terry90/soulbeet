@@ -696,6 +696,7 @@ impl Runner<'_> {
                 JobKind::Album => ImportMode::Album,
             },
             duplicates,
+            verify_policy: soulbeet::VerifyPolicy::Standard,
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),

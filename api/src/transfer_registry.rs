@@ -14,7 +14,7 @@ use crate::auth::UserId;
 use crate::ledger::DuplicateRule;
 use crate::server_fns::download::failover::Sent;
 use shared::download::{batch_folder, DownloadProgress, DownloadableItem, JobSlot};
-use soulbeet::ImportMode;
+use soulbeet::{ImportMode, VerifyPolicy};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -46,6 +46,7 @@ pub struct BatchRef {
     pub inbox: Arc<BatchInbox>,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
+    pub verify_policy: VerifyPolicy,
 }
 
 impl BatchRef {
@@ -68,6 +69,7 @@ impl BatchRef {
             inbox: BatchInbox::new(),
             import_mode,
             duplicates: DuplicateRule::Guarded,
+            verify_policy: VerifyPolicy::Standard,
         }
     }
 
@@ -81,6 +83,14 @@ impl BatchRef {
     pub fn with_duplicates(self, rule: DuplicateRule) -> Self {
         Self {
             duplicates: rule,
+            ..self
+        }
+    }
+
+    /// The batch with post-download audio verification policy `policy`.
+    pub fn with_verify_policy(self, policy: VerifyPolicy) -> Self {
+        Self {
+            verify_policy: policy,
             ..self
         }
     }
@@ -211,6 +221,7 @@ impl TransferRegistry {
                     running.target == fresh.target
                         && running.import_mode == fresh.import_mode
                         && running.duplicates == fresh.duplicates
+                        && running.verify_policy == fresh.verify_policy
                 })
                 .find_map(|(_, running)| Some((running.clone(), running.inbox.reserve()?))),
         };
@@ -352,6 +363,8 @@ pub struct AddedSlot {
     pub sent: Vec<Sent>,
     /// The job slot the transfer downloads for.
     pub job: JobSlot,
+    /// Expected duration in seconds from metadata/search, when known.
+    pub expected_duration_s: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -564,6 +577,7 @@ mod tests {
                 job: "j1".to_string(),
                 slot: 0,
             },
+            expected_duration_s: None,
         }
     }
 

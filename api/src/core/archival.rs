@@ -13,12 +13,12 @@ use std::time::Duration;
 use shared::download::{
     is_lossless_format, is_lossy_format, ArchivalUpgradeJob, ArchivalUpgradeOutcome,
     ArchivalUpgradeStatus, DownloadQuery, DownloadableGroup, DownloadableItem, EnqueueStatus,
-    TriggerArchivalUpgradeRequest,
+    SearchPriority, TriggerArchivalUpgradeRequest,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::Track;
 use shared::navidrome::DiscoveryTrack;
-use soulbeet::ImportMode;
+use soulbeet::{audio_duration_secs, ImportMode, VerifyPolicy};
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
 
@@ -71,6 +71,11 @@ pub async fn maybe_enqueue_for_promoted_discovery_in(
         username: String::new(),
         role: Role::User,
     };
+    let path = std::path::PathBuf::from(&track.path);
+    let duration_s = tokio::task::spawn_blocking(move || audio_duration_secs(&path))
+        .await
+        .ok()
+        .flatten();
     let req = TriggerArchivalUpgradeRequest {
         navidrome_song_id: track.song_id.clone(),
         discovery_track_id: Some(track.id.clone()),
@@ -80,6 +85,7 @@ pub async fn maybe_enqueue_for_promoted_discovery_in(
         recording_mbid: None,
         folder_id: Some(target_folder_id.to_string()),
         codec: None,
+        duration_s,
         trigger_reason: "promote".to_string(),
     };
     enqueue_on_keep_in(db, &ctx, &req).await
@@ -193,7 +199,7 @@ pub async fn enqueue_on_keep_in(
     .await
     .map_err(|e| database_failure(Stage::Input, e))?;
 
-    let (codec, backend_id, folder_id, recording_mbid, album) = match fast {
+    let (codec, backend_id, folder_id, recording_mbid, album, original_duration_s) = match fast {
         Some(record) => {
             // Re-check pending discovery status using IDs stored on the fast acquisition record too.
             if has_pending_discovery_track(
@@ -215,15 +221,23 @@ pub async fn enqueue_on_keep_in(
             if record.is_lossy == 0 || !is_lossy_format(&record.codec) {
                 return Ok(ArchivalUpgradeOutcome::NotFastAcquired);
             }
+            if record.imported_as_is != 0 {
+                return Ok(ArchivalUpgradeOutcome::SkippedUnmatched);
+            }
             let folder_id = requested_folder_id
                 .map(str::to_string)
                 .unwrap_or_else(|| record.folder_id.clone());
+            let fast_duration_s = record
+                .duration_s
+                .and_then(|s| u32::try_from(s).ok())
+                .filter(|&s| s > 0);
             (
                 record.codec,
                 record.backend_id,
                 folder_id,
                 req.recording_mbid.clone().or(record.recording_mbid),
                 req.album.clone().or(record.album),
+                req.duration_s.filter(|&s| s > 0).or(fast_duration_s),
             )
         }
         None => {
@@ -249,8 +263,18 @@ pub async fn enqueue_on_keep_in(
                 folder_id,
                 req.recording_mbid.clone(),
                 req.album.clone(),
+                req.duration_s.filter(|&s| s > 0),
             )
         }
+    };
+
+    // Never auto-upgrade tracks without a MusicBrainz recording ID so bootlegs,
+    // live cuts, or custom edits cannot be silently overwritten by a studio FLAC.
+    let recording_mbid = recording_mbid
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+    let Some(recording_mbid) = recording_mbid else {
+        return Ok(ArchivalUpgradeOutcome::SkippedUnmatched);
     };
 
     // Always verify folder ownership before inserting to prevent FK errors or cross-user targeting.
@@ -280,9 +304,10 @@ pub async fn enqueue_on_keep_in(
             artist,
             title,
             album: album.as_deref(),
-            recording_mbid: recording_mbid.as_deref(),
+            recording_mbid: Some(&recording_mbid),
             original_codec: &codec,
             original_backend: &backend_id,
+            original_duration_s,
             trigger_reason: &reason,
         },
     )
@@ -625,6 +650,31 @@ pub async fn process_next_upgrade_in(
         }
     };
 
+    // Defense in depth: never search/overwrite a queued upgrade row that lacks a recording MBID.
+    let verified_mbid = upgrade
+        .recording_mbid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(verified_mbid) = verified_mbid else {
+        let reason =
+            "Skipped archival upgrade: track lacks a verified MusicBrainz recording ID".to_string();
+        let _ = ArchivalUpgradeRow::mark_status_in(
+            db,
+            &upgrade.id,
+            ArchivalUpgradeStatus::Failed,
+            None,
+            MAX_UPGRADE_ATTEMPTS,
+            Some(&reason),
+        )
+        .await;
+        return Ok(WorkerTickOutcome::Failed {
+            upgrade_id: upgrade.id,
+            reason,
+        });
+    };
+
     let _ = ArchivalUpgradeRow::mark_status_in(
         db,
         &upgrade.id,
@@ -635,21 +685,33 @@ pub async fn process_next_upgrade_in(
     )
     .await;
 
+    let formatted_duration = upgrade
+        .original_duration_s
+        .and_then(|s| u32::try_from(s).ok())
+        .filter(|&s| s > 0)
+        .map(|s| format!("{}:{:02}", s / 60, s % 60));
+
     let track = Track {
-        id: upgrade.recording_mbid.clone().unwrap_or_default(),
+        id: verified_mbid.clone(),
         title: upgrade.title.clone(),
         artist: upgrade.artist.clone(),
         album_id: None,
         album_title: upgrade.album.clone(),
         release_date: None,
-        duration: None,
-        mbid: upgrade.recording_mbid.clone(),
+        duration: formatted_duration,
+        mbid: Some(verified_mbid),
         release_mbid: None,
     };
     let query = DownloadQuery::new(vec![track.clone()]).backend(archival_backend_id);
     let searched = (archival_backend_id.to_string(), backend.clone());
 
-    let found = sources::search_tier(std::slice::from_ref(&searched), None, &[track]).await;
+    let found = sources::search_tier_with_priority(
+        std::slice::from_ref(&searched),
+        None,
+        &[track],
+        SearchPriority::Background,
+    )
+    .await;
     if found.groups.is_empty() {
         let failure = found.failure();
         let next_attempts = upgrade.attempts + 1;
@@ -785,6 +847,7 @@ pub async fn process_next_upgrade_in(
         target,
         import_mode: ImportMode::Singleton,
         duplicates: DuplicateRule::Guarded,
+        verify_policy: VerifyPolicy::ArchivalLossless,
     };
     let acquisition = Acquisition {
         job: job_id.clone(),
@@ -952,6 +1015,8 @@ mod tests {
                 backend_id: "fast-archive",
                 codec: "opus",
                 is_lossy: true,
+                duration_s: Some(235),
+                imported_as_is: false,
             },
         )
         .await
@@ -976,6 +1041,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id.clone()),
                 codec: None,
+                duration_s: None,
                 trigger_reason: "preview".into(),
             },
         )
@@ -993,6 +1059,7 @@ mod tests {
             recording_mbid: Some("mbid-1".into()),
             folder_id: Some(folder_id.clone()),
             codec: None,
+            duration_s: None,
             trigger_reason: "keep".into(),
         };
         let first = enqueue_on_keep_in(&db, &ctx, &keep_req).await.unwrap();
@@ -1000,6 +1067,7 @@ mod tests {
             ArchivalUpgradeOutcome::Enqueued { job } => {
                 assert_eq!(job.original_codec, "opus");
                 assert_eq!(job.original_backend, "fast-archive");
+                assert_eq!(job.original_duration_s, Some(235));
                 assert_eq!(job.status, ArchivalUpgradeStatus::Queued);
                 job.id
             }
@@ -1033,6 +1101,8 @@ mod tests {
                 backend_id: "slskd",
                 codec: "flac",
                 is_lossy: false,
+                duration_s: None,
+                imported_as_is: false,
             },
         )
         .await
@@ -1050,6 +1120,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id.clone()),
                 codec: None,
+                duration_s: None,
                 trigger_reason: "star".into(),
             },
         )
@@ -1074,6 +1145,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id.clone()),
                 codec: Some("unknown".into()),
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
@@ -1110,6 +1182,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id.clone()),
                 codec: Some("mp3".into()),
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
@@ -1130,6 +1203,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some("other-f".into()),
                 codec: Some("mp3".into()),
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
@@ -1157,10 +1231,12 @@ mod tests {
                 artist: "Kowloon",
                 title: "Wake Up",
                 album: Some("Come Over"),
-                recording_mbid: None,
+                recording_mbid: Some("mbid-pending"),
                 backend_id: "fast-net",
                 codec: "opus",
                 is_lossy: true,
+                duration_s: None,
+                imported_as_is: false,
             },
         )
         .await
@@ -1179,6 +1255,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id.clone()),
                 codec: None,
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
@@ -1199,6 +1276,7 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id),
                 codec: None,
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
@@ -1222,10 +1300,12 @@ mod tests {
                 artist: "L'Impératrice",
                 title: "Agitations tropicales",
                 album: Some("Odyssée"),
-                recording_mbid: None,
+                recording_mbid: Some("mbid-agitations-42"),
                 backend_id: "fast-net",
                 codec: "mp3",
                 is_lossy: true,
+                duration_s: Some(248),
+                imported_as_is: false,
             },
         )
         .await
@@ -1310,10 +1390,12 @@ mod tests {
                 artist: "Artist A",
                 title: "Track A",
                 album: None,
-                recording_mbid: None,
+                recording_mbid: Some("mbid-a"),
                 backend_id: "fast-net",
                 codec: "opus",
                 is_lossy: true,
+                duration_s: Some(200),
+                imported_as_is: false,
             },
         )
         .await
@@ -1327,9 +1409,10 @@ mod tests {
                 artist: "Artist A",
                 title: "Track A",
                 album: None,
-                recording_mbid: None,
+                recording_mbid: Some("mbid-a"),
                 original_codec: "opus",
                 original_backend: "fast-net",
+                original_duration_s: Some(200),
                 trigger_reason: "keep",
             },
         )
@@ -1419,9 +1502,10 @@ mod tests {
                 artist: "Artist B",
                 title: "Track B",
                 album: None,
-                recording_mbid: None,
+                recording_mbid: Some("mbid-b"),
                 original_codec: "mp3",
                 original_backend: "fast-net",
+                original_duration_s: None,
                 trigger_reason: "keep",
             },
         )
@@ -1488,9 +1572,10 @@ mod tests {
                 artist: "Artist C",
                 title: "Track C",
                 album: None,
-                recording_mbid: None,
+                recording_mbid: Some("mbid-c"),
                 original_codec: "mp3",
                 original_backend: "fast-net",
+                original_duration_s: None,
                 trigger_reason: "keep",
             },
         )
@@ -1595,10 +1680,12 @@ mod tests {
                 artist: "Kowloon",
                 title: "Wake Up",
                 album: Some("Come Over"),
-                recording_mbid: None,
+                recording_mbid: Some("mbid-kowloon-99"),
                 backend_id: "fast-net",
                 codec: "opus",
                 is_lossy: true,
+                duration_s: Some(263),
+                imported_as_is: false,
             },
         )
         .await
@@ -1616,13 +1703,17 @@ mod tests {
                 recording_mbid: None,
                 folder_id: Some(folder_id),
                 codec: None,
+                duration_s: None,
                 trigger_reason: "keep".into(),
             },
         )
         .await
         .unwrap();
         let upgrade_id = match enqueued {
-            ArchivalUpgradeOutcome::Enqueued { job } => job.id,
+            ArchivalUpgradeOutcome::Enqueued { job } => {
+                assert_eq!(job.original_duration_s, Some(263));
+                job.id
+            }
             other => panic!("unexpected {other:?}"),
         };
 
@@ -1653,6 +1744,14 @@ mod tests {
             other => panic!("expected Enqueued, got {other:?}"),
         }
 
+        // Verify the archival search ran with Background priority and populated Track.duration!
+        let specs = stub.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].priority, SearchPriority::Background);
+        assert_eq!(specs[0].tracks.len(), 1);
+        assert_eq!(specs[0].tracks[0].duration.as_deref(), Some("4:23"));
+        assert_eq!(specs[0].tracks[0].duration_secs(), Some(263));
+
         let stored = ArchivalUpgradeRow::get_by_id_in(&db, &upgrade_id)
             .await
             .unwrap()
@@ -1662,5 +1761,100 @@ mod tests {
             ArchivalUpgradeStatus::Downloading
         );
         assert!(stored.job_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tracks_without_recording_mbid_or_imported_as_is_are_skipped_for_archival_upgrade() {
+        let db = test_db::migrated().await;
+        let (ctx, folder_id, _dir) = seed_user_and_folder(&db).await;
+
+        // 1. Track without recording_mbid (e.g., bootleg / unreleased live cut) -> skipped.
+        record_fast_acquisition_in(
+            &db,
+            NewFastAcquisition {
+                user_id: &ctx.user_id,
+                folder_id: &folder_id,
+                navidrome_song_id: Some("song-bootleg"),
+                discovery_track_id: None,
+                artist: "Radiohead",
+                title: "Creep (Live Acoustic Bootleg)",
+                album: None,
+                recording_mbid: None,
+                backend_id: "fast-net",
+                codec: "opus",
+                is_lossy: true,
+                duration_s: Some(310),
+                imported_as_is: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let no_mbid = enqueue_on_keep_in(
+            &db,
+            &ctx,
+            &TriggerArchivalUpgradeRequest {
+                navidrome_song_id: Some("song-bootleg".into()),
+                discovery_track_id: None,
+                artist: "Radiohead".into(),
+                title: "Creep (Live Acoustic Bootleg)".into(),
+                album: None,
+                recording_mbid: None,
+                folder_id: Some(folder_id.clone()),
+                codec: None,
+                duration_s: Some(310),
+                trigger_reason: "keep".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(no_mbid, ArchivalUpgradeOutcome::SkippedUnmatched);
+
+        // 2. Track imported AsIs (even if request passes an mbid) -> skipped.
+        record_fast_acquisition_in(
+            &db,
+            NewFastAcquisition {
+                user_id: &ctx.user_id,
+                folder_id: &folder_id,
+                navidrome_song_id: Some("song-asis"),
+                discovery_track_id: None,
+                artist: "Daft Punk",
+                title: "One More Time (DJ Edit)",
+                album: None,
+                recording_mbid: Some("mbid-studio"),
+                backend_id: "fast-net",
+                codec: "mp3",
+                is_lossy: true,
+                duration_s: Some(420),
+                imported_as_is: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let as_is = enqueue_on_keep_in(
+            &db,
+            &ctx,
+            &TriggerArchivalUpgradeRequest {
+                navidrome_song_id: Some("song-asis".into()),
+                discovery_track_id: None,
+                artist: "Daft Punk".into(),
+                title: "One More Time (DJ Edit)".into(),
+                album: None,
+                recording_mbid: Some("mbid-studio".into()),
+                folder_id: Some(folder_id),
+                codec: None,
+                duration_s: Some(420),
+                trigger_reason: "keep".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(as_is, ArchivalUpgradeOutcome::SkippedUnmatched);
+
+        assert!(ArchivalUpgradeRow::list_for_user_in(&db, &ctx.user_id, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

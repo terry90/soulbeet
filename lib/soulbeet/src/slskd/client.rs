@@ -19,10 +19,21 @@ use shared::{
         Cause, Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode,
     },
     metadata::{Album, Track},
-    slskd::{AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchState, TrackResult},
+    slskd::{
+        AlbumResult, DownloadResponse, FileEntry, FlattenedFiles, SearchPriority, SearchState,
+        TrackResult,
+    },
 };
-use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
-use tokio::sync::{Mutex, MutexGuard};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::Duration as StdDuration,
+};
+use tokio::sync::{Mutex, MutexGuard, Notify};
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -77,6 +88,8 @@ struct SearchContext {
     /// slskd was told to stop the slskd search running now, by `stop_search` or at the
     /// deadline.
     cancelled: bool,
+    /// Priority class preserved across unanswered wildcard retries.
+    priority: SearchPriority,
 }
 
 /// What one poll of a search found: the processed albums and what the search
@@ -146,20 +159,234 @@ fn poll_step(complete: bool, elapsed: Duration, deadline: Duration, cancelled: b
     }
 }
 
-/// A search the rate limit allows now, with the times of the searches sent in its window. Every
-/// other search waits while it is held, and it counts only once a search is sent in it, so a
-/// retry text found needless after the wait spends no search.
-struct SearchSlot<'a>(MutexGuard<'a, Vec<DateTime<Utc>>>);
+/// Default burst allowance before steady-state GCRA pacing kicks in.
+const DEFAULT_BURST_SIZE: usize = 4;
+/// Minimum spacing between consecutive searches during a burst.
+const DEFAULT_BURST_SPACING: StdDuration = StdDuration::from_secs(1);
+/// Window slots reserved exclusively for `SearchPriority::Interactive` callers
+/// (when the window holds more than 5 slots).
+const DEFAULT_INTERACTIVE_RESERVE: usize = 5;
+
+#[derive(Debug, Default)]
+struct PacerState {
+    timestamps: VecDeque<TokioInstant>,
+    tat: Option<TokioInstant>,
+    last_sent: Option<TokioInstant>,
+    total_recorded: usize,
+}
+
+/// Paces slskd search requests against the Soulseek 35 / 220s rate limit while:
+/// - serializing `POST /api/v0/searches` calls so we never race slskd's internal
+///   `SemaphoreSlim(1, 1)` into self-inflicted 429s,
+/// - recording quota ONLY after a POST succeeds/is accepted,
+/// - allowing a small initial burst (4 searches at 1s spacing) and smoothly pacing
+///   steady-state traffic at `window / max_searches` (~6.3s), and
+/// - reserving headroom (5 of 35 slots) and priority turn order for interactive callers.
+#[derive(Debug)]
+pub(crate) struct SearchPacer {
+    max_searches: usize,
+    window: StdDuration,
+    interactive_reserve: usize,
+    burst_size: usize,
+    burst_spacing: StdDuration,
+    steady_interval: StdDuration,
+    post_gate: Mutex<()>,
+    state: StdMutex<PacerState>,
+    interactive_waiting: AtomicUsize,
+    turn_notify: Notify,
+}
+
+struct InteractiveWaiter<'a>(&'a SearchPacer);
+
+impl Drop for InteractiveWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.interactive_waiting.fetch_sub(1, Ordering::AcqRel);
+        self.0.turn_notify.notify_waiters();
+    }
+}
+
+/// Exclusive permit to execute a single `POST /api/v0/searches` call.
+/// Dropping the permit without calling `record_accepted()` consumes zero quota.
+pub(crate) struct SearchPermit<'a> {
+    pacer: &'a SearchPacer,
+    _post_guard: MutexGuard<'a, ()>,
+    _interactive_guard: Option<InteractiveWaiter<'a>>,
+}
+
+impl SearchPermit<'_> {
+    /// Records that slskd accepted the search POST at the current instant.
+    pub(crate) fn record_accepted(&self) {
+        let mut state = self.pacer.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.pacer.record_accepted_at(&mut state, TokioInstant::now());
+    }
+}
+
+impl Drop for SearchPermit<'_> {
+    fn drop(&mut self) {
+        self.pacer.turn_notify.notify_waiters();
+    }
+}
+
+impl SearchPacer {
+    pub(crate) fn new(max_searches: usize, window: StdDuration) -> Self {
+        let max_searches = max_searches.max(1);
+        let steady_interval = window / (max_searches as u32);
+        let interactive_reserve = if max_searches > DEFAULT_INTERACTIVE_RESERVE {
+            DEFAULT_INTERACTIVE_RESERVE
+        } else {
+            0
+        };
+        let burst_size = DEFAULT_BURST_SIZE.min(max_searches);
+        let burst_spacing = DEFAULT_BURST_SPACING.min(steady_interval);
+        Self {
+            max_searches,
+            window,
+            interactive_reserve,
+            burst_size,
+            burst_spacing,
+            steady_interval,
+            post_gate: Mutex::new(()),
+            state: StdMutex::new(PacerState::default()),
+            interactive_waiting: AtomicUsize::new(0),
+            turn_notify: Notify::new(),
+        }
+    }
+
+    /// Acquires an exclusive search permit for `priority`, waiting for both
+    /// priority turn order and rate-limit / burst pacing as needed.
+    pub(crate) async fn acquire(&self, priority: SearchPriority) -> SearchPermit<'_> {
+        let interactive_guard = (priority == SearchPriority::Interactive).then(|| {
+            self.interactive_waiting.fetch_add(1, Ordering::AcqRel);
+            InteractiveWaiter(self)
+        });
+
+        loop {
+            if priority == SearchPriority::Background
+                && self.interactive_waiting.load(Ordering::Acquire) > 0
+            {
+                let notified = self.turn_notify.notified();
+                if self.interactive_waiting.load(Ordering::Acquire) > 0 {
+                    notified.await;
+                    continue;
+                }
+            }
+
+            let post_guard = self.post_gate.lock().await;
+
+            if priority == SearchPriority::Background
+                && self.interactive_waiting.load(Ordering::Acquire) > 0
+            {
+                drop(post_guard);
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            let (wait, window_len, limit) = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let wait = self.compute_wait(&mut state, priority, TokioInstant::now());
+                (wait, state.timestamps.len(), self.effective_limit(priority))
+            };
+
+            if wait.is_zero() {
+                return SearchPermit {
+                    pacer: self,
+                    _post_guard: post_guard,
+                    _interactive_guard: interactive_guard,
+                };
+            }
+
+            info!(
+                "Search pacer ({:?}, {}/{} in window): waiting {:.2}s",
+                priority,
+                window_len,
+                limit,
+                wait.as_secs_f64()
+            );
+            // Release the POST gate while sleeping so interactive callers can
+            // proceed immediately without waiting behind a background sleep.
+            drop(post_guard);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    fn effective_limit(&self, priority: SearchPriority) -> usize {
+        match priority {
+            SearchPriority::Interactive => self.max_searches,
+            SearchPriority::Background => self
+                .max_searches
+                .saturating_sub(self.interactive_reserve)
+                .max(1),
+        }
+    }
+
+    fn compute_wait(
+        &self,
+        state: &mut PacerState,
+        priority: SearchPriority,
+        now: TokioInstant,
+    ) -> StdDuration {
+        while let Some(&oldest) = state.timestamps.front() {
+            if now.saturating_duration_since(oldest) >= self.window {
+                state.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let mut wait = StdDuration::ZERO;
+
+        // 1. Hard sliding window and interactive headroom reserve.
+        let limit = self.effective_limit(priority);
+        if state.timestamps.len() >= limit {
+            let release_idx = state.timestamps.len() - limit;
+            let release_at = state.timestamps[release_idx] + self.window;
+            wait = wait.max(release_at.saturating_duration_since(now));
+        }
+
+        // 2. Minimum inter-search spacing during bursts.
+        if let Some(last) = state.last_sent {
+            let min_next = last + self.burst_spacing;
+            wait = wait.max(min_next.saturating_duration_since(now));
+        }
+
+        // 3. GCRA steady-state pacing once the burst budget is spent.
+        if let Some(tat) = state.tat {
+            let debt = tat.saturating_duration_since(now);
+            let burst_allowance = self
+                .steady_interval
+                .saturating_mul(self.burst_size.saturating_sub(1) as u32);
+            if debt > burst_allowance {
+                wait = wait.max(debt - burst_allowance);
+            }
+        }
+
+        wait
+    }
+
+    fn record_accepted_at(&self, state: &mut PacerState, now: TokioInstant) {
+        state.timestamps.push_back(now);
+        state.last_sent = Some(now);
+        let base = state.tat.map_or(now, |t| t.max(now));
+        state.tat = Some(base + self.steady_interval);
+        state.total_recorded += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_recorded(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .total_recorded
+    }
+}
 
 #[derive(Debug)]
 pub struct SoulseekClient {
     base_url: Url,
     api_key: Option<String>,
     client: Client,
-    search_timestamps: Arc<Mutex<Vec<DateTime<Utc>>>>,
+    search_pacer: Arc<SearchPacer>,
     active_searches: Arc<Mutex<HashMap<String, SearchContext>>>,
-    max_searches_per_window: usize,
-    rate_limit_window: Duration,
     download_config: DownloadConfig,
     circuit_breaker: Arc<CircuitBreaker>,
     /// slskd's download retry limit, read on the first listing.
@@ -230,14 +457,17 @@ impl SoulseekClientBuilder {
                 message: format!("Failed to build HTTP client: {}", e),
             })?;
 
+        let max_searches = self.max_searches_per_window.unwrap_or(35);
+        let window_secs = self.rate_limit_window_seconds.unwrap_or(220).max(1) as u64;
         Ok(SoulseekClient {
             base_url,
             api_key: self.api_key,
             client,
-            search_timestamps: Arc::new(Mutex::new(Vec::new())),
+            search_pacer: Arc::new(SearchPacer::new(
+                max_searches,
+                StdDuration::from_secs(window_secs),
+            )),
             active_searches: Arc::new(Mutex::new(HashMap::new())),
-            max_searches_per_window: self.max_searches_per_window.unwrap_or(35),
-            rate_limit_window: Duration::seconds(self.rate_limit_window_seconds.unwrap_or(220)),
             download_config: self.download_config.unwrap_or_default(),
             circuit_breaker: Arc::new(CircuitBreaker::default()),
             retry_limit: tokio::sync::OnceCell::new(),
@@ -371,32 +601,6 @@ impl SoulseekClient {
         }
     }
 
-    /// Waits until the rate limit allows one more search: the slot `post_search` sends it in.
-    async fn wait_for_rate_limit(&self) -> SearchSlot<'_> {
-        let mut timestamps = self.search_timestamps.lock().await;
-        let now = Utc::now();
-        let window_start = now - self.rate_limit_window;
-        timestamps.retain(|&ts| ts > window_start);
-        if timestamps.len() >= self.max_searches_per_window {
-            if let Some(&oldest) = timestamps.first() {
-                let wait_duration = (oldest + self.rate_limit_window) - now;
-                if !wait_duration.is_zero() {
-                    info!(
-                        "Rate limit reached ({}/{}), waiting for {:.1}s",
-                        timestamps.len(),
-                        self.max_searches_per_window,
-                        wait_duration.as_seconds_f64()
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        wait_duration.num_milliseconds() as u64,
-                    ))
-                    .await;
-                }
-            }
-        }
-        SearchSlot(timestamps)
-    }
-
     /// The search for `spec`: `spec.text` trimmed when given, else the
     /// `search_parts` of its album and tracks joined by a space, which a search needs either way
     /// to score what it finds. While no peer answers it, the search is sent
@@ -408,6 +612,7 @@ impl SoulseekClient {
             tracks,
             text,
             keep_below_floor,
+            priority,
         } = spec;
         let parts = search_parts(album.as_ref(), &tracks)?;
         let (query, retry_texts) = match text.as_deref().map(str::trim) {
@@ -424,12 +629,13 @@ impl SoulseekClient {
             .collect();
 
         info!(
-            "Starting search for: '{}' with timeout {}ms",
+            "Starting {:?} search for: '{}' with timeout {}ms",
+            priority,
             query,
             timeout.num_milliseconds()
         );
-        let slot = self.wait_for_rate_limit().await;
-        let search_id = self.post_search(slot, &query).await?;
+        let permit = self.search_pacer.acquire(priority).await;
+        let search_id = self.post_search(permit, &query).await?;
 
         self.active_searches.lock().await.insert(
             search_id.clone(),
@@ -449,6 +655,7 @@ impl SoulseekClient {
                 timeout,
                 stop_requested: false,
                 cancelled: false,
+                priority,
             },
         );
 
@@ -456,11 +663,10 @@ impl SoulseekClient {
         Ok(search_id)
     }
 
-    /// Starts one slskd search for `text` in `slot`, which counts it: slskd's id of it.
-    async fn post_search(&self, slot: SearchSlot<'_>, text: &str) -> Result<String> {
-        let SearchSlot(mut timestamps) = slot;
-        timestamps.push(Utc::now());
-        drop(timestamps);
+    /// Starts one slskd search for `text` while holding `permit` so concurrent POSTs
+    /// never race slskd's internal SemaphoreSlim(1, 1). Records quota ONLY after
+    /// `POST /api/v0/searches` succeeds.
+    async fn post_search(&self, permit: SearchPermit<'_>, text: &str) -> Result<String> {
         #[derive(Deserialize)]
         struct SearchId {
             id: String,
@@ -475,6 +681,7 @@ impl SoulseekClient {
                 } => search_refused(message),
                 e => e,
             })?;
+        permit.record_accepted();
         Ok(started.id)
     }
 
@@ -662,12 +869,12 @@ impl SoulseekClient {
             return false;
         }
         // Checked again after the wait for the rate limit, which can outlast the deadline.
-        let slot = self.wait_for_rate_limit().await;
+        let permit = self.search_pacer.acquire(context.priority).await;
         if !time_left() || self.stopped(search_id).await {
             return false;
         }
         info!("Search {search_id} drew no response, sending it again as '{text}'");
-        let next = match self.post_search(slot, &text).await {
+        let next = match self.post_search(permit, &text).await {
             Ok(next) => next,
             Err(e) => {
                 warn!("Search {search_id} could not be sent again as '{text}': {e}");
@@ -2854,8 +3061,108 @@ mod tests {
             Some(unanswered_note(false).as_str())
         );
         assert_eq!(texts_sent(&seen).len(), 1);
-        // The slot the retry waited for was not spent: the next search does not wait.
-        assert_eq!(client.search_timestamps.lock().await.len(), 1);
+        // The permit the retry waited for was not spent: the next search does not wait.
+        assert_eq!(client.search_pacer.total_recorded(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn search_pacer_smooths_burst_into_steady_state_spacing() {
+        let pacer = SearchPacer::new(35, StdDuration::from_secs(220));
+        let start = TokioInstant::now();
+        let mut fired_at = Vec::new();
+        for _ in 0..6 {
+            let permit = pacer.acquire(SearchPriority::Interactive).await;
+            fired_at.push(start.elapsed());
+            permit.record_accepted();
+        }
+        // First 4 searches fire as a 1s-spaced burst: 0s, 1s, 2s, 3s.
+        assert_eq!(fired_at[0], StdDuration::ZERO);
+        assert_eq!(fired_at[1], StdDuration::from_secs(1));
+        assert_eq!(fired_at[2], StdDuration::from_secs(2));
+        assert_eq!(fired_at[3], StdDuration::from_secs(3));
+        // 5th search waits until steady-state interval (220s / 35 ~= 6.285s) elapses.
+        let steady = StdDuration::from_secs(220) / 35;
+        assert!(
+            fired_at[4] >= steady && fired_at[4] <= steady + StdDuration::from_millis(5),
+            "5th search fired at {:?}",
+            fired_at[4]
+        );
+        // 6th search is spaced by another steady-state interval after the 5th.
+        let gap_5_6 = fired_at[5] - fired_at[4];
+        assert!(
+            gap_5_6 >= steady && gap_5_6 <= steady + StdDuration::from_millis(5),
+            "gap between 5th and 6th search was {:?}",
+            gap_5_6
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn search_pacer_reserves_headroom_for_interactive_and_yields_background() {
+        let pacer = Arc::new(SearchPacer::new(35, StdDuration::from_secs(220)));
+        // Fill 30 slots (leaving the 5 reserved for Interactive).
+        {
+            let mut state = pacer.state.lock().unwrap();
+            let now = TokioInstant::now();
+            for _ in 0..30 {
+                state.timestamps.push_back(now);
+            }
+            // No recent burst debt, only window count = 30.
+            state.last_sent = None;
+            state.tat = None;
+        }
+
+        // Background sees 30/30 and must wait the full 220s window.
+        let bg_pacer = Arc::clone(&pacer);
+        let bg_start = TokioInstant::now();
+        let bg_task = tokio::spawn(async move {
+            let permit = bg_pacer.acquire(SearchPriority::Background).await;
+            permit.record_accepted();
+            bg_start.elapsed()
+        });
+
+        // Give the background task a turn to hit its sleep.
+        tokio::task::yield_now().await;
+
+        // Interactive can immediately use a reserved slot without waiting 220s.
+        let int_start = TokioInstant::now();
+        let permit = pacer.acquire(SearchPriority::Interactive).await;
+        assert!(
+            int_start.elapsed() < StdDuration::from_secs(1),
+            "interactive waited {:?} despite reserved headroom",
+            int_start.elapsed()
+        );
+        permit.record_accepted();
+        drop(permit);
+
+        let bg_elapsed = bg_task.await.unwrap();
+        assert!(
+            bg_elapsed >= StdDuration::from_secs(220),
+            "background bypassed interactive reserve after {:?}",
+            bg_elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_search_post_does_not_burn_pacer_quota() {
+        let (base_url, _seen) = serve(vec![Reply {
+            status: 500,
+            body: "slskd error".into(),
+        }]);
+        let client = SoulseekClientBuilder::new()
+            .base_url(&base_url)
+            .api_key("test-key")
+            .rate_limit(1, 220)
+            .build()
+            .unwrap();
+        let err = client
+            .start_search(
+                SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")]),
+                Duration::seconds(30),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SoulseekError::Api { status: 500, .. }));
+        assert_eq!(client.search_pacer.total_recorded(), 0);
     }
 
     /// slskd refused the retry text: the search ends as the texts that ran found it.

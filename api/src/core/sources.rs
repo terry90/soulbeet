@@ -18,8 +18,8 @@ use dioxus::logger::tracing::{debug, warn};
 use serde::Serialize;
 use shared::backends::{delivery, BackendMeta, Delivery};
 use shared::download::{
-    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchResult, SearchSpec,
-    SearchState, SearchStats,
+    DownloadQuery, DownloadableGroup, DownloadableItem, FileFacts, SearchPriority, SearchResult,
+    SearchSpec, SearchState, SearchStats,
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::metadata::{Album, Track};
@@ -391,13 +391,24 @@ impl Found {
     }
 }
 
-/// Searches every backend of `tier` at once: all groups found, best score first.
+/// Searches every backend of `tier` at once with `SearchPriority::Interactive`:
+/// all groups found, best score first.
 pub(crate) async fn search_tier(
     tier: &[Searched],
     album: Option<&Album>,
     tracks: &[Track],
 ) -> Found {
-    let spec = SearchSpec::of(album.cloned(), tracks.to_vec());
+    search_tier_with_priority(tier, album, tracks, SearchPriority::Interactive).await
+}
+
+/// Searches every backend of `tier` at once using `priority`: all groups found, best score first.
+pub(crate) async fn search_tier_with_priority(
+    tier: &[Searched],
+    album: Option<&Album>,
+    tracks: &[Track],
+    priority: SearchPriority,
+) -> Found {
+    let spec = SearchSpec::of(album.cloned(), tracks.to_vec()).with_priority(priority);
     let results = futures::future::join_all(
         tier.iter()
             .map(|(id, backend)| search_backend(id, backend, &spec)),
@@ -826,6 +837,7 @@ async fn run_in_line(
             tracks: query.tracks,
             text: spec.text,
             keep_below_floor: spec.keep_below_floor,
+            priority: SearchPriority::Interactive,
         };
         let name = DEFAULT_DOWNLOAD_BACKEND;
         let (mut groups, stop) = match start_backend_search(name, &backend, &search).await {
