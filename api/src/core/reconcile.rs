@@ -336,10 +336,10 @@ impl Resume for Live {
         pool: SourcePool,
         found: Vec<ResolvedSlot>,
     ) {
-        let tx = get_or_create_user_channel(&ctx.id()).await;
+        let _ = get_or_create_user_channel(&ctx.id()).await;
         let target = batch.target.clone();
-        let monitor = DownloadMonitor::new(transfers, target, tx, batch, LEDGER.clone());
-        spawn_monitor(ctx, monitor.with_failover(pool).with_found(found));
+        let monitor = DownloadMonitor::for_user(transfers, target, batch, LEDGER.clone());
+        spawn_monitor(ctx, monitor.with_failover(pool).with_found(found)).await;
     }
 
     async fn enqueue(

@@ -603,8 +603,9 @@ pub(crate) async fn sync_in(
     let user = ctx.id();
     let _claim = deps.runs.claim(&user).ok_or_else(sync_running)?;
     let client = navidrome_for(deps.navidrome, ctx, Stage::LibraryCheck).await?;
-    let songs = (client.get_all_songs_with_ratings().await)
+    let songs = (crate::core::contextual::fetch_all_songs_native(&client).await)
         .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
     let unreadable = |e: String| database_failure(Stage::Input, e);
     let settings = (UserSettings::get_in(deps.db, &ctx.user_id).await).map_err(unreadable)?;
     let threshold = settings.discovery_promote_threshold;

@@ -64,3 +64,28 @@ pub async fn resolve_import_job_choice(
     .await
     .map_err(failure_error)
 }
+
+/// Clears all finished (`done`, `failed`, `cancelled`, `dismissed`) playlist import jobs for
+/// the signed-in user and returns the number of jobs removed.
+#[post("/api/playlists/import/jobs/clear-finished", auth: AuthSession)]
+pub async fn clear_finished_import_jobs() -> Result<u64, ServerFnError> {
+    crate::core::playlists::import::clear_finished_import_jobs(
+        &crate::core::jobs::runner::ACQUIRE,
+        &auth.0,
+    )
+    .await
+    .map_err(failure_error)
+}
+
+/// Retries a failed or cancelled playlist import job (trying the next untried candidate or a
+/// fresh search).
+#[post("/api/playlists/import/jobs/retry", auth: AuthSession)]
+pub async fn retry_import_job(job_id: String) -> Result<(), ServerFnError> {
+    crate::core::playlists::import::retry_import_job(
+        &crate::core::jobs::runner::ACQUIRE,
+        &auth.0,
+        &job_id,
+    )
+    .await
+    .map_err(failure_error)
+}

@@ -73,12 +73,17 @@ impl UserChannel {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Decrement the active task count and return true if no tasks remain
+    /// Decrement the active task count (saturating at 0) and return true if no tasks remain
     pub fn remove_task(&self) -> bool {
         self.touch();
         let prev = self
             .active_tasks
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |cur| Some(cur.saturating_sub(1)),
+            )
+            .unwrap_or(0);
         prev <= 1
     }
 
@@ -145,12 +150,73 @@ pub async fn send_user_event(user: &UserId, event: DownloadEvent) -> bool {
     channel.sender.send(event).is_ok()
 }
 
+/// Sends `event` to `user`'s current channel without awaiting, falling back to spawning
+/// `send_user_event` only if the channel map is momentarily write-locked. Returns `true` if a
+/// live channel was found or delivery was scheduled.
+#[cfg(feature = "server")]
+pub fn send_user_event_now(user: &UserId, event: DownloadEvent) -> bool {
+    match USER_CHANNELS.try_read() {
+        Ok(channels) => match channels.get(user) {
+            Some(channel) => {
+                channel.touch();
+                let _ = channel.sender.send(event);
+                true
+            }
+            None => false,
+        },
+        Err(_) => {
+            let user = user.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    send_user_event(&user, event).await;
+                });
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// Register a new task for a user
 #[cfg(feature = "server")]
 pub async fn register_user_task(user: &UserId) {
     let mut map = USER_CHANNELS.write().await;
     let channel = map.entry(user.clone()).or_insert_with(UserChannel::new);
     channel.add_task();
+}
+
+/// RAII guard that registers a user's background task synchronously before spawning and
+/// unregisters it automatically when dropped (including on task panic or cancellation).
+#[cfg(feature = "server")]
+pub struct UserTaskGuard {
+    user: UserId,
+}
+
+#[cfg(feature = "server")]
+impl UserTaskGuard {
+    pub async fn acquire(user: UserId) -> Self {
+        register_user_task(&user).await;
+        Self { user }
+    }
+}
+
+#[cfg(feature = "server")]
+impl Drop for UserTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(map) = USER_CHANNELS.try_read() {
+            if let Some(channel) = map.get(&self.user) {
+                channel.remove_task();
+            }
+            return;
+        }
+        let user = self.user.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                unregister_user_task(&user).await;
+            });
+        }
+    }
 }
 
 /// Unregister a task for a user and clean up if no tasks remain

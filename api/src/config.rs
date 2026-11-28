@@ -261,6 +261,9 @@ pub struct AppConfig {
     beets_python: Option<PathBuf>,
     /// `PUBLIC_URL`, parsed once; `None` when unset or empty
     public_url: Option<Result<BaseUrl, BaseUrlError>>,
+    /// Whether to trust `Forwarded` / `X-Forwarded-Proto` / `X-Forwarded-Host` when `PUBLIC_URL`
+    /// is unset (`TRUST_PROXY_HEADERS`, default `false`).
+    trust_proxy_headers: bool,
     /// `NAVIDROME_URL`; `None` when unset or empty
     navidrome_url: Option<String>,
     /// Optional external `NAVIDROME_PUBLIC_URL` advertised to native/browser clients
@@ -344,6 +347,7 @@ impl AppConfig {
             beet_bin,
             beets_python,
             public_url,
+            trust_proxy_headers: parse_bool_env("TRUST_PROXY_HEADERS", false),
             navidrome_url,
             navidrome_public_url,
             navidrome_music_path: std::env::var_os("NAVIDROME_MUSIC_PATH")
@@ -411,6 +415,12 @@ impl AppConfig {
     /// The pinned public address, when `PUBLIC_URL` is set.
     pub fn public_url(&self) -> Option<&Result<BaseUrl, BaseUrlError>> {
         self.public_url.as_ref()
+    }
+
+    /// Whether proxy forwarding headers (`Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`)
+    /// are trusted when `PUBLIC_URL` is unset (`TRUST_PROXY_HEADERS`).
+    pub fn trust_proxy_headers(&self) -> bool {
+        self.trust_proxy_headers
     }
 
     /// Why `PUBLIC_URL` stops every sign-in, if it does.

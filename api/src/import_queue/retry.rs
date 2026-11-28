@@ -948,9 +948,11 @@ mod tests {
         assert_eq!(stub.calls(), 2);
     }
 
-    /// Only a kept job is run again: one without rows has no Retry to keep.
+    /// An ownerless import (such as Discovery staging or background promotes) retries
+    /// bounded library-lock errors inline before finishing so transient SQLite locks do not
+    /// immediately drop the import.
     #[tokio::test]
-    async fn a_locked_import_without_rows_is_not_run_again() {
+    async fn a_locked_import_without_rows_retries_inline_within_bounds() {
         let tmp = tempfile::tempdir().unwrap();
         let wait = Duration::from_millis(10);
         let (queue, stub, _) = locking_queue(vec![wait]);
@@ -961,9 +963,25 @@ mod tests {
                 .await,
         )
         .await;
-        assert_eq!(outcome.result, locked());
-        tokio::time::sleep(wait * 10).await;
-        assert_eq!(stub.calls(), 1);
+        assert!(matches!(
+            outcome.result.outcome,
+            soulbeet::ImportOutcome::Imported { .. }
+        ));
+        assert_eq!(stub.calls(), 2);
+
+        // When the library stays locked past all configured waits, stops cleanly at 1 + waits.len().
+        let (queue2, stub2, _) = locking_queue(vec![wait, wait]);
+        stub2.script(locked());
+        stub2.script(locked());
+        stub2.script(locked());
+        let outcome2 = finish(
+            queue2
+                .submit(job(file(tmp.path(), "dl/b.flac"), &tmp.path().join("lib")))
+                .await,
+        )
+        .await;
+        assert_eq!(outcome2.result, locked());
+        assert_eq!(stub2.calls(), 3);
     }
 
     /// A locked import kept by a queue that waits `waits`, with the row its run left.

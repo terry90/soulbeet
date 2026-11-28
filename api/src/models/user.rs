@@ -77,6 +77,7 @@ pub enum UserChangeError {
     LastAdmin,
     /// Another account has this name, in any letter case.
     UsernameTaken,
+    InvalidInput(String),
     Db(String),
 }
 
@@ -87,6 +88,7 @@ impl fmt::Display for UserChangeError {
             Self::NotFound => f.write_str("User not found"),
             Self::LastAdmin => f.write_str("Soulbeet needs at least one admin"),
             Self::UsernameTaken => f.write_str("That username is taken"),
+            Self::InvalidInput(msg) => f.write_str(msg),
             Self::Db(e) => f.write_str(e),
         }
     }
@@ -171,6 +173,21 @@ impl User {
         username: &str,
         password: &str,
     ) -> Result<User, UserChangeError> {
+        if username.trim().is_empty() || username != username.trim() {
+            return Err(UserChangeError::InvalidInput(
+                "Username cannot be empty or have leading/trailing whitespace".to_string(),
+            ));
+        }
+        if !username_fits(username) {
+            return Err(UserChangeError::InvalidInput(format!(
+                "Username must be at most {MAX_USERNAME_BYTES} bytes"
+            )));
+        }
+        if password.is_empty() {
+            return Err(UserChangeError::InvalidInput(
+                "Password cannot be empty".to_string(),
+            ));
+        }
         let password_hash = hash_password(password).map_err(UserChangeError::Db)?;
         let id = Uuid::new_v4().to_string();
 
@@ -286,12 +303,36 @@ impl User {
     }
 
     pub(crate) async fn delete_in(db: &SqlitePool, id: &str) -> Result<(), UserChangeError> {
-        let done = sqlx::query(&format!("DELETE FROM users WHERE {DELETABLE}"))
-            .bind(id)
-            .execute(db)
+        let mut tx = db
+            .begin()
             .await
             .map_err(|e| UserChangeError::Db(e.to_string()))?;
-        Self::refusal_for_untouched(db, id, done.rows_affected()).await
+        let done = sqlx::query(&format!("DELETE FROM users WHERE {DELETABLE}"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| UserChangeError::Db(e.to_string()))?;
+        if done.rows_affected() > 0 {
+            // Clean up tables that predate foreign-key cascades on `users(id)`.
+            for table in [
+                "user_profiles",
+                "discovery_candidates",
+                "engine_reports",
+                "discovery_history",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| UserChangeError::Db(e.to_string()))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| UserChangeError::Db(e.to_string()))?;
+            return Ok(());
+        }
+        let _ = tx.rollback().await;
+        Self::refusal_for_untouched(db, id, 0).await
     }
 
     /// What delete_in would do to the account `id` now, changing nothing: Ok when it would

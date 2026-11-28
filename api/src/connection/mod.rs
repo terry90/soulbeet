@@ -15,7 +15,7 @@ use axum::routing::any;
 use axum::{Json, Router};
 use serde_json::Map;
 
-use crate::base_url::{explain_request, BaseExplanation, BaseUrl, BaseUrlError};
+use crate::base_url::{explain_request_with_proxy, BaseExplanation, BaseUrl, BaseUrlError};
 use crate::config::CONFIG;
 use crate::connections::LoggedRequest;
 use crate::core::delete_guard::{Listeners, LiveListeners};
@@ -65,6 +65,9 @@ pub struct ConnectionState {
     pub(crate) ratings: Arc<dyn RatingSync>,
     /// Navidrome as each user sees it, which the delete tools' guard checks through.
     pub(crate) listeners: Arc<dyn Listeners>,
+    /// Whether proxy forwarding headers (`Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`)
+    /// are trusted when `public_url` is unset.
+    pub(crate) trust_proxy_headers: bool,
 }
 
 impl ConnectionState {
@@ -93,6 +96,7 @@ impl ConnectionState {
             discovery: Arc::new(LiveDiscovery),
             ratings: Arc::new(LiveSync),
             listeners: Arc::new(LiveListeners),
+            trust_proxy_headers: CONFIG.trust_proxy_headers(),
         }
     }
 }
@@ -133,7 +137,12 @@ async fn guard(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let explained = explain_request(request.headers(), request.uri(), state.public_url.as_ref());
+    let explained = explain_request_with_proxy(
+        request.headers(),
+        request.uri(),
+        state.public_url.as_ref(),
+        state.trust_proxy_headers,
+    );
     let [host_header, x_forwarded_host, x_forwarded_proto, forwarded] =
         ["host", "x-forwarded-host", "x-forwarded-proto", "forwarded"]
             .map(|name| header_value(request.headers(), name));

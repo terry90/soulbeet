@@ -797,19 +797,29 @@ impl Ledger {
     /// The last row sent for `slot`, while the slot is not terminal ("Live byte counts are read
     /// from memory", design 8.3).
     pub fn live_row(&self, slot: &JobSlot) -> Option<DownloadProgress> {
-        self.live.lock().unwrap().get(slot).cloned()
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(slot)
+            .cloned()
     }
 
     /// `job`'s failure could not be written, or its runner could not read it: it waits, searching
     /// or queued, with no runner until the next start of the server, which forgets this, or until
     /// a transition of it is applied.
     pub fn strand(&self, job: &str) {
-        self.stranded.lock().unwrap().insert(job.to_string());
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(job.to_string());
     }
 
     /// Whether `job` waits with no runner until the next start (`strand`).
     pub fn stranded(&self, job: &str) -> bool {
-        self.stranded.lock().unwrap().contains(job)
+        self.stranded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(job)
     }
 
     /// A ledger with no writer whose events a test reads. Requests that wait for a reply
@@ -944,7 +954,10 @@ impl Ledger {
             })
             .await?;
         if let Transitioned::Applied { .. } = changed {
-            self.stranded.lock().unwrap().remove(job);
+            self.stranded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(job);
         }
         Ok(changed)
     }

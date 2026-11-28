@@ -347,6 +347,25 @@ impl PolicyRows {
         })
     }
 
+    /// Loads all folders and roots on an open SQLite connection/transaction (e.g. inside
+    /// `BEGIN IMMEDIATE`) so policy checks and writes serialize atomically.
+    pub(crate) async fn load_tx(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<PolicyRows, String> {
+        let folders = sqlx::query_as::<_, OwnedFolder>(
+            "SELECT f.*, u.username AS owner, u.role AS owner_role \
+             FROM folders f JOIN users u ON u.id = f.user_id ORDER BY u.username, f.name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| e.to_string())?;
+        let roots = sqlx::query_as::<_, FolderRoot>("SELECT * FROM folder_roots ORDER BY path")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(PolicyRows { folders, roots })
+    }
+
     pub fn inputs(&self) -> (Vec<PolicyFolder>, Vec<PathBuf>) {
         policy_inputs(&self.folders, &self.roots)
     }

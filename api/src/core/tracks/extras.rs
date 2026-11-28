@@ -122,9 +122,10 @@ impl LiveExtrasFetcher {
     pub(crate) fn with_bases(caa_base: String, mb_base: String, lrclib_base: String) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(Duration::from_secs(5))
             .timeout(FETCH_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("failed to build track extras HTTP client");
         Self {
             client,
             caa_base,

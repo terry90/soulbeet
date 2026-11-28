@@ -21,11 +21,13 @@ use crate::core::acquire::AUTO_SELECT_SCORE_THRESHOLD;
 use crate::core::database_failure;
 use crate::core::folders::owned_in;
 use crate::core::index::NavidromeOf;
-use crate::core::jobs::retry::{cancel, download_source, RetryAnswer, SourceTarget};
+use crate::core::jobs::retry::{
+    cancel, download_source, retry, NewSearchArgs, RetryAnswer, SourceTarget,
+};
 use crate::core::jobs::runner::Acquire;
 use crate::core::jobs::{
-    ensure_with_origin, job_failure, job_not_found, job_view, recent_failures, untried_given,
-    views_of, EnsureItem, EnsureRefusal, Wanted,
+    allowed, ensure_with_origin, job_failure, job_not_found, job_view, recent_failures, untried,
+    untried_given, views_of, EnsureItem, EnsureRefusal, RetryMode, Wanted,
 };
 use crate::core::library::{find, navidrome_for, MatchKind, Reference};
 use crate::core::sources::{candidate_id, parse_candidate_id};
@@ -553,6 +555,82 @@ pub(crate) async fn resolve_import_job_choice(
         None => cancel(acquire, ctx, job_id).await?,
     };
 
+    match answer {
+        RetryAnswer::Applied(_) | RetryAnswer::AppliedUnread { .. } => Ok(()),
+        RetryAnswer::Refused(f, _) | RetryAnswer::Unavailable(f, _) => Err(f),
+        RetryAnswer::InvalidInput { field, expected } => Err(Failure::new(
+            FailureCode::InvalidInput,
+            Stage::Input,
+            RetryAdvice::NotRetryable,
+            format!("Invalid {field}: {expected}"),
+        )),
+    }
+}
+
+/// Clears all finished (`done`, `failed`, `cancelled`, `dismissed`) playlist import jobs owned
+/// by `ctx` and removes any empty import batches left behind. Returns the number of jobs cleared.
+pub(crate) async fn clear_finished_import_jobs(
+    acquire: &Acquire,
+    ctx: &UserCtx,
+) -> Result<u64, Failure> {
+    let user_id = ctx.id().to_string();
+    let mut tx = acquire
+        .db
+        .begin()
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
+    let cleared = sqlx::query(
+        "DELETE FROM jobs \
+         WHERE user_id = ? \
+           AND state IN ('done', 'failed', 'cancelled', 'dismissed') \
+           AND batch_id IN (SELECT id FROM batches WHERE user_id = ? AND origin = 'import')",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| database_failure(Stage::Input, e))?
+    .rows_affected();
+
+    if cleared > 0 {
+        sqlx::query(
+            "DELETE FROM batches \
+             WHERE user_id = ? AND origin = 'import' \
+               AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.batch_id = batches.id)",
+        )
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
+    Ok(cleared)
+}
+
+/// Retries a failed or cancelled `BatchOrigin::Import` job owned by `ctx`, trying the next
+/// untried source if available or launching a fresh search otherwise.
+pub(crate) async fn retry_import_job(
+    acquire: &Arc<Acquire>,
+    ctx: &UserCtx,
+    job_id: &str,
+) -> Result<(), Failure> {
+    let view = job_view(acquire, ctx, job_id)
+        .await?
+        .ok_or_else(job_not_found)?;
+    if view.job.origin != BatchOrigin::Import {
+        return Err(job_not_found());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let available = untried(&acquire.db, &view, now).await?;
+    let (mode, args) = if allowed(&view, &available, RetryMode::NextSource) {
+        (RetryMode::NextSource, None)
+    } else {
+        (RetryMode::NewSearch, Some(NewSearchArgs::default()))
+    };
+    let answer = retry(acquire, ctx, job_id, mode, args).await?;
     match answer {
         RetryAnswer::Applied(_) | RetryAnswer::AppliedUnread { .. } => Ok(()),
         RetryAnswer::Refused(f, _) | RetryAnswer::Unavailable(f, _) => Err(f),

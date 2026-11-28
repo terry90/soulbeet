@@ -198,7 +198,12 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
         .await
         .map_err(server_error)?;
     let folder_name = if let Some(ref fid) = settings.discovery_folder_id {
-        Folder::get_by_id(fid).await.ok().flatten().map(|f| f.name)
+        Folder::get_by_id(fid)
+            .await
+            .ok()
+            .flatten()
+            .filter(|f| f.user_id == auth.0.user_id)
+            .map(|f| f.name)
     } else {
         None
     };
@@ -232,6 +237,12 @@ pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError
         .await
         .map_err(server_error)?;
     if let Some(ref folder_id) = settings.discovery_folder_id {
+        let Some(folder) = Folder::get_by_id(folder_id).await.map_err(server_error)? else {
+            return Ok(vec![]);
+        };
+        if folder.user_id != auth.0.user_id {
+            return Err(crate::forbidden_error("Discovery folder does not belong to you"));
+        }
         let mut tracks = DiscoveryTrackRow::get_by_folder(folder_id)
             .await
             .map_err(server_error)?;
@@ -391,6 +402,24 @@ pub async fn get_contextual_mix_playlist(
     .map_err(failure_error)
 }
 
+#[post("/api/discovery/contextual/refresh", auth: AuthSession)]
+pub async fn refresh_contextual_mix(
+    slug: String,
+) -> Result<shared::recommendation::ContextualMixPlaylist, ServerFnError> {
+    crate::core::contextual::invalidate_library_snapshot_cache(&auth.0.user_id);
+    crate::core::contextual::resolve_contextual_mix_playlist_in(
+        &crate::db::DB,
+        &crate::core::index::ServerNavidrome,
+        crate::config::CONFIG.navidrome_music_path(),
+        &auth.0,
+        &slug,
+        false,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(failure_error)
+}
+
 #[post("/api/discovery/seasonal/steer", auth: AuthSession)]
 pub async fn steer_seasonal_pack(
     req: shared::recommendation::SteerSeasonalPackRequest,
@@ -470,12 +499,16 @@ impl DiscoveryEffects for LiveDiscovery {
     }
 
     fn generate(&self, user: &UserId) {
+        use futures::FutureExt;
         use shared::navidrome::{GenerationStatus, ProfilePhase};
 
         let uid = user.to_string();
         tokio::spawn(async move {
-            match generate_discovery_playlist_internal(&uid).await {
-                Ok(result) => {
+            let outcome = std::panic::AssertUnwindSafe(generate_discovery_playlist_internal(&uid))
+                .catch_unwind()
+                .await;
+            match outcome {
+                Ok(Ok(result)) => {
                     let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
                     if let Some(p) = map.get_mut(&uid) {
                         p.status = GenerationStatus::Complete;
@@ -489,12 +522,26 @@ impl DiscoveryEffects for LiveDiscovery {
                         p.result = Some(result);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
                     if let Some(p) = map.get_mut(&uid) {
                         p.status = GenerationStatus::Error;
                         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
                         p.failure = Some(e);
+                    }
+                }
+                Err(_) => {
+                    warn!("Discovery generation task panicked for user {}", uid);
+                    let mut map = crate::globals::DISCOVERY_PROGRESS.write().await;
+                    if let Some(p) = map.get_mut(&uid) {
+                        p.status = GenerationStatus::Error;
+                        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                        p.failure = Some(Failure::new(
+                            FailureCode::ServerRestarted,
+                            Stage::Playlist,
+                            RetryAdvice::SameSourceLater,
+                            "Discovery generation stopped unexpectedly",
+                        ));
                     }
                 }
             }
@@ -1305,8 +1352,10 @@ pub async fn generate_discovery_playlist_internal(
 
             stats.downloads_timed_out += pending_ids.len() as u32;
             stats.downloads_failed += failed_ids.len() as u32;
-            stats.downloads_completed +=
-                (queued.len() - pending_ids.len() - failed_ids.len()) as u32;
+            stats.downloads_completed += queued
+                .len()
+                .saturating_sub(pending_ids.len())
+                .saturating_sub(failed_ids.len()) as u32;
             if !pending_ids.is_empty() {
                 warn!(
                     "{}: {} downloads didn't complete within timeout",
@@ -1569,22 +1618,33 @@ async fn scan_reconcile_after_imports(user_id: &str, imported: u32) {
         let navidrome = crate::core::index::ServerNavidrome;
         let user = UserId::new(user_id);
         if scan_imports(&crate::db::DB, &navidrome, &user, &navi, imported).await {
+            crate::core::contextual::invalidate_library_snapshot_cache(user_id);
             match DiscoveryTrackRow::pending_for_user_in(&crate::db::DB, user_id).await {
-                Ok(mut pending)
-                    if pending
-                        .iter()
-                        .any(crate::core::contextual::needs_song_id_reconciliation) =>
-                {
-                    match navi.get_all_songs_with_ratings().await {
+                Ok(mut pending) if !pending.is_empty() => {
+                    match crate::core::contextual::fetch_all_songs_native(&navi).await {
                         Ok(library) => {
-                            let reconciled =
+                            let cleared =
+                                crate::core::contextual::clear_stale_discovery_song_ids_in(
+                                    &crate::db::DB,
+                                    &library,
+                                    &mut pending,
+                                )
+                                .await;
+                            let reconciled = if cleared > 0
+                                || pending
+                                    .iter()
+                                    .any(crate::core::contextual::needs_song_id_reconciliation)
+                            {
                                 crate::core::contextual::reconcile_discovery_song_ids_in(
                                     &crate::db::DB,
                                     &library,
                                     crate::config::CONFIG.navidrome_music_path(),
                                     &mut pending,
                                 )
-                                .await;
+                                .await
+                            } else {
+                                0
+                            };
                             if reconciled > 0 {
                                 info!(
                                     "Reconciled {} discovery track song_ids after scan for user {}",
@@ -2493,45 +2553,7 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         music_path,
         &user,
     )
-    .await?;
-
-    // Also reconcile active seasonal packs as Navidrome smart playlists (`Discovery/Seasonal/<slug>/`)
-    // and clean up expired seasonal playlists.
-    if let Ok(settings) = UserSettings::get_in(&crate::db::DB, user_id).await {
-        if settings.discovery_enabled {
-            if let Some(ref folder_id) = settings.discovery_folder_id {
-                if let Ok(Some(folder)) = Folder::get_by_id_in(&crate::db::DB, folder_id).await {
-                    if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
-                        if let Ok(Some(discovery)) = crate::core::discovery::discovery_place_in(
-                            &crate::db::DB,
-                            &navi,
-                            music_path,
-                            &folder,
-                        )
-                        .await
-                        {
-                            if let Err(e) = crate::core::contextual::reconcile_seasonal_playlists_in(
-                                &crate::db::DB,
-                                &navi,
-                                user_id,
-                                &discovery,
-                                chrono::Utc::now(),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "Failed to reconcile seasonal playlists for user {}: {}",
-                                    user_id, e
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
+    .await
 }
 
 /// reconcile_discovery_playlists on `db` and `navidrome`, `music_path` the root of Navidrome's
@@ -2654,6 +2676,23 @@ async fn reconcile_in(
                 failed.push(format!("{profile_name}: {e}"));
             }
         }
+    }
+
+    // Reconcile active seasonal packs and clean up expired seasonal playlists under the same
+    // per-user `discovery_key` lock so concurrent runs never create duplicate seasonal playlists.
+    if let Err(e) = crate::core::contextual::reconcile_seasonal_playlists_in(
+        db,
+        &navi,
+        &user_id,
+        &discovery,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        warn!(
+            "Failed to reconcile seasonal playlists for user {}: {}",
+            user_id, e
+        );
     }
 
     if failed.is_empty() {

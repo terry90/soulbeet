@@ -32,8 +32,7 @@ pub async fn resolve_on_disk(
     destination: Option<&str>,
     claimed: &Mutex<HashSet<FileId>>,
 ) -> Result<PathBuf, Unresolved> {
-    let attempt = || find_on_disk(filename, base, destination, claimed);
-    let mut why = match attempt() {
+    let mut why = match find_on_disk_async(filename, base, destination, claimed).await {
         Ok(path) => return Ok(path),
         Err(why) => why,
     };
@@ -46,7 +45,7 @@ pub async fn resolve_on_disk(
         );
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-        match attempt() {
+        match find_on_disk_async(filename, base, destination, claimed).await {
             Ok(path) => {
                 info!(
                     "File appeared on disk after {}ms wait: {}",
@@ -61,6 +60,39 @@ pub async fn resolve_on_disk(
     }
 
     Err(why)
+}
+
+/// Asynchronous wrapper around `find_on_disk` that runs filesystem discovery on the blocking
+/// threadpool without holding the `claimed` mutex across disk I/O.
+pub async fn find_on_disk_async(
+    filename: &str,
+    base: &Path,
+    destination: Option<&str>,
+    claimed: &Mutex<HashSet<FileId>>,
+) -> Result<PathBuf, Unresolved> {
+    // Retry once if another concurrent slot claimed the same FileId while we were scanning disk.
+    for _ in 0..4 {
+        let exclude = claimed.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let filename_owned = filename.to_string();
+        let base_owned = base.to_path_buf();
+        let dest_owned = destination.map(str::to_string);
+        let found = tokio::task::spawn_blocking(move || {
+            let path = match dest_owned.as_deref() {
+                Some(dest) => resolve_in_destination(&filename_owned, &base_owned, dest, &exclude)?,
+                None => resolve_adopted(&filename_owned, &base_owned, &exclude)?,
+            };
+            let id = file_id(&path).ok_or(Unresolved::NotOnDisk)?;
+            Ok::<(PathBuf, FileId), Unresolved>((path, id))
+        })
+        .await
+        .map_err(|_| Unresolved::NotOnDisk)??;
+
+        let mut guard = claimed.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.insert(found.1) {
+            return Ok(found.0);
+        }
+    }
+    Err(Unresolved::Claimed)
 }
 
 /// One look of `resolve_on_disk`, without waiting for the file to appear.
