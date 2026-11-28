@@ -53,6 +53,15 @@ class OfflineSyncWorker(
             }
             if (runSync) {
                 core.syncNow(forceFull = forceFullSync)
+                if (!core.isOfflineOnly()) {
+                    try {
+                        core.warmCoverArtCache(maxItems = 60u, size = 512u)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Best-effort cover art warming; never fail background sync.
+                    }
+                }
             }
             if (runAutoCache) {
                 val isUnmeteredWifi = isUnmeteredConnection(applicationContext)

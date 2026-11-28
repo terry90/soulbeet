@@ -96,6 +96,7 @@ object PlaybackSessionStore {
                     isOfflineCached = offlineIds.contains(track.id),
                     mediaUri = mediaUriResolver(track),
                     sourceLabel = persisted.sourceLabel,
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
                 ),
             )
         }

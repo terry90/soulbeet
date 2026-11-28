@@ -12,6 +12,7 @@ members = [
 
 [workspace.dependencies]
 dioxus = { version = "0.7.4" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # workspace
 ui = { path = "ui" }

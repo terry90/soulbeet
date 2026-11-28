@@ -58,7 +58,7 @@ import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.ui.components.MixSleeveBackdrop
-import org.soulbeet.app.ui.components.TrackArtwork
+import org.soulbeet.app.ui.components.PlaylistArtwork
 import org.soulbeet.app.ui.components.TrackRow
 import org.soulbeet.app.ui.components.formatMixSleeveMeta
 import org.soulbeet.app.ui.components.formatMixSleeveTag
@@ -499,11 +499,13 @@ internal fun AddToPlaylistSheet(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                             ) {
-                                TrackArtwork(
+                                PlaylistArtwork(
+                                    name = pl.name,
                                     coverArtId = pl.coverArtId,
                                     artAuthority = artAuthority,
-                                    fallbackTitle = pl.name,
                                     size = 40.dp,
+                                    slug = pl.slug,
+                                    kind = pl.kind,
                                     shape = SoulbeetShapes.xs,
                                 )
                                 Column(modifier = Modifier.weight(1f)) {

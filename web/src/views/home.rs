@@ -4,10 +4,10 @@
 use dioxus::prelude::*;
 use shared::recommendation::{ContextualMixKind, CultureSteering};
 use ui::{
-    format_mix_subtitle, format_mix_title, format_mix_window_badge, use_player, IconArrowRight,
-    IconCompass, IconDisc3, IconLibrary, IconListMusic, IconPlay, IconRadio, IconSparkles,
-    LibraryImportModal, MixSleeveShelves, PlaylistCategory, SeasonalHeroCard, TrackRow,
-    TrackRowState,
+    format_mix_subtitle, format_mix_title, format_mix_window_badge,
+    resolve_playlist_mix_sleeve_slug, use_player, ArtFallbackKind, CoverImage, IconArrowRight,
+    IconCompass, IconLibrary, IconPlay, IconSparkles, LibraryImportModal, MixSleeveShelves,
+    PlaylistArtwork, PlaylistCategory, SeasonalHeroCard, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -180,10 +180,11 @@ pub fn HomePage() -> Element {
                                             }
                                         },
                                         div { class: "w-12 h-12 rounded-[8px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                                            if let Some(url) = alb.cover_art_url.as_deref() {
-                                                img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
-                                            } else {
-                                                IconDisc3 { size: 20, class: "text-beet-text-disabled".to_string() }
+                                            CoverImage {
+                                                src: alb.cover_art_url.clone(),
+                                                alt: alb.name.clone(),
+                                                kind: ArtFallbackKind::Album,
+                                                icon_size: 20,
                                             }
                                         }
                                         div { class: "min-w-0 flex-1",
@@ -223,17 +224,16 @@ pub fn HomePage() -> Element {
                                 let pname = pl.name.clone();
                                 let category = pl.category;
                                 let track_word = if pl.song_count == 1 { "TRACK" } else { "TRACKS" };
-                                let icon_cls = match category {
-                                    PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
-                                        "bg-beet-accent-surface border-beet-accent/25 text-beet-accent-text"
-                                    }
-                                    PlaylistCategory::MomentMix => {
-                                        "bg-beet-leaf-surface border-beet-leaf-solid/25 text-beet-leaf-text"
-                                    }
-                                    PlaylistCategory::Smart | PlaylistCategory::User => {
-                                        "bg-beet-surface-high border-beet-border-subtle text-beet-text-secondary"
-                                    }
-                                };
+                                let matched_mix_slug = mixes
+                                    .iter()
+                                    .find(|m| m.navidrome_playlist_id.as_deref() == Some(pl.id.as_str()))
+                                    .map(|m| m.slug.as_str());
+                                let mix_slug = resolve_playlist_mix_sleeve_slug(
+                                    matched_mix_slug,
+                                    &pl.name,
+                                    Some(&pl.comment),
+                                );
+                                let pl_cover_url = pl.cover_art_url(300);
                                 rsx! {
                                     div {
                                         key: "home-pl-{pl.id}",
@@ -249,12 +249,13 @@ pub fn HomePage() -> Element {
                                                 nav.push(Route::PlaylistDetailPage { id: pid_key.clone() });
                                             }
                                         },
-                                        div { class: "w-12 h-12 rounded-[8px] border shrink-0 flex items-center justify-center {icon_cls}",
-                                            match category {
-                                                PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 20 } },
-                                                PlaylistCategory::Discovery => rsx! { IconCompass { size: 20 } },
-                                                PlaylistCategory::MomentMix => rsx! { IconRadio { size: 20 } },
-                                                PlaylistCategory::Smart | PlaylistCategory::User => rsx! { IconListMusic { size: 20 } },
+                                        div { class: "w-12 h-12 rounded-[8px] overflow-hidden border border-beet-border-subtle shrink-0 flex items-center justify-center",
+                                            PlaylistArtwork {
+                                                mix_slug,
+                                                cover_art_url: pl_cover_url,
+                                                alt: pl.name.clone(),
+                                                svg_id_prefix: format!("home-pl-{}", pl.id),
+                                                icon_size: 20,
                                             }
                                         }
                                         div { class: "min-w-0 flex-1",

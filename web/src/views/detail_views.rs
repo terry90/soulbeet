@@ -6,10 +6,11 @@
 use dioxus::prelude::*;
 use shared::recommendation::SeedRadioRequest;
 use ui::{
-    format_duration, friendly_error, subsonic_cover_art_url, use_player, ConfirmModal,
-    IconChevronLeft, IconCompass, IconCopy, IconDisc3, IconListMusic, IconListPlus, IconLoader,
-    IconMoreHorizontal, IconPencil, IconPlay, IconRadio, IconShare2, IconShuffle, IconSparkles,
-    IconTrash2, IconUser, PlayerTrack, PlaylistCategory, ShareModalTarget, TrackRow, TrackRowState,
+    format_duration, friendly_error, resolve_playlist_mix_sleeve_slug, use_player,
+    web_cover_art_url, ArtFallbackKind, ConfirmModal, CoverImage, IconChevronLeft, IconCopy,
+    IconDisc3, IconListMusic, IconListPlus, IconLoader, IconMoreHorizontal, IconPencil, IconPlay,
+    IconRadio, IconShare2, IconShuffle, IconTrash2, IconUser, PlayerTrack, PlaylistArtwork,
+    ShareModalTarget, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -219,27 +220,28 @@ pub fn PlaylistDetailPage(id: String) -> Element {
                         .filter(|sid| !sid.is_empty())
                         .collect();
 
-                    let icon_wrap_cls = match pl.category {
-                        PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
-                            "bg-beet-accent-surface border-beet-accent/30 text-beet-accent-text"
-                        }
-                        PlaylistCategory::MomentMix => {
-                            "bg-beet-leaf-surface border-beet-leaf-solid/30 text-beet-leaf-text"
-                        }
-                        PlaylistCategory::Smart | PlaylistCategory::User => {
-                            "bg-beet-surface-high border-beet-border-default text-beet-text-secondary"
-                        }
-                    };
+                    let mixes_snapshot = studio.contextual_mixes.read().clone();
+                    let matched_slug = mixes_snapshot
+                        .iter()
+                        .find(|m| m.navidrome_playlist_id.as_deref() == Some(pl.id.as_str()))
+                        .map(|m| m.slug.as_str());
+                    let mix_slug = resolve_playlist_mix_sleeve_slug(
+                        matched_slug,
+                        &pl.name,
+                        Some(&pl.comment),
+                    );
+                    let pl_cover_url = pl.cover_art_url(400);
 
                     rsx! {
                         // Playlist Header
                         section { class: "rounded-[16px] bg-beet-surface-low border border-beet-border-subtle p-5 sm:p-6 flex flex-col sm:flex-row items-start sm:items-end gap-5",
-                            div { class: "w-28 h-28 sm:w-36 sm:h-36 rounded-[12px] border flex items-center justify-center shrink-0 {icon_wrap_cls}",
-                                match pl.category {
-                                    PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 42 } },
-                                    PlaylistCategory::Discovery => rsx! { IconCompass { size: 42 } },
-                                    PlaylistCategory::MomentMix => rsx! { IconRadio { size: 42 } },
-                                    PlaylistCategory::Smart | PlaylistCategory::User => rsx! { IconListMusic { size: 42 } },
+                            div { class: "w-28 h-28 sm:w-36 sm:h-36 rounded-[12px] overflow-hidden border border-beet-border-subtle flex items-center justify-center shrink-0 shadow-xl",
+                                PlaylistArtwork {
+                                    mix_slug,
+                                    cover_art_url: pl_cover_url,
+                                    alt: pl.name.clone(),
+                                    svg_id_prefix: format!("detail-pl-{}", pl.id),
+                                    icon_size: 42,
                                 }
                             }
 
@@ -1074,7 +1076,7 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                                             .map(|t| {
                                                                 let cover = nav_info
                                                                     .as_ref()
-                                                                    .map(|i| subsonic_cover_art_url(i, &t.song_id, 256));
+                                                                    .map(|_| web_cover_art_url(&t.song_id, 256));
                                                                 let mut pt = PlayerTrack {
                                                                     id: t.song_id.clone(),
                                                                     title: t.title,
@@ -1158,10 +1160,11 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                                         }
                                                     },
                                                     div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
-                                                        if let Some(url) = alb.cover_art_url.as_deref() {
-                                                            img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
-                                                        } else {
-                                                            IconDisc3 { size: 28, class: "text-beet-text-disabled".to_string() }
+                                                        CoverImage {
+                                                            src: alb.cover_art_url.clone(),
+                                                            alt: alb.name.clone(),
+                                                            kind: ArtFallbackKind::Album,
+                                                            icon_size: 28,
                                                         }
                                                         button {
                                                             r#type: "button",

@@ -11,8 +11,9 @@
 use dioxus::prelude::*;
 use dioxus_desktop::{Config, DesktopContext, LogicalSize, WindowBuilder};
 use ui::{
-    IconCheck, IconHeart, IconLoader, IconMusic, IconPause, IconPictureInPicture2, IconPlay,
-    IconSkipBack, IconSkipForward, IconSparkles, IconThumbsDown, IconX,
+    ArtFallbackKind, CoverImage, IconCheck, IconHeart, IconLoader, IconPause,
+    IconPictureInPicture2, IconPlay, IconSkipBack, IconSkipForward, IconSparkles, IconThumbsDown,
+    IconX,
 };
 
 use crate::assets::StudioAssets;
@@ -126,14 +127,15 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
 
                 // 64x64 Rounded Album Artwork
                 div { class: "w-16 h-16 rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                    if let Some(url) = current.as_ref().and_then(|t| t.cover_art_url.as_deref()) {
-                        img {
-                            src: "{url}",
-                            alt: "",
-                            class: "w-full h-full object-cover pointer-events-none",
-                        }
-                    } else {
-                        IconMusic { size: 22, class: "text-beet-text-disabled".to_string() }
+                    CoverImage {
+                        src: current.as_ref().and_then(|t| t.cover_art_url.clone()),
+                        alt: current
+                            .as_ref()
+                            .map(|t| t.title.clone())
+                            .unwrap_or_default(),
+                        img_class: "w-full h-full object-cover pointer-events-none".to_string(),
+                        kind: ArtFallbackKind::Track,
+                        icon_size: 22,
                     }
                 }
 

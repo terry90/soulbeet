@@ -64,12 +64,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.soulbeet.app.AppUiState
 import org.soulbeet.app.ContainerDetailUi
+import org.soulbeet.app.ContainerKind
 import org.soulbeet.app.LibraryCategory
 import org.soulbeet.app.TriageCardItem
 import org.soulbeet.app.data.FormattingUtils
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
+import org.soulbeet.app.ui.components.ArtworkFallbackKind
+import org.soulbeet.app.ui.components.PlaylistArtwork
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.TrackRow
 import org.soulbeet.core.FfiAlbum
@@ -279,6 +282,9 @@ fun LibraryScreen(
                             coverArtId = pl.coverArtId,
                             artAuthority = artAuthority,
                             isPinned = isPinned,
+                            fallbackKind = ArtworkFallbackKind.PLAYLIST,
+                            playlistSlug = pl.slug,
+                            playlistKind = pl.kind,
                             onClick = { onOpenPlaylist(pl) },
                             onTogglePin = { onTogglePin(target, pl.name) },
                         )
@@ -328,6 +334,9 @@ fun LibraryScreen(
                             coverArtId = pl.coverArtId,
                             artAuthority = artAuthority,
                             isPinned = isPinned,
+                            fallbackKind = ArtworkFallbackKind.PLAYLIST,
+                            playlistSlug = pl.slug,
+                            playlistKind = pl.kind,
                             badgeLabel = tagLabel,
                             badgeIcon = tagIcon,
                             badgeColor = tagTint,
@@ -353,6 +362,7 @@ fun LibraryScreen(
                             artAuthority = artAuthority,
                             isPinned = isPinned,
                             circularArt = true,
+                            fallbackKind = ArtworkFallbackKind.ARTIST,
                             onClick = { onOpenArtist(artist) },
                             onTogglePin = { onTogglePin(target, artist.name) },
                         )
@@ -376,6 +386,7 @@ fun LibraryScreen(
                             coverArtId = album.coverArtId,
                             artAuthority = artAuthority,
                             isPinned = isPinned,
+                            fallbackKind = ArtworkFallbackKind.ALBUM,
                             onClick = { onOpenAlbum(album) },
                             onTogglePin = { onTogglePin(target, album.name) },
                         )
@@ -569,6 +580,9 @@ private fun PinnableContainerRow(
     artAuthority: String,
     isPinned: Boolean,
     circularArt: Boolean = false,
+    fallbackKind: ArtworkFallbackKind = ArtworkFallbackKind.ALBUM,
+    playlistSlug: String? = null,
+    playlistKind: String? = null,
     badgeLabel: String? = null,
     badgeIcon: ImageVector? = null,
     badgeColor: Color? = null,
@@ -587,13 +601,26 @@ private fun PinnableContainerRow(
             .padding(horizontal = 4.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TrackArtwork(
-            coverArtId = coverArtId,
-            artAuthority = artAuthority,
-            fallbackTitle = title,
-            size = 48.dp,
-            shape = if (circularArt) SoulbeetShapes.full else SoulbeetShapes.xs,
-        )
+        if (fallbackKind == ArtworkFallbackKind.PLAYLIST) {
+            PlaylistArtwork(
+                name = title,
+                coverArtId = coverArtId,
+                artAuthority = artAuthority,
+                size = 48.dp,
+                slug = playlistSlug,
+                kind = playlistKind,
+                shape = SoulbeetShapes.xs,
+            )
+        } else {
+            TrackArtwork(
+                coverArtId = coverArtId,
+                artAuthority = artAuthority,
+                fallbackTitle = title,
+                size = 48.dp,
+                shape = if (circularArt) SoulbeetShapes.full else SoulbeetShapes.xs,
+                fallbackKind = fallbackKind,
+            )
+        }
         Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
@@ -722,13 +749,30 @@ internal fun ContainerDetailSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                TrackArtwork(
-                    coverArtId = detail.coverArtId,
-                    artAuthority = artAuthority,
-                    fallbackTitle = detail.title,
-                    size = 72.dp,
-                    shape = SoulbeetShapes.md,
-                )
+                if (detail.kind == ContainerKind.USER_PLAYLIST || detail.kind == ContainerKind.SMART_PLAYLIST) {
+                    PlaylistArtwork(
+                        name = detail.title,
+                        coverArtId = detail.coverArtId,
+                        artAuthority = artAuthority,
+                        size = 72.dp,
+                        slug = detail.slug,
+                        kind = detail.playlistKind,
+                        shape = SoulbeetShapes.md,
+                    )
+                } else {
+                    TrackArtwork(
+                        coverArtId = detail.coverArtId,
+                        artAuthority = artAuthority,
+                        fallbackTitle = detail.title,
+                        size = 72.dp,
+                        shape = if (detail.kind == ContainerKind.ARTIST) SoulbeetShapes.full else SoulbeetShapes.md,
+                        fallbackKind = if (detail.kind == ContainerKind.ARTIST) {
+                            ArtworkFallbackKind.ARTIST
+                        } else {
+                            ArtworkFallbackKind.ALBUM
+                        },
+                    )
+                }
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         text = detail.title,

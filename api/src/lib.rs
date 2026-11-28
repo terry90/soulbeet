@@ -10,6 +10,8 @@ pub mod connection;
 pub mod connections;
 #[cfg(feature = "server")]
 pub mod core;
+#[cfg(feature = "server")]
+pub mod cover_art;
 pub mod crypto;
 pub mod db;
 pub mod folder_policy;

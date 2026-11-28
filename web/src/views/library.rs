@@ -6,10 +6,10 @@ use std::collections::HashSet;
 use dioxus::prelude::*;
 use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
-    dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconCompass,
-    IconDisc3, IconListMusic, IconListPlus, IconLoader, IconPlay, IconPlus, IconRadio,
-    IconRefreshCw, IconSparkles, IconUser, PlayerTrack, PlaylistCategory, PlaylistImportModal,
-    TrackRow, TrackRowState,
+    dashboard::StatsOverview, friendly_error, resolve_playlist_mix_sleeve_slug, use_player,
+    web_cover_art_url, ArtFallbackKind, CoverImage, IconListPlus, IconLoader, IconPlay, IconPlus,
+    IconRefreshCw, PlayerTrack, PlaylistArtwork, PlaylistCategory, PlaylistImportModal, TrackRow,
+    TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -614,6 +614,7 @@ pub fn LibraryPage() -> Element {
                             }
                         } else {
                             {
+                                let mixes_snapshot = studio.contextual_mixes.read().clone();
                                 let user_playlists: Vec<&SubsonicPlaylistSummary> = playlists
                                     .iter()
                                     .filter(|pl| !pl.category.is_soulbeet_mix())
@@ -638,13 +639,27 @@ pub fn LibraryPage() -> Element {
                                                 }
                                                 div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
                                                     for pl in user_playlists.iter() {
-                                                        PlaylistGridCard {
-                                                            key: "lib-pl-{pl.id}",
-                                                            playlist: (*pl).clone(),
-                                                            on_open: move |pid: String| {
-                                                                navigator.push(Route::PlaylistDetailPage { id: pid });
-                                                            },
-                                                            on_play: move |pair| play_playlist_now.call(pair),
+                                                        {
+                                                            let matched_slug = mixes_snapshot
+                                                                .iter()
+                                                                .find(|m| m.navidrome_playlist_id.as_deref() == Some(pl.id.as_str()))
+                                                                .map(|m| m.slug.as_str());
+                                                            let mix_slug = resolve_playlist_mix_sleeve_slug(
+                                                                matched_slug,
+                                                                &pl.name,
+                                                                Some(&pl.comment),
+                                                            );
+                                                            rsx! {
+                                                                PlaylistGridCard {
+                                                                    key: "lib-pl-{pl.id}",
+                                                                    playlist: (*pl).clone(),
+                                                                    mix_slug,
+                                                                    on_open: move |pid: String| {
+                                                                        navigator.push(Route::PlaylistDetailPage { id: pid });
+                                                                    },
+                                                                    on_play: move |pair| play_playlist_now.call(pair),
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -663,23 +678,37 @@ pub fn LibraryPage() -> Element {
                                                 }
                                                 div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5",
                                                     for pl in mix_playlists.iter() {
-                                                        PlaylistGridCard {
-                                                            key: "lib-mix-{pl.id}",
-                                                            playlist: (*pl).clone(),
-                                                            on_open: move |pid: String| {
-                                                                let mix_slug = studio
-                                                                    .contextual_mixes
-                                                                    .peek()
-                                                                    .iter()
-                                                                    .find(|m| m.navidrome_playlist_id.as_deref() == Some(pid.as_str()))
-                                                                    .map(|m| m.slug.clone());
-                                                                if let Some(slug) = mix_slug {
-                                                                    navigator.push(Route::MixDetailPage { slug });
-                                                                } else {
-                                                                    navigator.push(Route::PlaylistDetailPage { id: pid });
+                                                        {
+                                                            let matched_slug = mixes_snapshot
+                                                                .iter()
+                                                                .find(|m| m.navidrome_playlist_id.as_deref() == Some(pl.id.as_str()))
+                                                                .map(|m| m.slug.as_str());
+                                                            let mix_slug = resolve_playlist_mix_sleeve_slug(
+                                                                matched_slug,
+                                                                &pl.name,
+                                                                Some(&pl.comment),
+                                                            );
+                                                            rsx! {
+                                                                PlaylistGridCard {
+                                                                    key: "lib-mix-{pl.id}",
+                                                                    playlist: (*pl).clone(),
+                                                                    mix_slug,
+                                                                    on_open: move |pid: String| {
+                                                                        let mix_slug = studio
+                                                                            .contextual_mixes
+                                                                            .peek()
+                                                                            .iter()
+                                                                            .find(|m| m.navidrome_playlist_id.as_deref() == Some(pid.as_str()))
+                                                                            .map(|m| m.slug.clone());
+                                                                        if let Some(slug) = mix_slug {
+                                                                            navigator.push(Route::MixDetailPage { slug });
+                                                                        } else {
+                                                                            navigator.push(Route::PlaylistDetailPage { id: pid });
+                                                                        }
+                                                                    },
+                                                                    on_play: move |pair| play_playlist_now.call(pair),
                                                                 }
-                                                            },
-                                                            on_play: move |pair| play_playlist_now.call(pair),
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -808,10 +837,11 @@ pub fn LibraryPage() -> Element {
                                                         }
                                                     },
                                                     div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
-                                                        if let Some(url) = alb.cover_art_url.as_deref() {
-                                                            img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
-                                                        } else {
-                                                            IconDisc3 { size: 28, class: "text-beet-text-disabled".to_string() }
+                                                        CoverImage {
+                                                            src: alb.cover_art_url.clone(),
+                                                            alt: alb.name.clone(),
+                                                            kind: ArtFallbackKind::Album,
+                                                            icon_size: 28,
                                                         }
                                                         button {
                                                             r#type: "button",
@@ -893,10 +923,12 @@ pub fn LibraryPage() -> Element {
                                                     navigator.push(Route::ArtistDetailPage { id: aid.clone() });
                                                 },
                                                 div { class: "w-12 h-12 rounded-full overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                                                    if let Some(url) = art.cover_art_url.as_deref() {
-                                                        img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
-                                                    } else {
-                                                        IconUser { size: 20, class: "text-beet-text-disabled".to_string() }
+                                                    CoverImage {
+                                                        src: art.cover_art_url.clone(),
+                                                        alt: art.name.clone(),
+                                                        kind: ArtFallbackKind::Artist,
+                                                        icon_size: 20,
+                                                        rounded_full: true,
                                                     }
                                                 }
                                                 div { class: "min-w-0 flex-1",
@@ -1162,6 +1194,7 @@ pub fn LibraryPage() -> Element {
 #[component]
 fn PlaylistGridCard(
     playlist: SubsonicPlaylistSummary,
+    #[props(default)] mix_slug: Option<String>,
     on_open: EventHandler<String>,
     on_play: EventHandler<(String, String)>,
 ) -> Element {
@@ -1171,18 +1204,7 @@ fn PlaylistGridCard(
     let name_play = playlist.name.clone();
     let category = playlist.category;
     let track_word = if playlist.song_count == 1 { "TRACK" } else { "TRACKS" };
-
-    let icon_wrap_cls = match category {
-        PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
-            "bg-beet-accent-surface border border-beet-accent/25 text-beet-accent-text"
-        }
-        PlaylistCategory::MomentMix => {
-            "bg-beet-leaf-surface border border-beet-leaf-solid/25 text-beet-leaf-text"
-        }
-        PlaylistCategory::Smart | PlaylistCategory::User => {
-            "bg-beet-surface-high border border-beet-border-subtle text-beet-text-secondary"
-        }
-    };
+    let cover_art_url = playlist.cover_art_url(300);
 
     let tag_cls = match category {
         PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
@@ -1209,12 +1231,13 @@ fn PlaylistGridCard(
                 }
             },
             div { class: "flex items-center gap-3 min-w-0",
-                div { class: "w-11 h-11 rounded-[8px] flex items-center justify-center shrink-0 {icon_wrap_cls}",
-                    match category {
-                        PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 19 } },
-                        PlaylistCategory::Discovery => rsx! { IconCompass { size: 19 } },
-                        PlaylistCategory::MomentMix => rsx! { IconRadio { size: 19 } },
-                        PlaylistCategory::Smart | PlaylistCategory::User => rsx! { IconListMusic { size: 19 } },
+                div { class: "w-11 h-11 rounded-[8px] overflow-hidden border border-beet-border-subtle flex items-center justify-center shrink-0",
+                    PlaylistArtwork {
+                        mix_slug,
+                        cover_art_url,
+                        alt: playlist.name.clone(),
+                        svg_id_prefix: format!("lib-pl-{}", playlist.id),
+                        icon_size: 19,
                     }
                 }
                 div { class: "min-w-0 space-y-1",
@@ -1301,7 +1324,7 @@ fn LibraryStatsPanel() -> Element {
             .map(|t| {
                 let cover = nav
                     .as_ref()
-                    .map(|info| subsonic_cover_art_url(info, &t.song_id, 256));
+                    .map(|_| web_cover_art_url(&t.song_id, 256));
                 let mut track = PlayerTrack {
                     id: t.song_id.clone(),
                     title: t.title,

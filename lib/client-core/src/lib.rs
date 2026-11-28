@@ -405,6 +405,27 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn warm_cover_art_cache(
+        &self,
+        max_items: usize,
+        size: Option<u32>,
+    ) -> CoreResult<usize> {
+        let never = AtomicBool::new(false);
+        self.warm_cover_art_cache_cancellable(max_items, size, &never)
+            .await
+    }
+
+    pub async fn warm_cover_art_cache_cancellable(
+        &self,
+        max_items: usize,
+        size: Option<u32>,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<usize> {
+        self.cache
+            .warm_cover_art_cache_cancellable(max_items, size, self.is_offline_only(), cancelled)
+            .await
+    }
+
     // --- Mutation Outbox ---
 
     pub async fn enqueue_mutation(&self, mutation: OutboxMutation) -> CoreResult<i64> {
@@ -525,6 +546,14 @@ impl SoulbeetCore {
         self.auto_browse
             .children(parent_id, self.is_offline_only())
             .await
+    }
+
+    pub async fn auto_children_with_offline(
+        &self,
+        parent_id: &str,
+        offline_only: bool,
+    ) -> CoreResult<Vec<AutoBrowseNode>> {
+        self.auto_browse.children(parent_id, offline_only).await
     }
 
     pub async fn voice_search(&self, query: &str) -> CoreResult<Option<VoiceMatchResult>> {

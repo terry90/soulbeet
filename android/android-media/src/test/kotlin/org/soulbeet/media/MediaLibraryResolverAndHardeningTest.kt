@@ -383,4 +383,41 @@ class MediaLibraryResolverAndHardeningTest {
         assertTrue(state.offlineOnly)
         assertEquals(FfiAudioQualityProfile.LosslessFlac, state.audioQualityProfile)
     }
+
+    @Test
+    fun resolvesDriveMixStarredShuffleMoodAndGenreRadioContainers() = runTest {
+        val core = FakeCoreClient()
+        core.tracksById["t1"] = FakeCoreClient.sampleTrack("t1", title = "Nightcall", artist = "Kavinsky")
+        core.tracksById["t2"] = FakeCoreClient.sampleTrack("t2", title = "Instant Crush", artist = "Daft Punk")
+        val nodes = listOf(
+            FakeCoreClient.browseNode("track:t1", "Nightcall", FfiAutoNodeKind.TRACK),
+            FakeCoreClient.browseNode("track:t2", "Instant Crush", FfiAutoNodeKind.TRACK),
+        )
+        core.childrenByParent[AutoBrowseTree.FOR_YOU_DRIVE_MIX] = nodes
+        core.childrenByParent[AutoBrowseTree.PLAYLIST_STARRED] = nodes
+        core.childrenByParent[AutoBrowseTree.RADIO_SHUFFLE] = nodes
+        core.childrenByParent["radio:mood:upbeat"] = nodes
+        core.childrenByParent["radio:genre:Synthwave"] = nodes
+
+        for ((containerId, expectedLabel) in listOf(
+            AutoBrowseTree.FOR_YOU_DRIVE_MIX to "Drive Mix",
+            AutoBrowseTree.PLAYLIST_STARRED to "Starred Favorites",
+            AutoBrowseTree.RADIO_SHUFFLE to "Library Shuffle",
+            "radio:mood:upbeat" to "Upbeat Radio",
+            "radio:genre:Synthwave" to "Synthwave Radio",
+        )) {
+            val res = MediaLibraryResolver.resolveSetMediaItems(
+                core = core,
+                requestedItems = listOf(MediaItem.Builder().setMediaId(containerId).build()),
+                startIndex = 0,
+                startPositionMs = 0L,
+                artAuthority = "org.soulbeet.app.art",
+            )
+            assertEquals("Expected 2 tracks for $containerId", 2, res.items.size)
+            assertEquals(
+                expectedLabel,
+                res.items[0].mediaMetadata.extras?.getString(AutoBrowseTree.EXTRA_SOURCE_LABEL),
+            )
+        }
+    }
 }

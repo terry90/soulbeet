@@ -33,7 +33,7 @@ use shared::recommendation::{
 };
 use ui::{
     classify_guard_mode, discovery_days_remaining, format_candidate_reason, friendly_error,
-    subsonic_cover_art_url, AcquireStageBadge, Auth, AutoDownloadSignal, DrawerTab, GuardModalMode,
+    web_cover_art_url, AcquireStageBadge, Auth, AutoDownloadSignal, DrawerTab, GuardModalMode,
     PendingDropItem, PendingDropQueue, PlaybackStatus, PlayerCommand, PlayerContext,
     PlayerProvider, PlayerState, PlayerTrack, ShareModalTarget,
 };
@@ -665,7 +665,7 @@ impl WebStudioContext {
         let cover_art_url = nav
             .as_ref()
             .filter(|_| !song_id.is_empty())
-            .map(|info| subsonic_cover_art_url(info, &song_id, 256));
+            .map(|_| web_cover_art_url(&song_id, 256));
         let reason_label = dt
             .reason
             .as_deref()
@@ -753,7 +753,7 @@ impl WebStudioContext {
         let cover_art_url = nav
             .as_ref()
             .filter(|_| !ct.song_id.is_empty())
-            .map(|info| subsonic_cover_art_url(info, &ct.song_id, 256));
+            .map(|_| web_cover_art_url(&ct.song_id, 256));
         let mut track = PlayerTrack {
             id: ct.song_id.clone(),
             title: ct.title.clone(),
@@ -1750,7 +1750,7 @@ impl WebStudioContext {
                         .map(|t| {
                             let cover = nav
                                 .as_ref()
-                                .map(|i| subsonic_cover_art_url(i, &t.song_id, 256));
+                                .map(|_| web_cover_art_url(&t.song_id, 256));
                             let mut pt = PlayerTrack {
                                 id: t.song_id.clone(),
                                 title: t.title,
@@ -1902,7 +1902,7 @@ impl WebStudioContext {
                         studio.acquire_states.write().remove(&key);
                         let cover = studio
                             .navidrome_info()
-                            .map(|info| subsonic_cover_art_url(&info, &navidrome_song_id, 256));
+                            .map(|_| web_cover_art_url(&navidrome_song_id, 256));
                         let mut pt = PlayerTrack {
                             id: navidrome_song_id.clone(),
                             title: title.clone(),
@@ -2038,7 +2038,7 @@ pub fn handle_acquire_event(
             if let Some(song_id) = navidrome_song_id {
                 let cover = studio
                     .navidrome_info()
-                    .map(|info| subsonic_cover_art_url(&info, &song_id, 256));
+                    .map(|_| web_cover_art_url(&song_id, 256));
                 let mut pt = PlayerTrack {
                     id: song_id.clone(),
                     title: ev.title.clone(),
@@ -3264,7 +3264,7 @@ fn apply_remote_connect_command(
                 let nav_opt = studio.navidrome_info();
                 let cover = nav_opt
                     .as_ref()
-                    .map(|info| subsonic_cover_art_url(info, &song_id, 256));
+                    .map(|_| web_cover_art_url(&song_id, 256));
                 let mut pt = PlayerTrack {
                     id: song_id.clone(),
                     title: snapshot

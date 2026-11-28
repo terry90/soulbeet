@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use chrono::DateTime;
+use chrono::{DateTime, Datelike, Local, Timelike};
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::{Sqlite, SqlitePool, Transaction};
@@ -382,6 +382,12 @@ impl SyncEngine {
             };
 
             let mut tx = self.pool.begin().await?;
+            let normalized_cover_art = pl
+                .cover_art
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
             upsert_playlist_exec(
                 &mut *tx,
                 &LocalPlaylist {
@@ -391,7 +397,7 @@ impl SyncEngine {
                     owner: pl.owner.clone(),
                     song_count: initial_song_count,
                     duration_secs: initial_duration_secs,
-                    cover_art_id: pl.cover_art.clone(),
+                    cover_art_id: normalized_cover_art.clone(),
                     is_smart,
                     kind,
                     slug,
@@ -404,13 +410,23 @@ impl SyncEngine {
             if let Some(detail) = detail_opt {
                 let mut track_ids = Vec::with_capacity(detail.entry.len());
                 let mut total_duration_secs: i64 = 0;
+                let mut first_track_cover_art: Option<String> = None;
                 for song in detail.entry {
                     total_duration_secs += song.duration.max(0);
                     let track_id = song.id.clone();
                     if full_sync {
                         synced_track_ids.insert(track_id.clone());
                     }
-                    upsert_track_exec(&mut *tx, &song_to_local(song, now), false).await?;
+                    let local_song = song_to_local(song, now);
+                    if first_track_cover_art.is_none() {
+                        first_track_cover_art = local_song
+                            .cover_art_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string);
+                    }
+                    upsert_track_exec(&mut *tx, &local_song, false).await?;
                     track_ids.push(track_id);
                 }
                 replace_playlist_tracks_tx(&mut tx, &pl.id, &track_ids).await?;
@@ -420,27 +436,67 @@ impl SyncEngine {
                 } else {
                     detail.duration
                 };
+                let effective_cover_art = normalized_cover_art.or(first_track_cover_art);
                 sqlx::query(
-                    "UPDATE playlists SET song_count = ?, duration_secs = ?, updated_at = ? WHERE id = ?",
+                    r#"
+                    UPDATE playlists
+                    SET song_count = ?,
+                        duration_secs = ?,
+                        cover_art_id = COALESCE(NULLIF(TRIM(cover_art_id), ''), ?),
+                        updated_at = ?
+                    WHERE id = ?
+                    "#,
                 )
                 .bind(live_song_count)
                 .bind(live_duration_secs)
+                .bind(&effective_cover_art)
                 .bind(now)
                 .bind(&pl.id)
                 .execute(&mut *tx)
                 .await?;
+            } else if normalized_cover_art.is_none() {
+                let first_track_cover_art: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT t.cover_art_id
+                    FROM playlist_tracks pt
+                    INNER JOIN tracks t ON t.id = pt.track_id
+                    WHERE pt.playlist_id = ?
+                      AND t.cover_art_id IS NOT NULL
+                      AND TRIM(t.cover_art_id) != ''
+                    ORDER BY pt.position ASC
+                    LIMIT 1
+                    "#,
+                )
+                .bind(&pl.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(fallback_art) = first_track_cover_art {
+                    sqlx::query(
+                        r#"
+                        UPDATE playlists
+                        SET cover_art_id = COALESCE(NULLIF(TRIM(cover_art_id), ''), ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        "#,
+                    )
+                    .bind(&fallback_art)
+                    .bind(now)
+                    .bind(&pl.id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
             tx.commit().await?;
             report.playlists_synced += 1;
         }
 
-        // Prune playlists that were deleted on Navidrome.
+        // Prune playlists that were deleted on Navidrome (preserve synthetic contextual mixes `mix:*`).
         let local_playlist_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM playlists")
             .fetch_all(&self.pool)
             .await?;
         let deleted_playlist_ids: Vec<String> = local_playlist_ids
             .into_iter()
-            .filter(|id| !synced_playlist_ids.contains(id))
+            .filter(|id| !id.starts_with("mix:") && !synced_playlist_ids.contains(id))
             .collect();
         if !deleted_playlist_ids.is_empty() {
             let mut tx = self.pool.begin().await?;
@@ -555,14 +611,32 @@ impl SyncEngine {
             tx.commit().await?;
         }
 
-        // 4a. Prune deleted tracks, albums, and artists after a complete full sync.
+        // 4a. Optional Soulbeet contextual mixes sync (Drive Mix, Seasonals, Moments) runs BEFORE
+        // full-sync pruning so contextual-only tracks are added to `synced_track_ids` and their
+        // offline cached audio is never deleted during a force-full sync.
+        if !cancelled.load(Ordering::Relaxed) {
+            if let Some(base) = self.soulbeet_base_url.as_deref() {
+                match self.sync_contextual_mixes(base, now, cancelled).await {
+                    Ok(ctx_track_ids) => {
+                        if full_sync {
+                            synced_track_ids.extend(ctx_track_ids);
+                        }
+                    }
+                    Err(err) => report
+                        .warnings
+                        .push(format!("contextual mixes sync failed: {err}")),
+                }
+            }
+        }
+
+        // 4b. Prune deleted tracks, albums, and artists after a complete full sync.
         if full_sync && !cancelled.load(Ordering::Relaxed) {
             self.prune_absent_library_rows(&synced_artist_ids, &synced_album_ids, &synced_track_ids)
                 .await?;
             set_cursor(&self.pool, CURSOR_LAST_FULL_SYNC, &now.to_string()).await?;
         }
 
-        // 4b. Incremental rating/annotation refresh via paginated search3 (empty query)
+        // 4c. Incremental rating/annotation refresh via paginated search3 (empty query)
         // Delta sync skips unchanged albums, so tracks rated in Navidrome would otherwise keep stale user_rating.
         if !full_sync && !cancelled.load(Ordering::Relaxed) {
             if let Err(err) = self.sync_song_ratings(&subsonic, now, cancelled).await {
@@ -957,6 +1031,255 @@ impl SyncEngine {
         tx.commit().await?;
         Ok(count)
     }
+
+    /// Syncs Soulbeet's active contextual mixes (including Drive Mix, seasonal packs, and moment
+    /// mixes) into the local `playlists` mirror so Android Auto's "For You" tab has instant,
+    /// zero-network access to Drive Mix and every active mix even when not materialized in Navidrome.
+    /// Returns the set of track IDs referenced by active synthetic `mix:*` playlists so full-sync
+    /// pruning preserves their cached rows and offline audio files.
+    async fn sync_contextual_mixes(
+        &self,
+        base: &str,
+        now: i64,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<HashSet<String>> {
+        let local_now = Local::now();
+        let local_hour = local_now.hour();
+        let local_weekday = local_now.weekday().number_from_monday();
+
+        let url = format!(
+            "{}/api/discovery/contextual-mixes?local_hour={local_hour}&local_weekday={local_weekday}",
+            base.trim_end_matches('/')
+        );
+        let mut req = self.http.get(&url);
+        if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
+            let (name, val) = auth.header_name_and_value();
+            req = req.header(name, val);
+        }
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(HashSet::new());
+        }
+        if !resp.status().is_success() {
+            return Err(CoreError::ServerHttp {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let mixes: Vec<shared::recommendation::ContextualMixSummary> = resp.json().await?;
+        // Record ALL active synthetic IDs upfront (before capping or fetching /playlist) so
+        // transient network failures or pagination caps never delete cached offline `mix:*` rows.
+        let mut active_synthetic_ids: HashSet<String> = mixes
+            .iter()
+            .map(|m| format!("mix:{}", m.slug))
+            .collect();
+        let mut protected_track_ids: HashSet<String> = HashSet::new();
+
+        for mix in mixes.into_iter().take(12) {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let kind_str = match mix.kind {
+                shared::recommendation::ContextualMixKind::Seasonal => "seasonal",
+                shared::recommendation::ContextualMixKind::Moment => "moment",
+                shared::recommendation::ContextualMixKind::Rolling => "discovery",
+            };
+            let title = mix
+                .custom_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| {
+                    shared::recommendation::canonical_mix_title(
+                        &mix.slug,
+                        mix.country_code.as_deref(),
+                        None,
+                    )
+                });
+
+            let synthetic_id = format!("mix:{}", mix.slug);
+
+            if let Some(ref nav_pl_id) = mix.navidrome_playlist_id {
+                // Enrich existing Navidrome playlist row with canonical kind, slug, and clean title.
+                let res = sqlx::query(
+                    "UPDATE playlists SET name = ?, kind = ?, slug = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(&title)
+                .bind(kind_str)
+                .bind(&mix.slug)
+                .bind(now)
+                .bind(nav_pl_id)
+                .execute(&self.pool)
+                .await?;
+                if res.rows_affected() > 0 {
+                    // Real Navidrome playlist exists locally; any older synthetic shadow can be pruned.
+                    active_synthetic_ids.remove(&synthetic_id);
+                    continue;
+                }
+            }
+
+            // Ephemeral contextual mix (e.g. Drive Mix, Focus, Morning, Late Night, Weather):
+            // materialize its tracklist once into synthetic playlist `mix:<slug>` so Android Auto
+            // can browse and play it offline-first with zero network calls on tap.
+            let should_materialize =
+                mix.slug == "drive" || kind_str == "moment" || kind_str == "seasonal";
+            if !should_materialize {
+                active_synthetic_ids.remove(&synthetic_id);
+                continue;
+            }
+
+            let pl_url = format!(
+                "{}/api/discovery/contextual-mixes/playlist?slug={}",
+                base.trim_end_matches('/'),
+                url::form_urlencoded::byte_serialize(mix.slug.as_bytes()).collect::<String>()
+            );
+            let mut pl_req = self.http.get(&pl_url);
+            if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
+                let (name, val) = auth.header_name_and_value();
+                pl_req = pl_req.header(name, val);
+            }
+            let pl_resp = match pl_req.send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    active_synthetic_ids.remove(&synthetic_id);
+                    continue;
+                }
+                _ => {
+                    // Transient error: preserve any previously cached tracklist for this active mix.
+                    continue;
+                }
+            };
+            let Ok(materialized) = pl_resp
+                .json::<shared::recommendation::ContextualMixPlaylist>()
+                .await
+            else {
+                continue;
+            };
+            if materialized.tracks.is_empty() {
+                active_synthetic_ids.remove(&synthetic_id);
+                continue;
+            }
+
+            let mut tx = self.pool.begin().await?;
+            let mut track_ids = Vec::with_capacity(materialized.tracks.len());
+            let mut total_duration_secs: i64 = 0;
+
+            for mt in materialized.tracks {
+                let dur = i64::from(mt.duration_s.unwrap_or(0));
+                total_duration_secs += dur;
+                let exists: i64 =
+                    sqlx::query_scalar("SELECT COUNT(1) FROM tracks WHERE id = ?")
+                        .bind(&mt.song_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if exists == 0 {
+                    upsert_track_exec(
+                        &mut *tx,
+                        &LocalTrack {
+                            id: mt.song_id.clone(),
+                            title: mt.title,
+                            artist_id: None,
+                            artist_name: mt.artist,
+                            album_id: None,
+                            album_name: mt.album.unwrap_or_default(),
+                            track_number: None,
+                            disc_number: None,
+                            duration_secs: dur,
+                            year: None,
+                            genre: None,
+                            bit_rate: None,
+                            suffix: None,
+                            content_type: None,
+                            size_bytes: None,
+                            cover_art_id: (!mt.song_id.trim().is_empty()).then(|| mt.song_id.clone()),
+                            path: None,
+                            starred: mt.starred,
+                            user_rating: i64::from(mt.rating.unwrap_or(0)),
+                            play_count: 0,
+                            last_played_at: None,
+                            musicbrainz_id: None,
+                            is_discovery: !mt.owned,
+                            updated_at: now,
+                        },
+                        false,
+                    )
+                    .await?;
+                }
+                protected_track_ids.insert(mt.song_id.clone());
+                track_ids.push(mt.song_id);
+            }
+
+            let comment = if mix.offline_priority {
+                Some(format!("soulbeet:contextual:{} offline_priority", mix.slug))
+            } else {
+                Some(format!("soulbeet:contextual:{}", mix.slug))
+            };
+            upsert_playlist_exec(
+                &mut *tx,
+                &LocalPlaylist {
+                    id: synthetic_id.clone(),
+                    name: title,
+                    comment,
+                    owner: None,
+                    song_count: track_ids.len() as i64,
+                    duration_secs: total_duration_secs,
+                    cover_art_id: None,
+                    is_smart: true,
+                    kind: kind_str.to_string(),
+                    slug: Some(mix.slug),
+                    changed_at: None,
+                    updated_at: now,
+                },
+            )
+            .await?;
+            replace_playlist_tracks_tx(&mut tx, &synthetic_id, &track_ids).await?;
+            tx.commit().await?;
+        }
+
+        // Prune stale synthetic `mix:*` rows no longer active (including offline_pins cleanup).
+        if !cancelled.load(Ordering::Relaxed) {
+            let existing_mix_ids: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM playlists WHERE id LIKE 'mix:%'")
+                    .fetch_all(&self.pool)
+                    .await?;
+            let stale: Vec<String> = existing_mix_ids
+                .into_iter()
+                .filter(|id| !active_synthetic_ids.contains(id))
+                .collect();
+            if !stale.is_empty() {
+                let mut tx = self.pool.begin().await?;
+                for id in stale {
+                    sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?")
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "DELETE FROM offline_pins WHERE target_kind = 'playlist' AND target_id = ?",
+                    )
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("DELETE FROM playlists WHERE id = ?")
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                tx.commit().await?;
+            }
+        }
+
+        // Also protect tracks of any preserved (not-pruned) synthetic `mix:*` playlists.
+        let preserved_tracks: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT track_id FROM playlist_tracks WHERE playlist_id LIKE 'mix:%'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        protected_track_ids.extend(preserved_tracks);
+
+        Ok(protected_track_ids)
+    }
 }
 
 async fn store_album_detail_tx(
@@ -1056,12 +1379,63 @@ fn is_moment_slug(slug: &str) -> bool {
             | "focus_flow"
             | "late_night"
             | "late-night"
+            | "evening_unwind"
+            | "evening-unwind"
+            | "friday_night"
+            | "friday-night"
+            | "sunday_morning"
+            | "sunday-morning"
+            | "dinner_groove"
+            | "dinner-groove"
+            | "rainy_day"
+            | "snow_day"
+            | "storm_night"
+            | "sunny_day"
     )
 }
 
-fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<String>, bool) {
-    let lower_name = name.to_ascii_lowercase();
-    let lower_comment = comment.unwrap_or_default().to_ascii_lowercase();
+fn infer_discovery_slug(lower_name: &str) -> Option<String> {
+    if lower_name.contains("weekly radar")
+        || lower_name.contains("fresh picks")
+        || lower_name.contains("balanced")
+    {
+        Some("weekly_radar".to_string())
+    } else if lower_name.contains("comfort") || lower_name.contains("conservative") {
+        Some("comfort".to_string())
+    } else if lower_name.contains("deep cuts") || lower_name.contains("adventurous") {
+        Some("deep_cuts".to_string())
+    } else if lower_name.contains("fresh arrivals") {
+        Some("fresh_arrivals".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_canonical_winter_holiday_name(lower_name: &str) -> bool {
+    let trimmed = lower_name.trim();
+    let stripped = trimmed
+        .strip_prefix("soulbeet:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    matches!(
+        stripped,
+        "christmas"
+            | "christmas mix"
+            | "winter holiday"
+            | "winter holiday mix"
+            | "holiday mix"
+            | "noël"
+            | "noel"
+            | "noël mix"
+            | "noel mix"
+            | "noël à la française"
+            | "noel a la francaise"
+    )
+}
+
+pub fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<String>, bool) {
+    let lower_name = name.to_lowercase();
+    let lower_comment = comment.unwrap_or_default().to_lowercase();
 
     if let Some(rest) = lower_comment.split("soulbeet:contextual:").nth(1) {
         let slug = rest
@@ -1080,7 +1454,8 @@ fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<Strin
     }
 
     if lower_comment.contains("soulbeet discovery") {
-        return ("discovery".to_string(), None, true);
+        let slug = infer_discovery_slug(&lower_name).or_else(|| Some(slugify(&lower_name)));
+        return ("discovery".to_string(), slug, true);
     }
 
     if lower_comment.contains("seasonal:") || lower_name.contains("seasonal") {
@@ -1089,11 +1464,32 @@ fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<Strin
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .map(ToString::to_string)
-            .or_else(|| Some(slugify(&lower_name)));
+            .or_else(|| {
+                if is_canonical_winter_holiday_name(&lower_name) {
+                    Some("winter_holiday".to_string())
+                } else {
+                    Some(slugify(&lower_name))
+                }
+            });
         return ("seasonal".to_string(), slug, true);
     }
-    if lower_name.contains("weekly radar") || lower_name.contains("discovery") {
-        return ("discovery".to_string(), Some(slugify(&lower_name)), true);
+    if lower_name.contains("weekly radar")
+        || lower_name.contains("comfort mix")
+        || lower_name.contains("comfort zone")
+        || lower_name.contains("deep cuts")
+        || lower_name.contains("fresh picks")
+        || lower_name.contains("fresh arrivals")
+        || lower_name.contains("discovery")
+    {
+        let slug = infer_discovery_slug(&lower_name).or_else(|| Some(slugify(&lower_name)));
+        return ("discovery".to_string(), slug, true);
+    }
+    if is_canonical_winter_holiday_name(&lower_name) {
+        return (
+            "seasonal".to_string(),
+            Some("winter_holiday".to_string()),
+            true,
+        );
     }
     if lower_comment.contains("moment:")
         || lower_name.contains("drive mix")
@@ -1108,7 +1504,13 @@ fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<Strin
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .map(ToString::to_string)
-            .or_else(|| Some(slugify(&lower_name)));
+            .or_else(|| {
+                if lower_name.contains("drive") {
+                    Some("drive".to_string())
+                } else {
+                    Some(slugify(&lower_name))
+                }
+            });
         return ("moment".to_string(), slug, false);
     }
     if lower_comment.contains("smart") {

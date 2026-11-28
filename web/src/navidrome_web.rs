@@ -9,7 +9,7 @@
 use serde::Deserialize;
 use shared::client::NavidromeSessionInfo;
 #[cfg(feature = "web")]
-use ui::subsonic_cover_art_url;
+use ui::web_cover_art_url;
 use ui::PlayerTrack;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -24,6 +24,26 @@ pub struct SubsonicPlaylistSummary {
     pub public: bool,
     pub is_smart: bool,
     pub category: ui::PlaylistCategory,
+}
+
+impl SubsonicPlaylistSummary {
+    /// Returns the authenticated Web cover-art proxy URL for this playlist's collage artwork.
+    /// Falls back to `pl-{id}` when Navidrome omits `coverArt` on non-empty playlists.
+    pub fn cover_art_url(&self, size: u32) -> Option<String> {
+        if let Some(cid) = self
+            .cover_art
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(ui::web_cover_art_url(cid, size));
+        }
+        let id = self.id.trim();
+        if !id.is_empty() && self.song_count > 0 {
+            return Some(ui::web_cover_art_url(&format!("pl-{id}"), size));
+        }
+        None
+    }
 }
 
 /// Detects whether a Navidrome playlist is smart or Soulbeet-managed from its comment.
@@ -316,9 +336,9 @@ mod wire {
     }
 
     impl RawSong {
-        pub(super) fn into_player_track(self, info: &NavidromeSessionInfo) -> PlayerTrack {
+        pub(super) fn into_player_track(self, _info: &NavidromeSessionInfo) -> PlayerTrack {
             let cover_id = self.cover_art.clone().unwrap_or_else(|| self.id.clone());
-            let cover_art_url = Some(subsonic_cover_art_url(info, &cover_id, 256));
+            let cover_art_url = Some(web_cover_art_url(&cover_id, 256));
             let codec_badge = format_codec_badge(
                 self.suffix.as_deref(),
                 self.bit_rate,
@@ -346,7 +366,7 @@ mod wire {
     }
 
     impl RawAlbum {
-        pub(super) fn into_summary(self, info: &NavidromeSessionInfo) -> SubsonicAlbumSummary {
+        pub(super) fn into_summary(self, _info: &NavidromeSessionInfo) -> SubsonicAlbumSummary {
             let name = self
                 .name
                 .or(self.title)
@@ -358,18 +378,25 @@ mod wire {
                 artist: self.artist.unwrap_or_else(|| "Unknown Artist".to_string()),
                 song_count: self.song_count,
                 year: self.year,
-                cover_art_url: Some(subsonic_cover_art_url(info, &cover_id, 300)),
+                cover_art_url: Some(web_cover_art_url(&cover_id, 300)),
             }
         }
     }
 
+    pub(super) fn non_placeholder_artist_image(url: Option<String>) -> Option<String> {
+        url.filter(|u| {
+            let trimmed = u.trim();
+            !trimmed.is_empty() && !trimmed.contains("2a96cbd8b46e442fc41c2b86b821562f")
+        })
+    }
+
     impl RawArtist {
-        pub(super) fn into_summary(self, info: &NavidromeSessionInfo) -> SubsonicArtistSummary {
+        pub(super) fn into_summary(self, _info: &NavidromeSessionInfo) -> SubsonicArtistSummary {
             let cover_art_url = self
                 .cover_art
                 .filter(|c| !c.trim().is_empty())
-                .map(|cid| subsonic_cover_art_url(info, &cid, 256))
-                .or_else(|| self.artist_image_url.filter(|u| !u.trim().is_empty()));
+                .map(|cid| web_cover_art_url(&cid, 256))
+                .or_else(|| non_placeholder_artist_image(self.artist_image_url));
             SubsonicArtistSummary {
                 id: self.id,
                 name: self.name,
@@ -868,7 +895,7 @@ pub async fn fetch_album_detail(
             tracks.len() as u32
         },
         year: alb.year,
-        cover_art_url: Some(subsonic_cover_art_url(info, &cover_id, 400)),
+        cover_art_url: Some(web_cover_art_url(&cover_id, 400)),
     };
     Ok(Some((summary, tracks)))
 }
@@ -898,8 +925,8 @@ pub async fn fetch_artist_detail(
     let cover_art_url = art
         .cover_art
         .filter(|c| !c.trim().is_empty())
-        .map(|cid| subsonic_cover_art_url(info, &cid, 300))
-        .or_else(|| art.artist_image_url.filter(|u| !u.trim().is_empty()))
+        .map(|cid| web_cover_art_url(&cid, 300))
+        .or_else(|| non_placeholder_artist_image(art.artist_image_url))
         .or_else(|| albums.first().and_then(|a| a.cover_art_url.clone()));
     let summary = SubsonicArtistSummary {
         id: if art.id.is_empty() {

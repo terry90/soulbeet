@@ -119,6 +119,7 @@ fn main() {
                     ))
                     .merge(api::oidc::router())
                     .merge(api::healthz::router())
+                    .merge(api::cover_art::router())
                     .layer(CookieManagerLayer::new()),
             ))
         });

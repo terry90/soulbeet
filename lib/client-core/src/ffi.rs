@@ -1126,6 +1126,8 @@ pub struct FfiAutoBrowseNode {
     pub cover_art_local_path: Option<String>,
     pub is_offline_ready: bool,
     pub is_pending_discovery: bool,
+    pub group_title: Option<String>,
+    pub sleeve_slug: Option<String>,
 }
 
 impl From<AutoBrowseNode> for FfiAutoBrowseNode {
@@ -1141,6 +1143,8 @@ impl From<AutoBrowseNode> for FfiAutoBrowseNode {
             cover_art_local_path: v.cover_art_local_path,
             is_offline_ready: v.is_offline_ready,
             is_pending_discovery: v.is_pending_discovery,
+            group_title: v.group_title,
+            sleeve_slug: v.sleeve_slug,
         }
     }
 }
@@ -2432,6 +2436,34 @@ impl SoulbeetCoreHandle {
         Ok(path)
     }
 
+    pub async fn warm_cover_art_cache(
+        &self,
+        max_items: u32,
+        size: Option<u32>,
+    ) -> Result<u32, FfiError> {
+        let core = self.core.clone();
+        let (warmed, maybe_stats) = self
+            .run_async_cooperative(|cancel| async move {
+                let count = core
+                    .warm_cover_art_cache_cancellable(max_items as usize, size, &cancel)
+                    .await
+                    .map_err(FfiError::from)?;
+                let stats = if count > 0 {
+                    Some(FfiCacheStats::from(
+                        core.cache_stats().await.map_err(FfiError::from)?,
+                    ))
+                } else {
+                    None
+                };
+                Ok((u32::try_from(count).unwrap_or(u32::MAX), stats))
+            })
+            .await?;
+        if let Some(stats) = maybe_stats {
+            self.emit_cache_changed(stats);
+        }
+        Ok(warmed)
+    }
+
     // --- Outbox & Curation ---
 
     pub async fn enqueue_mutation(&self, mutation: FfiOutboxMutation) -> Result<i64, FfiError> {
@@ -2608,6 +2640,22 @@ impl SoulbeetCoreHandle {
         self.run_async(async move {
             let nodes = core
                 .auto_children(&parent_id)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(nodes.into_iter().map(Into::into).collect())
+        })
+        .await
+    }
+
+    pub async fn auto_children_with_offline(
+        &self,
+        parent_id: String,
+        offline_only: bool,
+    ) -> Result<Vec<FfiAutoBrowseNode>, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let nodes = core
+                .auto_children_with_offline(&parent_id, offline_only)
                 .await
                 .map_err(FfiError::from)?;
             Ok(nodes.into_iter().map(Into::into).collect())

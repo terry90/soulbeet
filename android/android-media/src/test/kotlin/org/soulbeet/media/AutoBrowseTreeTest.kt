@@ -142,24 +142,123 @@ class AutoBrowseTreeTest {
         assertEquals(ContextualTrackRef("playlist:p1", "s1"), AutoBrowseTree.parseContextualTrackId(item1.mediaId))
         assertEquals("s1", AutoBrowseTree.extractTrackId(item1.mediaId))
         assertEquals(MediaMetadata.MEDIA_TYPE_MUSIC, item1.mediaMetadata.mediaType)
-        assertEquals("content://$authority/art/cov-123", item1.mediaMetadata.artworkUri?.toString())
+        assertEquals(
+            "content://$authority/art/cov-123?fallback=track&seed=Instant%20Crush",
+            item1.mediaMetadata.artworkUri?.toString(),
+        )
         assertEquals("RAM", item1.mediaMetadata.albumTitle?.toString())
         val extras1 = item1.mediaMetadata.extras
         assertNotNull(extras1)
         assertFalse(extras1!!.getBoolean(AutoBrowseTree.EXTRA_IS_DISCOVERY))
         assertTrue(extras1.getBoolean(AutoBrowseTree.EXTRA_IS_STARRED))
         assertTrue(extras1.getBoolean(AutoBrowseTree.EXTRA_IS_OFFLINE_CACHED))
+        assertEquals(
+            AutoBrowseTree.EXTRAS_VALUE_DOWNLOAD_STATUS_DOWNLOADED,
+            extras1.getLong(AutoBrowseTree.EXTRAS_KEY_DOWNLOAD_STATUS),
+        )
         assertEquals(5, extras1.getInt(AutoBrowseTree.EXTRA_RATING))
         assertEquals("s1", extras1.getString(AutoBrowseTree.EXTRA_TRACK_ID))
 
         val item2 = items[1]
-        assertNull("artworkUri must be omitted when coverArtId is null", item2.mediaMetadata.artworkUri)
+        assertNull("artworkUri must be omitted for track leaves when coverArtId is null", item2.mediaMetadata.artworkUri)
         val extras2 = item2.mediaMetadata.extras!!
         assertTrue(extras2.getBoolean(AutoBrowseTree.EXTRA_IS_DISCOVERY))
         assertFalse(extras2.getBoolean(AutoBrowseTree.EXTRA_IS_STARRED))
         assertFalse(extras2.getBoolean(AutoBrowseTree.EXTRA_IS_OFFLINE_CACHED))
         assertEquals(0, extras2.getInt(AutoBrowseTree.EXTRA_RATING))
         assertEquals("s2", extras2.getString(AutoBrowseTree.EXTRA_TRACK_ID))
+    }
+
+    @Test
+    fun mapsGroupTitlesSleevesContinueListeningListHintAndTabIcons() = runTest {
+        val core = FakeCoreClient()
+        core.childrenByParent[AutoBrowseTree.TAB_FOR_YOU] = listOf(
+            FakeCoreClient.browseNode(
+                id = AutoBrowseTree.FOR_YOU_DRIVE_MIX,
+                title = "Drive Mix",
+                subtitle = "Offline-first · 24 tracks",
+                kind = FfiAutoNodeKind.PLAYLIST,
+                playable = true,
+                browsable = true,
+                isOfflineReady = true,
+                groupTitle = "Right Now",
+                sleeveSlug = "drive",
+            ),
+            FakeCoreClient.browseNode(
+                id = "album:al-1",
+                title = "Cross",
+                subtitle = "Justice · 12 tracks",
+                kind = FfiAutoNodeKind.ALBUM,
+                playable = true,
+                browsable = true,
+                coverArtId = "cov-cross",
+                groupTitle = AutoBrowseTree.GROUP_CONTINUE_LISTENING,
+            ),
+            FakeCoreClient.browseNode(
+                id = "playlist:user-no-art",
+                title = "No Cover List",
+                kind = FfiAutoNodeKind.PLAYLIST,
+                playable = true,
+                browsable = true,
+                coverArtId = null,
+            ),
+        )
+
+        val tabs = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.ROOT_ID,
+            page = 0,
+            pageSize = 10,
+            artAuthority = authority,
+            packageName = "org.soulbeet.app",
+        )
+        tabs.forEach { tab ->
+            val uri = tab.mediaMetadata.artworkUri
+            assertTrue(
+                "Tab ${tab.mediaId} should have named android.resource://<pkg>/drawable/<name> URI (got $uri)",
+                uri?.scheme == "android.resource" &&
+                    uri.pathSegments.size == 2 &&
+                    uri.pathSegments[0] == "drawable" &&
+                    uri.pathSegments[1].startsWith("ic_auto_tab_"),
+            )
+        }
+
+        val items = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.TAB_FOR_YOU,
+            page = 0,
+            pageSize = 20,
+            artAuthority = authority,
+            packageName = "org.soulbeet.app",
+        )
+        assertEquals(3, items.size)
+
+        val drive = items[0]
+        assertEquals("content://$authority/sleeve/drive", drive.mediaMetadata.artworkUri?.toString())
+        assertEquals(
+            "Right Now",
+            drive.mediaMetadata.extras?.getString(AutoBrowseTree.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE_HINT),
+        )
+        assertEquals(
+            AutoBrowseTree.EXTRAS_VALUE_DOWNLOAD_STATUS_DOWNLOADED,
+            drive.mediaMetadata.extras?.getLong(AutoBrowseTree.EXTRAS_KEY_DOWNLOAD_STATUS),
+        )
+
+        val cont = items[1]
+        assertEquals(
+            AutoBrowseTree.GROUP_CONTINUE_LISTENING,
+            cont.mediaMetadata.extras?.getString(AutoBrowseTree.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE_HINT),
+        )
+        assertEquals(
+            MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
+            cont.mediaMetadata.extras?.getInt(AutoBrowseTree.EXTRAS_KEY_CONTENT_STYLE_SINGLE_ITEM),
+        )
+
+        val fallbackList = items[2]
+        assertEquals(
+            "content://$authority/tile/playlist?seed=No%20Cover%20List",
+            fallbackList.mediaMetadata.artworkUri?.toString(),
+        )
     }
 
     @Test
@@ -240,5 +339,70 @@ class AutoBrowseTreeTest {
         assertEquals(1, recent.size)
         assertEquals("t2", recent[0].mediaId)
         assertEquals("Resumed Track", recent[0].mediaMetadata.title?.toString())
+    }
+
+    @Test
+    fun artworkUriIncludesCachedQueryParamOnlyWhenCoverArtIsCachedLocally() = runTest {
+        val core = FakeCoreClient()
+        core.coverArtPaths["cov-cached"] = "/cache/cover_art/cov-cached.jpg"
+        core.childrenByParent[AutoBrowseTree.LIB_RECENT] = listOf(
+            FakeCoreClient.browseNode(
+                id = "album:al-cached",
+                title = "Discovery",
+                subtitle = "Daft Punk",
+                kind = FfiAutoNodeKind.ALBUM,
+                playable = true,
+                browsable = true,
+                coverArtId = "cov-cached",
+            ),
+            FakeCoreClient.browseNode(
+                id = "album:al-cold",
+                title = "Homework",
+                subtitle = "Daft Punk",
+                kind = FfiAutoNodeKind.ALBUM,
+                playable = true,
+                browsable = true,
+                coverArtId = "cov-cold",
+            ),
+        )
+
+        val initial = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.LIB_RECENT,
+            page = 0,
+            pageSize = 20,
+            artAuthority = authority,
+        )
+        assertEquals(2, initial.size)
+        assertEquals(
+            "loadChildren must reuse bulk-loaded node.coverArtLocalPath without N+1 FFI calls",
+            0,
+            core.coverArtLocalPathSyncCalls,
+        )
+
+        val cachedUri = initial[0].mediaMetadata.artworkUri
+        assertNotNull(cachedUri)
+        assertEquals("1", cachedUri!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+
+        val coldUriBefore = initial[1].mediaMetadata.artworkUri
+        assertNotNull(coldUriBefore)
+        assertNull(coldUriBefore!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+
+        // Simulate background prefetch caching cov-cold and notifyChildrenChanged() reloading the grid.
+        core.coverArtPaths["cov-cold"] = "/cache/cover_art/cov-cold.jpg"
+        val refreshed = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.LIB_RECENT,
+            page = 0,
+            pageSize = 20,
+            artAuthority = authority,
+        )
+        val coldUriAfter = refreshed[1].mediaMetadata.artworkUri
+        assertNotNull(coldUriAfter)
+        assertEquals("1", coldUriAfter!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+        assertFalse(
+            "Cached URI must differ from cold URI to bust Android Auto's bitmap cache",
+            coldUriBefore.toString() == coldUriAfter.toString(),
+        )
     }
 }

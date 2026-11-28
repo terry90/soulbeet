@@ -3,8 +3,8 @@
 use client_core::models::PinTarget;
 use dioxus::prelude::*;
 use ui::{
-    use_player, IconCloudCheck, IconCompass, IconDownload, IconListPlus, IconMusic, IconPlay,
-    IconRefreshCw, IconSparkles, StudioNavSection, TrackRow, TrackRowState,
+    use_player, ArtFallbackKind, CoverImage, IconCloudCheck, IconCompass, IconDownload,
+    IconListPlus, IconPlay, IconRefreshCw, IconSparkles, StudioNavSection, TrackRow, TrackRowState,
 };
 
 use crate::desktop_state::{
@@ -112,10 +112,11 @@ pub fn HomeView() -> Element {
                                         class: "group rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 flex flex-col gap-2 transition-colors cursor-pointer",
                                         onclick: move |_| studio.open_album_detail(album_id_open.clone()),
                                         div { class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center",
-                                            if let Some(url) = art_url {
-                                                img { src: "{url}", alt: "{album.name}", class: "w-full h-full object-cover" }
-                                            } else {
-                                                IconMusic { size: 28, class: "text-beet-text-disabled".to_string() }
+                                            CoverImage {
+                                                src: art_url,
+                                                alt: album.name.clone(),
+                                                kind: ArtFallbackKind::Album,
+                                                icon_size: 28,
                                             }
                                             button {
                                                 r#type: "button",

@@ -234,7 +234,7 @@ internal fun mixSleeveSpecFor(slug: String): MixSleeveSpec = when (normalizeMixS
     )
 
     // --- Moments & Weekdays (8) ---
-    "drive" -> MixSleeveSpec(
+    "drive", "drive_mix" -> MixSleeveSpec(
         motif = MixMotif.DRIVE,
         gradientStart = Color(0xFF121C2E),
         gradientMid = Color(0xFF1B0E30),
