@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,8 +12,10 @@ use shared::search_norm::{
     album_dedup_key, base_song_title_key, canonical_artist_key, classify_track_variant,
     fold_search_text, track_dedup_key, TrackVariantKind,
 };
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::sync::RwLock;
+
+const MAX_SEARCH_TOKENS: usize = 16;
 
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
@@ -463,15 +465,20 @@ impl SearchEngine {
         offline_only: bool,
     ) -> CoreResult<Vec<LocalAlbum>> {
         let folded_query = fold_search_text(trimmed);
-        let tokens: Vec<&str> = folded_query.split_whitespace().collect();
+        let tokens: Vec<&str> = folded_query
+            .split_whitespace()
+            .take(MAX_SEARCH_TOKENS)
+            .collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
 
-        let all_albums = if offline_only {
-            sqlx::query_as::<_, LocalAlbum>(
+        // Scan only lightweight (id, name, artist_name) columns for diacritic-folded matching,
+        // then hydrate at most `cap` full `LocalAlbum` rows.
+        let candidates: Vec<(String, String, String)> = if offline_only {
+            sqlx::query_as(
                 r#"
-                SELECT DISTINCT a.*
+                SELECT DISTINCT a.id, a.name, a.artist_name
                 FROM albums a
                 INNER JOIN tracks t ON t.album_id = a.id
                 INNER JOIN offline_downloads od ON od.track_id = t.id
@@ -481,27 +488,41 @@ impl SearchEngine {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, LocalAlbum>(
-                r#"
-                SELECT * FROM albums
-                ORDER BY name COLLATE NOCASE ASC
-                "#,
-            )
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query_as("SELECT id, name, artist_name FROM albums ORDER BY name COLLATE NOCASE ASC")
+                .fetch_all(&self.pool)
+                .await?
         };
 
-        Ok(all_albums
+        let matched_ids: Vec<String> = candidates
             .into_iter()
-            .filter(|album| {
+            .filter(|(_, name, artist_name)| {
                 let haystack = format!(
                     "{} {}",
-                    fold_search_text(&album.name),
-                    fold_search_text(&album.artist_name)
+                    fold_search_text(name),
+                    fold_search_text(artist_name)
                 );
                 tokens.iter().all(|tok| haystack.contains(tok))
             })
             .take(cap)
+            .map(|(id, _, _)| id)
+            .collect();
+
+        if matched_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM albums WHERE id IN (");
+        let mut sep = qb.separated(", ");
+        for id in &matched_ids {
+            sep.push_bind(id);
+        }
+        sep.push_unseparated(")");
+        let rows = qb.build_query_as::<LocalAlbum>().fetch_all(&self.pool).await?;
+        let mut by_id: HashMap<String, LocalAlbum> =
+            rows.into_iter().map(|a| (a.id.clone(), a)).collect();
+        Ok(matched_ids
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
             .collect())
     }
 
@@ -512,15 +533,20 @@ impl SearchEngine {
         offline_only: bool,
     ) -> CoreResult<Vec<LocalArtist>> {
         let folded_query = fold_search_text(trimmed);
-        let tokens: Vec<&str> = folded_query.split_whitespace().collect();
+        let tokens: Vec<&str> = folded_query
+            .split_whitespace()
+            .take(MAX_SEARCH_TOKENS)
+            .collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
 
-        let all_artists = if offline_only {
-            sqlx::query_as::<_, LocalArtist>(
+        // Scan only lightweight (id, name) columns for diacritic-folded matching,
+        // then hydrate at most `cap` full `LocalArtist` rows.
+        let candidates: Vec<(String, String)> = if offline_only {
+            sqlx::query_as(
                 r#"
-                SELECT DISTINCT ar.*
+                SELECT DISTINCT ar.id, ar.name
                 FROM artists ar
                 INNER JOIN tracks t ON t.artist_id = ar.id
                 INNER JOIN offline_downloads od ON od.track_id = t.id
@@ -530,23 +556,37 @@ impl SearchEngine {
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, LocalArtist>(
-                r#"
-                SELECT * FROM artists
-                ORDER BY name COLLATE NOCASE ASC
-                "#,
-            )
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query_as("SELECT id, name FROM artists ORDER BY name COLLATE NOCASE ASC")
+                .fetch_all(&self.pool)
+                .await?
         };
 
-        Ok(all_artists
+        let matched_ids: Vec<String> = candidates
             .into_iter()
-            .filter(|artist| {
-                let haystack = fold_search_text(&artist.name);
+            .filter(|(_, name)| {
+                let haystack = fold_search_text(name);
                 tokens.iter().all(|tok| haystack.contains(tok))
             })
             .take(cap)
+            .map(|(id, _)| id)
+            .collect();
+
+        if matched_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM artists WHERE id IN (");
+        let mut sep = qb.separated(", ");
+        for id in &matched_ids {
+            sep.push_bind(id);
+        }
+        sep.push_unseparated(")");
+        let rows = qb.build_query_as::<LocalArtist>().fetch_all(&self.pool).await?;
+        let mut by_id: HashMap<String, LocalArtist> =
+            rows.into_iter().map(|a| (a.id.clone(), a)).collect();
+        Ok(matched_ids
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
             .collect())
     }
 
@@ -638,11 +678,15 @@ fn parse_release_year(release_date: Option<&str>) -> Option<u32> {
 }
 
 /// Converts arbitrary user input into a safe FTS5 prefix-matching query string.
-/// Punctuation and FTS operators are stripped so user text can never cause syntax errors.
+/// Strips Unicode combining diacritical marks first (so NFD `"Noe\u{0308}l"` stays one token
+/// instead of splitting at the combining mark), strips punctuation and FTS operators, and caps
+/// the token count to prevent FTS5 query DoS.
 pub fn build_fts5_query(raw: &str) -> Option<String> {
-    let tokens: Vec<String> = raw
+    let normalized = shared::recommendation::without_marks(raw);
+    let tokens: Vec<String> = normalized
         .split(|c: char| !c.is_alphanumeric())
         .filter(|tok| !tok.is_empty())
+        .take(MAX_SEARCH_TOKENS)
         .map(|tok| format!("\"{}\"*", tok.replace('"', "")))
         .collect();
     if tokens.is_empty() {
@@ -797,5 +841,26 @@ mod tests {
         let kept = deduplicate_albums_against_owned(&owned, remote);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "a2");
+    }
+
+    #[test]
+    fn build_fts5_query_handles_nfd_diacritics_and_caps_tokens() {
+        // NFD combining diaeresis must NOT split "Noe\u{0308}l" or "O\u{0308}yster".
+        assert_eq!(
+            build_fts5_query("Noe\u{0308}l O\u{0308}yster"),
+            Some("\"Noel\"* \"Oyster\"*".to_string())
+        );
+        assert_eq!(
+            build_fts5_query("Noël Öyster"),
+            Some("\"Noel\"* \"Oyster\"*".to_string())
+        );
+
+        // Huge pasted input is capped at MAX_SEARCH_TOKENS (16).
+        let huge = (0..100)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let q = build_fts5_query(&huge).unwrap();
+        assert_eq!(q.split_whitespace().count(), MAX_SEARCH_TOKENS);
     }
 }

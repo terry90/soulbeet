@@ -1438,10 +1438,15 @@ async fn full_and_delta_sync_populates_mirror_normalizes_triage_prunes_playlists
     let s3 = get_track(core.pool(), "s3").await.unwrap().unwrap();
     assert!(!s3.is_discovery);
 
-    // 5. Bootstrap returning navidrome: None clears cached credentials
+    // 5. Bootstrap transiently returning navidrome: None preserves cached credentials
     state
         .bootstrap_returns_no_navidrome
         .store(true, Ordering::SeqCst);
+    let preserved = core.sync_now(false).await.unwrap();
+    assert!(!preserved.full_sync);
+
+    // Explicit auth rejection (HTTP 401 from bootstrap) clears cached Navidrome credentials.
+    *state.accepted_auth_token.lock().await = "rotated-token".to_string();
     let err = core.sync_now(false).await.unwrap_err();
     assert!(matches!(err, CoreError::NotConfigured("navidrome credentials")));
 }
@@ -2848,4 +2853,489 @@ async fn discovery_triage_sync_hydrates_rating_when_present_and_preserves_existi
         5,
         "pending outbox rating on discovery track must not be overwritten by triage hydration"
     );
+}
+
+#[tokio::test]
+async fn hardening_cache_pin_persistence_part_sweep_cover_art_lru_and_prefetch_resilience() {
+    let state = Arc::new(StubState::default());
+    let base_url = start_stub_server(state.clone()).await;
+    let dir = TempDir::new().unwrap();
+
+    // Seed orphaned .part files BEFORE init so init sweeps them.
+    let audio_dir = dir.path().join("audio_cache");
+    let art_dir = dir.path().join("cover_art");
+    std::fs::create_dir_all(&audio_dir).unwrap();
+    std::fs::create_dir_all(&art_dir).unwrap();
+    let orphan_audio = audio_dir.join("stale.1234.part");
+    let orphan_art = art_dir.join("stale-art.5678.part");
+    std::fs::write(&orphan_audio, b"partial").unwrap();
+    std::fs::write(&orphan_art, b"partial").unwrap();
+
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url.clone()), 10_000_000))
+        .await
+        .unwrap();
+    assert!(!orphan_audio.exists(), "init must sweep orphaned audio .part");
+    assert!(!orphan_art.exists(), "init must sweep orphaned cover art .part");
+
+    core.sync_now(true).await.unwrap();
+
+    // Explicit track pin via download_track(..., pinned: true, ...) must survive pin()/unpin() on another target.
+    let dl = core
+        .download_track("s1", &AudioQualityProfile::LosslessFlac, true, Some("manual"))
+        .await
+        .unwrap();
+    assert!(dl.pinned);
+
+    core.pin(&PinTarget::Album("al1".to_string())).await.unwrap();
+    core.unpin(&PinTarget::Album("al1".to_string()))
+        .await
+        .unwrap();
+
+    let pinned_flag: i64 =
+        sqlx::query_scalar("SELECT pinned FROM offline_downloads WHERE track_id = 's1'")
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        pinned_flag, 1,
+        "explicit track pin must NOT be silently cleared by unpinning another target"
+    );
+
+    // Cover art LRU touch on cache hit + cover_art_max_bytes enforcement in set_cache_policy.
+    let art1 = core.get_or_fetch_cover_art("ca-1", Some(300)).await.unwrap();
+    let art2 = core.get_or_fetch_cover_art("ca-2", Some(300)).await.unwrap();
+    assert!(art1.exists() && art2.exists());
+
+    // Force ca-1 to look older, then hit it via get_or_fetch_cover_art so its last_accessed_at jumps ahead of ca-2.
+    sqlx::query("UPDATE cover_art_cache SET last_accessed_at = 100 WHERE cover_art_id = 'ca-1'")
+        .execute(core.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cover_art_cache SET last_accessed_at = 200 WHERE cover_art_id = 'ca-2'")
+        .execute(core.pool())
+        .await
+        .unwrap();
+
+    let (_, newly_fetched) = core
+        .get_or_fetch_cover_art_with_status("ca-1", Some(300))
+        .await
+        .unwrap();
+    assert!(!newly_fetched);
+    let ts1: i64 =
+        sqlx::query_scalar("SELECT last_accessed_at FROM cover_art_cache WHERE cover_art_id = 'ca-1'")
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert!(ts1 > 200, "cover art cache hit must bump last_accessed_at");
+
+    // Shrink cover_art_max_bytes to fit only 1 image (~12 bytes) -> ca-2 (older) evicted, ca-1 kept.
+    let art1_size = std::fs::metadata(&art1).unwrap().len();
+    let mut pol = core.cache_policy().await;
+    pol.cover_art_max_bytes = art1_size;
+    core.set_cache_policy(pol).await.unwrap();
+    assert!(art1.exists(), "recently accessed ca-1 must survive cover-art LRU eviction");
+    assert!(!art2.exists(), "older ca-2 must be evicted when set_cache_policy lowers cover_art_max_bytes");
+
+    // Prefetch batch resilience: if the first track returns an error (404),
+    // the remaining track in the batch must still download.
+    let app = Router::new().route(
+        "/rest/download",
+        get(|Query(q): Query<HashMap<String, String>>| async move {
+            if q.get("id").map(String::as_str) == Some("missing-404") {
+                return (StatusCode::NOT_FOUND, "not found").into_response();
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "audio/flac")],
+                b"fLaCPREFETCHOK".to_vec(),
+            )
+                .into_response()
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    core.set_navidrome_credentials(NavidromeCredentials {
+        base_url: format!("http://{addr}"),
+        username: "alice".into(),
+        subsonic_salt: "s".into(),
+        subsonic_token: "t".into(),
+        api_version: "1.16.1".into(),
+        client_name: "Soulbeet".into(),
+    })
+    .await;
+
+    let queue = vec![
+        "current".to_string(),
+        "missing-404".to_string(),
+        "good-next".to_string(),
+    ];
+    let downloaded = core
+        .prefetch_queue(&queue, 0, &AudioQualityProfile::LosslessFlac, true)
+        .await
+        .unwrap();
+    assert_eq!(downloaded, vec!["good-next".to_string()]);
+}
+
+#[tokio::test]
+async fn hardening_outbox_concurrency_dead_letter_retry_after_and_url_redaction() {
+    // Custom server tracking dispatch count, returning 429 + Retry-After, and permanent Subsonic codes.
+    let scrobble_hits = Arc::new(AtomicUsize::new(0));
+    let subsonic_error_code = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let rate_limit_429 = Arc::new(AtomicBool::new(false));
+
+    let app = Router::new()
+        .route(
+            "/rest/scrobble",
+            get({
+                let scrobble_hits = scrobble_hits.clone();
+                let subsonic_error_code = subsonic_error_code.clone();
+                move || {
+                    let scrobble_hits = scrobble_hits.clone();
+                    let subsonic_error_code = subsonic_error_code.clone();
+                    async move {
+                        let code = subsonic_error_code.load(Ordering::SeqCst);
+                        if code != 0 {
+                            return Json(json!({
+                                "subsonic-response": {
+                                    "status": "failed",
+                                    "error": { "code": code, "message": "permanent failure" }
+                                }
+                            }));
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        scrobble_hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "subsonic-response": { "status": "ok" } }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/curation/star",
+            post({
+                let rate_limit_429 = rate_limit_429.clone();
+                move || {
+                    let rate_limit_429 = rate_limit_429.clone();
+                    async move {
+                        if rate_limit_429.load(Ordering::SeqCst) {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [("retry-after", "45")],
+                                "slow down",
+                            )
+                                .into_response();
+                        }
+                        (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response()
+                    }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = TempDir::new().unwrap();
+    let core = Arc::new(
+        SoulbeetCore::init(ClientConfig {
+            db_path: dir.path().join("client.db"),
+            cache_dir: dir.path().join("audio"),
+            cover_art_dir: dir.path().join("art"),
+            soulbeet_base_url: Some(base_url.clone()),
+            soulbeet_auth: Some(SoulbeetAuth::Bearer("tok".into())),
+            navidrome: Some(NavidromeCredentials {
+                base_url: base_url.clone(),
+                username: "alice".into(),
+                subsonic_salt: "secret-salt-xyz".into(),
+                subsonic_token: "secret-token-abc".into(),
+                api_version: "1.16.1".into(),
+                client_name: "Soulbeet".into(),
+            }),
+            device_id: "d1".into(),
+            device_name: "D1".into(),
+            platform: DevicePlatform::Desktop,
+            offline_only: false,
+            cache_policy: CachePolicy::default(),
+        })
+        .await
+        .unwrap(),
+    );
+
+    // 1. Concurrent drain_outbox() calls must dispatch each scrobble exactly once.
+    core.enqueue_mutation(OutboxMutation::Scrobble {
+        song_id: "s-conc".into(),
+        submission: true,
+        played_at_unix: now_unix(),
+    })
+    .await
+    .unwrap();
+    let (r1, r2) = tokio::join!(core.drain_outbox(), core.drain_outbox());
+    let total_replayed = r1.unwrap().replayed + r2.unwrap().replayed;
+    assert_eq!(total_replayed, 1);
+    assert_eq!(scrobble_hits.load(Ordering::SeqCst), 1);
+
+    // 2. Permanent Subsonic error code 50 (not authorized) is dead-lettered immediately.
+    subsonic_error_code.store(50, Ordering::SeqCst);
+    core.enqueue_mutation(OutboxMutation::Scrobble {
+        song_id: "s-perm50".into(),
+        submission: true,
+        played_at_unix: now_unix(),
+    })
+    .await
+    .unwrap();
+    let rep = core.drain_outbox().await.unwrap();
+    assert_eq!(rep.failed, 1);
+    assert_eq!(rep.remaining, 0);
+    assert_eq!(core.dead_letter_outbox().await.unwrap().len(), 1);
+
+    // 3. HTTP 429 Retry-After: 45 is honored in next_retry_at, and negative attempts never panics.
+    rate_limit_429.store(true, Ordering::SeqCst);
+    let seq = core
+        .enqueue_mutation(OutboxMutation::Star {
+            song_id: "s-429".into(),
+            starred: true,
+            discovery_track_id: None,
+        })
+        .await
+        .unwrap();
+    // Corrupt attempts to negative to verify shift clamping never panics.
+    sqlx::query("UPDATE mutation_outbox SET attempts = -5 WHERE seq = ?")
+        .bind(seq)
+        .execute(core.pool())
+        .await
+        .unwrap();
+    let before = now_unix();
+    let rep = core.drain_outbox().await.unwrap();
+    assert_eq!(rep.failed, 1);
+    assert_eq!(rep.remaining, 1);
+    let next_retry: i64 =
+        sqlx::query_scalar("SELECT next_retry_at FROM mutation_outbox WHERE seq = ?")
+            .bind(seq)
+            .fetch_one(core.pool())
+            .await
+            .unwrap();
+    assert!(
+        next_retry >= before + 45,
+        "429 Retry-After: 45 must push next_retry_at >= before+45 (got delta={})",
+        next_retry - before
+    );
+
+    // 4. Max attempts cap (20) dead-letters persistent 500 errors.
+    rate_limit_429.store(false, Ordering::SeqCst);
+    sqlx::query("UPDATE mutation_outbox SET attempts = 19, next_retry_at = 0 WHERE seq = ?")
+        .bind(seq)
+        .execute(core.pool())
+        .await
+        .unwrap();
+    let rep = core.drain_outbox().await.unwrap();
+    assert_eq!(rep.failed, 1);
+    assert_eq!(rep.remaining, 0);
+    let dead: i64 = sqlx::query_scalar("SELECT dead_letter FROM mutation_outbox WHERE seq = ?")
+        .bind(seq)
+        .fetch_one(core.pool())
+        .await
+        .unwrap();
+    assert_eq!(dead, 1, "reaching max attempts must dead-letter mutation");
+
+    // 5. reqwest::Error URL credential redaction: connect failure on closed port must NOT leak t=/s=.
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener);
+    let sub = client_core::subsonic::SubsonicClient::new(
+        reqwest::Client::new(),
+        NavidromeCredentials {
+            base_url: format!("http://127.0.0.1:{closed_port}"),
+            username: "alice".into(),
+            subsonic_salt: "super-secret-salt".into(),
+            subsonic_token: "super-secret-token".into(),
+            api_version: "1.16.1".into(),
+            client_name: "Soulbeet".into(),
+        },
+    );
+    let err = sub.get_artists().await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("super-secret-token") && !msg.contains("super-secret-salt"),
+        "CoreError::Http leaked Subsonic credentials: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn hardening_fts5_nfd_auto_the_sort_corrupt_session_and_full_sync_prune() {
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, None, 10_000_000))
+        .await
+        .unwrap();
+    let now = now_unix();
+
+    // 1. FTS5 search matches NFD decomposed "Noe\u{0308}l" against precomposed "Noël".
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "t-noel".into(),
+            title: "Chant de Noël".into(),
+            artist_id: Some("ar-noel".into()),
+            artist_name: "Blue Öyster Cult".into(),
+            album_id: Some("al-noel".into()),
+            album_name: "Winter".into(),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: 200,
+            year: Some(2025),
+            genre: Some("Rock".into()),
+            bit_rate: None,
+            suffix: None,
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: None,
+            path: None,
+            starred: false,
+            user_rating: 0,
+            play_count: 1,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    let nfd_res = core
+        .search_local("Noe\u{0308}l O\u{0308}yster", 10)
+        .await
+        .unwrap();
+    assert_eq!(nfd_res.local_tracks.len(), 1);
+    assert_eq!(nfd_res.local_tracks[0].id, "t-noel");
+
+    // 2. Android Auto A-Z bucket sorts "The Beatles" under B, ahead of 55 "D..." artists.
+    upsert_artist(
+        core.pool(),
+        &LocalArtist {
+            id: "ar-beatles".into(),
+            name: "The Beatles".into(),
+            album_count: 12,
+            cover_art_id: None,
+            starred: false,
+            musicbrainz_id: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    for i in 0..55 {
+        upsert_artist(
+            core.pool(),
+            &LocalArtist {
+                id: format!("ar-d-{i:02}"),
+                name: format!("D Artist {i:02}"),
+                album_count: 1,
+                cover_art_id: None,
+                starred: false,
+                musicbrainz_id: None,
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let az_ad = core.auto_children("az:a-d").await.unwrap();
+    assert_eq!(az_ad.len(), 50);
+    assert_eq!(
+        az_ad[0].title, "The Beatles",
+        "\"The Beatles\" must sort under B ahead of D artists instead of being dropped at T"
+    );
+
+    // 3. Corrupt playback_session JSON resets cleanly to Ok(None) instead of bricking boot.
+    sqlx::query(
+        "INSERT OR REPLACE INTO playback_session (id, queue_json, current_index, position_ms, is_playing, source_label, updated_at) VALUES (1, '{not-json', 0, 0, 0, NULL, ?)",
+    )
+    .bind(now)
+    .execute(core.pool())
+    .await
+    .unwrap();
+    let loaded = core.load_playback_session().await.unwrap();
+    assert!(loaded.is_none(), "corrupt playback_session must recover as Ok(None)");
+
+    // 4. force_full sync prunes deleted tracks, albums, and artists from local mirror.
+    let state = Arc::new(StubState::default());
+    let base_url = start_stub_server(state.clone()).await;
+    core.set_navidrome_credentials(NavidromeCredentials {
+        base_url,
+        username: "alice".into(),
+        subsonic_salt: "s".into(),
+        subsonic_token: "t".into(),
+        api_version: "1.16.1".into(),
+        client_name: "Soulbeet".into(),
+    })
+    .await;
+    core.sync_now(true).await.unwrap();
+    assert!(
+        get_track(core.pool(), "t-noel").await.unwrap().is_none(),
+        "force_full must prune tracks absent from Navidrome"
+    );
+    assert!(
+        core.get_artist("ar-beatles").await.unwrap().is_none(),
+        "force_full must prune artists absent from Navidrome"
+    );
+    assert!(get_track(core.pool(), "s1").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn hardening_connect_ws_clamps_heartbeat_and_stops_reconnect_on_401() {
+    let connect_attempts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/api/ws/connect",
+        get({
+            let connect_attempts = connect_attempts.clone();
+            move |ws: WebSocketUpgrade| {
+                let connect_attempts = connect_attempts.clone();
+                async move {
+                    let n = connect_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        // Accept first connection, then drop immediately to trigger reconnect.
+                        ws.on_upgrade(|mut socket| async move {
+                            let _ = socket.send(Message::Close(None)).await;
+                        })
+                        .into_response()
+                    } else {
+                        // Reject all reconnects with 401 Unauthorized.
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 1_000_000))
+        .await
+        .unwrap();
+
+    // Passing Duration::from_secs(u64::MAX) must clamp safely and never panic.
+    core.connect_ws(Duration::from_secs(u64::MAX)).await.unwrap();
+
+    // Wait long enough for 1s initial backoff reconnect (attempt #2 -> 401) and verify it does NOT
+    // keep reconnecting on attempt #3.
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    let attempts = connect_attempts.load(Ordering::SeqCst);
+    assert_eq!(
+        attempts, 2,
+        "reconnect supervisor must stop after receiving HTTP 401 (attempts={attempts})"
+    );
+    assert!(!core.connect_state().await.connected);
+    core.disconnect_ws().await;
 }

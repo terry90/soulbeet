@@ -229,7 +229,10 @@ where
         where
             E: de::Error,
         {
-            self.visit_u64(value as u64)
+            match u64::try_from(value) {
+                Ok(v) => self.visit_u64(v),
+                Err(_) => Ok(vec![DownloadState::Unknown(format!("bitfield:{value}"))]),
+            }
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -538,8 +541,8 @@ impl From<TrackResult> for crate::download::DownloadableItem {
             title: track.title,
             artist: track.artist,
             album: track.album,
-            size: Some(track.base.size as u64),
-            duration: track.base.duration.map(|d| d as u32),
+            size: u64::try_from(track.base.size).ok(),
+            duration: track.base.duration.and_then(|d| u32::try_from(d).ok()),
             quality: track.base.quality(),
             quality_score: track.base.quality_score(),
             backend_data: Some(serde_json::to_string(&track.base).unwrap_or_default()),
@@ -578,7 +581,7 @@ impl From<AlbumResult> for crate::download::DownloadableGroup {
             title: album.album_title,
             artist: album.artist,
             item_count: album.track_count,
-            total_size: album.total_size as u64,
+            total_size: album.total_size.max(0) as u64,
             items: album.tracks.into_iter().map(Into::into).collect(),
             quality: album.dominant_quality,
             score: album.score,
@@ -1751,5 +1754,58 @@ mod tests {
                 "unrecognized state {state} mapped to {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn negative_bitfield_and_peer_sizes_never_wrap() {
+        // Negative bitfield must never wrap to u64 and accidentally match Completed|Succeeded.
+        let got = mapped(json!(-1i64));
+        assert!(
+            matches!(got, DS::Queued),
+            "negative bitfield mapped to {got:?}"
+        );
+
+        let track = TrackResult {
+            base: SearchResult {
+                username: "peer".into(),
+                filename: "Music/song.flac".into(),
+                size: -512,
+                bitrate: Some(-320),
+                duration: Some(-180),
+                sample_rate: Some(-44100),
+                bit_depth: Some(-16),
+                has_free_upload_slot: true,
+                upload_speed: -100,
+                queue_length: -5,
+                variable_bit_rate: None,
+                declared_extension: None,
+                folder_audio_files: 1,
+            },
+            artist: "Artist".into(),
+            title: "Song".into(),
+            album: "Album".into(),
+            match_score: 0.9,
+            below_floor: false,
+        };
+        let item: crate::download::DownloadableItem = track.clone().into();
+        assert_eq!(item.size, None);
+        assert_eq!(item.duration, None);
+
+        let album = AlbumResult {
+            username: "peer".into(),
+            album_path: "Music".into(),
+            album_title: "Album".into(),
+            artist: Some("Artist".into()),
+            track_count: 1,
+            total_size: -1024,
+            tracks: vec![track],
+            dominant_quality: "flac".into(),
+            has_free_upload_slot: true,
+            upload_speed: 0,
+            queue_length: 0,
+            score: 0.9,
+        };
+        let group: crate::download::DownloadableGroup = album.into();
+        assert_eq!(group.total_size, 0);
     }
 }
