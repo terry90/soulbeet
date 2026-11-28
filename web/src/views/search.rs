@@ -1841,7 +1841,7 @@ pub fn SearchPage() -> Element {
                                                         "No tracklist available for this release."
                                                     }
                                                 } else {
-                                                    ul { class: "list-none p-0 divide-y divide-beet-border-subtle/60",
+                                                    ul { class: "list-none p-0 space-y-0.5",
                                                         for (idx, track) in det.tracks.iter().enumerate() {
                                                             {
                                                                 let track_acq = track.clone();
@@ -3258,7 +3258,7 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
                             }
                         },
                         Some(detail) => rsx! {
-                            ul { class: "list-none p-0 divide-y divide-beet-border-subtle/60",
+                            ul { class: "list-none p-0 space-y-0.5",
                                 for (idx, track) in detail.tracks.iter().enumerate() {
                                     {
                                         let track_acq = track.clone();
