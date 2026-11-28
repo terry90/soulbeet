@@ -78,6 +78,7 @@ impl SoulbeetCore {
             config.cache_policy.clone(),
             navidrome.clone(),
         );
+        cache.sweep_orphaned_parts().await;
         let outbox = MutationOutbox::new(
             pool.clone(),
             http.clone(),
@@ -180,6 +181,17 @@ impl SoulbeetCore {
         self.sync.sync(force_full).await
     }
 
+    pub async fn sync_now_cancellable(
+        &self,
+        force_full: bool,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<SyncReport> {
+        if self.is_offline_only() {
+            return Err(CoreError::Offline("sync disabled in offline_only mode".into()));
+        }
+        self.sync.sync_cancellable(force_full, cancelled).await
+    }
+
     // --- Local Library Queries (Zero Network) ---
 
     pub async fn get_track(&self, track_id: &str) -> CoreResult<Option<LocalTrack>> {
@@ -262,6 +274,24 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn download_track_cancellable(
+        &self,
+        track_id: &str,
+        profile: &AudioQualityProfile,
+        pinned: bool,
+        pin_source: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<OfflineTrackEntry> {
+        if self.is_offline_only() {
+            return Err(CoreError::Offline(
+                "downloads disabled in offline_only mode".into(),
+            ));
+        }
+        self.cache
+            .download_track_cancellable(track_id, profile, pinned, pin_source, cancelled)
+            .await
+    }
+
     pub async fn prefetch_queue(
         &self,
         queue_track_ids: &[String],
@@ -277,6 +307,22 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn prefetch_queue_cancellable(
+        &self,
+        queue_track_ids: &[String],
+        current_index: usize,
+        profile: &AudioQualityProfile,
+        is_wifi: bool,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<Vec<String>> {
+        if self.is_offline_only() {
+            return Ok(Vec::new());
+        }
+        self.cache
+            .prefetch_queue_cancellable(queue_track_ids, current_index, profile, is_wifi, cancelled)
+            .await
+    }
+
     pub async fn run_auto_cache_rules(
         &self,
         profile: &AudioQualityProfile,
@@ -286,6 +332,20 @@ impl SoulbeetCore {
             return Ok(Vec::new());
         }
         self.cache.run_auto_cache_rules(profile, is_wifi).await
+    }
+
+    pub async fn run_auto_cache_rules_cancellable(
+        &self,
+        profile: &AudioQualityProfile,
+        is_wifi: bool,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<Vec<String>> {
+        if self.is_offline_only() {
+            return Ok(Vec::new());
+        }
+        self.cache
+            .run_auto_cache_rules_cancellable(profile, is_wifi, cancelled)
+            .await
     }
 
     pub async fn pin(&self, target: &PinTarget) -> CoreResult<Vec<String>> {
@@ -384,6 +444,20 @@ impl SoulbeetCore {
             });
         }
         self.outbox.drain().await
+    }
+
+    pub async fn drain_outbox_cancellable(
+        &self,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<DrainReport> {
+        if self.is_offline_only() {
+            return Ok(DrainReport {
+                replayed: 0,
+                failed: 0,
+                remaining: self.outbox.pending_count().await?,
+            });
+        }
+        self.outbox.drain_cancellable(cancelled).await
     }
 
     // --- Unified Search & Android Auto ---

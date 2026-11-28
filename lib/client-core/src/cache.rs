@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::StreamExt;
 use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 use uuid::Uuid;
 
 use crate::db::now_unix;
@@ -20,6 +21,47 @@ use crate::subsonic::{
     is_subsonic_error_content_type, parse_subsonic_error_bytes, SubsonicClient,
 };
 
+/// RAII guard that removes an in-progress `.part` file on error, cancellation, or drop
+/// unless explicitly disarmed after a successful atomic `rename`.
+struct PartFileGuard {
+    path: PathBuf,
+    active_parts: Arc<StdMutex<HashSet<PathBuf>>>,
+    armed: bool,
+}
+
+impl PartFileGuard {
+    fn new(path: PathBuf, active_parts: Arc<StdMutex<HashSet<PathBuf>>>) -> Self {
+        {
+            let mut guard = active_parts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.insert(path.clone());
+        }
+        Self {
+            path,
+            active_parts,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        let mut guard = self
+            .active_parts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&self.path);
+    }
+}
+
 /// Manages offline audio downloads, profile-aware streaming URLs, explicit pinning,
 /// disk-budget LRU eviction (never evicting pinned tracks), and local cover-art caching.
 #[derive(Clone)]
@@ -30,6 +72,8 @@ pub struct CacheManager {
     cover_art_dir: PathBuf,
     policy: Arc<RwLock<CachePolicy>>,
     navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
+    cache_lock: Arc<TokioMutex<()>>,
+    active_parts: Arc<StdMutex<HashSet<PathBuf>>>,
 }
 
 impl CacheManager {
@@ -48,6 +92,16 @@ impl CacheManager {
             cover_art_dir,
             policy: Arc::new(RwLock::new(policy)),
             navidrome,
+            cache_lock: Arc::new(TokioMutex::new(())),
+            active_parts: Arc::new(StdMutex::new(HashSet::new())),
+        }
+    }
+
+    /// Removes orphaned `*.part` temporary files left behind by prior crashes or aborts,
+    /// while skipping any `.part` files currently owned by an active download guard.
+    pub async fn sweep_orphaned_parts(&self) {
+        for dir in [&self.cache_dir, &self.cover_art_dir] {
+            sweep_orphaned_parts_in_dir(dir, &self.active_parts).await;
         }
     }
 
@@ -56,8 +110,11 @@ impl CacheManager {
     }
 
     pub async fn set_policy(&self, policy: CachePolicy) -> CoreResult<()> {
+        let _guard = self.cache_lock.lock().await;
         *self.policy.write().await = policy;
-        self.enforce_budget().await?;
+        self.sweep_orphaned_parts().await;
+        self.enforce_budget_locked(None).await?;
+        self.enforce_cover_art_budget_locked(None).await?;
         Ok(())
     }
 
@@ -69,34 +126,39 @@ impl CacheManager {
         profile: &AudioQualityProfile,
         offline_only: bool,
     ) -> CoreResult<PlaybackSource> {
-        let cached = sqlx::query_as::<_, OfflineTrackEntry>(
-            "SELECT * FROM offline_downloads WHERE track_id = ?",
-        )
-        .bind(track_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        {
+            let _guard = self.cache_lock.lock().await;
+            let cached = sqlx::query_as::<_, OfflineTrackEntry>(
+                "SELECT * FROM offline_downloads WHERE track_id = ?",
+            )
+            .bind(track_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
-        if let Some(entry) = cached {
-            if tokio::fs::try_exists(&entry.local_path)
-                .await
-                .unwrap_or(false)
-            {
-                sqlx::query("UPDATE offline_downloads SET last_accessed_at = ? WHERE track_id = ?")
+            if let Some(entry) = cached {
+                if tokio::fs::try_exists(&entry.local_path)
+                    .await
+                    .unwrap_or(false)
+                {
+                    sqlx::query(
+                        "UPDATE offline_downloads SET last_accessed_at = ? WHERE track_id = ?",
+                    )
                     .bind(now_unix())
                     .bind(track_id)
                     .execute(&self.pool)
                     .await?;
-                return Ok(PlaybackSource::LocalFile {
-                    path: entry.local_path,
-                    format: entry.format,
-                    bit_rate: entry.bit_rate.map(|b| b.max(0) as u32),
-                });
+                    return Ok(PlaybackSource::LocalFile {
+                        path: entry.local_path,
+                        format: entry.format,
+                        bit_rate: entry.bit_rate.map(|b| b.max(0) as u32),
+                    });
+                }
+                // Stale DB row whose backing file disappeared externally: prune row.
+                sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
+                    .bind(track_id)
+                    .execute(&self.pool)
+                    .await?;
             }
-            // Stale DB row whose backing file disappeared externally: prune row.
-            sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
-                .bind(track_id)
-                .execute(&self.pool)
-                .await?;
         }
 
         if offline_only {
@@ -121,6 +183,7 @@ impl CacheManager {
     /// Pins a track, album, artist, playlist, or dynamic collection (Starred / Weekly Radar / Seasonal).
     /// Returns the list of track IDs in this pin target that are not yet cached locally.
     pub async fn pin(&self, target: &PinTarget) -> CoreResult<Vec<String>> {
+        let _guard = self.cache_lock.lock().await;
         let (kind, id) = target.as_db_pair();
         sqlx::query(
             r#"
@@ -135,7 +198,7 @@ impl CacheManager {
         .execute(&self.pool)
         .await?;
 
-        self.recompute_pin_flags().await?;
+        self.recompute_pin_flags_locked().await?;
         let target_tracks = self.resolve_pin_target_tracks(target).await?;
         let cached: HashSet<String> =
             sqlx::query_scalar::<_, String>("SELECT track_id FROM offline_downloads")
@@ -153,6 +216,7 @@ impl CacheManager {
     /// Unpins a target and recomputes `pinned` flags across all remaining active pins.
     /// Enforces disk budget afterwards in case newly unpinned files exceed `max_bytes`.
     pub async fn unpin(&self, target: &PinTarget) -> CoreResult<usize> {
+        let _guard = self.cache_lock.lock().await;
         let (kind, id) = target.as_db_pair();
         sqlx::query("DELETE FROM offline_pins WHERE target_kind = ? AND target_id = ?")
             .bind(kind)
@@ -160,8 +224,8 @@ impl CacheManager {
             .execute(&self.pool)
             .await?;
 
-        self.recompute_pin_flags().await?;
-        self.enforce_budget().await
+        self.recompute_pin_flags_locked().await?;
+        self.enforce_budget_locked(None).await
     }
 
     /// Downloads a track according to the active audio quality profile (`FLAC Direct` or `Opus 160`).
@@ -174,6 +238,30 @@ impl CacheManager {
         pinned: bool,
         pin_source: Option<&str>,
     ) -> CoreResult<OfflineTrackEntry> {
+        let never = AtomicBool::new(false);
+        self.download_track_cancellable(track_id, profile, pinned, pin_source, &never)
+            .await
+    }
+
+    /// Cooperatively cancellable variant of [`Self::download_track`].
+    /// Checks `cancelled` during HTTP streaming (cleaning up the `.part` file via RAII guard),
+    /// while executing the rename + SQLite registration + budget eviction atomically under
+    /// `cache_lock`.
+    pub async fn download_track_cancellable(
+        &self,
+        track_id: &str,
+        profile: &AudioQualityProfile,
+        pinned: bool,
+        pin_source: Option<&str>,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<OfflineTrackEntry> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "download cancelled",
+            )));
+        }
+
         let creds = self
             .navidrome
             .read()
@@ -211,11 +299,19 @@ impl CacheManager {
             .cache_dir
             .join(format!("{safe_id}.{}.part", Uuid::new_v4()));
 
-        let write_result: CoreResult<u64> = async {
+        let mut part_guard = PartFileGuard::new(part_path.clone(), self.active_parts.clone());
+
+        let size_bytes: u64 = {
             let mut file = tokio::fs::File::create(&part_path).await?;
             let mut stream = resp.bytes_stream();
             let mut size_bytes: u64 = 0;
             while let Some(chunk) = stream.next().await {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(CoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "download cancelled",
+                    )));
+                }
                 let bytes = chunk?;
                 file.write_all(&bytes).await?;
                 size_bytes = size_bytes.saturating_add(bytes.len() as u64);
@@ -225,30 +321,49 @@ impl CacheManager {
             if size_bytes == 0 {
                 return Err(parse_subsonic_error_bytes(&[], content_type.as_deref()));
             }
-            tokio::fs::rename(&part_path, &final_path).await?;
-            Ok(size_bytes)
-        }
-        .await;
-
-        let size_bytes = match write_result {
-            Ok(n) => n,
-            Err(err) => {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                return Err(err);
-            }
+            size_bytes
         };
 
-        self.register_cached_file(
-            track_id,
-            &final_path,
-            profile.format_label(),
-            profile.max_bit_rate(),
-            size_bytes,
-            pinned,
-            pin_source,
-            now_unix(),
-        )
-        .await
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(CoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "download cancelled",
+            )));
+        }
+
+        let _guard = self.cache_lock.lock().await;
+        let prev_path: Option<String> =
+            sqlx::query_scalar("SELECT local_path FROM offline_downloads WHERE track_id = ?")
+                .bind(track_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        tokio::fs::rename(&part_path, &final_path).await?;
+        part_guard.disarm();
+
+        let new_path_str = final_path.display().to_string();
+        match self
+            .register_cached_file_locked(
+                track_id,
+                &final_path,
+                profile.format_label(),
+                profile.max_bit_rate(),
+                size_bytes,
+                pinned,
+                pin_source,
+                now_unix(),
+                prev_path.clone(),
+            )
+            .await
+        {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                if prev_path.as_deref() != Some(new_path_str.as_str()) {
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Registers a locally written audio file in `offline_downloads` and enforces the LRU budget
@@ -265,12 +380,39 @@ impl CacheManager {
         pin_source: Option<&str>,
         accessed_at: i64,
     ) -> CoreResult<OfflineTrackEntry> {
+        let _guard = self.cache_lock.lock().await;
         let prev_path: Option<String> =
             sqlx::query_scalar("SELECT local_path FROM offline_downloads WHERE track_id = ?")
                 .bind(track_id)
                 .fetch_optional(&self.pool)
                 .await?;
+        self.register_cached_file_locked(
+            track_id,
+            local_path,
+            format,
+            bit_rate,
+            size_bytes,
+            pinned,
+            pin_source,
+            accessed_at,
+            prev_path,
+        )
+        .await
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn register_cached_file_locked(
+        &self,
+        track_id: &str,
+        local_path: &Path,
+        format: &str,
+        bit_rate: Option<u32>,
+        size_bytes: u64,
+        pinned: bool,
+        pin_source: Option<&str>,
+        accessed_at: i64,
+        prev_path: Option<String>,
+    ) -> CoreResult<OfflineTrackEntry> {
         let effective_pinned = pinned || self.is_track_pinned_by_rules(track_id).await?;
         let new_path_str = local_path.display().to_string();
         let size_i64 = i64::try_from(size_bytes).unwrap_or(i64::MAX);
@@ -286,6 +428,23 @@ impl CacheManager {
             downloaded_at: accessed_at,
             last_accessed_at: accessed_at,
         };
+
+        let mut tx = self.pool.begin().await?;
+        if pinned {
+            // Persist explicit track pin in `offline_pins` so a later `pin()`/`unpin()` on
+            // another target running `recompute_pin_flags` never silently unpins this track.
+            sqlx::query(
+                r#"
+                INSERT INTO offline_pins (target_kind, target_id, pinned_at)
+                VALUES ('track', ?, ?)
+                ON CONFLICT(target_kind, target_id) DO UPDATE SET pinned_at = excluded.pinned_at
+                "#,
+            )
+            .bind(track_id)
+            .bind(accessed_at)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -313,8 +472,9 @@ impl CacheManager {
         .bind(&entry.pin_source)
         .bind(entry.downloaded_at)
         .bind(entry.last_accessed_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         if let Some(old_path) = prev_path {
             if old_path != new_path_str {
@@ -322,17 +482,19 @@ impl CacheManager {
             }
         }
 
-        self.enforce_budget_excluding(Some(track_id)).await?;
+        self.enforce_budget_locked(Some(track_id)).await?;
         Ok(entry)
     }
 
     /// Evicts unpinned audio entries in strict LRU order (`last_accessed_at ASC`) until total
     /// audio cache bytes are within `policy.max_bytes`. Pinned items are never evicted.
     pub async fn enforce_budget(&self) -> CoreResult<usize> {
-        self.enforce_budget_excluding(None).await
+        let _guard = self.cache_lock.lock().await;
+        self.sweep_orphaned_parts().await;
+        self.enforce_budget_locked(None).await
     }
 
-    async fn enforce_budget_excluding(
+    async fn enforce_budget_locked(
         &self,
         protected_track_id: Option<&str>,
     ) -> CoreResult<usize> {
@@ -346,9 +508,9 @@ impl CacheManager {
             return Ok(0);
         }
 
-        let candidates: Vec<(String, String, i64)> = sqlx::query_as(
+        let candidates: Vec<(String, String, i64, i64)> = sqlx::query_as(
             r#"
-            SELECT track_id, local_path, size_bytes
+            SELECT track_id, local_path, size_bytes, last_accessed_at
             FROM offline_downloads
             WHERE pinned = 0
             ORDER BY last_accessed_at ASC, downloaded_at ASC
@@ -358,20 +520,27 @@ impl CacheManager {
         .await?;
 
         let mut evicted = 0usize;
-        for (track_id, local_path, size_bytes) in candidates {
+        for (track_id, local_path, size_bytes, last_accessed_at) in candidates {
             if total <= max_bytes {
                 break;
             }
             if protected_track_id == Some(track_id.as_str()) {
                 continue;
             }
-            let _ = tokio::fs::remove_file(&local_path).await;
-            sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
-                .bind(&track_id)
-                .execute(&self.pool)
-                .await?;
-            total = (total - size_bytes).max(0);
-            evicted += 1;
+            // Guard eviction delete against concurrent pin or access touch; only unlink the
+            // backing file when this delete actually claimed the row.
+            let res = sqlx::query(
+                "DELETE FROM offline_downloads WHERE track_id = ? AND pinned = 0 AND last_accessed_at = ?",
+            )
+            .bind(&track_id)
+            .bind(last_accessed_at)
+            .execute(&self.pool)
+            .await?;
+            if res.rows_affected() > 0 {
+                let _ = tokio::fs::remove_file(&local_path).await;
+                total = (total - size_bytes).max(0);
+                evicted += 1;
+            }
         }
 
         Ok(evicted)
@@ -384,6 +553,19 @@ impl CacheManager {
         current_index: usize,
         profile: &AudioQualityProfile,
         is_wifi: bool,
+    ) -> CoreResult<Vec<String>> {
+        let never = AtomicBool::new(false);
+        self.prefetch_queue_cancellable(queue_track_ids, current_index, profile, is_wifi, &never)
+            .await
+    }
+
+    pub async fn prefetch_queue_cancellable(
+        &self,
+        queue_track_ids: &[String],
+        current_index: usize,
+        profile: &AudioQualityProfile,
+        is_wifi: bool,
+        cancelled: &AtomicBool,
     ) -> CoreResult<Vec<String>> {
         let policy = self.policy.read().await.clone();
         if policy.wifi_only_auto_cache && !is_wifi {
@@ -399,6 +581,9 @@ impl CacheManager {
 
         let mut downloaded = Vec::new();
         for track_id in &queue_track_ids[start..end] {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(1) FROM offline_downloads WHERE track_id = ?",
             )
@@ -408,9 +593,20 @@ impl CacheManager {
             if exists > 0 {
                 continue;
             }
-            self.download_track(track_id, profile, false, Some("prefetch"))
-                .await?;
-            downloaded.push(track_id.clone());
+            match self
+                .download_track_cancellable(track_id, profile, false, Some("prefetch"), cancelled)
+                .await
+            {
+                Ok(_) => downloaded.push(track_id.clone()),
+                Err(err @ CoreError::NotConfigured(_)) => return Err(err),
+                Err(_) if cancelled.load(Ordering::Relaxed) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        track_id = %track_id,
+                        "prefetch download failed; continuing batch: {err}"
+                    );
+                }
+            }
         }
         Ok(downloaded)
     }
@@ -420,6 +616,17 @@ impl CacheManager {
         &self,
         profile: &AudioQualityProfile,
         is_wifi: bool,
+    ) -> CoreResult<Vec<String>> {
+        let never = AtomicBool::new(false);
+        self.run_auto_cache_rules_cancellable(profile, is_wifi, &never)
+            .await
+    }
+
+    pub async fn run_auto_cache_rules_cancellable(
+        &self,
+        profile: &AudioQualityProfile,
+        is_wifi: bool,
+        cancelled: &AtomicBool,
     ) -> CoreResult<Vec<String>> {
         let policy = self.policy.read().await.clone();
         if policy.wifi_only_auto_cache && !is_wifi {
@@ -460,9 +667,27 @@ impl CacheManager {
 
         let mut completed = Vec::new();
         for (track_id, source) in to_download {
-            self.download_track(&track_id, profile, true, Some(&source))
-                .await?;
-            completed.push(track_id);
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            // Pass `pinned: false` here because the collection pin target was already recorded
+            // in `offline_pins` above; `register_cached_file_locked` computes `effective_pinned`
+            // from `offline_pins`, so unpinning the collection later cleanly unpins these tracks.
+            match self
+                .download_track_cancellable(&track_id, profile, false, Some(&source), cancelled)
+                .await
+            {
+                Ok(_) => completed.push(track_id),
+                Err(err @ CoreError::NotConfigured(_)) => return Err(err),
+                Err(_) if cancelled.load(Ordering::Relaxed) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        track_id = %track_id,
+                        pin_source = %source,
+                        "auto-cache download failed; continuing batch: {err}"
+                    );
+                }
+            }
         }
         Ok(completed)
     }
@@ -521,8 +746,18 @@ impl CacheManager {
         size: Option<u32>,
         offline_only: bool,
     ) -> CoreResult<(PathBuf, bool)> {
-        if let Some(local) = self.cover_art_local_path(cover_art_id).await? {
-            return Ok((local, false));
+        {
+            let _guard = self.cache_lock.lock().await;
+            if let Some(local) = self.cover_art_local_path(cover_art_id).await? {
+                let _ = sqlx::query(
+                    "UPDATE cover_art_cache SET last_accessed_at = ? WHERE cover_art_id = ?",
+                )
+                .bind(now_unix())
+                .bind(cover_art_id)
+                .execute(&self.pool)
+                .await;
+                return Ok((local, false));
+            }
         }
         if offline_only {
             return Err(CoreError::Offline(format!(
@@ -552,13 +787,6 @@ impl CacheManager {
             "jpg"
         };
 
-        let prev_path: Option<String> = sqlx::query_scalar(
-            "SELECT local_path FROM cover_art_cache WHERE cover_art_id = ?",
-        )
-        .bind(cover_art_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
         tokio::fs::create_dir_all(&self.cover_art_dir).await?;
         let safe_id = encode_filename_key(cover_art_id);
         let final_path = self.cover_art_dir.join(format!("{safe_id}.{ext}"));
@@ -566,21 +794,24 @@ impl CacheManager {
             .cover_art_dir
             .join(format!("{safe_id}.{}.part", Uuid::new_v4()));
 
-        let write_res: CoreResult<()> = async {
-            tokio::fs::write(&part_path, &bytes).await?;
-            tokio::fs::rename(&part_path, &final_path).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(err) = write_res {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            return Err(err);
-        }
+        let mut part_guard = PartFileGuard::new(part_path.clone(), self.active_parts.clone());
+        tokio::fs::write(&part_path, &bytes).await?;
+
+        let _guard = self.cache_lock.lock().await;
+        let prev_path: Option<String> = sqlx::query_scalar(
+            "SELECT local_path FROM cover_art_cache WHERE cover_art_id = ?",
+        )
+        .bind(cover_art_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        tokio::fs::rename(&part_path, &final_path).await?;
+        part_guard.disarm();
 
         let now = now_unix();
         let new_path_str = final_path.display().to_string();
         let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-        sqlx::query(
+        let db_res = sqlx::query(
             r#"
             INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -598,7 +829,14 @@ impl CacheManager {
         .bind(now)
         .bind(now)
         .execute(&self.pool)
-        .await?;
+        .await;
+
+        if let Err(err) = db_res {
+            if prev_path.as_deref() != Some(new_path_str.as_str()) {
+                let _ = tokio::fs::remove_file(&final_path).await;
+            }
+            return Err(err.into());
+        }
 
         if let Some(old_path) = prev_path {
             if old_path != new_path_str {
@@ -606,12 +844,12 @@ impl CacheManager {
             }
         }
 
-        self.enforce_cover_art_budget_excluding(Some(cover_art_id))
+        self.enforce_cover_art_budget_locked(Some(cover_art_id))
             .await?;
         Ok((final_path, true))
     }
 
-    async fn enforce_cover_art_budget_excluding(
+    async fn enforce_cover_art_budget_locked(
         &self,
         protected_art_id: Option<&str>,
     ) -> CoreResult<usize> {
@@ -624,27 +862,32 @@ impl CacheManager {
         if total <= max_bytes {
             return Ok(0);
         }
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT cover_art_id, local_path, size_bytes FROM cover_art_cache ORDER BY last_accessed_at ASC",
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT cover_art_id, local_path, size_bytes, last_accessed_at FROM cover_art_cache ORDER BY last_accessed_at ASC",
         )
         .fetch_all(&self.pool)
         .await?;
 
         let mut evicted = 0usize;
-        for (id, path, size) in rows {
+        for (id, path, size, last_accessed_at) in rows {
             if total <= max_bytes {
                 break;
             }
             if protected_art_id == Some(id.as_str()) {
                 continue;
             }
-            let _ = tokio::fs::remove_file(&path).await;
-            sqlx::query("DELETE FROM cover_art_cache WHERE cover_art_id = ?")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-            total = (total - size).max(0);
-            evicted += 1;
+            let res = sqlx::query(
+                "DELETE FROM cover_art_cache WHERE cover_art_id = ? AND last_accessed_at = ?",
+            )
+            .bind(&id)
+            .bind(last_accessed_at)
+            .execute(&self.pool)
+            .await?;
+            if res.rows_affected() > 0 {
+                let _ = tokio::fs::remove_file(&path).await;
+                total = (total - size).max(0);
+                evicted += 1;
+            }
         }
         Ok(evicted)
     }
@@ -727,7 +970,7 @@ impl CacheManager {
         Ok(false)
     }
 
-    async fn recompute_pin_flags(&self) -> CoreResult<()> {
+    async fn recompute_pin_flags_locked(&self) -> CoreResult<()> {
         let pins: Vec<(String, String)> =
             sqlx::query_as("SELECT target_kind, target_id FROM offline_pins")
                 .fetch_all(&self.pool)
@@ -811,6 +1054,27 @@ impl CacheManager {
             }
         };
         Ok(ids)
+    }
+}
+
+async fn sweep_orphaned_parts_in_dir(dir: &Path, active_parts: &StdMutex<HashSet<PathBuf>>) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("part") {
+            continue;
+        }
+        let is_active = {
+            let guard = active_parts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.contains(&path)
+        };
+        if !is_active {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
     }
 }
 

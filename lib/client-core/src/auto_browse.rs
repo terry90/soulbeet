@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::db::{load_playback_session, save_playback_session};
 use crate::error::CoreResult;
@@ -63,41 +63,33 @@ impl AutoBrowseEngine {
         parent_id: &str,
         offline_only: bool,
     ) -> CoreResult<Vec<AutoBrowseNode>> {
-        let art_map = self.cover_art_map().await?;
         match parent_id {
             AUTO_ROOT_ID => Ok(self.root_tabs()),
-            AUTO_TAB_FOR_YOU => self.for_you_nodes(&art_map, offline_only).await,
-            AUTO_TAB_PLAYLISTS => self.playlist_nodes(&art_map, offline_only).await,
+            AUTO_TAB_FOR_YOU => self.for_you_nodes(offline_only).await,
+            AUTO_TAB_PLAYLISTS => self.playlist_nodes(offline_only).await,
             AUTO_TAB_LIBRARY => self.library_root_nodes().await,
-            AUTO_TAB_RADIO => self.radio_nodes(&art_map, offline_only).await,
-            AUTO_LIB_OFFLINE => self.offline_track_nodes(&art_map).await,
-            AUTO_LIB_RECENT => self.recent_album_nodes(&art_map, offline_only).await,
-            "for_you:triage" => self.pending_triage_nodes(&art_map, offline_only).await,
-            id if id.starts_with("az:") => self.az_bucket_artists(id, &art_map, offline_only).await,
+            AUTO_TAB_RADIO => self.radio_nodes(offline_only).await,
+            AUTO_LIB_OFFLINE => self.offline_track_nodes().await,
+            AUTO_LIB_RECENT => self.recent_album_nodes(offline_only).await,
+            "for_you:triage" => self.pending_triage_nodes(offline_only).await,
+            id if id.starts_with("az:") => self.az_bucket_artists(id, offline_only).await,
             id if id.starts_with("playlist:") => {
                 let pl_id = &id["playlist:".len()..];
-                self.playlist_track_nodes(pl_id, &art_map, offline_only)
-                    .await
+                self.playlist_track_nodes(pl_id, offline_only).await
             }
             id if id.starts_with("artist:") => {
                 let artist_id = &id["artist:".len()..];
-                self.artist_album_nodes(artist_id, &art_map, offline_only)
-                    .await
+                self.artist_album_nodes(artist_id, offline_only).await
             }
             id if id.starts_with("album:") => {
                 let album_id = &id["album:".len()..];
-                self.album_track_nodes(album_id, &art_map, offline_only)
-                    .await
+                self.album_track_nodes(album_id, offline_only).await
             }
             _ => Ok(Vec::new()),
         }
     }
 
-    async fn for_you_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-        offline_only: bool,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn for_you_nodes(&self, offline_only: bool) -> CoreResult<Vec<AutoBrowseNode>> {
         let mut nodes = Vec::new();
 
         // Pending Discovery triage shortcut if pending items exist
@@ -211,6 +203,9 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let art_map = self
+            .cover_art_map_for(playlists.iter().filter_map(|p| p.cover_art_id.as_deref()))
+            .await?;
         let offline_playlists = self.offline_playlist_set().await?;
         for pl in playlists {
             let offline_ready = offline_only || offline_playlists.contains(&pl.id);
@@ -235,11 +230,7 @@ impl AutoBrowseEngine {
         Ok(nodes)
     }
 
-    async fn playlist_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-        offline_only: bool,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn playlist_nodes(&self, offline_only: bool) -> CoreResult<Vec<AutoBrowseNode>> {
         let playlists = if offline_only {
             sqlx::query_as::<_, LocalPlaylist>(
                 r#"
@@ -308,6 +299,9 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let art_map = self
+            .cover_art_map_for(playlists.iter().filter_map(|p| p.cover_art_id.as_deref()))
+            .await?;
         let offline_playlists = self.offline_playlist_set().await?;
         let mut nodes = Vec::with_capacity(playlists.len());
         for pl in playlists {
@@ -373,10 +367,7 @@ impl AutoBrowseEngine {
         Ok(nodes)
     }
 
-    async fn offline_track_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn offline_track_nodes(&self) -> CoreResult<Vec<AutoBrowseNode>> {
         let tracks = sqlx::query_as::<_, LocalTrack>(
             r#"
             SELECT t.*
@@ -389,17 +380,16 @@ impl AutoBrowseEngine {
         .fetch_all(&self.pool)
         .await?;
 
+        let art_map = self
+            .cover_art_map_for(tracks.iter().filter_map(|t| t.cover_art_id.as_deref()))
+            .await?;
         Ok(tracks
             .into_iter()
-            .map(|t| track_to_node(t, art_map, true))
+            .map(|t| track_to_node(t, &art_map, true))
             .collect())
     }
 
-    async fn recent_album_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-        offline_only: bool,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn recent_album_nodes(&self, offline_only: bool) -> CoreResult<Vec<AutoBrowseNode>> {
         let albums = if offline_only {
             sqlx::query_as::<_, LocalAlbum>(
                 r#"
@@ -427,6 +417,9 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let art_map = self
+            .cover_art_map_for(albums.iter().filter_map(|a| a.cover_art_id.as_deref()))
+            .await?;
         let offline_albums = self.offline_album_set().await?;
         Ok(albums
             .into_iter()
@@ -455,7 +448,6 @@ impl AutoBrowseEngine {
     async fn az_bucket_artists(
         &self,
         bucket_id: &str,
-        art_map: &HashMap<String, String>,
         offline_only: bool,
     ) -> CoreResult<Vec<AutoBrowseNode>> {
         let Some(&(_, _, start_ch, end_ch)) = AZ_BUCKETS.iter().find(|b| b.0 == bucket_id) else {
@@ -469,61 +461,79 @@ impl AutoBrowseEngine {
                 FROM artists ar
                 INNER JOIN tracks t ON t.artist_id = ar.id
                 INNER JOIN offline_downloads od ON od.track_id = t.id
-                ORDER BY ar.name COLLATE NOCASE ASC
                 "#,
             )
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query_as::<_, LocalArtist>(
-                "SELECT * FROM artists ORDER BY name COLLATE NOCASE ASC",
-            )
-            .fetch_all(&self.pool)
-            .await?
+            sqlx::query_as::<_, LocalArtist>("SELECT * FROM artists")
+                .fetch_all(&self.pool)
+                .await?
         };
 
-        let offline_artists = self.offline_artist_set().await?;
         let is_last_bucket = bucket_id == "az:u-z";
-        let mut nodes = Vec::new();
-        for artist in artists {
-            let first = first_sort_char(&artist.name);
-            let matches = if is_last_bucket {
-                (first >= start_ch && first <= end_ch) || !first.is_ascii_alphabetic()
-            } else {
-                first >= start_ch && first <= end_ch
-            };
-            if !matches {
-                continue;
-            }
-            let is_off = offline_only || offline_artists.contains(&artist.id);
-            nodes.push(AutoBrowseNode {
-                id: format!("artist:{}", artist.id),
-                title: artist.name,
-                subtitle: Some(format!("{} albums", artist.album_count)),
-                kind: AutoBrowseKind::Artist,
-                playable: true,
-                browsable: true,
-                cover_art_local_path: artist
-                    .cover_art_id
-                    .as_deref()
-                    .and_then(|cid| art_map.get(cid))
-                    .cloned(),
-                cover_art_id: artist.cover_art_id,
-                is_offline_ready: is_off,
-                is_pending_discovery: false,
-            });
-            if nodes.len() >= AUTO_BUCKET_ARTISTS_LIMIT {
-                break;
-            }
-        }
+        // Filter into this A-Z bucket and sort by article-stripped, diacritic-folded sort key
+        // BEFORE applying the 50-item cap so artists like "The Beatles" sort under "B" and are
+        // never pushed past the limit by raw SQL "T..." ordering.
+        let mut bucketed: Vec<(String, LocalArtist)> = artists
+            .into_iter()
+            .filter_map(|artist| {
+                let sort_key = artist_sort_key(&artist.name);
+                let first = sort_key
+                    .chars()
+                    .next()
+                    .map(|c| c.to_ascii_uppercase())
+                    .unwrap_or('#');
+                let matches = if is_last_bucket {
+                    (first >= start_ch && first <= end_ch) || !first.is_ascii_alphabetic()
+                } else {
+                    first >= start_ch && first <= end_ch
+                };
+                matches.then_some((sort_key, artist))
+            })
+            .collect();
+
+        bucketed.sort_by(|(ka, a), (kb, b)| {
+            ka.cmp(kb)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        bucketed.truncate(AUTO_BUCKET_ARTISTS_LIMIT);
+
+        let art_map = self
+            .cover_art_map_for(
+                bucketed
+                    .iter()
+                    .filter_map(|(_, ar)| ar.cover_art_id.as_deref()),
+            )
+            .await?;
+        let offline_artists = self.offline_artist_set().await?;
+        let nodes = bucketed
+            .into_iter()
+            .map(|(_, artist)| {
+                let is_off = offline_only || offline_artists.contains(&artist.id);
+                AutoBrowseNode {
+                    id: format!("artist:{}", artist.id),
+                    title: artist.name,
+                    subtitle: Some(format!("{} albums", artist.album_count)),
+                    kind: AutoBrowseKind::Artist,
+                    playable: true,
+                    browsable: true,
+                    cover_art_local_path: artist
+                        .cover_art_id
+                        .as_deref()
+                        .and_then(|cid| art_map.get(cid))
+                        .cloned(),
+                    cover_art_id: artist.cover_art_id,
+                    is_offline_ready: is_off,
+                    is_pending_discovery: false,
+                }
+            })
+            .collect();
         Ok(nodes)
     }
 
-    async fn radio_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-        offline_only: bool,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn radio_nodes(&self, offline_only: bool) -> CoreResult<Vec<AutoBrowseNode>> {
         let artists = if offline_only {
             sqlx::query_as::<_, LocalArtist>(
                 r#"
@@ -551,6 +561,9 @@ impl AutoBrowseEngine {
             .await?
         };
 
+        let art_map = self
+            .cover_art_map_for(artists.iter().filter_map(|ar| ar.cover_art_id.as_deref()))
+            .await?;
         let offline_artists = self.offline_artist_set().await?;
         Ok(artists
             .into_iter()
@@ -576,11 +589,7 @@ impl AutoBrowseEngine {
             .collect())
     }
 
-    async fn pending_triage_nodes(
-        &self,
-        art_map: &HashMap<String, String>,
-        offline_only: bool,
-    ) -> CoreResult<Vec<AutoBrowseNode>> {
+    async fn pending_triage_nodes(&self, offline_only: bool) -> CoreResult<Vec<AutoBrowseNode>> {
         let tracks = if offline_only {
             sqlx::query_as::<_, LocalTrack>(
                 r#"
@@ -610,12 +619,17 @@ impl AutoBrowseEngine {
             .await?
         };
 
-        let offline_set = self.offline_track_set().await?;
+        let art_map = self
+            .cover_art_map_for(tracks.iter().filter_map(|t| t.cover_art_id.as_deref()))
+            .await?;
+        let offline_set = self
+            .offline_track_set_for(tracks.iter().map(|t| t.id.as_str()))
+            .await?;
         Ok(tracks
             .into_iter()
             .map(|t| {
                 let is_off = offline_set.contains(&t.id);
-                track_to_node(t, art_map, is_off)
+                track_to_node(t, &art_map, is_off)
             })
             .collect())
     }
@@ -623,7 +637,6 @@ impl AutoBrowseEngine {
     async fn playlist_track_nodes(
         &self,
         playlist_id: &str,
-        art_map: &HashMap<String, String>,
         offline_only: bool,
     ) -> CoreResult<Vec<AutoBrowseNode>> {
         let tracks = if offline_only {
@@ -656,12 +669,17 @@ impl AutoBrowseEngine {
             .fetch_all(&self.pool)
             .await?
         };
-        let offline_set = self.offline_track_set().await?;
+        let art_map = self
+            .cover_art_map_for(tracks.iter().filter_map(|t| t.cover_art_id.as_deref()))
+            .await?;
+        let offline_set = self
+            .offline_track_set_for(tracks.iter().map(|t| t.id.as_str()))
+            .await?;
         Ok(tracks
             .into_iter()
             .map(|t| {
                 let is_off = offline_set.contains(&t.id);
-                track_to_node(t, art_map, is_off)
+                track_to_node(t, &art_map, is_off)
             })
             .collect())
     }
@@ -669,7 +687,6 @@ impl AutoBrowseEngine {
     async fn artist_album_nodes(
         &self,
         artist_id: &str,
-        art_map: &HashMap<String, String>,
         offline_only: bool,
     ) -> CoreResult<Vec<AutoBrowseNode>> {
         let albums = if offline_only {
@@ -700,6 +717,9 @@ impl AutoBrowseEngine {
             .fetch_all(&self.pool)
             .await?
         };
+        let art_map = self
+            .cover_art_map_for(albums.iter().filter_map(|a| a.cover_art_id.as_deref()))
+            .await?;
         let offline_albums = self.offline_album_set().await?;
         Ok(albums
             .into_iter()
@@ -728,7 +748,6 @@ impl AutoBrowseEngine {
     async fn album_track_nodes(
         &self,
         album_id: &str,
-        art_map: &HashMap<String, String>,
         offline_only: bool,
     ) -> CoreResult<Vec<AutoBrowseNode>> {
         let tracks = if offline_only {
@@ -758,12 +777,17 @@ impl AutoBrowseEngine {
             .fetch_all(&self.pool)
             .await?
         };
-        let offline_set = self.offline_track_set().await?;
+        let art_map = self
+            .cover_art_map_for(tracks.iter().filter_map(|t| t.cover_art_id.as_deref()))
+            .await?;
+        let offline_set = self
+            .offline_track_set_for(tracks.iter().map(|t| t.id.as_str()))
+            .await?;
         Ok(tracks
             .into_iter()
             .map(|t| {
                 let is_off = offline_set.contains(&t.id);
-                track_to_node(t, art_map, is_off)
+                track_to_node(t, &art_map, is_off)
             })
             .collect())
     }
@@ -1111,18 +1135,67 @@ impl AutoBrowseEngine {
         Ok(ids)
     }
 
-    async fn cover_art_map(&self) -> CoreResult<HashMap<String, String>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT cover_art_id, local_path FROM cover_art_cache")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().collect())
+    async fn cover_art_map_for<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> CoreResult<HashMap<String, String>> {
+        let mut unique: Vec<&'a str> = Vec::new();
+        let mut seen: HashSet<&'a str> = HashSet::new();
+        for id in ids {
+            if !id.is_empty() && seen.insert(id) {
+                unique.push(id);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT cover_art_id, local_path FROM cover_art_cache WHERE cover_art_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in &unique {
+            sep.push_bind(*id);
+        }
+        sep.push_unseparated(")");
+        let rows: Vec<(String, String)> = qb.build_query_as().fetch_all(&self.pool).await?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for (id, path) in rows {
+            let is_file = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if is_file {
+                map.insert(id, path);
+            }
+        }
+        Ok(map)
     }
 
-    async fn offline_track_set(&self) -> CoreResult<HashSet<String>> {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT track_id FROM offline_downloads")
-            .fetch_all(&self.pool)
-            .await?;
+    async fn offline_track_set_for<'a>(
+        &self,
+        track_ids: impl IntoIterator<Item = &'a str>,
+    ) -> CoreResult<HashSet<String>> {
+        let mut unique: Vec<&'a str> = Vec::new();
+        let mut seen: HashSet<&'a str> = HashSet::new();
+        for id in track_ids {
+            if seen.insert(id) {
+                unique.push(id);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT track_id FROM offline_downloads WHERE track_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in &unique {
+            sep.push_bind(*id);
+        }
+        sep.push_unseparated(")");
+        let ids: Vec<String> = qb.build_query_scalar().fetch_all(&self.pool).await?;
         Ok(ids.into_iter().collect())
     }
 
@@ -1211,7 +1284,7 @@ fn track_to_node(
     }
 }
 
-fn first_sort_char(name: &str) -> char {
+fn artist_sort_key(name: &str) -> String {
     let trimmed = name.trim();
     let stripped = if trimmed
         .get(..4)
@@ -1221,12 +1294,7 @@ fn first_sort_char(name: &str) -> char {
     } else {
         trimmed
     };
-    let folded = fold_diacritics_ascii(stripped);
-    folded
-        .chars()
-        .next()
-        .map(|c| c.to_ascii_uppercase())
-        .unwrap_or('#')
+    fold_diacritics_ascii(stripped)
 }
 
 /// Returns `(prefix_stripped, prefix_and_suffix_stripped)` so both exact names like `"Drive Mix"`

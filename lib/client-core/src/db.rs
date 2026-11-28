@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{Executor, QueryBuilder, Sqlite, SqlitePool, Transaction};
 
 use crate::error::CoreResult;
 use crate::models::{
@@ -75,7 +75,10 @@ pub async fn set_cursor(pool: &SqlitePool, key: &str, value: &str) -> CoreResult
     Ok(())
 }
 
-pub async fn upsert_artist(pool: &SqlitePool, artist: &LocalArtist) -> CoreResult<()> {
+pub async fn upsert_artist_exec<'e, E>(executor: E, artist: &LocalArtist) -> CoreResult<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO artists (id, name, album_count, cover_art_id, starred, musicbrainz_id, updated_at)
@@ -96,12 +99,19 @@ pub async fn upsert_artist(pool: &SqlitePool, artist: &LocalArtist) -> CoreResul
     .bind(artist.starred)
     .bind(&artist.musicbrainz_id)
     .bind(artist.updated_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-pub async fn upsert_album(pool: &SqlitePool, album: &LocalAlbum) -> CoreResult<()> {
+pub async fn upsert_artist(pool: &SqlitePool, artist: &LocalArtist) -> CoreResult<()> {
+    upsert_artist_exec(pool, artist).await
+}
+
+pub async fn upsert_album_exec<'e, E>(executor: E, album: &LocalAlbum) -> CoreResult<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO albums (
@@ -135,19 +145,27 @@ pub async fn upsert_album(pool: &SqlitePool, album: &LocalAlbum) -> CoreResult<(
     .bind(album.starred)
     .bind(&album.created_at)
     .bind(album.updated_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-/// Inserts or updates a track in the local mirror.
-/// When `preserve_pending_curation` is true, existing local `starred` and `user_rating`
-/// values are preserved so un-replayed offline outbox mutations are not clobbered by sync.
-pub async fn upsert_track(
-    pool: &SqlitePool,
+pub async fn upsert_album(pool: &SqlitePool, album: &LocalAlbum) -> CoreResult<()> {
+    upsert_album_exec(pool, album).await
+}
+
+/// Inserts or updates a track in the local mirror using any SQLite executor/transaction.
+/// Preserves existing local `starred`, `user_rating`, and `is_discovery` values whenever
+/// `preserve_pending_curation` is true OR a live (non-dead-letter) outbox mutation exists
+/// for `tracks.id`, eliminating TOCTOU clobber races during long syncs.
+pub async fn upsert_track_exec<'e, E>(
+    executor: E,
     track: &LocalTrack,
     preserve_pending_curation: bool,
-) -> CoreResult<()> {
+) -> CoreResult<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO tracks (
@@ -175,12 +193,33 @@ pub async fn upsert_track(
             size_bytes = COALESCE(excluded.size_bytes, tracks.size_bytes),
             cover_art_id = COALESCE(excluded.cover_art_id, tracks.cover_art_id),
             path = COALESCE(excluded.path, tracks.path),
-            starred = CASE WHEN ? THEN tracks.starred ELSE excluded.starred END,
-            user_rating = CASE WHEN ? THEN tracks.user_rating ELSE excluded.user_rating END,
+            starred = CASE
+                WHEN ? OR EXISTS (
+                    SELECT 1 FROM mutation_outbox
+                    WHERE song_id = tracks.id AND dead_letter = 0
+                )
+                THEN tracks.starred
+                ELSE excluded.starred
+            END,
+            user_rating = CASE
+                WHEN ? OR EXISTS (
+                    SELECT 1 FROM mutation_outbox
+                    WHERE song_id = tracks.id AND dead_letter = 0
+                )
+                THEN tracks.user_rating
+                ELSE excluded.user_rating
+            END,
             play_count = MAX(tracks.play_count, excluded.play_count),
             last_played_at = COALESCE(excluded.last_played_at, tracks.last_played_at),
             musicbrainz_id = COALESCE(excluded.musicbrainz_id, tracks.musicbrainz_id),
-            is_discovery = CASE WHEN ? THEN tracks.is_discovery ELSE excluded.is_discovery END,
+            is_discovery = CASE
+                WHEN ? OR EXISTS (
+                    SELECT 1 FROM mutation_outbox
+                    WHERE song_id = tracks.id AND dead_letter = 0
+                )
+                THEN tracks.is_discovery
+                ELSE excluded.is_discovery
+            END,
             updated_at = excluded.updated_at
         "#,
     )
@@ -211,12 +250,26 @@ pub async fn upsert_track(
     .bind(preserve_pending_curation)
     .bind(preserve_pending_curation)
     .bind(preserve_pending_curation)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-pub async fn upsert_playlist(pool: &SqlitePool, playlist: &LocalPlaylist) -> CoreResult<()> {
+/// Inserts or updates a track in the local mirror.
+/// When `preserve_pending_curation` is true (or a pending outbox row exists for `track.id`),
+/// existing local `starred`, `user_rating`, and `is_discovery` values are preserved.
+pub async fn upsert_track(
+    pool: &SqlitePool,
+    track: &LocalTrack,
+    preserve_pending_curation: bool,
+) -> CoreResult<()> {
+    upsert_track_exec(pool, track, preserve_pending_curation).await
+}
+
+pub async fn upsert_playlist_exec<'e, E>(executor: E, playlist: &LocalPlaylist) -> CoreResult<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO playlists (
@@ -250,20 +303,23 @@ pub async fn upsert_playlist(pool: &SqlitePool, playlist: &LocalPlaylist) -> Cor
     .bind(&playlist.slug)
     .bind(&playlist.changed_at)
     .bind(playlist.updated_at)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
-pub async fn replace_playlist_tracks(
-    pool: &SqlitePool,
+pub async fn upsert_playlist(pool: &SqlitePool, playlist: &LocalPlaylist) -> CoreResult<()> {
+    upsert_playlist_exec(pool, playlist).await
+}
+
+pub async fn replace_playlist_tracks_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     playlist_id: &str,
     track_ids: &[String],
 ) -> CoreResult<()> {
-    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?")
         .bind(playlist_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     for (idx, track_id) in track_ids.iter().enumerate() {
@@ -273,16 +329,25 @@ pub async fn replace_playlist_tracks(
         .bind(playlist_id)
         .bind(idx as i64)
         .bind(track_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
+    Ok(())
+}
 
+pub async fn replace_playlist_tracks(
+    pool: &SqlitePool,
+    playlist_id: &str,
+    track_ids: &[String],
+) -> CoreResult<()> {
+    let mut tx = pool.begin().await?;
+    replace_playlist_tracks_tx(&mut tx, playlist_id, track_ids).await?;
     tx.commit().await?;
     Ok(())
 }
 
-pub async fn upsert_discovery_track(
-    pool: &SqlitePool,
+pub async fn upsert_discovery_track_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     track: &LocalDiscoveryTrack,
     preserve_pending_curation: bool,
 ) -> CoreResult<()> {
@@ -303,7 +368,18 @@ pub async fn upsert_discovery_track(
             folder_path = excluded.folder_path,
             profile_slug = excluded.profile_slug,
             mix_slug = excluded.mix_slug,
-            status = CASE WHEN ? THEN discovery_tracks.status ELSE excluded.status END,
+            status = CASE
+                WHEN ? OR (
+                    COALESCE(excluded.song_id, discovery_tracks.song_id) IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM mutation_outbox
+                        WHERE song_id = COALESCE(excluded.song_id, discovery_tracks.song_id)
+                          AND dead_letter = 0
+                    )
+                )
+                THEN discovery_tracks.status
+                ELSE excluded.status
+            END,
             created_at = COALESCE(excluded.created_at, discovery_tracks.created_at),
             expires_at = excluded.expires_at,
             reason_json = COALESCE(excluded.reason_json, discovery_tracks.reason_json),
@@ -326,19 +402,40 @@ pub async fn upsert_discovery_track(
     .bind(track.exclude_from_core_taste)
     .bind(track.updated_at)
     .bind(preserve_pending_curation)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     if !preserve_pending_curation {
         if let Some(song_id) = &track.song_id {
             let is_pending = normalized_status == "pending";
-            sqlx::query("UPDATE tracks SET is_discovery = ? WHERE id = ?")
-                .bind(is_pending)
-                .bind(song_id)
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                r#"
+                UPDATE tracks
+                SET is_discovery = ?
+                WHERE id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM mutation_outbox
+                      WHERE song_id = tracks.id AND dead_letter = 0
+                  )
+                "#,
+            )
+            .bind(is_pending)
+            .bind(song_id)
+            .execute(&mut **tx)
+            .await?;
         }
     }
+    Ok(())
+}
+
+pub async fn upsert_discovery_track(
+    pool: &SqlitePool,
+    track: &LocalDiscoveryTrack,
+    preserve_pending_curation: bool,
+) -> CoreResult<()> {
+    let mut tx = pool.begin().await?;
+    upsert_discovery_track_tx(&mut tx, track, preserve_pending_curation).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -620,7 +717,16 @@ pub async fn load_playback_session(
         return Ok(None);
     };
 
-    let queue_track_ids: Vec<String> = serde_json::from_str(&row.queue_json)?;
+    let queue_track_ids: Vec<String> = match serde_json::from_str(&row.queue_json) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!("corrupt playback_session queue_json; resetting row: {err}");
+            let _ = sqlx::query("DELETE FROM playback_session WHERE id = 1")
+                .execute(pool)
+                .await;
+            return Ok(None);
+        }
+    };
     Ok(Some(PersistedPlaybackSession {
         queue_track_ids,
         current_index: row.current_index.max(0) as usize,

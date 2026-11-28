@@ -1,10 +1,13 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use chrono::DateTime;
+use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::json;
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 use uuid::Uuid;
 
 use crate::db::now_unix;
@@ -13,6 +16,9 @@ use crate::models::{
     DrainReport, NavidromeCredentials, OutboxMutation, OutboxRow, OutboxSummary, SoulbeetAuth,
 };
 use crate::subsonic::SubsonicClient;
+
+const MAX_OUTBOX_ATTEMPTS: i64 = 20;
+const MAX_RETRY_AFTER_SECS: i64 = 3600;
 
 enum DispatchError {
     Retryable {
@@ -31,6 +37,7 @@ pub struct MutationOutbox {
     soulbeet_base_url: Option<String>,
     soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
+    drain_lock: Arc<TokioMutex<()>>,
 }
 
 impl MutationOutbox {
@@ -47,6 +54,7 @@ impl MutationOutbox {
             soulbeet_base_url,
             soulbeet_auth,
             navidrome,
+            drain_lock: Arc::new(TokioMutex::new(())),
         }
     }
 
@@ -306,12 +314,21 @@ impl MutationOutbox {
     }
 
     /// Replays due outbox mutations strictly in chronological order (`seq ASC`).
+    /// Serialized by `drain_lock` so concurrent triggers never double-dispatch the same row.
     /// If a mutation fails or is in retry backoff for a given `song_id`, subsequent mutations for
     /// that same `song_id` are deferred so later edits never overtake earlier ones.
-    /// Permanent (non-retryable) failures and corrupt JSON payloads are dead-lettered without
-    /// blocking unrelated songs or aborting the drain.
+    /// Permanent (non-retryable) failures, max-retry exhaustion, and corrupt JSON payloads are
+    /// dead-lettered without blocking unrelated songs or aborting the drain.
     pub async fn drain(&self) -> CoreResult<DrainReport> {
-        let now = now_unix();
+        let never = AtomicBool::new(false);
+        self.drain_cancellable(&never).await
+    }
+
+    /// Cooperatively cancellable variant of [`Self::drain`].
+    /// Checks `cancelled` strictly between items so an in-flight HTTP dispatch + SQLite DELETE
+    /// is never aborted mid-flight (preventing duplicate replays).
+    pub async fn drain_cancellable(&self, cancelled: &AtomicBool) -> CoreResult<DrainReport> {
+        let _drain_guard = self.drain_lock.lock().await;
         let rows = sqlx::query_as::<_, OutboxRow>(
             "SELECT * FROM mutation_outbox WHERE dead_letter = 0 ORDER BY seq ASC",
         )
@@ -320,12 +337,18 @@ impl MutationOutbox {
 
         let mut report = DrainReport::default();
         let mut blocked_songs: HashSet<String> = HashSet::new();
+        let total = rows.len();
 
-        for row in rows {
+        for (idx, row) in rows.into_iter().enumerate() {
+            if cancelled.load(Ordering::Relaxed) {
+                report.remaining += total - idx;
+                break;
+            }
             if blocked_songs.contains(&row.song_id) {
                 report.remaining += 1;
                 continue;
             }
+            let now = now_unix();
             if row.next_retry_at > now {
                 blocked_songs.insert(row.song_id.clone());
                 report.remaining += 1;
@@ -347,7 +370,7 @@ impl MutationOutbox {
                         WHERE seq = ?
                         "#,
                     )
-                    .bind(row.attempts + 1)
+                    .bind(row.attempts.saturating_add(1).max(1))
                     .bind(format!("corrupt payload JSON: {err}"))
                     .bind(row.seq)
                     .execute(&self.pool)
@@ -369,13 +392,37 @@ impl MutationOutbox {
                     err,
                     retry_after_secs,
                 }) => {
-                    let attempts = row.attempts + 1;
-                    let exp_backoff = (5i64 * (1i64 << attempts.min(6) as u32)).min(300);
+                    let attempts = row.attempts.saturating_add(1).max(1);
+                    if attempts >= MAX_OUTBOX_ATTEMPTS {
+                        tracing::warn!(
+                            seq = row.seq,
+                            song_id = %row.song_id,
+                            kind = %row.kind,
+                            attempts,
+                            "dead-lettering outbox mutation after max retry attempts: {err}"
+                        );
+                        sqlx::query(
+                            r#"
+                            UPDATE mutation_outbox
+                            SET dead_letter = 1, attempts = ?, last_error = ?, next_retry_at = 0
+                            WHERE seq = ?
+                            "#,
+                        )
+                        .bind(attempts)
+                        .bind(err.to_string())
+                        .bind(row.seq)
+                        .execute(&self.pool)
+                        .await?;
+                        report.failed += 1;
+                        continue;
+                    }
+                    let shift = attempts.clamp(0, 6) as u32;
+                    let exp_backoff = (5i64 * (1i64 << shift)).min(300);
                     let backoff_secs = retry_after_secs
-                        .map(|s| s.max(1))
+                        .map(|s| s.clamp(1, MAX_RETRY_AFTER_SECS))
                         .unwrap_or(exp_backoff)
                         .max(exp_backoff);
-                    let next_retry_at = now.saturating_add(backoff_secs);
+                    let next_retry_at = now_unix().saturating_add(backoff_secs);
                     sqlx::query(
                         r#"
                         UPDATE mutation_outbox
@@ -407,7 +454,7 @@ impl MutationOutbox {
                         WHERE seq = ?
                         "#,
                     )
-                    .bind(row.attempts + 1)
+                    .bind(row.attempts.saturating_add(1).max(1))
                     .bind(err.to_string())
                     .bind(row.seq)
                     .execute(&self.pool)
@@ -577,7 +624,7 @@ impl MutationOutbox {
             req = req.header(name, val);
         }
         let resp = req.send().await.map_err(|e| DispatchError::Retryable {
-            err: CoreError::Http(e),
+            err: CoreError::from(e),
             retry_after_secs: None,
         })?;
         let status = resp.status();
@@ -585,14 +632,34 @@ impl MutationOutbox {
             return Ok(());
         }
         let status_code = status.as_u16();
+        let header_retry_after = parse_retry_after_header(resp.headers());
         let text = resp.text().await.unwrap_or_default();
-        Err(classify_http_failure(status_code, text))
+        Err(classify_http_failure(status_code, text, header_retry_after))
     }
+}
+
+fn parse_retry_after_header(headers: &HeaderMap) -> Option<i64> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)?;
+    if let Ok(secs) = raw.parse::<i64>() {
+        return Some(secs.clamp(1, MAX_RETRY_AFTER_SECS));
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc2822(raw) {
+        let delta = dt.timestamp().saturating_sub(now_unix());
+        return Some(delta.clamp(1, MAX_RETRY_AFTER_SECS));
+    }
+    None
 }
 
 /// Classifies Soulbeet HTTP error responses, including HTTP 409 `Failure` envelopes whose
 /// `details.retry_advice` / `details.retry` dictates retryability.
-fn classify_http_failure(status: u16, body: String) -> DispatchError {
+fn classify_http_failure(
+    status: u16,
+    body: String,
+    header_retry_after: Option<i64>,
+) -> DispatchError {
     if status == 409 {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
             let advice = val
@@ -605,7 +672,9 @@ fn classify_http_failure(status: u16, body: String) -> DispatchError {
             let retry_after_secs = val
                 .pointer("/details/retry_after_seconds")
                 .or_else(|| val.get("retry_after_seconds"))
-                .and_then(|v| v.as_i64());
+                .and_then(|v| v.as_i64())
+                .map(|s| s.clamp(1, MAX_RETRY_AFTER_SECS))
+                .or(header_retry_after);
 
             if matches!(advice.as_deref(), Some("retryable" | "same_source_later")) {
                 return DispatchError::Retryable {
@@ -620,7 +689,7 @@ fn classify_http_failure(status: u16, body: String) -> DispatchError {
     if matches!(status, 401 | 403 | 408 | 429) || status >= 500 {
         return DispatchError::Retryable {
             err: CoreError::ServerHttp { status, body },
-            retry_after_secs: None,
+            retry_after_secs: header_retry_after,
         };
     }
 
@@ -629,8 +698,16 @@ fn classify_http_failure(status: u16, body: String) -> DispatchError {
 
 fn classify_subsonic_error(err: CoreError) -> DispatchError {
     match &err {
-        CoreError::Subsonic { code: 70, .. } => DispatchError::Permanent(err),
-        CoreError::ServerHttp { status, body } => classify_http_failure(*status, body.clone()),
+        // Permanent Subsonic error codes:
+        // 10 = required parameter missing, 20/30 = incompatible protocol version,
+        // 50 = user not authorized for operation, 70 = requested data not found.
+        CoreError::Subsonic {
+            code: 10 | 20 | 30 | 50 | 70,
+            ..
+        } => DispatchError::Permanent(err),
+        CoreError::ServerHttp { status, body } => {
+            classify_http_failure(*status, body.clone(), None)
+        }
         _ => DispatchError::Retryable {
             err,
             retry_after_secs: None,
