@@ -367,6 +367,9 @@
   .bottom-24 {
     bottom: calc(var(--spacing) * 24);
   }
+  .bottom-\[152px\] {
+    bottom: 152px;
+  }
   .bottom-\[164px\] {
     bottom: 164px;
   }
@@ -447,6 +450,9 @@
   }
   .my-6 {
     margin-block: calc(var(--spacing) * 6);
+  }
+  .my-auto {
+    margin-block: auto;
   }
   .-mt-1 {
     margin-top: calc(var(--spacing) * -1);
