@@ -104,12 +104,13 @@ test('a user who never takes lossy files is not offered them', async ({ context,
   await freshSession(context, page, 'ytdlp-never');
   await openSettings(page);
   await openLibraryTab(page);
-  const choice = page.locator('select[name="lossy_fallback"]');
+  const choice = page.getByRole('combobox', { name: `When only ${YOUTUBE} has it` });
   await expect(choice).toBeVisible();
   const saved = page.waitForResponse(
     (r) => new URL(r.url()).pathname === '/api/settings' && r.request().method() === 'POST',
   );
-  await choice.selectOption({ label: 'Never use it' });
+  await choice.click();
+  await page.getByRole('option', { name: 'Never use it', exact: true }).click();
   expect((await saved).ok()).toBeTruthy();
 
   await page.getByRole('link', { name: 'Search' }).click();

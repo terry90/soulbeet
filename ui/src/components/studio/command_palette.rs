@@ -81,6 +81,14 @@ pub fn should_ignore_shortcut_target(
         return true;
     }
 
+    if role.is_some_and(|r| {
+        r.eq_ignore_ascii_case("combobox")
+            || r.eq_ignore_ascii_case("listbox")
+            || r.eq_ignore_ascii_case("option")
+    }) {
+        return true;
+    }
+
     if key == " " {
         let is_button_role = role.is_some_and(|r| r.eq_ignore_ascii_case("button"));
         if matches!(upper_tag.as_str(), "BUTTON" | "A") || is_button_role {
@@ -425,6 +433,8 @@ mod tests {
         assert!(should_ignore_shortcut_target("INPUT", None, false, false, false, " ", false));
         assert!(should_ignore_shortcut_target("textarea", None, false, false, false, "s", false));
         assert!(should_ignore_shortcut_target("SELECT", None, false, false, false, "1", false));
+        assert!(should_ignore_shortcut_target("BUTTON", Some("combobox"), false, false, false, "ArrowDown", false));
+        assert!(should_ignore_shortcut_target("BUTTON", Some("option"), false, false, false, "s", false));
         assert!(should_ignore_shortcut_target("DIV", None, true, false, false, "x", false));
 
         // Space does NOT hijack focused buttons, links, or role="button" elements

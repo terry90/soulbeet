@@ -328,6 +328,26 @@ html {
     color-scheme: dark;
 }
 
+/* Defense-in-depth default styling for any native <select> element:
+   custom chevron with proper right spacing and dark popup palette. */
+@layer base {
+    select {
+        appearance: none;
+        -webkit-appearance: none;
+        color-scheme: dark;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239e8eb3' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 0.75rem center;
+        background-size: 1rem 1rem;
+        padding-right: 2.5rem;
+    }
+
+    select option {
+        background-color: var(--beet-surface-high);
+        color: var(--beet-text-primary);
+    }
+}
+
 /* Safari on iOS zooms the page into a field under 16px when it takes focus,
    and below md the root is 14px. Outside any layer, so a text-sm or text-xs
    class on a field cannot undo it. */
