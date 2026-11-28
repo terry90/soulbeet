@@ -640,11 +640,11 @@ pub fn DownloadResults(props: Props) -> Element {
                 }
             }
 
-            // Floating Studio "Start download" button (positioned above the 84px Studio player bar)
-            div { class: "fixed bottom-28 md:bottom-24 right-6 z-40",
+            // Sticky Studio "Start download" button (respects right drawer width & mobile bottom chrome)
+            div { class: "sticky bottom-4 z-30 flex justify-end pointer-events-none pt-3",
                 button {
                     r#type: "button",
-                    class: "inline-flex items-center justify-center gap-2 h-12 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-[14px] shadow-lg hover:brightness-105 transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer",
+                    class: "pointer-events-auto inline-flex items-center justify-center gap-2 h-12 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-[14px] shadow-lg hover:brightness-105 transition-[color,background-color,border-color,filter] disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                     aria_label: "Start download",
                     disabled: selected_count == 0 || selected_folder.read().is_empty() || *is_downloading.read(),
                     onclick: handle_download,

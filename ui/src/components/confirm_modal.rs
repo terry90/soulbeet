@@ -18,7 +18,7 @@ pub fn ConfirmModal(props: ConfirmModalProps) -> Element {
     let confirm_class = if props.danger {
         "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-solid/40 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white transition-colors cursor-pointer"
     } else {
-        "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer"
+        "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer"
     };
 
     rsx! {

@@ -70,7 +70,7 @@ pub fn MultiListenerGuardModal(
     let mode = classify_guard_mode(&preview);
 
     let track_label = match track_artist.as_deref().filter(|a| !a.trim().is_empty()) {
-        Some(artist) => format!("{track_title} — {artist}"),
+        Some(artist) => format!("{track_title} · {artist}"),
         None => track_title.clone(),
     };
 
@@ -98,9 +98,9 @@ pub fn MultiListenerGuardModal(
     };
 
     let confirm_class = if is_destructive {
-        "h-9 px-4 rounded-[8px] bg-beet-crimson-solid text-white text-[13px] font-semibold hover:brightness-110 disabled:opacity-50 transition-[filter,opacity] duration-150 cursor-pointer"
+        "h-9 px-4 rounded-[8px] bg-beet-crimson-solid text-white text-[13px] font-semibold hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none transition-[color,background-color,border-color,filter] duration-150 cursor-pointer"
     } else {
-        "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-crimson-surface hover:text-beet-crimson-text hover:border-beet-crimson-text/30 disabled:opacity-50 text-[13px] font-semibold transition-colors duration-150 cursor-pointer"
+        "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-crimson-surface hover:text-beet-crimson-text hover:border-beet-crimson-text/30 disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none text-[13px] font-semibold transition-colors duration-150 cursor-pointer"
     };
 
     rsx! {
@@ -140,7 +140,7 @@ pub fn MultiListenerGuardModal(
                         button {
                             r#type: "button",
                             disabled: busy,
-                            class: "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 text-[13px] font-semibold transition-colors duration-150 cursor-pointer",
+                            class: "h-9 px-4 rounded-[8px] bg-beet-surface-highest border border-beet-border-default text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none text-[13px] font-semibold transition-colors duration-150 cursor-pointer",
                             onclick: move |_| on_cancel.call(()),
                             "Close"
                         }
@@ -148,7 +148,7 @@ pub fn MultiListenerGuardModal(
                         button {
                             r#type: "button",
                             disabled: busy,
-                            class: "h-9 px-4 rounded-[8px] text-[13px] font-medium text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 transition-colors duration-150 cursor-pointer",
+                            class: "h-9 px-4 rounded-[8px] text-[13px] font-medium text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none transition-colors duration-150 cursor-pointer",
                             onclick: move |_| on_cancel.call(()),
                             "Cancel"
                         }

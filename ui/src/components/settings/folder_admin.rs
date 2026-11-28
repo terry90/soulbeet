@@ -5,7 +5,7 @@ use api::{
 use dioxus::prelude::*;
 
 use super::panel::{
-    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, PRIMARY_BUTTON_CLASS,
+    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, COMPACT_PRIMARY_BUTTON_CLASS,
     REMOVE_BUTTON_CLASS,
 };
 use crate::auth::use_auth;
@@ -107,7 +107,8 @@ pub fn FolderAdminPanel() -> Element {
                             }
                         }
                         button {
-                            class: "{PRIMARY_BUTTON_CLASS} h-9",
+                            r#type: "button",
+                            class: COMPACT_PRIMARY_BUTTON_CLASS,
                             onclick: move |_| async move {
                                 let result = auth.call(add_folder_root(new_root())).await;
                                 if result.is_ok() {

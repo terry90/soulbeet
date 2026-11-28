@@ -26,16 +26,19 @@ pub struct SubsonicPlaylistSummary {
     pub category: ui::PlaylistCategory,
 }
 
-/// Detects whether a Navidrome playlist is smart or Soulbeet-managed from its name and comment.
+/// Detects whether a Navidrome playlist is smart or Soulbeet-managed from its comment.
+/// Only matches explicit Soulbeet management prefixes or explicit smart-playlist markers
+/// so normal personal playlists (e.g. "My Discovery Gems" or "Smart Indie") remain editable.
 #[cfg(any(feature = "web", test))]
-pub fn detect_is_smart_playlist(name: &str, comment: &str) -> bool {
-    let comment_lower = comment.to_ascii_lowercase();
-    let name_lower = name.to_ascii_lowercase();
-    comment_lower.contains("soulbeet discovery")
+pub fn detect_is_smart_playlist(_name: &str, comment: &str) -> bool {
+    let comment_lower = comment.trim().to_ascii_lowercase();
+    comment_lower.starts_with("soulbeet discovery")
+        || comment_lower.contains("soulbeet discovery")
+        || comment_lower.starts_with("soulbeet:contextual:")
         || comment_lower.contains("soulbeet:contextual:")
-        || comment_lower.contains("smart")
-        || comment_lower.contains("discovery")
-        || name_lower.contains("discovery")
+        || comment_lower.contains("smart playlist")
+        || comment_lower.starts_with("smart:")
+        || comment_lower.contains("[smart]")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -134,6 +137,20 @@ mod wire {
     #[derive(Debug, Deserialize, Default)]
     pub(super) struct RawPlaylistDetail {
         #[serde(default)]
+        pub(super) id: String,
+        #[serde(default)]
+        pub(super) name: String,
+        #[serde(default)]
+        pub(super) duration: u32,
+        #[serde(rename = "coverArt", default)]
+        pub(super) cover_art: Option<String>,
+        #[serde(default)]
+        pub(super) comment: Option<String>,
+        #[serde(default)]
+        pub(super) owner: Option<String>,
+        #[serde(default)]
+        pub(super) public: bool,
+        #[serde(default)]
         pub(super) entry: Vec<RawSong>,
     }
 
@@ -174,6 +191,20 @@ mod wire {
 
     #[derive(Debug, Deserialize, Default)]
     pub(super) struct RawAlbumDetail {
+        #[serde(default)]
+        pub(super) id: String,
+        #[serde(default)]
+        pub(super) name: Option<String>,
+        #[serde(default)]
+        pub(super) title: Option<String>,
+        #[serde(default)]
+        pub(super) artist: Option<String>,
+        #[serde(rename = "songCount", default)]
+        pub(super) song_count: u32,
+        #[serde(default)]
+        pub(super) year: Option<u32>,
+        #[serde(rename = "coverArt", default)]
+        pub(super) cover_art: Option<String>,
         #[serde(default)]
         pub(super) song: Vec<RawSong>,
     }
@@ -227,7 +258,35 @@ mod wire {
     #[derive(Debug, Deserialize, Default)]
     pub(super) struct RawArtistDetail {
         #[serde(default)]
+        pub(super) id: String,
+        #[serde(default)]
+        pub(super) name: String,
+        #[serde(rename = "albumCount", default)]
+        pub(super) album_count: u32,
+        #[serde(rename = "coverArt", default)]
+        pub(super) cover_art: Option<String>,
+        #[serde(rename = "artistImageUrl", default)]
+        pub(super) artist_image_url: Option<String>,
+        #[serde(default)]
         pub(super) album: Vec<RawAlbum>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct ArtistsData {
+        #[serde(default)]
+        pub(super) artists: Option<ArtistsContainer>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct ArtistsContainer {
+        #[serde(default)]
+        pub(super) index: Vec<ArtistIndexBucket>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    pub(super) struct ArtistIndexBucket {
+        #[serde(default)]
+        pub(super) artist: Vec<RawArtist>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -354,19 +413,53 @@ mod wire {
 use wire::*;
 
 #[cfg(feature = "web")]
+const SUBSONIC_FETCH_TIMEOUT_MS: u32 = 15_000;
+
+/// Returns `true` when an error string from [`fetch_subsonic`] indicates Subsonic error 40
+/// (wrong username or password / expired Navidrome session credentials).
+#[cfg(any(feature = "web", test))]
+pub fn is_subsonic_auth_error(err: &str) -> bool {
+    err.contains("Navidrome error 40:")
+}
+
+#[cfg(feature = "web")]
 async fn fetch_subsonic<T: serde::de::DeserializeOwned>(
     info: &NavidromeSessionInfo,
     endpoint: &str,
     params: &[(&str, &str)],
 ) -> Result<T, String> {
+    use futures::future::{select, Either};
+    use futures::pin_mut;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
     let url = ui::subsonic_rest_url(info, endpoint, params);
     let window = web_sys::window().ok_or_else(|| "Browser window unavailable".to_string())?;
-    let resp_val = JsFuture::from(window.fetch_with_str(&url))
-        .await
-        .map_err(|_| "Could not reach Navidrome from browser".to_string())?;
+
+    let controller = web_sys::AbortController::new().ok();
+    let init = web_sys::RequestInit::new();
+    if let Some(ref ctrl) = controller {
+        let signal = ctrl.signal();
+        init.set_signal(Some(&signal));
+    }
+
+    let fetch_fut = JsFuture::from(window.fetch_with_str_and_init(&url, &init));
+    let timeout_fut = ui::sleep_ms(SUBSONIC_FETCH_TIMEOUT_MS);
+    pin_mut!(fetch_fut);
+    pin_mut!(timeout_fut);
+
+    let resp_val = match select(fetch_fut, timeout_fut).await {
+        Either::Left((res, _)) => {
+            res.map_err(|_| "Could not reach Navidrome from browser".to_string())?
+        }
+        Either::Right((_, _)) => {
+            if let Some(ref ctrl) = controller {
+                ctrl.abort();
+            }
+            return Err("Navidrome request timed out after 15s".to_string());
+        }
+    };
+
     let resp: web_sys::Response = resp_val
         .dyn_into()
         .map_err(|_| "Unexpected Navidrome response type".to_string())?;
@@ -387,6 +480,11 @@ async fn fetch_subsonic<T: serde::de::DeserializeOwned>(
     if env.response.status != "ok" {
         if let Some(err) = env.response.error {
             let msg = err.message.unwrap_or_else(|| "Unknown error".to_string());
+            if err.code == 40 {
+                dioxus::logger::tracing::warn!(
+                    "Navidrome Subsonic error 40 on {endpoint}: {msg}"
+                );
+            }
             return Err(format!("Navidrome error {}: {msg}", err.code));
         }
         return Err(format!("Navidrome returned status '{}'", env.response.status));
@@ -692,37 +790,221 @@ pub async fn search_navidrome(
 }
 
 #[cfg(feature = "web")]
-pub async fn fetch_artist_albums(
+pub async fn fetch_playlist_detail(
     info: &NavidromeSessionInfo,
-    artist_id: &str,
-) -> Result<Vec<SubsonicAlbumSummary>, String> {
-    let data: ArtistDetailData = fetch_subsonic(info, "getArtist", &[("id", artist_id)]).await?;
-    Ok(data
-        .artist
-        .map(|a| a.album)
-        .unwrap_or_default()
+    playlist_id: &str,
+) -> Result<Option<(SubsonicPlaylistSummary, Vec<PlayerTrack>)>, String> {
+    let data: PlaylistDetailData =
+        fetch_subsonic(info, "getPlaylist", &[("id", playlist_id)]).await?;
+    let Some(pl) = data.playlist else {
+        return Ok(None);
+    };
+    let comment = pl.comment.unwrap_or_default();
+    let owner = pl.owner.unwrap_or_default();
+    let is_smart = detect_is_smart_playlist(&pl.name, &comment);
+    let category = ui::classify_playlist_category(&pl.id, Some(&comment), is_smart, &[]);
+    let tracks: Vec<PlayerTrack> = pl
+        .entry
         .into_iter()
-        .map(|a| a.into_summary(info))
-        .collect())
+        .map(|s| s.into_player_track(info))
+        .collect();
+    let summary = SubsonicPlaylistSummary {
+        id: if pl.id.is_empty() {
+            playlist_id.to_string()
+        } else {
+            pl.id
+        },
+        name: pl.name,
+        song_count: tracks.len() as u32,
+        duration: pl.duration,
+        cover_art: pl.cover_art,
+        comment,
+        owner,
+        public: pl.public,
+        is_smart,
+        category,
+    };
+    Ok(Some((summary, tracks)))
 }
 
 #[cfg(not(feature = "web"))]
-pub async fn fetch_artist_albums(
+pub async fn fetch_playlist_detail(
+    _info: &NavidromeSessionInfo,
+    _playlist_id: &str,
+) -> Result<Option<(SubsonicPlaylistSummary, Vec<PlayerTrack>)>, String> {
+    Ok(None)
+}
+
+#[cfg(feature = "web")]
+pub async fn fetch_album_detail(
+    info: &NavidromeSessionInfo,
+    album_id: &str,
+) -> Result<Option<(SubsonicAlbumSummary, Vec<PlayerTrack>)>, String> {
+    let data: AlbumDetailData = fetch_subsonic(info, "getAlbum", &[("id", album_id)]).await?;
+    let Some(alb) = data.album else {
+        return Ok(None);
+    };
+    let tracks: Vec<PlayerTrack> = alb
+        .song
+        .into_iter()
+        .map(|s| s.into_player_track(info))
+        .collect();
+    let name = alb
+        .name
+        .or(alb.title)
+        .unwrap_or_else(|| "Untitled Album".to_string());
+    let cover_id = alb.cover_art.unwrap_or_else(|| album_id.to_string());
+    let summary = SubsonicAlbumSummary {
+        id: if alb.id.is_empty() {
+            album_id.to_string()
+        } else {
+            alb.id
+        },
+        name,
+        artist: alb.artist.unwrap_or_else(|| "Unknown Artist".to_string()),
+        song_count: if alb.song_count > 0 {
+            alb.song_count
+        } else {
+            tracks.len() as u32
+        },
+        year: alb.year,
+        cover_art_url: Some(subsonic_cover_art_url(info, &cover_id, 400)),
+    };
+    Ok(Some((summary, tracks)))
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn fetch_album_detail(
+    _info: &NavidromeSessionInfo,
+    _album_id: &str,
+) -> Result<Option<(SubsonicAlbumSummary, Vec<PlayerTrack>)>, String> {
+    Ok(None)
+}
+
+#[cfg(feature = "web")]
+pub async fn fetch_artist_detail(
+    info: &NavidromeSessionInfo,
+    artist_id: &str,
+) -> Result<Option<(SubsonicArtistSummary, Vec<SubsonicAlbumSummary>)>, String> {
+    let data: ArtistDetailData = fetch_subsonic(info, "getArtist", &[("id", artist_id)]).await?;
+    let Some(art) = data.artist else {
+        return Ok(None);
+    };
+    let albums: Vec<SubsonicAlbumSummary> = art
+        .album
+        .into_iter()
+        .map(|a| a.into_summary(info))
+        .collect();
+    let cover_art_url = art
+        .cover_art
+        .filter(|c| !c.trim().is_empty())
+        .map(|cid| subsonic_cover_art_url(info, &cid, 300))
+        .or_else(|| art.artist_image_url.filter(|u| !u.trim().is_empty()))
+        .or_else(|| albums.first().and_then(|a| a.cover_art_url.clone()));
+    let summary = SubsonicArtistSummary {
+        id: if art.id.is_empty() {
+            artist_id.to_string()
+        } else {
+            art.id
+        },
+        name: art.name,
+        album_count: if art.album_count > 0 {
+            art.album_count
+        } else {
+            albums.len() as u32
+        },
+        cover_art_url,
+    };
+    Ok(Some((summary, albums)))
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn fetch_artist_detail(
     _info: &NavidromeSessionInfo,
     _artist_id: &str,
-) -> Result<Vec<SubsonicAlbumSummary>, String> {
+) -> Result<Option<(SubsonicArtistSummary, Vec<SubsonicAlbumSummary>)>, String> {
+    Ok(None)
+}
+
+#[cfg(feature = "web")]
+pub async fn fetch_artists(
+    info: &NavidromeSessionInfo,
+) -> Result<Vec<SubsonicArtistSummary>, String> {
+    let data: ArtistsData = fetch_subsonic(info, "getArtists", &[]).await?;
+    let mut out = Vec::new();
+    if let Some(container) = data.artists {
+        for bucket in container.index {
+            for artist in bucket.artist {
+                out.push(artist.into_summary(info));
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn fetch_artists(
+    _info: &NavidromeSessionInfo,
+) -> Result<Vec<SubsonicArtistSummary>, String> {
     Ok(Vec::new())
 }
 
 #[cfg(feature = "web")]
-pub async fn send_scrobble(info: &NavidromeSessionInfo, song_id: &str, submission: bool) {
+pub async fn fetch_library_tracks(
+    info: &NavidromeSessionInfo,
+    offset: u32,
+    size: u32,
+) -> Result<Vec<PlayerTrack>, String> {
+    let size_s = size.clamp(1, 500).to_string();
+    let offset_s = offset.to_string();
+    let data: Search3Data = fetch_subsonic(
+        info,
+        "search3",
+        &[
+            ("query", ""),
+            ("songCount", &size_s),
+            ("songOffset", &offset_s),
+            ("albumCount", "0"),
+            ("artistCount", "0"),
+        ],
+    )
+    .await?;
+    Ok(data
+        .search_result3
+        .map(|r| r.song)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.into_player_track(info))
+        .collect())
+}
+
+#[cfg(not(feature = "web"))]
+pub async fn fetch_library_tracks(
+    _info: &NavidromeSessionInfo,
+    _offset: u32,
+    _size: u32,
+) -> Result<Vec<PlayerTrack>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(feature = "web")]
+pub async fn send_scrobble(info: &NavidromeSessionInfo, song_id: &str, submission: bool) -> bool {
     let sub = if submission { "true" } else { "false" };
-    let _ = fetch_subsonic::<serde_json::Value>(
+    match fetch_subsonic::<serde_json::Value>(
         info,
         "scrobble",
         &[("id", song_id), ("submission", sub)],
     )
-    .await;
+    .await
+    {
+        Ok(_) => true,
+        Err(err) => {
+            dioxus::logger::tracing::warn!(
+                "Navidrome scrobble failed for {song_id} (submission={sub}): {err}"
+            );
+            !is_subsonic_auth_error(&err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -730,11 +1012,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_smart_and_soulbeet_playlists_from_comment_and_name() {
+    fn detects_smart_and_soulbeet_playlists_without_false_positives() {
         assert!(detect_is_smart_playlist("Comfort Zone", "Soulbeet Discovery: conservative"));
         assert!(detect_is_smart_playlist("Summer Anthems", "soulbeet:contextual:summer"));
         assert!(detect_is_smart_playlist("Favorites", "Auto smart playlist"));
-        assert!(detect_is_smart_playlist("Weekly Discovery", ""));
+        assert!(!detect_is_smart_playlist("Weekly Discovery", ""));
+        assert!(!detect_is_smart_playlist("Smart Indie Mix", "Favorite smart pop songs"));
         assert!(!detect_is_smart_playlist("Road Trip", "Songs for the highway"));
     }
 
@@ -752,5 +1035,12 @@ mod tests {
         assert_eq!(AlbumListSort::Newest.as_subsonic_type(), "newest");
         assert_eq!(AlbumListSort::Recent.as_subsonic_type(), "recent");
         assert_eq!(AlbumListSort::Frequent.as_subsonic_type(), "frequent");
+    }
+
+    #[test]
+    fn recognizes_subsonic_error_40_auth_failures() {
+        assert!(is_subsonic_auth_error("Navidrome error 40: Wrong username or password"));
+        assert!(!is_subsonic_auth_error("Navidrome error 70: Song not found"));
+        assert!(!is_subsonic_auth_error("Request timed out"));
     }
 }

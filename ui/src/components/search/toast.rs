@@ -73,8 +73,9 @@ pub fn FallbackToast(props: FallbackToastProps) -> Element {
             }
 
             // Line 2: pick source link
-            p {
-                class: "text-[12px] text-beet-leaf-text font-medium cursor-pointer hover:underline mt-1.5",
+            button {
+                r#type: "button",
+                class: "text-[12px] text-beet-leaf-text font-medium cursor-pointer hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-beet-leaf-solid rounded mt-1.5",
                 onclick: move |_| {
                     on_pick_source.call(choices.clone());
                     on_dismiss.call(toast_id_pick.clone());
@@ -117,7 +118,7 @@ mod tests {
             html.contains(">No confident match for Morse Bloom.</p>"),
             "{html}"
         );
-        assert!(html.contains(">Pick a source manually</p>"), "{html}");
+        assert!(html.contains(">Pick a source manually</button>"), "{html}");
     }
 
     #[test]
@@ -131,6 +132,6 @@ mod tests {
         );
         assert!(html.contains(&said), "{html}");
         assert!(!html.contains("No confident match"), "{html}");
-        assert!(html.contains(">Pick a source manually</p>"), "{html}");
+        assert!(html.contains(">Pick a source manually</button>"), "{html}");
     }
 }

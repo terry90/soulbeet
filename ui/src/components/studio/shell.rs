@@ -6,7 +6,7 @@ use shared::recommendation::{ContextualMixKind, ContextualMixSummary};
 
 use crate::{
     IconActivity, IconCommand, IconCompass, IconHome, IconLibrary, IconListMusic, IconLogOut,
-    IconRadio, IconSearch, IconSettings, IconSparkles, Logo, OfflineTogglePill,
+    IconPlus, IconRadio, IconSearch, IconSettings, IconSparkles, Logo, OfflineTogglePill,
 };
 
 use super::format_mix_title;
@@ -164,6 +164,7 @@ pub fn StudioSidebar(
     #[props(default)] on_open_seasonal: Option<EventHandler<String>>,
     #[props(default)] playlists: Vec<SidebarPlaylistItem>,
     #[props(default)] on_select_playlist: Option<EventHandler<String>>,
+    #[props(default)] on_create_playlist: Option<EventHandler<()>>,
     #[props(default)] username: Option<String>,
     #[props(default)] on_whats_new: Option<EventHandler<()>>,
     on_logout: EventHandler<()>,
@@ -372,8 +373,20 @@ pub fn StudioSidebar(
 
                 // Your Playlists (User & Custom Smart Playlists)
                 div { class: "space-y-1",
-                    p { class: "px-2 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                        "Your Playlists"
+                    div { class: "flex items-center justify-between px-2",
+                        p { class: "tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                            "Your Playlists"
+                        }
+                        if let Some(create_cb) = on_create_playlist {
+                            button {
+                                r#type: "button",
+                                aria_label: "New playlist",
+                                title: "New playlist",
+                                class: "w-5 h-5 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors cursor-pointer",
+                                onclick: move |_| create_cb.call(()),
+                                IconPlus { size: 13 }
+                            }
+                        }
                     }
                     if user_playlists.is_empty() && mix_playlists.is_empty() && !has_pinned_seasonal {
                         p { class: "px-2 py-2 text-[12px] text-beet-text-disabled",
@@ -472,6 +485,7 @@ pub fn StudioTopBar(
     #[props(default)] on_logout: Option<EventHandler<()>>,
     #[props(default)] active_transfers_count: usize,
     #[props(default)] culture_badge: Option<String>,
+    #[props(default)] hide_search_bar: bool,
 ) -> Element {
     rsx! {
         header { class: "h-14 px-3 sm:px-6 border-b border-beet-border-subtle bg-beet-canvas/90 backdrop-blur-md flex items-center justify-between gap-2 sm:gap-3 shrink-0 z-20 overflow-hidden",
@@ -485,25 +499,40 @@ pub fn StudioTopBar(
                 }
             }
 
-            // Center: Clickable Command Palette Trigger (`min-w-0 overflow-hidden` prevents overlap on 390px)
-            button {
-                r#type: "button",
-                aria_label: "Open Command Palette",
-                class: "flex-1 min-w-0 max-w-md h-9 px-2.5 sm:px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 overflow-hidden transition-colors cursor-pointer",
-                onclick: move |_| on_open_palette.call(()),
-                span { class: "flex items-center gap-1.5 sm:gap-2 min-w-0 overflow-hidden text-[13px]",
-                    span { class: "shrink-0 inline-flex", IconSearch { size: 15 } }
-                    span { class: "sm:hidden truncate", "Search…" }
-                    span { class: "hidden sm:inline truncate", "Jump to view, track, or command…" }
+            // Center: Clickable Command Palette Trigger (collapsed on /search so we never show two stacked search bars)
+            if !hide_search_bar {
+                button {
+                    r#type: "button",
+                    aria_label: "Open Command Palette",
+                    class: "flex-1 min-w-0 max-w-md h-9 px-2.5 sm:px-3 rounded-[9px] bg-beet-surface border border-beet-border-default hover:border-beet-border-strong text-beet-text-tertiary hover:text-beet-text-secondary flex items-center justify-between gap-2 overflow-hidden transition-colors cursor-pointer",
+                    onclick: move |_| on_open_palette.call(()),
+                    span { class: "flex items-center gap-1.5 sm:gap-2 min-w-0 overflow-hidden text-[13px]",
+                        span { class: "shrink-0 inline-flex", IconSearch { size: 15 } }
+                        span { class: "sm:hidden truncate", "Search…" }
+                        span { class: "hidden sm:inline truncate", "Jump to view, track, or command…" }
+                    }
+                    span { class: "hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-secondary shrink-0",
+                        IconCommand { size: 10 }
+                        "K"
+                    }
                 }
-                span { class: "hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold text-beet-text-secondary shrink-0",
-                    IconCommand { size: 10 }
-                    "K"
-                }
+            } else {
+                div { class: "flex-1" }
             }
 
-            // Right: Culture Pill, Offline Toggle, Active Transfers, Mobile Sign Out
+            // Right: Compact Command Palette (on /search), Culture Pill, Offline Toggle, Active Transfers, Mobile Sign Out
             div { class: "flex items-center gap-1.5 sm:gap-2 shrink-0",
+                if hide_search_bar {
+                    button {
+                        r#type: "button",
+                        aria_label: "Open Command Palette",
+                        title: "Command Palette (Ctrl+K)",
+                        class: "inline-flex items-center justify-center gap-1 h-9 px-2.5 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high tabular-nums-mono text-[11px] font-semibold cursor-pointer transition-colors shrink-0",
+                        onclick: move |_| on_open_palette.call(()),
+                        IconCommand { size: 12 }
+                        "K"
+                    }
+                }
                 if let Some(badge) = culture_badge.as_deref().filter(|b| !b.is_empty()) {
                     span { class: "hidden xl:inline-flex items-center px-2.5 h-8 rounded-full bg-beet-surface-low border border-beet-border-subtle tabular-nums-mono text-[11px] font-semibold text-beet-text-secondary",
                         "{badge}"

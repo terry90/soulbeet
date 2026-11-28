@@ -43,6 +43,7 @@ pub fn SeasonalHeroCard(
     #[props(default)] is_pinned_offline: bool,
     #[props(default = true)] exclude_from_core_taste: bool,
     on_play: EventHandler<()>,
+    #[props(default)] on_open: Option<EventHandler<()>>,
     #[props(default)] on_pin_offline: Option<EventHandler<()>>,
     #[props(default)] on_steer: Option<EventHandler<CultureSteering>>,
     #[props(default)] class: String,
@@ -156,23 +157,41 @@ pub fn SeasonalHeroCard(
 
                 // Display title & subtitle
                 div { class: "max-w-2xl space-y-1.5",
-                    h2 { class: "text-2xl sm:text-[32px] font-bold leading-[1.12] tracking-[-0.025em] text-beet-text-primary",
-                        "{title}"
+                    if let Some(open_cb) = on_open {
+                        button {
+                            r#type: "button",
+                            class: "text-left text-2xl sm:text-[32px] font-bold leading-[1.12] tracking-[-0.025em] text-beet-text-primary hover:underline underline-offset-4 cursor-pointer",
+                            onclick: move |_| open_cb.call(()),
+                            "{title}"
+                        }
+                    } else {
+                        h2 { class: "text-2xl sm:text-[32px] font-bold leading-[1.12] tracking-[-0.025em] text-beet-text-primary",
+                            "{title}"
+                        }
                     }
                     p { class: "text-sm text-beet-text-secondary leading-[1.45]",
                         "{subtitle}"
                     }
                 }
 
-                // Controls row: Play CTA, optional Pin Offline, and Culture Steering segmented chips
+                // Controls row: Play CTA, View Mix, optional Pin Offline, and Culture Steering segmented chips
                 div { class: "flex flex-wrap items-center justify-between gap-3 pt-1",
                     div { class: "flex flex-wrap items-center gap-2.5",
                         button {
                             r#type: "button",
                             class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[15px] font-semibold hover:brightness-105 active:scale-[0.98] transition-[filter,transform] duration-150 cursor-pointer",
                             onclick: move |_| on_play.call(()),
-                            IconPlay { size: 16, filled: true }
+                            IconPlay { size: 16, filled: true, class: "ml-0.5".to_string() }
                             span { "Play Mix" }
+                        }
+
+                        if let Some(open_cb) = on_open {
+                            button {
+                                r#type: "button",
+                                class: "inline-flex items-center gap-2 h-10 px-4 rounded-full bg-beet-surface-high/90 border border-beet-border-default text-beet-text-primary hover:bg-beet-surface-highest text-[13px] font-medium transition-colors duration-150 cursor-pointer",
+                                onclick: move |_| open_cb.call(()),
+                                span { "View Mix" }
+                            }
                         }
 
                         if let Some(pin_cb) = on_pin_offline {

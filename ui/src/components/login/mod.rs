@@ -121,9 +121,9 @@ pub fn Login(props: Props) -> Element {
             }
 
             button {
-              class: "w-full h-10 px-4 rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-sm tracking-wide flex justify-center items-center gap-2 hover:brightness-105 transition-all cursor-pointer group",
+              class: "w-full h-10 px-4 rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-sm tracking-wide flex justify-center items-center gap-2 hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer group",
               "type": "submit",
-              span { "AUTHENTICATE" }
+              span { "Sign in" }
               svg {
                 class: "w-4 h-4 group-hover:translate-x-0.5 transition-transform",
                 fill: "none",

@@ -31,8 +31,7 @@ pub fn HomePage() -> Element {
     let moment_and_rolling: Vec<_> = mixes
         .iter()
         .filter(|m| {
-            Some(m.slug.as_str()) != hero_slug
-                && !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0)
+            Some(m.slug.as_str()) != hero_slug && m.kind != ContextualMixKind::Seasonal
         })
         .cloned()
         .collect();
@@ -159,14 +158,18 @@ pub fn HomePage() -> Element {
                     div { class: "grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3",
                         for alb in recent_albums.iter().take(4) {
                             {
-                                let aid = alb.id.clone();
+                                let aid_open = alb.id.clone();
+                                let aid_play = alb.id.clone();
                                 let aname = alb.name.clone();
                                 rsx! {
-                                    button {
+                                    div {
                                         key: "home-alb-{alb.id}",
-                                        r#type: "button",
+                                        role: "button",
+                                        tabindex: "0",
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
-                                        onclick: move |_| play_album.call((aid.clone(), aname.clone())),
+                                        onclick: move |_| {
+                                            nav.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                        },
                                         div { class: "w-12 h-12 rounded-[8px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
                                             if let Some(url) = alb.cover_art_url.as_deref() {
                                                 img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
@@ -182,8 +185,16 @@ pub fn HomePage() -> Element {
                                                 "{alb.artist}"
                                             }
                                         }
-                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 group-hover:scale-105 transition-[opacity,transform] shrink-0",
-                                            IconPlay { size: 13, filled: true }
+                                        button {
+                                            r#type: "button",
+                                            aria_label: format!("Play {}", alb.name),
+                                            title: format!("Play {}", alb.name),
+                                            class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:scale-105 transition-[opacity,transform] shrink-0 cursor-pointer",
+                                            onclick: move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                play_album.call((aid_play.clone(), aname.clone()));
+                                            },
+                                            IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                         }
                                     }
                                 }
@@ -192,7 +203,8 @@ pub fn HomePage() -> Element {
 
                         for pl in jump_playlists.iter() {
                             {
-                                let pid = pl.id.clone();
+                                let pid_open = pl.id.clone();
+                                let pid_play = pl.id.clone();
                                 let pname = pl.name.clone();
                                 let category = pl.category;
                                 let icon_cls = match category {
@@ -207,11 +219,14 @@ pub fn HomePage() -> Element {
                                     }
                                 };
                                 rsx! {
-                                    button {
+                                    div {
                                         key: "home-pl-{pl.id}",
-                                        r#type: "button",
+                                        role: "button",
+                                        tabindex: "0",
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
-                                        onclick: move |_| play_playlist.call((pid.clone(), pname.clone())),
+                                        onclick: move |_| {
+                                            nav.push(Route::PlaylistDetailPage { id: pid_open.clone() });
+                                        },
                                         div { class: "w-12 h-12 rounded-[8px] border shrink-0 flex items-center justify-center {icon_cls}",
                                             match category {
                                                 PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 20 } },
@@ -235,8 +250,16 @@ pub fn HomePage() -> Element {
                                                 }
                                             }
                                         }
-                                        span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 group-hover:scale-105 transition-[opacity,transform] shrink-0",
-                                            IconPlay { size: 13, filled: true }
+                                        button {
+                                            r#type: "button",
+                                            aria_label: format!("Play {}", pl.name),
+                                            title: format!("Play {}", pl.name),
+                                            class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:scale-105 transition-[opacity,transform] shrink-0 cursor-pointer",
+                                            onclick: move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                play_playlist.call((pid_play.clone(), pname.clone()));
+                                            },
+                                            IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                         }
                                     }
                                 }
@@ -250,6 +273,7 @@ pub fn HomePage() -> Element {
             if let Some(pack) = seasonal {
                 {
                     let slug_play = pack.slug.clone();
+                    let slug_open = pack.slug.clone();
                     let slug_steer = pack.slug.clone();
                     let local_ratio = pack
                         .local_pct
@@ -271,6 +295,9 @@ pub fn HomePage() -> Element {
                             steering: pack.steering.unwrap_or(CultureSteering::Balanced),
                             exclude_from_core_taste: pack.exclude_from_core_taste,
                             on_play: move |_| studio.play_contextual_mix(auth, player, slug_play.clone()),
+                            on_open: move |_| {
+                                nav.push(Route::MixDetailPage { slug: slug_open.clone() });
+                            },
                             on_steer: move |next| studio.steer_seasonal_mix(auth, slug_steer.clone(), next),
                         }
                     }
@@ -308,6 +335,9 @@ pub fn HomePage() -> Element {
                                 let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                                 let triage_for_row = visible_triage.clone();
                                 let t_play = track.clone();
+                                let t_next = track.clone();
+                                let t_queue = track.clone();
+                                let t_pl = track.clone();
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
                                 let t_rate = track.clone();
@@ -333,6 +363,19 @@ pub fn HomePage() -> Element {
                                                 false,
                                             )
                                         },
+                                        on_play_next: move |_| {
+                                            player.enqueue_next(t_next.clone());
+                                            studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                        },
+                                        on_add_to_queue: move |_| {
+                                            player.enqueue_last(t_queue.clone());
+                                            studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                        },
+                                        on_add_to_playlist: move |_| {
+                                            studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                        },
+                                        on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                        on_album_click: move |album| studio.navigate_to_album(nav, album),
                                         on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                         on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
                                         on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
@@ -363,6 +406,9 @@ pub fn HomePage() -> Element {
                         }
                     }),
                     on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
+                    on_open: move |slug| {
+                        nav.push(Route::MixDetailPage { slug });
+                    },
                 }
             }
 
@@ -377,6 +423,9 @@ pub fn HomePage() -> Element {
                             {
                                 let all_tracks = starred.clone();
                                 let is_playing = player.is_track_playing(&track.id);
+                                let t_next = track.clone();
+                                let t_queue = track.clone();
+                                let t_pl = track.clone();
                                 let t_star = track.clone();
                                 let t_rate = track.clone();
                                 let t_inspect = track.clone();
@@ -401,6 +450,19 @@ pub fn HomePage() -> Element {
                                         is_playing,
                                         state: row_state,
                                         on_play: move |_| player.play_queue(all_tracks.clone(), idx),
+                                        on_play_next: move |_| {
+                                            player.enqueue_next(t_next.clone());
+                                            studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                        },
+                                        on_add_to_queue: move |_| {
+                                            player.enqueue_last(t_queue.clone());
+                                            studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                        },
+                                        on_add_to_playlist: move |_| {
+                                            studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                        },
+                                        on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                        on_album_click: move |album| studio.navigate_to_album(nav, album),
                                         on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                         on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                         on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),

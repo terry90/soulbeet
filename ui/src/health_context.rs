@@ -49,7 +49,7 @@ pub fn HealthProvider(children: Element) -> Element {
                     state.set(health);
                 }
             }
-            gloo_timers::future::TimeoutFuture::new(10_000).await;
+            crate::sleep_ms(10_000).await;
         }
     });
 

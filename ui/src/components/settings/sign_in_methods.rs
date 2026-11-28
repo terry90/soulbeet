@@ -151,9 +151,12 @@ pub(super) fn SingleSignOnSection(
             match auth.call(start_sso_link(password)).await {
                 // A full page load: the provider's sign-in page, then back.
                 Ok(url) => {
+                    #[cfg(target_arch = "wasm32")]
                     if let Some(window) = web_sys::window() {
                         let _ = window.location().set_href(&url);
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = url;
                 }
                 Err(e) => {
                     error.set(friendly_error(&e));

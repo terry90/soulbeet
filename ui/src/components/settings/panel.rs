@@ -4,11 +4,15 @@ use dioxus::prelude::*;
 
 pub(super) const LABEL_CLASS: &str = "block text-xs font-medium text-beet-text-secondary mb-1.5";
 /// A primary positive action button inside settings panels.
-pub(super) const PRIMARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
+pub(super) const PRIMARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none";
+/// A compact primary positive action button (no height/padding class collisions).
+pub(super) const COMPACT_PRIMARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-1.5 px-3 h-8 text-xs font-semibold rounded-[8px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none";
 /// A secondary action button inside settings panels.
-pub(super) const SECONDARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-3.5 h-9 text-xs font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed";
+pub(super) const SECONDARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-2 px-3.5 h-9 text-xs font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none";
+/// A compact secondary action button (no height/padding class collisions).
+pub(super) const COMPACT_SECONDARY_BUTTON_CLASS: &str = "inline-flex items-center justify-center gap-1.5 px-3 h-8 text-xs font-medium rounded-[8px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none";
 /// A small text button that removes something.
-pub(super) const REMOVE_BUTTON_CLASS: &str = "text-xs font-medium text-beet-text-tertiary hover:text-beet-crimson-text transition-colors underline decoration-dotted underline-offset-4 cursor-pointer";
+pub(super) const REMOVE_BUTTON_CLASS: &str = "text-xs font-medium text-beet-text-tertiary hover:text-beet-crimson-text transition-colors cursor-pointer";
 
 /// The unix time `at` in UTC, written with the chrono `format`; the bare
 /// number when chrono cannot represent it.
