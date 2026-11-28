@@ -21,6 +21,20 @@ This page covers running Soulbeet (server/web, desktop app, and Android app) fro
    python -m pytest -q lib/soulbeet/tests/probe lib/soulbeet/tests/import
    ```
 
+## Seeded local dev build
+
+To review UI and UX changes interactively in desktop and mobile browsers without touching real data or external services, run the one-command seeded dev stack (debug binary on port `9766` with passwordless `admin` auto-login, mock Navidrome with SVG covers and playable demo audio, local service stubs, and an isolated SQLite DB under `.runtime-dev/`):
+
+```bash
+./scripts/dev-seeded.sh up                 # Start stack (builds debug web bundle if needed)
+./scripts/dev-seeded.sh up --build         # Rebuild debug web bundle and restart
+./scripts/dev-seeded.sh reset --all-mixes  # Reset DB and surface every built-in mix sleeve
+./scripts/dev-seeded.sh up --local-only    # Bind 127.0.0.1 instead of 0.0.0.0 (LAN)
+./scripts/dev-seeded.sh down               # Stop all dev stack daemons
+```
+
+By default it binds `0.0.0.0:9766` (trusted LAN only) so you can open `http://127.0.0.1:9766` on your workstation or `http://<workstation-ip>:9766` on your phone. Auto-login (`SOULBEET_DEV_AUTOLOGIN=1`) is compiled only in debug builds and omitted from release binaries.
+
 ## Native desktop app (`desktop/`)
 
 On Linux, install the development packages checked by `pkg-config` (`mpv`, `webkit2gtk-4.1`, `gtk+-3.0`, `dbus-1`):
