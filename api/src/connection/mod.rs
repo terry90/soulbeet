@@ -68,6 +68,8 @@ pub struct ConnectionState {
     /// Whether proxy forwarding headers (`Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`)
     /// are trusted when `public_url` is unset.
     pub(crate) trust_proxy_headers: bool,
+    /// Coordinator for 1-Click Existing Library Import batches.
+    pub(crate) library_import: Arc<crate::core::library_import::LibraryImportCoordinator>,
 }
 
 impl ConnectionState {
@@ -97,6 +99,7 @@ impl ConnectionState {
             ratings: Arc::new(LiveSync),
             listeners: Arc::new(LiveListeners),
             trust_proxy_headers: crate::config::trust_proxy_headers(),
+            library_import: crate::core::library_import::COORDINATOR.clone(),
         }
     }
 }

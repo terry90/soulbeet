@@ -35,10 +35,10 @@ pub use metadata_error::MetadataError;
 pub use navidrome::{NavidromeClient, NavidromeClientBuilder, NavidromeError};
 pub use traits::{
     BeetsTrackInfo, CandidateGenerator, DownloadBackend, DriverChoice, DuplicateRun, FailKind,
-    ForgetOutcome, GeneratorOutput, ImportMode, ImportOutcome, ImportResult, ImportedItem,
-    KnowledgeCache, ListeningHistory, MetadataProvider, MusicImporter, MusicKnowledge,
-    PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile, TagEdits, TaskCount,
-    TimeoutKind, WantedRemoval,
+    ForgetOutcome, GeneratorOutput, ImportMode, ImportOutcome, ImportPlacement, ImportResult,
+    ImportedItem, KnowledgeCache, ListeningHistory, MetadataProvider, MusicImporter,
+    MusicKnowledge, PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile, TagEdits,
+    TaskCount, TimeoutKind, WantedRemoval,
 };
 pub use transfer_book::{BookEntry, BookError, TransferBook};
 pub use verify::{audio_duration_secs, verify_downloaded_audio, VerifiedAudio, VerifyPolicy};

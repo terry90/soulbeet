@@ -1,5 +1,6 @@
 use crate::models;
 use dioxus::prelude::*;
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
 use super::{failure_error, refusal_error, server_error};
@@ -17,6 +18,31 @@ use crate::AuthSession;
 #[cfg(feature = "server")]
 use std::path::Path;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavidromeLibraryWarningDto {
+    pub default_library_path: String,
+    pub overlapping_user_paths: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserLibrarySyncEntryDto {
+    pub user_id: String,
+    pub username: String,
+    pub folder_path: String,
+    pub navidrome_library_id: Option<i64>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavidromeLibrarySyncReportDto {
+    pub has_admin: bool,
+    pub entries: Vec<UserLibrarySyncEntryDto>,
+    pub warning: Option<NavidromeLibraryWarningDto>,
+}
+
+/// Returns the caller's single personal library folder (as a 0- or 1-element list
+/// for simple UI consumption).
 #[get("/api/folders", auth: AuthSession)]
 pub async fn get_user_folders() -> Result<Vec<models::folder::Folder>, ServerFnError> {
     crate::core::folders::list(&auth.0)
@@ -24,6 +50,15 @@ pub async fn get_user_folders() -> Result<Vec<models::folder::Folder>, ServerFnE
         .map_err(failure_error)
 }
 
+/// Returns the caller's single personal library folder, if configured.
+#[get("/api/folder", auth: AuthSession)]
+pub async fn get_user_folder() -> Result<Option<models::folder::Folder>, ServerFnError> {
+    models::folder::Folder::get_for_user(&auth.0.user_id)
+        .await
+        .map_err(server_error)
+}
+
+/// Creates (if none exists) or updates the caller's single personal library folder.
 #[post("/api/folders", auth: AuthSession)]
 pub async fn create_user_folder(
     name: String,
@@ -37,9 +72,23 @@ pub async fn create_user_folder(
         .await
         .map_err(server_error)?;
 
+    let existing = sqlx::query_as::<_, models::folder::Folder>(
+        "SELECT * FROM folders WHERE user_id = ? LIMIT 1",
+    )
+    .bind(&auth.0.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(server_error)?;
+
     let rows = PolicyRows::load_tx(&mut tx).await.map_err(server_error)?;
     let (folders, roots) = rows.inputs();
-    check_folder_path(&candidate, &auth.0, &folders, &roots).map_err(refusal_error)?;
+    match existing.as_ref() {
+        Some(existing) => {
+            check_folder_update(&candidate, &existing.path, &auth.0, &folders, &roots)
+        }
+        None => check_folder_path(&candidate, &auth.0, &folders, &roots),
+    }
+    .map_err(refusal_error)?;
 
     let dir_existed = tokio::fs::try_exists(&candidate).await.unwrap_or(true);
     if !dir_existed {
@@ -63,17 +112,30 @@ pub async fn create_user_folder(
         }
     };
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let folder = match sqlx::query_as::<_, models::folder::Folder>(
-        "INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?) RETURNING *",
-    )
-    .bind(&id)
-    .bind(&auth.0.user_id)
-    .bind(&name)
-    .bind(path_str(&created))
-    .fetch_one(&mut *tx)
-    .await
-    {
+    let folder_res = if let Some(existing) = existing {
+        sqlx::query_as::<_, models::folder::Folder>(
+            "UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ? RETURNING *",
+        )
+        .bind(&name)
+        .bind(path_str(&created))
+        .bind(&existing.id)
+        .bind(&auth.0.user_id)
+        .fetch_one(&mut *tx)
+        .await
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query_as::<_, models::folder::Folder>(
+            "INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?) RETURNING *",
+        )
+        .bind(&id)
+        .bind(&auth.0.user_id)
+        .bind(&name)
+        .bind(path_str(&created))
+        .fetch_one(&mut *tx)
+        .await
+    };
+
+    let folder = match folder_res {
         Ok(folder) => folder,
         Err(e) => {
             let _ = tx.rollback().await;
@@ -90,6 +152,11 @@ pub async fn create_user_folder(
         }
         return Err(server_error(e));
     }
+
+    let uid = auth.0.user_id.clone();
+    tokio::spawn(async move {
+        crate::core::navidrome_libraries::sync_single_user_library_best_effort(&uid).await;
+    });
     Ok(folder)
 }
 
@@ -134,16 +201,54 @@ pub async fn update_folder(
     check_folder_update(&candidate, &existing.path, &auth.0, &folders, &roots)
         .map_err(refusal_error)?;
 
-    sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ?")
+    let dir_existed = tokio::fs::try_exists(&candidate).await.unwrap_or(true);
+    if !dir_existed {
+        tokio::fs::create_dir_all(&candidate)
+            .await
+            .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
+    }
+    let created = match canonical_folder_path(&candidate) {
+        Ok(c) if c == candidate => c,
+        Ok(_) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Changed));
+        }
+        Err(e) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Path(e)));
+        }
+    };
+
+    if let Err(e) = sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ?")
         .bind(&name)
-        .bind(path_str(&candidate))
+        .bind(path_str(&created))
         .bind(&folder_id)
         .bind(&auth.0.user_id)
         .execute(&mut *tx)
         .await
-        .map_err(server_error)?;
+    {
+        let _ = tx.rollback().await;
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
 
-    tx.commit().await.map_err(server_error)?;
+    if let Err(e) = tx.commit().await {
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
+
+    let uid = auth.0.user_id.clone();
+    tokio::spawn(async move {
+        crate::core::navidrome_libraries::sync_single_user_library_best_effort(&uid).await;
+    });
     Ok(())
 }
 
@@ -185,9 +290,38 @@ pub async fn remove_folder_root(path: String) -> Result<(), ServerFnError> {
     FolderRoot::remove(&path).await.map_err(server_error)
 }
 
-#[post("/api/folders/shared", _: AdminSession)]
-pub async fn set_folder_shared(folder_id: String, shared: bool) -> Result<(), ServerFnError> {
-    models::folder::Folder::set_shared(&folder_id, shared)
+#[post("/api/admin/navidrome/sync-libraries", _: AdminSession)]
+pub async fn sync_navidrome_libraries() -> Result<NavidromeLibrarySyncReportDto, ServerFnError> {
+    let report = crate::core::navidrome_libraries::sync_all_user_libraries().await;
+    Ok(NavidromeLibrarySyncReportDto {
+        has_admin: report.has_admin,
+        entries: report
+            .entries
+            .into_iter()
+            .map(|e| UserLibrarySyncEntryDto {
+                user_id: e.user_id,
+                username: e.username,
+                folder_path: e.folder_path,
+                navidrome_library_id: e.navidrome_library_id,
+                status: e.status,
+            })
+            .collect(),
+        warning: report.warning.map(|w| NavidromeLibraryWarningDto {
+            default_library_path: w.default_library_path,
+            overlapping_user_paths: w.overlapping_user_paths,
+            message: w.message,
+        }),
+    })
+}
+
+#[get("/api/admin/navidrome/library-warning", _: AdminSession)]
+pub async fn get_navidrome_library_warning(
+) -> Result<Option<NavidromeLibraryWarningDto>, ServerFnError> {
+    Ok(crate::core::navidrome_libraries::inspect_library_warning()
         .await
-        .map_err(server_error)
+        .map(|w| NavidromeLibraryWarningDto {
+            default_library_path: w.default_library_path,
+            overlapping_user_paths: w.overlapping_user_paths,
+            message: w.message,
+        }))
 }

@@ -40,7 +40,7 @@ To stay on releases, use a `:latest` tag or a version tag. Use `:light`, `:mediu
 - Library has files where MusicBrainz refuses to match because the track length is off → medium. The `chroma` plugin uses AcoustID fingerprints, which bypass length checks.
 - You want covers embedded, lyrics fetched, normalized loudness, and the kitchen sink → full.
 
-Switch tiers by editing `image:` in your `docker-compose.yml` and recreating the container:
+Switch tiers by editing `image:` (or `SOULBEET_TAG` in `.env`) in your `compose.yaml` and recreating the container:
 
 ```yaml
 services:
@@ -121,7 +121,7 @@ Soulbeet's default config sets `pluginpath: [/opt/beets-plugins, /data/beets-plu
    ```
    The file must subclass `beets.plugins.BeetsPlugin`. **No `__init__.py` is needed**: `pluginpath` extends beets' PEP 420 namespace package.
 
-2. Mount it into the container in `docker-compose.yml`:
+2. Mount it into the container in `compose.yaml` (or `docker-compose.dev.yml` when building from source):
    ```yaml
    volumes:
      - ./my-beets-plugins:/data/beets-plugins:ro

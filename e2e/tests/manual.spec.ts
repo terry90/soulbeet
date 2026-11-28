@@ -1,5 +1,6 @@
 // Manual source selection: "Search sources" opens the download options view
-// where the user inspects candidate groups, picks tracks and a target folder.
+// where the user inspects candidate groups and picks tracks to download into
+// their personal library folder.
 
 import { expect, test } from '@playwright/test';
 import { freshSession, performSearch } from '../helpers/app.js';
@@ -23,7 +24,6 @@ test('lists scored sources and downloads a hand-picked track', async ({ context,
   await expect(page.getByText('FLAC 16/44.1').first()).toBeVisible();
 
   await page.getByRole('button', { name: 'Select All' }).first().click();
-  await page.locator('select[name="dl_folder"]').selectOption({ label: folder.name });
   await page.getByRole('button', { name: 'Start download' }).click();
 
   const imported = importedTrackPath(

@@ -264,7 +264,7 @@ pub enum Stage {
     Index,
     Playlist,
     Delete,
-    Move,
+    Share,
     Retag,
 }
 
@@ -470,14 +470,18 @@ failure_codes! {
     ResultRejected => "result_rejected",
     /// A search Soulful stopped before it ran, because the job it served was cancelled.
     SearchStopped => "search_stopped",
-    /// The track is already inside the target folder.
-    MoveSameFolder => "move_same_folder",
-    /// A file already exists at the destination path.
-    MoveTargetExists => "move_target_exists",
-    /// Another copy of this track already lives in the target folder.
-    MoveDuplicateInTarget => "move_duplicate_in_target",
-    /// The OS refused to move the file or finish cleaning up after it.
-    MoveFailed => "move_failed",
+    /// The recipient has disabled incoming shares from other users.
+    ShareRecipientDisabled => "share_recipient_disabled",
+    /// The recipient does not have a configured library folder yet.
+    ShareNoTargetFolder => "share_no_target_folder",
+    /// You cannot share tracks to your own account.
+    ShareSelfDisallowed => "share_self_disallowed",
+    /// A file already exists at the recipient's destination path.
+    ShareTargetExists => "share_target_exists",
+    /// The recipient already has a matching copy of this track in their library.
+    ShareAlreadyInLibrary => "share_already_in_library",
+    /// The OS refused to hardlink/copy the file into the recipient's library.
+    ShareFailed => "share_failed",
     /// beets failed to modify tags or re-match the track.
     RetagFailed => "retag_failed",
     /// Relocating after re-tagging requires a linked Navidrome admin to scan between tag write and move.
@@ -497,7 +501,7 @@ mod tests {
     /// `download_disk_full`, and
     /// without `peer_rejected_enqueue`, which nothing produces. The one
     /// normative list of FailureCode names.
-    const NAMES: [&str; 99] = [
+    const NAMES: [&str; 101] = [
         "invalid_input",
         "unknown_handle",
         "expired_handle",
@@ -591,10 +595,12 @@ mod tests {
         "sources_exhausted",
         "result_rejected",
         "search_stopped",
-        "move_same_folder",
-        "move_target_exists",
-        "move_duplicate_in_target",
-        "move_failed",
+        "share_recipient_disabled",
+        "share_no_target_folder",
+        "share_self_disallowed",
+        "share_target_exists",
+        "share_already_in_library",
+        "share_failed",
         "retag_failed",
         "retag_relocate_needs_scan",
     ];

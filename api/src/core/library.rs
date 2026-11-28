@@ -28,7 +28,6 @@ use crate::models::navidrome_library::NavidromeLibraryRow;
 pub struct FolderRef {
     pub folder_id: String,
     pub name: String,
-    pub shared: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,7 +190,6 @@ impl FolderResolver {
                         FolderRef {
                             folder_id: row.folder.id,
                             name: row.folder.name,
-                            shared: row.folder.shared,
                             owner: Some(row.owner),
                             is_own: Some(is_own),
                         },
@@ -212,7 +210,6 @@ impl FolderResolver {
                         FolderRef {
                             folder_id: f.id,
                             name: f.name,
-                            shared: f.shared,
                             owner: None,
                             is_own: None,
                         },

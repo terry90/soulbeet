@@ -198,6 +198,14 @@ export async function openConfigTab(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Config', exact: true }).click();
 }
 
+/**
+ * Opens the Library tab of the settings page. Its name is matched exactly: while the tab is
+ * open, its "Import Existing Library" button holds "Library" too.
+ */
+export async function openLibraryTab(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Library', exact: true }).click();
+}
+
 export type SearchFilterType = 'ALL' | 'ALBUM' | 'TRACK' | 'ARTIST';
 
 function filterPillPattern(type: SearchFilterType): RegExp {

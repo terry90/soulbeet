@@ -141,7 +141,7 @@ pub(super) fn tag_overrides_singleton_only() -> ImportRefusal {
 }
 
 /// Validates and trims `overrides`, refusing empty artist or title while keeping the job.
-pub(super) fn validate_tag_overrides(
+pub(crate) fn validate_tag_overrides(
     overrides: &AsIsTagOverrides,
 ) -> Result<AsIsTagOverrides, ImportRefusal> {
     let artist = overrides.artist.trim().to_string();
@@ -202,7 +202,7 @@ pub(super) fn resolve(
 
 /// The MBID in a bare ID or a musicbrainz.org link, refusing a link to an
 /// entity that `mode` cannot import.
-fn musicbrainz_id(text: &str, mode: ImportMode) -> Result<String, ImportRefusal> {
+pub(crate) fn musicbrainz_id(text: &str, mode: ImportMode) -> Result<String, ImportRefusal> {
     let text = text.trim().to_ascii_lowercase();
     if !text.contains('/') {
         return mbid(&text).ok_or_else(not_an_id);

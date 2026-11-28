@@ -25,9 +25,10 @@ use crate::auth::UserCtx;
 use crate::connection::ConnectionState;
 use crate::core::index::ServerNavidrome;
 use crate::core::library::{library_roots_in, listing, navidrome_failure};
+use crate::core::navidrome_libraries::{inspect_library_warning_in, NavidromeLibraryWarning};
 use crate::core::scan::{scan_by, ScanBy, SCAN_ROLES};
 use crate::core::time;
-use crate::core::{database_failure, folders, health::system_health, settings};
+use crate::core::{database_failure, folders, health::system_health};
 use crate::ledger::store::{running_batches, RunningBatch};
 use crate::models::folder::Folder;
 use crate::oauth::metadata::mcp_url;
@@ -73,8 +74,9 @@ pub(crate) struct StatusFacts {
     /// Where Navidrome's libraries are on this machine, as far as Soulful
     /// knows (library_roots_in).
     pub library_roots: Vec<PathBuf>,
-    pub default_folder_id: Option<String>,
     pub running_batches: Vec<RunningBatch>,
+    /// Present when Navidrome's default library (ID 1) overlaps user library folders.
+    pub navidrome_library_warning: Option<NavidromeLibraryWarning>,
 }
 
 /// Where the facts come from, a seam for tests.
@@ -91,32 +93,33 @@ pub(crate) struct LiveStatus {
 #[async_trait]
 impl StatusSource for LiveStatus {
     /// Reads every fact at once; fails only when the folders, the library
-    /// roots, the settings or the ledger's batches cannot be read.
+    /// roots, or the ledger's batches cannot be read.
     async fn gather(&self, ctx: &UserCtx) -> Result<StatusFacts, Failure> {
         let user = ctx.id();
-        let (health, navidrome, folders, library_roots, settings, batches) = tokio::join!(
+        let music_path = crate::config::CONFIG.navidrome_music_path();
+        let (health, navidrome, folders, library_roots, batches, warning) = tokio::join!(
             system_health(ctx),
             navidrome_facts(&self.db, ctx),
             async { Ok::<_, Failure>(with_free_space(folders::list(ctx).await?).await) },
-            library_roots_in(&self.db, crate::config::CONFIG.navidrome_music_path()),
-            settings::get(ctx),
+            library_roots_in(&self.db, music_path),
             running_batches(&self.db, &user),
+            async {
+                if ctx.role.is_admin() {
+                    inspect_library_warning_in(&self.db, &ServerNavidrome, music_path).await
+                } else {
+                    None
+                }
+            },
         );
         Ok(StatusFacts {
             health,
             navidrome,
             folders: folders?,
             library_roots: library_roots?,
-            default_folder_id: chosen_folder(settings?.default_download_folder_id),
             running_batches: batches.map_err(|e| database_failure(Stage::Input, e))?,
+            navidrome_library_warning: warning,
         })
     }
-}
-
-/// The folder a settings choice names: an empty id is a cleared choice
-/// (core::settings::check_folder_choices), so no folder.
-pub(crate) fn chosen_folder(id: Option<String>) -> Option<String> {
-    id.filter(|id| !id.is_empty())
 }
 
 /// The user's own admin role, read here, is also what an import knows of their account; of the
@@ -157,11 +160,7 @@ pub(crate) async fn with_free_space(folders: Vec<Folder>) -> Vec<FolderFacts> {
 /// read against `library_roots`. Its name is the user's own text, cut to
 /// TEXT_MAX_CHARS of JSON; its path is canonical, so the kernel bounds it at
 /// PATH_MAX.
-pub(crate) fn folder_fields(
-    f: &FolderFacts,
-    default_folder_id: Option<&str>,
-    library_roots: &[PathBuf],
-) -> Value {
+pub(crate) fn folder_fields(f: &FolderFacts, library_roots: &[PathBuf]) -> Value {
     let (free_bytes, free_space_failure) = match &f.free {
         Ok(bytes) => (json!(bytes), Value::Null),
         Err(e) => (Value::Null, json!(e)),
@@ -170,8 +169,6 @@ pub(crate) fn folder_fields(
         "folder_id": f.folder.id,
         "name": cut_json(f.folder.name.clone(), TEXT_MAX_CHARS),
         "path": f.folder.path,
-        "shared": f.folder.shared,
-        "default": Some(f.folder.id.as_str()) == default_folder_id,
         "free_bytes": free_bytes,
         "free_space_failure": free_space_failure,
         "in_navidrome": listing(Path::new(&f.folder.path), library_roots),
@@ -183,12 +180,14 @@ pub(crate) fn owned_folder_fields(
     f: &FolderFacts,
     owner: &str,
     is_own: bool,
-    default_folder_id: Option<&str>,
     library_roots: &[PathBuf],
 ) -> Value {
-    let mut val = folder_fields(f, if is_own { default_folder_id } else { None }, library_roots);
+    let mut val = folder_fields(f, library_roots);
     if let Value::Object(ref mut map) = val {
-        map.insert("owner".into(), json!(cut_json(owner.to_string(), TEXT_MAX_CHARS)));
+        map.insert(
+            "owner".into(),
+            json!(cut_json(owner.to_string(), TEXT_MAX_CHARS)),
+        );
         map.insert("is_own".into(), json!(is_own));
     }
     val
@@ -337,11 +336,10 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
             })
         })
         .collect();
-    let default = facts.default_folder_id.as_deref();
     let folders: Vec<Value> = facts
         .folders
         .iter()
-        .map(|f| folder_fields(f, default, &facts.library_roots))
+        .map(|f| folder_fields(f, &facts.library_roots))
         .collect();
     let running_batches: Vec<Value> = facts
         .running_batches
@@ -381,12 +379,17 @@ pub(crate) fn status_fields(facts: &StatusFacts, caller: &McpCaller) -> Map<Stri
             "scan": scan,
             "scan_failure": scan_failure,
         },
-        "default_folder_id": facts.default_folder_id,
         "deletion_enabled": caller.allow_delete,
         "allow_admin": caller.has_admin_access(),
     }) else {
         unreachable!("an object literal is an object");
     };
+    if caller.ctx.role.is_admin() {
+        fields.insert(
+            "navidrome_library_warning".into(),
+            json!(facts.navidrome_library_warning),
+        );
+    }
     // The batches are fitted with room kept for the folders' empty list and
     // their count at its longest, so fitting the folders after them in what
     // is left keeps the whole within the cap.
@@ -469,16 +472,24 @@ mod tests {
                               "scan": {"scanning": false, "songs": 1342, "files_scanned": null,
                                        "last_scan": "2026-11-14T21:03:11Z", "error": null},
                               "scan_failure": null},
-                "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "shared": false, "default": true, "free_bytes": 1000,
+                "folders": [{"folder_id": "f1", "name": "Music", "path": "/music/alice", "free_bytes": 1000,
                              "free_space_failure": null, "in_navidrome": "listed"}],
                 "folders_left_out": 0,
-                "default_folder_id": "f1",
                 "running_batches": [{"batch_id": "b1", "label": "Come Over", "unfinished_jobs": 2}],
                 "running_batches_left_out": 0,
                 "deletion_enabled": false,
                 "allow_admin": false
             })
         );
+        // Non-admin callers never see navidrome_library_warning even if populated.
+        let mut with_warning = sample_facts();
+        with_warning.navidrome_library_warning = Some(NavidromeLibraryWarning {
+            default_library_path: "/music".into(),
+            overlapping_user_paths: vec!["/music/alice".into(), "/music/bob".into()],
+            message: "overlap".into(),
+        });
+        assert!(!status_fields(&with_warning, &alice_caller(false))
+            .contains_key("navidrome_library_warning"));
         assert_eq!(
             status_fields(&sample_facts(), &alice_caller(true))["deletion_enabled"],
             true
@@ -489,6 +500,11 @@ mod tests {
         assert_eq!(
             status_fields(&sample_facts(), &admin_caller)["allow_admin"],
             false
+        );
+        assert_eq!(
+            status_fields(&with_warning, &admin_caller)["navidrome_library_warning"]
+                ["default_library_path"],
+            "/music"
         );
         admin_caller.allow_admin = true;
         assert_eq!(
@@ -660,13 +676,6 @@ mod tests {
             ),
             (&Value::Null, &json!(412))
         );
-    }
-
-    #[test]
-    fn an_empty_default_folder_id_is_no_default() {
-        assert_eq!(chosen_folder(Some("f1".into())), Some("f1".to_string()));
-        assert_eq!(chosen_folder(Some(String::new())), None);
-        assert_eq!(chosen_folder(None), None);
     }
 
     /// Reads that block until the test lets them return, counting how many

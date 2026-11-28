@@ -875,6 +875,8 @@ pub enum DownloadEvent {
     /// used by clients to animate the `seam-light` sweep and start playback the instant
     /// Navidrome indexes the track.
     AcquireAndPlay(AcquireAndPlayEvent),
+    /// Existing library import batch progress and item decision events.
+    LibraryImport(Box<crate::library_import::LibraryImportEvent>),
     /// The server's build id, the first frame on a socket whose client asked
     /// for it. A bundle from another build may misread every event after it.
     Build(String),
@@ -893,9 +895,6 @@ pub struct AcquireAndPlayRequest {
     pub release_mbid: Option<String>,
     #[serde(default)]
     pub duration_s: Option<u32>,
-    /// Target folder id; when omitted, uses the user's default download folder (or first owned folder).
-    #[serde(default)]
-    pub folder_id: Option<String>,
     /// Prefer fast secondary backends before falling back to archival P2P (Soulseek).
     #[serde(default = "default_prefer_fast")]
     pub prefer_fast: bool,

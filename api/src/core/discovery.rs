@@ -85,8 +85,8 @@ pub(crate) fn discovery_disabled() -> Failure {
 pub(crate) fn choose_discovery_folder() -> UserAction {
     UserAction::new(
         UserActionCode::AddFolder,
-        "Choose a discovery folder",
-        "Settings > Library > Discovery",
+        "Set your library folder",
+        "Settings > Library",
     )
 }
 
@@ -438,9 +438,11 @@ pub(crate) async fn start_in(
     }
     let selected_profiles = parse_profiles(&settings.discovery_profiles);
     let track_counts = settings.parse_track_counts();
-    let folder_id = settings
-        .discovery_folder()
+    let folder = Folder::get_for_user_in(db, &ctx.user_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?
         .ok_or_else(discovery_folder_required)?;
+    let folder_id = folder.id.as_str();
     let mut profiles = Vec::new();
     for profile in &selected_profiles {
         let profile = profile.to_string();
@@ -494,13 +496,9 @@ pub(crate) async fn overview_in(
     ctx: &UserCtx,
 ) -> Result<Overview, Failure> {
     let settings = crate::core::settings::get_in(db, ctx).await?;
-    let folder = match settings.discovery_folder() {
-        Some(id) => Folder::get_by_id_in(db, id)
-            .await
-            .map_err(|e| database_failure(Stage::Input, e))?
-            .filter(|f| f.user_id == ctx.user_id),
-        None => None,
-    };
+    let folder = Folder::get_for_user_in(db, &ctx.user_id)
+        .await
+        .map_err(|e| database_failure(Stage::Input, e))?;
     let mut pending = match &folder {
         Some(folder) => DiscoveryTrackRow::get_pending_by_folder_in(db, &folder.id)
             .await
@@ -1128,7 +1126,6 @@ mod tests {
             user_id: user_id.into(),
             name: "Music".into(),
             path: "/music".into(),
-            shared: false,
         };
         assert_eq!(
             track_folder_of(Some(folder("user-b")), "user-a"),
@@ -1187,16 +1184,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            start_in(&lib.db, &effects, &ctx).await.unwrap_err().message,
-            "No download folder configured for discovery"
-        );
-        // How Settings clears the choice.
-        let cleared = UpdateUserSettings {
-            discovery_folder_id: Some(String::new()),
-            ..Default::default()
-        };
-        UserSettings::upsert_in(&lib.db, "alice", cleared)
+        // Without a personal library folder, discovery cannot start.
+        sqlx::query("DELETE FROM folders WHERE user_id = 'alice'")
+            .execute(&lib.db)
             .await
             .unwrap();
         assert_eq!(
@@ -1204,16 +1194,8 @@ mod tests {
             Err(discovery_folder_required())
         );
         assert!(effects.generated().is_empty());
-        UserSettings::upsert_in(
-            &lib.db,
-            "alice",
-            UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        // Once the user has their personal library folder, discovery starts cleanly.
+        lib.folder("alice", "alice-music", "music/alice", false).await;
         let progress = start_in(&lib.db, &effects, &ctx).await.unwrap();
         assert_eq!(
             progress

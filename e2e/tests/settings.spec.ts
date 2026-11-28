@@ -3,7 +3,15 @@
 
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import { admin, loginViaApi, openSettings, registerUser, uniqueUser, type TestUser } from '../helpers/app.js';
+import {
+  admin,
+  loginViaApi,
+  openLibraryTab,
+  openSettings,
+  registerUser,
+  uniqueUser,
+  type TestUser,
+} from '../helpers/app.js';
 import { musicDirForApp } from '../helpers/env.js';
 
 
@@ -17,19 +25,27 @@ test.beforeEach(async ({ context, page }) => {
   await openSettings(page);
 });
 
-test('creates and deletes a music folder', async ({ page }) => {
-  await page.getByRole('button', { name: 'Library' }).click();
+test('views and updates the personal music library folder', async ({ page }) => {
+  await openLibraryTab(page);
 
+  // Registration auto-provisions the user's single personal library folder.
+  await expect(page.getByText(`${musicDirForApp}/${user.username}`, { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Edit Folder' }).click();
+
+  const updatedPath = `${musicDirForApp}/settings-vault-${randomUUID().slice(0, 8)}`;
   await page.getByPlaceholder('My Music').fill('Vault');
-  await page.getByPlaceholder('/home/user/Music').fill(`${musicDirForApp}/settings-vault-${randomUUID().slice(0, 8)}`);
-  await page.getByRole('button', { name: 'Add Folder' }).click();
+  await page.getByPlaceholder('/music/alice').fill(updatedPath);
+  await page.getByRole('button', { name: 'Save Changes' }).click();
 
-  await expect(page.getByText('Folder added successfully')).toBeVisible();
+  await expect(page.getByText('Music library folder saved.')).toBeVisible();
   await expect(page.getByText('Vault', { exact: true })).toBeVisible();
+  await expect(page.getByText(updatedPath, { exact: true })).toBeVisible();
 
-  await page.getByRole('button', { name: 'Delete' }).first().click();
-  await expect(page.getByText('Folder deleted successfully')).toBeVisible();
-  await expect(page.getByText('Vault', { exact: true })).not.toBeVisible();
+  // Persisted across reload.
+  await page.reload();
+  await openLibraryTab(page);
+  await expect(page.getByText('Vault', { exact: true })).toBeVisible();
+  await expect(page.getByText(updatedPath, { exact: true })).toBeVisible();
 });
 
 test('creates another user account', async ({ context, page }) => {

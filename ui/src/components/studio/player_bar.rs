@@ -10,7 +10,7 @@ use shared::client::{ConnectDevice, DevicePlatform};
 use crate::{
     format_discovery_badge, format_duration, use_player, IconCar, IconCheck, IconHeart, IconInfo,
     IconLaptop, IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause,
-    IconPictureInPicture2, IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShuffle,
+    IconPictureInPicture2, IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShare2, IconShuffle,
     IconSkipBack, IconSkipForward, IconSmartphone, IconSparkles, IconStar, IconThumbsDown,
     IconTrash2, IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode,
 };
@@ -456,6 +456,7 @@ pub fn StudioPlayerBar(
     on_star: EventHandler<(PlayerTrack, bool)>,
     on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
+    #[props(default)] on_share: Option<EventHandler<PlayerTrack>>,
     #[props(default)] on_claim_active_device: Option<EventHandler<()>>,
     #[props(default)] on_transfer_to_device: Option<EventHandler<String>>,
     #[props(default)] mini_player_open: bool,
@@ -589,6 +590,7 @@ pub fn StudioPlayerBar(
                         let track_star = track.clone();
                         let track_radio = track.clone();
                         let artist_for_click = track.artist.clone();
+                        let track_share = track.clone();
                         let is_starred = track.starred;
 
                         rsx! {
@@ -694,6 +696,18 @@ pub fn StudioPlayerBar(
                                         class: "hidden xl:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-accent-text hover:bg-beet-surface-high cursor-pointer transition-colors",
                                         onclick: move |_| on_start_radio.call(track_radio.clone()),
                                         IconRadio { size: 15 }
+                                    }
+                                    if !track.is_discovery && !track.id.is_empty() {
+                                        if let Some(share_cb) = on_share {
+                                            button {
+                                                r#type: "button",
+                                                title: "Share track",
+                                                aria_label: "Share track",
+                                                class: "hidden xl:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-leaf-text hover:bg-beet-surface-high cursor-pointer transition-colors",
+                                                onclick: move |_| share_cb.call(track_share.clone()),
+                                                IconShare2 { size: 15 }
+                                            }
+                                        }
                                     }
                                     button {
                                         r#type: "button",

@@ -83,7 +83,7 @@ pub(crate) const ENSURE_IN_LIBRARY: ToolSpec = ToolSpec {
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
         let replace_hours = REPLACE_CONSENT_SECS / 3600;
-        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item, all in one batch. Whenever multiple library folders exist (e.g. personal, shared/common, or other users' folders for admins) and the user did not explicitly specify which folder to download into, ask the user which folder they want before calling ensure_in_library instead of assuming a default. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file unless replace_existing carries the confirmation_token of a preview_delete_tracks call with reason replaced: then the previewed copies, and only they, are deleted once the new copy is imported, within {replace_hours} hours and if every check still allows it, and the token is used up; a previewed copy beets saw no duplicate of stays and is listed in the job's not_replaced. Show the user that preview and get their explicit yes before passing its token. Each previewed song goes to the first track item the library holds it for, which then gets a job; replace_unmatched lists the songs no item took, whose copies stay. Without replace_existing a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id, or replace_existing's token), expired_handle (replace_existing's token used or expired), permission_not_granted (replace_existing while deletion is off for this app), delete_daily_limit (replace_existing past the day's deletions), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. A playlist refused before any job is made fails the call with playlist_not_found, playlist_not_owner, playlist_not_editable or playlist_name_taken (next offers filling each playlist of that name first, then a second one of the name); once the jobs are made, playlist.error says what stopped the playlist: those codes, unknown_handle (an owned song whose file is missing), playlist_tracks_not_written, playlist_not_written (a comment or public flag not shown) or one of the Navidrome codes. With playlist.error, facts.batch_fills_playlist false says the batch's downloads are not added to any playlist as its jobs finish. An item refused for a passing failure offers this call for that item alone, with the playlist this call made as playlist_id.")
+        format!("The main way to get music: for up to {MAX_ITEMS} track or album references, says which tracks the library already has (by recording MBID or exact artist and title; fuzzy matches are listed, not accepted) and starts a job for each other item into this user's personal library folder, all in one batch. Returns at once with batch_id; follow it with get_batch. Jobs search the download backend one search at a time, pick the best source at min_score (default {AUTO_SELECT_SCORE_THRESHOLD}) whose source has not failed 3 times today, or wait for download_source with pick review, download at most {MCP_DOWNLOADS_PER_USER} at a time per user, fail over to other sources (failover off, or max_attempts, default {MAX_SOURCES_PER_TRACK}), import with beets (never replacing a library file unless replace_existing carries the confirmation_token of a preview_delete_tracks call with reason replaced: then the previewed copies, and only they, are deleted once the new copy is imported, within {replace_hours} hours and if every check still allows it, and the token is used up; a previewed copy beets saw no duplicate of stays and is listed in the job's not_replaced. Show the user that preview and get their explicit yes before passing its token. Each previewed song goes to the first track item the library holds it for, which then gets a job; replace_unmatched lists the songs no item took, whose copies stay. Without replace_existing a duplicate ends import_already_in_library with the library's song ids) and wait until Navidrome lists the file. A user without Navidrome gets a job for every item (library_checked false). A user has at most {MCP_UNFINISHED_JOBS_PER_USER} unfinished jobs from connected apps: an item past that is refused rate_limited. A 40 track list with 28 downloads takes 20 to 60 minutes. Album references need release_mbid. An answer that would pass 60,000 characters leaves out, from the last refused item on, the reference its facts echo, then its next calls, then its cause.raw, then cuts its message, facts.omitted naming what. Failure codes: {common}, folder_required, unknown_handle (folder_id, or replace_existing's token), expired_handle (replace_existing's token used or expired), permission_not_granted (replace_existing while deletion is off for this app), delete_daily_limit (replace_existing past the day's deletions), importer_broken, backend_not_configured, already_running (per item: the job_id that already wants this recording; or a call with this request_key still runs), {NAVIDROME_CODES} (from the library lookup, per item or for the call), partial. With playlist ({{playlist_id}} of one of this user's static playlists, or {{create: {{name, comment?, public?, allow_duplicate_name?}}}}), the playlist gets the owned tracks now in the order given and each other track at its place as its job finishes, whether or not this chat stays open; get_batch shows how far it is. A playlist refused before any job is made fails the call with playlist_not_found, playlist_not_owner, playlist_not_editable or playlist_name_taken (next offers filling each playlist of that name first, then a second one of the name); once the jobs are made, playlist.error says what stopped the playlist: those codes, unknown_handle (an owned song whose file is missing), playlist_tracks_not_written, playlist_not_written (a comment or public flag not shown) or one of the Navidrome codes. With playlist.error, facts.batch_fills_playlist false says the batch's downloads are not added to any playlist as its jobs finish. An item refused for a passing failure offers this call for that item alone, with the playlist this call made as playlist_id.")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["items"], "properties": {"items": {"type": "array", "minItems": 1, "maxItems": 50, "items": "#,
@@ -737,7 +737,7 @@ pub(crate) const DOWNLOAD_SOURCE_TOOL: ToolSpec = ToolSpec {
     title: "Download a chosen source",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Downloads one candidate of a find_sources or job search: for job_id (a job waiting for a source choice, failed or cancelled) it becomes the job's source; with a reference (and folder_id, else the default folder) it starts a new job in a new batch. The candidate's search must be of the same kind as the job or reference (track or album). Jobs started in Soulbeet's web page take their source there. Answers the job's full document, as get_jobs gives it. Failure codes: {common}, unknown_handle (job, candidate or folder), expired_handle, wrong_job_state, folder_required, importer_broken, backend_not_configured, already_running (a job already wants this recording; or a call with this request_key still runs), metadata_not_found, metadata_unavailable (album tracklist).")
+        format!("Downloads one candidate of a find_sources or job search: for job_id (a job waiting for a source choice, failed or cancelled) it becomes the job's source; with a reference (and optional folder_id, defaulting to this user's library folder) it starts a new job in a new batch. The candidate's search must be of the same kind as the job or reference (track or album). Jobs started in Soulbeet's web page take their source there. Answers the job's full document, as get_jobs gives it. Failure codes: {common}, unknown_handle (job, candidate or folder), expired_handle, wrong_job_state, folder_required, importer_broken, backend_not_configured, already_running (a job already wants this recording; or a call with this request_key still runs), metadata_not_found, metadata_unavailable (album tracklist).")
     },
     input_schema: concat!(
         r#"{"type": "object", "additionalProperties": false, "required": ["candidate_id"], "properties": {"candidate_id": {"type": "string", "minLength": 1}, "job_id": {"type": "string", "minLength": 1}, "reference": "#,
@@ -852,7 +852,7 @@ mod tests {
     use crate::auth::UserId;
     use crate::connection::test_util::{
         add_folder, app_of, app_with_acquire, app_with_navidrome, call_tool, count, document,
-        grant_of, jobs_app, set_default_folder,
+        grant_of, jobs_app,
     };
     use crate::core::acquire::{Acquisition, NewBatch};
     use crate::core::delete_guard::test_support::previewed_file;
@@ -1342,47 +1342,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_default_folder_lists_the_folders_to_choose_from() {
-        let (db, acq, _, token) = app_with_acquire().await;
-        // Never written to: no job is made.
-        add_folder(&db, "u1", "f2", "Christmas", Path::new("/music/christmas")).await;
-        set_default_folder(&db, "u1", None).await; // two folders, no default
-        let error = document(
-            &call_tool(
-                app_of(&db, &acq),
-                &token,
-                "ensure_in_library",
-                json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}],
-                    "request_key": "k1"}),
-            )
-            .await,
-        )["error"]
-            .clone();
-        assert_eq!(
-            (error["code"].as_str(), error["retry"].as_str()),
-            (Some("folder_required"), Some("needs_decision")),
-            "{error}"
-        );
-        assert_eq!(
-            error["facts"]["folders"],
-            json!([{"folder_id": "f1", "name": "Music"}, {"folder_id": "f2", "name": "Christmas"}])
-        );
-        assert_eq!(
-            error["next"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|n| n["args"]["folder_id"].clone())
-                .collect::<Vec<_>>(),
-            vec![json!("f1"), json!("f2")]
-        );
-        assert_eq!(
-            error["next"][0]["args"],
-            json!({"items": [{"artist": "Marrow Choir", "title": "O Holy Night"}], "folder_id": "f1"})
-        );
-    }
-
-    #[tokio::test]
     async fn a_user_without_a_folder_is_told_to_add_one() {
         let (db, acq, _, token) = app_with_acquire().await;
         sqlx::query("DELETE FROM folders")
@@ -1413,7 +1372,7 @@ mod tests {
         );
         assert_eq!(
             error["user_action"],
-            json!({"code": "add_folder", "what": "Add a library folder", "where": "Settings > Library"})
+            json!({"code": "add_folder", "what": "Set your library folder", "where": "Settings > Library"})
         );
         assert_eq!(error["next"], json!([]));
     }
@@ -2057,32 +2016,14 @@ mod tests {
         let (db, acq, effects, token) = jobs_app().await;
         let job = choosing_track_job(&acq).await;
         let candidate = candidate_of(&acq, &job, "peer_b").await;
-        // alice has no default folder: the call again with each of hers.
         let reference = json!({"artist": "Marrow Choir", "title": "O Come All Ye Faithful"});
+        // The same recording as alice's waiting job (folder_id omitted uses alice's folder): refused, naming it.
         let error = document(
             &call_tool(
                 app_of(&db, &acq),
                 &token,
                 "download_source",
                 json!({"candidate_id": candidate, "reference": reference}),
-            )
-            .await,
-        )["error"]
-            .clone();
-        assert_eq!(error["code"], "folder_required", "{error}");
-        assert_eq!(
-            error["next"],
-            json!([{"tool": "download_source", "args": {"candidate_id": candidate,
-                "reference": reference, "folder_id": "alice-folder"}}])
-        );
-        // The same recording as alice's waiting job: refused, naming it.
-        let error = document(
-            &call_tool(
-                app_of(&db, &acq),
-                &token,
-                "download_source",
-                json!({"candidate_id": candidate, "reference": reference,
-                    "folder_id": "alice-folder"}),
             )
             .await,
         )["error"]

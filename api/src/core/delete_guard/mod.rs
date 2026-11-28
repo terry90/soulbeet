@@ -26,7 +26,7 @@ pub(crate) mod staging;
 pub(crate) mod test_support;
 pub(crate) mod unlink;
 
-pub use listeners::{Listeners, LiveListeners};
+pub use listeners::{Listeners, LiveListeners, NavidromeUserAccess};
 
 /// The guard over Soulful's database, Navidrome as each user sees it, and the local path of
 /// Navidrome's default library when it is set (D8). One guard serves one run (a rating sync, or
@@ -36,8 +36,9 @@ pub struct Guard<'a> {
     pub db: &'a SqlitePool,
     pub listeners: &'a dyn Listeners,
     pub music_path: Option<&'a Path>,
-    /// Navidrome's users as the first linked admin lists them, or why they cannot be listed.
-    navidrome_users: tokio::sync::OnceCell<Result<Vec<String>, Failure>>,
+    /// Navidrome's users (with library visibility) as the first linked admin lists them,
+    /// or why they cannot be listed.
+    navidrome_users: tokio::sync::OnceCell<Result<Vec<NavidromeUserAccess>, Failure>>,
 }
 
 impl<'a> Guard<'a> {
@@ -1513,17 +1514,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_file_in_another_users_nested_folder_is_theirs_and_a_tie_is_each_ones() {
-        // alice's folder `music` is shared over bob's `music/bob`.
+        // alice's folder `music` encloses bob's `music/bob`.
         let lib = Library::new().await;
-        lib.folder("alice", "alice-top", "music", true).await;
+        sqlx::query("UPDATE folders SET path = ? WHERE id = 'alice-music'")
+            .bind(lib.root.join("music").to_string_lossy().as_ref())
+            .execute(&lib.db)
+            .await
+            .unwrap();
         lib.song("s3", "bob/B/y.flac", b"audio");
         assert_eq!(
             refusal(lib.guard().check_song(&lib.alice(), "s3").await).0,
             FailureCode::DeleteOutsideLibrary
         );
-        // bob's second folder at alice's path: the deepest folder ties, so each owns the file.
-        lib.folder("bob", "bob-alice", "music/alice", false).await;
-        library_verdict(lib.guard().check_song(&lib.alice(), "s1").await);
     }
 
     #[tokio::test]
@@ -1742,7 +1744,7 @@ mod tests {
         ];
         for (i, (folder, state, query, blocks)) in cases.into_iter().enumerate() {
             let lib = Library::new().await;
-            lib.folder("alice", "alice-top", "music", true).await;
+            lib.folder("carol", "alice-top", "music", true).await;
             lib.fake.file(
                 NativeSong {
                     mbz_recording_id: Some(mbid.into()),
@@ -1873,7 +1875,7 @@ mod tests {
     ) {
         let lib = Library::new().await;
         // Stored with `..`: it neither resolves nor compares.
-        lib.folder("bob", "bob-odd", "music/alice/../bob", false)
+        lib.folder("carol", "bob-odd", "music/alice/../bob", false)
             .await;
         let f = lib
             .guard()
@@ -2176,20 +2178,24 @@ mod tests {
         assert_eq!((f.code, f.message), no_file);
         assert_eq!(learned_root(&lib).await, None);
 
-        // Two of alice's folders each hold a file that proves a root (a copy that kept its
+        // Two folders each hold a file that proves a root (a copy that kept its
         // times): either may be the song's, so neither is learned.
         let lib = Library::new().await;
         mounted_elsewhere(&lib, test_support::mtime());
-        lib.folder("alice", "alice-backup", "backup/alice", false)
-            .await;
         let copy = lib.root.join("backup/alice/A/x.flac");
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
         std::fs::write(&copy, b"audio").unwrap();
         test_support::set_mtime(&copy, test_support::mtime());
-        assert_eq!(
-            refusal(lib.guard().check_song(&lib.alice(), "s1").await),
-            no_file
-        );
+        let music_alice = std::fs::canonicalize(lib.root.join("music/alice")).unwrap();
+        let backup_alice = std::fs::canonicalize(lib.root.join("backup/alice")).unwrap();
+        let outcome = paths::learn_from_folders(
+            &lib.db,
+            &lib.record("s1"),
+            &[music_alice.as_path(), backup_alice.as_path()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, paths::FromFolders::Unproven);
         assert_eq!(learned_root(&lib).await, None);
         assert_eq!(lib.fake.ratings_set(), vec![]);
     }
@@ -2212,7 +2218,7 @@ mod tests {
     /// its times (rsync -a, cp -p) holding A/x.flac and A/y.flac; song s2 at
     /// `{root}/music/alice/A/y.flac`, rated 1 by alice; and s1's file under music gone.
     async fn mirrored_with_one_file_gone(lib: &Library) {
-        lib.folder("alice", "alice-mirror", "mirror/alice", false)
+        lib.folder("carol", "alice-mirror", "mirror/alice", false)
             .await;
         lib.song("s2", "alice/A/y.flac", b"other!");
         lib.fake.rates("alice", "s2", 1);
@@ -2308,17 +2314,34 @@ mod tests {
     #[tokio::test]
     async fn a_folder_that_cannot_be_read_may_hold_a_second_copy_so_no_root_is_learned() {
         use std::os::unix::fs::PermissionsExt;
-        // With no root here, alice's music/alice proves one; her backup/alice cannot be
-        // searched, so a second copy may be there.
+        // With no root here, music/alice proves one; backup/alice cannot be
+        // searched, so a second copy may be there and no root is learned.
         let lib = Library::new().await;
         mounted_elsewhere(&lib, test_support::mtime());
-        lib.folder("alice", "alice-backup", "backup/alice", false)
-            .await;
         let locked = lib.root.join("backup/alice/A");
         std::fs::create_dir_all(&locked).unwrap();
+        let music_alice = std::fs::canonicalize(lib.root.join("music/alice")).unwrap();
+        let backup_alice = std::fs::canonicalize(lib.root.join("backup/alice")).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let checked = lib.guard().check_song(&lib.alice(), "s1").await;
+        let outcome = paths::learn_from_folders(
+            &lib.db,
+            &lib.record("s1"),
+            &[music_alice.as_path(), backup_alice.as_path()],
+        )
+        .await
+        .unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            outcome,
+            paths::FromFolders::Unreadable(std::io::Error::from_raw_os_error(13).to_string())
+        );
+        assert_eq!(learned_root(&lib).await, None);
+
+        // And when alice's own folder cannot be read, check_song refuses with the OS error cause.
+        let alice_a = lib.root.join("music/alice/A");
+        std::fs::set_permissions(&alice_a, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let checked = lib.guard().check_song(&lib.alice(), "s1").await;
+        std::fs::set_permissions(&alice_a, std::fs::Permissions::from_mode(0o755)).unwrap();
         let f = match checked {
             Err(f) => f,
             Ok(_) => panic!("allowed"),

@@ -1414,7 +1414,6 @@ mod tests {
             user_id: "user-a".into(),
             name: "Music".into(),
             path: file.join("Come Over").to_string_lossy().into_owned(),
-            shared: false,
         };
         let f = prepare_target(&folder).await.unwrap_err();
         let os = std::io::Error::from_raw_os_error(20); // ENOTDIR: "Not a directory (os error 20)"

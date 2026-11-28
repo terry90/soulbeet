@@ -7,7 +7,6 @@ use shared::playlist_import::{
     ImportMatchStatus, PlaylistImportPreview, PlaylistImportTarget,
 };
 
-use crate::settings_context::use_settings;
 use crate::{
     friendly_error, use_auth, IconActivity, IconCheck, IconInfo, IconListPlus, IconLoader, Modal,
     TextInput,
@@ -38,7 +37,6 @@ pub struct PlaylistImportModalProps {
 #[component]
 pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
     let auth = use_auth();
-    let settings = use_settings();
 
     let mut step = use_signal(|| ImportStep::UrlInput);
     let mut url_input = use_signal(String::new);
@@ -48,30 +46,21 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
     // Step 2 state
     let mut playlist_name = use_signal(String::new);
     let mut selected_indices = use_signal(HashSet::<usize>::new);
-    let mut folders = use_signal(Vec::<Folder>::new);
-    let mut folders_loading = use_signal(|| true);
-    let mut folders_error = use_signal(|| None::<String>);
-    let mut selected_folder_id = use_signal(|| None::<String>);
+    let mut user_folder = use_signal(|| None::<Folder>);
+    let mut folder_loading = use_signal(|| true);
+    let mut folder_error = use_signal(|| None::<String>);
 
     use_future(move || async move {
-        match auth.call(api::get_user_folders()).await {
-            Ok(list) => {
-                if selected_folder_id.peek().is_none() {
-                    let default_id = settings
-                        .get()
-                        .and_then(|s| s.default_download_folder_id)
-                        .filter(|id| list.iter().any(|f| f.id == *id));
-                    let chosen = default_id.or_else(|| list.first().map(|f| f.id.clone()));
-                    selected_folder_id.set(chosen);
-                }
-                folders.set(list);
-                folders_error.set(None);
+        match auth.call(api::get_user_folder()).await {
+            Ok(folder) => {
+                user_folder.set(folder);
+                folder_error.set(None);
             }
             Err(e) => {
-                folders_error.set(Some(friendly_error(&e)));
+                folder_error.set(Some(friendly_error(&e)));
             }
         }
-        folders_loading.set(false);
+        folder_loading.set(false);
     });
 
     let run_preview = use_callback(move |()| {
@@ -110,14 +99,14 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
             error.set(Some("Enter a name for the playlist.".into()));
             return;
         }
-        let Some(folder_id) = selected_folder_id.read().clone() else {
-            let msg = match folders_error.read().clone() {
-                Some(err) => format!("Could not load library folders: {err}"),
-                None => "Add a library folder in Settings before importing playlists.".into(),
+        if user_folder.read().is_none() {
+            let msg = match folder_error.read().clone() {
+                Some(err) => format!("Could not load library folder: {err}"),
+                None => "Set your music library folder in Settings before importing playlists.".into(),
             };
             error.set(Some(msg));
             return;
-        };
+        }
         let chosen_set = selected_indices.read().clone();
         let tracks: Vec<CommitPlaylistImportTrack> = preview
             .tracks
@@ -148,7 +137,6 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                 comment,
                 allow_duplicate_name: false,
             },
-            folder_id,
             tracks,
         };
 
@@ -209,7 +197,7 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
             let selected_count = selected_indices.read().len();
             let can_import = selected_count > 0
                 && !playlist_name.read().trim().is_empty()
-                && selected_folder_id.read().is_some()
+                && user_folder.read().is_some()
                 && !busy();
             rsx! {
                 div { class: "flex items-center justify-between gap-2",
@@ -336,55 +324,30 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                         let total_tracks = preview.tracks.len();
                         let all_selected = chosen.len() == total_tracks && total_tracks > 0;
                         let all_indices: Vec<usize> = preview.tracks.iter().map(|t| t.index).collect();
-                        let folder_list = folders.read().clone();
-                        let current_folder = selected_folder_id().unwrap_or_default();
+                        let configured_folder = user_folder.read().clone();
 
                         rsx! {
                             div { class: "space-y-4",
-                                // Playlist name + target folder
-                                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
-                                    div { class: "space-y-1",
-                                        label { class: "block text-[11px] font-medium uppercase tracking-wider text-beet-text-tertiary",
-                                            "Playlist Name"
-                                        }
-                                        TextInput {
-                                            class: "text-[13px] rounded-[8px] text-beet-text-primary",
-                                            placeholder: "My Playlist",
-                                            aria_label: "Playlist Name",
-                                            value: playlist_name(),
-                                            oninput: move |v: String| playlist_name.set(v),
-                                        }
+                                // Playlist name
+                                div { class: "space-y-1",
+                                    label { class: "block text-[11px] font-medium uppercase tracking-wider text-beet-text-tertiary",
+                                        "Playlist Name"
                                     }
-                                    div { class: "space-y-1",
-                                        label { class: "block text-[11px] font-medium uppercase tracking-wider text-beet-text-tertiary",
-                                            "Target Folder"
-                                        }
-                                        if let Some(err) = folders_error() {
-                                            p { class: "text-[12px] text-beet-crimson-text py-2 break-words",
-                                                "Could not load folders: {err}"
-                                            }
-                                        } else if folders_loading() {
-                                            p { class: "text-[12px] text-beet-text-tertiary py-2",
-                                                "Loading folders..."
-                                            }
-                                        } else if folder_list.is_empty() {
-                                            p { class: "text-[12px] text-beet-crimson-text py-2",
-                                                "No folders configured"
-                                            }
-                                        } else {
-                                            select {
-                                                class: "w-full h-[38px] px-3 rounded-[8px] bg-beet-surface border border-beet-border-default text-[13px] text-beet-text-primary outline-none focus:border-beet-accent",
-                                                aria_label: "Target Folder",
-                                                value: "{current_folder}",
-                                                onchange: move |evt| {
-                                                    let val = evt.value();
-                                                    selected_folder_id.set((!val.is_empty()).then_some(val));
-                                                },
-                                                for f in folder_list.iter() {
-                                                    option { key: "{f.id}", value: "{f.id}", "{f.name}" }
-                                                }
-                                            }
-                                        }
+                                    TextInput {
+                                        class: "text-[13px] rounded-[8px] text-beet-text-primary",
+                                        placeholder: "My Playlist",
+                                        aria_label: "Playlist Name",
+                                        value: playlist_name(),
+                                        oninput: move |v: String| playlist_name.set(v),
+                                    }
+                                }
+                                if let Some(err) = folder_error() {
+                                    p { class: "text-[12px] text-beet-crimson-text break-words",
+                                        "Could not load library folder: {err}"
+                                    }
+                                } else if !folder_loading() && configured_folder.is_none() {
+                                    p { class: "text-[12px] text-beet-crimson-text",
+                                        "No music library folder configured. Set one in Settings > Library before importing."
                                     }
                                 }
 

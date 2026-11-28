@@ -15,6 +15,21 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Navidrome user visibility entry used by Rule 4 (`every_rater_read`) to scope
+/// unseen-listener checks to users who actually have library access to a song.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NavidromeUserAccess {
+    pub user_name: String,
+    pub is_admin: bool,
+    pub library_ids: Vec<i64>,
+}
+
+impl NavidromeUserAccess {
+    pub fn has_library_access(&self, library_id: i64) -> bool {
+        self.is_admin || self.library_ids.contains(&library_id)
+    }
+}
+
 /// Navidrome as each Soulful user sees it.
 #[async_trait::async_trait]
 pub trait Listeners: Send + Sync {
@@ -64,6 +79,24 @@ pub trait Listeners: Send + Sync {
         &self,
         user: &UserId,
     ) -> Result<Option<Vec<String>>, NavidromeLookupError>;
+
+    /// Full Navidrome users with library access information; defaults to treating
+    /// every name from `navidrome_users` as having access to every library.
+    async fn navidrome_users_with_libraries(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<Vec<NavidromeUserAccess>>, NavidromeLookupError> {
+        Ok(self.navidrome_users(user).await?.map(|names| {
+            names
+                .into_iter()
+                .map(|user_name| NavidromeUserAccess {
+                    user_name,
+                    is_admin: true,
+                    library_ids: Vec::new(),
+                })
+                .collect()
+        }))
+    }
 }
 
 /// Each user's client from navidrome_client_for_user.
@@ -157,6 +190,27 @@ impl Listeners for LiveListeners {
         navi.user_names()
             .await
             .map_err(NavidromeLookupError::Client)
+    }
+
+    async fn navidrome_users_with_libraries(
+        &self,
+        user: &UserId,
+    ) -> Result<Option<Vec<NavidromeUserAccess>>, NavidromeLookupError> {
+        let navi = client(user).await?;
+        Ok(navi
+            .list_users_full()
+            .await
+            .map_err(NavidromeLookupError::Client)?
+            .map(|users| {
+                users
+                    .into_iter()
+                    .map(|u| NavidromeUserAccess {
+                        user_name: u.user_name,
+                        is_admin: u.is_admin,
+                        library_ids: u.libraries.into_iter().map(|l| l.id).collect(),
+                    })
+                    .collect()
+            }))
     }
 }
 
@@ -261,104 +315,6 @@ impl Guard<'_> {
             Some(f) => Err(f),
             None => Ok(read),
         }
-    }
-
-    /// Multi-user veto check for cross-library visibility-shrinking moves.
-    ///
-    /// When `reader == actor`, runs the standard rules 3 & 4 sequence.
-    /// When `reader != actor` (e.g., an admin moving a track from another user's private library
-    /// that the admin's Navidrome account cannot see), still checks `reader` as another listener
-    /// (so `reader`'s ratings > 1, stars, or static playlists veto hiding it from them), excludes
-    /// `reader`'s rating from `others.ratings` so `no_unknown_rater(reader, ...)` never
-    /// double-counts it, and only includes `actor` in `others.names` / checks `own_playlists`
-    /// when `actor` can actually see the song.
-    pub(crate) async fn check_move_veto(
-        &self,
-        actor: &UserId,
-        actor_name: &str,
-        reader: &UserId,
-        song: &NativeSong,
-        path: &Path,
-    ) -> Result<(), Failure> {
-        self.one_song(reader, song, path).await?;
-        if reader == actor {
-            let others = self.others_permit(actor, actor_name, song, path).await?;
-            let _ = self.own_playlists(actor, actor_name, &song.id).await?;
-            let _ = self.no_unknown_rater(actor, song, &others).await?;
-            return Ok(());
-        }
-
-        let users = User::linked_to_navidrome_in(self.db)
-            .await
-            .map_err(|e| database_failure(Stage::Delete, e))?;
-        let actor_str = actor.to_string();
-        let reader_str = reader.to_string();
-        let mut read = Read {
-            ratings: Vec::new(),
-            names: Vec::new(),
-            unseen: Vec::new(),
-        };
-        let mut refusal = None;
-
-        // Check every other linked listener (including `reader`!) for marks/playlists.
-        for user in users.iter().filter(|u| u.id != actor_str) {
-            let listener = UserId::new(&user.id);
-            let marks = self.marks_of(&listener, actor_name, song, path).await;
-            let recorded = match &marks {
-                Err(Keeps::Unreadable(error)) => {
-                    NavidromeReadFailureRow::record_in(self.db, &user.id, error).await
-                }
-                _ => NavidromeReadFailureRow::clear_in(self.db, &user.id).await,
-            };
-            if let Err(e) = recorded {
-                warn!(
-                    "Could not store whether Navidrome account {} can be read: {e}",
-                    user.username
-                );
-            }
-            match marks {
-                Ok(None) => read.unseen.push(user.username.clone()),
-                Ok(Some(rating)) => {
-                    read.names.push(user.username.clone());
-                    // `no_unknown_rater(reader, ...)` chains `reader`'s own rating once, so do
-                    // not also push `reader`'s rating into `read.ratings`.
-                    if user.id != reader_str && rating > 0 {
-                        read.ratings.push(rating);
-                    }
-                }
-                Err(keeps) => {
-                    refusal.get_or_insert(match keeps {
-                        Keeps::Unreadable(_) => veto_unknown(),
-                        Keeps::Refused(f) => f,
-                    });
-                }
-            }
-        }
-        if let Some(f) = refusal {
-            return Err(f);
-        }
-
-        // Check whether `actor` sees the song in Navidrome so rule 4's `names`/`unseen` and
-        // `own_playlists` reflect reality.
-        match self.listeners.song(actor, &song.id).await {
-            Ok(Some(seen)) => {
-                read.names.push(actor_name.to_string());
-                let r = seen.user_rating.unwrap_or(0);
-                if r > 0 {
-                    read.ratings.push(r);
-                }
-                let _ = self.own_playlists(actor, actor_name, &song.id).await?;
-            }
-            Ok(None) => {
-                read.unseen.push(actor_name.to_string());
-            }
-            Err(_) => {
-                return Err(veto_unknown());
-            }
-        }
-
-        let _ = self.no_unknown_rater(reader, song, &read).await?;
-        Ok(())
     }
 
     /// `listener`'s rating of `song` (0 when unrated), None when they cannot see it, or why they
@@ -523,19 +479,16 @@ impl Guard<'_> {
             return Err(blocked_by_other_user());
         }
         if raters.iter().any(|r| *r > 1) {
-            self.every_rater_read(others).await?;
+            self.every_rater_read(&after, others).await?;
         }
         Ok(after)
     }
 
-    /// Whether every Navidrome user is a linked account whose rating this check read (`read`):
-    /// the first linked account Navidrome lets list its users (an admin's) lists them, and each
-    /// name must be one of `read.names`, compared without regard to ASCII case as both Soulful
-    /// (`COLLATE NOCASE`) and Navidrome's login (persistence/user_repository.go:203) compare
-    /// names. The listing is read once per guard. Else unknown_listener: CannotSee when a name
-    /// not read is a linked account that cannot see the song (signing in again cannot change
-    /// that, so it is named before any user who never signed in), NotSignedIn otherwise.
-    async fn every_rater_read(&self, read: &Read) -> Result<(), Failure> {
+    /// Whether every Navidrome user who has access to `song.library_id` is a linked account whose
+    /// rating this check read (`read`). Scoping by `song.library_id` allows per-user private
+    /// Navidrome libraries to delete or upgrade tracks rated > 1 without being falsely vetoed by
+    /// other users who cannot access that library.
+    async fn every_rater_read(&self, song: &NativeSong, read: &Read) -> Result<(), Failure> {
         let listed = self
             .navidrome_users
             .get_or_init(|| self.list_navidrome_users())
@@ -545,8 +498,9 @@ impl Guard<'_> {
             |names: &[String], name: &str| names.iter().any(|n| n.eq_ignore_ascii_case(name));
         let unread: Vec<&str> = listed
             .iter()
-            .filter(|name| !among(&read.names, name))
-            .map(String::as_str)
+            .filter(|u| song.library_id <= 0 || u.has_library_access(song.library_id))
+            .filter(|u| !among(&read.names, &u.user_name))
+            .map(|u| u.user_name.as_str())
             .collect();
         if unread.is_empty() {
             return Ok(());
@@ -564,17 +518,21 @@ impl Guard<'_> {
         ))
     }
 
-    /// Navidrome's users, as the first linked account that may list them lists them. None of
-    /// them may (none is a Navidrome admin): unknown_listener NoAdmin; a read that failed
-    /// before any list was read: unknown_listener Unreadable with its error.
-    async fn list_navidrome_users(&self) -> Result<Vec<String>, Failure> {
+    /// Navidrome's users (with library access), as the first linked account that may list them
+    /// lists them. None of them may (none is a Navidrome admin): unknown_listener NoAdmin; a read
+    /// that failed before any list was read: unknown_listener Unreadable with its error.
+    async fn list_navidrome_users(&self) -> Result<Vec<NavidromeUserAccess>, Failure> {
         let users = User::linked_to_navidrome_in(self.db)
             .await
             .map_err(|e| database_failure(Stage::Delete, e))?;
         let mut failed = None;
         for user in &users {
-            match self.listeners.navidrome_users(&UserId::new(&user.id)).await {
-                Ok(Some(names)) => return Ok(names),
+            match self
+                .listeners
+                .navidrome_users_with_libraries(&UserId::new(&user.id))
+                .await
+            {
+                Ok(Some(listed)) => return Ok(listed),
                 Ok(None) => {}
                 Err(e) => {
                     warn!("Could not list Navidrome's users as {}: {e}", user.username);
@@ -710,5 +668,129 @@ mod tests {
         assert!(average_matches(1.13, mean));
         assert!(!average_matches(1.14, mean));
         assert!(average_matches(1.67, positive_mean(&[1, 2, 2])));
+    }
+
+    #[tokio::test]
+    async fn every_rater_read_ignores_users_without_access_to_private_library() {
+        use crate::core::delete_guard::test_support::Library;
+
+        let lib = Library::new().await;
+        // Alice has a song in private library 2; bob is a Navidrome user who only has access
+        // to library 3, while carol is a Navidrome admin (or has access to library 2).
+        struct PrivateLibListeners {
+            users: Vec<NavidromeUserAccess>,
+        }
+
+        #[async_trait::async_trait]
+        impl Listeners for PrivateLibListeners {
+            async fn native_song(
+                &self,
+                _user: &UserId,
+                _id: &str,
+            ) -> Result<Option<NativeSong>, NavidromeLookupError> {
+                Ok(None)
+            }
+            async fn song(
+                &self,
+                _user: &UserId,
+                _id: &str,
+            ) -> Result<Option<SubsonicSong>, NavidromeLookupError> {
+                Ok(None)
+            }
+            async fn album(
+                &self,
+                _user: &UserId,
+                _id: &str,
+            ) -> Result<Option<SubsonicAlbum>, NavidromeLookupError> {
+                Ok(None)
+            }
+            async fn set_rating(
+                &self,
+                _user: &UserId,
+                _id: &str,
+                _rating: u8,
+            ) -> Result<(), NavidromeLookupError> {
+                Ok(())
+            }
+            async fn song_playlists(
+                &self,
+                _user: &UserId,
+                _id: &str,
+            ) -> Result<Vec<NativePlaylist>, NavidromeLookupError> {
+                Ok(vec![])
+            }
+            async fn songs_for_item(
+                &self,
+                _user: &UserId,
+                _item: &ImportedItem,
+            ) -> Result<Option<Vec<NativeSong>>, NavidromeLookupError> {
+                Ok(Some(vec![]))
+            }
+            async fn server_version(
+                &self,
+                _user: &UserId,
+            ) -> Result<Option<String>, NavidromeLookupError> {
+                Ok(Some("0.60.0".into()))
+            }
+            async fn navidrome_users(
+                &self,
+                _user: &UserId,
+            ) -> Result<Option<Vec<String>>, NavidromeLookupError> {
+                Ok(Some(self.users.iter().map(|u| u.user_name.clone()).collect()))
+            }
+            async fn navidrome_users_with_libraries(
+                &self,
+                _user: &UserId,
+            ) -> Result<Option<Vec<NavidromeUserAccess>>, NavidromeLookupError> {
+                Ok(Some(self.users.clone()))
+            }
+        }
+
+        let mut song = lib.record("s1");
+        song.library_id = 2;
+        song.rating = 5;
+
+        // Case 1: bob has access only to library 3 -> bob cannot rate song in library 2,
+        // so every_rater_read MUST allow deleting/upgrading alice's >1-star song.
+        let listeners_isolated = PrivateLibListeners {
+            users: vec![
+                NavidromeUserAccess {
+                    user_name: "alice".into(),
+                    is_admin: false,
+                    library_ids: vec![2],
+                },
+                NavidromeUserAccess {
+                    user_name: "bob".into(),
+                    is_admin: false,
+                    library_ids: vec![3],
+                },
+            ],
+        };
+        let guard_isolated = Guard::new(&lib.db, &listeners_isolated, None);
+        let read = Read {
+            ratings: vec![],
+            names: vec!["alice".into()],
+            unseen: vec!["bob".into()],
+        };
+        assert_eq!(guard_isolated.every_rater_read(&song, &read).await, Ok(()));
+
+        // Case 2: unlinked user dave DOES have access to library 2 -> MUST veto.
+        let listeners_shared = PrivateLibListeners {
+            users: vec![
+                NavidromeUserAccess {
+                    user_name: "alice".into(),
+                    is_admin: false,
+                    library_ids: vec![2],
+                },
+                NavidromeUserAccess {
+                    user_name: "dave".into(),
+                    is_admin: false,
+                    library_ids: vec![2],
+                },
+            ],
+        };
+        let guard_shared = Guard::new(&lib.db, &listeners_shared, None);
+        let err = guard_shared.every_rater_read(&song, &read).await.unwrap_err();
+        assert_eq!(err.code, FailureCode::DeleteVetoUnknown);
     }
 }

@@ -8,8 +8,8 @@ use shared::recommendation::SeedRadioRequest;
 use ui::{
     format_duration, friendly_error, subsonic_cover_art_url, use_player, ConfirmModal,
     IconChevronLeft, IconCompass, IconCopy, IconDisc3, IconListMusic, IconListPlus, IconLoader,
-    IconMoreHorizontal, IconPencil, IconPlay, IconRadio, IconShuffle, IconSparkles, IconTrash2,
-    IconUser, PlayerTrack, PlaylistCategory, TrackRow, TrackRowState,
+    IconMoreHorizontal, IconPencil, IconPlay, IconRadio, IconShare2, IconShuffle, IconSparkles,
+    IconTrash2, IconUser, PlayerTrack, PlaylistCategory, ShareModalTarget, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -432,6 +432,7 @@ pub fn PlaylistDetailPage(id: String) -> Element {
                                         let t_pl = track.clone();
                                         let t_star = track.clone();
                                         let t_rate = track.clone();
+                                        let t_share = track.clone();
                                         let t_inspect = track.clone();
                                         let pid_up = pl.id.clone();
                                         let pid_down = pl.id.clone();
@@ -570,6 +571,7 @@ pub fn PlaylistDetailPage(id: String) -> Element {
                                                 on_album_click: move |album| studio.navigate_to_album(nav, album),
                                                 on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                 on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                                on_share: move |_| studio.open_share_track(&t_share),
                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                                 on_move_up,
                                                 on_move_down,
@@ -707,7 +709,11 @@ pub fn AlbumDetailPage(id: String) -> Element {
                     let tracks_for_shuffle = display_tracks.clone();
                     let tracks_for_queue = display_tracks.clone();
                     let alb_name = alb.name.clone();
+                    let alb_name_share = alb.name.clone();
+                    let alb_id_share = alb.id.clone();
                     let alb_artist = alb.artist.clone();
+                    let alb_artist_share = alb.artist.clone();
+                    let alb_track_count = display_tracks.len();
                     let alb_ids: Vec<String> = display_tracks
                         .iter()
                         .map(|t| t.id.clone())
@@ -811,6 +817,21 @@ pub fn AlbumDetailPage(id: String) -> Element {
                                         IconListPlus { size: 14 }
                                         span { "Add to Playlist" }
                                     }
+                                    button {
+                                        r#type: "button",
+                                        disabled: display_tracks.is_empty(),
+                                        class: "inline-flex items-center gap-1.5 h-10 px-4 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-primary hover:border-beet-leaf-solid/40 hover:text-beet-leaf-text text-[13px] font-medium disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none transition-colors cursor-pointer",
+                                        onclick: move |_| {
+                                            studio.open_share_modal(ShareModalTarget::Album {
+                                                album_id: alb_id_share.clone(),
+                                                title: alb_name_share.clone(),
+                                                artist: alb_artist_share.clone(),
+                                                track_count: alb_track_count,
+                                            });
+                                        },
+                                        IconShare2 { size: 14 }
+                                        span { "Share Album" }
+                                    }
                                 }
                             }
                         }
@@ -824,6 +845,7 @@ pub fn AlbumDetailPage(id: String) -> Element {
                                     let t_pl = track.clone();
                                     let t_star = track.clone();
                                     let t_rate = track.clone();
+                                    let t_share = track.clone();
                                     let t_inspect = track.clone();
                                     let row_state = if offline_only && !track.is_offline_cached {
                                         TrackRowState::OfflineUnavailable
@@ -861,6 +883,7 @@ pub fn AlbumDetailPage(id: String) -> Element {
                                             on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
                                             on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                             on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                            on_share: move |_| studio.open_share_track(&t_share),
                                             on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                         }
                                     }

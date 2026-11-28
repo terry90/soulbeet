@@ -162,9 +162,8 @@ use crate::AuthSession;
 use super::{failure_error, server_error};
 #[cfg(feature = "server")]
 use crate::core::discovery::{
-    choose_discovery_folder, claim_run, current_progress, discovery_disabled,
-    discovery_folder_required, generation_running, parse_profiles, promote, remove_in, start_in,
-    DiscoveryEffects, Replace,
+    claim_run, current_progress, discovery_disabled, discovery_folder_required, generation_running,
+    parse_profiles, promote, remove_in, start_in, DiscoveryEffects, Replace,
 };
 #[cfg(feature = "server")]
 use crate::core::{database_failure, target_unwritable};
@@ -172,18 +171,6 @@ use crate::core::{database_failure, target_unwritable};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 #[cfg(feature = "server")]
 use shared::navidrome::DiscoveryProgress;
-
-/// The discovery folder the user's settings name no longer exists.
-#[cfg(feature = "server")]
-fn discovery_folder_not_found() -> Failure {
-    Failure::new(
-        FailureCode::FolderRequired,
-        Stage::Input,
-        RetryAdvice::NeedsUser,
-        "Discovery folder not found",
-    )
-    .with_user_action(choose_discovery_folder())
-}
 
 /// A database error of a generation run, shown as the database's own text.
 #[cfg(feature = "server")]
@@ -197,15 +184,12 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     let settings = UserSettings::get(&auth.0.user_id)
         .await
         .map_err(server_error)?;
-    let folder_name = if let Some(ref fid) = settings.discovery_folder_id {
-        Folder::get_by_id(fid)
-            .await
-            .ok()
-            .flatten()
-            .filter(|f| f.user_id == auth.0.user_id)
-            .map(|f| f.name)
-    } else {
-        None
+    let folder = Folder::get_for_user(&auth.0.user_id)
+        .await
+        .map_err(server_error)?;
+    let (folder_id, folder_name) = match folder {
+        Some(f) => (Some(f.id), Some(f.name)),
+        None => (None, None),
     };
     let track_counts = settings.parse_track_counts();
     let lifetime_days = settings.parse_lifetime_days();
@@ -219,7 +203,7 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     .map_err(server_error)?;
     Ok(DiscoveryConfig {
         enabled: settings.discovery_enabled,
-        folder_id: settings.discovery_folder_id,
+        folder_id,
         folder_name,
         track_counts,
         lifetime_days,
@@ -230,20 +214,14 @@ pub async fn get_discovery_config() -> Result<DiscoveryConfig, ServerFnError> {
     })
 }
 
-/// Get discovery tracks for the current user's configured folder
+/// Get discovery tracks for the current user's library folder
 #[get("/api/discovery/tracks", auth: AuthSession)]
 pub async fn get_discovery_tracks() -> Result<Vec<DiscoveryTrack>, ServerFnError> {
-    let settings = UserSettings::get(&auth.0.user_id)
+    let folder = Folder::get_for_user(&auth.0.user_id)
         .await
         .map_err(server_error)?;
-    if let Some(ref folder_id) = settings.discovery_folder_id {
-        let Some(folder) = Folder::get_by_id(folder_id).await.map_err(server_error)? else {
-            return Ok(vec![]);
-        };
-        if folder.user_id != auth.0.user_id {
-            return Err(crate::forbidden_error("Discovery folder does not belong to you"));
-        }
-        let mut tracks = DiscoveryTrackRow::get_by_folder(folder_id)
+    if let Some(folder) = folder {
+        let mut tracks = DiscoveryTrackRow::get_by_folder(&folder.id)
             .await
             .map_err(server_error)?;
         crate::core::contextual::reconcile_and_hydrate_discovery_tracks_in(
@@ -893,14 +871,11 @@ pub async fn generate_discovery_playlist_internal(
     if !settings.discovery_enabled {
         return Err(discovery_disabled());
     }
-    let folder_id = settings
-        .discovery_folder_id
-        .as_ref()
-        .ok_or_else(discovery_folder_required)?;
-    let folder = Folder::get_by_id(folder_id)
+    let folder = Folder::get_for_user(user_id)
         .await
         .map_err(|e| run_database_failure(Stage::Input, e))?
-        .ok_or_else(discovery_folder_not_found)?;
+        .ok_or_else(discovery_folder_required)?;
+    let folder_id = folder.id.as_str();
 
     // Shown as the run's error, so the user sees why nothing was imported.
     if let Some(failure) = crate::importer_health::blocking_failure().await {
@@ -1470,6 +1445,7 @@ pub async fn generate_discovery_playlist_internal(
                         duplicates: Duplicates::AsConfigured,
                         last_run: None,
                         lock_retries: 0,
+                        placement: soulbeet::ImportPlacement::Default,
                     })
                     .await
                     .wait()
@@ -1698,14 +1674,10 @@ pub async fn generate_seasonal_packs_for_user(user_id: &str) -> Result<u32, Fail
     if !settings.discovery_enabled {
         return Err(discovery_disabled());
     }
-    let folder_id = settings
-        .discovery_folder_id
-        .as_ref()
-        .ok_or_else(discovery_folder_required)?;
-    let folder = Folder::get_by_id(folder_id)
+    let folder = Folder::get_for_user(user_id)
         .await
         .map_err(|e| run_database_failure(Stage::Input, e))?
-        .ok_or_else(discovery_folder_not_found)?;
+        .ok_or_else(discovery_folder_required)?;
 
     if let Some(failure) = crate::importer_health::blocking_failure().await {
         return Err(failure);
@@ -2368,6 +2340,7 @@ async fn generate_seasonal_packs_with_work(
                         duplicates: Duplicates::AsConfigured,
                         last_run: None,
                         lock_retries: 0,
+                        placement: soulbeet::ImportPlacement::Default,
                     })
                     .await
                     .wait()
@@ -2553,7 +2526,43 @@ pub async fn reconcile_discovery_playlists(user_id: &str) -> Result<(), String> 
         music_path,
         &user,
     )
-    .await
+    .await?;
+
+    // Also reconcile active seasonal packs as Navidrome smart playlists (`Discovery/Seasonal/<slug>/`)
+    // and clean up expired seasonal playlists.
+    if let Ok(settings) = UserSettings::get_in(&crate::db::DB, user_id).await {
+        if settings.discovery_enabled {
+            if let Ok(Some(folder)) = Folder::get_for_user_in(&crate::db::DB, user_id).await {
+                if let Ok(navi) = crate::services::navidrome_client_for_user(user_id).await {
+                    if let Ok(Some(discovery)) = crate::core::discovery::discovery_place_in(
+                        &crate::db::DB,
+                        &navi,
+                        music_path,
+                        &folder,
+                    )
+                    .await
+                    {
+                        if let Err(e) = crate::core::contextual::reconcile_seasonal_playlists_in(
+                            &crate::db::DB,
+                            &navi,
+                            user_id,
+                            &discovery,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Failed to reconcile seasonal playlists for user {}: {}",
+                                user_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// reconcile_discovery_playlists on `db` and `navidrome`, `music_path` the root of Navidrome's
@@ -2575,13 +2584,9 @@ async fn reconcile_in(
     if !settings.discovery_enabled {
         return Ok(());
     }
-    let folder_id = match settings.discovery_folder_id.as_ref() {
-        Some(id) => id.clone(),
-        None => return Ok(()),
+    let Some(folder) = Folder::get_for_user_in(db, &user_id).await? else {
+        return Ok(());
     };
-    let folder = Folder::get_by_id_in(db, &folder_id)
-        .await?
-        .ok_or("Discovery folder not found")?;
 
     let navi = match navidrome.navidrome_of(user).await {
         Ok(c) => c,
@@ -2902,9 +2907,8 @@ pub async fn get_engine_reports() -> Result<Vec<ReportEntry>, ServerFnError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::{
-        discovery_folder_not_found, run_database_failure, run_outcome, scan_imports,
-        search_candidate, settle_poll, stop_waiting, CandidateSearch, QueuedTrack,
-        FAILED_STATE_CONFIRM,
+        run_database_failure, run_outcome, scan_imports, search_candidate, settle_poll,
+        stop_waiting, CandidateSearch, QueuedTrack, FAILED_STATE_CONFIRM,
     };
     use crate::core::discovery::{
         discovery_disabled, discovery_folder_required, generation_running,
@@ -3048,29 +3052,21 @@ mod tests {
                 NeedsUser,
                 "No download folder configured for discovery",
             ),
-            (
-                discovery_folder_not_found(),
-                FolderRequired,
-                NeedsUser,
-                "Discovery folder not found",
-            ),
         ] {
             assert_eq!(
                 (f.code, f.stage, f.retry, f.message.as_str()),
                 (code, Stage::Input, retry, message)
             );
         }
-        for f in [discovery_folder_required(), discovery_folder_not_found()] {
-            let action = f.user_action.unwrap();
-            assert_eq!(
-                (action.code, action.what.as_str(), action.where_.as_str()),
-                (
-                    UserActionCode::AddFolder,
-                    "Choose a discovery folder",
-                    "Settings > Library > Discovery"
-                )
-            );
-        }
+        let action = discovery_folder_required().user_action.unwrap();
+        assert_eq!(
+            (action.code, action.what.as_str(), action.where_.as_str()),
+            (
+                UserActionCode::AddFolder,
+                "Set your library folder",
+                "Settings > Library"
+            )
+        );
     }
 
     #[test]
@@ -3902,10 +3898,9 @@ mod tests {
         /// alice with discovery on for Balanced in her folder, `ids` stored as her playlists.
         async fn discovering(ids: &str) -> SqlitePool {
             let db = crate::db::test_db::migrated().await;
-            let folder = crate::core::folder_of(&db, "alice").await;
+            let _folder = crate::core::folder_of(&db, "alice").await;
             let update = UpdateUserSettings {
                 discovery_enabled: Some(true),
-                discovery_folder_id: Some(folder),
                 discovery_profiles: Some("Balanced".into()),
                 ..Default::default()
             };

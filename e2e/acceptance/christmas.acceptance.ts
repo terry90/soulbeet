@@ -546,7 +546,6 @@ test('the Christmas playlist is filled through every injected failure by followi
         ['set_rating', { song_id: coventryId, rating: 1 }, 'rate_in_navidrome'],
         ['update_settings', { auto_delete: true }, 'enable_auto_delete'],
         ['update_settings', { discovery_promote_threshold: 3 }, 'change_discovery_settings'],
-        ['update_settings', { discovery_folder_id: folderId }, 'change_discovery_settings'],
       ];
       for (const [tool, args, userAction] of refused) {
         const answer = await a.call(tool, args);

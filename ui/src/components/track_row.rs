@@ -4,8 +4,8 @@ use shared::download::AcquireAndPlayStage;
 use crate::{
     IconCheck, IconChevronDown, IconChevronUp, IconDisc3, IconHeart, IconInfo, IconListMusic,
     IconListPlus, IconLoader, IconMoreHorizontal, IconMusic, IconPlay, IconPlus, IconRefreshCw,
-    IconSlidersHorizontal, IconSparkles, IconStar, IconTrash2, IconUser, IconWifiOff, IconX,
-    StarStrip, StarStripSize,
+    IconShare2, IconSlidersHorizontal, IconSparkles, IconStar, IconTrash2, IconUser, IconWifiOff,
+    IconX, StarStrip, StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -162,6 +162,7 @@ pub fn TrackRow(
     #[props(default)] on_rate: Option<EventHandler<u8>>,
     #[props(default)] on_acquire: Option<EventHandler<()>>,
     #[props(default)] on_pick_source: Option<EventHandler<()>>,
+    #[props(default)] on_share: Option<EventHandler<()>>,
     #[props(default)] on_inspect: Option<EventHandler<()>>,
     #[props(default)] on_artist_click: Option<EventHandler<String>>,
     #[props(default)] on_album_click: Option<EventHandler<String>>,
@@ -228,9 +229,12 @@ pub fn TrackRow(
         .filter(|a| !a.is_empty())
         .map(str::to_string);
 
+    let can_share = matches!(state, TrackRowState::Owned { .. }) && on_share.is_some();
+
     let has_overflow_menu = on_play_next.is_some()
         || on_add_to_queue.is_some()
         || on_add_to_playlist.is_some()
+        || can_share
         || on_move_up.is_some()
         || on_move_down.is_some()
         || on_remove_from_playlist.is_some()
@@ -736,6 +740,22 @@ pub fn TrackRow(
                                     }
                                 }
 
+                                if matches!(state, TrackRowState::Owned { .. }) {
+                                    if let Some(share_cb) = on_share {
+                                        button {
+                                            r#type: "button",
+                                            role: "menuitem",
+                                            class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                            onclick: move |_| {
+                                                share_cb.call(());
+                                                menu_open.set(false);
+                                            },
+                                            IconShare2 { size: 14, class: "text-beet-leaf-text".to_string() }
+                                            span { "Share with user..." }
+                                        }
+                                    }
+                                }
+
                                 if let Some(artist_cb) = on_artist_click {
                                     button {
                                         r#type: "button",
@@ -1072,5 +1092,50 @@ mod tests {
         let html_playing = dioxus_ssr::render(&dom_playing);
         assert!(html_playing.contains("border-beet-leaf-solid/25"), "{html_playing}");
         assert!(!html_playing.contains("border-transparent"), "{html_playing}");
+    }
+
+    #[test]
+    fn renders_share_button_only_for_owned_tracks() {
+        let mut owned_dom = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Owned Song".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::Owned {
+                        is_offline_cached: false,
+                        starred: false,
+                        rating: 0,
+                    },
+                    on_share: |_| {},
+                }
+            }
+        });
+        owned_dom.rebuild_in_place();
+        let owned_html = dioxus_ssr::render(&owned_dom);
+        assert!(
+            owned_html.contains("aria-label=\"More actions for Owned Song\""),
+            "{owned_html}"
+        );
+
+        let mut disc_dom = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Discovery Song".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::PendingDiscovery {
+                        days_remaining: Some(3),
+                        reason_label: None,
+                        rating: 0,
+                    },
+                    on_share: |_| {},
+                }
+            }
+        });
+        disc_dom.rebuild_in_place();
+        let disc_html = dioxus_ssr::render(&disc_dom);
+        assert!(
+            !disc_html.contains("aria-label=\"More actions for Discovery Song\""),
+            "{disc_html}"
+        );
     }
 }

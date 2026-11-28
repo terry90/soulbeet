@@ -316,14 +316,13 @@ pub async fn cancel_download(req: CancelDownloadRequest) -> Result<(), ServerFnE
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadRequest {
     pub items: Vec<DownloadableItem>,
-    pub target_folder: String,
     /// The search the items were picked from.
     pub search_id: String,
 }
 
 #[post("/api/downloads/queue", auth: AuthSession)]
 pub async fn download(req: DownloadRequest) -> Result<Vec<QueuedDownload>, ServerFnError> {
-    let folder = crate::core::folders::owned_at(&auth.0, &req.target_folder)
+    let folder = crate::core::folders::for_user(&auth.0.user_id)
         .await
         .map_err(failure_error)?;
     crate::core::acquire::download(&auth.0, &folder, req.items, &req.search_id)

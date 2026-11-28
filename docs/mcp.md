@@ -210,14 +210,14 @@ Every person connects their own Soulbeet account, and an app connected by one pe
 
 ### Multi-account admin library access
 
-When a Soulbeet **Admin** wants an assistant to organize libraries across household accounts (for example, moving tracks from another family member's private folder into a shared folder), they can turn on **Admin library access (all users' folders)** for their own connected app in **Settings > Users > Connected apps**. It starts off for every new connection and is only available on grants owned by an Admin account.
+When a Soulbeet **Admin** wants an assistant to inspect libraries across household accounts or migrate retired legacy/shared folders into per-user personal libraries, they can turn on **Admin library access (all users' folders)** for their own connected app in **Settings > Users > Connected apps**. It starts off for every new connection and is only available on grants owned by an Admin account.
 
 With **Admin library access (all users' folders)** enabled:
 
 - `get_status` reports `"allow_admin": true`.
-- `list_folders` defaults to `scope: "all"` and returns every registered library folder across all users with `owner`, `shared`, and `is_own` fields (pass `scope: "own"` to list only your own folders).
+- `list_folders` defaults to `scope: "all"` and returns every registered personal library folder across all users with `owner` and `is_own` fields (pass `scope: "own"` to list only your own folder).
 - `find_in_library`, `browse_library`, `get_playlist`, `find_duplicates`, and `inspect_tracks` resolve track folders across all registered users and include `owner` and `is_own` metadata.
-- `move_tracks` can move tracks from or into any registered user's folder (for example, from a private folder into a shared folder, which expands visibility). Moving requires **Allow managing library files (delete, move, re-tag)** as well, and all safety guards remain enforced (Discovery staging protection, active download checks, and the multi-user visibility-shrinking veto when moving out of a shared or multi-user-visible folder into a non-shared folder). If `target_folder_id` is omitted, `move_tracks` returns `folder_required` with all accessible folders so the assistant can ask which folder to use.
+- `migrate_legacy_folders` lists unmigrated retired legacy/shared folders recorded during the single-folder-per-user upgrade and migrates their audio files into each participating user's personal library folder via hardlinks. Passing `remove_source_after: true` (with `dry_run: false`) also unlinks source files after verifying every target copy and requires **Allow managing library files (delete, re-tag)** as well.
 
 How accounts appear depends on `REGISTRATION` (see [configuration.md](configuration.md)): with Navidrome sign-in (`navidrome`, the default when `NAVIDROME_URL` is set), a Navidrome user's Soulbeet account is created the first time they sign in, which can be the sign-in of the connection itself. With `admin`, an admin creates the accounts; with `open`, anyone can register.
 
@@ -238,7 +238,7 @@ Soulbeet remembers what Navidrome said of each account for 15 minutes, so it doe
   > Let {app host} manage library files (delete, move between folders, and re-tag)? Before deleting, moving or re-tagging tracks it has to ask you first. While this is on it can also run your rating sync, which deletes the songs you rated 1 star when auto-delete is on, and keep a discovery track, which replaces an earlier copy of the song. Deletions are limited to at most 100 tracks in any 24 hours, for all your connected apps together. Deleted files cannot be restored.
 
   with the buttons **Cancel** and **Allow managing files**. Turning it off acts at once.
-- **Admin library access (all users' folders)** is shown on an admin's own apps and starts off for every new connection. Turning it on asks for confirmation before allowing that app to list and inspect all users' registered folders and perform cross-user folder moves (with file management also enabled). Turning it off acts at once.
+- **Admin library access (all users' folders)** is shown on an admin's own apps and starts off for every new connection. Turning it on asks for confirmation before allowing that app to list and inspect all users' registered folders and run legacy folder migrations (`migrate_legacy_folders`). Turning it off acts at once.
 - **Disconnect** asks "Disconnect {app host}? It will have to be connected again from the app." and ends the app's access.
 - Admins see every user's apps, with the owner's name, and can disconnect any of them. Only the owner can turn on an app's file-management or admin-access switches.
 
@@ -250,11 +250,11 @@ When nothing is connected the panel says "No app is connected. Add {your address
 
 ## Deleting music
 
-File management (deleting, moving across folders, and re-tagging) is off for every app until its owner turns on **Allow managing library files (delete, move, re-tag)** in Settings > Users > Connected apps. With it on, an app can:
+File management (deleting and re-tagging) is off for every app until its owner turns on **Allow managing library files (delete, move, re-tag)** in Settings > Users > Connected apps. Track sharing (`share_tracks`) is additive and never deletes or alters the sender's files, so it does not require the file-management switch. With the switch on, an app can:
 
 - delete songs you confirmed: `preview_delete_tracks` checks up to 25 songs and says for each whether it may be deleted and, if not, why, with a confirmation token for exactly the songs it allows; the assistant shows you the preview and asks; `delete_tracks` with that token deletes them after your yes. `find_duplicates` finds songs your library holds more than once, to preview;
-- move tracks or whole albums between your folders (`move_tracks`) while preserving file bytes, filename, beets libraries, Navidrome song ids, ratings, stars, play counts and static playlists; dry-run previews (`dry_run: true`) and `inspect_tracks` work without the switch;
-- re-tag or re-match existing library tracks through beets (`retag_tracks`), in place by default so Navidrome keeps the same song id (or with `relocate: true` using a two-scan dance when an admin account can scan); dry-run previews work without the switch;
+- re-tag or re-match existing library tracks through beets (`retag_tracks`), in place by default so Navidrome keeps the same song id (or with `relocate: true` using a two-scan dance when an admin account can scan); hardlinked shared files are automatically detached via copy-on-write before writing tags; dry-run previews work without the switch;
+- remove legacy source files after a verified migration (`migrate_legacy_folders` with `remove_source_after: true` and `dry_run: false`, admin-only);
 - replace a library copy while it downloads a better one: `ensure_in_library`'s `replace_existing` takes the token of a preview with reason `replaced`, and the previewed copies are deleted once the new copy is imported, within 24 hours;
 - run your rating sync (`sync_ratings`) with its auto-delete: when you turned auto-delete on, the songs you rated 1 star are deleted;
 - keep a discovery track (`promote_discovery_track`) that replaces an earlier copy of the song in your library;
@@ -262,7 +262,7 @@ File management (deleting, moving across folders, and re-tagging) is off for eve
 
 The last three delete without a preview. They count against the same daily limit and appear in the deletion history under the app's name.
 
-Without the switch, `preview_delete_tracks`, `delete_tracks`, `move_tracks` (`dry_run: false`) and `retag_tracks` (`dry_run: false`) answer `permission_not_granted` with "Managing library files (delete, move, re-tag) is turned off for this app" and the user action "Allow managing library files for this app" in "Settings > Users > Connected apps"; `ensure_in_library` refuses `replace_existing` the same way; `sync_ratings` skips auto-delete (the 6-hourly sync does it); `promote_discovery_track` and `resolve_import` replace no earlier copy and end `import_already_in_library`.
+Without the switch, `preview_delete_tracks`, `delete_tracks`, `retag_tracks` (`dry_run: false`) and `migrate_legacy_folders` (`dry_run: false` with `remove_source_after: true`) answer `permission_not_granted` with "Managing library files (delete, move, re-tag) is turned off for this app" and the user action "Allow managing library files for this app" in "Settings > Users > Connected apps"; `ensure_in_library` refuses `replace_existing` the same way; `sync_ratings` skips auto-delete (the 6-hourly sync does it); `promote_discovery_track` and `resolve_import` replace no earlier copy and end `import_already_in_library`.
 
 Some changes are refused to every app, whether or not its deletion switch is on, because they would let a later sync delete files without a preview:
 
@@ -301,9 +301,9 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 ### Status, settings and folders
 
-- `get_status`: what Soulbeet can do for this user now: whether each enabled download backend and beets work (`download_backends`, one `{id, name, online, failure}` per backend, the default first; `download_backend` describes the default one, slskd), the Navidrome link and scan status, whether Soulbeet can start a Navidrome scan after the user's imports (`can_trigger_scan`, with `scan_note` saying how, see [Navidrome scans](#navidrome-scans)), the folders with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music, and Soulbeet's address.
-- `get_settings`: the user's settings: default folder, auto-delete, ListenBrainz name (never the token), discovery settings, with `discovery.deezer_recommendations` (whether the names of artists the user plays go to Deezer).
-- `list_folders`: the user's library folders with ids, paths, free space, whether shared, `in_navidrome`, and which is the default.
+- `get_status`: what Soulbeet can do for this user now: whether each enabled download backend and beets work (`download_backends`, one `{id, name, online, failure}` per backend, the default first; `download_backend` describes the default one, slskd), the Navidrome link and scan status, whether Soulbeet can start a Navidrome scan after the user's imports (`can_trigger_scan`, with `scan_note` saying how, see [Navidrome scans](#navidrome-scans)), `navidrome_library_warning` when the user's personal folder is not yet configured as a Navidrome library, the user's personal folder with free space and `in_navidrome` (`listed` when a Navidrome library Soulbeet has located on this machine holds the folder, so imports into it show up in Navidrome; `unknown` otherwise), the batches still running, whether this app may delete music and whether `allow_admin` is on, and Soulbeet's address.
+- `get_settings`: the user's settings: auto-delete, `accept_shares` (whether other household users can share tracks into this user's personal library), ListenBrainz name (never the token), discovery settings, with `discovery.deezer_recommendations` (whether the names of artists the user plays go to Deezer).
+- `list_folders`: the user's personal library folder (or all users' personal folders when an admin app has `allow_admin`) with ids, paths, owner, `is_own`, free space and `in_navidrome`.
 
 ### Library
 
@@ -352,13 +352,13 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 
 - `set_rating`: sets the user's own rating of a song or album; a 1-star song rating and any rating of a pending discovery track other than clearing it are refused.
 - `set_star`: stars or unstars a song or album.
-- `update_settings`: changes the default folder, turns auto-delete off, and changes discovery's on/off, profiles, track counts, lifetimes and playlist names.
+- `update_settings`: turns auto-delete off, toggles `accept_shares`, and changes discovery's on/off, profiles, track counts, lifetimes and playlist names.
 
 ### Discovery
 
 - `get_discovery`: the user's discovery: folder, profiles, the current run and the pending tracks. A run that ended in error has its failure in `run.failure` for 5 minutes. `last_run` is the newest recommendation run, the automatic 6-hourly one included: `state` (`recommended` or `no_listening_data`), the `sources` it used and the `source_errors` of those that failed.
 - `run_discovery`: starts a discovery run. Recommendations come from the user's Navidrome plays and stars, from ListenBrainz when a username is saved, from data about music from ListenBrainz and MusicBrainz, and from Deezer when the user turned it on. The call returns as soon as the run starts; its own failures are only `invalid_input` (discovery off), `folder_required` and `already_running`. A run that cannot build recommendations ends with `run.status` `error`, and `get_discovery` shows the reason in `run.failure`: `no_listening_data` with nothing played or starred in Navidrome (and no ListenBrainz history), `metadata_unavailable` naming a listening history such as ListenBrainz that could not be read while nothing else has plays or stars (retry later), or `navidrome_not_linked` / `navidrome_unreachable` when the Navidrome library could not be read.
-- `promote_discovery_track`: moves a pending discovery track into the library (optionally into another folder owned by the user via `target_folder_id`); it replaces an earlier copy only with the file-management switch on.
+- `promote_discovery_track`: moves a pending discovery track into the user's personal library folder; it replaces an earlier copy only with the file-management switch on.
 - `remove_discovery_track`: deletes a pending discovery track from the discovery folder.
 - `sync_ratings`: runs the user's rating sync now, as Soulbeet does every 6 hours.
 
@@ -369,12 +369,14 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 - `delete_tracks`: deletes the songs a confirmation token allows, from disk and from beets; there is no undo.
 - `get_deletion_history`: the deletions of the user's files, newest first, with why, how and which app.
 
-### Track management
+### Track sharing and management
 
 - `inspect_tracks`: inspects up to 25 library tracks: exact local path, Soulbeet folder, Navidrome library id, beets database tags, album peers and album rating/star, caller's playlists, other-listener visibility, sidecars (`.lrc`, cover art) and discovery state.
-- `move_tracks`: moves up to 25 songs (`song_ids`) or one whole album (`album_id`, up to 100 tracks) to another of the user's folders (`target_folder_id`) while preserving file bytes, filename, beets libraries, Navidrome song id, ratings, stars, play counts and static playlists. Supports `dry_run: true` and `replace_existing: true` (through the delete guard).
-- `get_move_history`: lists the user's track moves between folders, newest first, with source and target folders/paths, status (`moved`, `moved_pending_scan`, `moved_id_changed`) and warnings.
-- `retag_tracks`: edits tags directly (`tags`) or re-matches against MusicBrainz via beets (`rematch`) for up to 25 songs or one album; keeps files in place by default so Navidrome keeps the same song id, or runs a two-scan dance with `relocate: true` when an admin can scan. Supports `dry_run: true`.
+- `list_share_recipients`: lists other household users who have `accept_shares` enabled and a configured personal library folder, returning `user_id` and `username` without exposing folder paths.
+- `share_tracks`: shares up to 25 songs (`song_ids`) or one whole album (`album_id`, up to 100 tracks) into one or more recipients' personal libraries via hardlinks (falling back to reflink or copy across filesystems), registering in beets and triggering a Navidrome scan. Additive (does not require the file-management switch); supports `dry_run: true`.
+- `get_share_history`: lists this user's incoming or outgoing track shares (`direction`: `all`, `incoming`, `outgoing`), newest first, with batch id, sender/recipient usernames, link mode, origin and timestamp.
+- `migrate_legacy_folders`: admin-only tool (requires `allow_admin`) to inspect or migrate retired legacy and shared folders into each participating user's personal library via hardlinks, with optional source cleanup (`remove_source_after: true`, which requires the file-management switch). Supports `dry_run: true`.
+- `retag_tracks`: edits tags directly (`tags`) or re-matches against MusicBrainz via beets (`rematch`) for up to 25 songs or one album; detaches hardlinked files via copy-on-write before writing tags; keeps files in place by default so Navidrome keeps the same song id, or runs a two-scan dance with `relocate: true` when an admin can scan. Supports `dry_run: true`.
 
 ### Library browsing, insights and maintenance
 
@@ -385,6 +387,14 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 - `get_recommendations`: read-only preview of Soulbeet's recommendation engine (`Conservative`, `Balanced`, or `Adventurous`) returning ranked candidate tracks, signals and seed artists without downloading or modifying discovery state.
 - `audit_library`: read-only health audit of the user's library folders against Navidrome, reporting untracked audio files on disk, missing Navidrome files, albums split across folders/libraries, missing recording MBIDs, missing cover art, and missing lyrics.
 - `fetch_artwork_and_lyrics`: fetches missing album cover art (Cover Art Archive / MusicBrainz) and/or synced/plain `.lrc` lyrics (LRCLIB) for up to 25 songs or one album, writing files atomically inside the caller's owned folders and triggering a Navidrome scan. Supports `dry_run: true`; `overwrite: true` requires the file-management switch.
+
+### Existing library import
+
+- `scan_unimported_files`: read-only scan of the user's personal library folder (or a validated external `source_path`) against the folder's beets database, returning counts and a sample of unimported album folders and loose audio files.
+- `start_library_import`: starts a persistent background import batch in `tag_and_organize`, `tag_in_place`, or `register_as_is` mode (`tag_and_organize` and `tag_in_place` require the file-management switch; `register_as_is` does not). Never deletes source files; supports `request_key` for idempotency.
+- `get_library_import`: shows a library import batch (the caller's latest batch when `batch_id` is omitted) with progress counters and a paginated, status-filtered list of items and Match Picker choices.
+- `resolve_library_import_item`: resolves a `needs_decision` or `failed` library import item (`auto`, `as_is` with optional `tag_overrides`, `candidate`, `musicbrainz`, or `dismiss`). Non-dismiss actions on `tag_and_organize` / `tag_in_place` batches and any `tag_overrides` require the file-management switch; `dismiss` and `register_as_is` do not.
+- `control_library_import`: pauses, resumes, or cancels a library import batch (`action`: `pause`, `resume`, or `cancel`) without modifying or deleting source files. Resuming a `tag_and_organize` or `tag_in_place` batch requires the file-management switch; `pause`, `cancel`, and resuming `register_as_is` do not.
 
 ## Limits
 
@@ -489,7 +499,7 @@ The registration and token endpoints answer `{"error", "error_description"}`:
 A tool that fails answers its document with `ok: false` and an `error` with these fields:
 
 - `code`: one of the [error codes](#error-codes);
-- `stage`: where it failed: `input`, `metadata`, `library_check`, `source_search`, `enqueue`, `transfer`, `file_lookup`, `import`, `index`, `playlist`, `delete`, `move` or `retag`;
+- `stage`: where it failed: `input`, `metadata`, `library_check`, `source_search`, `enqueue`, `transfer`, `file_lookup`, `import`, `index`, `playlist`, `delete`, `share` or `retag`;
 - `message`: what happened;
 - `cause`: the other service's own answer, when there is one (see [Failure causes](#failure-causes));
 - `retry`: whether and how to try again: `same_source_later` (with `retry_after_seconds` when known), `other_source`, `other_query`, `needs_decision`, `needs_user`, `not_retryable`, or `per_item` for a `partial` answer;
@@ -512,7 +522,7 @@ The ones you are most likely to see:
 | `invalid_input` | `input` | An argument is missing, has the wrong type or range, or is one the tool does not take; `facts.expected` names what it takes. Also a request the state does not allow, such as running discovery while it is off. | The assistant corrects the call. |
 | `unknown_handle` | `input` | An id that names nothing this user may use: a job, batch, search, candidate, folder, song, album, discovery track, confirmation token or connected app. Another user's id reads the same. | Get the id again from the tool that lists it. |
 | `expired_handle` | `input`, `import`, `delete` | The id was valid but is no longer usable: a search older than 24 hours, a confirmation token used or older than 10 minutes, a replacement consent past its 24 hours, a discovery track no longer pending. | Start again from the step that gave it: a new search or a new preview. |
-| `permission_not_granted` | `input`, `delete`, `move`, `retag` | The app may not do this: file management is off for it (user action `enable_deletion`), or no app may make the change: auto-delete on (`enable_auto_delete`), the discovery folder or promote threshold (`change_discovery_settings`), a 1-star song rating or a rating of a pending discovery track (`rate_in_navidrome`). | Do what the user action says: tick Allow managing library files (delete, move, re-tag) in Settings > Users > Connected apps, change the setting in Settings > Library, or rate in Navidrome. |
+| `permission_not_granted` | `input`, `delete`, `share`, `retag` | The app may not do this: file management is off for it (user action `enable_deletion`), admin library access is off (`allow_admin`), or no app may make the change: auto-delete on (`enable_auto_delete`), the promote threshold (`change_discovery_settings`), a 1-star song rating or a rating of a pending discovery track (`rate_in_navidrome`). | Do what the user action says: tick Allow managing library files or Admin library access in Settings > Users > Connected apps, change the setting in Settings > Library, or rate in Navidrome. |
 | `folder_required` | `input` | There is no folder to download into: no `folder_id` and no default folder, no library folder at all, or no discovery folder. User action `add_folder` when one is missing. | Add a folder or choose a default in Settings > Library, or a discovery folder in Settings > Library > Discovery. |
 | `no_listening_data` | `input` | Discovery found nothing played or starred in Navidrome, and no ListenBrainz history, every history having answered. User action `listen_in_navidrome`. | Play or star music in Navidrome, then run discovery again. |
 | `rate_limited` | `input`, `source_search`, `enqueue`, `transfer` | Too many tool calls from this app, 3 source searches already waiting for this user, or 200 unfinished app jobs for this user; or YouTube rate-limited this server, which holds every YouTube Music download for an hour (`retry_after_seconds` says how long is left); or GD Studio refused a download's call for too many requests. | Wait; `retry_after_seconds` says how long where it is known. |
@@ -595,11 +605,13 @@ The ones you are most likely to see:
 | `delete_in_use` | `delete` | A download or import that is not finished wants this track. | Wait until it ends. |
 | `delete_changed_since_preview` | `delete` | The file changed after the preview, or was not in it. | Preview again. |
 | `delete_failed` | `delete`, `import` | The system refused to remove a file every check allowed; the message gives its reason. | Fix the file's permissions. |
-| `delete_daily_limit` | `delete`, `move` | 100 tracks were deleted through apps in the last 24 hours, or more than 100 were asked at once. | Wait until the time the message names. |
-| `move_same_folder` | `move` | The track is already inside the requested target folder. | Nothing to move; choose another folder. |
-| `move_target_exists` | `move` | A file already exists at the exact destination path in the target folder. | Pass `replace_existing: true` after confirming with the user, or inspect the existing file first. |
-| `move_duplicate_in_target` | `move` | The target folder already contains a copy of this song (matching recording MBID or normalized artist + title); `facts.existing_in_target` lists the existing copies. | Compare both copies with the user; pass `replace_existing: true` if they want to replace the target copy. |
-| `move_failed` | `move` | Moving the track on disk failed (for example permissions or disk full); the message gives the OS error. | Fix the filesystem error and try again. |
+| `delete_daily_limit` | `delete` | 100 tracks were deleted through apps in the last 24 hours, or more than 100 were asked at once. | Wait until the time the message names. |
+| `share_recipient_disabled` | `share` | The target user has disabled incoming track shares (`accept_shares` is off). | Choose another recipient or ask the user to enable incoming shares in Settings > Library. |
+| `share_no_target_folder` | `share` | The target user does not have a configured personal library folder yet. | Have an admin or the recipient ensure their personal library folder exists in Settings > Library. |
+| `share_self_disallowed` | `share` | A user cannot share tracks to their own account. | Choose another household user from `list_share_recipients`. |
+| `share_target_exists` | `share` | A file already exists at the exact destination path in the recipient's library folder. | Nothing to overwrite; sharing never replaces existing files in another user's library. |
+| `share_already_in_library` | `share` | The recipient's library already holds a copy of this song (matching recording MBID or normalized artist and title). | Nothing to share; the recipient already has the track. |
+| `share_failed` | `share` | Hardlinking, reflinking, copying or registering the shared track failed; the message gives the OS or beets error. | Fix the filesystem permissions or disk space error and try again. |
 | `retag_failed` | `retag` | Updating tags, re-matching or relocating the track through beets failed. | Check beets output in `cause` or retry. |
 | `retag_relocate_needs_scan` | `retag` | `retag_tracks` was called with `relocate: true`, which requires a linked Navidrome admin account to run the two-scan dance so Navidrome keeps the same song id. | Re-tag in place (`relocate: false`), or link a Navidrome admin account to Soulbeet. |
 | `server_restarted` | `source_search`, `transfer`, `import` | Soulbeet restarted while the search, download or import ran. | Retry the job. |

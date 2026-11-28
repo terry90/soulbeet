@@ -1,4 +1,3 @@
-use api::models::folder::Folder;
 use dioxus::prelude::*;
 use shared::metadata::Track;
 
@@ -11,13 +10,8 @@ pub struct Props {
     pub on_album_click: Callback,
     pub on_search_sources: Callback,
     pub download_state: DownloadRowState,
-    pub folders: Vec<Folder>,
-    pub selected_folder_id: Option<String>,
-    pub active_menu: Signal<Option<String>>,
     #[props(into)]
     pub on_download: EventHandler<()>,
-    #[props(into)]
-    pub on_override_download: EventHandler<Folder>,
     /// Live Acquire & Play stage badge for this track (when integrated with the Studio player).
     #[props(default)]
     pub acquiring_stage: Option<AcquireStageBadge>,
@@ -213,13 +207,8 @@ pub fn TrackResult(props: Props) -> Element {
 
           // Auto-download button
           DownloadIcon {
-            item_id: props.track.id.clone(),
             state: props.download_state.clone(),
-            folders: props.folders.clone(),
-            selected_folder_id: props.selected_folder_id.clone(),
-            active_menu: props.active_menu,
             on_download: props.on_download,
-            on_override_download: props.on_override_download,
           }
         }
 

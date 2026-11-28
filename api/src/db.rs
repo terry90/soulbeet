@@ -132,6 +132,7 @@ pub(crate) mod test_db {
     pub const BACKEND_TRANSFERS: i64 = 20261204000001;
     pub const LOSSY_FALLBACK: i64 = 20261205000002;
     pub const BATCH_ORIGIN_IMPORT: i64 = 20261209000000;
+    pub const SINGLE_FOLDER_AND_SHARING: i64 = 20261210000000;
 
     pub async fn empty() -> SqlitePool {
         SqlitePoolOptions::new()
@@ -1177,6 +1178,228 @@ mod tests {
         .execute(&db)
         .await;
         assert!(bad.is_err());
+    }
+
+    #[tokio::test]
+    async fn single_folder_migration_preserves_all_records_and_handles_shared_and_duplicates() {
+        let db = test_db::migrated_before(test_db::SINGLE_FOLDER_AND_SHARING).await;
+        sqlx::query("INSERT OR IGNORE INTO folder_roots (path) VALUES ('/music')")
+            .execute(&db)
+            .await
+            .unwrap();
+        // Users:
+        // - alice: 2 personal folders + 1 shared folder (default_download_folder_id = f-alice-2)
+        // - bob: ONLY a shared folder (/music/Shared)
+        // - carol & dave: pre-hardening duplicate non-shared path (/music/dup)
+        // - eve: ONLY a shared folder whose path is ALREADY /music/eve (must NOT create a self-pointing legacy_folders row!)
+        // - orphaned folder belonging to deleted user 'u-ghost' with colliding path '/music/eve'
+        insert_user(&db, "u-alice", "alice").await;
+        insert_user(&db, "u-bob", "bob").await;
+        insert_user(&db, "u-carol", "carol").await;
+        insert_user(&db, "u-dave", "dave").await;
+        insert_user(&db, "u-eve", "eve").await;
+
+        for (id, uid, name, path, shared) in [
+            ("f-alice-1", "u-alice", "Old", "/music/alice-old/", 0),
+            ("f-alice-2", "u-alice", "Main", "/music/alice", 0),
+            ("f-alice-shared", "u-alice", "Shared", "/music/Shared", 1),
+            ("f-bob-shared", "u-bob", "Shared", "/music/Shared", 1),
+            ("f-carol-dup", "u-carol", "Dup", "/music/dup/", 0),
+            ("f-dave-dup", "u-dave", "Dup", "/music/dup", 0),
+            ("f-eve-shared", "u-eve", "Eve", "/music/eve", 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders (id, user_id, name, path, shared) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(uid)
+            .bind(name)
+            .bind(path)
+            .bind(shared)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        // Orphaned folder (no matching row in users) that collides on path with eve's folder.
+        sqlx::query("PRAGMA foreign_keys = OFF").execute(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO folders (id, user_id, name, path, shared) VALUES ('f-orphan', 'u-ghost', 'Ghost', '/music/eve', 0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON").execute(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO user_settings (user_id, default_download_folder_id, discovery_enabled, discovery_folder_id) \
+             VALUES ('u-alice', 'f-alice-2', 1, 'f-alice-1')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_settings (user_id, discovery_enabled, discovery_folder_id) \
+             VALUES ('u-bob', 1, NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Seed rows in all 4 FK tables referencing retired folders, plus a Pending
+        // discovery track on alice's surviving primary folder (must stay Pending)
+        // and on bob's reassigned shared folder (must become Removed).
+        sqlx::query("INSERT INTO batches (id, user_id, created_at, origin) VALUES ('b1', 'u-alice', 1, 'ui')")
+            .execute(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, user_id, folder_id, created_at, updated_at, wanted, import_mode, state, batch_id) \
+             VALUES ('j-alice', 'u-alice', 'f-alice-shared', 1, 1, '{}', 'singleton', 'done', 'b1')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, title, artist, album, path, folder_id, status) \
+             VALUES ('dt-alice', 'T', 'A', 'Al', '/music/alice-old/Discovery/t.flac', 'f-alice-1', 'Pending')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, title, artist, album, path, folder_id, status) \
+             VALUES ('dt-alice-keep', 'T2', 'A', 'Al', '/music/alice/Discovery/t2.flac', 'f-alice-2', 'Pending')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO discovery_tracks (id, title, artist, album, path, folder_id, status) \
+             VALUES ('dt-bob-moved', 'T3', 'A', 'Al', '/music/Shared/Discovery/t3.flac', 'f-bob-shared', 'Pending')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fast_acquisitions (id, user_id, folder_id, artist, title, backend_id, codec) \
+             VALUES ('fa-alice', 'u-alice', 'f-alice-1', 'A', 'T', 'ytdlp', 'opus')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO archival_upgrade_jobs (id, user_id, folder_id, artist, title, original_codec, original_backend, trigger_reason) \
+             VALUES ('au-alice', 'u-alice', 'f-alice-shared', 'A', 'T', 'opus', 'ytdlp', 'star')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        test_db::apply_from(&db, test_db::SINGLE_FOLDER_AND_SHARING).await;
+
+        // Zero FK violations!
+        let fk_issues: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert!(fk_issues.is_empty(), "foreign key issues: {fk_issues:?}");
+
+        // Every existing user has exactly 1 folder with unique normalized paths; orphaned folder is gone.
+        let folders: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT user_id, id, path FROM folders ORDER BY user_id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(folders.len(), 5);
+        assert_eq!(
+            folders.iter().find(|(u, _, _)| u == "u-alice").unwrap(),
+            &("u-alice".into(), "f-alice-2".into(), "/music/alice".into())
+        );
+        assert_eq!(
+            folders.iter().find(|(u, _, _)| u == "u-bob").unwrap(),
+            &("u-bob".into(), "f-bob-shared".into(), "/music/bob".into())
+        );
+        assert_eq!(
+            folders.iter().find(|(u, _, _)| u == "u-carol").unwrap(),
+            &("u-carol".into(), "f-carol-dup".into(), "/music/dup".into())
+        );
+        assert_eq!(
+            folders.iter().find(|(u, _, _)| u == "u-dave").unwrap(),
+            &("u-dave".into(), "f-dave-dup".into(), "/music/dave".into())
+        );
+        assert_eq!(
+            folders.iter().find(|(u, _, _)| u == "u-eve").unwrap(),
+            &("u-eve".into(), "f-eve-shared".into(), "/music/eve".into())
+        );
+
+        // Zero rows lost in jobs, discovery_tracks, fast_acquisitions, archival_upgrade_jobs!
+        for (table, id) in [
+            ("jobs", "j-alice"),
+            ("discovery_tracks", "dt-alice"),
+            ("fast_acquisitions", "fa-alice"),
+            ("archival_upgrade_jobs", "au-alice"),
+        ] {
+            let fid: String =
+                sqlx::query_scalar(&format!("SELECT folder_id FROM {table} WHERE id = ?"))
+                    .bind(id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            assert_eq!(fid, "f-alice-2", "{table} must be re-pointed to surviving primary folder");
+        }
+
+        // Pending discovery tracks from retired or moved folders are marked 'Removed',
+        // while pending tracks in the surviving unmoved primary folder stay 'Pending'.
+        let dt_statuses: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM discovery_tracks ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            dt_statuses,
+            vec![
+                ("dt-alice".into(), "Removed".into()),
+                ("dt-alice-keep".into(), "Pending".into()),
+                ("dt-bob-moved".into(), "Removed".into()),
+            ]
+        );
+
+        // Legacy folders recorded for migration, and NEVER self-pointing!
+        let legacy: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT user_id, path, was_shared FROM legacy_folders ORDER BY user_id, path",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy,
+            vec![
+                ("u-alice".into(), "/music/Shared".into(), true),
+                ("u-alice".into(), "/music/alice-old".into(), false),
+                ("u-bob".into(), "/music/Shared".into(), true),
+                ("u-dave".into(), "/music/dup".into(), true),
+            ]
+        );
+        let self_pointing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM legacy_folders lf JOIN folders f ON f.id = lf.target_folder_id WHERE lf.path = f.path",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(self_pointing, 0, "legacy_folders must never contain self-pointing rows");
+
+        // Discovery enabled state preserved accurately.
+        let alice_disc: bool =
+            sqlx::query_scalar("SELECT discovery_enabled FROM user_settings WHERE user_id = 'u-alice'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let bob_disc: bool =
+            sqlx::query_scalar("SELECT discovery_enabled FROM user_settings WHERE user_id = 'u-bob'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(alice_disc);
+        assert!(!bob_disc);
     }
 
     #[test]

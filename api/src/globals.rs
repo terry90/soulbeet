@@ -476,12 +476,11 @@ async fn run_seasonal_asap_check() {
             Ok(s) if s.discovery_enabled => s,
             _ => continue,
         };
-        let Some(ref folder_id) = settings.discovery_folder_id else {
+        let _ = settings;
+        let Ok(Some(folder)) = Folder::get_for_user(&user.id).await else {
             continue;
         };
-        if !matches!(Folder::get_by_id(folder_id).await, Ok(Some(_))) {
-            continue;
-        }
+        let folder_id = folder.id.as_str();
 
         let now_inst = tokio::time::Instant::now();
         {
@@ -619,23 +618,14 @@ async fn run_automation() {
             Ok(s) if s.discovery_enabled => s,
             _ => continue,
         };
-        let Some(ref folder_id) = settings.discovery_folder_id else {
-            continue;
-        };
         let lifetime_map = settings.parse_lifetime_days();
         let now = chrono::Utc::now();
-        let folder = match crate::models::folder::Folder::get_by_id(folder_id).await {
+        let folder = match crate::models::folder::Folder::get_for_user(user_id).await {
             Ok(Some(folder)) => Some(folder),
-            Ok(None) => {
-                warn!(
-                    "Automation: discovery folder {folder_id} of user {} is gone, so no track expires",
-                    user.username
-                );
-                None
-            }
+            Ok(None) => None,
             Err(e) => {
                 warn!(
-                    "Automation: discovery folder {folder_id} of user {} cannot be read, so no track expires: {e}",
+                    "Automation: library folder of user {} cannot be read, so no track expires: {e}",
                     user.username
                 );
                 None

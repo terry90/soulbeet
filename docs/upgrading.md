@@ -2,6 +2,13 @@
 
 This page lists what changes on the first start after an upgrade, and what to do where something needs doing.
 
+## Upgrading to single-folder libraries and hardlink sharing
+
+-   **Single-folder-per-user library model.** Each user now has a single personal library folder (`/music/<username>`), backed by a dedicated per-user Navidrome library. Users can share individual tracks or full albums with other household users in one click via filesystem hardlinks (zero extra disk space and independent 1-star deletion).
+-   **Migrating retired folders (`legacy_folders`).** If a user previously had multiple folders or belonged to a shared folder, Soulbeet keeps their primary personal folder and records the retired paths in `legacy_folders` without touching any audio files on disk. Admins can inspect and migrate those retired folders into users' personal libraries from **Settings > Library** (or with the admin-only `migrate_legacy_folders` MCP tool).
+-   **Point Navidrome `ND_MUSICFOLDER` to `/music/_default`.** If your Navidrome container still has `ND_MUSICFOLDER=/music`, Library 1 overlaps `/music/<username>` and hardlinked shared tracks will appear as duplicates in Navidrome. Update Navidrome to `ND_MUSICFOLDER=/music/_default` (an empty sibling folder under the same `/music` mount) so each user only sees their own per-user Navidrome library. Soulbeet checks for overlap and warns in **Settings > Library** until Library 1 is moved out of `/music`.
+-   **Compose files.** The root `compose.yaml` is now the ready-to-run production stack using prebuilt images (no manual `SECRET_KEY` or `beets_config.yaml` extraction required). If you build Soulbeet from source with Docker Compose, use `docker-compose.dev.yml` (`docker compose -f docker-compose.dev.yml up --build`).
+
 ## Upgrading to library databases in the data folder
 
 -   **The beets library databases move out of the music folders.** Each music folder's `.beets_library.db` moves from the root of that folder to `beets-libraries` next to Soulbeet's database (`/data/beets-libraries/music/Person1/.beets_library.db` for `/music/Person1`), on the first start, or for a folder that is not there then, on its first import, delete or replace. A database on a network share made imports fail with "database is locked"; keep `/data` on a local disk, and your music can stay on the share. Back up `beets-libraries` with the database from now on. If you run `beet` yourself, point `-l` at the new path and pass `-d` with the music folder (see [Library databases](beets.md#library-databases)).

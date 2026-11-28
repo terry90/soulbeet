@@ -3182,7 +3182,6 @@ impl DesktopStudio {
                 recording_mbid: mbid_opt,
                 release_mbid: release_mbid_opt,
                 duration_s: duration_opt,
-                folder_id: None,
                 prefer_fast: true,
             };
             let mut req = client

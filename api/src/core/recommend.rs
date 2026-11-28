@@ -106,7 +106,10 @@ pub(crate) async fn due_in(db: &SqlitePool) -> Result<Vec<(User, Vec<DiscoveryPr
     let mut due = Vec::new();
     for user in User::get_connected_users_in(db).await? {
         let settings = UserSettings::get_in(db, &user.id).await?;
-        if settings.discovery_enabled && settings.discovery_folder().is_some() {
+        let has_folder = crate::models::folder::Folder::get_for_user_in(db, &user.id)
+            .await?
+            .is_some();
+        if settings.discovery_enabled && has_folder {
             due.push((user, parse_profiles(&settings.discovery_profiles)));
         }
     }
@@ -729,9 +732,24 @@ mod tests {
         assert!(plan_for(&s).deezer);
     }
 
-    /// Makes `user` with a folder, Navidrome `status` and `discovery` settings.
-    async fn user_with(db: &SqlitePool, user: &str, status: &str, discovery: UpdateUserSettings) {
-        crate::core::folder_of(db, user).await;
+    /// Makes `user` with an optional folder, Navidrome `status` and `discovery` settings.
+    async fn user_with(
+        db: &SqlitePool,
+        user: &str,
+        status: &str,
+        with_folder: bool,
+        discovery: UpdateUserSettings,
+    ) {
+        if with_folder {
+            crate::core::folder_of(db, user).await;
+        } else {
+            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, 'x')")
+                .bind(user)
+                .bind(user)
+                .execute(db)
+                .await
+                .unwrap();
+        }
         sqlx::query("UPDATE users SET navidrome_status = ? WHERE id = ?")
             .bind(status)
             .bind(user)
@@ -741,10 +759,9 @@ mod tests {
         UserSettings::upsert_in(db, user, discovery).await.unwrap();
     }
 
-    fn discovery(enabled: bool, folder: Option<&str>) -> UpdateUserSettings {
+    fn discovery(enabled: bool) -> UpdateUserSettings {
         UpdateUserSettings {
             discovery_enabled: Some(enabled),
-            discovery_folder_id: folder.map(str::to_string),
             ..Default::default()
         }
     }
@@ -997,23 +1014,17 @@ mod tests {
             &db,
             "alice",
             connected,
+            true,
             UpdateUserSettings {
                 discovery_profiles: Some("Balanced,Adventurous".into()),
-                ..discovery(true, Some("alice-folder"))
+                ..discovery(true)
             },
         )
         .await;
-        user_with(&db, "off", connected, discovery(false, Some("off-folder"))).await;
-        user_with(&db, "nofolder", connected, discovery(true, None)).await;
-        user_with(&db, "cleared", connected, discovery(true, Some(""))).await;
+        user_with(&db, "off", connected, true, discovery(false)).await;
+        user_with(&db, "nofolder", connected, false, discovery(true)).await;
         let offline = NavidromeStatus::Offline.as_str();
-        user_with(
-            &db,
-            "offline",
-            offline,
-            discovery(true, Some("offline-folder")),
-        )
-        .await;
+        user_with(&db, "offline", offline, true, discovery(true)).await;
 
         let due: Vec<(String, Vec<DiscoveryProfile>)> = due_in(&db)
             .await

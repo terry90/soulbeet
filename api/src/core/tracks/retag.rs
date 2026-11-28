@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 use shared::download::MatchChoices;
-use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, UserActionCode};
+use shared::failure::{Failure, FailureCode, RetryAdvice, Service, Stage, UserAction, UserActionCode};
 use soulbeet::navidrome::models::NativeSong;
 use soulbeet::{
     BeetsTrackInfo, DriverChoice, ImportMode, ImportOutcome, RegisterOutcome, SkipReason, TagEdits,
@@ -369,6 +369,26 @@ pub(crate) async fn retag_tracks(
 
     let mut updated: Vec<Retagged> = Vec::new();
     for track in checked {
+        // Copy-on-Write: break any hardlink before beets modifies tags in place so
+        // another user's shared copy is never mutated.
+        let cow_path = track.file.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || super::cow::break_hardlink_if_shared(&cow_path))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|r| r)
+        {
+            entries[track.idx] = Some(RetagEntry {
+                song_id: track.song.id,
+                outcome: Err(Failure::new(
+                    FailureCode::RetagFailed,
+                    Stage::Retag,
+                    RetryAdvice::SameSourceLater,
+                    format!("Could not isolate shared file before re-tagging: {e}"),
+                )
+                .with_cause(Service::Filesystem, None, e.to_string())),
+            });
+            continue;
+        }
         match &req.mode {
             RetagMode::Direct(edits) => {
                 match queue

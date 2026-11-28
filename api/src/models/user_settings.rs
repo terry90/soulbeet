@@ -61,17 +61,16 @@ pub struct UserSettings {
     pub listenbrainz_username: Option<String>,
     pub listenbrainz_token: Option<String>,
     pub discovery_enabled: bool,
-    pub discovery_folder_id: Option<String>,
     pub discovery_track_count: String,
     pub discovery_lifetime_days: String,
     pub discovery_profiles: String,
     pub discovery_playlist_name: String,
     pub discovery_navidrome_playlist_id: Option<String>,
     pub discovery_last_generated_at: Option<String>,
-    pub default_download_folder_id: Option<String>,
     pub deezer_recommendations: bool,
     pub lossy_fallback: LossyFallback,
     pub external_rating_sync_enabled: bool,
+    pub accept_shares: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -91,8 +90,6 @@ pub struct UpdateUserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discovery_folder_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_track_count: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_lifetime_days: Option<String>,
@@ -101,13 +98,13 @@ pub struct UpdateUserSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_playlist_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_download_folder_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deezer_recommendations: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossy_fallback: Option<LossyFallback>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_rating_sync_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_shares: Option<bool>,
 }
 
 #[cfg(feature = "server")]
@@ -129,13 +126,6 @@ impl UserSettings {
         Ok(settings.unwrap_or_else(|| Self::defaults(user_id)))
     }
 
-    /// The chosen discovery folder's id. Settings clears the choice by storing an empty id.
-    pub(crate) fn discovery_folder(&self) -> Option<&str> {
-        self.discovery_folder_id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-    }
-
     /// What a user without a row has.
     pub(crate) fn defaults(user_id: &str) -> UserSettings {
         UserSettings {
@@ -147,17 +137,16 @@ impl UserSettings {
             listenbrainz_username: None,
             listenbrainz_token: None,
             discovery_enabled: false,
-            discovery_folder_id: None,
             discovery_track_count: r#"{"Conservative":10,"Balanced":10,"Adventurous":10}"#.to_string(),
             discovery_lifetime_days: r#"{"Conservative":7,"Balanced":7,"Adventurous":7}"#.to_string(),
             discovery_profiles: "Conservative,Balanced,Adventurous".to_string(),
             discovery_playlist_name: r#"{"Conservative":"Comfort Zone","Balanced":"Fresh Picks","Adventurous":"Deep Cuts"}"#.to_string(),
             discovery_navidrome_playlist_id: None,
             discovery_last_generated_at: None,
-            default_download_folder_id: None,
             deezer_recommendations: false,
             lossy_fallback: LossyFallback::Ask,
             external_rating_sync_enabled: true,
+            accept_shares: true,
         }
     }
 
@@ -204,15 +193,14 @@ impl UserSettings {
             listenbrainz_username,
             listenbrainz_token,
             discovery_enabled,
-            discovery_folder_id,
             discovery_track_count,
             discovery_lifetime_days,
             discovery_profiles,
             discovery_playlist_name,
-            default_download_folder_id,
             deezer_recommendations,
             lossy_fallback,
-            external_rating_sync_enabled
+            external_rating_sync_enabled,
+            accept_shares
         );
         if given.is_empty() {
             insert.push(" ON CONFLICT(user_id) DO NOTHING");

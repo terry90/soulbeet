@@ -1248,17 +1248,10 @@ impl NavidromeClient {
         }
     }
 
-    /// The name of every Navidrome user (`GET /api/user`, server/nativeapi/native_api.go:70), as
-    /// an admin may list them; Ok(None) when this user is not an admin, as Navidrome refuses
-    /// anyone else with rest.ErrPermissionDenied (persistence/user_repository.go:234-256), which
-    /// deluan/rest answers with 403. No `_end` is sent, so the list is not cut short
-    /// (persistence/sql_base_repository.go:136 limits only a positive Max).
-    pub async fn user_names(&self) -> Result<Option<Vec<String>>> {
-        #[derive(serde::Deserialize)]
-        struct NavidromeUser {
-            #[serde(rename = "userName")]
-            user_name: String,
-        }
+    /// Every Navidrome user with role and library assignments (`GET /api/user`,
+    /// server/nativeapi/native_api.go:70), as an admin may list them; Ok(None) when
+    /// this user is not an admin (403).
+    pub async fn list_users_full(&self) -> Result<Option<Vec<NavidromeUserInfo>>> {
         let url = self.base_url.join("api/user")?;
         let resp = self.native_request(self.client.get(url)).await?;
         if resp.status() == reqwest::StatusCode::FORBIDDEN {
@@ -1267,8 +1260,131 @@ impl NavidromeClient {
         if !resp.status().is_success() {
             return Err(native_failure("List users", resp).await);
         }
-        let users: Vec<NavidromeUser> = resp.json().await.map_err(parse)?;
-        Ok(Some(users.into_iter().map(|u| u.user_name).collect()))
+        let users: Vec<NavidromeUserInfo> = resp.json().await.map_err(parse)?;
+        Ok(Some(users))
+    }
+
+    /// The name of every Navidrome user (`GET /api/user`, server/nativeapi/native_api.go:70), as
+    /// an admin may list them; Ok(None) when this user is not an admin (403).
+    pub async fn user_names(&self) -> Result<Option<Vec<String>>> {
+        Ok(self
+            .list_users_full()
+            .await?
+            .map(|users| users.into_iter().map(|u| u.user_name).collect()))
+    }
+
+    /// Every Navidrome library (`GET /api/library`, server/nativeapi/native_api.go:90,
+    /// admin-only); Ok(None) when this user is not an admin (403).
+    pub async fn list_libraries(&self) -> Result<Option<Vec<NavidromeLibrary>>> {
+        let url = self.base_url.join("api/library")?;
+        let resp = self.native_request(self.client.get(url)).await?;
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(native_failure("List libraries", resp).await);
+        }
+        let libs: Vec<NavidromeLibrary> = resp.json().await.map_err(parse)?;
+        Ok(Some(libs))
+    }
+
+    /// Reads a single Navidrome library (`GET /api/library/{id}`, admin-only).
+    pub async fn get_library(&self, id: i64) -> Result<NavidromeLibrary> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "library", &id.to_string()]);
+        let resp = self.native_request(self.client.get(url)).await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("Get library", resp).await);
+        }
+        resp.json().await.map_err(parse)
+    }
+
+    /// Creates a Navidrome library (`POST /api/library`, admin-only).
+    ///
+    /// Navidrome's `deluan/rest` `POST /api/library` responds with only `{"id": "2"}`
+    /// (string ID, without `name`/`path`), so we parse `id` flexibly (string or
+    /// integer) and fetch the full record via `GET /api/library/{id}`, falling back
+    /// to the submitted fields if that follow-up GET fails.
+    pub async fn create_library(
+        &self,
+        name: &str,
+        path: &str,
+        default_new_users: bool,
+    ) -> Result<NavidromeLibrary> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CreateLibraryBody<'a> {
+            name: &'a str,
+            path: &'a str,
+            default_new_users: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct CreateLibraryResp {
+            #[serde(deserialize_with = "deserialize_library_id")]
+            id: i64,
+        }
+        let url = self.base_url.join("api/library")?;
+        let body = CreateLibraryBody {
+            name,
+            path,
+            default_new_users,
+        };
+        let resp = self
+            .native_request(self.client.post(url).json(&body))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("Create library", resp).await);
+        }
+        let created: CreateLibraryResp = resp.json().await.map_err(parse)?;
+        match self.get_library(created.id).await {
+            Ok(lib) => Ok(lib),
+            Err(e) => {
+                warn!(
+                    "Created Navidrome library {} ('{}') but follow-up GET /api/library/{} failed: {e}",
+                    created.id, name, created.id
+                );
+                Ok(NavidromeLibrary {
+                    id: created.id,
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    default_new_users,
+                })
+            }
+        }
+    }
+
+    /// Assigns the exact list of library IDs to a non-admin Navidrome user
+    /// (`PUT /api/user/{id}/library`, server/nativeapi/library.go:20, admin-only).
+    pub async fn set_user_libraries(
+        &self,
+        user_id: &str,
+        library_ids: &[i64],
+    ) -> Result<Vec<NavidromeLibrary>> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SetUserLibrariesBody<'a> {
+            library_ids: &'a [i64],
+        }
+        let mut url = self.base_url.join("api/user/")?;
+        {
+            let mut segs = url.path_segments_mut().map_err(|_| {
+                NavidromeError::Config("Navidrome base URL cannot be a base".to_string())
+            })?;
+            segs.pop_if_empty();
+            segs.push(user_id);
+            segs.push("library");
+        }
+        let body = SetUserLibrariesBody { library_ids };
+        let resp = self
+            .native_request(self.client.put(url).json(&body))
+            .await?;
+        if !resp.status().is_success() {
+            return Err(native_failure("Set user libraries", resp).await);
+        }
+        resp.json().await.map_err(parse)
     }
 
     /// Every artist row this user can see, in one request (`GET /api/artist`,
@@ -1350,6 +1466,27 @@ pub(super) async fn native_failure(
         status,
         body: None,
         raw,
+    }
+}
+
+/// Deserializes a Navidrome library ID from either a JSON integer (`2`) or a
+/// JSON string (`"2"`), as `deluan/rest`'s `POST /api/library` returns `{"id": "2"}`.
+fn deserialize_library_id<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum IdValue {
+        Int(i64),
+        Str(String),
+    }
+    match serde::Deserialize::deserialize(deserializer)? {
+        IdValue::Int(n) => Ok(n),
+        IdValue::Str(s) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| serde::de::Error::custom(format!("invalid library id '{s}'"))),
     }
 }
 
@@ -3270,6 +3407,66 @@ mod tests {
         assert_eq!(
             (sent.method.as_str(), sent.target.as_str()),
             ("DELETE", "/api/playlist/pl-1%3Fx=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_library_parses_deluan_rest_string_id_and_fetches_full_library() {
+        let (url, seen) = serve(vec![
+            reply(LOGIN),
+            // deluan/rest POST /api/library returns only {"id": "2"} (string ID).
+            reply(r#"{"id":"2"}"#),
+            reply(r#"{"id":2,"name":"alice","path":"/music/alice","defaultNewUsers":false}"#),
+            // Also handles integer IDs and falls back gracefully if follow-up GET fails.
+            reply(r#"{"id":3}"#),
+            Reply {
+                status: 500,
+                body: r#"{"error":"temporary"}"#.into(),
+            },
+        ]);
+        let c = client(&url);
+
+        let lib = c
+            .create_library("alice", "/music/alice", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            lib,
+            NavidromeLibrary {
+                id: 2,
+                name: "alice".into(),
+                path: "/music/alice".into(),
+                default_new_users: false,
+            }
+        );
+
+        let fallback = c.create_library("bob", "/music/bob", true).await.unwrap();
+        assert_eq!(
+            fallback,
+            NavidromeLibrary {
+                id: 3,
+                name: "bob".into(),
+                path: "/music/bob".into(),
+                default_new_users: true,
+            }
+        );
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (seen[1].method.as_str(), seen[1].target.as_str()),
+            ("POST", "/api/library")
+        );
+        assert_eq!(
+            (seen[2].method.as_str(), seen[2].target.as_str()),
+            ("GET", "/api/library/2")
+        );
+        assert_eq!(
+            (seen[3].method.as_str(), seen[3].target.as_str()),
+            ("POST", "/api/library")
+        );
+        assert_eq!(
+            (seen[4].method.as_str(), seen[4].target.as_str()),
+            ("GET", "/api/library/3")
         );
     }
 }

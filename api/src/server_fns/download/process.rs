@@ -191,6 +191,7 @@ pub fn import_job(
         duplicates: Duplicates::of(duplicates, user),
         last_run: None,
         lock_retries: 0,
+        placement: soulbeet::ImportPlacement::Default,
     }
 }
 

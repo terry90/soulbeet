@@ -224,8 +224,12 @@ impl User {
     }
 
     pub async fn get_all() -> Result<Vec<User>, String> {
+        Self::get_all_in(&DB).await
+    }
+
+    pub(crate) async fn get_all_in(db: &SqlitePool) -> Result<Vec<User>, String> {
         sqlx::query_as::<_, User>("SELECT * FROM users")
-            .fetch_all(&*DB)
+            .fetch_all(db)
             .await
             .map_err(|e| e.to_string())
     }

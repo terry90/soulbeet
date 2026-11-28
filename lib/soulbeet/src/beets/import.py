@@ -32,7 +32,10 @@
 # (KnownTags).
 import json
 import os
+import shutil
+import stat
 import sys
+import tempfile
 
 import beets
 
@@ -195,6 +198,145 @@ def _store_pair(self, mutagen_file, value):
         _STORE_PAIR(self, mutagen_file, value)
     elif self.key in mutagen_file:
         del mutagen_file[self.key]
+
+
+def cow_break_hardlink(target, st):
+    """Atomically replaces a hardlinked regular file with a private copy
+    (copy to sibling temp file, preserve mode & mtime, fsync, os.replace)
+    so tag writes never mutate another user's hardlinked copy."""
+    target_bytes = os.fsencode(target)
+    parent = os.path.dirname(target_bytes) or b"."
+    fd, tmp_path = tempfile.mkstemp(prefix=b".soulbeet-cow-", suffix=b".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as dst:
+            with open(target_bytes, "rb") as src:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        try:
+            os.chmod(tmp_path, stat.S_IMODE(st.st_mode))
+        except OSError:
+            pass
+        try:
+            os.utime(tmp_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError:
+            pass
+        os.replace(tmp_path, target_bytes)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class HardlinkWriteGuard(BeetsPlugin):
+    """Defense-in-depth guard on every file write beets attempts.
+
+    - In RegisterSession, any write event is refused so register-in-place can
+      never mutate hardlinked or shared files on disk.
+    - Symlinks are always refused so tag writes can never follow a symlink out
+      of the library or bypass copy-on-write isolation.
+    - In all other import/rematch modes, any file with st_nlink > 1 is
+      atomically CoW-detached before beets opens it for writing.
+    """
+
+    register_mode = False
+
+    def __init__(self):
+        super().__init__("soulbeet")
+        self.register_listener("write", self.before_write)
+
+    def before_write(self, item, path=None, tags=None):
+        target = path if path is not None else getattr(item, "path", None)
+        if self.register_mode:
+            raise beets.ui.UserError(
+                "soulbeet: refusing file write during register mode for"
+                f" {path_text(target or b'')}"
+            )
+        if target is None:
+            return
+        try:
+            st = os.lstat(target)
+        except OSError:
+            return
+        if stat.S_ISLNK(st.st_mode):
+            raise beets.ui.UserError(
+                f"refusing to write tags through symlink: {path_text(target)}"
+            )
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink <= 1:
+            return
+        cow_break_hardlink(target, st)
+
+
+HardlinkWriteGuard()
+
+
+def _has_symlink_component(path, root=None):
+    """True when `path` itself is a symlink, or when `root` or any intermediate
+    path component between `root` and `path` is a symlink."""
+    if path is None:
+        return False
+    p_bytes = os.fsencode(path)
+    if os.path.islink(p_bytes):
+        return True
+    if root is None:
+        return False
+    r_bytes = os.fsencode(root)
+    if os.path.islink(r_bytes):
+        return True
+    try:
+        rel = os.path.relpath(p_bytes, r_bytes)
+    except ValueError:
+        return False
+    sep = os.sep.encode()
+    if rel == b"." or rel == b".." or rel.startswith(b".." + sep):
+        return False
+    cur = r_bytes
+    for part in rel.split(sep):
+        if not part or part == b".":
+            continue
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return True
+    return False
+
+
+_ORIG_FACTORY_PATHS = ImportTaskFactory.paths
+_ORIG_FACTORY_READ_ITEM = ImportTaskFactory.read_item
+
+
+def _guarded_factory_paths(self):
+    toppath = getattr(self, "toppath", None)
+    if toppath is not None and os.path.islink(os.fsencode(toppath)):
+        raise beets.ui.UserError(
+            f"soulbeet: refusing to import symlinked path: {path_text(toppath)}"
+        )
+    for dirs, paths in _ORIG_FACTORY_PATHS(self):
+        for d in dirs:
+            if _has_symlink_component(d, toppath):
+                raise beets.ui.UserError(
+                    f"soulbeet: refusing to import through symlinked directory: {path_text(d)}"
+                )
+        for p in paths:
+            if _has_symlink_component(p, toppath):
+                raise beets.ui.UserError(
+                    f"soulbeet: refusing to import symlinked file: {path_text(p)}"
+                )
+        yield dirs, paths
+
+
+def _guarded_factory_read_item(self, path):
+    toppath = getattr(self, "toppath", None)
+    if _has_symlink_component(path, toppath):
+        raise beets.ui.UserError(
+            f"soulbeet: refusing to import symlinked file: {path_text(path)}"
+        )
+    return _ORIG_FACTORY_READ_ITEM(self, path)
+
+
+ImportTaskFactory.paths = _guarded_factory_paths
+ImportTaskFactory.read_item = _guarded_factory_read_item
 
 
 class KnownTags(BeetsPlugin):
@@ -535,9 +677,13 @@ class AsIsSession(Reporting):
 
 class RegisterSession(Reporting):
     """Registers files already in a library folder into its beets DB without
-    moving, copying, writing tags, or refusing files with partial tags."""
+    moving, copying, writing tags, running user plugins, or refusing files
+    with partial tags."""
 
-    pass
+    def run(self):
+        config["plugins"] = []
+        config["import"]["write"] = False
+        super().run()
 
 
 def parse(argv):
@@ -555,7 +701,14 @@ def parse(argv):
     if choice == ["asis"]:
         return report_path, AsIsSession, [*beet_args, "-A"]
     if choice == ["register"]:
-        return report_path, RegisterSession, [*beet_args, "-A", "-C", "-M", "-W"]
+        HardlinkWriteGuard.register_mode = True
+        config["plugins"] = []
+        # `-p ""` is a global beet option (before `import`) that disables all
+        # configured plugins so replaygain/scrub/embedart/zero/lastgenre/lyrics
+        # never load or touch hardlinked files during registration.
+        idx = beet_args.index("import") + 1 if "import" in beet_args else len(beet_args)
+        reg_args = [*beet_args[:idx], "-A", "-C", "-M", "-W", *beet_args[idx:]]
+        return report_path, RegisterSession, ["-p", "", *reg_args]
     if len(choice) == 3 and choice[0] == "pick":
         PickSession.source, PickSession.wanted = choice[1], choice[2]
         return report_path, PickSession, [*beet_args, "-S", choice[2]]

@@ -5,8 +5,9 @@ use dioxus::prelude::*;
 use shared::recommendation::{ContextualMixKind, CultureSteering};
 use ui::{
     format_mix_subtitle, format_mix_title, format_mix_window_badge, use_player, IconArrowRight,
-    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, MixSleeveShelves,
-    PlaylistCategory, SeasonalHeroCard, TrackRow, TrackRowState,
+    IconCompass, IconDisc3, IconLibrary, IconListMusic, IconPlay, IconRadio, IconSparkles,
+    LibraryImportModal, MixSleeveShelves, PlaylistCategory, SeasonalHeroCard, TrackRow,
+    TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -20,6 +21,7 @@ pub fn HomePage() -> Element {
     let player = use_player();
     let mut studio = use_studio();
     let nav = use_navigator();
+    let mut import_modal_open = use_signal(|| false);
 
     let offline_only = player.offline_only();
     let mixes = studio.contextual_mixes.read().clone();
@@ -516,6 +518,13 @@ pub fn HomePage() -> Element {
                     div { class: "flex flex-wrap items-center justify-center gap-3 pt-1",
                         button {
                             r#type: "button",
+                            class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-accent-solid text-beet-text-primary text-[14px] font-semibold hover:brightness-110 cursor-pointer",
+                            onclick: move |_| import_modal_open.set(true),
+                            IconLibrary { size: 16 }
+                            span { "Import Existing Library" }
+                        }
+                        button {
+                            r#type: "button",
                             class: "h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[14px] font-semibold hover:brightness-105 cursor-pointer",
                             onclick: move |_| {
                                 nav.push(Route::SearchPage {});
@@ -532,6 +541,13 @@ pub fn HomePage() -> Element {
                         }
                     }
                 }
+            }
+
+            LibraryImportModal {
+                open: import_modal_open,
+                on_started: move |_| {
+                    nav.push(Route::ActivityPage {});
+                },
             }
         }
     }

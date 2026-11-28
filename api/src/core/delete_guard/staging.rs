@@ -211,7 +211,6 @@ mod tests {
             user_id: "alice".into(),
             name: "Music".into(),
             path: lib.root.join("music/alice").to_string_lossy().into_owned(),
-            shared: false,
         }
     }
 
@@ -318,15 +317,11 @@ mod tests {
 
     #[tokio::test]
     async fn another_users_folder_inside_the_profile_folder_keeps_its_files() {
-        // alice's folder is shared, so bob may register one inside its staging folder.
+        // carol has a folder overlapping inside alice's staging folder (e.g. misconfigured overlap).
         let lib = Library::new().await;
-        sqlx::query("UPDATE folders SET shared = 1 WHERE id = 'alice-music'")
-            .execute(&lib.db)
-            .await
-            .unwrap();
         lib.folder(
-            "bob",
-            "bob-inside",
+            "carol",
+            "carol-inside",
             "music/alice/Discovery/Explore/Marrow Choir",
             false,
         )

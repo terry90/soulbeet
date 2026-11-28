@@ -37,7 +37,7 @@ fn stage_label(stage: Stage) -> &'static str {
         Stage::Index => "Navidrome",
         Stage::Delete => "Delete",
         Stage::Playlist => "Playlist",
-        Stage::Move => "Move",
+        Stage::Share => "Share",
         Stage::Retag => "Retag",
     }
 }

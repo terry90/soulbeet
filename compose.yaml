@@ -1,0 +1,61 @@
+# Ready-to-run production stack for Soulbeet + Navidrome + slskd.
+# Start with: docker compose up -d
+# Optional overrides (paths, ports, image tag): copy .env.example to .env.
+# Building from source? Use: docker compose -f docker-compose.dev.yml up --build
+
+services:
+  soulbeet:
+    image: ${SOULBEET_IMAGE:-docker.io/docccccc/soulbeet}:${SOULBEET_TAG:-latest}
+    container_name: soulbeet
+    restart: unless-stopped
+    ports:
+      - "${SOULBEET_PORT:-9765}:9765"
+    environment:
+      - DATABASE_URL=sqlite:/data/soulbeet.db
+      - DOWNLOAD_PATH=/downloads
+      - NAVIDROME_URL=http://navidrome:4533
+      - NAVIDROME_MUSIC_PATH=/music
+      # Optional: externally reachable Navidrome URL for browser and native clients
+      # - NAVIDROME_PUBLIC_URL=https://music.example.com
+    volumes:
+      # Local disk required: holds soulbeet.db, auto-generated secret.key, and beets libraries
+      - ./soulbeet-data:/data
+      # Must match the physical downloads folder mounted into slskd (/app/downloads)
+      - ${DOWNLOADS_DIR:-./downloads}:/downloads
+      # Must match the physical music folder mounted into navidrome (/music)
+      - ${MUSIC_DIR:-./music}:/music
+    depends_on:
+      - navidrome
+      - slskd
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9765/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    environment:
+      # Keep Library 1 on an empty sibling folder so per-user libraries (/music/<username>)
+      # never overlap with it and hardlinked shared tracks never appear as duplicates.
+      - ND_MUSICFOLDER=/music/_default
+    volumes:
+      - ./navidrome-data:/data
+      - ${MUSIC_DIR:-./music}:/music
+
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    restart: unless-stopped
+    ports:
+      - "${SLSKD_PORT:-5030}:5030"
+    environment:
+      - SLSKD_REMOTE_CONFIGURATION=true
+    volumes:
+      - ./slskd-data:/app
+      - ${DOWNLOADS_DIR:-./downloads}:/app/downloads

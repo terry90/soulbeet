@@ -678,14 +678,13 @@ impl Library {
         self.fake.with(|s| s.records[id].0.clone())
     }
 
-    /// Inserts folder `id` of `user` at `{root}/{rel}`.
-    pub async fn folder(&self, user: &str, id: &str, rel: &str, shared: bool) {
-        sqlx::query("INSERT INTO folders (id, user_id, name, path, shared) VALUES (?, ?, ?, ?, ?)")
+    /// Inserts (or replaces) folder `id` of `user` at `{root}/{rel}`.
+    pub async fn folder(&self, user: &str, id: &str, rel: &str, _shared: bool) {
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?)")
             .bind(id)
             .bind(user)
             .bind(id)
             .bind(format!("{}/{rel}", self.root.display()))
-            .bind(shared)
             .execute(&self.db)
             .await
             .unwrap();

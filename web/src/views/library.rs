@@ -946,6 +946,7 @@ pub fn LibraryPage() -> Element {
                                             let t_pl = track.clone();
                                             let t_star = track.clone();
                                             let t_rate = track.clone();
+                                            let t_share = track.clone();
                                             let t_inspect = track.clone();
                                             let state = if offline_only && !track.is_offline_cached {
                                                 TrackRowState::OfflineUnavailable
@@ -983,6 +984,7 @@ pub fn LibraryPage() -> Element {
                                                     on_album_click: move |album| studio.navigate_to_album(navigator, album),
                                                     on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                     on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                                    on_share: move |_| studio.open_share_track(&t_share),
                                                     on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                                 }
                                             }
@@ -1023,6 +1025,7 @@ pub fn LibraryPage() -> Element {
                                         let t_pl = track.clone();
                                         let t_star = track.clone();
                                         let t_rate = track.clone();
+                                        let t_share = track.clone();
                                         let t_inspect = track.clone();
                                         let state = if offline_only && !track.is_offline_cached {
                                             TrackRowState::OfflineUnavailable
@@ -1060,6 +1063,7 @@ pub fn LibraryPage() -> Element {
                                                 on_album_click: move |album| studio.navigate_to_album(navigator, album),
                                                 on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                 on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                                on_share: move |_| studio.open_share_track(&t_share),
                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                             }
                                         }

@@ -10,7 +10,7 @@ mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub(crate) use choice::{files_gone, nothing_to_retry};
+pub(crate) use choice::{files_gone, musicbrainz_id, nothing_to_retry, validate_tag_overrides};
 pub use prune::start_library_prune;
 pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded, FileLeft};
 pub(crate) use rows::import_failure;
@@ -26,11 +26,11 @@ use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use shared::download::{DownloadEvent, DownloadProgress, DownloadState, JobSlot, MatchChoices};
 use shared::failure::Failure;
-use soulbeet::audio::{count_audio_files, is_audio_path};
+use soulbeet::audio::{collect_audio_files, count_audio_files, is_audio_path};
 use soulbeet::{
     BeetsTrackInfo, DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome,
-    ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation, SkipReason, SourceFile,
-    TagEdits, TaskCount,
+    ImportPlacement, ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation,
+    SkipReason, SourceFile, TagEdits, TaskCount,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -80,6 +80,8 @@ pub struct ImportJob {
     /// The runs the queue already made of these files by itself after one found their library
     /// database locked (`LOCK_RETRY_WAITS`); a person's retry starts again from none.
     pub lock_retries: usize,
+    /// Explicit copy/move placement policy for this import run.
+    pub placement: ImportPlacement,
 }
 
 /// What the last run of a kept import knew (design 11.6).
@@ -227,6 +229,7 @@ impl ImportJob {
             last_run: stored.last_run.map(Arc::new),
             // A restart starts the automatic runs over (`ImportQueue::restore`).
             lock_retries: 0,
+            placement: ImportPlacement::Default,
         }
     }
 
@@ -354,6 +357,24 @@ enum Work {
     Prune {
         done: oneshot::Sender<PruneOutcome>,
     },
+    /// Reads all file paths currently indexed in the target's beets library database.
+    IndexedPaths {
+        done: oneshot::Sender<Result<HashSet<PathBuf>, String>>,
+    },
+    /// Registers a batch of existing `sources` in place (`-A -C -M -W`, duplicate skip).
+    RegisterInPlaceBatch {
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+        done: oneshot::Sender<ImportResult>,
+    },
+    /// Autotags existing `sources` in place (`-C -M`) without copying or moving files.
+    ImportInPlace {
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+        choice: DriverChoice,
+        duplicates: DuplicateRun,
+        done: oneshot::Sender<ImportResult>,
+    },
 }
 
 impl Work {
@@ -367,7 +388,10 @@ impl Work {
             | Work::ModifyTags { .. }
             | Work::RematchInPlace { .. }
             | Work::RelocateFile { .. }
-            | Work::Prune { .. } => None,
+            | Work::Prune { .. }
+            | Work::IndexedPaths { .. }
+            | Work::RegisterInPlaceBatch { .. }
+            | Work::ImportInPlace { .. } => None,
         }
     }
 }
@@ -492,6 +516,87 @@ impl ImportQueue {
         outcome
             .await
             .unwrap_or_else(|_| PruneOutcome::Failed(WORKER_STOPPED.into()))
+    }
+
+    /// Reads all file paths currently indexed in `library`'s beets database, serialized
+    /// through the library's worker so it never races an in-flight import.
+    pub async fn indexed_paths(&self, library: &Path) -> Result<HashSet<PathBuf>, String> {
+        let key = match tokio::fs::canonicalize(library).await {
+            Ok(key) => key,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(e) => return Err(format!("Could not read {}: {e}", library.display())),
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(key, Work::IndexedPaths { done });
+        outcome
+            .await
+            .unwrap_or_else(|_| Err(WORKER_STOPPED.into()))
+    }
+
+    /// Registers a batch of existing `sources` in `library`'s beets database in one run
+    /// (`-A -C -M -W`, duplicate skip, no plugins).
+    pub async fn register_in_place_batch(
+        &self,
+        library: &Path,
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+    ) -> ImportResult {
+        let key = match canonical_target(library).await {
+            Ok(key) => key,
+            Err(e) => {
+                return ImportResult::failed(
+                    FailKind::TargetUnwritable,
+                    format!("Could not create {}: {e}", library.display()),
+                );
+            }
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::RegisterInPlaceBatch {
+                sources,
+                mode,
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+    }
+
+    /// Autotags existing `sources` in place (`-C -M`) inside `library`, detaching any shared
+    /// hardlinks via copy-on-write before beets writes tags.
+    pub async fn import_in_place(
+        &self,
+        library: &Path,
+        sources: Vec<PathBuf>,
+        mode: ImportMode,
+        choice: DriverChoice,
+        duplicates: DuplicateRun,
+    ) -> ImportResult {
+        let key = match canonical_target(library).await {
+            Ok(key) => key,
+            Err(e) => {
+                return ImportResult::failed(
+                    FailKind::TargetUnwritable,
+                    format!("Could not create {}: {e}", library.display()),
+                );
+            }
+        };
+        let (done, outcome) = oneshot::channel();
+        self.enqueue(
+            key,
+            Work::ImportInPlace {
+                sources,
+                mode,
+                choice,
+                duplicates,
+                done,
+            },
+        );
+        outcome
+            .await
+            .unwrap_or_else(|_| ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
     }
 
     /// Registers an existing `file` inside `library`'s beets database without copying, moving,
@@ -795,22 +900,39 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 let _ = done.send(outcome);
             }
             Work::ModifyTags { file, edits, done } => {
-                let outcome = AssertUnwindSafe(shared.modify_tags(&key, &file, &edits))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Modifying tags of {} in {} panicked",
-                            file.display(),
-                            key.display()
-                        );
-                        Err(Failure::new(
-                            shared::failure::FailureCode::RetagFailed,
-                            shared::failure::Stage::Retag,
-                            shared::failure::RetryAdvice::SameSourceLater,
-                            WORKER_STOPPED,
-                        ))
-                    });
+                let cow_file = file.clone();
+                let cow_err = tokio::task::spawn_blocking(move || {
+                    crate::core::tracks::cow::break_hardlink_if_shared(&cow_file)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|r| r)
+                .err();
+                let outcome = if let Some(e) = cow_err {
+                    Err(Failure::new(
+                        shared::failure::FailureCode::RetagFailed,
+                        shared::failure::Stage::Retag,
+                        shared::failure::RetryAdvice::SameSourceLater,
+                        format!("Could not isolate shared file before modifying tags: {e}"),
+                    ))
+                } else {
+                    AssertUnwindSafe(shared.modify_tags(&key, &file, &edits))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            warn!(
+                                "Modifying tags of {} in {} panicked",
+                                file.display(),
+                                key.display()
+                            );
+                            Err(Failure::new(
+                                shared::failure::FailureCode::RetagFailed,
+                                shared::failure::Stage::Retag,
+                                shared::failure::RetryAdvice::SameSourceLater,
+                                WORKER_STOPPED,
+                            ))
+                        })
+                };
                 let _ = done.send(outcome);
             }
             Work::RematchInPlace {
@@ -820,15 +942,37 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 pretend,
                 done,
             } => {
-                let outcome = AssertUnwindSafe(
-                    shared.rematch_in_place(&key, &sources, mode, &choice, pretend),
-                )
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    warn!("Re-matching in {} panicked", key.display());
-                    ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
-                });
+                let cow_err = if !pretend {
+                    let paths = sources.clone();
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        for p in &paths {
+                            crate::core::tracks::cow::break_hardlink_if_shared(p)?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .and_then(|r| r)
+                    .err()
+                } else {
+                    None
+                };
+                let outcome = if let Some(e) = cow_err {
+                    ImportResult::failed(
+                        FailKind::Beets,
+                        format!("Could not isolate shared file before re-matching: {e}"),
+                    )
+                } else {
+                    AssertUnwindSafe(
+                        shared.rematch_in_place(&key, &sources, mode, &choice, pretend),
+                    )
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Re-matching in {} panicked", key.display());
+                        ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
+                    })
+                };
                 let _ = done.send(outcome);
             }
             Work::RelocateFile { file, done } => {
@@ -857,6 +1001,57 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                         warn!("Pruning the library of {} panicked", key.display());
                         PruneOutcome::Failed(WORKER_STOPPED.into())
                     });
+                let _ = done.send(outcome);
+            }
+            Work::IndexedPaths { done } => {
+                let outcome = AssertUnwindSafe(shared.indexed_paths(&key))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Reading indexed paths of {} panicked", key.display());
+                        Err(WORKER_STOPPED.into())
+                    });
+                let _ = done.send(outcome);
+            }
+            Work::RegisterInPlaceBatch {
+                sources,
+                mode,
+                done,
+            } => {
+                let outcome =
+                    AssertUnwindSafe(shared.register_in_place_batch(&key, &sources, mode))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            warn!("Registering batch in {} panicked", key.display());
+                            ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
+                        });
+                let _ = done.send(outcome);
+            }
+            Work::ImportInPlace {
+                sources,
+                mode,
+                choice,
+                duplicates,
+                done,
+            } => {
+                let cow_err = break_hardlinks_in_sources(&sources).await.err();
+                let outcome = if let Some(e) = cow_err {
+                    ImportResult::failed(
+                        FailKind::Beets,
+                        format!("Could not isolate shared file before in-place import: {e}"),
+                    )
+                } else {
+                    AssertUnwindSafe(shared.import_in_place(
+                        &key, &sources, mode, &choice, duplicates,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("In-place import in {} panicked", key.display());
+                        ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
+                    })
+                };
                 let _ = done.send(outcome);
             }
         }
@@ -985,9 +1180,72 @@ impl Shared {
         }
     }
 
+    async fn indexed_paths(&self, library: &Path) -> Result<HashSet<PathBuf>, String> {
+        match self.deps.importer().await {
+            Ok(importer) => importer.indexed_paths(library).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn register_in_place_batch(
+        &self,
+        library: &Path,
+        sources: &[PathBuf],
+        mode: ImportMode,
+    ) -> ImportResult {
+        let importer = match self.deps.importer().await {
+            Ok(importer) => importer,
+            Err(e) => return ImportResult::failed(FailKind::Setup, e),
+        };
+        if let Some(issue) = crate::importer_health::refusal(importer.as_ref()).await {
+            return importer.refused(issue);
+        }
+        let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+        importer.register_in_place_batch(&refs, library, mode).await
+    }
+
+    async fn import_in_place(
+        &self,
+        library: &Path,
+        sources: &[PathBuf],
+        mode: ImportMode,
+        choice: &DriverChoice,
+        duplicates: DuplicateRun,
+    ) -> ImportResult {
+        let importer = match self.deps.importer().await {
+            Ok(importer) => importer,
+            Err(e) => return ImportResult::failed(FailKind::Setup, e),
+        };
+        if let Some(issue) = crate::importer_health::refusal(importer.as_ref()).await {
+            return importer.refused(issue);
+        }
+        let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+        importer
+            .import_with_placement(
+                &refs,
+                library,
+                mode,
+                choice,
+                duplicates,
+                ImportPlacement::InPlaceNoMove,
+            )
+            .await
+    }
+
     async fn execute(&self, target: &Path, job: &ImportJob) -> JobOutcome {
         if !job.holds_audio().await {
             return JobOutcome::of(ImportResult::nothing_to_import());
+        }
+        if matches!(
+            job.placement,
+            ImportPlacement::MoveInPlace | ImportPlacement::InPlaceNoMove
+        ) {
+            if let Err(e) = break_hardlinks_in_sources(&job.sources).await {
+                return JobOutcome::of(ImportResult::failed(
+                    FailKind::Beets,
+                    format!("Could not isolate shared file before import: {e}"),
+                ));
+            }
         }
         let sources: Vec<&Path> = job.sources.iter().map(PathBuf::as_path).collect();
         let importer = match self.deps.importer().await {
@@ -1008,7 +1266,14 @@ impl Shared {
             Duplicates::Replace { .. } => DuplicateRun::Replace,
         };
         let result = importer
-            .import(&sources, target, job.mode, &job.choice, duplicates)
+            .import_with_placement(
+                &sources,
+                target,
+                job.mode,
+                &job.choice,
+                duplicates,
+                job.placement,
+            )
             .await;
         let removals = match &job.duplicates {
             Duplicates::Guarded { actor, origin } => Some((actor, Removals::Guarded(origin))),
@@ -1338,6 +1603,21 @@ async fn existing_key(library: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("Could not resolve {}: {e}", library.display()))
 }
 
+/// Breaks shared hardlinks (`st_nlink > 1`) on every audio file among `sources`
+/// (recursing into album directories without following symlinks) before in-place mutations.
+async fn break_hardlinks_in_sources(sources: &[PathBuf]) -> std::io::Result<()> {
+    let refs: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+    let files = collect_audio_files(&refs).await;
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        for file in &files {
+            crate::core::tracks::cow::break_hardlink_if_shared(file)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))?
+}
+
 /// Imports one file into a library folder and waits for it (promote), treating an earlier
 /// copy by `duplicates`. Ok when the file imported, its warnings logged since no row shows
 /// them, else the outcome's failure.
@@ -1360,6 +1640,7 @@ pub async fn import_to_library(
             duplicates,
             last_run: None,
             lock_retries: 0,
+            placement: ImportPlacement::Default,
         })
         .await
         .wait()
@@ -1450,6 +1731,7 @@ mod tests {
             duplicates: Duplicates::AsConfigured,
             last_run: None,
             lock_retries: 0,
+            placement: ImportPlacement::Default,
         }
     }
 
