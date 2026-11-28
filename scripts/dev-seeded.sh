@@ -218,6 +218,10 @@ start_soulbeet() {
 
 cmd_up() {
   if [[ "$FORCE_BUILD" -eq 1 || ! -x "$SERVER_DIR/server" ]]; then
+    if [[ -d "$REPO_DIR/node_modules/@tailwindcss" ]]; then
+      echo "Rebuilding Tailwind CSS (web/assets/tailwind.css)..."
+      (cd "$REPO_DIR" && npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css)
+    fi
     echo "Building debug web bundle (dx bundle --package web)..."
     (cd "$REPO_DIR" && dx bundle --package web)
   fi
