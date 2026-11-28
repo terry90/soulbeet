@@ -1126,6 +1126,8 @@ pub struct FfiAutoBrowseNode {
     pub cover_art_local_path: Option<String>,
     pub is_offline_ready: bool,
     pub is_pending_discovery: bool,
+    pub group_title: Option<String>,
+    pub sleeve_slug: Option<String>,
 }
 
 impl From<AutoBrowseNode> for FfiAutoBrowseNode {
@@ -1141,6 +1143,8 @@ impl From<AutoBrowseNode> for FfiAutoBrowseNode {
             cover_art_local_path: v.cover_art_local_path,
             is_offline_ready: v.is_offline_ready,
             is_pending_discovery: v.is_pending_discovery,
+            group_title: v.group_title,
+            sleeve_slug: v.sleeve_slug,
         }
     }
 }
@@ -2608,6 +2612,22 @@ impl SoulbeetCoreHandle {
         self.run_async(async move {
             let nodes = core
                 .auto_children(&parent_id)
+                .await
+                .map_err(FfiError::from)?;
+            Ok(nodes.into_iter().map(Into::into).collect())
+        })
+        .await
+    }
+
+    pub async fn auto_children_with_offline(
+        &self,
+        parent_id: String,
+        offline_only: bool,
+    ) -> Result<Vec<FfiAutoBrowseNode>, FfiError> {
+        let core = self.core.clone();
+        self.run_async(async move {
+            let nodes = core
+                .auto_children_with_offline(&parent_id, offline_only)
                 .await
                 .map_err(FfiError::from)?;
             Ok(nodes.into_iter().map(Into::into).collect())

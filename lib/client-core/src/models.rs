@@ -526,6 +526,10 @@ pub struct AutoBrowseNode {
     pub cover_art_local_path: Option<String>,
     pub is_offline_ready: bool,
     pub is_pending_discovery: bool,
+    #[serde(default)]
+    pub group_title: Option<String>,
+    #[serde(default)]
+    pub sleeve_slug: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

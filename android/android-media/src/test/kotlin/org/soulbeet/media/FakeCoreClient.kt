@@ -66,6 +66,11 @@ open class FakeCoreClient : CoreClient {
     override suspend fun autoChildren(parentId: String): List<FfiAutoBrowseNode> =
         childrenByParent[parentId].orEmpty()
 
+    override suspend fun autoChildrenWithOffline(
+        parentId: String,
+        offlineOnly: Boolean,
+    ): List<FfiAutoBrowseNode> = childrenByParent[parentId].orEmpty()
+
     override fun isOfflineOnly(): Boolean = offlineOnlyFlag
 
     override fun setOfflineOnly(offlineOnly: Boolean) {
@@ -211,6 +216,8 @@ open class FakeCoreClient : CoreClient {
             coverArtId: String? = null,
             isOfflineReady: Boolean = false,
             isPendingDiscovery: Boolean = false,
+            groupTitle: String? = null,
+            sleeveSlug: String? = null,
         ): FfiAutoBrowseNode = FfiAutoBrowseNode(
             id = id,
             title = title,
@@ -222,6 +229,8 @@ open class FakeCoreClient : CoreClient {
             coverArtLocalPath = null,
             isOfflineReady = isOfflineReady,
             isPendingDiscovery = isPendingDiscovery,
+            groupTitle = groupTitle,
+            sleeveSlug = sleeveSlug,
         )
 
         fun sampleTrack(

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="soulbeet_auto_primary">#24103A</color>
+    <color name="soulbeet_auto_primary_dark">#0F0518</color>
+    <color name="soulbeet_auto_accent">#00FF9D</color>
+
+    <style name="CarTheme.Soulbeet" parent="android:Theme.DeviceDefault">
+        <item name="android:colorPrimary">@color/soulbeet_auto_primary</item>
+        <item name="android:colorPrimaryDark">@color/soulbeet_auto_primary_dark</item>
+        <item name="android:colorAccent">@color/soulbeet_auto_accent</item>
+    </style>
+</resources>

@@ -2305,13 +2305,13 @@ async fn android_auto_browse_bounds_az_buckets_voice_search_and_ignition_resumpt
     assert!(!pls.iter().any(|n| n.id == "playlist:pl-0"));
     assert!(!pls.iter().any(|n| n.id == "playlist:pl-2"));
 
-    // 4. Library has Offline, Recent (<=25), and 6 A-Z buckets
+    // 4. Library has Offline, Recent Albums, Recent Artists, 6 Artist A-Z buckets, and 6 Album A-Z buckets
     let lib = core
         .auto_browse()
         .children(AUTO_TAB_LIBRARY, false)
         .await
         .unwrap();
-    assert_eq!(lib.len(), 8);
+    assert_eq!(lib.len(), 15);
     assert_eq!(lib[0].id, AUTO_LIB_OFFLINE);
     assert_eq!(lib[0].subtitle.as_deref(), Some("1 tracks ready"));
     assert_eq!(lib[1].id, AUTO_LIB_RECENT);
@@ -3342,4 +3342,234 @@ async fn hardening_connect_ws_clamps_heartbeat_and_stops_reconnect_on_401() {
     );
     assert!(!core.connect_state().await.connected);
     core.disconnect_ws().await;
+}
+
+#[tokio::test]
+async fn android_auto_drive_mix_groups_sleeves_starred_radio_and_placeholder_rejection() {
+    use client_core::auto_browse::{
+        AUTO_FOR_YOU_DRIVE_MIX, AUTO_FOR_YOU_TRIAGE, AUTO_PLAYLIST_STARRED, AUTO_RADIO_SHUFFLE,
+        AUTO_TAB_FOR_YOU, AUTO_TAB_PLAYLISTS, AUTO_TAB_RADIO, GROUP_CONTINUE_LISTENING,
+        GROUP_DISCOVER, GROUP_GENRES, GROUP_QUICK_STATIONS, GROUP_RIGHT_NOW,
+    };
+    use client_core::cache::is_navidrome_placeholder_bytes;
+    use client_core::db::{upsert_album, upsert_artist, upsert_discovery_track, upsert_playlist, upsert_track};
+    use client_core::models::LocalDiscoveryTrack;
+
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, None, 10_000_000))
+        .await
+        .unwrap();
+    let now = 1_700_000_000i64;
+
+    // Seed an artist, album, starred track, 1-star track, discovery track, and playlists.
+    upsert_artist(
+        core.pool(),
+        &LocalArtist {
+            id: "ar-1".into(),
+            name: "Kavinsky".into(),
+            album_count: 1,
+            cover_art_id: Some("ar-1".into()),
+            starred: true,
+            musicbrainz_id: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_album(
+        core.pool(),
+        &LocalAlbum {
+            id: "al-1".into(),
+            name: "OutRun".into(),
+            artist_id: Some("ar-1".into()),
+            artist_name: "Kavinsky".into(),
+            year: Some(2013),
+            genre: Some("Synthwave".into()),
+            song_count: 2,
+            duration_secs: 400,
+            cover_art_id: Some("al-1".into()),
+            starred: false,
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-good".into(),
+            title: "Nightcall".into(),
+            artist_id: Some("ar-1".into()),
+            artist_name: "Kavinsky".into(),
+            album_id: Some("al-1".into()),
+            album_name: "OutRun".into(),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: 258,
+            year: Some(2013),
+            genre: Some("Synthwave".into()),
+            bit_rate: Some(320),
+            suffix: Some("flac".into()),
+            content_type: Some("audio/flac".into()),
+            size_bytes: Some(20_000_000),
+            cover_art_id: Some("al-1".into()),
+            path: None,
+            starred: true,
+            user_rating: 5,
+            play_count: 10,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-bad".into(),
+            title: "Skip Me".into(),
+            artist_id: Some("ar-1".into()),
+            artist_name: "Kavinsky".into(),
+            album_id: Some("al-1".into()),
+            album_name: "OutRun".into(),
+            track_number: Some(2),
+            disc_number: Some(1),
+            duration_secs: 180,
+            year: Some(2013),
+            genre: Some("Synthwave".into()),
+            bit_rate: Some(320),
+            suffix: Some("flac".into()),
+            content_type: Some("audio/flac".into()),
+            size_bytes: Some(10_000_000),
+            cover_art_id: Some("al-1".into()),
+            path: None,
+            starred: false,
+            user_rating: 1,
+            play_count: 0,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_discovery_track(
+        core.pool(),
+        &LocalDiscoveryTrack {
+            id: "dt-1".into(),
+            song_id: Some("tr-good".into()),
+            artist: "Kavinsky".into(),
+            title: "Nightcall".into(),
+            album: Some("OutRun".into()),
+            folder_path: None,
+            profile_slug: Some("balanced".into()),
+            mix_slug: None,
+            status: "pending".into(),
+            created_at: None,
+            expires_at: None,
+            reason_json: None,
+            exclude_from_core_taste: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-radar".into(),
+            name: "Weekly Radar".into(),
+            comment: Some("Soulbeet Discovery".into()),
+            owner: Some("alice".into()),
+            song_count: 14,
+            duration_secs: 3000,
+            cover_art_id: Some("pl-radar".into()),
+            is_smart: true,
+            kind: "discovery".into(),
+            slug: Some("weekly_radar".into()),
+            changed_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-smart".into(),
+            name: "High Rated Smart".into(),
+            comment: Some("Smart playlist".into()),
+            owner: Some("alice".into()),
+            song_count: 5,
+            duration_secs: 1000,
+            cover_art_id: None,
+            is_smart: true,
+            kind: "smart".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // 1. For You: Drive Mix is #1 in Right Now, Weekly Radar + Triage in Discover, OutRun in Continue Listening
+    let for_you = core.auto_browse().children(AUTO_TAB_FOR_YOU, false).await.unwrap();
+    assert_eq!(for_you[0].id, AUTO_FOR_YOU_DRIVE_MIX);
+    assert_eq!(for_you[0].group_title.as_deref(), Some(GROUP_RIGHT_NOW));
+    assert_eq!(for_you[0].sleeve_slug.as_deref(), Some("drive"));
+    assert!(for_you[0].playable && for_you[0].browsable);
+
+    let drive_tracks = core.auto_browse().children(AUTO_FOR_YOU_DRIVE_MIX, false).await.unwrap();
+    assert_eq!(drive_tracks.len(), 1, "1-star tracks must be excluded from Drive Mix");
+    assert_eq!(drive_tracks[0].id, "track:tr-good");
+
+    let radar = for_you.iter().find(|n| n.id == "playlist:pl-radar").unwrap();
+    assert_eq!(radar.group_title.as_deref(), Some(GROUP_DISCOVER));
+    assert_eq!(radar.sleeve_slug.as_deref(), Some("weekly_radar"));
+    assert!(radar.cover_art_id.is_none(), "mix sleeve playlists must not fetch Navidrome pl-* art");
+
+    let triage = for_you.iter().find(|n| n.id == AUTO_FOR_YOU_TRIAGE).unwrap();
+    assert_eq!(triage.group_title.as_deref(), Some(GROUP_DISCOVER));
+    assert_eq!(triage.sleeve_slug.as_deref(), Some("triage"));
+    assert!(triage.playable && triage.browsable);
+
+    assert!(for_you
+        .iter()
+        .any(|n| n.id == "album:al-1" && n.group_title.as_deref() == Some(GROUP_CONTINUE_LISTENING)));
+
+    // Voice search resolves Drive Mix directly
+    let voice_drive = core
+        .auto_browse()
+        .voice_search("Play Drive Mix", false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(voice_drive.label, "Drive Mix");
+    assert_eq!(voice_drive.track_ids, vec!["tr-good".to_string()]);
+
+    // 2. Playlists pins Starred Favorites #1 and includes smart playlists
+    let playlists = core.auto_browse().children(AUTO_TAB_PLAYLISTS, false).await.unwrap();
+    assert_eq!(playlists[0].id, AUTO_PLAYLIST_STARRED);
+    assert_eq!(playlists[0].sleeve_slug.as_deref(), Some("starred"));
+    assert!(playlists.iter().any(|n| n.id == "playlist:pl-smart"));
+
+    // 3. Radio exposes Library Shuffle + Moods + Genres + Artist Radio with group titles
+    let radio = core.auto_browse().children(AUTO_TAB_RADIO, false).await.unwrap();
+    assert_eq!(radio[0].id, AUTO_RADIO_SHUFFLE);
+    assert_eq!(radio[0].group_title.as_deref(), Some(GROUP_QUICK_STATIONS));
+    assert_eq!(radio[0].sleeve_slug.as_deref(), Some("shuffle"));
+    assert!(radio
+        .iter()
+        .any(|n| n.id == "radio:genre:Synthwave" && n.group_title.as_deref() == Some(GROUP_GENRES)));
+
+    // 4. Placeholder detector never falsely flags normal image bytes
+    assert!(!is_navidrome_placeholder_bytes(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
 }

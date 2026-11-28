@@ -102,29 +102,49 @@ internal object MediaLibraryResolver {
         core: CoreClient,
         mediaId: String,
         artAuthority: String,
+        packageName: String? = null,
     ): MediaItem? {
         if (mediaId == AutoBrowseTree.ROOT_ID) return AutoBrowseTree.rootMediaItem()
         if (mediaId == AutoBrowseTree.RECENT_ROOT_ID) return AutoBrowseTree.recentRootMediaItem()
 
         core.autoRootTabs().firstOrNull { it.id == mediaId }?.let { tab ->
-            return AutoBrowseTree.mapNode(tab, artAuthority)
+            return AutoBrowseTree.mapNode(tab, artAuthority, packageName = packageName)
         }
 
         if (mediaId == AutoBrowseTree.LIB_OFFLINE ||
             mediaId == AutoBrowseTree.LIB_RECENT ||
-            mediaId.startsWith(AutoBrowseTree.PREFIX_AZ)
+            mediaId == AutoBrowseTree.LIB_RECENT_ARTISTS ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_AZ) ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_AZ_ALBUM)
         ) {
             val libNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_LIBRARY) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (libNode != null) return AutoBrowseTree.mapNode(libNode, artAuthority)
+            if (libNode != null) return AutoBrowseTree.mapNode(libNode, artAuthority, packageName = packageName)
         }
 
-        if (mediaId == AutoBrowseTree.FOR_YOU_TRIAGE) {
-            val triageNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_FOR_YOU) }
+        if (mediaId == AutoBrowseTree.FOR_YOU_TRIAGE || mediaId == AutoBrowseTree.FOR_YOU_DRIVE_MIX) {
+            val forYouNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_FOR_YOU) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (triageNode != null) return AutoBrowseTree.mapNode(triageNode, artAuthority)
+            if (forYouNode != null) return AutoBrowseTree.mapNode(forYouNode, artAuthority, packageName = packageName)
+        }
+
+        if (mediaId == AutoBrowseTree.PLAYLIST_STARRED) {
+            val starredNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_PLAYLISTS) }
+                .getOrDefault(emptyList())
+                .firstOrNull { it.id == mediaId }
+            if (starredNode != null) return AutoBrowseTree.mapNode(starredNode, artAuthority, packageName = packageName)
+        }
+
+        if (mediaId == AutoBrowseTree.RADIO_SHUFFLE ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_RADIO_MOOD) ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_RADIO_GENRE)
+        ) {
+            val radioNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_RADIO) }
+                .getOrDefault(emptyList())
+                .firstOrNull { it.id == mediaId }
+            if (radioNode != null) return AutoBrowseTree.mapNode(radioNode, artAuthority, packageName = packageName)
         }
 
         if (mediaId.startsWith(AutoBrowseTree.PREFIX_PLAYLIST)) {
@@ -133,17 +153,18 @@ internal object MediaLibraryResolver {
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == playlistId }
             if (playlist != null) {
+                val artworkUri = playlist.slug?.takeIf { it.isNotBlank() }?.let { slug ->
+                    CoverArtContentProvider.sleeveUriFor(artAuthority, slug)
+                } ?: playlist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
+                    CoverArtContentProvider.uriFor(artAuthority, cid, "playlist", playlist.name)
+                } ?: CoverArtContentProvider.tileUriFor(artAuthority, "playlist", playlist.name)
                 val metadata = MediaMetadata.Builder()
                     .setTitle(playlist.name)
                     .setSubtitle("${playlist.songCount} tracks")
                     .setIsBrowsable(true)
                     .setIsPlayable(true)
                     .setMediaType(MediaMetadata.MEDIA_TYPE_PLAYLIST)
-                    .apply {
-                        playlist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                            setArtworkUri(CoverArtContentProvider.uriFor(artAuthority, cid))
-                        }
-                    }
+                    .setArtworkUri(artworkUri)
                     .build()
                 return MediaItem.Builder()
                     .setMediaId(mediaId)
@@ -156,6 +177,9 @@ internal object MediaLibraryResolver {
         if (mediaId.startsWith(AutoBrowseTree.PREFIX_ALBUM)) {
             val albumId = mediaId.removePrefix(AutoBrowseTree.PREFIX_ALBUM)
             val album = runCatching { core.getAlbum(albumId) }.getOrNull() ?: return null
+            val artUri = album.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
+                CoverArtContentProvider.uriFor(artAuthority, cid, "album", album.name)
+            } ?: CoverArtContentProvider.tileUriFor(artAuthority, "album", album.name)
             val metadata = MediaMetadata.Builder()
                 .setTitle(album.name)
                 .setArtist(album.artistName)
@@ -163,11 +187,7 @@ internal object MediaLibraryResolver {
                 .setIsBrowsable(true)
                 .setIsPlayable(true)
                 .setMediaType(MediaMetadata.MEDIA_TYPE_ALBUM)
-                .apply {
-                    album.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                        setArtworkUri(CoverArtContentProvider.uriFor(artAuthority, cid))
-                    }
-                }
+                .setArtworkUri(artUri)
                 .build()
             return MediaItem.Builder()
                 .setMediaId(mediaId)
@@ -183,6 +203,9 @@ internal object MediaLibraryResolver {
                 .removePrefix(AutoBrowseTree.PREFIX_RADIO_ARTIST)
                 .removePrefix(AutoBrowseTree.PREFIX_ARTIST)
             val artist = runCatching { core.getArtist(artistId) }.getOrNull() ?: return null
+            val artUri = artist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
+                CoverArtContentProvider.uriFor(artAuthority, cid, "artist", artist.name)
+            } ?: CoverArtContentProvider.tileUriFor(artAuthority, "artist", artist.name)
             val metadata = MediaMetadata.Builder()
                 .setTitle(if (isRadio) "${artist.name} Radio" else artist.name)
                 .setSubtitle(if (isRadio) "Instant station" else "${artist.albumCount} albums")
@@ -191,11 +214,7 @@ internal object MediaLibraryResolver {
                 .setMediaType(
                     if (isRadio) MediaMetadata.MEDIA_TYPE_RADIO_STATION else MediaMetadata.MEDIA_TYPE_ARTIST,
                 )
-                .apply {
-                    artist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                        setArtworkUri(CoverArtContentProvider.uriFor(artAuthority, cid))
-                    }
-                }
+                .setArtworkUri(artUri)
                 .build()
             return MediaItem.Builder()
                 .setMediaId(mediaId)
@@ -417,8 +436,23 @@ internal object MediaLibraryResolver {
     ): String? {
         providedTitle?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
         return when {
+            containerId == AutoBrowseTree.FOR_YOU_DRIVE_MIX -> "Drive Mix"
+            containerId == AutoBrowseTree.PLAYLIST_STARRED -> "Starred Favorites"
             containerId == AutoBrowseTree.LIB_OFFLINE -> "Offline Downloaded"
             containerId == AutoBrowseTree.FOR_YOU_TRIAGE -> "Discovery Triage"
+            containerId == AutoBrowseTree.RADIO_SHUFFLE -> "Library Shuffle"
+            containerId.startsWith(AutoBrowseTree.PREFIX_RADIO_MOOD) -> {
+                when (containerId.removePrefix(AutoBrowseTree.PREFIX_RADIO_MOOD)) {
+                    "upbeat" -> "Upbeat Radio"
+                    "chill" -> "Chill Radio"
+                    "late_night" -> "Late Night Radio"
+                    else -> "Mood Radio"
+                }
+            }
+            containerId.startsWith(AutoBrowseTree.PREFIX_RADIO_GENRE) -> {
+                val genre = containerId.removePrefix(AutoBrowseTree.PREFIX_RADIO_GENRE)
+                if (genre.isNotBlank()) "$genre Radio" else "Genre Radio"
+            }
             containerId.startsWith(AutoBrowseTree.PREFIX_PLAYLIST) -> {
                 val plId = containerId.removePrefix(AutoBrowseTree.PREFIX_PLAYLIST)
                 runCatching { core.listPlaylists() }.getOrDefault(emptyList())
@@ -510,7 +544,11 @@ internal object MediaLibraryResolver {
         mediaId.startsWith(AutoBrowseTree.PREFIX_PLAYLIST) ||
             mediaId.startsWith(AutoBrowseTree.PREFIX_ALBUM) ||
             mediaId == AutoBrowseTree.LIB_OFFLINE ||
-            mediaId == AutoBrowseTree.FOR_YOU_TRIAGE
+            mediaId == AutoBrowseTree.FOR_YOU_DRIVE_MIX ||
+            mediaId == AutoBrowseTree.FOR_YOU_TRIAGE ||
+            mediaId == AutoBrowseTree.RADIO_SHUFFLE ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_RADIO_MOOD) ||
+            mediaId.startsWith(AutoBrowseTree.PREFIX_RADIO_GENRE)
 
     private suspend fun appendTracksByIds(
         core: CoreClient,
@@ -548,6 +586,8 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
     private var trackRefreshJob: Job? = null
     private var currentTrackContext: TrackActionContext? = null
     private var trackContextGeneration: Long = 0L
+    private val activePrefetchParents = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val lastNotifyChangedByParentMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     private val artAuthority: String
         get() = CoverArtContentProvider.authorityFor(applicationContext)
@@ -701,14 +741,15 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
                 val core = awaitCore()
                     ?: return@future LibraryResult.ofError(SessionError.ERROR_INVALID_STATE)
                 val offlineOnly = (params?.isOffline == true) || core.isOfflineOnly()
-                val items = try {
-                    AutoBrowseTree.loadChildren(
+                val pageResult = try {
+                    AutoBrowseTree.loadChildrenWithTotal(
                         core = core,
                         parentId = parentId,
                         page = page,
                         pageSize = pageSize,
                         artAuthority = artAuthority,
                         offlineOnly = offlineOnly,
+                        packageName = applicationContext.packageName,
                     )
                 } catch (e: CancellationException) {
                     throw e
@@ -717,13 +758,19 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
                 }
 
                 if (!offlineOnly) {
-                    val coverArtIds = items.mapNotNull {
+                    val coverArtIds = pageResult.items.mapNotNull {
                         it.mediaMetadata.extras?.getString(AutoBrowseTree.EXTRA_COVER_ART_ID)
                     }
-                    prefetchCoverArtAsync(core, coverArtIds)
+                    prefetchCoverArtAsync(
+                        core = core,
+                        coverArtIds = coverArtIds,
+                        notifyParentId = parentId,
+                        notifyItemCount = pageResult.totalCount,
+                        notifyParams = params,
+                    )
                 }
 
-                LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
+                LibraryResult.ofItemList(ImmutableList.copyOf(pageResult.items), params)
             }
 
         override fun onGetItem(
@@ -740,8 +787,12 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
                 }
                 val core = awaitCore()
                     ?: return@future LibraryResult.ofError(SessionError.ERROR_INVALID_STATE)
-                val resolved = MediaLibraryResolver.resolveItemById(core, mediaId, artAuthority)
-                    ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
+                val resolved = MediaLibraryResolver.resolveItemById(
+                    core = core,
+                    mediaId = mediaId,
+                    artAuthority = artAuthority,
+                    packageName = applicationContext.packageName,
+                ) ?: return@future LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
                 LibraryResult.ofItem(resolved, null)
             }
 
@@ -987,7 +1038,8 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
             trackId = baseContext.trackId,
             title = mediaItem.mediaMetadata.title?.toString().orEmpty(),
             artist = mediaItem.mediaMetadata.artist?.toString().orEmpty(),
-            album = mediaItem.mediaMetadata.albumTitle?.toString().orEmpty(),
+            album = extras?.getString(AutoBrowseTree.EXTRA_RAW_ALBUM_NAME)
+                ?: mediaItem.mediaMetadata.albumTitle?.toString().orEmpty(),
             coverArtId = extras?.getString(AutoBrowseTree.EXTRA_COVER_ART_ID),
             durationMs = durationMs,
             queueTrackIds = queueIds,
@@ -1109,21 +1161,63 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
         }
     }
 
-    private fun prefetchCoverArtAsync(core: CoreClient, coverArtIds: Collection<String>) {
+    private fun prefetchCoverArtAsync(
+        core: CoreClient,
+        coverArtIds: Collection<String>,
+        notifyParentId: String? = null,
+        notifyItemCount: Int = 0,
+        notifyParams: LibraryParams? = null,
+    ) {
         if (core.isOfflineOnly()) return
-        val boundedIds = coverArtIds
+        val uniqueIds = coverArtIds
             .asSequence()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
-            .take(MAX_COVER_ART_PREFETCH_BATCH)
             .toList()
-        if (boundedIds.isEmpty()) return
+        if (uniqueIds.isEmpty()) return
+
+        val parentKey = notifyParentId?.takeIf { it.isNotBlank() }
+        if (parentKey != null && !activePrefetchParents.add(parentKey)) {
+            return
+        }
 
         serviceScope.launch(Dispatchers.IO) {
-            for (artId in boundedIds) {
-                if (!isActive || core.isOfflineOnly()) break
-                runCatching { core.getOrFetchCoverArt(artId, COVER_ART_PREFETCH_SIZE_PX) }
+            try {
+                var attemptedFetches = 0
+                var newlyFetched = 0
+                for (artId in uniqueIds) {
+                    if (!isActive || core.isOfflineOnly() || attemptedFetches >= MAX_COVER_ART_PREFETCH_BATCH) {
+                        break
+                    }
+                    val alreadyLocal = runCatching { core.coverArtLocalPathSync(artId) }.getOrNull()
+                    if (!alreadyLocal.isNullOrBlank()) continue
+                    attemptedFetches++
+                    val fetched = runCatching {
+                        core.getOrFetchCoverArt(artId, COVER_ART_PREFETCH_SIZE_PX)
+                    }.getOrNull()
+                    if (!fetched.isNullOrBlank()) {
+                        newlyFetched++
+                    }
+                }
+                if (newlyFetched > 0 && parentKey != null) {
+                    val nowMs = System.currentTimeMillis()
+                    val lastMs = lastNotifyChangedByParentMs[parentKey] ?: 0L
+                    if (nowMs - lastMs >= PREFETCH_NOTIFY_COOLDOWN_MS) {
+                        lastNotifyChangedByParentMs[parentKey] = nowMs
+                        withContext(Dispatchers.Main.immediate) {
+                            mediaLibrarySession?.notifyChildrenChanged(
+                                parentKey,
+                                notifyItemCount,
+                                notifyParams,
+                            )
+                        }
+                    }
+                }
+            } finally {
+                if (parentKey != null) {
+                    activePrefetchParents.remove(parentKey)
+                }
             }
         }
     }
@@ -1236,8 +1330,9 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
     companion object {
         private const val PROGRESS_POLL_INTERVAL_MS: Long = 1_000L
         private const val DETACHED_SAVE_TIMEOUT_MS: Long = 2_000L
-        private const val MAX_COVER_ART_PREFETCH_BATCH: Int = 12
+        private const val MAX_COVER_ART_PREFETCH_BATCH: Int = 24
         private const val COVER_ART_PREFETCH_SIZE_PX: UInt = 512u
+        private const val PREFETCH_NOTIFY_COOLDOWN_MS: Long = 15_000L
 
         /**
          * Persists an immutable [SessionSnapshot] inside a detached short-lived IO scope so

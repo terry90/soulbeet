@@ -714,12 +714,16 @@ impl CacheManager {
         };
 
         let pb = PathBuf::from(&p);
-        let is_file = tokio::fs::metadata(&pb)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false);
-        if !is_file {
-            return Ok(None);
+        let meta = match tokio::fs::metadata(&pb).await {
+            Ok(m) if m.is_file() => m,
+            _ => return Ok(None),
+        };
+        if is_navidrome_placeholder_size(meta.len()) {
+            if let Ok(bytes) = tokio::fs::read(&pb).await {
+                if is_navidrome_placeholder_bytes(&bytes) {
+                    return Ok(None);
+                }
+            }
         }
 
         let canonical_base = tokio::fs::canonicalize(&self.cover_art_dir).await.ok();
@@ -731,7 +735,8 @@ impl CacheManager {
     }
 
     /// Returns cached cover-art path, or fetches and persists it on cache miss (unless `offline_only`).
-    /// Rejects Subsonic HTTP 200 JSON/XML/plain-text error envelopes and empty bodies.
+    /// Rejects Subsonic HTTP 200 JSON/XML/plain-text error envelopes, empty bodies, and Navidrome
+    /// built-in placeholder images so Soulbeet's own artwork renderer handles missing art cleanly.
     pub async fn get_or_fetch_cover_art(
         &self,
         cover_art_id: &str,
@@ -782,6 +787,11 @@ impl CacheManager {
 
         if bytes.is_empty() || is_subsonic_error_content_type(content_type.as_deref()) {
             return Err(parse_subsonic_error_bytes(&bytes, content_type.as_deref()));
+        }
+        if is_navidrome_placeholder_bytes(&bytes) {
+            return Err(CoreError::InvalidInput(format!(
+                "navidrome placeholder artwork for {cover_art_id}"
+            )));
         }
 
         let content_type = content_type.unwrap_or_else(|| "image/jpeg".to_string());
@@ -1115,4 +1125,29 @@ fn sanitize_extension(raw: &str) -> String {
     } else {
         ext
     }
+}
+
+const NAVIDROME_ALBUM_PLACEHOLDER_LEN: u64 = 69_228;
+const NAVIDROME_ALBUM_PLACEHOLDER_FNV1A: u64 = 0xbed0_ba17_fa90_9643;
+const NAVIDROME_ARTIST_PLACEHOLDER_LEN: u64 = 546;
+const NAVIDROME_ARTIST_PLACEHOLDER_FNV1A: u64 = 0xa027_5d7a_1708_302f;
+
+fn is_navidrome_placeholder_size(len: u64) -> bool {
+    len == NAVIDROME_ALBUM_PLACEHOLDER_LEN || len == NAVIDROME_ARTIST_PLACEHOLDER_LEN
+}
+
+/// Detects Navidrome's built-in `album-placeholder.webp` and `artist-placeholder.webp`
+/// responses so we never persist or display Navidrome's default logo in Soulbeet.
+pub fn is_navidrome_placeholder_bytes(bytes: &[u8]) -> bool {
+    let len = bytes.len() as u64;
+    if !is_navidrome_placeholder_size(len) {
+        return false;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (len == NAVIDROME_ALBUM_PLACEHOLDER_LEN && h == NAVIDROME_ALBUM_PLACEHOLDER_FNV1A)
+        || (len == NAVIDROME_ARTIST_PLACEHOLDER_LEN && h == NAVIDROME_ARTIST_PLACEHOLDER_FNV1A)
 }

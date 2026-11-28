@@ -12,6 +12,12 @@
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
+        <meta-data
+            android:name="com.google.android.gms.car.application.theme"
+            android:resource="@style/CarTheme.Soulbeet" />
+        <meta-data
+            android:name="com.google.android.gms.car.notification.SmallIcon"
+            android:resource="@drawable/ic_auto_notification" />
 
         <!--
             Exported without a custom permission so Android Auto and system media controllers can

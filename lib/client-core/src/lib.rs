@@ -527,6 +527,14 @@ impl SoulbeetCore {
             .await
     }
 
+    pub async fn auto_children_with_offline(
+        &self,
+        parent_id: &str,
+        offline_only: bool,
+    ) -> CoreResult<Vec<AutoBrowseNode>> {
+        self.auto_browse.children(parent_id, offline_only).await
+    }
+
     pub async fn voice_search(&self, query: &str) -> CoreResult<Option<VoiceMatchResult>> {
         self.auto_browse
             .voice_search(query, self.is_offline_only())
