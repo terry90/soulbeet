@@ -5,8 +5,8 @@ use dioxus::prelude::*;
 use shared::recommendation::{ContextualMixKind, CultureSteering};
 use ui::{
     format_mix_subtitle, format_mix_title, format_mix_window_badge, use_player, IconArrowRight,
-    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, MixSleeveCard,
-    MixSleeveLayout, PlaylistCategory, SeasonalHeroCard, TrackRow, TrackRowState,
+    IconCompass, IconDisc3, IconListMusic, IconPlay, IconRadio, IconSparkles, MixSleeveShelves,
+    PlaylistCategory, SeasonalHeroCard, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -345,13 +345,13 @@ pub fn HomePage() -> Element {
                 }
             }
 
-            // 4. Contextual & Rolling Mixes Shelf
+            // 4. Contextual & Rolling Mixes Split-Shelf (Right Now wide + From Your Collection square)
             if !moment_and_rolling.is_empty() {
-                section { class: "space-y-3",
-                    div { class: "flex items-center justify-between",
-                        h2 { class: "text-[18px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                            "Made for Right Now"
-                        }
+                MixSleeveShelves {
+                    mixes: moment_and_rolling,
+                    id_prefix: "home".to_string(),
+                    show_owned_pct: true,
+                    header_action: Some(rsx! {
                         button {
                             r#type: "button",
                             class: "inline-flex items-center gap-1 text-[12px] font-medium text-beet-text-tertiary hover:text-beet-text-primary cursor-pointer",
@@ -361,20 +361,8 @@ pub fn HomePage() -> Element {
                             span { "Explore Discover" }
                             IconArrowRight { size: 13 }
                         }
-                    }
-
-                    div { class: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4",
-                        for (idx, mix) in moment_and_rolling.into_iter().enumerate() {
-                            MixSleeveCard {
-                                key: "home-mix-{idx}-{mix.slug}",
-                                mix,
-                                layout: MixSleeveLayout::Wide,
-                                id_prefix: format!("home-{idx}"),
-                                show_owned_pct: true,
-                                on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
-                            }
-                        }
-                    }
+                    }),
+                    on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
                 }
             }
 

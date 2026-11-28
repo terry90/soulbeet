@@ -786,185 +786,270 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
         // --- Additional Time-of-Day & Activity Moments ---
         "morning" => {
             let mg = format!("ms-{p}-morn-rg");
+            let sun = format!("ms-{p}-morn-sun");
+            let bar = format!("ms-{p}-morn-bar");
             let mg_url = format!("url(#{mg})");
+            let sun_url = format!("url(#{sun})");
+            let bar_url = format!("url(#{bar})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{mg}", cx: "78%", cy: "76%", r: "56%",
-                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.30" }
-                            stop { offset: "45%", stop_color: "#fda4af", stop_opacity: "0.14" }
+                        radialGradient { id: "{mg}", cx: "80%", cy: "62%", r: "58%",
+                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.28" }
+                            stop { offset: "48%", stop_color: "#fda4af", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{mg_url}" }
-                    path { d: "M272 152 A40 40 0 0 1 352 152", fill: "#fed7aa", opacity: "0.18" }
-                    g { stroke: "#fda4af", stroke_linecap: "round", stroke_width: "1.1", opacity: "0.34",
-                        line { x1: "234", y1: "152", x2: "390", y2: "152" }
-                        line { x1: "312", y1: "100", x2: "312", y2: "68" }
-                        line { x1: "282", y1: "110", x2: "260", y2: "86" }
-                        line { x1: "342", y1: "110", x2: "364", y2: "86" }
-                        line { x1: "266", y1: "132", x2: "238", y2: "120" }
-                        line { x1: "358", y1: "132", x2: "386", y2: "120" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{sun}", x1: "0", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", stop_color: "#fde68a", stop_opacity: "0.38" }
+                            stop { offset: "100%", stop_color: "#fda4af", stop_opacity: "0.08" }
+                        }
+                        linearGradient { id: "{bar}", x1: "0", y1: "0", x2: "1", y2: "0",
+                            stop { offset: "0%", stop_color: "#fda4af", stop_opacity: "0" }
+                            stop { offset: "50%", stop_color: "#fed7aa", stop_opacity: "0.46" }
+                            stop { offset: "100%", stop_color: "#fda4af", stop_opacity: "0.08" }
+                        }
                     }
+                    path { d: "M110 114 A42 42 0 0 1 194 114 Z", fill: "{sun_url}" }
+                    path {
+                        d: "M96 114 A56 56 0 0 1 208 114",
+                        fill: "none",
+                        stroke: "#fda4af",
+                        stroke_opacity: "0.24",
+                        stroke_width: "1",
+                    }
+                    rect { x: "42", y: "114", width: "178", height: "1.2", rx: "0.6", fill: "{bar_url}" }
+                    rect { x: "86", y: "128", width: "130", height: "1.1", rx: "0.5", fill: "{bar_url}", opacity: "0.78" }
+                    rect { x: "112", y: "142", width: "92", height: "1.0", rx: "0.5", fill: "{bar_url}", opacity: "0.52" }
+                    rect { x: "134", y: "156", width: "54", height: "0.9", rx: "0.5", fill: "{bar_url}", opacity: "0.32" }
                 }
             }
         }
 
         "focus" => {
             let fg = format!("ms-{p}-focus-rg");
-            let pat = format!("ms-{p}-focus-grid");
             let fg_url = format!("url(#{fg})");
-            let pat_url = format!("url(#{pat})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{fg}", cx: "76%", cy: "54%", r: "52%",
-                            stop { offset: "0%", stop_color: "#2dd4bf", stop_opacity: "0.22" }
+                        radialGradient { id: "{fg}", cx: "78%", cy: "50%", r: "56%",
+                            stop { offset: "0%", stop_color: "#2dd4bf", stop_opacity: "0.24" }
                             stop { offset: "55%", stop_color: "#38bdf8", stop_opacity: "0.08" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
-                        pattern { id: "{pat}", width: "22", height: "22", pattern_units: "userSpaceOnUse",
-                            path { d: "M 22 0 L 0 0 0 22", fill: "none", stroke: "#5eead4", stroke_opacity: "0.10", stroke_width: "0.8" }
-                        }
                     }
                     rect { width: "400", height: "200", fill: "{fg_url}" }
-                    rect { x: "200", y: "0", width: "200", height: "200", fill: "{pat_url}" }
-                    g { fill: "none", stroke: "#5eead4",
-                        circle { cx: "312", cy: "112", r: "34", stroke_opacity: "0.24", stroke_width: "1" }
-                        circle { cx: "312", cy: "112", r: "18", stroke_opacity: "0.34", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    g { fill: "#5eead4", opacity: "0.18",
+                        circle { cx: "102", cy: "52", r: "1.1" }
+                        circle { cx: "126", cy: "52", r: "1.1" }
+                        circle { cx: "174", cy: "52", r: "1.1" }
+                        circle { cx: "198", cy: "52", r: "1.1" }
+                        circle { cx: "102", cy: "76", r: "1.1" }
+                        circle { cx: "198", cy: "76", r: "1.1" }
+                        circle { cx: "102", cy: "124", r: "1.1" }
+                        circle { cx: "198", cy: "124", r: "1.1" }
+                        circle { cx: "102", cy: "148", r: "1.1" }
+                        circle { cx: "126", cy: "148", r: "1.1" }
+                        circle { cx: "174", cy: "148", r: "1.1" }
+                        circle { cx: "198", cy: "148", r: "1.1" }
                     }
-                    circle { cx: "312", cy: "112", r: "4", fill: "#5eead4", opacity: "0.62" }
+                    g { fill: "none", stroke: "#5eead4",
+                        circle { cx: "150", cy: "100", r: "48", stroke_opacity: "0.22", stroke_width: "1" }
+                        circle { cx: "150", cy: "100", r: "26", stroke_opacity: "0.36", stroke_width: "1.1" }
+                        line { x1: "150", y1: "38", x2: "150", y2: "46", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "150", y1: "154", x2: "150", y2: "162", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "88", y1: "100", x2: "96", y2: "100", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "204", y1: "100", x2: "212", y2: "100", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                    }
+                    circle { cx: "150", cy: "100", r: "4.2", fill: "#5eead4", opacity: "0.74" }
                 }
             }
         }
 
+        // Warm candlelight vertical glow pillars & subtle table reflection hairline
         "dinner_groove" => {
             let dg = format!("ms-{p}-din-rg");
+            let col = format!("ms-{p}-din-col");
+            let col_warm = format!("ms-{p}-din-colw");
             let dg_url = format!("url(#{dg})");
+            let col_url = format!("url(#{col})");
+            let col_warm_url = format!("url(#{col_warm})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{dg}", cx: "78%", cy: "56%", r: "56%",
-                            stop { offset: "0%", stop_color: "#f59e0b", stop_opacity: "0.26" }
-                            stop { offset: "52%", stop_color: "#fb7185", stop_opacity: "0.10" }
+                        radialGradient { id: "{dg}", cx: "80%", cy: "58%", r: "58%",
+                            stop { offset: "0%", stop_color: "#f59e0b", stop_opacity: "0.28" }
+                            stop { offset: "52%", stop_color: "#fb7185", stop_opacity: "0.11" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{dg_url}" }
-                    g { fill: "none", stroke: "#fbbf24",
-                        circle { cx: "320", cy: "116", r: "26", stroke_opacity: "0.30", stroke_width: "1.1" }
-                        circle { cx: "320", cy: "116", r: "46", stroke_opacity: "0.20", stroke_width: "1" }
-                        circle { cx: "320", cy: "116", r: "68", stroke_opacity: "0.12", stroke_width: "0.9" }
-                    }
-                    g { fill: "none", stroke: "#fda4af",
-                        circle { cx: "272", cy: "134", r: "36", stroke_opacity: "0.18", stroke_width: "1" }
-                    }
-                    circle { cx: "320", cy: "116", r: "5", fill: "#fde68a", opacity: "0.42" }
                 }
-            }
-        }
-
-        // Inspired by B from generate_friday.py: Nocturnal City Skyline & Neon Glow
-        "late_night" => {
-            let sky = format!("ms-{p}-ln-sky");
-            let bldg = format!("ms-{p}-ln-bldg");
-            let sky_url = format!("url(#{sky})");
-            let bldg_url = format!("url(#{bldg})");
-            rsx! {
                 svg {
-                    view_box: "0 0 600 184",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{sky}", cx: "76%", cy: "82%", r: "55%",
-                            stop { offset: "0%", stop_color: "#ff00ff", stop_opacity: "0.30" }
-                            stop { offset: "48%", stop_color: "#38bdf8", stop_opacity: "0.12" }
-                            stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
+                        linearGradient { id: "{col}", x1: "0", y1: "1", x2: "0", y2: "0",
+                            stop { offset: "0%", stop_color: "#f59e0b", stop_opacity: "0.02" }
+                            stop { offset: "26%", stop_color: "#fbbf24", stop_opacity: "0.28" }
+                            stop { offset: "72%", stop_color: "#fda4af", stop_opacity: "0.14" }
+                            stop { offset: "100%", stop_color: "#fda4af", stop_opacity: "0" }
                         }
-                        linearGradient { id: "{bldg}", x1: "0", y1: "0", x2: "0", y2: "1",
-                            stop { offset: "0%", stop_color: "#2a1246", stop_opacity: "0.88" }
-                            stop { offset: "100%", stop_color: "#110621", stop_opacity: "0.95" }
+                        linearGradient { id: "{col_warm}", x1: "0", y1: "1", x2: "0", y2: "0",
+                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.04" }
+                            stop { offset: "30%", stop_color: "#fde68a", stop_opacity: "0.36" }
+                            stop { offset: "75%", stop_color: "#fbbf24", stop_opacity: "0.14" }
+                            stop { offset: "100%", stop_color: "#fbbf24", stop_opacity: "0" }
                         }
                     }
-                    rect { width: "600", height: "184", fill: "{sky_url}" }
-                    g { fill: "#220f3b", opacity: "0.65",
-                        rect { x: "330", y: "106", width: "24", height: "78" }
-                        rect { x: "386", y: "76", width: "28", height: "108" }
-                        rect { x: "442", y: "64", width: "32", height: "120" }
-                        rect { x: "498", y: "88", width: "26", height: "96" }
-                        rect { x: "546", y: "72", width: "34", height: "112" }
-                    }
-                    g { fill: "{bldg_url}", stroke: "rgba(244,114,244,0.22)", stroke_width: "0.9",
-                        rect { x: "352", y: "122", width: "28", height: "62" }
-                        rect { x: "404", y: "92", width: "34", height: "92" }
-                        rect { x: "466", y: "78", width: "36", height: "106" }
-                        rect { x: "518", y: "104", width: "30", height: "80" }
-                    }
-                    line { x1: "484", y1: "54", x2: "484", y2: "78", stroke: "#f472f4", stroke_opacity: "0.45", stroke_width: "1.2" }
-                    circle { cx: "484", cy: "54", r: "2", fill: "#ff00ff", opacity: "0.8" }
-                    g {
-                        rect { x: "411", y: "102", width: "5", height: "3", fill: "#fde68a", opacity: "0.65" }
-                        rect { x: "421", y: "102", width: "5", height: "3", fill: "#f472f4", opacity: "0.55" }
-                        rect { x: "411", y: "112", width: "5", height: "3", fill: "#fde68a", opacity: "0.45" }
-                        rect { x: "421", y: "122", width: "5", height: "3", fill: "#33ffb0", opacity: "0.65" }
-                        rect { x: "411", y: "136", width: "5", height: "3", fill: "#fde68a", opacity: "0.55" }
-                        rect { x: "474", y: "90", width: "6", height: "3", fill: "#33ffb0", opacity: "0.65" }
-                        rect { x: "486", y: "90", width: "6", height: "3", fill: "#fde68a", opacity: "0.55" }
-                        rect { x: "474", y: "102", width: "6", height: "3", fill: "#f472f4", opacity: "0.65" }
-                        rect { x: "486", y: "114", width: "6", height: "3", fill: "#fde68a", opacity: "0.70" }
-                        rect { x: "474", y: "128", width: "6", height: "3", fill: "#38bdf8", opacity: "0.55" }
-                        rect { x: "486", y: "142", width: "6", height: "3", fill: "#f472f4", opacity: "0.50" }
-                        rect { x: "525", y: "114", width: "5", height: "3", fill: "#fde68a", opacity: "0.60" }
-                        rect { x: "535", y: "126", width: "5", height: "3", fill: "#33ffb0", opacity: "0.55" }
-                        rect { x: "360", y: "134", width: "5", height: "3", fill: "#f472f4", opacity: "0.50" }
-                        rect { x: "360", y: "148", width: "5", height: "3", fill: "#fde68a", opacity: "0.50" }
-                    }
+                    rect { x: "108", y: "88", width: "10", height: "66", rx: "5", fill: "{col_url}" }
+                    rect { x: "128", y: "62", width: "12", height: "92", rx: "6", fill: "{col_warm_url}" }
+                    rect { x: "150", y: "48", width: "14", height: "106", rx: "7", fill: "{col_warm_url}" }
+                    rect { x: "174", y: "72", width: "11", height: "82", rx: "5.5", fill: "{col_url}" }
+                    rect { x: "194", y: "98", width: "9", height: "56", rx: "4.5", fill: "{col_url}", opacity: "0.75" }
+                    circle { cx: "134", cy: "78", r: "2.0", fill: "#fef3c7", opacity: "0.62" }
+                    circle { cx: "157", cy: "64", r: "2.4", fill: "#fef3c7", opacity: "0.76" }
+                    circle { cx: "179.5", cy: "86", r: "1.6", fill: "#fde68a", opacity: "0.55" }
+                    line { x1: "86", y1: "156", x2: "218", y2: "156", stroke: "#fbbf24", stroke_opacity: "0.22", stroke_width: "1", stroke_linecap: "round" }
                 }
             }
         }
 
-        "sunday_morning" => {
-            let smg = format!("ms-{p}-sunm-rg");
-            let steam = format!("ms-{p}-sunm-steam");
-            let smg_url = format!("url(#{smg})");
-            let steam_url = format!("url(#{steam})");
+        // Nocturnal frequency: sleek after-hours sine ribbon and sparse starlight pinpoints
+        "late_night" => {
+            let sky = format!("ms-{p}-ln-sky");
+            let wave = format!("ms-{p}-ln-wave");
+            let sky_url = format!("url(#{sky})");
+            let wave_url = format!("url(#{wave})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{smg}", cx: "76%", cy: "52%", r: "56%",
-                            stop { offset: "0%", stop_color: "#f59e0b", stop_opacity: "0.24" }
-                            stop { offset: "55%", stop_color: "#fed7aa", stop_opacity: "0.08" }
+                        radialGradient { id: "{sky}", cx: "78%", cy: "48%", r: "58%",
+                            stop { offset: "0%", stop_color: "#a855f7", stop_opacity: "0.28" }
+                            stop { offset: "52%", stop_color: "#38bdf8", stop_opacity: "0.10" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
-                        linearGradient { id: "{steam}", x1: "0", y1: "1", x2: "0", y2: "0",
-                            stop { offset: "0%", stop_color: "#fed7aa", stop_opacity: "0.42" }
-                            stop { offset: "100%", stop_color: "#fed7aa", stop_opacity: "0" }
+                    }
+                    rect { width: "400", height: "200", fill: "{sky_url}" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{wave}", x1: "0", y1: "0", x2: "1", y2: "0",
+                            stop { offset: "0%", stop_color: "#c084fc", stop_opacity: "0" }
+                            stop { offset: "30%", stop_color: "#d8b4fe", stop_opacity: "0.68" }
+                            stop { offset: "76%", stop_color: "#7dd3fc", stop_opacity: "0.58" }
+                            stop { offset: "100%", stop_color: "#38bdf8", stop_opacity: "0.14" }
+                        }
+                    }
+                    line { x1: "48", y1: "106", x2: "226", y2: "106", stroke: "#d8b4fe", stroke_opacity: "0.12", stroke_width: "0.9" }
+                    path {
+                        d: "M24 106 C64 62, 108 148, 152 94 C182 58, 208 82, 232 98",
+                        fill: "none",
+                        stroke: "#c084fc",
+                        stroke_width: "8",
+                        stroke_linecap: "round",
+                        opacity: "0.12",
+                    }
+                    path {
+                        d: "M24 106 C64 62, 108 148, 152 94 C182 58, 208 82, 232 98",
+                        fill: "none",
+                        stroke: "{wave_url}",
+                        stroke_width: "1.6",
+                        stroke_linecap: "round",
+                    }
+                    path {
+                        d: "M38 118 C80 86, 122 152, 168 112 C196 86, 214 96, 232 108",
+                        fill: "none",
+                        stroke: "{wave_url}",
+                        stroke_width: "1.0",
+                        stroke_linecap: "round",
+                        opacity: "0.42",
+                    }
+                    circle { cx: "116", cy: "56", r: "1.4", fill: "#e9d5ff", opacity: "0.48" }
+                    circle { cx: "176", cy: "46", r: "1.8", fill: "#bae6fd", opacity: "0.54" }
+                    circle { cx: "204", cy: "138", r: "1.3", fill: "#d8b4fe", opacity: "0.38" }
+                }
+            }
+        }
+
+        // Slow sunlit slats pouring diagonally across a warm studio room
+        "sunday_morning" => {
+            let smg = format!("ms-{p}-sunm-rg");
+            let slat = format!("ms-{p}-sunm-slat");
+            let smg_url = format!("url(#{smg})");
+            let slat_url = format!("url(#{slat})");
+            rsx! {
+                svg {
+                    view_box: "0 0 400 200",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{smg}", cx: "80%", cy: "38%", r: "60%",
+                            stop { offset: "0%", stop_color: "#f59e0b", stop_opacity: "0.26" }
+                            stop { offset: "55%", stop_color: "#fed7aa", stop_opacity: "0.10" }
+                            stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{smg_url}" }
-                    g { fill: "none", stroke: "{steam_url}", stroke_width: "1.5", stroke_linecap: "round",
-                        path { d: "M294 148 C286 126 304 108 294 84 C288 70 296 58 294 46" }
-                        path { d: "M314 144 C306 122 324 102 314 78 C308 64 316 52 314 38", opacity: "0.85" }
-                        path { d: "M334 150 C326 130 342 112 334 90 C328 76 336 66 334 56", opacity: "0.65" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{slat}", x1: "1", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", stop_color: "#fef3c7", stop_opacity: "0.34" }
+                            stop { offset: "55%", stop_color: "#fdba74", stop_opacity: "0.14" }
+                            stop { offset: "100%", stop_color: "#fdba74", stop_opacity: "0" }
+                        }
                     }
-                    ellipse { cx: "314", cy: "162", rx: "38", ry: "7", fill: "none", stroke: "#fed7aa", stroke_opacity: "0.22", stroke_width: "1.1" }
+                    g { fill: "{slat_url}",
+                        polygon { points: "152,0 178,0 82,200 56,200", opacity: "0.42" }
+                        polygon { points: "186,0 208,0 112,200 90,200", opacity: "0.68" }
+                        polygon { points: "216,0 232,0 140,200 124,200", opacity: "0.52" }
+                        polygon { points: "240,18 240,56 174,200 156,200", opacity: "0.34" }
+                    }
+                    circle { cx: "142", cy: "72", r: "1.8", fill: "#fef3c7", opacity: "0.56" }
+                    circle { cx: "174", cy: "108", r: "1.4", fill: "#fed7aa", opacity: "0.46" }
+                    circle { cx: "122", cy: "132", r: "1.2", fill: "#fde68a", opacity: "0.38" }
                 }
             }
         }
@@ -980,8 +1065,8 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                     class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{cg}", cx: "80%", cy: "32%", r: "62%",
-                            stop { offset: "0%", stop_color: "#33ffb0", stop_opacity: "0.22" }
+                        radialGradient { id: "{cg}", cx: "80%", cy: "34%", r: "62%",
+                            stop { offset: "0%", stop_color: "#33ffb0", stop_opacity: "0.24" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
@@ -992,11 +1077,13 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                     preserve_aspect_ratio: "xMaxYMid meet",
                     class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
+                    circle { cx: "194", cy: "94", r: "26", fill: "none", stroke: "#33ffb0", stroke_opacity: "0.18", stroke_width: "1" }
                     g { fill: "none", stroke: "#33ffb0", stroke_linecap: "round",
-                        path { d: "M104 92 Q154 64 204 92 T260 92", stroke_opacity: "0.30", stroke_width: "1.3" }
-                        path { d: "M92 108 Q148 80 204 108 T260 108", stroke_opacity: "0.22", stroke_width: "1.1" }
-                        path { d: "M116 124 Q166 98 216 124 T260 124", stroke_opacity: "0.14", stroke_width: "1" }
+                        path { d: "M96 86 Q146 60 196 86 T260 86", stroke_opacity: "0.34", stroke_width: "1.3" }
+                        path { d: "M84 102 Q140 76 196 102 T260 102", stroke_opacity: "0.24", stroke_width: "1.1" }
+                        path { d: "M108 118 Q158 94 208 118 T260 118", stroke_opacity: "0.15", stroke_width: "1" }
                     }
+                    circle { cx: "194", cy: "94", r: "3.5", fill: "#33ffb0", opacity: "0.68" }
                 }
             }
         }
@@ -1024,13 +1111,15 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                     preserve_aspect_ratio: "xMaxYMid meet",
                     class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
+                    path { d: "M204 94 L242 68 A46 46 0 0 1 248 106 Z", fill: "#33ffb0", opacity: "0.08" }
                     g { fill: "none", stroke: "#f472f4",
                         circle { cx: "204", cy: "94", r: "22", stroke_opacity: "0.30", stroke_width: "1.1" }
                         circle { cx: "204", cy: "94", r: "42", stroke_opacity: "0.20", stroke_width: "1", stroke_dasharray: "18 10" }
                         circle { cx: "204", cy: "94", r: "64", stroke_opacity: "0.13", stroke_width: "0.9" }
                     }
-                    line { x1: "204", y1: "94", x2: "242", y2: "68", stroke: "#33ffb0", stroke_opacity: "0.42", stroke_width: "1.2", stroke_linecap: "round" }
-                    circle { cx: "204", cy: "94", r: "3.2", fill: "#33ffb0", opacity: "0.65" }
+                    line { x1: "204", y1: "94", x2: "242", y2: "68", stroke: "#33ffb0", stroke_opacity: "0.46", stroke_width: "1.2", stroke_linecap: "round" }
+                    circle { cx: "204", cy: "94", r: "3.2", fill: "#33ffb0", opacity: "0.70" }
+                    circle { cx: "234", cy: "74", r: "2.0", fill: "#f472f4", opacity: "0.58" }
                 }
             }
         }
@@ -1061,193 +1150,328 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                     g { fill: "none", stroke: "#f0abfc",
                         circle { cx: "202", cy: "94", r: "48", stroke_opacity: "0.20", stroke_width: "1", stroke_dasharray: "6 6" }
                         circle { cx: "202", cy: "94", r: "28", stroke_opacity: "0.28", stroke_width: "1" }
+                        line { x1: "202", y1: "38", x2: "202", y2: "44", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "202", y1: "144", x2: "202", y2: "150", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "146", y1: "94", x2: "152", y2: "94", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
+                        line { x1: "252", y1: "94", x2: "258", y2: "94", stroke_opacity: "0.34", stroke_width: "1", stroke_linecap: "round" }
                     }
-                    path { d: "M202 68 L206 90 L228 94 L206 98 L202 120 L198 98 L176 94 L198 90 Z", fill: "#f0abfc", opacity: "0.34" }
+                    path {
+                        d: "M202 64 Q204 92 232 94 Q204 96 202 124 Q200 96 172 94 Q200 92 202 64 Z",
+                        fill: "#f0abfc",
+                        opacity: "0.42",
+                    }
                 }
             }
         }
 
         // --- Seasonal Mixes ---
+        // Minimalist anamorphic winter starlight & soft warm holiday bokeh spheres
         "winter_holiday" | "noel" | "christmas" => {
             let wh = format!("ms-{p}-wh-rg");
+            let bokeh = format!("ms-{p}-wh-bk");
+            let vbeam = format!("ms-{p}-wh-vb");
+            let hbeam = format!("ms-{p}-wh-hb");
             let wh_url = format!("url(#{wh})");
+            let bokeh_url = format!("url(#{bokeh})");
+            let vbeam_url = format!("url(#{vbeam})");
+            let hbeam_url = format!("url(#{hbeam})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{wh}", cx: "78%", cy: "38%", r: "58%",
-                            stop { offset: "0%", stop_color: "#ffd166", stop_opacity: "0.26" }
-                            stop { offset: "52%", stop_color: "#34d399", stop_opacity: "0.09" }
+                        radialGradient { id: "{wh}", cx: "78%", cy: "44%", r: "58%",
+                            stop { offset: "0%", stop_color: "#ffd166", stop_opacity: "0.28" }
+                            stop { offset: "52%", stop_color: "#34d399", stop_opacity: "0.11" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{wh_url}" }
-                    g { stroke: "#ffd166", stroke_linecap: "round", fill: "none",
-                        line { x1: "312", y1: "48", x2: "312", y2: "104", stroke_opacity: "0.42", stroke_width: "1.2" }
-                        line { x1: "284", y1: "76", x2: "340", y2: "76", stroke_opacity: "0.42", stroke_width: "1.2" }
-                        line { x1: "294", y1: "58", x2: "330", y2: "94", stroke_opacity: "0.26", stroke_width: "1" }
-                        line { x1: "330", y1: "58", x2: "294", y2: "94", stroke_opacity: "0.26", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{bokeh}", cx: "50%", cy: "50%", r: "50%",
+                            stop { offset: "0%", stop_color: "#fef08a", stop_opacity: "0.34" }
+                            stop { offset: "60%", stop_color: "#ffd166", stop_opacity: "0.12" }
+                            stop { offset: "100%", stop_color: "#ffd166", stop_opacity: "0" }
+                        }
+                        linearGradient { id: "{vbeam}", x1: "0", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", stop_color: "#fef08a", stop_opacity: "0" }
+                            stop { offset: "50%", stop_color: "#fffbeb", stop_opacity: "0.85" }
+                            stop { offset: "100%", stop_color: "#fef08a", stop_opacity: "0" }
+                        }
+                        linearGradient { id: "{hbeam}", x1: "0", y1: "0", x2: "1", y2: "0",
+                            stop { offset: "0%", stop_color: "#fef08a", stop_opacity: "0" }
+                            stop { offset: "50%", stop_color: "#fffbeb", stop_opacity: "0.85" }
+                            stop { offset: "100%", stop_color: "#fef08a", stop_opacity: "0" }
+                        }
                     }
-                    path { d: "M270 156 L312 118 L354 156 M284 176 L312 148 L340 176", fill: "none", stroke: "#6ee7b7", stroke_opacity: "0.22", stroke_width: "1.1", stroke_linecap: "round", stroke_linejoin: "round" }
-                    circle { cx: "312", cy: "76", r: "3.5", fill: "#fef08a", opacity: "0.70" }
+                    circle { cx: "110", cy: "126", r: "22", fill: "{bokeh_url}", opacity: "0.62" }
+                    circle { cx: "194", cy: "118", r: "15", fill: "{bokeh_url}", opacity: "0.52" }
+                    circle { cx: "156", cy: "82", r: "34", fill: "{bokeh_url}", opacity: "0.85" }
+                    rect { x: "155.3", y: "26", width: "1.4", height: "112", rx: "0.7", fill: "{vbeam_url}" }
+                    rect { x: "106", y: "81.3", width: "100", height: "1.4", rx: "0.7", fill: "{hbeam_url}" }
+                    line { x1: "136", y1: "62", x2: "176", y2: "102", stroke: "#fef08a", stroke_opacity: "0.24", stroke_width: "0.9", stroke_linecap: "round" }
+                    line { x1: "176", y1: "62", x2: "136", y2: "102", stroke: "#fef08a", stroke_opacity: "0.24", stroke_width: "0.9", stroke_linecap: "round" }
+                    circle { cx: "156", cy: "82", r: "3.2", fill: "#fffbeb", opacity: "0.94" }
+                    circle { cx: "102", cy: "54", r: "1.5", fill: "#6ee7b7", opacity: "0.52" }
+                    circle { cx: "204", cy: "140", r: "1.6", fill: "#ffd166", opacity: "0.54" }
                 }
             }
         }
 
+        // Champagne long-exposure radial light burst & soft bokeh
         "new_years_eve" | "nye" => {
             let nye = format!("ms-{p}-nye-rg");
+            let bk = format!("ms-{p}-nye-bk");
             let nye_url = format!("url(#{nye})");
+            let bk_url = format!("url(#{bk})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{nye}", cx: "78%", cy: "42%", r: "56%",
+                        radialGradient { id: "{nye}", cx: "78%", cy: "48%", r: "58%",
                             stop { offset: "0%", stop_color: "#fde047", stop_opacity: "0.28" }
-                            stop { offset: "50%", stop_color: "#f472f4", stop_opacity: "0.12" }
+                            stop { offset: "52%", stop_color: "#f472f4", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{nye_url}" }
-                    g { stroke: "#fde047", stroke_linecap: "round", stroke_width: "1.1", opacity: "0.34",
-                        line { x1: "316", y1: "92", x2: "316", y2: "46" }
-                        line { x1: "316", y1: "92", x2: "354", y2: "64" }
-                        line { x1: "316", y1: "92", x2: "360", y2: "104" }
-                        line { x1: "316", y1: "92", x2: "340", y2: "136" }
-                        line { x1: "316", y1: "92", x2: "278", y2: "126" }
-                        line { x1: "316", y1: "92", x2: "272", y2: "80" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{bk}", cx: "50%", cy: "50%", r: "50%",
+                            stop { offset: "0%", stop_color: "#fef08a", stop_opacity: "0.42" }
+                            stop { offset: "65%", stop_color: "#fde047", stop_opacity: "0.12" }
+                            stop { offset: "100%", stop_color: "#fde047", stop_opacity: "0" }
+                        }
                     }
-                    circle { cx: "256", cy: "148", r: "1.8", fill: "#fde047", opacity: "0.45" }
-                    circle { cx: "286", cy: "54", r: "1.5", fill: "#f472f4", opacity: "0.50" }
-                    circle { cx: "368", cy: "132", r: "2", fill: "#33ffb0", opacity: "0.40" }
+                    circle { cx: "152", cy: "98", r: "34", fill: "{bk_url}", opacity: "0.75" }
+                    circle { cx: "106", cy: "136", r: "14", fill: "{bk_url}", opacity: "0.52" }
+                    circle { cx: "194", cy: "138", r: "10", fill: "{bk_url}", opacity: "0.42" }
+                    g { stroke: "#fef08a", stroke_linecap: "round",
+                        line { x1: "152", y1: "84", x2: "152", y2: "42", stroke_width: "1.2", opacity: "0.56" }
+                        line { x1: "160", y1: "87", x2: "184", y2: "54", stroke_width: "1.1", opacity: "0.46" }
+                        line { x1: "165", y1: "94", x2: "206", y2: "80", stroke_width: "1.2", opacity: "0.52" }
+                        line { x1: "165", y1: "103", x2: "200", y2: "118", stroke_width: "1.0", opacity: "0.40" }
+                        line { x1: "159", y1: "110", x2: "178", y2: "144", stroke_width: "1.1", opacity: "0.44" }
+                        line { x1: "148", y1: "112", x2: "140", y2: "150", stroke_width: "1.0", opacity: "0.38" }
+                        line { x1: "140", y1: "106", x2: "106", y2: "128", stroke_width: "1.2", opacity: "0.48" }
+                        line { x1: "138", y1: "97", x2: "98", y2: "94", stroke_width: "1.1", opacity: "0.42" }
+                        line { x1: "143", y1: "88", x2: "116", y2: "62", stroke_width: "1.0", opacity: "0.44" }
+                    }
+                    circle { cx: "152", cy: "98", r: "3.4", fill: "#fffbeb", opacity: "0.88" }
+                    circle { cx: "152", cy: "40", r: "1.6", fill: "#fde047", opacity: "0.70" }
+                    circle { cx: "208", cy: "79", r: "1.6", fill: "#f472f4", opacity: "0.66" }
+                    circle { cx: "104", cy: "129", r: "1.5", fill: "#fef08a", opacity: "0.64" }
+                    circle { cx: "114", cy: "60", r: "1.4", fill: "#f472f4", opacity: "0.58" }
                 }
             }
         }
 
+        // Soft horizontal hearth-light bands meeting quiet drifting frost specks
         "cozy_winter" => {
             let cw = format!("ms-{p}-cw-rg");
+            let band = format!("ms-{p}-cw-band");
             let cw_url = format!("url(#{cw})");
+            let band_url = format!("url(#{band})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{cw}", cx: "76%", cy: "62%", r: "58%",
-                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.26" }
-                            stop { offset: "52%", stop_color: "#93c5fd", stop_opacity: "0.10" }
+                        radialGradient { id: "{cw}", cx: "78%", cy: "66%", r: "60%",
+                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.30" }
+                            stop { offset: "50%", stop_color: "#93c5fd", stop_opacity: "0.10" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{cw_url}" }
-                    g { fill: "none", stroke: "#fdba74",
-                        path { d: "M246 176 A66 66 0 0 1 378 176", stroke_opacity: "0.24", stroke_width: "1.2" }
-                        path { d: "M268 176 A44 44 0 0 1 356 176", stroke_opacity: "0.30", stroke_width: "1.2" }
-                        path { d: "M290 176 A22 22 0 0 1 334 176", stroke_opacity: "0.38", stroke_width: "1.2" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{band}", x1: "0", y1: "0", x2: "1", y2: "0",
+                            stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0" }
+                            stop { offset: "52%", stop_color: "#fdba74", stop_opacity: "0.46" }
+                            stop { offset: "100%", stop_color: "#fde68a", stop_opacity: "0.06" }
+                        }
                     }
-                    g { stroke: "#bae6fd", stroke_linecap: "round", stroke_width: "1.1", opacity: "0.34",
-                        line { x1: "272", y1: "54", x2: "272", y2: "70" }
-                        line { x1: "265", y1: "58", x2: "279", y2: "66" }
-                        line { x1: "265", y1: "66", x2: "279", y2: "58" }
-                    }
+                    rect { x: "66", y: "112", width: "148", height: "10", rx: "5", fill: "{band_url}", opacity: "0.28" }
+                    rect { x: "52", y: "130", width: "166", height: "12", rx: "6", fill: "{band_url}", opacity: "0.48" }
+                    rect { x: "78", y: "150", width: "136", height: "8", rx: "4", fill: "{band_url}", opacity: "0.34" }
+                    rect { x: "104", y: "166", width: "92", height: "2", rx: "1", fill: "{band_url}", opacity: "0.52" }
+                    circle { cx: "116", cy: "62", r: "1.6", fill: "#bae6fd", opacity: "0.46" }
+                    circle { cx: "152", cy: "48", r: "2.2", fill: "#e0f2fe", opacity: "0.42" }
+                    circle { cx: "184", cy: "70", r: "1.4", fill: "#bae6fd", opacity: "0.48" }
+                    circle { cx: "138", cy: "86", r: "1.3", fill: "#fed7aa", opacity: "0.44" }
                 }
             }
         }
 
+        // Imperial moon-gate & burnished gold disc
         "lunar_new_year" => {
             let lny = format!("ms-{p}-lny-rg");
+            let disc = format!("ms-{p}-lny-disc");
             let lny_url = format!("url(#{lny})");
+            let disc_url = format!("url(#{disc})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{lny}", cx: "78%", cy: "48%", r: "56%",
+                        radialGradient { id: "{lny}", cx: "78%", cy: "50%", r: "58%",
                             stop { offset: "0%", stop_color: "#fb7185", stop_opacity: "0.28" }
-                            stop { offset: "50%", stop_color: "#fbbf24", stop_opacity: "0.14" }
+                            stop { offset: "52%", stop_color: "#fbbf24", stop_opacity: "0.14" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{lny_url}" }
-                    line { x1: "314", y1: "0", x2: "314", y2: "56", stroke: "#fbbf24", stroke_opacity: "0.36", stroke_width: "1.1" }
-                    g { fill: "none", stroke: "#fbbf24",
-                        ellipse { cx: "314", cy: "98", rx: "34", ry: "38", stroke_opacity: "0.30", stroke_width: "1.2" }
-                        ellipse { cx: "314", cy: "98", rx: "18", ry: "38", stroke_opacity: "0.22", stroke_width: "1" }
-                        line { x1: "314", y1: "60", x2: "314", y2: "136", stroke_opacity: "0.22", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{disc}", cx: "50%", cy: "50%", r: "50%",
+                            stop { offset: "0%", stop_color: "#fde68a", stop_opacity: "0.42" }
+                            stop { offset: "72%", stop_color: "#fbbf24", stop_opacity: "0.16" }
+                            stop { offset: "100%", stop_color: "#fb7185", stop_opacity: "0.04" }
+                        }
                     }
-                    line { x1: "314", y1: "138", x2: "314", y2: "168", stroke: "#fda4af", stroke_opacity: "0.36", stroke_width: "1.2" }
+                    circle { cx: "154", cy: "100", r: "34", fill: "{disc_url}" }
+                    circle { cx: "154", cy: "100", r: "48", fill: "none", stroke: "#fbbf24", stroke_opacity: "0.38", stroke_width: "1.2" }
+                    path { d: "M108 56 A64 64 0 0 0 108 144", fill: "none", stroke: "#fbbf24", stroke_opacity: "0.22", stroke_width: "1", stroke_linecap: "round" }
+                    path { d: "M200 56 A64 64 0 0 1 200 144", fill: "none", stroke: "#fbbf24", stroke_opacity: "0.22", stroke_width: "1", stroke_linecap: "round" }
+                    line { x1: "154", y1: "22", x2: "154", y2: "42", stroke: "#fbbf24", stroke_opacity: "0.38", stroke_width: "1.1", stroke_linecap: "round" }
+                    line { x1: "154", y1: "158", x2: "154", y2: "178", stroke: "#fda4af", stroke_opacity: "0.42", stroke_width: "1.1", stroke_linecap: "round" }
+                    circle { cx: "154", cy: "178", r: "2.0", fill: "#fda4af", opacity: "0.68" }
                 }
             }
         }
 
+        // Velvet cinema bokeh duet: two softly glowing light spheres with delicate rim gleam
         "valentines" => {
             let val = format!("ms-{p}-val-rg");
+            let orb_a = format!("ms-{p}-val-oa");
+            let orb_b = format!("ms-{p}-val-ob");
             let val_url = format!("url(#{val})");
+            let orb_a_url = format!("url(#{orb_a})");
+            let orb_b_url = format!("url(#{orb_b})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{val}", cx: "78%", cy: "48%", r: "56%",
-                            stop { offset: "0%", stop_color: "#f472b6", stop_opacity: "0.28" }
-                            stop { offset: "52%", stop_color: "#c084fc", stop_opacity: "0.10" }
+                        radialGradient { id: "{val}", cx: "78%", cy: "50%", r: "56%",
+                            stop { offset: "0%", stop_color: "#f472b6", stop_opacity: "0.26" }
+                            stop { offset: "54%", stop_color: "#c084fc", stop_opacity: "0.10" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{val_url}" }
-                    g { fill: "none", stroke: "#f9a8d4",
-                        circle { cx: "294", cy: "104", r: "34", stroke_opacity: "0.28", stroke_width: "1.1" }
-                        circle { cx: "330", cy: "104", r: "34", stroke_opacity: "0.22", stroke_width: "1.1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{orb_a}", cx: "38%", cy: "38%", r: "62%",
+                            stop { offset: "0%", stop_color: "#fbcfe8", stop_opacity: "0.44" }
+                            stop { offset: "58%", stop_color: "#f472b6", stop_opacity: "0.22" }
+                            stop { offset: "100%", stop_color: "#f472b6", stop_opacity: "0" }
+                        }
+                        radialGradient { id: "{orb_b}", cx: "62%", cy: "60%", r: "62%",
+                            stop { offset: "0%", stop_color: "#e9d5ff", stop_opacity: "0.34" }
+                            stop { offset: "58%", stop_color: "#c084fc", stop_opacity: "0.16" }
+                            stop { offset: "100%", stop_color: "#c084fc", stop_opacity: "0" }
+                        }
                     }
-                    circle { cx: "262", cy: "62", r: "2", fill: "#fbcfe8", opacity: "0.42" }
-                    circle { cx: "354", cy: "148", r: "1.6", fill: "#f472b6", opacity: "0.45" }
+                    circle { cx: "136", cy: "108", r: "48", fill: "{orb_a_url}" }
+                    circle { cx: "174", cy: "92", r: "42", fill: "{orb_b_url}" }
+                    path {
+                        d: "M108 82 A38 38 0 0 1 154 74",
+                        fill: "none",
+                        stroke: "#fbcfe8",
+                        stroke_opacity: "0.36",
+                        stroke_width: "1.1",
+                        stroke_linecap: "round",
+                    }
+                    circle { cx: "198", cy: "136", r: "1.6", fill: "#fbcfe8", opacity: "0.52" }
+                    circle { cx: "98", cy: "62", r: "1.4", fill: "#f472b6", opacity: "0.46" }
                 }
             }
         }
 
+        // Syncopated prism cadence ribbons & crisp geometric diamonds
         "carnival" => {
             let crn = format!("ms-{p}-crn-rg");
             let crn_url = format!("url(#{crn})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{crn}", cx: "80%", cy: "44%", r: "58%",
+                        radialGradient { id: "{crn}", cx: "80%", cy: "46%", r: "58%",
                             stop { offset: "0%", stop_color: "#fde047", stop_opacity: "0.24" }
                             stop { offset: "48%", stop_color: "#33ffb0", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{crn_url}" }
-                    path { d: "M212 164 C264 106 318 134 392 54", fill: "none", stroke: "#fde047", stroke_opacity: "0.34", stroke_width: "1.4" }
-                    path { d: "M232 180 C286 126 336 150 404 78", fill: "none", stroke: "#33ffb0", stroke_opacity: "0.28", stroke_width: "1.2" }
-                    polygon { points: "312,62 320,72 312,82 304,72", fill: "#f472f4", opacity: "0.42" }
-                    polygon { points: "276,104 282,111 276,118 270,111", fill: "#fde047", opacity: "0.46" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    g { fill: "none", stroke_linecap: "round",
+                        path { d: "M48 154 C98 102, 152 128, 226 48", stroke: "#fde047", stroke_opacity: "0.44", stroke_width: "1.5" }
+                        path { d: "M62 168 C112 118, 166 142, 232 68", stroke: "#33ffb0", stroke_opacity: "0.36", stroke_width: "1.3" }
+                        path { d: "M78 180 C126 134, 178 156, 234 90", stroke: "#f472f4", stroke_opacity: "0.28", stroke_width: "1.1" }
+                    }
+                    polygon { points: "142,56 149,64 142,72 135,64", fill: "#fde047", opacity: "0.56" }
+                    polygon { points: "106,96 111,102 106,108 101,102", fill: "#f472f4", opacity: "0.52" }
+                    polygon { points: "192,126 198,133 192,140 186,133", fill: "#33ffb0", opacity: "0.50" }
                 }
             }
         }
 
+        // Minimalist symmetric geometric triquetra
         "celtic_spring" => {
             let cs = format!("ms-{p}-celt-rg");
             let cs_url = format!("url(#{cs})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
                         radialGradient { id: "{cs}", cx: "78%", cy: "50%", r: "56%",
@@ -1257,132 +1481,221 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                         }
                     }
                     rect { width: "400", height: "200", fill: "{cs_url}" }
-                    g { fill: "none", stroke: "#6ee7b7", stroke_width: "1.2",
-                        circle { cx: "312", cy: "82", r: "22", stroke_opacity: "0.30" }
-                        circle { cx: "294", cy: "114", r: "22", stroke_opacity: "0.26" }
-                        circle { cx: "330", cy: "114", r: "22", stroke_opacity: "0.26" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    circle { cx: "154", cy: "100", r: "56", fill: "none", stroke: "#6ee7b7", stroke_opacity: "0.18", stroke_width: "1" }
+                    circle { cx: "154", cy: "100", r: "26", fill: "none", stroke: "#34d399", stroke_opacity: "0.26", stroke_width: "1.1" }
+                    g { fill: "#34d399", fill_opacity: "0.06", stroke: "#6ee7b7", stroke_opacity: "0.46", stroke_width: "1.35", stroke_linejoin: "round",
+                        path { d: "M154 100 Q130 74 154 48 Q178 74 154 100 Z" }
+                        path { d: "M154 100 Q188.5 92.2 199 126 Q164.5 133.8 154 100 Z" }
+                        path { d: "M154 100 Q143.5 133.8 109 126 Q119.5 92.2 154 100 Z" }
                     }
+                    circle { cx: "154", cy: "100", r: "3.0", fill: "#a7f3d0", opacity: "0.72" }
                 }
             }
         }
 
+        // Vernal geometric blossom: 6 radial vesica petals with luminous center
         "spring" => {
             let sp = format!("ms-{p}-spr-rg");
             let sp_url = format!("url(#{sp})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{sp}", cx: "78%", cy: "44%", r: "58%",
+                        radialGradient { id: "{sp}", cx: "78%", cy: "48%", r: "58%",
                             stop { offset: "0%", stop_color: "#6ee7b7", stop_opacity: "0.24" }
-                            stop { offset: "52%", stop_color: "#f9a8d4", stop_opacity: "0.10" }
+                            stop { offset: "52%", stop_color: "#f9a8d4", stop_opacity: "0.11" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{sp_url}" }
-                    g { fill: "none", stroke: "#6ee7b7", stroke_width: "1.1",
-                        path { d: "M272 152 C288 110 318 82 362 66", stroke_opacity: "0.30" }
-                        path { d: "M304 114 C308 92 324 80 342 82 C338 100 324 112 304 114 Z", stroke_opacity: "0.26" }
-                        path { d: "M318 122 C338 118 352 128 354 144 C336 146 322 138 318 122 Z", stroke_opacity: "0.22" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    g { transform: "translate(154 100)",
+                        g { fill: "#6ee7b7", fill_opacity: "0.08", stroke: "#a7f3d0", stroke_opacity: "0.38", stroke_width: "1.1", stroke_linejoin: "round",
+                            path { d: "M0 -8 Q-12 -26 0 -46 Q12 -26 0 -8 Z" }
+                            path { d: "M0 -8 Q-12 -26 0 -46 Q12 -26 0 -8 Z", transform: "rotate(120)" }
+                            path { d: "M0 -8 Q-12 -26 0 -46 Q12 -26 0 -8 Z", transform: "rotate(240)" }
+                        }
+                        g { fill: "#f9a8d4", fill_opacity: "0.07", stroke: "#f9a8d4", stroke_opacity: "0.32", stroke_width: "1.0", stroke_linejoin: "round",
+                            path { d: "M0 -8 Q-11 -24 0 -42 Q11 -24 0 -8 Z", transform: "rotate(60)" }
+                            path { d: "M0 -8 Q-11 -24 0 -42 Q11 -24 0 -8 Z", transform: "rotate(180)" }
+                            path { d: "M0 -8 Q-11 -24 0 -42 Q11 -24 0 -8 Z", transform: "rotate(300)" }
+                        }
+                        circle { cx: "0", cy: "0", r: "4.0", fill: "#fbcfe8", opacity: "0.82" }
                     }
-                    circle { cx: "282", cy: "76", r: "1.8", fill: "#f9a8d4", opacity: "0.45" }
-                    circle { cx: "354", cy: "104", r: "1.5", fill: "#6ee7b7", opacity: "0.45" }
+                    circle { cx: "104", cy: "64", r: "1.4", fill: "#f9a8d4", opacity: "0.46" }
+                    circle { cx: "204", cy: "136", r: "1.5", fill: "#6ee7b7", opacity: "0.46" }
                 }
             }
         }
 
+        // Golden coast solar disc & tapering shimmer horizon
         "summer" => {
             let sm = format!("ms-{p}-sum-rg");
+            let sun = format!("ms-{p}-sum-sun");
             let sm_url = format!("url(#{sm})");
+            let sun_url = format!("url(#{sun})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{sm}", cx: "78%", cy: "42%", r: "58%",
+                        radialGradient { id: "{sm}", cx: "78%", cy: "44%", r: "58%",
                             stop { offset: "0%", stop_color: "#fb923c", stop_opacity: "0.30" }
                             stop { offset: "50%", stop_color: "#fde047", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{sm_url}" }
-                    circle { cx: "314", cy: "88", r: "26", fill: "#fdba74", opacity: "0.20" }
-                    g { fill: "none", stroke: "#fdba74", stroke_linecap: "round",
-                        path { d: "M220 140 Q262 128 304 140 T388 140", stroke_opacity: "0.28", stroke_width: "1.2" }
-                        path { d: "M236 158 Q276 146 316 158 T396 158", stroke_opacity: "0.20", stroke_width: "1.1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{sun}", x1: "0", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", stop_color: "#fef08a", stop_opacity: "0.52" }
+                            stop { offset: "65%", stop_color: "#fb923c", stop_opacity: "0.24" }
+                            stop { offset: "100%", stop_color: "#f472b6", stop_opacity: "0.06" }
+                        }
                     }
+                    circle { cx: "154", cy: "82", r: "34", fill: "{sun_url}" }
+                    circle { cx: "154", cy: "82", r: "43", fill: "none", stroke: "#fed7aa", stroke_opacity: "0.20", stroke_width: "1" }
+                    rect { x: "66", y: "128", width: "156", height: "1.3", rx: "0.6", fill: "#fed7aa", opacity: "0.44" }
+                    rect { x: "94", y: "140", width: "120", height: "1.3", rx: "0.6", fill: "#fdba74", opacity: "0.34" }
+                    rect { x: "112", y: "151", width: "84", height: "1.2", rx: "0.6", fill: "#fdba74", opacity: "0.26" }
+                    rect { x: "128", y: "162", width: "52", height: "1.1", rx: "0.5", fill: "#fde047", opacity: "0.18" }
+                    rect { x: "140", y: "173", width: "28", height: "1.0", rx: "0.5", fill: "#fde047", opacity: "0.12" }
                 }
             }
         }
 
+        // Celestial zenith corona & tilted ecliptic orbit (no crosshair)
         "summer_solstice" => {
             let ss = format!("ms-{p}-sol-rg");
             let ss_url = format!("url(#{ss})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{ss}", cx: "78%", cy: "44%", r: "58%",
-                            stop { offset: "0%", stop_color: "#fde047", stop_opacity: "0.30" }
+                        radialGradient { id: "{ss}", cx: "78%", cy: "48%", r: "58%",
+                            stop { offset: "0%", stop_color: "#fde047", stop_opacity: "0.28" }
                             stop { offset: "48%", stop_color: "#f472b6", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{ss_url}" }
-                    g { fill: "none", stroke: "#fde047",
-                        circle { cx: "312", cy: "98", r: "22", stroke_opacity: "0.34", stroke_width: "1.2" }
-                        circle { cx: "312", cy: "98", r: "42", stroke_opacity: "0.22", stroke_width: "1" }
-                        line { x1: "252", y1: "98", x2: "372", y2: "98", stroke_opacity: "0.20", stroke_width: "1" }
-                        line { x1: "312", y1: "38", x2: "312", y2: "158", stroke_opacity: "0.20", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    circle {
+                        cx: "154",
+                        cy: "100",
+                        r: "48",
+                        fill: "none",
+                        stroke: "#fde047",
+                        stroke_opacity: "0.36",
+                        stroke_width: "2.2",
+                        stroke_dasharray: "1.8 10.76",
                     }
-                    circle { cx: "312", cy: "98", r: "8", fill: "#fef08a", opacity: "0.34" }
+                    circle { cx: "154", cy: "100", r: "28", fill: "none", stroke: "#fef08a", stroke_opacity: "0.28", stroke_width: "1" }
+                    ellipse {
+                        cx: "154",
+                        cy: "100",
+                        rx: "68",
+                        ry: "20",
+                        transform: "rotate(-22 154 100)",
+                        fill: "none",
+                        stroke: "#f9a8d4",
+                        stroke_opacity: "0.36",
+                        stroke_width: "1.1",
+                    }
+                    circle { cx: "154", cy: "100", r: "13", fill: "#fef08a", opacity: "0.30" }
+                    circle { cx: "154", cy: "100", r: "5.2", fill: "#fffbeb", opacity: "0.78" }
+                    circle { cx: "217", cy: "75", r: "2.4", fill: "#fde047", opacity: "0.78" }
                 }
             }
         }
 
+        // Equinox dusk horizon & mirrored half-arc reflection
         "late_summer_reset" => {
             let lsr = format!("ms-{p}-lsr-rg");
+            let dusk = format!("ms-{p}-lsr-dusk");
             let lsr_url = format!("url(#{lsr})");
+            let dusk_url = format!("url(#{dusk})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{lsr}", cx: "78%", cy: "46%", r: "56%",
-                            stop { offset: "0%", stop_color: "#f0abfc", stop_opacity: "0.24" }
+                        radialGradient { id: "{lsr}", cx: "78%", cy: "48%", r: "56%",
+                            stop { offset: "0%", stop_color: "#f0abfc", stop_opacity: "0.26" }
                             stop { offset: "50%", stop_color: "#fb923c", stop_opacity: "0.12" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{lsr_url}" }
-                    path { d: "M272 132 A40 40 0 0 1 352 132", fill: "none", stroke: "#f0abfc", stroke_opacity: "0.28", stroke_width: "1.2" }
-                    g { fill: "none", stroke: "#f0abfc", stroke_linecap: "round",
-                        line { x1: "230", y1: "136", x2: "388", y2: "136", stroke_opacity: "0.24", stroke_width: "1.1" }
-                        line { x1: "252", y1: "152", x2: "384", y2: "152", stroke_opacity: "0.18", stroke_width: "1" }
-                        line { x1: "276", y1: "168", x2: "378", y2: "168", stroke_opacity: "0.12", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        linearGradient { id: "{dusk}", x1: "0", y1: "0", x2: "0", y2: "1",
+                            stop { offset: "0%", stop_color: "#f0abfc", stop_opacity: "0.38" }
+                            stop { offset: "100%", stop_color: "#fb923c", stop_opacity: "0.14" }
+                        }
                     }
+                    path { d: "M118 106 A36 36 0 0 1 190 106 Z", fill: "{dusk_url}" }
+                    path {
+                        d: "M118 106 A36 36 0 0 0 190 106",
+                        fill: "none",
+                        stroke: "#fdba74",
+                        stroke_opacity: "0.28",
+                        stroke_width: "1.1",
+                        stroke_dasharray: "4 5",
+                    }
+                    line { x1: "58", y1: "106", x2: "222", y2: "106", stroke: "#f0abfc", stroke_opacity: "0.40", stroke_width: "1.1", stroke_linecap: "round" }
+                    line { x1: "94", y1: "152", x2: "214", y2: "152", stroke: "#f0abfc", stroke_opacity: "0.18", stroke_width: "1", stroke_linecap: "round" }
+                    line { x1: "118", y1: "166", x2: "190", y2: "166", stroke: "#fdba74", stroke_opacity: "0.14", stroke_width: "1", stroke_linecap: "round" }
                 }
             }
         }
 
+        // Geometric amber drift facets along a crisp breeze curve
         "autumn" => {
             let aut = format!("ms-{p}-aut-rg");
             let aut_url = format!("url(#{aut})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
                         radialGradient { id: "{aut}", cx: "78%", cy: "48%", r: "58%",
@@ -1392,61 +1705,114 @@ pub fn render_mix_sleeve_art(slug: &str, id_prefix: &str) -> Element {
                         }
                     }
                     rect { width: "400", height: "200", fill: "{aut_url}" }
-                    g { fill: "none", stroke: "#fbbf24", stroke_linecap: "round",
-                        path { d: "M232 146 C276 122 316 140 374 108", stroke_opacity: "0.24", stroke_width: "1.1" }
-                        path { d: "M296 76 C318 68 334 78 338 96 C318 102 302 94 296 76 Z", stroke_opacity: "0.32", stroke_width: "1.1" }
-                        path { d: "M264 114 C278 108 290 114 292 126 C278 130 268 124 264 114 Z", stroke_opacity: "0.24", stroke_width: "1" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    path {
+                        d: "M48 156 Q132 126 226 62",
+                        fill: "none",
+                        stroke: "#fbbf24",
+                        stroke_opacity: "0.20",
+                        stroke_width: "1",
+                        stroke_linecap: "round",
+                    }
+                    g { transform: "translate(168 78) rotate(-24)",
+                        polygon { points: "0,-24 13,0 0,24 -13,0", fill: "#fbbf24", fill_opacity: "0.13", stroke: "#fbbf24", stroke_opacity: "0.46", stroke_width: "1.1" }
+                        line { x1: "0", y1: "-24", x2: "0", y2: "24", stroke: "#fde68a", stroke_opacity: "0.34", stroke_width: "0.9" }
+                    }
+                    g { transform: "translate(122 116) rotate(16) scale(0.76)",
+                        polygon { points: "0,-24 13,0 0,24 -13,0", fill: "#fb923c", fill_opacity: "0.11", stroke: "#fdba74", stroke_opacity: "0.36", stroke_width: "1.1" }
+                        line { x1: "0", y1: "-24", x2: "0", y2: "24", stroke: "#fed7aa", stroke_opacity: "0.28", stroke_width: "0.9" }
+                    }
+                    g { transform: "translate(202 128) rotate(-38) scale(0.56)",
+                        polygon { points: "0,-24 13,0 0,24 -13,0", fill: "#f59e0b", fill_opacity: "0.10", stroke: "#fbbf24", stroke_opacity: "0.28", stroke_width: "1.1" }
+                        line { x1: "0", y1: "-24", x2: "0", y2: "24", stroke: "#fde68a", stroke_opacity: "0.22", stroke_width: "0.9" }
                     }
                 }
             }
         }
 
+        // Minimalist blood-moon eclipse (pure corona + occulted dark disc, no orbital ring)
         "halloween" => {
             let hal = format!("ms-{p}-hal-rg");
+            let cor = format!("ms-{p}-hal-cor");
             let hal_url = format!("url(#{hal})");
+            let cor_url = format!("url(#{cor})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{hal}", cx: "78%", cy: "42%", r: "56%",
+                        radialGradient { id: "{hal}", cx: "78%", cy: "48%", r: "56%",
                             stop { offset: "0%", stop_color: "#f97316", stop_opacity: "0.28" }
-                            stop { offset: "50%", stop_color: "#a855f7", stop_opacity: "0.14" }
+                            stop { offset: "52%", stop_color: "#a855f7", stop_opacity: "0.14" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{hal_url}" }
-                    circle { cx: "316", cy: "82", r: "28", fill: "none", stroke: "#fb923c", stroke_opacity: "0.34", stroke_width: "1.3" }
-                    circle { cx: "322", cy: "80", r: "24", fill: "#1a0b28", opacity: "0.78" }
-                    polyline { points: "224,168 268,132 306,154 348,122 396,168", fill: "none", stroke: "#c084fc", stroke_opacity: "0.22", stroke_width: "1.1", stroke_linejoin: "round" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
+                    defs {
+                        radialGradient { id: "{cor}", cx: "50%", cy: "50%", r: "50%",
+                            stop { offset: "50%", stop_color: "#fb923c", stop_opacity: "0.52" }
+                            stop { offset: "72%", stop_color: "#f97316", stop_opacity: "0.22" }
+                            stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
+                        }
+                    }
+                    circle { cx: "156", cy: "98", r: "56", fill: "{cor_url}" }
+                    circle { cx: "156", cy: "98", r: "34", fill: "none", stroke: "#f97316", stroke_opacity: "0.24", stroke_width: "4" }
+                    circle { cx: "156", cy: "98", r: "32", fill: "none", stroke: "#fb923c", stroke_opacity: "0.72", stroke_width: "1.5" }
+                    circle { cx: "161", cy: "95", r: "30", fill: "#160822" }
+                    circle { cx: "104", cy: "60", r: "1.5", fill: "#c084fc", opacity: "0.48" }
+                    circle { cx: "206", cy: "138", r: "1.4", fill: "#fb923c", opacity: "0.50" }
                 }
             }
         }
 
-        // --- Default fallback: Midnight Studio violet-magenta radial wash ---
+        // --- Default fallback: Midnight Studio acoustic pulse & 4-point spark ---
         _ => {
             let def = format!("ms-{p}-def-rg");
             let def_url = format!("url(#{def})");
             rsx! {
                 svg {
                     view_box: "0 0 400 200",
-                    preserve_aspect_ratio: "xMaxYMid slice",
-                    class: "w-full h-full",
+                    preserve_aspect_ratio: "none",
+                    class: "absolute inset-0 w-full h-full",
                     "aria-hidden": "true",
                     defs {
-                        radialGradient { id: "{def}", cx: "80%", cy: "36%", r: "60%",
+                        radialGradient { id: "{def}", cx: "78%", cy: "46%", r: "58%",
                             stop { offset: "0%", stop_color: "#f472f4", stop_opacity: "0.24" }
                             stop { offset: "52%", stop_color: "#a855f7", stop_opacity: "0.10" }
                             stop { offset: "100%", stop_color: "#000000", stop_opacity: "0" }
                         }
                     }
                     rect { width: "400", height: "200", fill: "{def_url}" }
+                }
+                svg {
+                    view_box: "0 0 240 200",
+                    preserve_aspect_ratio: "xMaxYMid meet",
+                    class: "absolute inset-0 w-full h-full",
+                    "aria-hidden": "true",
                     g { fill: "none", stroke: "#f472f4",
-                        circle { cx: "324", cy: "98", r: "34", stroke_opacity: "0.18", stroke_width: "1" }
-                        circle { cx: "324", cy: "98", r: "60", stroke_opacity: "0.11", stroke_width: "0.9" }
+                        circle { cx: "154", cy: "100", r: "26", stroke_opacity: "0.28", stroke_width: "1.1" }
+                        circle { cx: "154", cy: "100", r: "46", stroke_opacity: "0.18", stroke_width: "1", stroke_dasharray: "8 6" }
+                        circle { cx: "154", cy: "100", r: "66", stroke_opacity: "0.11", stroke_width: "0.9" }
                     }
+                    path {
+                        d: "M154 84 Q155.5 98.5 170 100 Q155.5 101.5 154 116 Q152.5 101.5 138 100 Q152.5 98.5 154 84 Z",
+                        fill: "#f5d0fe",
+                        opacity: "0.56",
+                    }
+                    circle { cx: "186", cy: "67", r: "2.2", fill: "#33ffb0", opacity: "0.62" }
                 }
             }
         }
@@ -1500,7 +1866,7 @@ pub fn MixSleeveCard(
     rsx! {
         button {
             r#type: "button",
-            class: "group relative overflow-hidden rounded-[14px] border text-left flex flex-col justify-between transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.99] cursor-pointer {card_padding}",
+            class: "group relative w-full h-full overflow-hidden rounded-[14px] border text-left flex flex-col justify-between transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.99] cursor-pointer {card_padding}",
             style: "background:{theme.background};border-color:{theme.border};{card_extra_style}",
             onclick: move |_| on_play.call(slug_for_click.clone()),
 
@@ -1534,22 +1900,22 @@ pub fn MixSleeveCard(
                 }
 
                 if layout == MixSleeveLayout::Wide {
-                    div { class: "mt-4 max-w-[78%]",
+                    div { class: "mt-4", style: "max-width:68%;",
                         h3 { class: "text-[20px] sm:text-[21px] font-bold tracking-[-0.02em] leading-[1.2] text-beet-text-primary",
                             "{title}"
                         }
                         p {
                             class: "text-[13px] leading-[1.42] mt-1 line-clamp-2",
-                            style: "color:rgba(235,228,246,0.80);",
+                            style: "color:rgba(235,228,246,0.80);min-height:2.84em;",
                             "{subtitle}"
                         }
                     }
                     div {
-                        class: "mt-3.5 flex items-center gap-1.5 tabular-nums-mono text-[11px] tracking-[0.04em]",
+                        class: "mt-3.5 flex flex-wrap items-center gap-1.5 tabular-nums-mono text-[11px] tracking-[0.04em]",
                         style: "color:rgba(216,194,245,0.68);",
-                        span { "{mix.track_count} {track_word}" }
+                        span { class: "whitespace-nowrap", "{mix.track_count} {track_word}" }
                         if show_owned_pct && mix.owned_pct > 0 {
-                            span { "· {mix.owned_pct}% LIBRARY" }
+                            span { class: "whitespace-nowrap", "· {mix.owned_pct}% LIBRARY" }
                         }
                     }
                 } else {
@@ -1559,15 +1925,15 @@ pub fn MixSleeveCard(
                         }
                         p {
                             class: "text-[12px] leading-[1.42] mt-1 line-clamp-2",
-                            style: "color:rgba(235,228,246,0.78);",
+                            style: "color:rgba(235,228,246,0.78);min-height:2.84em;",
                             "{subtitle}"
                         }
                         div {
                             class: "mt-2.5 flex items-center gap-1.5 tabular-nums-mono text-[11px] tracking-[0.04em]",
                             style: "color:rgba(216,194,245,0.68);",
-                            span { "{mix.track_count} {track_word}" }
+                            span { class: "whitespace-nowrap", "{mix.track_count} {track_word}" }
                             if show_owned_pct && mix.owned_pct > 0 {
-                                span { "· {mix.owned_pct}% LIBRARY" }
+                                span { class: "whitespace-nowrap", "· {mix.owned_pct}% LIBRARY" }
                             }
                         }
                     }
@@ -1583,6 +1949,8 @@ pub fn MixSleeveCard(
 pub fn MixSleeveShelves(
     mixes: Vec<ContextualMixSummary>,
     #[props(default = "disc".to_string())] id_prefix: String,
+    #[props(default)] show_owned_pct: bool,
+    #[props(default)] header_action: Option<Element>,
     on_play: EventHandler<String>,
 ) -> Element {
     let mut right_now = Vec::new();
@@ -1599,16 +1967,30 @@ pub fn MixSleeveShelves(
         return rsx! {};
     }
 
+    let action_on_right_now = !right_now.is_empty();
+    let mut right_now_action = None;
+    let mut collection_action = None;
+    if action_on_right_now {
+        right_now_action = header_action;
+    } else {
+        collection_action = header_action;
+    }
+
     rsx! {
         div { class: "space-y-7",
             if !right_now.is_empty() {
                 section { class: "space-y-3.5",
                     div { class: "flex flex-wrap items-baseline justify-between gap-2",
-                        h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                            "Right Now"
+                        div { class: "flex flex-wrap items-baseline gap-2.5",
+                            h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
+                                "Right Now"
+                            }
+                            span { class: "tabular-nums-mono text-[11px] uppercase tracking-[0.06em] text-beet-text-tertiary",
+                                "LIVE WEATHER & TIME OF DAY"
+                            }
                         }
-                        span { class: "tabular-nums-mono text-[11px] uppercase tracking-[0.06em] text-beet-text-tertiary",
-                            "LIVE WEATHER & TIME OF DAY"
+                        if let Some(action) = right_now_action {
+                            {action}
                         }
                     }
                     div { class: "grid grid-cols-1 md:grid-cols-2 gap-4",
@@ -1618,6 +2000,7 @@ pub fn MixSleeveShelves(
                                 mix,
                                 layout: MixSleeveLayout::Wide,
                                 id_prefix: format!("{id_prefix}-rn-{idx}"),
+                                show_owned_pct,
                                 on_play,
                             }
                         }
@@ -1628,11 +2011,16 @@ pub fn MixSleeveShelves(
             if !collection.is_empty() {
                 section { class: "space-y-3.5",
                     div { class: "flex flex-wrap items-baseline justify-between gap-2",
-                        h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
-                            "From Your Collection"
+                        div { class: "flex flex-wrap items-baseline gap-2.5",
+                            h2 { class: "text-[17px] font-semibold tracking-[-0.015em] text-beet-text-primary",
+                                "From Your Collection"
+                            }
+                            span { class: "tabular-nums-mono text-[11px] uppercase tracking-[0.06em] text-beet-text-tertiary",
+                                "SMART LIBRARY & DECADE SLEEVES"
+                            }
                         }
-                        span { class: "tabular-nums-mono text-[11px] uppercase tracking-[0.06em] text-beet-text-tertiary",
-                            "SMART LIBRARY & DECADE SLEEVES"
+                        if let Some(action) = collection_action {
+                            {action}
                         }
                     }
                     div { class: "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5",
@@ -1642,6 +2030,7 @@ pub fn MixSleeveShelves(
                                 mix,
                                 layout: MixSleeveLayout::Square,
                                 id_prefix: format!("{id_prefix}-col-{idx}"),
+                                show_owned_pct: false,
                                 on_play,
                             }
                         }
@@ -2014,6 +2403,48 @@ mod tests {
             assert!(
                 !html.contains("preserveAspectRatio=\"xMaxYMid slice\""),
                 "260x260 motif `{slug}` must not use slice: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn seasonal_and_redesigned_wide_motifs_use_meet_to_prevent_hero_cropping() {
+        for slug in [
+            "morning",
+            "focus",
+            "dinner_groove",
+            "late_night",
+            "sunday_morning",
+            "winter_holiday",
+            "new_years_eve",
+            "cozy_winter",
+            "lunar_new_year",
+            "valentines",
+            "carnival",
+            "celtic_spring",
+            "spring",
+            "summer",
+            "summer_solstice",
+            "late_summer_reset",
+            "autumn",
+            "halloween",
+            "custom_unknown_slug",
+        ] {
+            let slug_owned = slug.to_string();
+            let mut dom = VirtualDom::new_with_props(
+                |s: String| render_mix_sleeve_art(&s, "hero-fit"),
+                slug_owned,
+            );
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+
+            assert!(
+                html.contains("preserveAspectRatio=\"xMaxYMid meet\""),
+                "expected xMaxYMid meet for wide/seasonal motif `{slug}`: {html}"
+            );
+            assert!(
+                !html.contains("preserveAspectRatio=\"xMaxYMid slice\""),
+                "wide/seasonal motif `{slug}` must not use slice: {html}"
             );
         }
     }

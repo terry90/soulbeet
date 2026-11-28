@@ -25,11 +25,14 @@ import org.soulbeet.app.theme.BeetCanvasOled
 import org.soulbeet.app.theme.soulbeetPaletteFor
 import org.soulbeet.app.ui.components.MixMotif
 import org.soulbeet.app.ui.components.MixShelfBucket
+import org.soulbeet.app.ui.components.ViewBoxScaleMode
 import org.soulbeet.app.ui.components.classifyMixShelf
 import org.soulbeet.app.ui.components.formatMixSleeveMeta
 import org.soulbeet.app.ui.components.formatMixSleeveTag
 import org.soulbeet.app.ui.components.mixSleeveSpecFor
+import org.soulbeet.app.ui.components.motifViewBoxSpecFor
 import org.soulbeet.app.ui.components.normalizeMixSlug
+import org.soulbeet.app.ui.components.seasonalHeroScrimSpec
 import org.soulbeet.core.FfiAudioQualityProfile
 
 @RunWith(RobolectricTestRunner::class)
@@ -306,14 +309,33 @@ class FormattingAndThemeTest {
         assertEquals(listOf("pl-disc"), state.soulbeetMixPlaylists.map { it.id })
         assertEquals(listOf("pl-disc"), state.homeFallbackMixPlaylists.map { it.id })
 
-        // Verify homeFallbackMixPlaylists deduplicates ONLY against seasonalHeroMix, keeping moment mixes visible
+        // Home renders seasonalHeroMix AND rollingAndMomentMixes split shelves, so homeFallbackMixPlaylists
+        // must exclude mixes already shown in either the hero or the split shelves (by playlist ID or slug,
+        // including hyphenated slugs from sync.rs slugify() and mix.custom. prefixes).
         val momentPl = userPl.copy(id = "pl-moment", name = "Drive", isSmart = true, kind = "moment", slug = "drive")
+        val slugMatchedPl = userPl.copy(id = "pl-evening-local", name = "Evening Unwind", isSmart = true, kind = "moment", slug = "mix.moment.evening_unwind")
+        val hyphenatedPl = userPl.copy(id = "pl-late-night", name = "Late Night", isSmart = true, kind = "moment", slug = "late-night")
+        val customPl = userPl.copy(id = "pl-custom-vibe", name = "My Vibe", isSmart = true, kind = "moment", slug = "mix.custom.my-vibe")
         val momentMix = ctxMix.copy(slug = "drive", kind = "moment", navidromePlaylistId = "pl-moment")
+        val eveningMixNoPlId = ctxMix.copy(slug = "evening_unwind", kind = "moment", navidromePlaylistId = null)
+        val lateNightNoPlId = ctxMix.copy(slug = "late_night", kind = "moment", navidromePlaylistId = null)
+        val customMixNoPlId = ctxMix.copy(slug = "my_vibe", kind = "moment", navidromePlaylistId = null)
         val stateWithMoment = AppUiState(
-            playlists = listOf(seasonalPl, momentPl, discoveryPl),
-            contextualMixes = listOf(ctxMix, momentMix),
+            playlists = listOf(seasonalPl, momentPl, slugMatchedPl, hyphenatedPl, customPl, discoveryPl),
+            contextualMixes = listOf(ctxMix, momentMix, eveningMixNoPlId, lateNightNoPlId, customMixNoPlId),
         )
-        assertEquals(listOf("pl-moment", "pl-disc"), stateWithMoment.homeFallbackMixPlaylists.map { it.id })
+        assertEquals(
+            listOf("drive", "evening_unwind", "late_night", "my_vibe"),
+            stateWithMoment.rollingAndMomentMixes.map { it.slug },
+        )
+        assertEquals(listOf("pl-disc"), stateWithMoment.homeFallbackMixPlaylists.map { it.id })
+
+        // Offline fallback: when contextualMixes is empty, homeFallbackMixPlaylists still surfaces non-empty mixes.
+        val offlineState = AppUiState(
+            playlists = listOf(seasonalPl, momentPl, discoveryPl),
+            contextualMixes = emptyList(),
+        )
+        assertEquals(listOf("pl-seasonal", "pl-moment", "pl-disc"), offlineState.homeFallbackMixPlaylists.map { it.id })
     }
 
     @Test
@@ -997,5 +1019,77 @@ class FormattingAndThemeTest {
             "Queued album for download",
             formatDownloadAlbumQueuedMessage("   "),
         )
+    }
+
+    @Test
+    fun mixSleeveMotifsUseMeetViewBoxWithoutHeroVerticalCropping() {
+        val wideSeasonalAndFallback = listOf(
+            MixMotif.MORNING,
+            MixMotif.FOCUS,
+            MixMotif.DINNER_GROOVE,
+            MixMotif.LATE_NIGHT,
+            MixMotif.SUNDAY_MORNING,
+            MixMotif.SEASONAL_WINTER_HOLIDAY,
+            MixMotif.SEASONAL_NEW_YEARS_EVE,
+            MixMotif.SEASONAL_COZY_WINTER,
+            MixMotif.SEASONAL_LUNAR_NEW_YEAR,
+            MixMotif.SEASONAL_VALENTINES,
+            MixMotif.SEASONAL_CARNIVAL,
+            MixMotif.SEASONAL_CELTIC_SPRING,
+            MixMotif.SEASONAL_SPRING,
+            MixMotif.SEASONAL_SUMMER,
+            MixMotif.SEASONAL_SUMMER_SOLSTICE,
+            MixMotif.SEASONAL_LATE_SUMMER_RESET,
+            MixMotif.SEASONAL_AUTUMN,
+            MixMotif.SEASONAL_HALLOWEEN,
+            MixMotif.FALLBACK,
+        )
+        assertEquals(19, wideSeasonalAndFallback.size)
+        for (motif in wideSeasonalAndFallback) {
+            val vb = motifViewBoxSpecFor(motif)
+            assertEquals("Expected 240 viewBox width for $motif", 240f, vb.width, 0f)
+            assertEquals("Expected 200 viewBox height for $motif", 200f, vb.height, 0f)
+            assertEquals("Expected MEET mode for $motif", ViewBoxScaleMode.MEET, vb.scaleMode)
+        }
+
+        val collectionAndRolling = listOf(
+            MixMotif.FORGOTTEN_GEMS,
+            MixMotif.FRESH_ARRIVALS,
+            MixMotif.DECADE_80S,
+            MixMotif.DECADE_90S,
+            MixMotif.DECADE_2000S,
+            MixMotif.ROLLING_COMFORT,
+            MixMotif.ROLLING_RADAR,
+            MixMotif.ROLLING_DEEP_CUTS,
+        )
+        for (motif in collectionAndRolling) {
+            val vb = motifViewBoxSpecFor(motif)
+            assertEquals("Expected 260 viewBox width for $motif", 260f, vb.width, 0f)
+            assertEquals("Expected 260 viewBox height for $motif", 260f, vb.height, 0f)
+            assertEquals("Expected MEET mode for $motif", ViewBoxScaleMode.MEET, vb.scaleMode)
+        }
+    }
+
+    @Test
+    fun updatedMixSleevePalettesAndHeroAdaptiveScrimMatchWebTokens() {
+        // Spot-check updated palettes mirrored from ui/src/components/mix_sleeve_card.rs
+        assertEquals(androidx.compose.ui.graphics.Color(0xFF341926), mixSleeveSpecFor("morning").gradientStart)
+        assertEquals(androidx.compose.ui.graphics.Color(0xFF5EEAD4), mixSleeveSpecFor("focus").pillForeground)
+        assertEquals(androidx.compose.ui.graphics.Color(0xFF33FFB0), mixSleeveSpecFor("conservative").pillForeground)
+        assertEquals(androidx.compose.ui.graphics.Color(0xFFF472F4), mixSleeveSpecFor("balanced").pillForeground)
+        assertEquals(androidx.compose.ui.graphics.Color(0xFF2C1220), mixSleeveSpecFor("winter_holiday").gradientStart)
+        assertEquals(androidx.compose.ui.graphics.Color(0xFFF0ABFC), mixSleeveSpecFor("late_summer_reset").pillForeground)
+
+        // Procedural hero scrim stays luminous on the right edge with no heavy vertical wash
+        val proceduralScrim = seasonalHeroScrimSpec(hasPhotoArt = false, isOled = false)
+        assertEquals(0.80f, proceduralScrim.horizontalStops.first().second, 0.001f)
+        assertEquals(0.06f, proceduralScrim.horizontalStops.last().second, 0.001f)
+        assertNull(proceduralScrim.verticalStops)
+
+        // Photographic hero scrim uses the heavier dual horizontal + bottom vertical scrim
+        val photoScrim = seasonalHeroScrimSpec(hasPhotoArt = true, isOled = false)
+        assertEquals(0.94f, photoScrim.horizontalStops.first().second, 0.001f)
+        assertEquals(0.48f, photoScrim.horizontalStops.last().second, 0.001f)
+        assertTrue(photoScrim.verticalStops != null && photoScrim.verticalStops!!.last().second >= 0.90f)
     }
 }

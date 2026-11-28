@@ -38,6 +38,7 @@ import org.soulbeet.app.data.StoredAuthKind
 import org.soulbeet.app.data.TrackLyricsData
 import org.soulbeet.app.data.UserCultureProfileUi
 import org.soulbeet.app.data.parseAudioQualityProfile
+import org.soulbeet.app.ui.components.normalizeMixSlug
 import org.soulbeet.core.CoreEventListener
 import org.soulbeet.core.FfiAlbum
 import org.soulbeet.core.FfiArtist
@@ -210,8 +211,12 @@ data class AppUiState(
         get() = contextualMixes.firstOrNull { it.kind == "seasonal" && it.trackCount > 0 }
             ?: contextualMixes.firstOrNull { !(it.kind == "seasonal" && it.trackCount == 0) }
     val rollingAndMomentMixes: List<ContextualMixUi>
-        get() = contextualMixes.filterNot {
-            it.slug == seasonalHeroMix?.slug || (it.kind == "seasonal" && it.trackCount == 0)
+        get() {
+            val heroSlug = seasonalHeroMix?.slug?.takeIf(String::isNotBlank)?.let(::normalizeMixSlug)
+            return contextualMixes.filterNot {
+                (heroSlug != null && normalizeMixSlug(it.slug) == heroSlug) ||
+                    (it.kind == "seasonal" && it.trackCount == 0)
+            }
         }
     val userPlaylists: List<FfiPlaylist>
         get() = playlists.filter { it.kind == "user" }
@@ -228,11 +233,24 @@ data class AppUiState(
         }
     val homeFallbackMixPlaylists: List<FfiPlaylist>
         get() {
-            val heroPlaylistId = seasonalHeroMix?.navidromePlaylistId?.takeIf(String::isNotBlank)
+            val shownPlaylistIds = buildSet {
+                seasonalHeroMix?.navidromePlaylistId?.takeIf(String::isNotBlank)?.let(::add)
+                rollingAndMomentMixes.mapNotNullTo(this) {
+                    it.navidromePlaylistId?.takeIf(String::isNotBlank)
+                }
+            }
+            val shownSlugs = buildSet {
+                seasonalHeroMix?.slug?.takeIf(String::isNotBlank)?.let { add(normalizeMixSlug(it)) }
+                rollingAndMomentMixes.mapNotNullTo(this) {
+                    it.slug.takeIf(String::isNotBlank)?.let(::normalizeMixSlug)
+                }
+            }
             return playlists.filter { pl ->
+                val plSlug = pl.slug?.takeIf(String::isNotBlank)?.let(::normalizeMixSlug)
                 pl.kind in SOULBEET_MIX_KINDS &&
                     !(pl.kind == "seasonal" && pl.songCount == 0L) &&
-                    pl.id != heroPlaylistId
+                    pl.id !in shownPlaylistIds &&
+                    (plSlug == null || plSlug !in shownSlugs)
             }
         }
 

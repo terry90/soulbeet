@@ -54,6 +54,7 @@ pub fn SeasonalHeroCard(
         .as_ref()
         .filter(|url| !url.is_empty() && failed_art_url.read().as_ref() != Some(*url))
         .cloned();
+    let has_photo_art = show_art.is_some();
     let procedural_slug = mix_slug
         .as_deref()
         .map(str::trim)
@@ -116,11 +117,23 @@ pub fn SeasonalHeroCard(
                 }
             }
 
-            // Adaptive OLED-aware dark gradient scrim preserving WCAG AAA readability
-            div {
-                class: "absolute inset-0 pointer-events-none",
-                aria_hidden: "true",
-                style: "background: linear-gradient(95deg, color-mix(in srgb, var(--beet-canvas) 94%, transparent) 0%, color-mix(in srgb, var(--beet-canvas) 80%, transparent) 56%, color-mix(in srgb, var(--beet-canvas) 48%, transparent) 100%), linear-gradient(0deg, color-mix(in srgb, var(--beet-canvas) 92%, transparent) 0%, transparent 55%);",
+            // Adaptive OLED-aware dark gradient scrim preserving WCAG AAA readability.
+            // Photographic artwork uses a heavier dual scrim; procedural Midnight Studio
+            // sleeves are already dark-grounded so a directional left scrim keeps the
+            // right-hand geometric motif crisp and luminous.
+            {
+                let hero_scrim = if has_photo_art {
+                    "linear-gradient(95deg, color-mix(in srgb, var(--beet-canvas) 94%, transparent) 0%, color-mix(in srgb, var(--beet-canvas) 80%, transparent) 56%, color-mix(in srgb, var(--beet-canvas) 48%, transparent) 100%), linear-gradient(0deg, color-mix(in srgb, var(--beet-canvas) 92%, transparent) 0%, transparent 55%)"
+                } else {
+                    "linear-gradient(95deg, color-mix(in srgb, var(--beet-canvas) 80%, transparent) 0%, color-mix(in srgb, var(--beet-canvas) 46%, transparent) 54%, color-mix(in srgb, var(--beet-canvas) 6%, transparent) 100%)"
+                };
+                rsx! {
+                    div {
+                        class: "absolute inset-0 pointer-events-none",
+                        aria_hidden: "true",
+                        style: "background: {hero_scrim};",
+                    }
+                }
             }
 
             // Content layer
