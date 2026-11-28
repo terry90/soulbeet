@@ -318,6 +318,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val contextualMixesGen = java.util.concurrent.atomic.AtomicLong(0L)
     private var mixDetailJob: Job? = null
     private val mixDetailGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var containerDetailJob: Job? = null
+    private val containerDetailGeneration = java.util.concurrent.atomic.AtomicLong(0L)
     private var connectWsJob: Job? = null
     private var lyricsJob: Job? = null
     private var lyricsFetchSeq: Long = 0L
@@ -583,6 +585,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             remoteArtistGen.incrementAndGet()
             downloadAlbumJob?.cancel()
             downloadAlbumGen.incrementAndGet()
+            containerDetailJob?.cancel()
+            containerDetailJob = null
+            containerDetailGeneration.incrementAndGet()
             _uiState.update { it.copy(showSettingsSheet = false, showNowPlayingSheet = false) }
             undoController.undo()
             mediaBridge.stopAndClear()
@@ -2363,15 +2368,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openPlaylistDetail(playlist: FfiPlaylist) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 runCatching { core.listTracksByPlaylist(playlist.id) }.getOrDefault(emptyList())
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Playlist(playlist.id)
             val isStaticUser = playlist.kind == "user" && !playlist.isSmart
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
                         id = playlist.id,
                         kind = if (isStaticUser) ContainerKind.USER_PLAYLIST else ContainerKind.SMART_PLAYLIST,
@@ -2389,14 +2398,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAlbumDetail(album: FfiAlbum) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 runCatching { core.listTracksByAlbum(album.id) }.getOrDefault(emptyList())
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Album(album.id)
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
                         id = album.id,
                         kind = ContainerKind.ALBUM,
@@ -2416,17 +2429,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openArtistDetail(artist: FfiArtist) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 val albums = runCatching { core.listAlbums(artist.id) }.getOrDefault(emptyList())
                 albums.flatMap { al ->
+                    if (containerDetailGeneration.get() != gen) return@withContext emptyList()
                     runCatching { core.listTracksByAlbum(al.id) }.getOrDefault(emptyList())
                 }
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Artist(artist.id)
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
                         id = artist.id,
                         kind = ContainerKind.ARTIST,
@@ -2443,12 +2461,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeContainerDetail() {
+        containerDetailJob?.cancel()
+        containerDetailJob = null
+        containerDetailGeneration.incrementAndGet()
         _uiState.update { it.copy(selectedContainer = null) }
     }
 
     // =========================================================================
     // Static Playlist Management (Create, Rename/Edit, Delete, Add/Remove Tracks)
     // =========================================================================
+
+    private fun tryAcquirePlaylistMutation(): Boolean {
+        while (true) {
+            val current = _uiState.value
+            if (current.playlistMutationInFlight) return false
+            if (_uiState.compareAndSet(current, current.copy(playlistMutationInFlight = true))) {
+                return true
+            }
+        }
+    }
 
     fun openAddToPlaylist(track: FfiTrack) {
         _uiState.update { it.copy(addToPlaylistTrack = track) }
@@ -2473,36 +2504,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Connect online to create a playlist")
             return
         }
+        if (!tryAcquirePlaylistMutation()) return
         viewModelScope.launch {
-            _uiState.update { it.copy(playlistMutationInFlight = true) }
-            val result = apiClient.createPlaylist(
-                config = cfg,
-                name = trimmedName,
-                comment = comment?.trim()?.takeIf { it.isNotEmpty() },
-                public = null,
-                songIds = initialTrack?.let { listOf(it.id) },
-            )
-            result.fold(
-                onSuccess = { created ->
-                    _uiState.update {
-                        it.copy(
-                            playlistMutationInFlight = false,
-                            addToPlaylistTrack = if (initialTrack != null) null else it.addToPlaylistTrack,
-                        )
-                    }
-                    syncAndRefreshPlaylists()
-                    val msg = if (initialTrack != null) {
-                        "Created \"${created.name}\" with \"${initialTrack.title}\""
-                    } else {
-                        "Created playlist \"${created.name}\""
-                    }
-                    showNotice(msg)
-                },
-                onFailure = { err ->
-                    _uiState.update { it.copy(playlistMutationInFlight = false) }
-                    showNotice(err.localizedMessage ?: "Failed to create playlist")
-                },
-            )
+            try {
+                val result = apiClient.createPlaylist(
+                    config = cfg,
+                    name = trimmedName,
+                    comment = comment?.trim()?.takeIf { it.isNotEmpty() },
+                    public = null,
+                    songIds = initialTrack?.let { listOf(it.id) },
+                )
+                result.fold(
+                    onSuccess = { created ->
+                        _uiState.update {
+                            it.copy(
+                                addToPlaylistTrack = if (initialTrack != null) null else it.addToPlaylistTrack,
+                            )
+                        }
+                        syncAndRefreshPlaylists()
+                        val msg = if (initialTrack != null) {
+                            "Created \"${created.name}\" with \"${initialTrack.title}\""
+                        } else {
+                            "Created playlist \"${created.name}\""
+                        }
+                        showNotice(msg)
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to create playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
         }
     }
 
@@ -2517,41 +2550,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Connect online to edit playlists")
             return
         }
+        if (!tryAcquirePlaylistMutation()) return
         viewModelScope.launch {
-            _uiState.update { it.copy(playlistMutationInFlight = true) }
-            val result = apiClient.updatePlaylist(
-                config = cfg,
-                playlistId = playlistId,
-                name = trimmedName,
-                comment = comment?.trim().orEmpty(),
-                public = null,
-            )
-            result.fold(
-                onSuccess = { updated ->
-                    _uiState.update { state ->
-                        val nextContainer = state.selectedContainer?.let { cur ->
-                            if (cur.isStaticUserPlaylist && cur.id == playlistId) {
-                                cur.copy(
-                                    title = updated.name.ifBlank { trimmedName },
-                                    comment = updated.comment.takeIf { it.isNotBlank() },
-                                )
-                            } else {
-                                cur
+            try {
+                val result = apiClient.updatePlaylist(
+                    config = cfg,
+                    playlistId = playlistId,
+                    name = trimmedName,
+                    comment = comment?.trim().orEmpty(),
+                    public = null,
+                )
+                result.fold(
+                    onSuccess = { updated ->
+                        val resolvedName = updated.name.ifBlank { trimmedName }
+                        val resolvedComment = updated.comment.takeIf { it.isNotBlank() }
+                        _uiState.update { state ->
+                            val nextContainer = state.selectedContainer?.let { cur ->
+                                if (cur.isStaticUserPlaylist && cur.id == playlistId) {
+                                    cur.copy(
+                                        title = resolvedName,
+                                        comment = resolvedComment,
+                                    )
+                                } else {
+                                    cur
+                                }
                             }
+                            val nextPlaylists = state.playlists.map { pl ->
+                                if (pl.id == playlistId) {
+                                    pl.copy(name = resolvedName, comment = resolvedComment)
+                                } else {
+                                    pl
+                                }
+                            }
+                            state.copy(
+                                playlists = nextPlaylists,
+                                selectedContainer = nextContainer,
+                            )
                         }
-                        state.copy(
-                            playlistMutationInFlight = false,
-                            selectedContainer = nextContainer,
-                        )
-                    }
-                    syncAndRefreshPlaylists()
-                    showNotice("Updated \"${updated.name.ifBlank { trimmedName }}\"")
-                },
-                onFailure = { err ->
-                    _uiState.update { it.copy(playlistMutationInFlight = false) }
-                    showNotice(err.localizedMessage ?: "Failed to update playlist")
-                },
-            )
+                        syncAndRefreshPlaylists()
+                        showNotice("Updated \"$resolvedName\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to update playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
         }
     }
 
@@ -2561,30 +2606,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Connect online to delete playlists")
             return
         }
+        if (!tryAcquirePlaylistMutation()) return
         viewModelScope.launch {
-            _uiState.update { it.copy(playlistMutationInFlight = true) }
-            val result = apiClient.deletePlaylist(cfg, playlistId)
-            result.fold(
-                onSuccess = {
-                    _uiState.update { state ->
-                        val nextContainer = if (state.selectedContainer?.id == playlistId) {
-                            null
-                        } else {
-                            state.selectedContainer
+            try {
+                val result = apiClient.deletePlaylist(cfg, playlistId)
+                result.fold(
+                    onSuccess = {
+                        if (_uiState.value.selectedContainer?.id == playlistId) {
+                            containerDetailJob?.cancel()
+                            containerDetailJob = null
+                            containerDetailGeneration.incrementAndGet()
                         }
-                        state.copy(
-                            playlistMutationInFlight = false,
-                            selectedContainer = nextContainer,
-                        )
-                    }
-                    syncAndRefreshPlaylists()
-                    showNotice("Deleted playlist \"$playlistName\"")
-                },
-                onFailure = { err ->
-                    _uiState.update { it.copy(playlistMutationInFlight = false) }
-                    showNotice(err.localizedMessage ?: "Failed to delete playlist")
-                },
-            )
+                        _uiState.update { state ->
+                            val nextContainer = if (state.selectedContainer?.id == playlistId) {
+                                null
+                            } else {
+                                state.selectedContainer
+                            }
+                            state.copy(
+                                playlists = state.playlists.filterNot { it.id == playlistId },
+                                selectedContainer = nextContainer,
+                            )
+                        }
+                        syncAndRefreshPlaylists()
+                        showNotice("Deleted playlist \"$playlistName\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to delete playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
         }
     }
 
@@ -2594,25 +2647,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Connect online to add tracks to playlists")
             return
         }
+        if (!tryAcquirePlaylistMutation()) return
         viewModelScope.launch {
-            _uiState.update { it.copy(playlistMutationInFlight = true) }
-            val result = apiClient.addPlaylistTracks(cfg, playlist.id, listOf(track.id))
-            result.fold(
-                onSuccess = {
-                    _uiState.update {
-                        it.copy(
-                            playlistMutationInFlight = false,
-                            addToPlaylistTrack = null,
-                        )
-                    }
-                    syncAndRefreshPlaylists(reloadContainerPlaylistId = playlist.id)
-                    showNotice("Added \"${track.title}\" to \"${playlist.name}\"")
-                },
-                onFailure = { err ->
-                    _uiState.update { it.copy(playlistMutationInFlight = false) }
-                    showNotice(err.localizedMessage ?: "Failed to add track to playlist")
-                },
-            )
+            try {
+                val result = apiClient.addPlaylistTracks(cfg, playlist.id, listOf(track.id))
+                result.fold(
+                    onSuccess = {
+                        _uiState.update { it.copy(addToPlaylistTrack = null) }
+                        syncAndRefreshPlaylists(reloadContainerPlaylistId = playlist.id)
+                        showNotice("Added \"${track.title}\" to \"${playlist.name}\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to add track to playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
         }
     }
 
@@ -2626,32 +2677,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             showNotice("Connect online to edit playlist tracks")
             return
         }
-        val prevContainer = _uiState.value.selectedContainer
-        if (prevContainer != null && prevContainer.isStaticUserPlaylist && prevContainer.id == playlistId) {
-            val remaining = prevContainer.tracks.filterNot { it.id == track.id }
-            _uiState.update { state ->
-                state.copy(
-                    selectedContainer = prevContainer.copy(
-                        tracks = remaining,
-                        subtitle = if (remaining.size == 1) "1 track" else "${remaining.size} tracks",
-                    ),
-                )
+        if (!tryAcquirePlaylistMutation()) return
+        val openGen = containerDetailGeneration.get()
+        var removedEntries: List<Pair<Int, FfiTrack>> = emptyList()
+        _uiState.update { state ->
+            val cur = state.selectedContainer
+            if (cur != null && cur.isStaticUserPlaylist && cur.id == playlistId) {
+                val matches = buildList {
+                    cur.tracks.forEachIndexed { idx, t ->
+                        if (t.id == track.id) add(idx to t)
+                    }
+                }
+                removedEntries = matches
+                if (matches.isEmpty()) {
+                    state
+                } else {
+                    val remaining = cur.tracks.filterNot { it.id == track.id }
+                    state.copy(
+                        selectedContainer = cur.copy(
+                            tracks = remaining,
+                            subtitle = if (remaining.size == 1) "1 track" else "${remaining.size} tracks",
+                        ),
+                    )
+                }
+            } else {
+                removedEntries = emptyList()
+                state
             }
         }
         viewModelScope.launch {
-            val result = apiClient.removePlaylistTracks(cfg, playlistId, listOf(track.id))
-            result.fold(
-                onSuccess = {
-                    syncAndRefreshPlaylists(reloadContainerPlaylistId = playlistId)
-                    showNotice("Removed \"${track.title}\" from playlist")
-                },
-                onFailure = { err ->
-                    if (prevContainer != null && _uiState.value.selectedContainer?.id == playlistId) {
-                        _uiState.update { it.copy(selectedContainer = prevContainer) }
-                    }
-                    showNotice(err.localizedMessage ?: "Failed to remove track from playlist")
-                },
-            )
+            try {
+                val result = apiClient.removePlaylistTracks(cfg, playlistId, listOf(track.id))
+                result.fold(
+                    onSuccess = {
+                        syncAndRefreshPlaylists(reloadContainerPlaylistId = playlistId)
+                        showNotice("Removed \"${track.title}\" from playlist")
+                    },
+                    onFailure = { err ->
+                        if (removedEntries.isNotEmpty() && containerDetailGeneration.get() == openGen) {
+                            _uiState.update { state ->
+                                if (containerDetailGeneration.get() != openGen) return@update state
+                                val cur = state.selectedContainer ?: return@update state
+                                if (!cur.isStaticUserPlaylist || cur.id != playlistId) return@update state
+                                val restored = cur.tracks.toMutableList()
+                                for ((idx, removedTrack) in removedEntries) {
+                                    restored.add(idx.coerceIn(0, restored.size), removedTrack)
+                                }
+                                state.copy(
+                                    selectedContainer = cur.copy(
+                                        tracks = restored,
+                                        subtitle = if (restored.size == 1) "1 track" else "${restored.size} tracks",
+                                    ),
+                                )
+                            }
+                        }
+                        showNotice(err.localizedMessage ?: "Failed to remove track from playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
         }
     }
 
@@ -2667,11 +2752,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value.selectedContainer?.id == reloadContainerPlaylistId &&
             core != null
         ) {
+            val expectedGen = containerDetailGeneration.get()
             val refreshedTracks = withContext(Dispatchers.IO) {
                 runCatching { core.listTracksByPlaylist(reloadContainerPlaylistId) }.getOrNull()
             }
-            if (refreshedTracks != null) {
+            if (refreshedTracks != null && containerDetailGeneration.get() == expectedGen) {
                 _uiState.update { state ->
+                    if (containerDetailGeneration.get() != expectedGen) return@update state
                     val cur = state.selectedContainer ?: return@update state
                     if (cur.id != reloadContainerPlaylistId) return@update state
                     state.copy(

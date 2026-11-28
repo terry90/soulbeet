@@ -700,9 +700,9 @@ internal fun ContainerDetailSheet(
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var showOverflowMenu by remember { mutableStateOf(false) }
-    var showRenameDialog by remember { mutableStateOf(false) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showOverflowMenu by remember(detail.id) { mutableStateOf(false) }
+    var showRenameDialog by remember(detail.id) { mutableStateOf(false) }
+    var showDeleteConfirm by remember(detail.id) { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
