@@ -76,7 +76,6 @@ test('an album only YouTube Music has is offered as lossy, and the pick imports'
     await group.getByText(morseBloomAlbum.title, { exact: true }).first().click();
   }
   await selectAll.click();
-  await page.locator('select[name="dl_folder"]').selectOption({ label: folder.name });
   await page.getByRole('button', { name: 'Start download' }).click();
 
   await openDownloadsPanel(page);

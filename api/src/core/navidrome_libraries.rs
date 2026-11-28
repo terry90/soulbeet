@@ -427,6 +427,17 @@ pub async fn sync_single_user_library_best_effort(user_id: &str) {
     }
 }
 
+/// Spawns per-user Navidrome library synchronization in the background so HTTP
+/// server startup never blocks on Navidrome network calls.
+pub fn start_startup_sync() {
+    tokio::spawn(async {
+        let report = sync_all_user_libraries().await;
+        if let Some(warning) = report.warning {
+            warn!("{}", warning.message);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

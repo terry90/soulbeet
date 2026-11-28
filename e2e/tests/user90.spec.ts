@@ -30,7 +30,7 @@ function installConfig(source: string): void {
 
 test('a broken config is visible and refuses downloads', async ({ context, page }) => {
   installConfig(user90BrokenConfig);
-  const { folder } = await freshSession(context, page, 'user90-broken');
+  await freshSession(context, page, 'user90-broken');
 
   await openServiceStatus(page);
   await expect(page.getByText('BEETS BROKEN', { exact: true })).toBeVisible({
@@ -50,7 +50,6 @@ test('a broken config is visible and refuses downloads', async ({ context, page 
   await row.getByRole('button', { name: 'Search sources' }).click();
   await expect(page.getByText('Best match')).toBeVisible({ timeout: 60_000 });
   await page.getByRole('button', { name: 'Select All' }).first().click();
-  await page.locator('select[name="dl_folder"]').selectOption({ label: folder.name });
   await page.getByRole('button', { name: 'Start download' }).click();
   await expect(page.locator('p').filter({ hasText: BROKEN })).toBeVisible();
 
