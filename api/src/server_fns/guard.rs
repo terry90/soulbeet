@@ -100,6 +100,50 @@ pub(crate) async fn load_session_claims(
     Ok((ctx, claims))
 }
 
+/// Enables automatic login as the seeded admin when `SOULBEET_DEV_AUTOLOGIN=1`
+/// is set. Compiled only in debug builds; release binaries never inspect this.
+#[cfg(all(feature = "server", debug_assertions))]
+fn dev_autologin_enabled() -> bool {
+    std::env::var("SOULBEET_DEV_AUTOLOGIN").as_deref() == Ok("1")
+}
+
+#[cfg(all(feature = "server", debug_assertions))]
+async fn load_dev_autologin_session(
+    db: &SqlitePool,
+) -> Result<(UserCtx, Claims), (StatusCode, String)> {
+    let user = User::find_by_id_in(db, crate::security::SEEDED_ADMIN_ID)
+        .await
+        .map_err(|e| {
+            tracing::error!("Dev auto-login failed to load seeded admin: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not check the session".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Seeded admin user not found".to_string(),
+            )
+        })?;
+    let now = chrono::Utc::now();
+    let iat = now.timestamp().max(0) as usize;
+    let exp = (now + chrono::Duration::days(1)).timestamp().max(0) as usize;
+    let claims = Claims {
+        sub: user.id.clone(),
+        ver: user.credentials_version,
+        jti: "dev-autologin".to_string(),
+        iat,
+        exp,
+    };
+    let ctx = UserCtx {
+        user_id: user.id,
+        username: user.username,
+        role: user.role,
+    };
+    Ok((ctx, claims))
+}
+
 /// `load_session_claims`, also for a session that may only set a new
 /// password.
 #[cfg(feature = "server")]
@@ -109,6 +153,10 @@ pub(crate) async fn load_any_session_claims(
     key: &SecretKey,
 ) -> Result<(UserCtx, Claims), (StatusCode, String)> {
     let Some(token) = token else {
+        #[cfg(debug_assertions)]
+        if dev_autologin_enabled() {
+            return load_dev_autologin_session(db).await;
+        }
         tracing::warn!("Auth failure: No auth token found in request cookies or Authorization header");
         return Err((StatusCode::UNAUTHORIZED, "No auth token found".to_string()));
     };
@@ -541,5 +589,19 @@ mod tests {
             session_token(&bare_parts).unwrap_err(),
             (StatusCode::UNAUTHORIZED, "Missing cookie middleware".into())
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn dev_autologin_loads_seeded_admin_and_is_disabled_by_default() {
+        assert!(!dev_autologin_enabled());
+
+        let db = db_with_user().await;
+        let (ctx, claims) = load_dev_autologin_session(&db).await.unwrap();
+        assert_eq!(ctx.user_id, SEEDED_ADMIN_ID);
+        assert_eq!(ctx.username, "admin");
+        assert_eq!(ctx.role, Role::Admin);
+        assert_eq!(claims.sub, SEEDED_ADMIN_ID);
+        assert_eq!(claims.jti, "dev-autologin");
     }
 }

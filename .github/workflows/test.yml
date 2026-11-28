@@ -146,3 +146,29 @@ jobs:
 
       - name: Test the import driver on beets 2.8.0
         run: python -m pytest -q lib/soulbeet/tests/import
+
+  # Mechanical gate: ensure committed web/assets/tailwind.css matches every class in web/ and ui/.
+  tailwind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install Tailwind CLI
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify web/assets/tailwind.css is up to date
+        run: |
+          npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css
+          if ! git diff --exit-code web/assets/tailwind.css; then
+            echo "::error::web/assets/tailwind.css is out of date. Run: npm ci && npx @tailwindcss/cli -i ./web/assets/input.css -o ./web/assets/tailwind.css"
+            exit 1
+          fi

@@ -13,6 +13,7 @@ soulbeet.db
 soulbeet.db-shm
 soulbeet.db-wal
 secret.key
+.runtime-dev/
 
 # Env files
 **/.env
