@@ -54,6 +54,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -645,8 +646,38 @@ fun UndoDropSnackbar(
     }
 }
 
+internal data class HeroScrimSpec(
+    val horizontalStops: List<Pair<Float, Float>>,
+    val verticalStops: List<Pair<Float, Float>>?,
+)
+
+internal fun seasonalHeroScrimSpec(hasPhotoArt: Boolean, isOled: Boolean): HeroScrimSpec =
+    if (hasPhotoArt) {
+        HeroScrimSpec(
+            horizontalStops = listOf(
+                0.0f to 0.94f,
+                0.56f to 0.80f,
+                1.0f to 0.48f,
+            ),
+            verticalStops = listOf(
+                0.0f to 0.0f,
+                0.45f to 0.0f,
+                1.0f to 0.92f,
+            ),
+        )
+    } else {
+        HeroScrimSpec(
+            horizontalStops = listOf(
+                0.0f to if (isOled) 0.84f else 0.80f,
+                0.54f to if (isOled) 0.50f else 0.46f,
+                1.0f to 0.06f,
+            ),
+            verticalStops = null,
+        )
+    }
+
 /**
- * Seasonal / Contextual Hero Card with violet scrim, live Culture Ratio Steering chips,
+ * Seasonal / Contextual Hero Card with adaptive OLED-aware scrim, live Culture Ratio Steering chips,
  * primary Play CTA, and Pin Offline toggle.
  */
 @Composable
@@ -658,46 +689,87 @@ fun SeasonalHeroCard(
     onTogglePin: () -> Unit,
     onSteer: (CultureSteeringOption) -> Unit,
     modifier: Modifier = Modifier,
+    artworkUrl: String? = null,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
+    val context = LocalContext.current
     val country = mix.countryCode ?: "LOCAL"
     val localPct = mix.localPct
     val intlPct = localPct?.let { (100 - it).coerceIn(0, 100) }
 
     val sleeveSpec = remember(mix.slug) { mixSleeveSpecFor(mix.slug) }
+    val cleanArtworkUrl = remember(artworkUrl) { artworkUrl?.trim()?.takeIf { it.isNotEmpty() } }
+    var photoLoaded by remember(cleanArtworkUrl) { mutableStateOf(false) }
+    val hasPhotoArt = cleanArtworkUrl != null && photoLoaded
+    val scrimSpec = remember(hasPhotoArt, colors.isOled) {
+        seasonalHeroScrimSpec(hasPhotoArt = hasPhotoArt, isOled = colors.isOled)
+    }
+    val horizontalScrim = remember(scrimSpec, colors.canvas) {
+        Brush.horizontalGradient(
+            colorStops = scrimSpec.horizontalStops.map { (pos, alpha) ->
+                pos to colors.canvas.copy(alpha = alpha)
+            }.toTypedArray(),
+        )
+    }
+    val verticalScrim = remember(scrimSpec, colors.canvas) {
+        scrimSpec.verticalStops?.let { stops ->
+            Brush.verticalGradient(
+                colorStops = stops.map { (pos, alpha) ->
+                    pos to if (alpha <= 0f) Color.Transparent else colors.canvas.copy(alpha = alpha)
+                }.toTypedArray(),
+            )
+        }
+    }
 
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = colors.surface,
         shape = SoulbeetShapes.lg,
-        border = BorderStroke(1.dp, sleeveSpec.borderColor),
+        border = BorderStroke(1.dp, if (hasPhotoArt) colors.borderDefault else sleeveSpec.borderColor),
     ) {
         Box(modifier = Modifier.fillMaxWidth()) {
-            MixSleeveBackdrop(
-                slug = mix.slug,
-                modifier = Modifier.matchParentSize(),
-            )
+            if (cleanArtworkUrl != null) {
+                SubcomposeAsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(cleanArtworkUrl)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    onLoading = { photoLoaded = false },
+                    onSuccess = { photoLoaded = true },
+                    onError = { photoLoaded = false },
+                    loading = {
+                        MixSleeveBackdrop(
+                            slug = mix.slug,
+                            modifier = Modifier.matchParentSize(),
+                        )
+                    },
+                    error = {
+                        MixSleeveBackdrop(
+                            slug = mix.slug,
+                            modifier = Modifier.matchParentSize(),
+                        )
+                    },
+                    modifier = Modifier.matchParentSize(),
+                )
+            } else {
+                MixSleeveBackdrop(
+                    slug = mix.slug,
+                    modifier = Modifier.matchParentSize(),
+                )
+            }
             Box(
                 modifier = Modifier
                     .matchParentSize()
-                    .background(
-                        Brush.horizontalGradient(
-                            colorStops = arrayOf(
-                                0.0f to colors.canvas.copy(alpha = if (colors.isOled) 0.94f else 0.88f),
-                                0.56f to colors.surface.copy(alpha = if (colors.isOled) 0.78f else 0.68f),
-                                1.0f to colors.surfaceLow.copy(alpha = if (colors.isOled) 0.54f else 0.42f),
-                            ),
-                        ),
-                    )
-                    .background(
-                        Brush.verticalGradient(
-                            colorStops = arrayOf(
-                                0.0f to Color.Transparent,
-                                0.48f to colors.canvas.copy(alpha = if (colors.isOled) 0.24f else 0.16f),
-                                1.0f to colors.canvas.copy(alpha = if (colors.isOled) 0.52f else 0.38f),
-                            ),
-                        ),
+                    .background(horizontalScrim)
+                    .then(
+                        if (verticalScrim != null) {
+                            Modifier.background(verticalScrim)
+                        } else {
+                            Modifier
+                        },
                     ),
             )
             Column(

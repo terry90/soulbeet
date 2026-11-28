@@ -22,8 +22,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -73,11 +71,10 @@ import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.ui.components.MixShelfBucket
-import org.soulbeet.app.ui.components.MixSleeveCard
-import org.soulbeet.app.ui.components.MixSleeveLayout
 import org.soulbeet.app.ui.components.SeasonalHeroCard
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.classifyMixShelf
+import org.soulbeet.app.ui.components.mixSleeveShelves
 import org.soulbeet.core.FfiPinTarget
 import kotlin.math.roundToInt
 
@@ -150,79 +147,12 @@ fun DiscoverScreen(
         }
 
         // 2. Split-Shelf Curated Mixes ("Right Now" wide sleeves + "From Your Collection" square sleeves)
-        if (rightNowMixes.isNotEmpty()) {
-            item(key = "right_now_mixes") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "Right Now",
-                            style = type.titleMd,
-                            color = colors.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            text = "LIVE WEATHER & TIME",
-                            style = type.monoXs,
-                            color = colors.textMuted,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(rightNowMixes, key = { it.slug }) { mix ->
-                            MixSleeveCard(
-                                mix = mix,
-                                layout = MixSleeveLayout.WIDE,
-                                onClick = { onPlayMix(mix) },
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        if (collectionMixes.isNotEmpty()) {
-            item(key = "collection_mixes") {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "From Your Collection",
-                            style = type.titleMd,
-                            color = colors.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            text = "LIBRARY & DECADES",
-                            style = type.monoXs,
-                            color = colors.textMuted,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(collectionMixes, key = { it.slug }) { mix ->
-                            MixSleeveCard(
-                                mix = mix,
-                                layout = MixSleeveLayout.SQUARE,
-                                onClick = { onPlayMix(mix) },
-                            )
-                        }
-                    }
-                }
-            }
-        }
+        mixSleeveShelves(
+            rightNowMixes = rightNowMixes,
+            collectionMixes = collectionMixes,
+            keyPrefix = "discover",
+            onPlayMix = onPlayMix,
+        )
 
         // 3. Fast Triage Swipeable Card Deck
         item(key = "fast_triage_deck") {

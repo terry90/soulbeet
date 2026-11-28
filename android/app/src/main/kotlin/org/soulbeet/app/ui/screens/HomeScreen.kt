@@ -29,6 +29,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -40,10 +41,13 @@ import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
+import org.soulbeet.app.ui.components.MixShelfBucket
 import org.soulbeet.app.ui.components.OfflineDot
 import org.soulbeet.app.ui.components.SeasonalHeroCard
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.TrackRow
+import org.soulbeet.app.ui.components.classifyMixShelf
+import org.soulbeet.app.ui.components.mixSleeveShelves
 import org.soulbeet.core.FfiPinTarget
 import org.soulbeet.core.FfiPlaylist
 import org.soulbeet.core.FfiTrack
@@ -66,6 +70,9 @@ fun HomeScreen(
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
+    val (rightNowMixes, collectionMixes) = remember(state.rollingAndMomentMixes) {
+        state.rollingAndMomentMixes.partition { classifyMixShelf(it) == MixShelfBucket.RIGHT_NOW }
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -184,7 +191,16 @@ fun HomeScreen(
             }
         }
 
-        // 4. Your Playlists Shelf (focused on user playlists; falls back to mixes excluding seasonalHeroMix)
+        // 4. Split-Shelf Curated Mixes ("Right Now" wide sleeves + "From Your Collection" square sleeves)
+        // state.rollingAndMomentMixes already excludes state.seasonalHeroMix and empty seasonal packs.
+        mixSleeveShelves(
+            rightNowMixes = rightNowMixes,
+            collectionMixes = collectionMixes,
+            keyPrefix = "home",
+            onPlayMix = onPlayMix,
+        )
+
+        // 5. Your Playlists Shelf (focused on user playlists; falls back to remaining mixes not shown above)
         val homeShelfPlaylists = state.userPlaylists.ifEmpty { state.homeFallbackMixPlaylists }
         if (homeShelfPlaylists.isNotEmpty()) {
             val isMixFallback = state.userPlaylists.isEmpty()
@@ -313,7 +329,7 @@ fun HomeScreen(
         }
 
         // Empty state when freshly connected with zero synced items
-        if (state.quickResume.isEmpty() && state.playlists.isEmpty() && state.recentTracks.isEmpty()) {
+        if (state.quickResume.isEmpty() && state.playlists.isEmpty() && state.recentTracks.isEmpty() && state.contextualMixes.isEmpty()) {
             item(key = "home_empty") {
                 Surface(
                     color = colors.surface,
