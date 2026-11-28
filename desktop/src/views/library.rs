@@ -414,11 +414,20 @@ pub fn LibraryView() -> Element {
                                                             }
                                                         }
                                                     }
-                                                    p { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                                                        if total_secs > 0 {
-                                                            "{pl_tracks.len()} TRACKS · {format_duration(total_secs)}"
+                                                    {
+                                                        let track_word = if pl_tracks.len() == 1 {
+                                                            "TRACK"
                                                         } else {
-                                                            "{pl_tracks.len()} TRACKS"
+                                                            "TRACKS"
+                                                        };
+                                                        rsx! {
+                                                            p { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                                                if total_secs > 0 {
+                                                                    "{pl_tracks.len()} {track_word} · {format_duration(total_secs)}"
+                                                                } else {
+                                                                    "{pl_tracks.len()} {track_word}"
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     if let Some(ref desc) = visible_comment {
@@ -1147,20 +1156,28 @@ pub fn LibraryView() -> Element {
                         } else {
                             Some(comment.trim().to_string())
                         };
+                        let close_editor = EventHandler::new(move |_| playlist_form.set(None));
                         match mode_out {
                             PlaylistFormMode::Create => {
-                                studio.create_playlist(name, comment_opt, public, None);
+                                studio.create_playlist(
+                                    name,
+                                    comment_opt,
+                                    public,
+                                    None,
+                                    true,
+                                    Some(close_editor),
+                                );
                             }
                             PlaylistFormMode::Edit { playlist_id, .. } => {
                                 studio.update_playlist(
                                     playlist_id,
                                     Some(name),
                                     Some(comment.trim().to_string()),
-                                    None,
+                                    public,
+                                    Some(close_editor),
                                 );
                             }
                         }
-                        playlist_form.set(None);
                     },
                 }
             }
@@ -1169,11 +1186,15 @@ pub fn LibraryView() -> Element {
             if let Some((del_id, del_name)) = delete_confirm() {
                 ConfirmModal {
                     message: format!("Delete playlist \"{del_name}\"? Your library tracks will not be removed."),
-                    confirm_label: "Delete Playlist".to_string(),
+                    confirm_label: if playlist_mutating {
+                        "Deleting...".to_string()
+                    } else {
+                        "Delete Playlist".to_string()
+                    },
                     danger: true,
                     on_confirm: move |_| {
-                        studio.delete_playlist(del_id.clone(), del_name.clone());
-                        delete_confirm.set(None);
+                        let close_confirm = EventHandler::new(move |_| delete_confirm.set(None));
+                        studio.delete_playlist(del_id.clone(), del_name.clone(), Some(close_confirm));
                     },
                     on_cancel: move |_| delete_confirm.set(None),
                 }
@@ -1189,7 +1210,7 @@ fn PlaylistEditorModal(
     on_close: EventHandler<()>,
     on_save: EventHandler<(PlaylistFormMode, String, String, Option<bool>)>,
 ) -> Element {
-    let (heading, submit_label, init_name, init_comment, show_public_toggle) = match &mode {
+    let (heading, submit_label, init_name, init_comment, is_create_mode) = match &mode {
         PlaylistFormMode::Create => (
             "New Playlist",
             "Create Playlist",
@@ -1213,6 +1234,7 @@ fn PlaylistEditorModal(
     let mut name = use_signal(move || init_name);
     let mut comment = use_signal(move || init_comment);
     let mut is_public = use_signal(|| false);
+    let mut edit_public_choice = use_signal(|| None::<bool>);
 
     let mode_for_submit = mode.clone();
     let can_submit = !busy && !name().trim().is_empty();
@@ -1230,7 +1252,8 @@ fn PlaylistEditorModal(
                         r#type: "text",
                         value: "{name}",
                         placeholder: "Late Night Synth",
-                        class: "w-full h-10 px-3 rounded-[8px] bg-beet-surface border border-beet-border-default text-[14px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none",
+                        disabled: busy,
+                        class: "w-full h-10 px-3 rounded-[8px] bg-beet-surface border border-beet-border-default text-[14px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none disabled:opacity-50",
                         oninput: move |evt| name.set(evt.value()),
                     }
                 }
@@ -1240,19 +1263,55 @@ fn PlaylistEditorModal(
                         rows: "3",
                         value: "{comment}",
                         placeholder: "Mood, notes, or curation theme...",
-                        class: "w-full px-3 py-2 rounded-[8px] bg-beet-surface border border-beet-border-default text-[13px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none resize-none",
+                        disabled: busy,
+                        class: "w-full px-3 py-2 rounded-[8px] bg-beet-surface border border-beet-border-default text-[13px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none resize-none disabled:opacity-50",
                         oninput: move |evt| comment.set(evt.value()),
                     }
                 }
-                if show_public_toggle {
+                if is_create_mode {
                     label { class: "inline-flex items-center gap-2.5 text-[13px] text-beet-text-secondary cursor-pointer",
                         input {
                             r#type: "checkbox",
                             checked: is_public(),
+                            disabled: busy,
                             class: "accent-beet-leaf-solid cursor-pointer",
                             onchange: move |evt| is_public.set(evt.checked()),
                         }
                         span { "Public playlist (visible to other household listeners)" }
+                    }
+                } else {
+                    div { class: "space-y-1.5",
+                        span { class: "block text-[12px] text-beet-text-secondary", "Visibility" }
+                        div {
+                            role: "group",
+                            aria_label: "Playlist visibility",
+                            class: "inline-flex items-center gap-1 p-1 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle",
+                            for (choice, label) in [
+                                (None, "Keep current"),
+                                (Some(false), "Private"),
+                                (Some(true), "Public"),
+                            ] {
+                                {
+                                    let active = edit_public_choice() == choice;
+                                    let cls = if active {
+                                        "bg-beet-surface-high border-beet-border-default text-beet-text-primary font-semibold"
+                                    } else {
+                                        "border-transparent text-beet-text-secondary hover:text-beet-text-primary font-medium"
+                                    };
+                                    rsx! {
+                                        button {
+                                            key: "{label}",
+                                            r#type: "button",
+                                            disabled: busy,
+                                            aria_pressed: if active { "true" } else { "false" },
+                                            class: "h-7 px-3 rounded-[7px] border text-[12px] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none {cls}",
+                                            onclick: move |_| edit_public_choice.set(choice),
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 div { class: "flex justify-end gap-2.5 pt-2",
@@ -1269,15 +1328,20 @@ fn PlaylistEditorModal(
                         onclick: move |_| {
                             let trimmed = name().trim().to_string();
                             if !trimmed.is_empty() {
+                                let public_val = if is_create_mode {
+                                    Some(is_public())
+                                } else {
+                                    edit_public_choice()
+                                };
                                 on_save.call((
                                     mode_for_submit.clone(),
                                     trimmed,
                                     comment(),
-                                    show_public_toggle.then_some(is_public()),
+                                    public_val,
                                 ));
                             }
                         },
-                        "{submit_label}"
+                        if busy { "Saving..." } else { "{submit_label}" }
                     }
                 }
             }

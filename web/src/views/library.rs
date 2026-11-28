@@ -15,8 +15,8 @@ use ui::{
 use crate::auth::use_auth;
 use crate::navidrome_web::{
     fetch_album_list, fetch_album_tracks, fetch_artists, fetch_library_tracks,
-    fetch_playlist_tracks, fetch_playlists, AlbumListSort, SubsonicAlbumSummary,
-    SubsonicArtistSummary, SubsonicPlaylistSummary, ALBUM_LIST_PAGE_SIZE,
+    fetch_playlist_tracks, AlbumListSort, SubsonicAlbumSummary, SubsonicArtistSummary,
+    SubsonicPlaylistSummary, ALBUM_LIST_PAGE_SIZE,
 };
 use crate::web_player::use_studio;
 use crate::Route;
@@ -105,8 +105,9 @@ pub fn LibraryPage() -> Element {
     // Artists tab state
     let mut artists_list = use_signal(Vec::<SubsonicArtistSummary>::new);
     let mut artists_loading = use_signal(|| false);
-    let mut artists_loaded = use_signal(|| false);
     let mut artists_error = use_signal(|| None::<String>);
+    let mut artists_req_id = use_signal(|| 0u64);
+    let mut loaded_artists_key = use_signal(|| None::<(String, String)>);
 
     // Tracks tab state (paginated)
     let mut tracks_list = use_signal(Vec::<PlayerTrack>::new);
@@ -114,25 +115,34 @@ pub fn LibraryPage() -> Element {
     let mut tracks_has_more = use_signal(|| false);
     let mut tracks_loading = use_signal(|| false);
     let mut tracks_loading_more = use_signal(|| false);
-    let mut tracks_loaded = use_signal(|| false);
     let mut tracks_error = use_signal(|| None::<String>);
+    let mut tracks_req_id = use_signal(|| 0u64);
+    let mut loaded_tracks_key = use_signal(|| None::<(String, String)>);
 
     let load_artists = use_callback(move |()| {
+        if player.offline_only() {
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
-        if *artists_loading.peek() {
-            return;
-        }
+        let req_id = artists_req_id.peek().wrapping_add(1);
+        artists_req_id.set(req_id);
+        loaded_artists_key.set(Some((info.base_url.clone(), info.username.clone())));
         artists_loading.set(true);
         artists_error.set(None);
         spawn(async move {
-            match fetch_artists(&info).await {
+            let res = fetch_artists(&info).await;
+            if *artists_req_id.peek() != req_id {
+                return;
+            }
+            match res {
                 Ok(list) => {
                     artists_list.set(list);
-                    artists_loaded.set(true);
+                    artists_error.set(None);
                 }
                 Err(e) => {
+                    loaded_artists_key.set(None);
                     artists_error.set(Some(e));
                 }
             }
@@ -141,6 +151,9 @@ pub fn LibraryPage() -> Element {
     });
 
     let load_tracks_page = use_callback(move |append: bool| {
+        if player.offline_only() {
+            return;
+        }
         let Some(info) = studio.navidrome_info() else {
             return;
         };
@@ -148,14 +161,25 @@ pub fn LibraryPage() -> Element {
             return;
         }
         let offset = if append { *tracks_offset.peek() } else { 0 };
+        let req_id = tracks_req_id.peek().wrapping_add(1);
+        tracks_req_id.set(req_id);
         if append {
             tracks_loading_more.set(true);
         } else {
+            loaded_tracks_key.set(Some((info.base_url.clone(), info.username.clone())));
             tracks_loading.set(true);
+            tracks_loading_more.set(false);
             tracks_error.set(None);
+            tracks_list.set(Vec::new());
+            tracks_offset.set(0);
+            tracks_has_more.set(false);
         }
         spawn(async move {
-            match fetch_library_tracks(&info, offset, TRACKS_PAGE_SIZE).await {
+            let res = fetch_library_tracks(&info, offset, TRACKS_PAGE_SIZE).await;
+            if *tracks_req_id.peek() != req_id {
+                return;
+            }
+            match res {
                 Ok(page) => {
                     let raw_len = page.len() as u32;
                     let has_more = raw_len >= TRACKS_PAGE_SIZE;
@@ -173,12 +197,13 @@ pub fn LibraryPage() -> Element {
                     tracks_list.set(next);
                     tracks_offset.set(offset.saturating_add(raw_len));
                     tracks_has_more.set(has_more);
-                    tracks_loaded.set(true);
+                    tracks_error.set(None);
                 }
                 Err(e) => {
                     if append {
                         studio.show_toast(format!("Could not load more tracks: {e}"));
                     } else {
+                        loaded_tracks_key.set(None);
                         tracks_error.set(Some(e));
                     }
                 }
@@ -188,22 +213,101 @@ pub fn LibraryPage() -> Element {
         });
     });
 
-    // Lazy-load Artists or Tracks when their tab becomes active.
+    // Lazy-load Artists or Tracks and invalidate stale session data on Navidrome session changes.
     use_effect(move || {
         let tab = active_tab();
-        let has_nav = studio
+        let offline = player.offline_only();
+        let nav = studio
             .bootstrap
             .read()
             .as_ref()
-            .and_then(|b| b.navidrome.as_ref())
-            .is_some();
-        if !has_nav || player.offline_only() {
-            return;
-        }
-        if tab == LibraryTab::Artists && !*artists_loaded.peek() && !*artists_loading.peek() {
-            load_artists.call(());
-        } else if tab == LibraryTab::Tracks && !*tracks_loaded.peek() && !*tracks_loading.peek() {
-            load_tracks_page.call(false);
+            .and_then(|b| b.navidrome.clone());
+        match nav {
+            Some(info) if !offline => {
+                let session_key = (info.base_url.clone(), info.username.clone());
+                if loaded_artists_key
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|k| k != &session_key)
+                {
+                    let next_req = artists_req_id.peek().wrapping_add(1);
+                    artists_req_id.set(next_req);
+                    loaded_artists_key.set(None);
+                    artists_list.set(Vec::new());
+                    artists_error.set(None);
+                    artists_loading.set(false);
+                }
+                if loaded_tracks_key
+                    .peek()
+                    .as_ref()
+                    .is_some_and(|k| k != &session_key)
+                {
+                    let next_req = tracks_req_id.peek().wrapping_add(1);
+                    tracks_req_id.set(next_req);
+                    loaded_tracks_key.set(None);
+                    tracks_list.set(Vec::new());
+                    tracks_offset.set(0);
+                    tracks_has_more.set(false);
+                    tracks_error.set(None);
+                    tracks_loading.set(false);
+                    tracks_loading_more.set(false);
+                }
+                if tab == LibraryTab::Artists
+                    && loaded_artists_key.peek().as_ref() != Some(&session_key)
+                {
+                    load_artists.call(());
+                } else if tab == LibraryTab::Tracks
+                    && loaded_tracks_key.peek().as_ref() != Some(&session_key)
+                {
+                    load_tracks_page.call(false);
+                }
+            }
+            None => {
+                if loaded_artists_key.peek().is_some()
+                    || *artists_loading.peek()
+                    || !artists_list.peek().is_empty()
+                {
+                    let next_req = artists_req_id.peek().wrapping_add(1);
+                    artists_req_id.set(next_req);
+                    loaded_artists_key.set(None);
+                    artists_list.set(Vec::new());
+                    artists_error.set(None);
+                    artists_loading.set(false);
+                }
+                if loaded_tracks_key.peek().is_some()
+                    || *tracks_loading.peek()
+                    || *tracks_loading_more.peek()
+                    || !tracks_list.peek().is_empty()
+                {
+                    let next_req = tracks_req_id.peek().wrapping_add(1);
+                    tracks_req_id.set(next_req);
+                    loaded_tracks_key.set(None);
+                    tracks_list.set(Vec::new());
+                    tracks_offset.set(0);
+                    tracks_has_more.set(false);
+                    tracks_error.set(None);
+                    tracks_loading.set(false);
+                    tracks_loading_more.set(false);
+                }
+            }
+            Some(_) => {
+                if *artists_loading.peek() {
+                    let next_req = artists_req_id.peek().wrapping_add(1);
+                    artists_req_id.set(next_req);
+                    artists_loading.set(false);
+                    loaded_artists_key.set(None);
+                }
+                if *tracks_loading.peek() || *tracks_loading_more.peek() {
+                    let was_initial = *tracks_loading.peek();
+                    let next_req = tracks_req_id.peek().wrapping_add(1);
+                    tracks_req_id.set(next_req);
+                    tracks_loading.set(false);
+                    tracks_loading_more.set(false);
+                    if was_initial {
+                        loaded_tracks_key.set(None);
+                    }
+                }
+            }
         }
     });
 
@@ -685,6 +789,7 @@ pub fn LibraryPage() -> Element {
                                     for alb in albums.iter() {
                                         {
                                             let aid_open = alb.id.clone();
+                                            let aid_key = alb.id.clone();
                                             let aid_play = alb.id.clone();
                                             let name_play = alb.name.clone();
                                             rsx! {
@@ -695,6 +800,12 @@ pub fn LibraryPage() -> Element {
                                                     class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default p-3 text-left transition-colors cursor-pointer space-y-2.5",
                                                     onclick: move |_| {
                                                         navigator.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                                    },
+                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                        if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                            evt.prevent_default();
+                                                            navigator.push(Route::AlbumDetailPage { id: aid_key.clone() });
+                                                        }
                                                     },
                                                     div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
                                                         if let Some(url) = alb.cover_art_url.as_deref() {
@@ -710,6 +821,11 @@ pub fn LibraryPage() -> Element {
                                                             onclick: move |evt: MouseEvent| {
                                                                 evt.stop_propagation();
                                                                 play_album_now.call((aid_play.clone(), name_play.clone()));
+                                                            },
+                                                            onkeydown: move |evt: KeyboardEvent| {
+                                                                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                    evt.stop_propagation();
+                                                                }
                                                             },
                                                             IconPlay { size: 15, filled: true, class: "ml-0.5".to_string() }
                                                         }
@@ -1030,14 +1146,7 @@ pub fn LibraryPage() -> Element {
                             "Imported \"{}\": {} in library, {} queued.",
                             resp.playlist_name, resp.already_in_library, resp.queued_for_download
                         ));
-                        if let Some(info) = studio.navidrome_info() {
-                            spawn(async move {
-                                if let Ok(pls) = fetch_playlists(&info).await {
-                                    studio.playlists.set(pls);
-                                    studio.reclassify_playlists();
-                                }
-                            });
-                        }
+                        studio.refresh_playlists();
                     },
                     on_view_activity: Some(on_view_activity),
                 }
@@ -1053,9 +1162,11 @@ fn PlaylistGridCard(
     on_play: EventHandler<(String, String)>,
 ) -> Element {
     let pid_open = playlist.id.clone();
+    let pid_key = playlist.id.clone();
     let pid_play = playlist.id.clone();
     let name_play = playlist.name.clone();
     let category = playlist.category;
+    let track_word = if playlist.song_count == 1 { "TRACK" } else { "TRACKS" };
 
     let icon_wrap_cls = match category {
         PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
@@ -1087,6 +1198,12 @@ fn PlaylistGridCard(
             tabindex: "0",
             class: "group p-4 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer flex items-center justify-between gap-3",
             onclick: move |_| on_open.call(pid_open.clone()),
+            onkeydown: move |evt: KeyboardEvent| {
+                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                    evt.prevent_default();
+                    on_open.call(pid_key.clone());
+                }
+            },
             div { class: "flex items-center gap-3 min-w-0",
                 div { class: "w-11 h-11 rounded-[8px] flex items-center justify-center shrink-0 {icon_wrap_cls}",
                     match category {
@@ -1100,7 +1217,7 @@ fn PlaylistGridCard(
                     p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{playlist.name}" }
                     div { class: "flex items-center gap-1.5 flex-wrap",
                         span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                            "{playlist.song_count} TRACKS"
+                            "{playlist.song_count} {track_word}"
                         }
                         if let Some(tag) = category.badge_label() {
                             span { class: "px-1.5 py-0.5 rounded border tabular-nums-mono text-[9px] font-semibold tracking-wider {tag_cls}",
@@ -1118,6 +1235,11 @@ fn PlaylistGridCard(
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
                     on_play.call((pid_play.clone(), name_play.clone()));
+                },
+                onkeydown: move |evt: KeyboardEvent| {
+                    if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                        evt.stop_propagation();
+                    }
                 },
                 IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
             }

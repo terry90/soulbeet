@@ -103,6 +103,11 @@ pub enum PlayerCommand {
     EnqueueNext(PlayerTrack),
     EnqueueLast(PlayerTrack),
     RemoveFromQueue(usize),
+    /// Moves a queued item from `from` to `to`, keeping playback and gapless prefetch in sync.
+    MoveQueueItem {
+        from: usize,
+        to: usize,
+    },
     /// Atomically removes every occurrence of the given track ID from the queue,
     /// advancing playback once when the active track was removed.
     RemoveTrackFromQueue(String),
@@ -350,6 +355,9 @@ impl PlayerState {
             }
             PlayerCommand::RemoveFromQueue(idx) => {
                 self.remove_queue_index(*idx, position_secs, duration_secs);
+            }
+            PlayerCommand::MoveQueueItem { from, to } => {
+                self.move_queue_item(*from, *to);
             }
             PlayerCommand::RemoveTrackFromQueue(track_id) => {
                 if track_id.is_empty() {
@@ -1016,10 +1024,9 @@ impl PlayerContext {
         self.dispatch(PlayerCommand::RemoveFromQueue(index));
     }
 
-    /// Moves a queued item from `from` to `to` directly in reactive queue state.
+    /// Dispatches a queue reorder command so audio engines stay synchronized.
     pub fn move_queue_item(&self, from: usize, to: usize) {
-        let mut state = self.state;
-        state.write().move_queue_item(from, to);
+        self.dispatch(PlayerCommand::MoveQueueItem { from, to });
     }
 
     /// Inserts `track` at `index` in the playback queue without interrupting current playback.
@@ -1620,5 +1627,30 @@ mod tests {
         let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c", "d"]);
         assert_eq!(state.queue_index, Some(2));
+    }
+
+    #[test]
+    fn move_queue_item_command_applies_via_local_command_dispatcher() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 120), track("c", 140)],
+                start_index: 0,
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Playing;
+        state.apply_local_command(
+            &PlayerCommand::MoveQueueItem { from: 2, to: 1 },
+            &mut pos,
+            &mut dur,
+        );
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "b"]);
+        assert_eq!(state.queue_index, Some(0));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("a"));
+        assert_eq!(state.status, PlaybackStatus::Playing);
     }
 }

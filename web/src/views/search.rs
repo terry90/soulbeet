@@ -1951,7 +1951,9 @@ pub fn SearchPage() -> Element {
                                     for mix in mixes.iter().take(6) {
                                         {
                                             let slug_open = mix.slug.clone();
+                                            let slug_key = mix.slug.clone();
                                             let slug_play = mix.slug.clone();
+                                            let track_word = if mix.track_count == 1 { "TRACK" } else { "TRACKS" };
                                             rsx! {
                                                 div {
                                                     key: "srch-mix-{mix.slug}",
@@ -1961,12 +1963,18 @@ pub fn SearchPage() -> Element {
                                                     onclick: move |_| {
                                                         nav.push(Route::MixDetailPage { slug: slug_open.clone() });
                                                     },
+                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                        if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                            evt.prevent_default();
+                                                            nav.push(Route::MixDetailPage { slug: slug_key.clone() });
+                                                        }
+                                                    },
                                                     div { class: "min-w-0",
                                                         p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
                                                             "{format_mix_title(mix)}"
                                                         }
                                                         p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary mt-0.5",
-                                                            "{mix.track_count} TRACKS"
+                                                            "{mix.track_count} {track_word}"
                                                         }
                                                     }
                                                     button {
@@ -1976,6 +1984,11 @@ pub fn SearchPage() -> Element {
                                                         onclick: move |evt: MouseEvent| {
                                                             evt.stop_propagation();
                                                             studio.play_contextual_mix(auth, player, slug_play.clone());
+                                                        },
+                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                evt.stop_propagation();
+                                                            }
                                                         },
                                                         IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                                     }
@@ -2127,6 +2140,7 @@ pub fn SearchPage() -> Element {
                                                 for alb in local_snapshot.albums.iter().take(if active_filter == SearchFilter::Albums { 8 } else { 4 }) {
                                                     {
                                                         let aid_open = alb.id.clone();
+                                                        let aid_key = alb.id.clone();
                                                         let aid_play = alb.id.clone();
                                                         rsx! {
                                                             div {
@@ -2136,6 +2150,12 @@ pub fn SearchPage() -> Element {
                                                                 class: "group p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer space-y-2",
                                                                 onclick: move |_| {
                                                                     nav.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                                                },
+                                                                onkeydown: move |evt: KeyboardEvent| {
+                                                                    if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                        evt.prevent_default();
+                                                                        nav.push(Route::AlbumDetailPage { id: aid_key.clone() });
+                                                                    }
                                                                 },
                                                                 div { class: "relative aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center",
                                                                     if let Some(url) = alb.cover_art_url.as_deref() {
@@ -2150,6 +2170,11 @@ pub fn SearchPage() -> Element {
                                                                         onclick: move |evt: MouseEvent| {
                                                                             evt.stop_propagation();
                                                                             play_local_album(aid_play.clone());
+                                                                        },
+                                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                                evt.stop_propagation();
+                                                                            }
                                                                         },
                                                                         IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                                                     }

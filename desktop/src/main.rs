@@ -95,6 +95,7 @@ fn DesktopShell() -> Element {
     let lyrics = studio.lyrics.read().clone();
     let lyrics_loading = (studio.lyrics_loading)();
     let lyrics_error = studio.lyrics_error.read().clone();
+    let mut save_queue_ids = use_signal(|| None::<Vec<String>>);
 
     let palette_commands = build_palette_commands(offline_only, mini_open, cfg.replaygain);
 
@@ -349,6 +350,28 @@ fn DesktopShell() -> Element {
                     on_drop: move |track| studio.drop_track(player, track),
                     on_rate: move |(track, rating)| studio.rate_track(player, track, rating),
                     on_start_radio: move |track| studio.start_local_radio(player, track),
+                    on_artist_click: Some(EventHandler::new(move |artist: String| {
+                        studio.open_artist_by_name(artist);
+                    })),
+                    on_album_click: Some(EventHandler::new(move |album: String| {
+                        studio.open_album_by_name(album);
+                    })),
+                    on_save_queue_as_playlist: Some(EventHandler::new(move |_| {
+                        let ids: Vec<String> = player
+                            .snapshot()
+                            .queue
+                            .into_iter()
+                            .map(|t| t.id)
+                            .filter(|id| !id.trim().is_empty())
+                            .collect();
+                        if ids.is_empty() {
+                            studio
+                                .status_toast
+                                .set(Some("No playable library tracks in queue to save.".into()));
+                        } else {
+                            save_queue_ids.set(Some(ids));
+                        }
+                    })),
                 }
             }
 
@@ -356,6 +379,28 @@ fn DesktopShell() -> Element {
             StudioPlayerBar {
                 active_drawer_tab: active_drawer,
                 on_toggle_drawer: move |tab| studio.toggle_drawer(tab),
+                on_inspect_current: Some(EventHandler::new(move |_| {
+                    let showing_current_inspector = *studio.active_drawer.peek()
+                        == Some(DrawerTab::Inspector)
+                        && studio.inspected_track.peek().is_none();
+                    if showing_current_inspector {
+                        studio.active_drawer.set(None);
+                    } else {
+                        studio.inspected_track.set(None);
+                        studio.active_drawer.set(Some(DrawerTab::Inspector));
+                        if let Some(cur) = player.current_track() {
+                            if !cur.id.is_empty() {
+                                studio.audit_delete_guard(cur.id);
+                            }
+                        }
+                    }
+                })),
+                on_artist_click: Some(EventHandler::new(move |artist: String| {
+                    studio.open_artist_by_name(artist);
+                })),
+                on_album_click: Some(EventHandler::new(move |album: String| {
+                    studio.open_album_by_name(album);
+                })),
                 connect_devices,
                 local_device_id: cfg.device_id.clone(),
                 acquiring_in_flight: sync_st.syncing,
@@ -414,6 +459,14 @@ fn DesktopShell() -> Element {
                 AddToPlaylistModal {
                     track,
                     on_close: move |_| studio.add_to_playlist_track.set(None),
+                }
+            }
+
+            // Save Queue as Playlist Modal
+            if let Some(ids) = save_queue_ids.read().clone() {
+                SaveQueuePlaylistModal {
+                    song_ids: ids,
+                    on_close: move |_| save_queue_ids.set(None),
                 }
             }
 
@@ -727,12 +780,13 @@ fn AddToPlaylistModal(track: PlayerTrack, on_close: EventHandler<()>) -> Element
                                         None,
                                         Some(false),
                                         Some(vec![track_id_create.clone()]),
+                                        false,
+                                        Some(on_close),
                                     );
-                                    on_close.call(());
                                 }
                             },
                             IconPlus { size: 13 }
-                            span { "Create & Add" }
+                            span { if mutating { "Saving..." } else { "Create & Add" } }
                         }
                     }
                 }
@@ -781,8 +835,8 @@ fn AddToPlaylistModal(track: PlayerTrack, on_close: EventHandler<()>) -> Element
                                                     pid.clone(),
                                                     pname.clone(),
                                                     vec![tid.clone()],
+                                                    Some(on_close),
                                                 );
-                                                on_close.call(());
                                             },
                                             div { class: "flex items-center gap-2.5 min-w-0",
                                                 IconListMusic { size: 14, class: "text-beet-text-tertiary shrink-0".to_string() }
@@ -791,13 +845,114 @@ fn AddToPlaylistModal(track: PlayerTrack, on_close: EventHandler<()>) -> Element
                                                 }
                                             }
                                             span { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary shrink-0",
-                                                "{item.playlist.song_count} TRACKS"
+                                                if item.playlist.song_count == 1 {
+                                                    "1 TRACK"
+                                                } else {
+                                                    "{item.playlist.song_count} TRACKS"
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SaveQueuePlaylistModal(song_ids: Vec<String>, on_close: EventHandler<()>) -> Element {
+    let mut studio = use_desktop_studio();
+    let player = use_player();
+    let offline_only = player.offline_only();
+    let has_server = studio
+        .config
+        .read()
+        .soulbeet_base_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+    let mut name = use_signal(|| "Queue Playlist".to_string());
+    let mut is_public = use_signal(|| false);
+    let mutating = (studio.playlist_mutating)();
+    let can_submit = !offline_only && has_server && !mutating && !name().trim().is_empty();
+    let track_count = song_ids.len();
+    let track_word = if track_count == 1 { "track" } else { "tracks" };
+
+    rsx! {
+        Modal {
+            on_close: move |_| on_close.call(()),
+            header: rsx! {
+                div { class: "min-w-0",
+                    h2 { class: "text-base font-semibold text-beet-text-primary",
+                        "Save Queue as Playlist"
+                    }
+                    p { class: "text-[12px] text-beet-text-secondary mt-0.5",
+                        "{track_count} {track_word} in queue"
+                    }
+                }
+            },
+            div { class: "space-y-4",
+                if !has_server {
+                    div { class: "p-3 rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-text/30 text-[12px] text-beet-crimson-text",
+                        "Connect a Soulbeet server in Settings to save playlists."
+                    }
+                } else if offline_only {
+                    div { class: "p-3 rounded-[10px] bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary",
+                        "Disable Offline Only mode to save playlists."
+                    }
+                }
+
+                label { class: "block space-y-1.5",
+                    span { class: "text-[12px] text-beet-text-secondary", "Playlist Name" }
+                    input {
+                        r#type: "text",
+                        value: "{name}",
+                        placeholder: "Queue Playlist",
+                        disabled: mutating,
+                        class: "w-full h-10 px-3 rounded-[8px] bg-beet-surface border border-beet-border-default text-[14px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none disabled:opacity-50",
+                        oninput: move |evt| name.set(evt.value()),
+                    }
+                }
+
+                label { class: "inline-flex items-center gap-2.5 text-[13px] text-beet-text-secondary cursor-pointer",
+                    input {
+                        r#type: "checkbox",
+                        checked: is_public(),
+                        disabled: mutating,
+                        class: "accent-beet-leaf-solid cursor-pointer",
+                        onchange: move |evt| is_public.set(evt.checked()),
+                    }
+                    span { "Public playlist (visible to other household listeners)" }
+                }
+
+                div { class: "flex justify-end gap-2.5 pt-2",
+                    button {
+                        r#type: "button",
+                        class: "px-4 py-2 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer",
+                        onclick: move |_| on_close.call(()),
+                        "Cancel"
+                    }
+                    button {
+                        r#type: "button",
+                        disabled: !can_submit,
+                        class: "px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none transition-[filter] cursor-pointer",
+                        onclick: move |_| {
+                            let trimmed = name().trim().to_string();
+                            if !trimmed.is_empty() {
+                                studio.create_playlist(
+                                    trimmed,
+                                    None,
+                                    Some(is_public()),
+                                    Some(song_ids.clone()),
+                                    false,
+                                    Some(on_close),
+                                );
+                            }
+                        },
+                        if mutating { "Saving..." } else { "Save Playlist" }
                     }
                 }
             }

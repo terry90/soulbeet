@@ -1641,6 +1641,92 @@ impl DesktopStudio {
         self.active_section.set(StudioNavSection::Library);
     }
 
+    /// Resolves an artist name in the local SQLite mirror and opens Artist Detail, falling back to Search.
+    pub fn open_artist_by_name(&mut self, artist_name: String) {
+        let trimmed = artist_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(core) = self.core.peek().clone() else {
+            self.search_seed_query.set(trimmed);
+            self.active_section.set(StudioNavSection::Search);
+            return;
+        };
+        let mut studio = *self;
+        spawn(async move {
+            let exact: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM artists WHERE name = ? COLLATE NOCASE LIMIT 1",
+            )
+            .bind(&trimmed)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = exact {
+                studio.open_artist_detail(id);
+                return;
+            }
+            let pattern = format!("%{trimmed}%");
+            let fuzzy: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM artists WHERE name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1",
+            )
+            .bind(&pattern)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = fuzzy {
+                studio.open_artist_detail(id);
+            } else {
+                studio.search_seed_query.set(trimmed);
+                studio.active_section.set(StudioNavSection::Search);
+            }
+        });
+    }
+
+    /// Resolves an album name in the local SQLite mirror and opens Album Detail, falling back to Search.
+    pub fn open_album_by_name(&mut self, album_name: String) {
+        let trimmed = album_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(core) = self.core.peek().clone() else {
+            self.search_seed_query.set(trimmed);
+            self.active_section.set(StudioNavSection::Search);
+            return;
+        };
+        let mut studio = *self;
+        spawn(async move {
+            let exact: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM albums WHERE name = ? COLLATE NOCASE LIMIT 1",
+            )
+            .bind(&trimmed)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = exact {
+                studio.open_album_detail(id);
+                return;
+            }
+            let pattern = format!("%{trimmed}%");
+            let fuzzy: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM albums WHERE name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1",
+            )
+            .bind(&pattern)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = fuzzy {
+                studio.open_album_detail(id);
+            } else {
+                studio.search_seed_query.set(trimmed);
+                studio.active_section.set(StudioNavSection::Search);
+            }
+        });
+    }
+
     pub fn open_add_to_playlist(&mut self, track: PlayerTrack) {
         self.add_to_playlist_track.set(Some(track));
     }
@@ -2058,7 +2144,8 @@ impl DesktopStudio {
             PlayerCommand::ToggleShuffle
             | PlayerCommand::CycleRepeat
             | PlayerCommand::EnqueueNext(_)
-            | PlayerCommand::EnqueueLast(_) => {
+            | PlayerCommand::EnqueueLast(_)
+            | PlayerCommand::MoveQueueItem { .. } => {
                 self.schedule_gapless_prefetch(player);
             }
             PlayerCommand::RemoveFromQueue(idx) => {
@@ -4092,7 +4179,12 @@ impl DesktopStudio {
         comment: Option<String>,
         public: Option<bool>,
         song_ids: Option<Vec<String>>,
+        select_after_create: bool,
+        on_success: Option<EventHandler<()>>,
     ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() {
             self.status_toast
@@ -4137,16 +4229,27 @@ impl DesktopStudio {
                                     studio.bump_library();
                                 }
                             }
-                            studio.selected_playlist_id.set(Some(created_id));
+                            if select_after_create
+                                && studio.selected_album_id.peek().is_none()
+                                && studio.selected_artist_id.peek().is_none()
+                            {
+                                studio.selected_playlist_id.set(Some(created_id));
+                            }
                             studio.status_toast.set(Some(format!(
                                 "Created playlist \"{created_name}\""
                             )));
+                            if let Some(cb) = on_success {
+                                cb.call(());
+                            }
                         }
                         Err(err) => {
                             studio.status_toast.set(Some(format!(
                                 "Playlist created, but failed to decode response: {err}"
                             )));
                             studio.sync_now(false);
+                            if let Some(cb) = on_success {
+                                cb.call(());
+                            }
                         }
                     }
                 }
@@ -4175,7 +4278,11 @@ impl DesktopStudio {
         name: Option<String>,
         comment: Option<String>,
         public: Option<bool>,
+        on_success: Option<EventHandler<()>>,
     ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
         let Some((base, auth, client)) = self.playlist_endpoint_context() else {
             return;
         };
@@ -4218,6 +4325,9 @@ impl DesktopStudio {
                     studio
                         .status_toast
                         .set(Some(format!("Updated playlist \"{updated_name}\"")));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
                 }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -4238,7 +4348,15 @@ impl DesktopStudio {
     }
 
     /// Deletes a user playlist via `POST /api/playlists/delete` and syncs the local mirror.
-    pub fn delete_playlist(&mut self, playlist_id: String, playlist_name: String) {
+    pub fn delete_playlist(
+        &mut self,
+        playlist_id: String,
+        playlist_name: String,
+        on_success: Option<EventHandler<()>>,
+    ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
         let Some((base, auth, client)) = self.playlist_endpoint_context() else {
             return;
         };
@@ -4278,6 +4396,9 @@ impl DesktopStudio {
                     studio
                         .status_toast
                         .set(Some(format!("Deleted playlist \"{playlist_name}\"")));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
                 }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -4303,8 +4424,9 @@ impl DesktopStudio {
         playlist_id: String,
         playlist_name: String,
         song_ids: Vec<String>,
+        on_success: Option<EventHandler<()>>,
     ) {
-        if song_ids.is_empty() {
+        if *self.playlist_mutating.peek() || song_ids.is_empty() {
             return;
         }
         let Some((base, auth, client)) = self.playlist_endpoint_context() else {
@@ -4346,6 +4468,9 @@ impl DesktopStudio {
                         format!("Added {count} tracks to \"{playlist_name}\"")
                     };
                     studio.status_toast.set(Some(label));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
                 }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -4372,6 +4497,9 @@ impl DesktopStudio {
         song_id: String,
         track_title: String,
     ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
         let Some((base, auth, client)) = self.playlist_endpoint_context() else {
             return;
         };

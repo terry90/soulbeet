@@ -29,6 +29,11 @@ pub fn PlaylistDetailPage(id: String) -> Element {
     let mut studio = use_studio();
     let nav = use_navigator();
 
+    let mut target_id = use_signal(|| id.clone());
+    if *target_id.peek() != id {
+        target_id.set(id.clone());
+    }
+
     let mut summary = use_signal(|| None::<SubsonicPlaylistSummary>);
     let mut tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut loading = use_signal(|| true);
@@ -38,17 +43,35 @@ pub fn PlaylistDetailPage(id: String) -> Element {
     let mut busy_mutation = use_signal(|| false);
     let mut req_id = use_signal(|| 0u64);
     let mut reload_tick = use_signal(|| 0u64);
+    let mut last_loaded_id = use_signal(String::new);
 
-    let id_for_load = id.clone();
     use_effect(move || {
+        let pid = target_id();
         let _tick = reload_tick();
-        let pid = id_for_load.clone();
-        let nav_info = studio
-            .bootstrap
-            .read()
-            .as_ref()
-            .and_then(|b| b.navidrome.clone());
-        let Some(info) = nav_info else {
+        let route_changed = *last_loaded_id.peek() != pid;
+        if route_changed {
+            last_loaded_id.set(pid.clone());
+            summary.set(None);
+            tracks.set(Vec::new());
+            error.set(None);
+            menu_open.set(false);
+            confirm_delete_open.set(false);
+            busy_mutation.set(false);
+        }
+        let boot = studio.bootstrap.read().clone();
+        let Some(boot) = boot else {
+            loading.set(true);
+            return;
+        };
+        let Some(info) = boot.navidrome else {
+            let next_req = req_id.peek().wrapping_add(1);
+            req_id.set(next_req);
+            summary.set(None);
+            tracks.set(Vec::new());
+            error.set(Some(
+                "Connect Navidrome in Settings to view playlists.".to_string(),
+            ));
+            loading.set(false);
             return;
         };
         let next_req = req_id.peek().wrapping_add(1);
@@ -74,6 +97,8 @@ pub fn PlaylistDetailPage(id: String) -> Element {
                 }
                 Ok(None) => {
                     if *req_id.peek() == next_req {
+                        summary.set(None);
+                        tracks.set(Vec::new());
                         error.set(Some("Playlist not found.".to_string()));
                         loading.set(false);
                     }
@@ -89,38 +114,43 @@ pub fn PlaylistDetailPage(id: String) -> Element {
     });
 
     // Reload metadata whenever global playlist edits finish (e.g. Rename modal closed).
+    // Intentionally excludes `song_count` so optimistic track removals do not trigger a mid-flight reload.
     let mut prev_playlist_sig = use_signal(|| {
-        studio
+        let meta = studio
             .playlists
             .peek()
             .iter()
             .find(|p| p.id == id)
-            .map(|p| (p.name.clone(), p.comment.clone(), p.public, p.song_count))
+            .map(|p| (p.name.clone(), p.comment.clone(), p.public));
+        (id.clone(), meta)
     });
     {
-        let current_sig = studio
+        let current_meta = studio
             .playlists
             .read()
             .iter()
             .find(|p| p.id == id)
-            .map(|p| (p.name.clone(), p.comment.clone(), p.public, p.song_count));
-        if current_sig.is_some() && current_sig != *prev_playlist_sig.peek() {
-            prev_playlist_sig.set(current_sig);
+            .map(|p| (p.name.clone(), p.comment.clone(), p.public));
+        let (prev_id, prev_meta) = prev_playlist_sig.peek().clone();
+        if prev_id != id {
+            prev_playlist_sig.set((id.clone(), current_meta));
+        } else if current_meta.is_some() && current_meta != prev_meta {
+            prev_playlist_sig.set((id.clone(), current_meta));
             reload_tick += 1;
         }
     }
 
-    let id_for_delete = id.clone();
     let handle_delete = move |_| {
         if busy_mutation() {
             return;
         }
         busy_mutation.set(true);
-        let pid = id_for_delete.clone();
+        let pid = target_id.peek().clone();
         spawn(async move {
-            match auth.call(api::delete_playlist(pid)).await {
+            match auth.call(api::delete_playlist(pid.clone())).await {
                 Ok(()) => {
                     confirm_delete_open.set(false);
+                    studio.playlists.write().retain(|p| p.id != pid);
                     studio.refresh_playlists();
                     studio.show_toast("Playlist deleted");
                     nav.push(Route::LibraryPage {});
@@ -239,10 +269,19 @@ pub fn PlaylistDetailPage(id: String) -> Element {
                                     }
                                 }
 
-                                p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                    "{display_tracks.len()} TRACKS"
-                                    if total_secs > 0 {
-                                        " · {format_duration(total_secs)}"
+                                {
+                                    let track_word = if display_tracks.len() == 1 {
+                                        "TRACK"
+                                    } else {
+                                        "TRACKS"
+                                    };
+                                    rsx! {
+                                        p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                            "{display_tracks.len()} {track_word}"
+                                            if total_secs > 0 {
+                                                " · {format_duration(total_secs)}"
+                                            }
+                                        }
                                     }
                                 }
 
@@ -412,16 +451,25 @@ pub fn PlaylistDetailPage(id: String) -> Element {
 
                                         let on_move_up = (is_static_editable && idx > 0).then(|| {
                                             EventHandler::new(move |()| {
+                                                if *busy_mutation.peek() {
+                                                    return;
+                                                }
                                                 let mut next_list = tracks.peek().clone();
                                                 if idx > 0 && idx < next_list.len() {
+                                                    busy_mutation.set(true);
                                                     next_list.swap(idx, idx - 1);
                                                     let ids: Vec<String> = next_list.iter().map(|t| t.id.clone()).collect();
                                                     tracks.set(next_list);
                                                     let pid = pid_up.clone();
                                                     spawn(async move {
-                                                        if let Err(err) = auth.call(api::set_playlist_tracks(pid, ids)).await {
+                                                        if let Err(err) = auth.call(api::set_playlist_tracks(pid.clone(), ids)).await {
                                                             studio.show_toast(format!("Reorder failed: {}", friendly_error(&err)));
-                                                            reload_tick += 1;
+                                                            if *target_id.peek() == pid {
+                                                                reload_tick += 1;
+                                                            }
+                                                        }
+                                                        if *target_id.peek() == pid {
+                                                            busy_mutation.set(false);
                                                         }
                                                     });
                                                 }
@@ -430,16 +478,25 @@ pub fn PlaylistDetailPage(id: String) -> Element {
 
                                         let on_move_down = (is_static_editable && idx + 1 < total_len).then(|| {
                                             EventHandler::new(move |()| {
+                                                if *busy_mutation.peek() {
+                                                    return;
+                                                }
                                                 let mut next_list = tracks.peek().clone();
                                                 if idx + 1 < next_list.len() {
+                                                    busy_mutation.set(true);
                                                     next_list.swap(idx, idx + 1);
                                                     let ids: Vec<String> = next_list.iter().map(|t| t.id.clone()).collect();
                                                     tracks.set(next_list);
                                                     let pid = pid_down.clone();
                                                     spawn(async move {
-                                                        if let Err(err) = auth.call(api::set_playlist_tracks(pid, ids)).await {
+                                                        if let Err(err) = auth.call(api::set_playlist_tracks(pid.clone(), ids)).await {
                                                             studio.show_toast(format!("Reorder failed: {}", friendly_error(&err)));
-                                                            reload_tick += 1;
+                                                            if *target_id.peek() == pid {
+                                                                reload_tick += 1;
+                                                            }
+                                                        }
+                                                        if *target_id.peek() == pid {
+                                                            busy_mutation.set(false);
                                                         }
                                                     });
                                                 }
@@ -448,27 +505,37 @@ pub fn PlaylistDetailPage(id: String) -> Element {
 
                                         let on_remove_from_playlist = is_static_editable.then(|| {
                                             EventHandler::new(move |()| {
+                                                if *busy_mutation.peek() {
+                                                    return;
+                                                }
                                                 let sid = rm_song_id.clone();
                                                 let title = rm_title.clone();
                                                 let pid = pid_rm.clone();
                                                 let mut next_list = tracks.peek().clone();
                                                 if idx < next_list.len() && next_list[idx].id == sid {
+                                                    busy_mutation.set(true);
                                                     next_list.remove(idx);
-                                                    tracks.set(next_list.clone());
-                                                    studio.sync_playlist_count(&pid, next_list.len() as u32);
+                                                    let remaining_count = next_list.len() as u32;
+                                                    tracks.set(next_list);
+                                                    spawn(async move {
+                                                        match auth.call(api::remove_playlist_tracks(pid.clone(), vec![sid])).await {
+                                                            Ok(updated) => {
+                                                                studio.sync_playlist_count(&pid, updated.song_count.min(remaining_count));
+                                                                studio.refresh_playlists();
+                                                                studio.show_toast(format!("Removed \"{title}\" from playlist"));
+                                                            }
+                                                            Err(err) => {
+                                                                studio.show_toast(format!("Remove failed: {}", friendly_error(&err)));
+                                                                if *target_id.peek() == pid {
+                                                                    reload_tick += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                        if *target_id.peek() == pid {
+                                                            busy_mutation.set(false);
+                                                        }
+                                                    });
                                                 }
-                                                spawn(async move {
-                                                    match auth.call(api::remove_playlist_tracks(pid, vec![sid])).await {
-                                                        Ok(_) => {
-                                                            studio.refresh_playlists();
-                                                            studio.show_toast(format!("Removed \"{title}\" from playlist"));
-                                                        }
-                                                        Err(err) => {
-                                                            studio.show_toast(format!("Remove failed: {}", friendly_error(&err)));
-                                                            reload_tick += 1;
-                                                        }
-                                                    }
-                                                });
                                             })
                                         });
 
@@ -538,6 +605,11 @@ pub fn AlbumDetailPage(id: String) -> Element {
     let mut studio = use_studio();
     let nav = use_navigator();
 
+    let mut target_id = use_signal(|| id.clone());
+    if *target_id.peek() != id {
+        target_id.set(id.clone());
+    }
+
     let mut album = use_signal(|| None::<SubsonicAlbumSummary>);
     let mut tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut loading = use_signal(|| true);
@@ -545,22 +617,29 @@ pub fn AlbumDetailPage(id: String) -> Element {
     let mut art_failed = use_signal(|| false);
     let mut req_id = use_signal(|| 0u64);
 
-    let id_for_load = id.clone();
     use_effect(move || {
-        let aid = id_for_load.clone();
-        let nav_info = studio
-            .bootstrap
-            .read()
-            .as_ref()
-            .and_then(|b| b.navidrome.clone());
-        let Some(info) = nav_info else {
+        let aid = target_id();
+        album.set(None);
+        tracks.set(Vec::new());
+        error.set(None);
+        art_failed.set(false);
+        let boot = studio.bootstrap.read().clone();
+        let Some(boot) = boot else {
+            loading.set(true);
+            return;
+        };
+        let Some(info) = boot.navidrome else {
+            let next_req = req_id.peek().wrapping_add(1);
+            req_id.set(next_req);
+            error.set(Some(
+                "Connect Navidrome in Settings to view albums.".to_string(),
+            ));
+            loading.set(false);
             return;
         };
         let next_req = req_id.peek().wrapping_add(1);
         req_id.set(next_req);
         loading.set(true);
-        error.set(None);
-        art_failed.set(false);
         spawn(async move {
             match fetch_album_detail(&info, &aid).await {
                 Ok(Some((alb, list))) => {
@@ -668,7 +747,11 @@ pub fn AlbumDetailPage(id: String) -> Element {
                                         span { class: "tabular-nums-mono text-[12px] text-beet-text-tertiary", "· {yr}" }
                                     }
                                     span { class: "tabular-nums-mono text-[12px] text-beet-text-tertiary",
-                                        "· {display_tracks.len()} TRACKS"
+                                        if display_tracks.len() == 1 {
+                                            "· 1 TRACK"
+                                        } else {
+                                            "· {display_tracks.len()} TRACKS"
+                                        }
                                     }
                                     if total_secs > 0 {
                                         span { class: "tabular-nums-mono text-[12px] text-beet-text-tertiary",
@@ -799,6 +882,11 @@ pub fn ArtistDetailPage(id: String) -> Element {
     let mut studio = use_studio();
     let nav = use_navigator();
 
+    let mut target_id = use_signal(|| id.clone());
+    if *target_id.peek() != id {
+        target_id.set(id.clone());
+    }
+
     let mut artist = use_signal(|| None::<SubsonicArtistSummary>);
     let mut albums = use_signal(Vec::<SubsonicAlbumSummary>::new);
     let mut loading = use_signal(|| true);
@@ -807,22 +895,30 @@ pub fn ArtistDetailPage(id: String) -> Element {
     let mut error = use_signal(|| None::<String>);
     let mut req_id = use_signal(|| 0u64);
 
-    let id_for_load = id.clone();
     use_effect(move || {
-        let artist_id = id_for_load.clone();
-        let nav_info = studio
-            .bootstrap
-            .read()
-            .as_ref()
-            .and_then(|b| b.navidrome.clone());
-        let Some(info) = nav_info else {
+        let artist_id = target_id();
+        artist.set(None);
+        albums.set(Vec::new());
+        error.set(None);
+        art_failed.set(false);
+        radio_busy.set(false);
+        let boot = studio.bootstrap.read().clone();
+        let Some(boot) = boot else {
+            loading.set(true);
+            return;
+        };
+        let Some(info) = boot.navidrome else {
+            let next_req = req_id.peek().wrapping_add(1);
+            req_id.set(next_req);
+            error.set(Some(
+                "Connect Navidrome in Settings to view artists.".to_string(),
+            ));
+            loading.set(false);
             return;
         };
         let next_req = req_id.peek().wrapping_add(1);
         req_id.set(next_req);
         loading.set(true);
-        error.set(None);
-        art_failed.set(false);
         spawn(async move {
             match fetch_artist_detail(&info, &artist_id).await {
                 Ok(Some((art, list))) => {
@@ -1019,8 +1115,10 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                     for alb in alb_list {
                                         {
                                             let aid_open = alb.id.clone();
+                                            let aid_key = alb.id.clone();
                                             let aid_play = alb.id.clone();
                                             let aname_play = alb.name.clone();
+                                            let track_word = if alb.song_count == 1 { "track" } else { "tracks" };
                                             rsx! {
                                                 div {
                                                     key: "art-alb-{alb.id}",
@@ -1029,6 +1127,12 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                                     class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default p-3 text-left transition-colors cursor-pointer space-y-2.5",
                                                     onclick: move |_| {
                                                         nav.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                                    },
+                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                        if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                            evt.prevent_default();
+                                                            nav.push(Route::AlbumDetailPage { id: aid_key.clone() });
+                                                        }
                                                     },
                                                     div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
                                                         if let Some(url) = alb.cover_art_url.as_deref() {
@@ -1045,6 +1149,11 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                                                 evt.stop_propagation();
                                                                 play_album.call((aid_play.clone(), aname_play.clone()));
                                                             },
+                                                            onkeydown: move |evt: KeyboardEvent| {
+                                                                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                    evt.stop_propagation();
+                                                                }
+                                                            },
                                                             IconPlay { size: 15, filled: true, class: "ml-0.5".to_string() }
                                                         }
                                                     }
@@ -1052,9 +1161,9 @@ pub fn ArtistDetailPage(id: String) -> Element {
                                                         p { class: "text-[14px] font-semibold text-beet-text-primary truncate", "{alb.name}" }
                                                         p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary truncate",
                                                             if let Some(yr) = alb.year {
-                                                                "{yr} · {alb.song_count} tracks"
+                                                                "{yr} · {alb.song_count} {track_word}"
                                                             } else {
-                                                                "{alb.song_count} tracks"
+                                                                "{alb.song_count} {track_word}"
                                                             }
                                                         }
                                                     }

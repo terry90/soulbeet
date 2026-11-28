@@ -376,6 +376,9 @@
   .bottom-\[168px\] {
     bottom: 168px;
   }
+  .bottom-\[232px\] {
+    bottom: 232px;
+  }
   .left-0 {
     left: 0px;
   }
@@ -3401,6 +3404,9 @@
     .md\:bottom-\[152px\] {
       bottom: 152px;
     }
+    .md\:bottom-\[220px\] {
+      bottom: 220px;
+    }
     .md\:block {
       display: block;
     }
@@ -3487,6 +3493,9 @@
     .lg\:bottom-\[100px\] {
       bottom: 100px;
     }
+    .lg\:bottom-\[168px\] {
+      bottom: 168px;
+    }
     .lg\:col-span-2 {
       grid-column: span 2 / span 2;
     }
@@ -3542,6 +3551,9 @@
     }
     .xl\:hidden {
       display: none;
+    }
+    .xl\:inline {
+      display: inline;
     }
     .xl\:inline-flex {
       display: inline-flex;
