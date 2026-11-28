@@ -23,22 +23,24 @@ use shared::search_norm::{
 };
 use ui::{
     format_mix_title, friendly_error, run_multi_backend_source_search,
-    submit_multi_backend_download, use_player, use_system_health, AcquireStageBadge,
-    AutoDownloadSignal, DirectSearchEscape, DownloadIcon, DownloadResults, DownloadRowState,
-    FallbackToast, FallbackToastData, IconChevronLeft, IconDisc3, IconLoader, IconMusic, IconPlay,
-    IconRefreshCw, IconSearch, IconSlidersHorizontal, IconSparkles, IconWifiOff, IconX,
-    PlayerTrack, SearchPrefill, SearchReset, SourceChoices, SystemStatus, TrackRow, TrackRowState,
+    submit_multi_backend_download, use_player, AcquireStageBadge, AutoDownloadSignal,
+    DirectSearchEscape, DownloadIcon, DownloadResults, DownloadRowState, FallbackToast,
+    FallbackToastData, IconChevronLeft, IconDisc3, IconDownload, IconLoader, IconMoreHorizontal,
+    IconMusic, IconPlay, IconRefreshCw, IconSearch, IconSlidersHorizontal, IconSparkles,
+    IconWifiOff, IconX, PlayerTrack, SearchPrefill, SearchReset, SourceChoices, TrackRow,
+    TrackRowState,
 };
 
 use crate::auth::use_auth;
 use crate::navidrome_web::{
-    fetch_album_tracks, fetch_artist_albums, search_navidrome, NavidromeSearchHits,
-    SubsonicAlbumSummary, SubsonicArtistSummary,
+    fetch_album_tracks, search_navidrome, NavidromeSearchHits, SubsonicAlbumSummary,
 };
 use crate::web_player::{acquire_key, use_studio, AcquireTrackState, ManualChoiceModalState};
+use crate::Route;
 
 const LOCAL_DEBOUNCE_MS: u32 = 120;
 const REMOTE_DEBOUNCE_MS: u32 = 250;
+const REMOTE_SEARCH_TIMEOUT_MS: u32 = 12_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchFilter {
@@ -78,12 +80,6 @@ enum ActiveDetail {
         detail: Option<CatalogAlbumDetail>,
         error: Option<String>,
         return_to_artist: Option<(String, String)>,
-    },
-    LocalArtist {
-        artist: SubsonicArtistSummary,
-        loading: bool,
-        albums: Vec<SubsonicAlbumSummary>,
-        error: Option<String>,
     },
 }
 
@@ -280,7 +276,7 @@ pub fn SearchPage() -> Element {
     let auth = use_auth();
     let player = use_player();
     let mut studio = use_studio();
-    let system_health = use_system_health();
+    let nav = use_navigator();
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
     let auto_dl = try_use_context::<AutoDownloadSignal>();
@@ -551,23 +547,36 @@ pub fn SearchPage() -> Element {
         search_error.set(String::new());
         remote_loading.set(true);
         spawn(async move {
-            let res = auth
-                .call(api::search_unified(api::UnifiedSearchQuery {
-                    query: trimmed,
-                    provider,
-                    limit: None,
-                }))
-                .await;
+            use futures::future::{select, Either};
+            use futures::pin_mut;
+
+            let req_fut = auth.call(api::search_unified(api::UnifiedSearchQuery {
+                query: trimmed,
+                provider,
+                limit: None,
+            }));
+            let timeout_fut = ui::sleep_ms(REMOTE_SEARCH_TIMEOUT_MS);
+            pin_mut!(req_fut);
+            pin_mut!(timeout_fut);
+
+            let outcome = match select(req_fut, timeout_fut).await {
+                Either::Left((res, _)) => Some(res),
+                Either::Right((_, _)) => None,
+            };
 
             if *remote_req_id.peek() == next_req {
-                match res {
-                    Ok(data) => {
+                match outcome {
+                    Some(Ok(data)) => {
                         remote_results.set(Some(data));
                         search_error.set(String::new());
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         remote_results.set(None);
                         search_error.set(friendly_error(&e));
+                    }
+                    None => {
+                        remote_results.set(None);
+                        search_error.set("Catalog search timed out. Try searching again or pick sources directly.".to_string());
                     }
                 }
                 remote_loading.set(false);
@@ -726,22 +735,36 @@ pub fn SearchPage() -> Element {
                 }
                 search_error.set(String::new());
                 remote_loading.set(true);
-                let res = auth
-                    .call(api::search_unified(api::UnifiedSearchQuery {
-                        query: remote_q,
-                        provider: None,
-                        limit: None,
-                    }))
-                    .await;
+                use futures::future::{select, Either};
+                use futures::pin_mut;
+
+                let req_fut = auth.call(api::search_unified(api::UnifiedSearchQuery {
+                    query: remote_q,
+                    provider: None,
+                    limit: None,
+                }));
+                let timeout_fut = ui::sleep_ms(REMOTE_SEARCH_TIMEOUT_MS);
+                pin_mut!(req_fut);
+                pin_mut!(timeout_fut);
+
+                let outcome = match select(req_fut, timeout_fut).await {
+                    Either::Left((res, _)) => Some(res),
+                    Either::Right((_, _)) => None,
+                };
+
                 if *remote_req_id.peek() == next_remote {
-                    match res {
-                        Ok(data) => {
+                    match outcome {
+                        Some(Ok(data)) => {
                             remote_results.set(Some(data));
                             search_error.set(String::new());
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             remote_results.set(None);
                             search_error.set(friendly_error(&e));
+                        }
+                        None => {
+                            remote_results.set(None);
+                            search_error.set("Catalog search timed out. Try searching again or pick sources directly.".to_string());
                         }
                     }
                     remote_loading.set(false);
@@ -905,49 +928,6 @@ pub fn SearchPage() -> Element {
                         detail: None,
                         error: Some(friendly_error(&e)),
                         return_to_artist,
-                    }));
-                }
-            }
-        });
-    };
-
-    let mut open_local_artist = move |artist: SubsonicArtistSummary| {
-        if player.offline_only() {
-            studio.show_toast("Offline Only mode is active: library artist lookup is unavailable.");
-            return;
-        }
-        let Some(info) = studio.navidrome_info() else {
-            return;
-        };
-        let next_detail = detail_req_id.peek().wrapping_add(1);
-        detail_req_id.set(next_detail);
-        let artist_id = artist.id.clone();
-        active_detail.set(Some(ActiveDetail::LocalArtist {
-            artist: artist.clone(),
-            loading: true,
-            albums: Vec::new(),
-            error: None,
-        }));
-        spawn(async move {
-            let res = fetch_artist_albums(&info, &artist_id).await;
-            if *detail_req_id.peek() != next_detail {
-                return;
-            }
-            match res {
-                Ok(albums) => {
-                    active_detail.set(Some(ActiveDetail::LocalArtist {
-                        artist,
-                        loading: false,
-                        albums,
-                        error: None,
-                    }));
-                }
-                Err(e) => {
-                    active_detail.set(Some(ActiveDetail::LocalArtist {
-                        artist,
-                        loading: false,
-                        albums: Vec::new(),
-                        error: Some(e),
                     }));
                 }
             }
@@ -1155,13 +1135,6 @@ pub fn SearchPage() -> Element {
             t
         })
         .collect();
-    let active_backends = enabled_backends.read().clone();
-    let backend_summary: String = active_backends
-        .iter()
-        .map(|b| b.name)
-        .collect::<Vec<_>>()
-        .join(" · ");
-
     let detail_snapshot = active_detail.read().clone();
 
     rsx! {
@@ -1218,7 +1191,7 @@ pub fn SearchPage() -> Element {
                                 }
                             }
 
-                            // Single unified search input
+                            // Single unified search input (no inner focus-visible ring inside pill)
                             input {
                                 id: "search-query",
                                 r#type: "search",
@@ -1231,7 +1204,7 @@ pub fn SearchPage() -> Element {
                                 aria_label: "Search tracks, albums, or artists",
                                 autocomplete: "off",
                                 spellcheck: "false",
-                                class: "w-full min-w-0 bg-transparent text-[15px] text-beet-text-primary placeholder:text-beet-text-disabled focus:outline-none py-2.5",
+                                class: "beet-pill-input w-full min-w-0 bg-transparent text-[15px] text-beet-text-primary placeholder:text-beet-text-disabled outline-none focus:outline-none focus-visible:outline-none py-2.5",
                                 oninput: move |evt| {
                                     schedule_live_search(evt.value());
                                 },
@@ -1272,7 +1245,7 @@ pub fn SearchPage() -> Element {
                         }
                     }
 
-                    // Filter Pills (All | Tracks | Albums | Artists) + active backend badges
+                    // Filter Pills (All | Tracks | Albums | Artists)
                     div { class: "flex flex-wrap items-center justify-between gap-2",
                         div { class: "flex flex-wrap items-center gap-1.5",
                             for (tab, label, count) in [
@@ -1311,26 +1284,17 @@ pub fn SearchPage() -> Element {
                                 }
                             }
                         }
-
-                        if !offline_only && !active_backends.is_empty() {
-                            div { class: "flex flex-wrap items-center gap-1.5",
-                                span { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary uppercase tracking-wider",
-                                    "Sources"
-                                }
-                                for backend in active_backends.iter() {
-                                    span {
-                                        key: "active-backend-{backend.id}",
-                                        class: "tabular-nums-mono text-[10px] px-2 py-0.5 rounded-full bg-beet-surface-low border border-beet-border-subtle text-beet-text-secondary",
-                                        "{backend.name}"
-                                    }
-                                }
-                            }
-                        }
                     }
 
-                    SystemStatus {
-                        health: system_health.get(),
-                        navidrome_status: auth.navidrome_status(),
+                    if !offline_only && has_searched() && !has_folder {
+                        div { class: "flex flex-wrap items-center justify-between gap-2 rounded-[10px] bg-beet-surface-low border border-beet-border-subtle px-3.5 py-2 text-[12px] text-beet-text-secondary",
+                            span { "Configure a music download folder in Settings to enable direct folder downloads." }
+                            Link {
+                                to: Route::SettingsPage {},
+                                class: "font-semibold text-beet-leaf-text hover:underline shrink-0",
+                                "Open Settings"
+                            }
+                        }
                     }
                 }
 
@@ -1857,100 +1821,6 @@ pub fn SearchPage() -> Element {
                                 }
                             }
                         }
-                        ActiveDetail::LocalArtist { artist, loading, albums, error } => {
-                            let artist_name_for_catalog = artist.name.clone();
-                            rsx! {
-                                section { class: "rounded-[16px] bg-beet-surface-low border border-beet-border-subtle p-4 sm:p-5 space-y-5",
-                                    div { class: "flex flex-wrap items-center justify-between gap-2",
-                                        button {
-                                            r#type: "button",
-                                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle text-[12px] font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors cursor-pointer",
-                                            onclick: move |_| active_detail.set(None),
-                                            IconChevronLeft { size: 14 }
-                                            span { "Back to results" }
-                                        }
-                                        if !offline_only {
-                                            button {
-                                                r#type: "button",
-                                                class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-accent-surface border border-beet-accent/35 text-[12px] font-medium text-beet-accent-text hover:brightness-110 transition-all cursor-pointer",
-                                                onclick: move |_| open_catalog_artist(String::new(), artist_name_for_catalog.clone()),
-                                                IconSparkles { size: 13 }
-                                                span { "Explore full catalog" }
-                                            }
-                                        }
-                                    }
-
-                                    div { class: "flex items-center gap-4 border-b border-beet-border-subtle pb-4",
-                                        ArtistAvatar {
-                                            key: "local-detail-art-avatar-{artist.id}",
-                                            name: artist.name.clone(),
-                                            picture_url: artist.cover_art_url.clone(),
-                                            size_class: "w-14 h-14 text-[16px]".to_string(),
-                                        }
-                                        div { class: "min-w-0",
-                                            h2 { class: "text-[19px] font-semibold text-beet-text-primary truncate",
-                                                "{artist.name}"
-                                            }
-                                            p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary mt-0.5",
-                                                if artist.album_count == 1 {
-                                                    "IN YOUR LIBRARY · 1 ALBUM"
-                                                } else {
-                                                    "IN YOUR LIBRARY · {artist.album_count} ALBUMS"
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if loading {
-                                        div { class: "flex flex-col items-center justify-center py-10 gap-3",
-                                            div { class: "size-8 animate-spin rounded-full border-2 border-beet-border-default border-t-beet-leaf-text" }
-                                            p { class: "text-[12px] tabular-nums-mono text-beet-text-tertiary",
-                                                "Loading library albums..."
-                                            }
-                                        }
-                                    } else if let Some(err) = error {
-                                        p { class: "text-[13px] text-beet-crimson-text py-4", "{err}" }
-                                    } else if albums.is_empty() {
-                                        p { class: "text-[13px] text-beet-text-tertiary py-4",
-                                            "No local albums found for this artist."
-                                        }
-                                    } else {
-                                        div { class: "grid grid-cols-2 sm:grid-cols-4 gap-3",
-                                            for alb in albums.iter() {
-                                                {
-                                                    let aid = alb.id.clone();
-                                                    rsx! {
-                                                        button {
-                                                            key: "local-art-alb-{alb.id}",
-                                                            r#type: "button",
-                                                            class: "p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer space-y-2",
-                                                            onclick: move |_| play_local_album(aid.clone()),
-                                                            div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center",
-                                                                if let Some(url) = alb.cover_art_url.as_deref() {
-                                                                    img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
-                                                                } else {
-                                                                    IconDisc3 { size: 24, class: "text-beet-text-disabled".to_string() }
-                                                                }
-                                                            }
-                                                            div {
-                                                                p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{alb.name}" }
-                                                                p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary truncate",
-                                                                    if let Some(yr) = alb.year {
-                                                                        "{yr} · {alb.song_count} tracks"
-                                                                    } else {
-                                                                        "{alb.song_count} tracks"
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 } else if !has_searched() {
                     // Idle State (Never Blank!)
@@ -1963,23 +1833,47 @@ pub fn SearchPage() -> Element {
                                 div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3",
                                     for mix in mixes.iter().take(6) {
                                         {
-                                            let slug = mix.slug.clone();
+                                            let slug_open = mix.slug.clone();
+                                            let slug_key = mix.slug.clone();
+                                            let slug_play = mix.slug.clone();
+                                            let track_word = if mix.track_count == 1 { "TRACK" } else { "TRACKS" };
                                             rsx! {
-                                                button {
+                                                div {
                                                     key: "srch-mix-{mix.slug}",
-                                                    r#type: "button",
-                                                    class: "flex items-center justify-between gap-3 p-3.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
-                                                    onclick: move |_| studio.play_contextual_mix(auth, player, slug.clone()),
+                                                    role: "button",
+                                                    tabindex: "0",
+                                                    class: "group flex items-center justify-between gap-3 p-3.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
+                                                    onclick: move |_| {
+                                                        nav.push(Route::MixDetailPage { slug: slug_open.clone() });
+                                                    },
+                                                    onkeydown: move |evt: KeyboardEvent| {
+                                                        if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                            evt.prevent_default();
+                                                            nav.push(Route::MixDetailPage { slug: slug_key.clone() });
+                                                        }
+                                                    },
                                                     div { class: "min-w-0",
                                                         p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
                                                             "{format_mix_title(mix)}"
                                                         }
                                                         p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary mt-0.5",
-                                                            "{mix.track_count} TRACKS"
+                                                            "{mix.track_count} {track_word}"
                                                         }
                                                     }
-                                                    span { class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shrink-0",
-                                                        IconPlay { size: 13, filled: true }
+                                                    button {
+                                                        r#type: "button",
+                                                        aria_label: format!("Play {}", format_mix_title(mix)),
+                                                        class: "w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shrink-0 hover:scale-105 transition-transform cursor-pointer",
+                                                        onclick: move |evt: MouseEvent| {
+                                                            evt.stop_propagation();
+                                                            studio.play_contextual_mix(auth, player, slug_play.clone());
+                                                        },
+                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                evt.stop_propagation();
+                                                            }
+                                                        },
+                                                        IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                                     }
                                                 }
                                             }
@@ -1998,6 +1892,9 @@ pub fn SearchPage() -> Element {
                                     for (idx, track) in starred.iter().take(6).enumerate() {
                                         {
                                             let queue = starred.clone();
+                                            let t_next = track.clone();
+                                            let t_queue = track.clone();
+                                            let t_pl = track.clone();
                                             let t_star = track.clone();
                                             let t_rate = track.clone();
                                             let t_inspect = track.clone();
@@ -2021,6 +1918,19 @@ pub fn SearchPage() -> Element {
                                                     is_playing: player.is_track_playing(&track.id),
                                                     state: row_state,
                                                     on_play: move |_| player.play_queue(queue.clone(), idx),
+                                                    on_play_next: move |_| {
+                                                        player.enqueue_next(t_next.clone());
+                                                        studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                                    },
+                                                    on_add_to_queue: move |_| {
+                                                        player.enqueue_last(t_queue.clone());
+                                                        studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                                    },
+                                                    on_add_to_playlist: move |_| {
+                                                        studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                                    },
+                                                    on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                                    on_album_click: move |album| studio.navigate_to_album(nav, album),
                                                     on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                     on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                                     on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
@@ -2032,15 +1942,8 @@ pub fn SearchPage() -> Element {
                             }
                         }
 
-                        if !backend_summary.is_empty() {
-                            div { class: "rounded-[12px] bg-beet-surface-low border border-beet-border-subtle px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-[12px] text-beet-text-secondary",
-                                span {
-                                    "Type any track, album, or artist to search your library and the remote catalog simultaneously."
-                                }
-                                span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                    "ACTIVE SOURCES · {backend_summary}"
-                                }
-                            }
+                        div { class: "rounded-[12px] bg-beet-surface-low border border-beet-border-subtle px-4 py-3 text-[12px] text-beet-text-secondary",
+                            "Type any track, album, or artist to search your library and the remote catalog simultaneously."
                         }
                     }
                 } else {
@@ -2076,13 +1979,15 @@ pub fn SearchPage() -> Element {
                                             div { class: "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2.5",
                                                 for art in local_snapshot.artists.iter() {
                                                     {
-                                                        let art_click = art.clone();
+                                                        let aid = art.id.clone();
                                                         rsx! {
                                                             button {
                                                                 key: "loc-art-{art.id}",
                                                                 r#type: "button",
                                                                 class: "flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer min-w-0",
-                                                                onclick: move |_| open_local_artist(art_click.clone()),
+                                                                onclick: move |_| {
+                                                                    nav.push(Route::ArtistDetailPage { id: aid.clone() });
+                                                                },
                                                                 ArtistAvatar {
                                                                     name: art.name.clone(),
                                                                     picture_url: art.cover_art_url.clone(),
@@ -2117,18 +2022,44 @@ pub fn SearchPage() -> Element {
                                             div { class: "grid grid-cols-2 sm:grid-cols-4 gap-3",
                                                 for alb in local_snapshot.albums.iter().take(if active_filter == SearchFilter::Albums { 8 } else { 4 }) {
                                                     {
-                                                        let aid = alb.id.clone();
+                                                        let aid_open = alb.id.clone();
+                                                        let aid_key = alb.id.clone();
+                                                        let aid_play = alb.id.clone();
                                                         rsx! {
-                                                            button {
+                                                            div {
                                                                 key: "srch-alb-{alb.id}",
-                                                                r#type: "button",
-                                                                class: "p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer space-y-2",
-                                                                onclick: move |_| play_local_album(aid.clone()),
-                                                                div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center",
+                                                                role: "button",
+                                                                tabindex: "0",
+                                                                class: "group p-2.5 rounded-[10px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer space-y-2",
+                                                                onclick: move |_| {
+                                                                    nav.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                                                },
+                                                                onkeydown: move |evt: KeyboardEvent| {
+                                                                    if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                        evt.prevent_default();
+                                                                        nav.push(Route::AlbumDetailPage { id: aid_key.clone() });
+                                                                    }
+                                                                },
+                                                                div { class: "relative aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center",
                                                                     if let Some(url) = alb.cover_art_url.as_deref() {
                                                                         img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
                                                                     } else {
                                                                         IconDisc3 { size: 24, class: "text-beet-text-disabled".to_string() }
+                                                                    }
+                                                                    button {
+                                                                        r#type: "button",
+                                                                        aria_label: format!("Play {}", alb.name),
+                                                                        class: "absolute bottom-2 right-2 w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:scale-105 transition-[opacity,transform] shadow-lg cursor-pointer",
+                                                                        onclick: move |evt: MouseEvent| {
+                                                                            evt.stop_propagation();
+                                                                            play_local_album(aid_play.clone());
+                                                                        },
+                                                                        onkeydown: move |evt: KeyboardEvent| {
+                                                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                                                evt.stop_propagation();
+                                                                            }
+                                                                        },
+                                                                        IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                                                     }
                                                                 }
                                                                 div {
@@ -2153,6 +2084,9 @@ pub fn SearchPage() -> Element {
                                                 for dt in matching_triage.iter() {
                                                     {
                                                         let t_play = dt.clone();
+                                                        let t_next = dt.clone();
+                                                        let t_queue = dt.clone();
+                                                        let t_pl = dt.clone();
                                                         let t_keep = dt.clone();
                                                         let t_drop = dt.clone();
                                                         let t_rate = dt.clone();
@@ -2171,6 +2105,19 @@ pub fn SearchPage() -> Element {
                                                                     rating: dt.rating,
                                                                 },
                                                                 on_play: move |_| player.play_track(t_play.clone()),
+                                                                on_play_next: move |_| {
+                                                                    player.enqueue_next(t_next.clone());
+                                                                    studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                                                },
+                                                                on_add_to_queue: move |_| {
+                                                                    player.enqueue_last(t_queue.clone());
+                                                                    studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                                                },
+                                                                on_add_to_playlist: move |_| {
+                                                                    studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                                                },
+                                                                on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                                                on_album_click: move |album| studio.navigate_to_album(nav, album),
                                                                 on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                                                 on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
                                                                 on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
@@ -2182,6 +2129,9 @@ pub fn SearchPage() -> Element {
                                                 for (idx, song) in local_snapshot.songs.iter().enumerate() {
                                                     {
                                                         let all_songs = local_snapshot.songs.clone();
+                                                        let t_next = song.clone();
+                                                        let t_queue = song.clone();
+                                                        let t_pl = song.clone();
                                                         let t_star = song.clone();
                                                         let t_rate = song.clone();
                                                         let t_inspect = song.clone();
@@ -2206,6 +2156,19 @@ pub fn SearchPage() -> Element {
                                                                 is_playing: player.is_track_playing(&song.id),
                                                                 state: row_state,
                                                                 on_play: move |_| player.play_queue(all_songs.clone(), idx),
+                                                                on_play_next: move |_| {
+                                                                    player.enqueue_next(t_next.clone());
+                                                                    studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                                                },
+                                                                on_add_to_queue: move |_| {
+                                                                    player.enqueue_last(t_queue.clone());
+                                                                    studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                                                },
+                                                                on_add_to_playlist: move |_| {
+                                                                    studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                                                },
+                                                                on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                                                on_album_click: move |album| studio.navigate_to_album(nav, album),
                                                                 on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                                 on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
                                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
@@ -2260,11 +2223,6 @@ pub fn SearchPage() -> Element {
                                             }
                                             span { class: "tabular-nums-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-beet-surface border border-beet-border-subtle text-beet-text-tertiary",
                                                 "{res.provider.display_name()}"
-                                            }
-                                        }
-                                        if !backend_summary.is_empty() {
-                                            span { class: "tabular-nums-mono text-[10px] px-2 py-0.5 rounded-full bg-beet-surface border border-beet-border-subtle text-beet-text-secondary",
-                                                "{backend_summary}"
                                             }
                                         }
                                     }
@@ -2419,12 +2377,8 @@ pub fn SearchPage() -> Element {
                                                 for album in deduped_remote_albums.iter() {
                                                     {
                                                         let aid = album.id.clone();
-                                                        let is_expanded = expanded_albums.read().contains(&aid);
-                                                        let detail = if is_expanded {
-                                                            album_cache.read().get(&aid).cloned()
-                                                        } else {
-                                                            None
-                                                        };
+                                                        let alb_title_open = album.title.clone();
+                                                        let alb_artist_open = album.artist.clone();
                                                         let dl_state = download_states.read().get(&aid).cloned().unwrap_or_default();
                                                         let eff_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                                         let alb_src = album.clone();
@@ -2436,13 +2390,20 @@ pub fn SearchPage() -> Element {
                                                             li { key: "cat-alb-{album.id}",
                                                                 CatalogAlbumRow {
                                                                     album: album.clone(),
-                                                                    is_expanded,
-                                                                    detail,
+                                                                    is_expanded: false,
+                                                                    detail: None,
                                                                     download_state: eff_state,
                                                                     download_states,
                                                                     acquire_map: acquire_map.clone(),
                                                                     has_folder,
-                                                                    on_toggle: move |_| toggle_expand_album(aid.clone()),
+                                                                    on_toggle: move |_| {
+                                                                        open_catalog_album(
+                                                                            aid.clone(),
+                                                                            alb_title_open.clone(),
+                                                                            alb_artist_open.clone(),
+                                                                            None,
+                                                                        );
+                                                                    },
                                                                     on_artist_click: move |_| open_catalog_artist(art_id.clone(), art_name.clone()),
                                                                     on_search_sources: move |_| {
                                                                         open_source_picker(DownloadQuery::new(vec![]).album(alb_src.to_album()));
@@ -2525,13 +2486,23 @@ pub fn SearchPage() -> Element {
                                 }
                             }
                         }
+                    } else if !trimmed_query.is_empty() {
+                        div { class: "rounded-[14px] bg-beet-surface-low border border-beet-border-subtle p-6 text-center space-y-3",
+                            p { class: "text-[13px] text-beet-text-secondary",
+                                "No catalog results found for “{trimmed_query}”."
+                            }
+                            DirectSearchEscape {
+                                query: trimmed_query.clone(),
+                                on_search_sources: move |q: DownloadQuery| open_source_picker(q),
+                            }
+                        }
                     }
                 }
             }
 
-            // Fallback toasts lifted cleanly above the 84px Studio player bar
+            // Fallback toasts lifted cleanly above mobile bottom chrome & Studio player bar
             if !fallback_toasts.read().is_empty() {
-                div { class: "fixed bottom-24 right-5 flex flex-col-reverse gap-2 z-40 w-80 md:w-96",
+                div { class: "fixed bottom-[168px] md:bottom-[152px] lg:bottom-24 right-5 flex flex-col-reverse gap-2 z-40 w-80 md:w-96",
                     for toast_data in fallback_toasts.read().iter() {
                         FallbackToast {
                             key: "{toast_data.id}",
@@ -2671,6 +2642,7 @@ struct CatalogTrackRowProps {
 #[component]
 fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
     let mut failed_url = use_signal(|| None::<String>);
+    let mut menu_open = use_signal(|| false);
     let track = &props.track;
     let stage = props.acquire_entry.as_ref().map(|e| e.badge.clone());
     let manual_choice = props
@@ -2691,7 +2663,7 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
     let artist_for_pick = track.artist.clone();
     let title_for_pick = track.title.clone();
 
-    let on_art_click = {
+    let trigger_primary = {
         let stage = stage.clone();
         let manual_choice = manual_choice.clone();
         let on_acquire = props.on_acquire_and_play;
@@ -2720,15 +2692,22 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
             }
         }
     };
+    let on_art_click = trigger_primary.clone();
+    let on_title_click = trigger_primary;
+    let has_folder = !matches!(props.download_state, DownloadRowState::Disabled);
+    let show_download_badge = !matches!(
+        props.download_state,
+        DownloadRowState::Idle | DownloadRowState::Disabled
+    );
 
     rsx! {
         div {
-            class: "relative bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default rounded-[12px] transition-colors duration-150 group flex items-center gap-3 px-3 py-2.5",
+            class: "relative rounded-[8px] border border-transparent hover:bg-beet-surface-low transition-colors duration-150 group flex items-center gap-2.5 sm:gap-3 px-2.5 sm:px-3 py-2 min-h-[56px]",
 
             // Cover art with 1-tap Acquire & Play surface
             button {
                 r#type: "button",
-                class: "relative w-11 h-11 shrink-0 bg-beet-surface-low border border-beet-border-subtle rounded-[6px] flex items-center justify-center overflow-hidden cursor-pointer disabled:cursor-default",
+                class: "relative w-10 h-10 sm:w-11 sm:h-11 shrink-0 bg-beet-surface border border-beet-border-subtle rounded-[6px] flex items-center justify-center overflow-hidden cursor-pointer disabled:cursor-default",
                 aria_label: "Acquire and play {track.title}",
                 disabled: in_flight,
                 onclick: on_art_click,
@@ -2749,16 +2728,20 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                     IconMusic { size: 18, class: "text-beet-text-disabled".to_string() }
                 }
                 if !in_flight {
-                    div { class: "absolute inset-0 bg-beet-canvas/65 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-beet-leaf-text",
-                        IconPlay { size: 15, filled: true }
+                    span { class: "absolute inset-0 bg-beet-canvas/65 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-beet-leaf-text",
+                        IconPlay { size: 15, filled: true, class: "ml-0.5".to_string() }
                     }
                 }
             }
 
-            // Track title, variant badge, clickable artist & album
-            div { class: "flex-grow min-w-0",
+            // Track title (clickable primary action), variant badge, clickable artist & album
+            div { class: "flex-1 min-w-0",
                 div { class: "flex items-center gap-2 min-w-0",
-                    p { class: "text-[14px] font-semibold text-beet-text-primary truncate group-hover:text-beet-leaf-text transition-colors",
+                    button {
+                        r#type: "button",
+                        disabled: in_flight,
+                        class: "text-[14px] sm:text-[15px] font-medium leading-[1.35] text-beet-text-primary truncate group-hover:text-beet-leaf-text transition-colors text-left cursor-pointer disabled:cursor-default",
+                        onclick: on_title_click,
                         "{track.title}"
                     }
                     if let Some(ref variant) = track.variant_label {
@@ -2767,10 +2750,10 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                         }
                     }
                 }
-                div { class: "flex items-center gap-1.5 min-w-0 text-[13px] text-beet-text-secondary",
+                div { class: "flex items-center gap-1.5 mt-0.5 min-w-0 text-[12px] sm:text-[13px] text-beet-text-secondary",
                     button {
                         r#type: "button",
-                        class: "truncate hover:text-beet-leaf-text transition-colors cursor-pointer text-left",
+                        class: "truncate hover:text-beet-text-primary hover:underline transition-colors cursor-pointer text-left max-w-full",
                         onclick: move |evt| {
                             evt.stop_propagation();
                             props.on_artist_click.call(());
@@ -2778,11 +2761,11 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                         "{track.artist}"
                     }
                     if let Some(ref album_title) = track.album_title {
-                        span { class: "text-beet-text-disabled shrink-0", "·" }
+                        span { class: "hidden sm:inline text-beet-text-disabled shrink-0", "·" }
                         if track.album_id.is_some() {
                             button {
                                 r#type: "button",
-                                class: "text-[12px] text-beet-text-tertiary truncate hover:text-beet-leaf-text transition-colors cursor-pointer text-left",
+                                class: "hidden sm:inline text-[12px] text-beet-text-tertiary truncate hover:text-beet-text-primary hover:underline transition-colors cursor-pointer text-left min-w-0",
                                 onclick: move |evt| {
                                     evt.stop_propagation();
                                     props.on_album_click.call(());
@@ -2790,7 +2773,7 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                                 "{album_title}"
                             }
                         } else {
-                            span { class: "text-[12px] text-beet-text-tertiary truncate",
+                            span { class: "hidden sm:inline text-[12px] text-beet-text-tertiary truncate min-w-0",
                                 "{album_title}"
                             }
                         }
@@ -2800,13 +2783,13 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
 
             // Duration
             if let Some(dur) = duration {
-                span { class: "text-[12px] tabular-nums-mono text-beet-text-tertiary whitespace-nowrap shrink-0 hidden sm:block",
+                span { class: "hidden sm:block text-[12px] tabular-nums-mono text-beet-text-tertiary whitespace-nowrap shrink-0",
                     "{dur}"
                 }
             }
 
-            // Actions: Acquire & Play, Search sources, Auto-download
-            div { class: "flex items-center gap-1 shrink-0",
+            // Calm right actions: single primary Acquire & Play pill + unified `...` overflow menu
+            div { class: "flex items-center gap-1.5 shrink-0",
                 AcquireActionPill {
                     stage,
                     manual_choice,
@@ -2819,26 +2802,72 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                     on_pick_source: props.on_pick_acquire_source,
                 }
 
-                // Search sources button
-                button {
-                    r#type: "button",
-                    class: "p-2 rounded-full hover:bg-beet-surface-highest transition-colors cursor-pointer group/src",
-                    aria_label: "Search sources",
-                    title: "Search sources",
-                    onclick: move |evt: MouseEvent| {
-                        evt.stop_propagation();
-                        props.on_search_sources.call(());
-                    },
-                    IconSearch {
-                        size: 15,
-                        class: "text-beet-text-secondary group-hover/src:text-beet-text-primary transition-colors".to_string(),
+                if show_download_badge {
+                    DownloadIcon {
+                        state: props.download_state.clone(),
+                        on_download: props.on_download,
                     }
                 }
 
-                // Auto-download button
-                DownloadIcon {
-                    state: props.download_state.clone(),
-                    on_download: props.on_download,
+                div { class: "relative",
+                    button {
+                        r#type: "button",
+                        aria_haspopup: "menu",
+                        aria_expanded: if menu_open() { "true" } else { "false" },
+                        aria_label: format!("More options for {}", track.title),
+                        title: "More options",
+                        class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors cursor-pointer",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            menu_open.toggle();
+                        },
+                        IconMoreHorizontal { size: 16 }
+                    }
+
+                    if menu_open() {
+                        div {
+                            class: "fixed inset-0 z-40",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                menu_open.set(false);
+                            },
+                        }
+                        div {
+                            role: "menu",
+                            class: "absolute right-0 top-9 z-50 w-56 rounded-[11px] bg-beet-surface-high border border-beet-border-default shadow-2xl p-1.5 space-y-0.5",
+                            onclick: move |evt: MouseEvent| evt.stop_propagation(),
+
+                            button {
+                                r#type: "button",
+                                role: "menuitem",
+                                class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                onclick: move |_| {
+                                    menu_open.set(false);
+                                    props.on_search_sources.call(());
+                                },
+                                IconSearch { size: 14, class: "text-beet-text-secondary".to_string() }
+                                span { "Pick source manually" }
+                            }
+
+                            if has_folder {
+                                button {
+                                    r#type: "button",
+                                    role: "menuitem",
+                                    class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                    onclick: move |_| {
+                                        menu_open.set(false);
+                                        props.on_download.call(());
+                                    },
+                                    IconDownload { size: 14, class: "text-beet-text-secondary".to_string() }
+                                    span { "Download to library" }
+                                }
+                            } else {
+                                div { class: "px-2.5 py-2 text-[11px] text-beet-text-tertiary",
+                                    "Configure your music library folder in Settings to download directly."
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

@@ -69,11 +69,21 @@ const SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(15);
 /// name. The scheme is not compared, since a proxy may end TLS. A request
 /// with no `Origin` is not from a browser page, so no other site can be
 /// riding on the user's cookie. A refusal says which addresses were compared.
-#[cfg(feature = "server")]
+#[cfg(all(test, feature = "server"))]
 pub(crate) fn origin_allowed(
     headers: &HeaderMap,
     uri: &Uri,
     public_url: Option<&BaseUrl>,
+) -> Result<Result<(), String>, BaseUrlError> {
+    origin_allowed_with_proxy(headers, uri, public_url, true)
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn origin_allowed_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&BaseUrl>,
+    trust_proxy: bool,
 ) -> Result<Result<(), String>, BaseUrlError> {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         return Ok(Ok(()));
@@ -85,7 +95,7 @@ pub(crate) fn origin_allowed(
     {
         return Ok(Ok(()));
     }
-    let addressed = crate::base_url::addressed_to(headers, uri)?;
+    let addressed = crate::base_url::addressed_to_with_proxy(headers, uri, trust_proxy)?;
     if page.as_ref().is_some_and(|page| page.same_host(&addressed)) {
         return Ok(Ok(()));
     }
@@ -182,7 +192,12 @@ pub async fn download_updates_ws(
     let public_url = crate::config::CONFIG
         .public_url()
         .and_then(|p| p.as_ref().ok());
-    let allowed = origin_allowed(&headers, &uri, public_url)
+    let allowed = origin_allowed_with_proxy(
+        &headers,
+        &uri,
+        public_url,
+        crate::config::trust_proxy_headers(),
+    )
         .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
     if let Err(why) = allowed {
         warn!("Refused a download updates socket for user {user}: {why}");
@@ -190,9 +205,7 @@ pub async fn download_updates_ws(
             "Download updates can only be opened from Soulbeet's own page",
         ));
     }
-    let token = cookies
-        .get(crate::AUTH_COOKIE_NAME)
-        .map(|c| c.value().to_string());
+    let token = super::guard::extract_session_token(Some(&cookies), &headers);
 
     let rx = {
         let map = USER_CHANNELS.read().await;
@@ -572,6 +585,20 @@ mod tests {
             ("origin", "http://192.168.1.5:9765"),
         ]);
         assert_eq!(origin_allowed(&lan, &uri, Some(&pin)), Ok(Ok(())));
+
+        // When TRUST_PROXY_HEADERS=false, spoofed X-Forwarded-Host does not bypass origin checks.
+        let spoofed = headers(&[
+            ("host", "192.168.1.5:9765"),
+            ("x-forwarded-host", "evil.example.com"),
+            ("origin", "https://evil.example.com"),
+        ]);
+        assert_eq!(
+            origin_allowed_with_proxy(&spoofed, &uri, None, true),
+            Ok(Ok(()))
+        );
+        assert!(origin_allowed_with_proxy(&spoofed, &uri, None, false)
+            .unwrap()
+            .is_err());
     }
 
     #[tokio::test]

@@ -112,6 +112,7 @@ fun SearchScreen(
     onSelectFilter: (SearchFilter) -> Unit,
     onPlayTrack: (FfiTrack) -> Unit,
     onStarTrack: (FfiTrack) -> Unit,
+    onAddToPlaylist: (FfiTrack) -> Unit,
     onOpenAlbum: (FfiAlbum) -> Unit,
     onOpenArtist: (FfiArtist) -> Unit,
     onOpenPlaylist: (FfiPlaylist) -> Unit,
@@ -194,15 +195,14 @@ fun SearchScreen(
                 items(SearchFilter.entries) { filter ->
                     val selected = state.searchFilter == filter
                     Surface(
+                        onClick = { onSelectFilter(filter) },
                         color = if (selected) colors.leafSurface else colors.surfaceHigh,
                         shape = SoulbeetShapes.full,
                         border = BorderStroke(
                             1.dp,
                             if (selected) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
                         ),
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .clickable { onSelectFilter(filter) },
+                        modifier = Modifier.heightIn(min = 48.dp),
                     ) {
                         Box(
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
@@ -255,15 +255,14 @@ fun SearchScreen(
                             ) {
                                 state.config.recentSearches.forEach { recent ->
                                     Surface(
+                                        onClick = {
+                                            focusManager.clearFocus()
+                                            onSubmitQuery(recent)
+                                        },
                                         color = colors.surface,
                                         shape = SoulbeetShapes.full,
                                         border = BorderStroke(1.dp, colors.borderSubtle),
-                                        modifier = Modifier
-                                            .heightIn(min = 48.dp)
-                                            .clickable {
-                                                focusManager.clearFocus()
-                                                onSubmitQuery(recent)
-                                            },
+                                        modifier = Modifier.heightIn(min = 48.dp),
                                     ) {
                                         Row(
                                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
@@ -302,15 +301,14 @@ fun SearchScreen(
                         ) {
                             QUICK_MOOD_PILLS.forEach { mood ->
                                 Surface(
+                                    onClick = {
+                                        focusManager.clearFocus()
+                                        onSubmitQuery(mood)
+                                    },
                                     color = colors.surfaceHigh,
                                     shape = SoulbeetShapes.full,
                                     border = BorderStroke(1.dp, colors.borderDefault),
-                                    modifier = Modifier
-                                        .heightIn(min = 48.dp)
-                                        .clickable {
-                                            focusManager.clearFocus()
-                                            onSubmitQuery(mood)
-                                        },
+                                    modifier = Modifier.heightIn(min = 48.dp),
                                 ) {
                                     Box(
                                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
@@ -455,6 +453,7 @@ fun SearchScreen(
                                 userRating = track.userRating.toInt(),
                                 onClick = { onPlayTrack(track) },
                                 onStarClick = { onStarTrack(track) },
+                                onAddToPlaylistClick = { onAddToPlaylist(track) },
                             )
                         }
                     }
@@ -843,7 +842,7 @@ internal fun RemoteArtwork(
     val cleanUrl = imageUrl?.trim()?.takeIf { it.isNotEmpty() }
     val sizeMod = if (size != null) modifier.size(size) else modifier
 
-    val placeholder: @Composable () -> Unit = {
+    val placeholder: @Composable (Boolean) -> Unit = { drawBorder ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -855,7 +854,9 @@ internal fun RemoteArtwork(
                         end = Offset(120f, 120f),
                     ),
                 )
-                .border(1.dp, colors.borderSubtle, shape),
+                .then(
+                    if (drawBorder) Modifier.border(1.dp, colors.borderSubtle, shape) else Modifier,
+                ),
             contentAlignment = Alignment.Center,
         ) {
             val initial = fallbackTitle.trim().firstOrNull()?.uppercaseChar()?.toString()
@@ -879,7 +880,7 @@ internal fun RemoteArtwork(
     }
 
     if (cleanUrl == null) {
-        Box(modifier = sizeMod) { placeholder() }
+        Box(modifier = sizeMod) { placeholder(true) }
     } else {
         SubcomposeAsyncImage(
             model = ImageRequest.Builder(context)
@@ -888,8 +889,8 @@ internal fun RemoteArtwork(
                 .build(),
             contentDescription = fallbackTitle,
             contentScale = ContentScale.Crop,
-            loading = { placeholder() },
-            error = { placeholder() },
+            loading = { placeholder(false) },
+            error = { placeholder(false) },
             modifier = sizeMod
                 .clip(shape)
                 .border(1.dp, colors.borderSubtle, shape),
@@ -1127,40 +1128,35 @@ internal fun RemoteTrackRow(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            Box(
-                modifier = Modifier
-                    .heightIn(min = 48.dp)
-                    .clickable(enabled = !isAcquiring, onClick = onClick),
-                contentAlignment = Alignment.Center,
+            Surface(
+                onClick = onClick,
+                enabled = !isAcquiring,
+                modifier = Modifier.height(32.dp),
+                color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
+                shape = SoulbeetShapes.full,
+                border = BorderStroke(
+                    1.dp,
+                    if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
+                ),
             ) {
-                Surface(
-                    modifier = Modifier.height(32.dp),
-                    color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
-                    shape = SoulbeetShapes.full,
-                    border = BorderStroke(
-                        1.dp,
-                        if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
-                    ),
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.CloudDownload,
-                            contentDescription = "Acquire and Play",
-                            tint = if (isAcquiring) colors.accentText else colors.leafText,
-                            modifier = Modifier.size(14.dp),
-                        )
-                        Text(
-                            text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING...") else "ACQUIRE",
-                            style = type.monoXs,
-                            color = if (isAcquiring) colors.accentText else colors.textPrimary,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.Filled.CloudDownload,
+                        contentDescription = "Acquire and Play",
+                        tint = if (isAcquiring) colors.accentText else colors.leafText,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Text(
+                        text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING...") else "ACQUIRE",
+                        style = type.monoXs,
+                        color = if (isAcquiring) colors.accentText else colors.textPrimary,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
                 }
             }
         }

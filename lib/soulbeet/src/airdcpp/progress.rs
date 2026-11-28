@@ -342,7 +342,7 @@ impl Engine {
                         entry.key
                     );
                 }
-                self.state.lock().unwrap().watches.remove(&bundle.id);
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&bundle.id);
                 info!(
                     "Direct Connect transfer {} failed: {}",
                     bundle.id, failure.message
@@ -401,7 +401,7 @@ impl Engine {
             _ => {}
         }
         let source = Source::parse(&entry.source);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let watch = state.watches.entry(bundle.id).or_insert(Watch {
             since: now,
@@ -525,7 +525,7 @@ impl Engine {
     /// whose bundle is gone, queued more than 7 days ago.
     async fn prune_once(&self, sidecar: &Sidecar, listing: &Listing) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.pruned {
                 return;
             }
@@ -584,7 +584,7 @@ impl Engine {
         if finished(bundle) || bundle.speed > 0.0 {
             return Ok(Some(0));
         }
-        Ok((self.state.lock().unwrap().watches.get(&bundle.id)).and_then(|w| w.place))
+        Ok((self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.get(&bundle.id)).and_then(|w| w.place))
     }
 
     /// Removes from the sidecar every unfinished bundle of the book and forgets its entry.
@@ -641,7 +641,7 @@ impl Engine {
                         warn!("Could not remove Direct Connect bundle {}: {e}", bundle.id);
                         continue;
                     }
-                    self.state.lock().unwrap().watches.remove(&bundle.id);
+                    self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&bundle.id);
                 }
                 None => {}
             }

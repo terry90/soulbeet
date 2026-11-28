@@ -390,7 +390,7 @@ fn CommandPaletteDialog(
                                             div { class: "flex items-center gap-2.5 min-w-0",
                                                 IconSearch { size: 15, class: "text-beet-accent-text".to_string() }
                                                 span { class: "text-[14px] font-medium truncate",
-                                                    "Search library & MusicBrainz for “{trimmed_query}”"
+                                                    "Search library & catalog for “{trimmed_query}”"
                                                 }
                                             }
                                             IconArrowRight { size: 15 }

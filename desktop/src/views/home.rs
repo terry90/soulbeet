@@ -3,8 +3,8 @@
 use client_core::models::PinTarget;
 use dioxus::prelude::*;
 use ui::{
-    use_player, IconCloudCheck, IconCompass, IconDownload, IconMusic, IconPlay, IconRefreshCw,
-    IconSparkles, StudioNavSection, TrackRow, TrackRowState,
+    use_player, IconCloudCheck, IconCompass, IconDownload, IconListPlus, IconMusic, IconPlay,
+    IconRefreshCw, IconSparkles, StudioNavSection, TrackRow, TrackRowState,
 };
 
 use crate::desktop_state::{
@@ -62,7 +62,7 @@ pub fn HomeView() -> Element {
                     button {
                         r#type: "button",
                         disabled: sync_st.syncing || offline_only,
-                        class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 text-[12px] font-medium cursor-pointer transition-colors",
+                        class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none text-[12px] font-medium cursor-pointer transition-colors",
                         onclick: move |_| studio.sync_now(false),
                         IconRefreshCw { size: 14 }
                         span { if sync_st.syncing { "Syncing…" } else { "Sync Now" } }
@@ -83,7 +83,7 @@ pub fn HomeView() -> Element {
                     button {
                         r#type: "button",
                         disabled: sync_st.syncing || offline_only,
-                        class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[14px] font-semibold hover:brightness-105 disabled:opacity-40 cursor-pointer",
+                        class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[14px] font-semibold hover:brightness-105 disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                         onclick: move |_| studio.sync_now(true),
                         IconRefreshCw { size: 15 }
                         span { "Run Full Sync" }
@@ -100,7 +100,8 @@ pub fn HomeView() -> Element {
                     div { class: "grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-3",
                         for album in data.recent_albums.iter() {
                             {
-                                let album_id = album.id.clone();
+                                let album_id_open = album.id.clone();
+                                let album_id_play = album.id.clone();
                                 let album_id_pin = album.id.clone();
                                 let album_name = album.name.clone();
                                 let album_name_play = album.name.clone();
@@ -108,26 +109,30 @@ pub fn HomeView() -> Element {
                                 rsx! {
                                     div {
                                         key: "{album.id}",
-                                        class: "group rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 flex flex-col gap-2 transition-colors",
-                                        button {
-                                            r#type: "button",
-                                            class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center cursor-pointer",
-                                            onclick: move |_| {
-                                                let aid = album_id.clone();
-                                                let label = album_name_play.clone();
-                                                if let Some(core) = studio.core.peek().clone() {
-                                                    spawn(async move {
-                                                        let tracks = load_tracks_for_album(&core, &aid).await;
-                                                        studio.play_collection(player, tracks, 0, &label);
-                                                    });
-                                                }
-                                            },
+                                        class: "group rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 flex flex-col gap-2 transition-colors cursor-pointer",
+                                        onclick: move |_| studio.open_album_detail(album_id_open.clone()),
+                                        div { class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center",
                                             if let Some(url) = art_url {
                                                 img { src: "{url}", alt: "{album.name}", class: "w-full h-full object-cover" }
                                             } else {
                                                 IconMusic { size: 28, class: "text-beet-text-disabled".to_string() }
                                             }
-                                            span { class: "absolute bottom-2 right-2 w-9 h-9 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-lg",
+                                            button {
+                                                r#type: "button",
+                                                title: format!("Play {}", album.name),
+                                                aria_label: format!("Play {}", album.name),
+                                                class: "absolute bottom-2 right-2 w-9 h-9 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity shadow-lg cursor-pointer hover:brightness-105",
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
+                                                    let aid = album_id_play.clone();
+                                                    let label = album_name_play.clone();
+                                                    if let Some(core) = studio.core.peek().clone() {
+                                                        spawn(async move {
+                                                            let tracks = load_tracks_for_album(&core, &aid).await;
+                                                            studio.play_collection(player, tracks, 0, &label);
+                                                        });
+                                                    }
+                                                },
                                                 IconPlay { size: 15, filled: true, class: "ml-0.5".to_string() }
                                             }
                                         }
@@ -145,7 +150,8 @@ pub fn HomeView() -> Element {
                                                 title: "Pin album offline",
                                                 aria_label: format!("Pin {} offline", album.name),
                                                 class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-leaf-text hover:bg-beet-leaf-surface shrink-0 cursor-pointer transition-colors",
-                                                onclick: move |_| {
+                                                onclick: move |evt| {
+                                                    evt.stop_propagation();
                                                     studio.pin_target_offline(
                                                         PinTarget::Album(album_id_pin.clone()),
                                                         album_name.clone(),
@@ -198,6 +204,7 @@ pub fn HomeView() -> Element {
                                 let t_star = track.clone();
                                 let t_rate = track.clone();
                                 let t_inspect = track.clone();
+                                let t_pl = track.clone();
                                 let row_playing = current_id.as_deref() == Some(track.id.as_str()) && is_playing;
                                 let row_state = if offline_only && !track.is_offline_cached {
                                     TrackRowState::OfflineUnavailable
@@ -209,20 +216,33 @@ pub fn HomeView() -> Element {
                                     }
                                 };
                                 rsx! {
-                                    TrackRow {
+                                    div {
                                         key: "star-{track.id}",
-                                        title: track.title.clone(),
-                                        artist: track.artist.clone(),
-                                        album: track.album.clone(),
-                                        cover_art_url: track.cover_art_url.clone(),
-                                        duration_secs: track.duration_secs,
-                                        codec_badge: track.codec_badge.clone(),
-                                        is_playing: row_playing,
-                                        state: row_state,
-                                        on_play: move |_| player.play_queue(all.clone(), idx),
-                                        on_star: move |next| studio.star_track(player, t_star.clone(), next),
-                                        on_rate: move |r| studio.rate_track(player, t_rate.clone(), r),
-                                        on_inspect: move |_| studio.inspect_track(t_inspect.clone()),
+                                        class: "flex items-center gap-1",
+                                        div { class: "flex-1 min-w-0",
+                                            TrackRow {
+                                                title: track.title.clone(),
+                                                artist: track.artist.clone(),
+                                                album: track.album.clone(),
+                                                cover_art_url: track.cover_art_url.clone(),
+                                                duration_secs: track.duration_secs,
+                                                codec_badge: track.codec_badge.clone(),
+                                                is_playing: row_playing,
+                                                state: row_state,
+                                                on_play: move |_| player.play_queue(all.clone(), idx),
+                                                on_star: move |next| studio.star_track(player, t_star.clone(), next),
+                                                on_rate: move |r| studio.rate_track(player, t_rate.clone(), r),
+                                                on_inspect: move |_| studio.inspect_track(t_inspect.clone()),
+                                            }
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            title: "Add to playlist",
+                                            aria_label: format!("Add {} to playlist", track.title),
+                                            class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-leaf-text hover:bg-beet-surface-high shrink-0 cursor-pointer transition-colors",
+                                            onclick: move |_| studio.open_add_to_playlist(t_pl.clone()),
+                                            IconListPlus { size: 14 }
+                                        }
                                     }
                                 }
                             }
@@ -246,6 +266,8 @@ pub fn HomeView() -> Element {
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
                                 let t_inspect = track.clone();
+                                let t_pl = track.clone();
+                                let can_add_playlist = !track.is_discovery;
                                 let row_playing = current_id.as_deref() == Some(track.id.as_str()) && is_playing;
                                 let row_state = if offline_only && !track.is_offline_cached {
                                     TrackRowState::OfflineUnavailable
@@ -263,22 +285,37 @@ pub fn HomeView() -> Element {
                                     }
                                 };
                                 rsx! {
-                                    TrackRow {
+                                    div {
                                         key: "rec-{track.id}",
-                                        title: track.title.clone(),
-                                        artist: track.artist.clone(),
-                                        album: track.album.clone(),
-                                        cover_art_url: track.cover_art_url.clone(),
-                                        duration_secs: track.duration_secs,
-                                        codec_badge: track.codec_badge.clone(),
-                                        is_playing: row_playing,
-                                        state: row_state,
-                                        on_play: move |_| player.play_queue(all.clone(), idx),
-                                        on_keep: move |_| studio.keep_track(player, t_keep.clone()),
-                                        on_drop: move |_| studio.drop_track(player, t_drop.clone()),
-                                        on_star: move |next| studio.star_track(player, t_star.clone(), next),
-                                        on_rate: move |r| studio.rate_track(player, t_rate.clone(), r),
-                                        on_inspect: move |_| studio.inspect_track(t_inspect.clone()),
+                                        class: "flex items-center gap-1",
+                                        div { class: "flex-1 min-w-0",
+                                            TrackRow {
+                                                title: track.title.clone(),
+                                                artist: track.artist.clone(),
+                                                album: track.album.clone(),
+                                                cover_art_url: track.cover_art_url.clone(),
+                                                duration_secs: track.duration_secs,
+                                                codec_badge: track.codec_badge.clone(),
+                                                is_playing: row_playing,
+                                                state: row_state,
+                                                on_play: move |_| player.play_queue(all.clone(), idx),
+                                                on_keep: move |_| studio.keep_track(player, t_keep.clone()),
+                                                on_drop: move |_| studio.drop_track(player, t_drop.clone()),
+                                                on_star: move |next| studio.star_track(player, t_star.clone(), next),
+                                                on_rate: move |r| studio.rate_track(player, t_rate.clone(), r),
+                                                on_inspect: move |_| studio.inspect_track(t_inspect.clone()),
+                                            }
+                                        }
+                                        if can_add_playlist {
+                                            button {
+                                                r#type: "button",
+                                                title: "Add to playlist",
+                                                aria_label: format!("Add {} to playlist", track.title),
+                                                class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-leaf-text hover:bg-beet-surface-high shrink-0 cursor-pointer transition-colors",
+                                                onclick: move |_| studio.open_add_to_playlist(t_pl.clone()),
+                                                IconListPlus { size: 14 }
+                                            }
+                                        }
                                     }
                                 }
                             }

@@ -1,15 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::DateTime;
 use reqwest::Client;
 use serde::Deserialize;
-use sqlx::SqlitePool;
-use tokio::sync::RwLock;
+use sqlx::{Sqlite, SqlitePool, Transaction};
+use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 use crate::db::{
-    get_cursor, now_unix, pending_outbox_song_ids, replace_playlist_tracks, set_cursor,
-    upsert_album, upsert_artist, upsert_discovery_track, upsert_playlist, upsert_track,
+    get_cursor, now_unix, replace_playlist_tracks_tx, set_cursor, upsert_album_exec,
+    upsert_artist_exec, upsert_discovery_track_tx, upsert_playlist_exec, upsert_track_exec,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::models::{
@@ -35,6 +36,7 @@ pub struct SyncEngine {
     soulbeet_base_url: Option<String>,
     soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     navidrome: Arc<RwLock<Option<NavidromeCredentials>>>,
+    sync_lock: Arc<TokioMutex<()>>,
 }
 
 impl SyncEngine {
@@ -51,11 +53,15 @@ impl SyncEngine {
             soulbeet_base_url,
             soulbeet_auth,
             navidrome,
+            sync_lock: Arc::new(TokioMutex::new(())),
         }
     }
 
     /// Calls `GET /api/client/bootstrap` on Soulbeet to refresh scoped OpenSubsonic credentials
     /// and persist server curation settings (e.g. `promote_threshold`).
+    ///
+    /// Preserves existing cached `navidrome` credentials if bootstrap transiently omits them
+    /// (`navidrome: null`), clearing them only on explicit auth rejection (HTTP 401/403).
     pub async fn fetch_bootstrap(&self) -> CoreResult<Option<ClientBootstrapDto>> {
         let Some(base) = self.soulbeet_base_url.as_deref() else {
             return Ok(None);
@@ -69,14 +75,24 @@ impl SyncEngine {
         let resp = req.send().await?;
         let status = resp.status();
         if !status.is_success() {
+            let status_code = status.as_u16();
+            if matches!(status_code, 401 | 403) {
+                *self.navidrome.write().await = None;
+            }
             let body = resp.text().await.unwrap_or_default();
             return Err(CoreError::ServerHttp {
-                status: status.as_u16(),
+                status: status_code,
                 body,
             });
         }
         let dto: ClientBootstrapDto = resp.json().await?;
-        *self.navidrome.write().await = dto.navidrome.clone();
+        if let Some(creds) = dto.navidrome.clone() {
+            *self.navidrome.write().await = Some(creds);
+        } else if self.navidrome.read().await.is_some() {
+            tracing::warn!(
+                "bootstrap returned navidrome=None; preserving existing cached Navidrome credentials"
+            );
+        }
         set_cursor(
             &self.pool,
             CURSOR_PROMOTE_THRESHOLD,
@@ -88,10 +104,42 @@ impl SyncEngine {
 
     /// Performs an initial full sync or incremental delta sync against Navidrome + Soulbeet.
     pub async fn sync(&self, force_full: bool) -> CoreResult<SyncReport> {
+        let never = AtomicBool::new(false);
+        self.sync_cancellable(force_full, &never).await
+    }
+
+    /// Cooperatively cancellable variant of [`Self::sync`], serialized via `sync_lock`.
+    /// Checks `cancelled` between network pages and database transactions so partial transactions
+    /// or premature full-sync pruning never occur.
+    pub async fn sync_cancellable(
+        &self,
+        force_full: bool,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<SyncReport> {
+        let _sync_guard = self.sync_lock.lock().await;
+        let result = self.sync_locked(force_full, cancelled).await;
+        if let Err(CoreError::Subsonic { code: 40, .. }) = &result {
+            *self.navidrome.write().await = None;
+        }
+        result
+    }
+
+    async fn sync_locked(
+        &self,
+        force_full: bool,
+        cancelled: &AtomicBool,
+    ) -> CoreResult<SyncReport> {
         let mut report = SyncReport::default();
+
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(report);
+        }
 
         if self.soulbeet_base_url.is_some() {
             if let Err(err) = self.fetch_bootstrap().await {
+                if matches!(err, CoreError::ServerHttp { status: 401 | 403, .. }) {
+                    return Err(err);
+                }
                 report.warnings.push(format!("bootstrap failed: {err}"));
             }
         }
@@ -108,26 +156,34 @@ impl SyncEngine {
         let full_sync = force_full || last_full.is_none();
         report.full_sync = full_sync;
 
-        let pending_songs = pending_outbox_song_ids(&self.pool).await?;
         let now = now_unix();
 
-        // 1. Artists
+        // 1. Artists (batched in one transaction)
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(report);
+        }
         let artists = subsonic.get_artists().await?;
-        for artist in artists {
-            upsert_artist(
-                &self.pool,
-                &LocalArtist {
-                    id: artist.id,
-                    name: artist.name,
-                    album_count: artist.album_count,
-                    cover_art_id: artist.cover_art,
-                    starred: artist.starred.is_some(),
-                    musicbrainz_id: artist.music_brainz_id,
-                    updated_at: now,
-                },
-            )
-            .await?;
-            report.artists_synced += 1;
+        let mut synced_artist_ids = HashSet::with_capacity(artists.len());
+        {
+            let mut tx = self.pool.begin().await?;
+            for artist in artists {
+                synced_artist_ids.insert(artist.id.clone());
+                upsert_artist_exec(
+                    &mut *tx,
+                    &LocalArtist {
+                        id: artist.id,
+                        name: artist.name,
+                        album_count: artist.album_count,
+                        cover_art_id: artist.cover_art,
+                        starred: artist.starred.is_some(),
+                        musicbrainz_id: artist.music_brainz_id,
+                        updated_at: now,
+                    },
+                )
+                .await?;
+                report.artists_synced += 1;
+            }
+            tx.commit().await?;
         }
 
         // 2. Albums + Tracks (full alphabetical pagination vs delta newest/recent)
@@ -135,43 +191,69 @@ impl SyncEngine {
             .await?
             .unwrap_or_default();
         let previous_created = newest_created.clone();
+        let mut synced_album_ids: HashSet<String> = HashSet::new();
+        let mut synced_track_ids: HashSet<String> = HashSet::new();
 
         if full_sync {
             let mut offset = 0usize;
             loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(report);
+                }
                 let page = subsonic
                     .get_album_list2("alphabeticalByName", ALBUM_PAGE_SIZE, offset)
                     .await?;
                 let count = page.len();
+                let mut page_details = Vec::with_capacity(count);
                 for summary in page {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(report);
+                    }
                     if let Some(c) = &summary.created {
                         if is_timestamp_newer(c, &newest_created) {
                             newest_created = c.clone();
                         }
                     }
                     let detail = subsonic.get_album(&summary.id).await?;
-                    report.tracks_synced +=
-                        self.store_album_detail(&detail, &pending_songs, now).await?;
-                    report.albums_synced += 1;
+                    page_details.push(detail);
+                }
+                if !page_details.is_empty() {
+                    let mut tx = self.pool.begin().await?;
+                    for detail in &page_details {
+                        synced_album_ids.insert(detail.id.clone());
+                        for song in &detail.song {
+                            synced_track_ids.insert(song.id.clone());
+                        }
+                        report.tracks_synced +=
+                            store_album_detail_tx(&mut tx, detail, now).await?;
+                        report.albums_synced += 1;
+                    }
+                    tx.commit().await?;
                 }
                 if count < ALBUM_PAGE_SIZE {
                     break;
                 }
                 offset += count;
             }
-            set_cursor(&self.pool, CURSOR_LAST_FULL_SYNC, &now.to_string()).await?;
         } else {
             let mut seen_album_ids = HashSet::new();
 
             // Paginate `newest` until a page is shorter than DELTA_PAGE_SIZE or yields no new albums.
             let mut offset = 0usize;
             loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(report);
+                }
                 let page = subsonic
                     .get_album_list2("newest", DELTA_PAGE_SIZE, offset)
                     .await?;
                 let count = page.len();
                 let mut page_had_new = false;
+                let mut page_details = Vec::new();
                 for summary in page {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(report);
+                    }
                     if !seen_album_ids.insert(summary.id.clone()) {
                         continue;
                     }
@@ -197,9 +279,16 @@ impl SyncEngine {
                         }
                     }
                     let detail = subsonic.get_album(&summary.id).await?;
-                    report.tracks_synced +=
-                        self.store_album_detail(&detail, &pending_songs, now).await?;
-                    report.albums_synced += 1;
+                    page_details.push(detail);
+                }
+                if !page_details.is_empty() {
+                    let mut tx = self.pool.begin().await?;
+                    for detail in &page_details {
+                        report.tracks_synced +=
+                            store_album_detail_tx(&mut tx, detail, now).await?;
+                        report.albums_synced += 1;
+                    }
+                    tx.commit().await?;
                 }
                 if count < DELTA_PAGE_SIZE || !page_had_new {
                     break;
@@ -208,20 +297,33 @@ impl SyncEngine {
             }
 
             // Refresh recently played albums (single page) for updated play counts / metadata.
-            let recent_page = subsonic.get_album_list2("recent", DELTA_PAGE_SIZE, 0).await?;
-            for summary in recent_page {
-                if !seen_album_ids.insert(summary.id.clone()) {
-                    continue;
-                }
-                if let Some(c) = &summary.created {
-                    if is_timestamp_newer(c, &newest_created) {
-                        newest_created = c.clone();
+            if !cancelled.load(Ordering::Relaxed) {
+                let recent_page = subsonic.get_album_list2("recent", DELTA_PAGE_SIZE, 0).await?;
+                let mut recent_details = Vec::new();
+                for summary in recent_page {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(report);
                     }
+                    if !seen_album_ids.insert(summary.id.clone()) {
+                        continue;
+                    }
+                    if let Some(c) = &summary.created {
+                        if is_timestamp_newer(c, &newest_created) {
+                            newest_created = c.clone();
+                        }
+                    }
+                    let detail = subsonic.get_album(&summary.id).await?;
+                    recent_details.push(detail);
                 }
-                let detail = subsonic.get_album(&summary.id).await?;
-                report.tracks_synced +=
-                    self.store_album_detail(&detail, &pending_songs, now).await?;
-                report.albums_synced += 1;
+                if !recent_details.is_empty() {
+                    let mut tx = self.pool.begin().await?;
+                    for detail in &recent_details {
+                        report.tracks_synced +=
+                            store_album_detail_tx(&mut tx, detail, now).await?;
+                        report.albums_synced += 1;
+                    }
+                    tx.commit().await?;
+                }
             }
         }
 
@@ -230,9 +332,15 @@ impl SyncEngine {
         }
 
         // 3. Playlists (delta via changed_at for static playlists; always refresh smart or 0-count playlists) + prune deleted playlists
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(report);
+        }
         let playlists = subsonic.get_playlists().await?;
         let mut synced_playlist_ids = HashSet::with_capacity(playlists.len());
         for pl in playlists {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(report);
+            }
             synced_playlist_ids.insert(pl.id.clone());
             let (kind, slug, is_smart) = classify_playlist(&pl.name, pl.comment.as_deref());
             let existing: Option<(Option<String>, i64, i64)> = sqlx::query_as(
@@ -267,8 +375,15 @@ impl SyncEngine {
                 pl.name.clone()
             };
 
-            upsert_playlist(
-                &self.pool,
+            let detail_opt = if needs_tracks {
+                Some(subsonic.get_playlist(&pl.id).await?)
+            } else {
+                None
+            };
+
+            let mut tx = self.pool.begin().await?;
+            upsert_playlist_exec(
+                &mut *tx,
                 &LocalPlaylist {
                     id: pl.id.clone(),
                     name: display_name,
@@ -286,18 +401,19 @@ impl SyncEngine {
             )
             .await?;
 
-            if needs_tracks {
-                let detail = subsonic.get_playlist(&pl.id).await?;
+            if let Some(detail) = detail_opt {
                 let mut track_ids = Vec::with_capacity(detail.entry.len());
                 let mut total_duration_secs: i64 = 0;
                 for song in detail.entry {
                     total_duration_secs += song.duration.max(0);
                     let track_id = song.id.clone();
-                    let preserve = pending_songs.contains(&track_id);
-                    upsert_track(&self.pool, &song_to_local(song, now), preserve).await?;
+                    if full_sync {
+                        synced_track_ids.insert(track_id.clone());
+                    }
+                    upsert_track_exec(&mut *tx, &song_to_local(song, now), false).await?;
                     track_ids.push(track_id);
                 }
-                replace_playlist_tracks(&self.pool, &pl.id, &track_ids).await?;
+                replace_playlist_tracks_tx(&mut tx, &pl.id, &track_ids).await?;
                 let live_song_count = track_ids.len() as i64;
                 let live_duration_secs = if total_duration_secs > 0 || track_ids.is_empty() {
                     total_duration_secs
@@ -311,9 +427,10 @@ impl SyncEngine {
                 .bind(live_duration_secs)
                 .bind(now)
                 .bind(&pl.id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             }
+            tx.commit().await?;
             report.playlists_synced += 1;
         }
 
@@ -332,6 +449,12 @@ impl SyncEngine {
                     .bind(&pl_id)
                     .execute(&mut *tx)
                     .await?;
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'playlist' AND target_id = ?",
+                )
+                .bind(&pl_id)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query("DELETE FROM playlists WHERE id = ?")
                     .bind(&pl_id)
                     .execute(&mut *tx)
@@ -340,86 +463,109 @@ impl SyncEngine {
             tx.commit().await?;
         }
 
-        // 4. Starred reconciliation for songs, albums, and artists (protecting pending outbox edits)
+        // 4. Starred reconciliation for songs, albums, and artists (atomic SQL NOT EXISTS outbox protection)
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(report);
+        }
         let starred = subsonic.get_starred2().await?;
         let starred_song_ids: HashSet<String> =
             starred.song.iter().map(|s| s.id.clone()).collect();
-        for song in starred.song {
-            let preserve = pending_songs.contains(&song.id);
-            let mut local = song_to_local(song, now);
-            local.starred = true;
-            upsert_track(&self.pool, &local, preserve).await?;
-            report.starred_reconciled += 1;
-        }
-        let locally_starred_songs: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM tracks WHERE starred = 1")
-                .fetch_all(&self.pool)
-                .await?;
-        for id in locally_starred_songs {
-            if !starred_song_ids.contains(&id) && !pending_songs.contains(&id) {
-                sqlx::query("UPDATE tracks SET starred = 0, updated_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-            }
-        }
-
         let starred_album_ids: HashSet<String> =
             starred.album.iter().map(|a| a.id.clone()).collect();
-        for album_id in &starred_album_ids {
-            sqlx::query("UPDATE albums SET starred = 1, updated_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(album_id)
-                .execute(&self.pool)
-                .await?;
-            report.starred_reconciled += 1;
-        }
-        let locally_starred_albums: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM albums WHERE starred = 1")
-                .fetch_all(&self.pool)
-                .await?;
-        for id in locally_starred_albums {
-            if !starred_album_ids.contains(&id) {
-                sqlx::query("UPDATE albums SET starred = 0, updated_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-            }
-        }
-
         let starred_artist_ids: HashSet<String> =
             starred.artist.iter().map(|a| a.id.clone()).collect();
-        for artist_id in &starred_artist_ids {
-            sqlx::query("UPDATE artists SET starred = 1, updated_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(artist_id)
-                .execute(&self.pool)
-                .await?;
-            report.starred_reconciled += 1;
-        }
-        let locally_starred_artists: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM artists WHERE starred = 1")
-                .fetch_all(&self.pool)
-                .await?;
-        for id in locally_starred_artists {
-            if !starred_artist_ids.contains(&id) {
-                sqlx::query("UPDATE artists SET starred = 0, updated_at = ? WHERE id = ?")
+        {
+            let mut tx = self.pool.begin().await?;
+            for song in starred.song {
+                if full_sync {
+                    synced_track_ids.insert(song.id.clone());
+                }
+                let mut local = song_to_local(song, now);
+                local.starred = true;
+                upsert_track_exec(&mut *tx, &local, false).await?;
+                report.starred_reconciled += 1;
+            }
+            let locally_starred_songs: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM tracks WHERE starred = 1")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for id in locally_starred_songs {
+                if !starred_song_ids.contains(&id) {
+                    sqlx::query(
+                        r#"
+                        UPDATE tracks
+                        SET starred = 0, updated_at = ?
+                        WHERE id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM mutation_outbox
+                              WHERE song_id = tracks.id AND dead_letter = 0
+                          )
+                        "#,
+                    )
                     .bind(now)
                     .bind(id)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await?;
+                }
             }
+
+            for album_id in &starred_album_ids {
+                sqlx::query("UPDATE albums SET starred = 1, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(album_id)
+                    .execute(&mut *tx)
+                    .await?;
+                report.starred_reconciled += 1;
+            }
+            let locally_starred_albums: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM albums WHERE starred = 1")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for id in locally_starred_albums {
+                if !starred_album_ids.contains(&id) {
+                    sqlx::query("UPDATE albums SET starred = 0, updated_at = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+
+            for artist_id in &starred_artist_ids {
+                sqlx::query("UPDATE artists SET starred = 1, updated_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(artist_id)
+                    .execute(&mut *tx)
+                    .await?;
+                report.starred_reconciled += 1;
+            }
+            let locally_starred_artists: Vec<String> =
+                sqlx::query_scalar("SELECT id FROM artists WHERE starred = 1")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for id in locally_starred_artists {
+                if !starred_artist_ids.contains(&id) {
+                    sqlx::query("UPDATE artists SET starred = 0, updated_at = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            tx.commit().await?;
+        }
+
+        // 4a. Prune deleted tracks, albums, and artists after a complete full sync.
+        if full_sync && !cancelled.load(Ordering::Relaxed) {
+            self.prune_absent_library_rows(&synced_artist_ids, &synced_album_ids, &synced_track_ids)
+                .await?;
+            set_cursor(&self.pool, CURSOR_LAST_FULL_SYNC, &now.to_string()).await?;
         }
 
         // 4b. Incremental rating/annotation refresh via paginated search3 (empty query)
         // Delta sync skips unchanged albums, so tracks rated in Navidrome would otherwise keep stale user_rating.
-        if !full_sync {
-            if let Err(err) = self
-                .sync_song_ratings(&subsonic, &pending_songs, now)
-                .await
-            {
+        if !full_sync && !cancelled.load(Ordering::Relaxed) {
+            if let Err(err) = self.sync_song_ratings(&subsonic, now, cancelled).await {
                 report
                     .warnings
                     .push(format!("rating sync failed: {err}"));
@@ -427,73 +573,154 @@ impl SyncEngine {
         }
 
         // 5. Genres snapshot
-        match subsonic.get_genres().await {
-            Ok(genres) => {
-                let json = serde_json::to_string(&genres)?;
-                set_cursor(&self.pool, CURSOR_GENRES_JSON, &json).await?;
+        if !cancelled.load(Ordering::Relaxed) {
+            match subsonic.get_genres().await {
+                Ok(genres) => {
+                    let json = serde_json::to_string(&genres)?;
+                    set_cursor(&self.pool, CURSOR_GENRES_JSON, &json).await?;
+                }
+                Err(err) => report.warnings.push(format!("genres sync failed: {err}")),
             }
-            Err(err) => report.warnings.push(format!("genres sync failed: {err}")),
         }
 
         // 6. Optional Soulbeet Discovery triage queue sync
-        if let Some(base) = self.soulbeet_base_url.as_deref() {
-            match self
-                .sync_discovery_triage(base, &pending_songs, now)
-                .await
-            {
-                Ok(n) => report.discovery_tracks_synced = n,
-                Err(err) => report.warnings.push(format!("discovery sync failed: {err}")),
+        if !cancelled.load(Ordering::Relaxed) {
+            if let Some(base) = self.soulbeet_base_url.as_deref() {
+                match self.sync_discovery_triage(base, now).await {
+                    Ok(n) => report.discovery_tracks_synced = n,
+                    Err(err) => report.warnings.push(format!("discovery sync failed: {err}")),
+                }
             }
         }
 
         Ok(report)
     }
 
-    async fn store_album_detail(
+    async fn prune_absent_library_rows(
         &self,
-        detail: &SubsonicAlbumDetail,
-        pending_songs: &HashSet<String>,
-        now: i64,
-    ) -> CoreResult<usize> {
-        upsert_album(
-            &self.pool,
-            &LocalAlbum {
-                id: detail.id.clone(),
-                name: detail.name.clone(),
-                artist_id: detail.artist_id.clone(),
-                artist_name: detail.artist.clone(),
-                year: detail.year,
-                genre: detail.genre.clone(),
-                song_count: detail.song_count,
-                duration_secs: detail.duration,
-                cover_art_id: detail.cover_art.clone(),
-                starred: detail.starred.is_some(),
-                created_at: detail.created.clone(),
-                updated_at: now,
-            },
+        synced_artist_ids: &HashSet<String>,
+        synced_album_ids: &HashSet<String>,
+        synced_track_ids: &HashSet<String>,
+    ) -> CoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let mut orphan_audio_paths: Vec<String> = Vec::new();
+
+        let local_track_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM tracks")
+            .fetch_all(&mut *tx)
+            .await?;
+        for tid in local_track_ids {
+            if !synced_track_ids.contains(&tid) {
+                sqlx::query("DELETE FROM playlist_tracks WHERE track_id = ?")
+                    .bind(&tid)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'track' AND target_id = ?",
+                )
+                .bind(&tid)
+                .execute(&mut *tx)
+                .await?;
+                if let Some(local_path) = sqlx::query_scalar::<_, String>(
+                    "SELECT local_path FROM offline_downloads WHERE track_id = ?",
+                )
+                .bind(&tid)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    orphan_audio_paths.push(local_path);
+                    sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
+                        .bind(&tid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query("DELETE FROM tracks WHERE id = ?")
+                    .bind(&tid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        let local_album_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM albums")
+            .fetch_all(&mut *tx)
+            .await?;
+        for aid in local_album_ids {
+            if !synced_album_ids.contains(&aid) {
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'album' AND target_id = ?",
+                )
+                .bind(&aid)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM albums WHERE id = ?")
+                    .bind(&aid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        let local_artist_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM artists")
+            .fetch_all(&mut *tx)
+            .await?;
+        for arid in local_artist_ids {
+            if !synced_artist_ids.contains(&arid) {
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'artist' AND target_id = ?",
+                )
+                .bind(&arid)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("DELETE FROM artists WHERE id = ?")
+                    .bind(&arid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        // Sweep any pre-existing orphaned offline_downloads or offline_pins whose target
+        // rows no longer exist in the mirrored library.
+        let dangling_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT local_path FROM offline_downloads WHERE track_id NOT IN (SELECT id FROM tracks)",
         )
+        .fetch_all(&mut *tx)
+        .await?;
+        orphan_audio_paths.extend(dangling_paths);
+        sqlx::query("DELETE FROM offline_downloads WHERE track_id NOT IN (SELECT id FROM tracks)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM offline_pins
+            WHERE (target_kind = 'track' AND target_id NOT IN (SELECT id FROM tracks))
+               OR (target_kind = 'album' AND target_id NOT IN (SELECT id FROM albums))
+               OR (target_kind = 'artist' AND target_id NOT IN (SELECT id FROM artists))
+               OR (target_kind = 'playlist' AND target_id NOT IN (SELECT id FROM playlists))
+            "#,
+        )
+        .execute(&mut *tx)
         .await?;
 
-        let mut synced = 0usize;
-        for song in &detail.song {
-            let preserve = pending_songs.contains(&song.id);
-            upsert_track(&self.pool, &song_to_local(song.clone(), now), preserve).await?;
-            synced += 1;
+        tx.commit().await?;
+
+        for path in orphan_audio_paths {
+            let _ = tokio::fs::remove_file(&path).await;
         }
-        Ok(synced)
+        Ok(())
     }
 
     async fn sync_song_ratings(
         &self,
         subsonic: &SubsonicClient,
-        pending_songs: &HashSet<String>,
         now: i64,
+        cancelled: &AtomicBool,
     ) -> CoreResult<usize> {
         let mut offset = 0usize;
         let mut remote_songs: Vec<(String, i64, bool)> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
 
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             let page = subsonic
                 .search3_songs("", RATING_SYNC_PAGE_SIZE, offset)
                 .await?;
@@ -516,15 +743,11 @@ impl SyncEngine {
             offset += count;
         }
 
-        let mut tx = self.pool.begin().await?;
-        let live_pending_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT song_id FROM mutation_outbox WHERE dead_letter = 0",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut protected_songs = pending_songs.clone();
-        protected_songs.extend(live_pending_ids);
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
 
+        let mut tx = self.pool.begin().await?;
         let local_rows: Vec<(String, i64, bool)> =
             sqlx::query_as("SELECT id, user_rating, starred FROM tracks")
                 .fetch_all(&mut *tx)
@@ -537,13 +760,18 @@ impl SyncEngine {
         let mut updated = 0usize;
 
         for (id, remote_rating, remote_starred) in &remote_songs {
-            if protected_songs.contains(id) {
-                continue;
-            }
             if let Some(&(local_rating, local_starred)) = local_map.get(id) {
                 if local_rating != *remote_rating || local_starred != *remote_starred {
-                    sqlx::query(
-                        "UPDATE tracks SET user_rating = ?, starred = ?, updated_at = ? WHERE id = ?",
+                    let res = sqlx::query(
+                        r#"
+                        UPDATE tracks
+                        SET user_rating = ?, starred = ?, updated_at = ?
+                        WHERE id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM mutation_outbox
+                              WHERE song_id = tracks.id AND dead_letter = 0
+                          )
+                        "#,
                     )
                     .bind(*remote_rating)
                     .bind(*remote_starred)
@@ -551,7 +779,9 @@ impl SyncEngine {
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
-                    updated += 1;
+                    if res.rows_affected() > 0 {
+                        updated += 1;
+                    }
                 }
             }
         }
@@ -560,12 +790,7 @@ impl SyncEngine {
         Ok(updated)
     }
 
-    async fn sync_discovery_triage(
-        &self,
-        base: &str,
-        pending_songs: &HashSet<String>,
-        now: i64,
-    ) -> CoreResult<usize> {
+    async fn sync_discovery_triage(&self, base: &str, now: i64) -> CoreResult<usize> {
         let url = format!("{}/api/discovery/triage", base.trim_end_matches('/'));
         let mut req = self.http.get(&url);
         if let Some(auth) = self.soulbeet_auth.read().await.as_ref() {
@@ -615,16 +840,12 @@ impl SyncEngine {
         }
 
         let items: Vec<TriageItem> = resp.json().await?;
-        let live_pending = pending_outbox_song_ids(&self.pool).await?;
         let count = items.len();
         let mut synced_ids = HashSet::with_capacity(count);
+        let mut tx = self.pool.begin().await?;
 
         for item in items {
             synced_ids.insert(item.id.clone());
-            let preserve = item
-                .song_id
-                .as_deref()
-                .is_some_and(|sid| pending_songs.contains(sid) || live_pending.contains(sid));
             let reason_json = item
                 .reason
                 .as_ref()
@@ -637,8 +858,8 @@ impl SyncEngine {
             let song_id_for_rating = item.song_id.clone();
             let rating = item.rating;
 
-            upsert_discovery_track(
-                &self.pool,
+            upsert_discovery_track_tx(
+                &mut tx,
                 &LocalDiscoveryTrack {
                     id: item.id,
                     song_id: item.song_id,
@@ -655,62 +876,119 @@ impl SyncEngine {
                     exclude_from_core_taste: item.exclude_from_core_taste,
                     updated_at: now,
                 },
-                preserve,
+                false,
             )
             .await?;
 
-            if !preserve {
-                if let (Some(sid), Some(r)) = (song_id_for_rating.as_deref(), rating) {
-                    sqlx::query(
-                        "UPDATE tracks SET user_rating = ?, updated_at = ? WHERE id = ?",
-                    )
-                    .bind(i64::from(r.min(5)))
-                    .bind(now)
-                    .bind(sid)
-                    .execute(&self.pool)
-                    .await?;
-                }
+            if let (Some(sid), Some(r)) = (song_id_for_rating.as_deref(), rating) {
+                sqlx::query(
+                    r#"
+                    UPDATE tracks
+                    SET user_rating = ?, updated_at = ?
+                    WHERE id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM mutation_outbox
+                          WHERE song_id = tracks.id AND dead_letter = 0
+                      )
+                    "#,
+                )
+                .bind(i64::from(r.min(5)))
+                .bind(now)
+                .bind(sid)
+                .execute(&mut *tx)
+                .await?;
             }
         }
 
         // Prune stale discovery tracks no longer in server triage queue (protecting pending outbox edits).
         let local_rows: Vec<(String, Option<String>)> =
             sqlx::query_as("SELECT id, song_id FROM discovery_tracks")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
         for (id, song_id) in local_rows {
             if synced_ids.contains(&id) {
                 continue;
             }
-            if song_id
-                .as_deref()
-                .is_some_and(|sid| pending_songs.contains(sid) || live_pending.contains(sid))
-            {
-                continue;
-            }
-            sqlx::query("DELETE FROM discovery_tracks WHERE id = ?")
-                .bind(&id)
-                .execute(&self.pool)
-                .await?;
-            if let Some(sid) = song_id {
-                let still_pending: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(1) FROM discovery_tracks WHERE song_id = ? AND status = 'pending'",
-                )
-                .bind(&sid)
-                .fetch_one(&self.pool)
-                .await?;
-                if still_pending == 0 {
-                    sqlx::query("UPDATE tracks SET is_discovery = 0, updated_at = ? WHERE id = ?")
+            let res = sqlx::query(
+                r#"
+                DELETE FROM discovery_tracks
+                WHERE id = ?
+                  AND (
+                      song_id IS NULL
+                      OR NOT EXISTS (
+                          SELECT 1 FROM mutation_outbox
+                          WHERE song_id = discovery_tracks.song_id AND dead_letter = 0
+                      )
+                  )
+                "#,
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            if res.rows_affected() > 0 {
+                if let Some(sid) = song_id {
+                    let still_pending: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(1) FROM discovery_tracks WHERE song_id = ? AND status = 'pending'",
+                    )
+                    .bind(&sid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if still_pending == 0 {
+                        sqlx::query(
+                            r#"
+                            UPDATE tracks
+                            SET is_discovery = 0, updated_at = ?
+                            WHERE id = ?
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM mutation_outbox
+                                  WHERE song_id = tracks.id AND dead_letter = 0
+                              )
+                            "#,
+                        )
                         .bind(now)
                         .bind(&sid)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await?;
+                    }
                 }
             }
         }
 
+        tx.commit().await?;
         Ok(count)
     }
+}
+
+async fn store_album_detail_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    detail: &SubsonicAlbumDetail,
+    now: i64,
+) -> CoreResult<usize> {
+    upsert_album_exec(
+        &mut **tx,
+        &LocalAlbum {
+            id: detail.id.clone(),
+            name: detail.name.clone(),
+            artist_id: detail.artist_id.clone(),
+            artist_name: detail.artist.clone(),
+            year: detail.year,
+            genre: detail.genre.clone(),
+            song_count: detail.song_count,
+            duration_secs: detail.duration,
+            cover_art_id: detail.cover_art.clone(),
+            starred: detail.starred.is_some(),
+            created_at: detail.created.clone(),
+            updated_at: now,
+        },
+    )
+    .await?;
+
+    let mut synced = 0usize;
+    for song in &detail.song {
+        upsert_track_exec(&mut **tx, &song_to_local(song.clone(), now), false).await?;
+        synced += 1;
+    }
+    Ok(synced)
 }
 
 fn is_timestamp_newer(candidate: &str, baseline: &str) -> bool {

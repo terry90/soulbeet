@@ -113,14 +113,14 @@ pub(crate) async fn check(engine: &Engine, link: &Link) -> Result<(), AirdcppErr
         return Err(AirdcppError::MissingPermissions(lacking));
     }
     let settings = read_settings(sidecar).await?;
-    *link.settings.lock().unwrap() = Some(settings.clone());
+    *link.settings.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settings.clone());
     if !settings.language_file.trim().is_empty() {
         return Err(AirdcppError::Language);
     }
     if hubs(sidecar).await?.0 == 0 {
         return Err(AirdcppError::NoHub);
     }
-    let kept = (link.probed.lock().unwrap().clone()).filter(|(at, _)| at.elapsed() < PROBE_EVERY);
+    let kept = (link.probed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()).filter(|(at, _)| at.elapsed() < PROBE_EVERY);
     if let Some((_, found)) = kept {
         return found;
     }
@@ -130,7 +130,7 @@ pub(crate) async fn check(engine: &Engine, link: &Link) -> Result<(), AirdcppErr
         found,
         Err(AirdcppError::Unreachable(_) | AirdcppError::Unauthorized)
     ) {
-        *link.probed.lock().unwrap() = Some((Instant::now(), found.clone()));
+        *link.probed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), found.clone()));
     }
     found
 }
@@ -140,7 +140,7 @@ pub(crate) async fn report(engine: &Engine, link: &Link) -> SidecarReport {
     let sidecar = &link.sidecar;
     let mut report = SidecarReport::default();
     // The folder probe runs again, whenever it last ran.
-    *link.probed.lock().unwrap() = None;
+    *link.probed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let checked = check(engine, link).await;
     report.problem = checked.as_ref().err().map(|e| e.to_string());
     if let Ok(info) = sidecar.get::<SystemInfo>("system/system_info").await {

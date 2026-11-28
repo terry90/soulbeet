@@ -75,7 +75,7 @@ static REFUSED: LazyLock<Mutex<HashSet<[u8; 32]>>> = LazyLock::new(Default::defa
 
 /// Forgets every 401: called when the settings are saved, so the next request signs in again.
 pub fn forget_refusals() {
-    REFUSED.lock().unwrap().clear();
+    REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
 /// The base of the Web API at `url`: an http or https address with no user name, password,
@@ -204,7 +204,7 @@ impl Sidecar {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<Answer, AirdcppError> {
-        if REFUSED.lock().unwrap().contains(&self.refusal) {
+        if REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&self.refusal) {
             return Err(AirdcppError::Unauthorized);
         }
         if self.breaker.is_open().await {
@@ -246,7 +246,7 @@ impl Sidecar {
         let answer = Answer { status, body: text };
         match status {
             401 => {
-                REFUSED.lock().unwrap().insert(self.refusal);
+                REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(self.refusal);
                 warn!("AirDC++ refused the user name and password; nothing more is sent until the settings change");
                 Err(AirdcppError::Unauthorized)
             }

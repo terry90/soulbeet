@@ -12,8 +12,7 @@ use crate::{
     IconLaptop, IconListMusic, IconLoader, IconMic2, IconMonitor, IconMusic, IconPause,
     IconPictureInPicture2, IconPlay, IconRadio, IconRepeat, IconRepeatOne, IconShare2, IconShuffle,
     IconSkipBack, IconSkipForward, IconSmartphone, IconSparkles, IconStar, IconThumbsDown,
-    IconTrash2, IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode, StarStrip,
-    StarStripSize,
+    IconTrash2, IconVolume1, IconVolume2, IconVolumeX, PlayerTrack, RepeatMode,
 };
 
 use super::DrawerTab;
@@ -226,7 +225,7 @@ fn PlayerScrubber(
                 // Glowing playhead scrubber thumb
                 if can_seek {
                     div {
-                        class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
+                        class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-beet-text-primary ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
                         style: "left: {pct:.2}%;",
                     }
                 }
@@ -410,7 +409,7 @@ fn PlayerVolumeSlider(volume: f32, muted: bool, on_change: EventHandler<f32>) ->
             }
 
             div {
-                class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
+                class: "absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-beet-text-primary ring-2 ring-beet-leaf-glow shadow-[0_0_8px_rgba(0,229,141,0.55)] pointer-events-none transition-[transform,opacity] duration-150 {thumb_visibility_class}",
                 style: "left: {vol_pct}%;",
             }
 
@@ -462,7 +461,11 @@ pub fn StudioPlayerBar(
     #[props(default)] on_transfer_to_device: Option<EventHandler<String>>,
     #[props(default)] mini_player_open: bool,
     #[props(default)] on_toggle_mini_player: Option<EventHandler<()>>,
+    #[props(default)] on_inspect_current: Option<EventHandler<()>>,
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+    #[props(default)] on_album_click: Option<EventHandler<String>>,
 ) -> Element {
+    let _ = on_rate;
     let player = use_player();
     let state = player.snapshot();
     let mut connect_open = use_signal(|| false);
@@ -491,7 +494,7 @@ pub fn StudioPlayerBar(
     rsx! {
         footer {
             aria_label: "Audio player",
-            class: "relative shrink-0 bg-beet-surface-low border-t border-beet-border-subtle px-3 sm:px-5 pt-2 pb-2.5 md:py-0 md:h-[84px] flex flex-col md:flex-row md:items-center md:justify-between gap-2 md:gap-3 z-30",
+            class: "relative shrink-0 bg-beet-surface-low border-t border-beet-border-subtle px-3 sm:px-5 pt-2 pb-2.5 md:py-0 md:h-[84px] flex flex-col md:flex-row md:items-center md:justify-between gap-1.5 md:gap-3 z-30",
 
             // Signature Soulbeet 2px seam-light sweep when buffering / loading / acquiring
             if is_busy {
@@ -501,28 +504,65 @@ pub fn StudioPlayerBar(
                 }
             }
 
-            // Mobile (< md): Dedicated full-width seek bar above controls so it is clear and easy to scrub
-            div { class: "w-full md:hidden",
-                PlayerScrubber {
-                    track_id: current.as_ref().map(|t| t.id.clone()),
-                    has_track,
-                    codec_badge: None,
-                    full_width: true,
+            // Mobile (< md): Dedicated full-width seek bar flanked by compact Shuffle & Repeat
+            div { class: "w-full flex items-center gap-1.5 md:hidden",
+                button {
+                    r#type: "button",
+                    aria_pressed: if state.shuffle { "true" } else { "false" },
+                    aria_label: "Toggle shuffle",
+                    title: "Shuffle",
+                    class: if state.shuffle {
+                        "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-leaf-text bg-beet-leaf-surface shrink-0 cursor-pointer transition-colors"
+                    } else {
+                        "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary shrink-0 cursor-pointer transition-colors"
+                    },
+                    onclick: move |_| player.toggle_shuffle(),
+                    IconShuffle { size: 13 }
+                }
+                div { class: "flex-1 min-w-0",
+                    PlayerScrubber {
+                        track_id: current.as_ref().map(|t| t.id.clone()),
+                        has_track,
+                        codec_badge: None,
+                        full_width: true,
+                    }
+                }
+                button {
+                    r#type: "button",
+                    aria_label: "{state.repeat.aria_label()}",
+                    title: "{state.repeat.aria_label()}",
+                    class: if state.repeat != RepeatMode::Off {
+                        "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-leaf-text bg-beet-leaf-surface shrink-0 cursor-pointer transition-colors"
+                    } else {
+                        "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary shrink-0 cursor-pointer transition-colors"
+                    },
+                    onclick: move |_| player.cycle_repeat(),
+                    if state.repeat == RepeatMode::One {
+                        IconRepeatOne { size: 13 }
+                    } else {
+                        IconRepeat { size: 13 }
+                    }
                 }
             }
 
             // Controls row (flex row on mobile; dissolved via `md:contents` into the 3-column desktop bar)
             div { class: "flex items-center justify-between gap-2 w-full md:contents",
-            // LEFT (32%): Artwork, Title/Artist, Discovery pill, Context-Aware Curation
-            div { class: "flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 lg:w-[32%] lg:flex-none",
+            // LEFT (30-32%): Artwork, Title/Artist, compact Discovery pill, Context-Aware Curation
+            div { class: "flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1 md:w-[30%] lg:w-[32%] md:flex-none",
                 // Cover Art (40px on mobile, 52px on desktop)
                 button {
                     r#type: "button",
                     aria_label: "Open Track Inspector",
                     title: "Inspect current track",
                     disabled: !has_track,
-                    class: "group/art relative w-10 h-10 md:w-[52px] md:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle hover:border-beet-border-strong disabled:hover:border-beet-border-subtle shrink-0 flex items-center justify-center cursor-pointer disabled:cursor-default transition-colors",
-                    onclick: move |_| on_toggle_drawer.call(DrawerTab::Inspector),
+                    class: "group/art relative w-10 h-10 md:w-[52px] md:h-[52px] rounded-[8px] overflow-hidden bg-beet-surface border border-beet-border-subtle hover:border-beet-border-strong disabled:hover:border-beet-border-subtle disabled:cursor-not-allowed disabled:pointer-events-none shrink-0 flex items-center justify-center cursor-pointer transition-colors",
+                    onclick: move |_| {
+                        if let Some(cb) = &on_inspect_current {
+                            cb.call(());
+                        } else {
+                            on_toggle_drawer.call(DrawerTab::Inspector);
+                        }
+                    },
                     if let Some(url) = show_art {
                         img {
                             src: "{url}",
@@ -548,8 +588,8 @@ pub fn StudioPlayerBar(
                         let track_keep = track.clone();
                         let track_drop = track.clone();
                         let track_star = track.clone();
-                        let track_rate = track.clone();
                         let track_radio = track.clone();
+                        let artist_for_click = track.artist.clone();
                         let track_share = track.clone();
                         let is_starred = track.starred;
 
@@ -560,22 +600,53 @@ pub fn StudioPlayerBar(
                                         "{track.title}"
                                     }
                                     if track.is_discovery {
-                                        span { class: "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text tabular-nums-mono text-[10px] font-semibold tracking-wider shrink-0",
+                                        span { class: "hidden xl:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text tabular-nums-mono text-[10px] font-semibold tracking-wider shrink-0",
                                             IconSparkles { size: 10 }
                                             "{format_discovery_badge(track.days_remaining)}"
                                         }
                                     }
                                     if track.rating > 0 {
                                         span {
-                                            class: "inline-flex md:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                                            class: "hidden sm:inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
                                             title: format!("Rated {} out of 5 stars", track.rating),
                                             IconStar { size: 10, filled: true }
                                             span { "{track.rating}" }
                                         }
                                     }
                                 }
-                                p { class: "text-[12px] text-beet-text-secondary truncate mt-0.5",
-                                    "{track.artist}"
+                                div { class: "flex items-center gap-1 min-w-0 mt-0.5 text-[12px] text-beet-text-secondary",
+                                    if let Some(artist_cb) = on_artist_click {
+                                        button {
+                                            r#type: "button",
+                                            class: "min-w-0 truncate text-left hover:text-beet-text-primary hover:underline cursor-pointer",
+                                            onclick: move |_| artist_cb.call(artist_for_click.clone()),
+                                            "{track.artist}"
+                                        }
+                                    } else {
+                                        span { class: "min-w-0 truncate",
+                                            "{track.artist}"
+                                        }
+                                    }
+                                    if let Some(alb) = track.album.as_deref().filter(|a| !a.trim().is_empty()) {
+                                        span { class: "hidden xl:inline text-beet-text-disabled shrink-0", "·" }
+                                        if let Some(album_cb) = on_album_click {
+                                            {
+                                                let alb_for_click = alb.to_string();
+                                                rsx! {
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "hidden xl:inline min-w-0 truncate text-left text-beet-text-tertiary hover:text-beet-text-primary hover:underline cursor-pointer",
+                                                        onclick: move |_| album_cb.call(alb_for_click.clone()),
+                                                        "{alb}"
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            span { class: "hidden xl:inline min-w-0 truncate text-beet-text-tertiary",
+                                                "{alb}"
+                                            }
+                                        }
+                                    }
                                 }
                                 if let Some(ref err) = error_msg {
                                     p { class: "text-[11px] text-beet-crimson-text truncate mt-0.5",
@@ -584,8 +655,8 @@ pub fn StudioPlayerBar(
                                 }
                             }
 
-                            // Context-Aware Quick Curation
-                            div { class: "hidden sm:flex items-center gap-1.5 shrink-0",
+                            // Context-Aware Quick Curation (calm & compact so title never crushes)
+                            div { class: "hidden sm:flex items-center gap-1 shrink-0",
                                 if track.is_discovery {
                                     button {
                                         r#type: "button",
@@ -594,7 +665,7 @@ pub fn StudioPlayerBar(
                                         class: "inline-flex items-center gap-1 h-8 px-2.5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[12px] font-semibold hover:brightness-105 cursor-pointer transition-[filter]",
                                         onclick: move |_| on_keep.call(track_keep.clone()),
                                         IconCheck { size: 14 }
-                                        span { class: "hidden xl:inline", "Keep" }
+                                        span { class: "hidden 2xl:inline", "Keep" }
                                     }
                                     button {
                                         r#type: "button",
@@ -603,14 +674,6 @@ pub fn StudioPlayerBar(
                                         class: "w-8 h-8 rounded-full inline-flex items-center justify-center bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white cursor-pointer transition-colors",
                                         onclick: move |_| on_drop.call(track_drop.clone()),
                                         IconThumbsDown { size: 14 }
-                                    }
-                                    div { class: "hidden md:flex items-center",
-                                        StarStrip {
-                                            rating: track.rating,
-                                            size: StarStripSize::Compact,
-                                            on_rate: move |r| on_rate.call((track_rate.clone(), r)),
-                                            aria_label: format!("Rate {}", track.title),
-                                        }
                                     }
                                 } else {
                                     button {
@@ -625,14 +688,6 @@ pub fn StudioPlayerBar(
                                         },
                                         onclick: move |_| on_star.call((track_star.clone(), !is_starred)),
                                         IconHeart { size: 16, filled: is_starred }
-                                    }
-                                    div { class: "hidden md:flex items-center",
-                                        StarStrip {
-                                            rating: track.rating,
-                                            size: StarStripSize::Compact,
-                                            on_rate: move |r| on_rate.call((track_rate.clone(), r)),
-                                            aria_label: format!("Rate {}", track.title),
-                                        }
                                     }
                                     button {
                                         r#type: "button",
@@ -658,7 +713,7 @@ pub fn StudioPlayerBar(
                                         r#type: "button",
                                         title: "Remove from library (X)",
                                         aria_label: "Remove track from library",
-                                        class: "hidden xl:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface cursor-pointer transition-colors",
+                                        class: "hidden 2xl:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface cursor-pointer transition-colors",
                                         onclick: move |_| on_drop.call(track_drop.clone()),
                                         IconTrash2 { size: 15 }
                                     }
@@ -678,18 +733,18 @@ pub fn StudioPlayerBar(
                 }
             }
 
-            // CENTER (40%): Transport + Isolated Scrubber (scrubber shown inline on md+; full-width row on mobile)
+            // CENTER: Transport + Isolated Scrubber (scrubber shown inline on md+; full-width row on mobile)
             div { class: "flex flex-col items-center justify-center gap-1 shrink-0 md:flex-1 md:max-w-xl",
-                div { class: "flex items-center gap-1 sm:gap-3",
+                div { class: "flex items-center gap-0.5 sm:gap-2.5",
                     button {
                         r#type: "button",
                         aria_pressed: if state.shuffle { "true" } else { "false" },
                         aria_label: "Toggle shuffle",
                         title: "Shuffle",
                         class: if state.shuffle {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
+                            "hidden md:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
                         } else {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
+                            "hidden md:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
                         },
                         onclick: move |_| player.toggle_shuffle(),
                         IconShuffle { size: 15 }
@@ -700,9 +755,9 @@ pub fn StudioPlayerBar(
                         aria_label: "Previous track",
                         title: "Previous (Shift+←)",
                         disabled: !has_track,
-                        class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 cursor-pointer transition-colors",
+                        class: "w-7 h-7 sm:w-8 sm:h-8 rounded-lg inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
                         onclick: move |_| player.previous(),
-                        IconSkipBack { size: 17 }
+                        IconSkipBack { size: 16 }
                     }
 
                     button {
@@ -710,14 +765,14 @@ pub fn StudioPlayerBar(
                         aria_label: if is_playing { "Pause" } else { "Play" },
                         title: "Play / Pause (Space)",
                         disabled: !has_track && state.queue.is_empty(),
-                        class: "w-10 h-10 rounded-full inline-flex items-center justify-center bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 active:scale-95 disabled:opacity-40 cursor-pointer transition-[filter,transform]",
+                        class: "w-9 h-9 sm:w-10 sm:h-10 rounded-full inline-flex items-center justify-center bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-[filter,transform]",
                         onclick: move |_| player.toggle_play_pause(),
                         if state.status.is_busy() {
-                            IconLoader { size: 18 }
+                            IconLoader { size: 17 }
                         } else if is_playing {
-                            IconPause { size: 18, filled: true }
+                            IconPause { size: 17, filled: true }
                         } else {
-                            IconPlay { size: 18, filled: true, class: "ml-0.5".to_string() }
+                            IconPlay { size: 17, filled: true, class: "ml-0.5".to_string() }
                         }
                     }
 
@@ -726,9 +781,9 @@ pub fn StudioPlayerBar(
                         aria_label: "Next track",
                         title: "Next (Shift+→)",
                         disabled: !has_track,
-                        class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 cursor-pointer transition-colors",
+                        class: "w-7 h-7 sm:w-8 sm:h-8 rounded-lg inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
                         onclick: move |_| player.next(),
-                        IconSkipForward { size: 17 }
+                        IconSkipForward { size: 16 }
                     }
 
                     button {
@@ -736,9 +791,9 @@ pub fn StudioPlayerBar(
                         aria_label: "{state.repeat.aria_label()}",
                         title: "{state.repeat.aria_label()}",
                         class: if state.repeat != RepeatMode::Off {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
+                            "hidden md:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-leaf-text bg-beet-leaf-surface hover:bg-beet-surface-high hover:brightness-110 cursor-pointer transition-[color,background-color,filter]"
                         } else {
-                            "hidden sm:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
+                            "hidden md:inline-flex w-8 h-8 rounded-lg items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer transition-colors"
                         },
                         onclick: move |_| player.cycle_repeat(),
                         if state.repeat == RepeatMode::One {
@@ -758,8 +813,8 @@ pub fn StudioPlayerBar(
                 }
             }
 
-            // RIGHT (28%): Drawer Toggles, Connect Switcher, Volume
-            div { class: "flex items-center justify-end gap-1 sm:gap-1.5 lg:w-[28%] shrink-0",
+            // RIGHT: Drawer Toggles, Connect Switcher, Volume (visible from md+ 768px)
+            div { class: "flex items-center justify-end gap-0.5 sm:gap-1.5 md:w-[30%] lg:w-[28%] shrink-0",
                 // Lyrics Toggle
                 button {
                     r#type: "button",
@@ -911,8 +966,8 @@ pub fn StudioPlayerBar(
                     }
                 }
 
-                // Volume Control
-                div { class: "hidden xl:flex items-center gap-1.5 pl-1.5 border-l border-beet-border-subtle",
+                // Volume Control (reachable from md+ 768px)
+                div { class: "hidden md:flex items-center gap-1.5 pl-1.5 border-l border-beet-border-subtle",
                     button {
                         r#type: "button",
                         aria_label: if state.muted { "Unmute" } else { "Mute" },

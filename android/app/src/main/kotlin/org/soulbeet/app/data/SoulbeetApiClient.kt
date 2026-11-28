@@ -90,6 +90,15 @@ data class UserCultureProfileUi(
     val weatherCity: String? = null,
 )
 
+data class PlaylistMutationResultUi(
+    val id: String,
+    val name: String,
+    val comment: String,
+    val public: Boolean,
+    val songCount: Int,
+    val duration: Int,
+)
+
 data class ListenerProtectionUi(
     val kind: String,
     val summary: String,
@@ -603,6 +612,161 @@ class SoulbeetApiClient(
             }
         }
     }
+
+    suspend fun createPlaylist(
+        config: PersistedAppConfig,
+        name: String,
+        comment: String? = null,
+        public: Boolean? = null,
+        songIds: List<String>? = null,
+    ): Result<PlaylistMutationResultUi> = withContext(Dispatchers.IO) {
+        runCatching {
+            val base = normalizeBaseUrl(config.serverUrl)
+            val payload = JSONObject()
+                .put("name", name.trim())
+                .put("comment", comment?.trim()?.takeIf { it.isNotEmpty() } ?: JSONObject.NULL)
+                .put("public", public ?: JSONObject.NULL)
+                .put("song_ids", if (songIds != null) JSONArray(songIds) else JSONObject.NULL)
+                .toString()
+
+            val request = Request.Builder()
+                .url("$base/api/playlists/create")
+                .post(payload.toRequestBody(jsonMediaType))
+                .applyAuth(config)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException(extractErrorMessage(raw) ?: "Create playlist HTTP ${response.code}")
+                }
+                parsePlaylistMutationResult(JSONObject(raw))
+            }
+        }
+    }
+
+    suspend fun updatePlaylist(
+        config: PersistedAppConfig,
+        playlistId: String,
+        name: String? = null,
+        comment: String? = null,
+        public: Boolean? = null,
+    ): Result<PlaylistMutationResultUi> = withContext(Dispatchers.IO) {
+        runCatching {
+            val base = normalizeBaseUrl(config.serverUrl)
+            val payload = JSONObject()
+                .put("playlist_id", playlistId)
+                .put("name", name?.trim() ?: JSONObject.NULL)
+                .put("comment", comment?.trim() ?: JSONObject.NULL)
+                .put("public", public ?: JSONObject.NULL)
+                .toString()
+
+            val request = Request.Builder()
+                .url("$base/api/playlists/update")
+                .post(payload.toRequestBody(jsonMediaType))
+                .applyAuth(config)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException(extractErrorMessage(raw) ?: "Update playlist HTTP ${response.code}")
+                }
+                parsePlaylistMutationResult(JSONObject(raw))
+            }
+        }
+    }
+
+    suspend fun deletePlaylist(
+        config: PersistedAppConfig,
+        playlistId: String,
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val base = normalizeBaseUrl(config.serverUrl)
+            val payload = JSONObject()
+                .put("playlist_id", playlistId)
+                .toString()
+
+            val request = Request.Builder()
+                .url("$base/api/playlists/delete")
+                .post(payload.toRequestBody(jsonMediaType))
+                .applyAuth(config)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException(extractErrorMessage(raw) ?: "Delete playlist HTTP ${response.code}")
+                }
+            }
+        }
+    }
+
+    suspend fun addPlaylistTracks(
+        config: PersistedAppConfig,
+        playlistId: String,
+        songIds: List<String>,
+    ): Result<PlaylistMutationResultUi> = withContext(Dispatchers.IO) {
+        runCatching {
+            val base = normalizeBaseUrl(config.serverUrl)
+            val payload = JSONObject()
+                .put("playlist_id", playlistId)
+                .put("song_ids", JSONArray(songIds))
+                .toString()
+
+            val request = Request.Builder()
+                .url("$base/api/playlists/add-tracks")
+                .post(payload.toRequestBody(jsonMediaType))
+                .applyAuth(config)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException(extractErrorMessage(raw) ?: "Add tracks HTTP ${response.code}")
+                }
+                parsePlaylistMutationResult(JSONObject(raw))
+            }
+        }
+    }
+
+    suspend fun removePlaylistTracks(
+        config: PersistedAppConfig,
+        playlistId: String,
+        songIds: List<String>,
+    ): Result<PlaylistMutationResultUi> = withContext(Dispatchers.IO) {
+        runCatching {
+            val base = normalizeBaseUrl(config.serverUrl)
+            val payload = JSONObject()
+                .put("playlist_id", playlistId)
+                .put("song_ids", JSONArray(songIds))
+                .toString()
+
+            val request = Request.Builder()
+                .url("$base/api/playlists/remove-tracks")
+                .post(payload.toRequestBody(jsonMediaType))
+                .applyAuth(config)
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw IOException(extractErrorMessage(raw) ?: "Remove tracks HTTP ${response.code}")
+                }
+                parsePlaylistMutationResult(JSONObject(raw))
+            }
+        }
+    }
+
+    internal fun parsePlaylistMutationResult(obj: JSONObject): PlaylistMutationResultUi =
+        PlaylistMutationResultUi(
+            id = obj.optNonNullString("id").orEmpty(),
+            name = obj.optNonNullString("name").orEmpty(),
+            comment = obj.optNonNullString("comment").orEmpty(),
+            public = obj.optBoolean("public", false),
+            songCount = obj.optInt("song_count", 0).coerceAtLeast(0),
+            duration = obj.optInt("duration", 0).coerceAtLeast(0),
+        )
 
     private fun Request.Builder.applyAuth(config: PersistedAppConfig): Request.Builder {
         header("Accept", "application/json")

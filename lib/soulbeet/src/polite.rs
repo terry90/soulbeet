@@ -48,6 +48,15 @@ impl Pace {
         timeout: Duration::from_secs(15),
     };
 
+    /// Fast interactive pace for user-facing Deezer search so MusicBrainz
+    /// fallback happens promptly on quota or upstream errors instead of stalling.
+    pub const DEEZER_INTERACTIVE: Pace = Pace {
+        min_interval: Duration::from_millis(250),
+        backoff: Duration::from_secs(1),
+        retries: 1,
+        timeout: Duration::from_secs(6),
+    };
+
     /// archive.org publishes no limit and blocks heavy automated traffic, so one request a
     /// second, shared by every user's searches.
     pub const ARCHIVE: Pace = Pace {
@@ -129,7 +138,7 @@ impl HostGate {
             Some(port) => format!("{host}:{port}"),
             None => host.to_string(),
         };
-        let mut gates = GATES.lock().unwrap();
+        let mut gates = GATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let gate = gates.entry(key).or_insert_with(|| {
             Arc::new(HostGate {
                 turn: tokio::sync::Mutex::new(()),
@@ -145,7 +154,10 @@ impl HostGate {
         let _turn = self.turn.lock().await;
         loop {
             let until = {
-                let mut next = self.next.lock().unwrap();
+                let mut next = self
+                    .next
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let now = Instant::now();
                 if *next <= now {
                     *next = now + interval;
@@ -159,7 +171,10 @@ impl HostGate {
 
     /// Holds every request to the host for `wait` from now, unless a longer hold is on.
     pub fn hold(&self, wait: Duration) {
-        let mut next = self.next.lock().unwrap();
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *next = (*next).max(Instant::now() + wait);
     }
 }
@@ -173,18 +188,43 @@ fn header_secs(headers: &HeaderMap, name: &str) -> Option<u64> {
 }
 
 /// Calls in a row that end unavailable, rate limited or challenged after their retries before
-/// the client stops asking.
+/// the circuit breaker opens.
 const FAILED_CALLS_BEFORE_GIVING_UP: u32 = 2;
 
-/// The calls in a row that failed after their retries, and the last one's error.
+/// How long an open circuit breaker waits before allowing a half-open probe.
+const DEFAULT_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Time-bounded circuit breaker state: tracks consecutive transient failures, when the
+/// breaker opened, and whether a single half-open probe is currently in flight.
 #[derive(Default)]
 struct Streak {
     calls: u32,
     last: Option<RemoteError>,
+    opened_at: Option<Instant>,
+    probing: bool,
 }
 
-/// A client lives for one recommendation run, so a service that went down is given up on for
-/// the rest of that run only.
+/// Releases `Streak::probing` if a half-open probe future is dropped or panics before
+/// recording its outcome.
+struct ProbeGuard<'a> {
+    failed: &'a std::sync::Mutex<Streak>,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut failed = self
+                .failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            failed.probing = false;
+        }
+    }
+}
+
+/// A paced HTTP client with a time-bounded circuit breaker: after consecutive failures it
+/// fails fast for `cooldown`, then permits a half-open probe to recover automatically.
 pub struct PoliteClient {
     http: Client,
     base: String,
@@ -193,6 +233,7 @@ pub struct PoliteClient {
     gate: Arc<HostGate>,
     token: Option<String>,
     is_quota: Option<fn(&[u8]) -> bool>,
+    cooldown: Duration,
     failed: std::sync::Mutex<Streak>,
 }
 
@@ -238,6 +279,7 @@ impl PoliteClient {
             gate,
             token: None,
             is_quota: None,
+            cooldown: DEFAULT_CIRCUIT_COOLDOWN,
             failed: Default::default(),
         })
     }
@@ -250,6 +292,12 @@ impl PoliteClient {
     /// For services that report a quota overrun inside a 200 answer.
     pub fn with_quota_check(mut self, is_quota: fn(&[u8]) -> bool) -> PoliteClient {
         self.is_quota = Some(is_quota);
+        self
+    }
+
+    /// Overrides the circuit-breaker cooldown before a half-open probe is attempted.
+    pub fn with_cooldown(mut self, cooldown: Duration) -> PoliteClient {
+        self.cooldown = cooldown;
         self
     }
 
@@ -286,31 +334,63 @@ impl PoliteClient {
         self.pace.backoff * 2u32.pow(attempt)
     }
 
-    /// Once the service has failed `FAILED_CALLS_BEFORE_GIVING_UP` calls in a row, answers with
-    /// the last failure and sends nothing; any other outcome starts the count again.
+    /// Once the service has failed `FAILED_CALLS_BEFORE_GIVING_UP` calls in a row, fails fast
+    /// with the last failure for `self.cooldown`, then allows a single half-open probe that
+    /// resets the breaker on success or re-opens it for another cooldown on failure.
     async fn send<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,
         body: Option<&B>,
     ) -> Result<Option<T>, RemoteError> {
-        let given_up = {
-            let failed = self.failed.lock().unwrap();
-            (failed.calls >= FAILED_CALLS_BEFORE_GIVING_UP).then(|| failed.last.clone())
+        let mut probe_guard = {
+            let mut failed = self
+                .failed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failed.calls >= FAILED_CALLS_BEFORE_GIVING_UP {
+                let cooldown_elapsed = failed
+                    .opened_at
+                    .is_some_and(|at| at.elapsed() >= self.cooldown);
+                if cooldown_elapsed && !failed.probing {
+                    failed.probing = true;
+                    Some(ProbeGuard {
+                        failed: &self.failed,
+                        armed: true,
+                    })
+                } else if let Some(err) = failed.last.clone() {
+                    return Err(err);
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
-        if let Some(Some(e)) = given_up {
-            return Err(e);
-        }
+
         let result = self.exchange(method, path, body).await;
-        let mut failed = self.failed.lock().unwrap();
+
+        let mut failed = self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(guard) = probe_guard.as_mut() {
+            guard.armed = false;
+        }
         match &result {
             Err(
                 e @ (RemoteError::Unavailable { .. }
                 | RemoteError::RateLimited { .. }
                 | RemoteError::Challenged { .. }),
             ) => {
-                failed.calls += 1;
+                if probe_guard.is_some() {
+                    failed.probing = false;
+                }
+                failed.calls = failed.calls.saturating_add(1);
                 failed.last = Some(e.clone());
+                if failed.calls >= FAILED_CALLS_BEFORE_GIVING_UP {
+                    failed.opened_at = Some(Instant::now());
+                }
             }
             _ => *failed = Streak::default(),
         }
@@ -721,6 +801,20 @@ mod tests {
         );
         assert_eq!(
             (
+                Pace::DEEZER_INTERACTIVE.min_interval,
+                Pace::DEEZER_INTERACTIVE.backoff,
+                Pace::DEEZER_INTERACTIVE.retries,
+                Pace::DEEZER_INTERACTIVE.timeout
+            ),
+            (
+                Duration::from_millis(250),
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(6)
+            )
+        );
+        assert_eq!(
+            (
                 Pace::ARCHIVE.min_interval,
                 Pace::ARCHIVE.backoff,
                 Pace::ARCHIVE.retries,
@@ -733,5 +827,58 @@ mod tests {
                 Duration::from_secs(30)
             )
         );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_recovers_after_cooldown_on_successful_probe() {
+        let mut replies: Vec<Reply> = (0..8).map(|_| bad_gateway()).collect();
+        replies.push(ok("[7]"));
+        replies.push(ok("[8]"));
+        let (base, seen) = serve(replies);
+        let c = PoliteClient::new(&base, "Deezer", Pace::immediate())
+            .unwrap()
+            .with_cooldown(Duration::from_millis(60));
+        let down = Err(RemoteError::Unavailable {
+            service: "Deezer",
+            detail: "HTTP 502".into(),
+        });
+
+        // Two failed calls trip the circuit breaker.
+        assert_eq!(c.get::<Vec<u8>>("/1").await, down);
+        assert_eq!(c.get::<Vec<u8>>("/2").await, down);
+        assert_eq!(seen.lock().unwrap().len(), 8);
+
+        // During cooldown, requests fail fast without hitting the server.
+        assert_eq!(c.get::<Vec<u8>>("/3").await, down);
+        assert_eq!(seen.lock().unwrap().len(), 8);
+
+        // After cooldown elapses, a half-open probe succeeds and resets the breaker.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(c.get::<Vec<u8>>("/4").await.unwrap(), Some(vec![7]));
+        assert_eq!(c.get::<Vec<u8>>("/5").await.unwrap(), Some(vec![8]));
+        assert_eq!(seen.lock().unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_reopens_for_another_cooldown_if_half_open_probe_fails() {
+        // 2 initial failures (4 attempts each = 8) + 1 failed probe (4 attempts) = 12
+        let replies: Vec<Reply> = (0..12).map(|_| bad_gateway()).collect();
+        let (base, seen) = serve(replies);
+        let c = PoliteClient::new(&base, "Deezer", Pace::immediate())
+            .unwrap()
+            .with_cooldown(Duration::from_millis(60));
+
+        assert!(c.get::<Vec<u8>>("/1").await.is_err());
+        assert!(c.get::<Vec<u8>>("/2").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 8);
+
+        // Wait past cooldown; probe fails and re-opens the breaker.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(c.get::<Vec<u8>>("/probe").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 12);
+
+        // Immediately after the failed probe, requests are blocked again.
+        assert!(c.get::<Vec<u8>>("/blocked").await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 12);
     }
 }

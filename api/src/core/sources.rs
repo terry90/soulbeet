@@ -590,20 +590,33 @@ impl Searches {
     /// The searches holding or waiting for the turn before search `id`; None once it holds the
     /// turn, and for a search no task runs.
     pub fn ahead_of(&self, id: &str) -> Option<usize> {
-        let line = self.line.lock().unwrap();
+        let line = self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let place = line.runs.iter().position(|run| run.id == id)?;
         (!line.runs[place].holds_turn).then_some(place)
     }
 
     /// The ids of `user`'s `find_sources` searches waiting for the turn, in arrival order.
     pub fn waiting_finds(&self, user: &UserId) -> Vec<String> {
-        waiting_finds_in(&self.line.lock().unwrap().runs, user)
+        waiting_finds_in(
+            &self
+                .line
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .runs,
+            user,
+        )
     }
 
     /// The backend's id of stored search `id`, once its task started it at the backend.
     #[cfg(test)]
     pub fn backend_search(&self, id: &str) -> Option<String> {
-        let line = self.line.lock().unwrap();
+        let line = self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         line.runs
             .iter()
             .find(|run| run.id == id)
@@ -621,7 +634,10 @@ impl Searches {
     /// SEARCH_KEPT_SECS are dropped when one is added. True when it stopped a task's search.
     pub async fn stop_job_search(&self, id: &str, recorded: bool) -> bool {
         let started = {
-            let mut line = self.line.lock().unwrap();
+            let mut line = self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
             match line.runs.iter_mut().find(|run| run.id == id) {
                 Some(run) if run.purpose == SearchFor::Job => {
                     run.stop = true;
@@ -649,14 +665,25 @@ impl Searches {
 
     /// Puts a job's search `id` in line; it leaves when the returned place is dropped.
     fn enter(self: &Arc<Self>, id: &str, user: UserId) -> Place {
-        self.push(&mut self.line.lock().unwrap(), id, user, SearchFor::Job)
+        self.push(
+            &mut self
+                .line
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            id,
+            user,
+            SearchFor::Job,
+        )
     }
 
     /// Puts `user`'s find_sources search `id` in line, unless `user` already has
     /// FINDS_WAITING_PER_USER waiting: then their ids. Counted and entered under one lock, so
     /// calls made together never pass the bound together.
     fn enter_find(self: &Arc<Self>, id: &str, user: UserId) -> Result<Place, Vec<String>> {
-        let mut line = self.line.lock().unwrap();
+        let mut line = self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let waiting = waiting_finds_in(&line.runs, &user);
         if waiting.len() >= FINDS_WAITING_PER_USER {
             return Err(waiting);
@@ -695,7 +722,10 @@ impl Searches {
             // Registered before the look, so a search leaving after it still wakes this one.
             left.as_mut().enable();
             {
-                let mut line = self.line.lock().unwrap();
+                let mut line = self
+                    .line
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if line.runs.iter().any(|run| run.id == id && run.stop) {
                     return false;
                 }
@@ -713,7 +743,10 @@ impl Searches {
     /// The backend started search `id` as `backend_search`: whether it was stopped meanwhile, so
     /// its task stops it at the backend now.
     fn started(&self, id: &str, backend_search: &str, backend: &Arc<dyn DownloadBackend>) -> bool {
-        let mut line = self.line.lock().unwrap();
+        let mut line = self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match line.runs.iter_mut().find(|run| run.id == id) {
             Some(run) => {
                 run.started
@@ -767,7 +800,11 @@ pub(crate) struct Place {
 
 impl Drop for Place {
     fn drop(&mut self) {
-        let mut line = self.searches.line.lock().unwrap();
+        let mut line = self
+            .searches
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(place) = line.runs.iter().position(|run| run.id == self.id) {
             line.runs.remove(place);
         }

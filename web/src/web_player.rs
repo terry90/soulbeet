@@ -81,6 +81,25 @@ pub struct GuardModalState {
     pub busy: bool,
 }
 
+/// Active playlist management modal state (Create, Edit, or Add Tracks).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaylistModalState {
+    Create {
+        initial_name: String,
+        initial_song_ids: Vec<String>,
+    },
+    Edit {
+        playlist_id: String,
+        initial_name: String,
+        initial_comment: String,
+        initial_public: bool,
+    },
+    AddTracks {
+        item_label: String,
+        song_ids: Vec<String>,
+    },
+}
+
 /// Builds all non-empty deduplicated triage guard keys for a track (`discovery_track_id` and `song_id`)
 /// so concurrent actions from different UI surfaces (triage card vs player bar) share the same guard.
 fn triage_guard_keys(disc_id: Option<&str>, song_id: &str) -> Vec<String> {
@@ -205,12 +224,17 @@ pub struct WebStudioContext {
     pub in_flight_triage: Signal<HashSet<String>>,
     pub optimistic_kept: Signal<HashSet<String>>,
     pub guard_modal: Signal<Option<GuardModalState>>,
+    pub guard_modal_loading: Signal<Option<PlayerTrack>>,
+    pub playlist_modal: Signal<Option<PlaylistModalState>>,
+    pub dropped_queue_backup: Signal<Option<(String, usize, PlayerTrack)>>,
     pub share_modal: Signal<Option<ShareModalTarget>>,
     pub inspected_track: Signal<Option<PlayerTrack>>,
     pub drawer_tab: Signal<Option<DrawerTab>>,
     pub cmdk_open: Signal<bool>,
     pub toast_notice: Signal<Option<String>>,
+    pub toast_gen: Signal<u64>,
     pub playlists: Signal<Vec<SubsonicPlaylistSummary>>,
+    pub playlists_refresh_tick: Signal<u64>,
     pub selected_playlist_id: Signal<Option<String>>,
     pub recent_albums: Signal<Vec<SubsonicAlbumSummary>>,
     pub starred_tracks: Signal<Vec<PlayerTrack>>,
@@ -468,13 +492,144 @@ impl WebStudioContext {
 
     pub fn show_toast(&mut self, msg: impl Into<String>) {
         let text = msg.into();
-        self.toast_notice.set(Some(text.clone()));
-        let mut sig = self.toast_notice;
+        let next_gen = self.toast_gen.peek().wrapping_add(1);
+        self.toast_gen.set(next_gen);
+        self.toast_notice.set(Some(text));
+    }
+
+    pub fn dismiss_toast(&mut self) {
+        self.toast_notice.set(None);
+    }
+
+    pub fn dismiss_acquire_state(&mut self, key: &str) {
+        self.acquire_states.write().remove(key);
+    }
+
+    pub fn open_create_playlist(
+        &mut self,
+        initial_name: impl Into<String>,
+        initial_song_ids: Vec<String>,
+    ) {
+        self.playlist_modal.set(Some(PlaylistModalState::Create {
+            initial_name: initial_name.into(),
+            initial_song_ids,
+        }));
+    }
+
+    pub fn open_edit_playlist(
+        &mut self,
+        playlist_id: String,
+        initial_name: String,
+        initial_comment: String,
+        initial_public: bool,
+    ) {
+        self.playlist_modal.set(Some(PlaylistModalState::Edit {
+            playlist_id,
+            initial_name,
+            initial_comment,
+            initial_public,
+        }));
+    }
+
+    pub fn open_add_to_playlist(
+        &mut self,
+        item_label: impl Into<String>,
+        song_ids: Vec<String>,
+    ) {
+        let clean_ids: Vec<String> = song_ids
+            .into_iter()
+            .filter(|id| !id.trim().is_empty())
+            .collect();
+        if clean_ids.is_empty() {
+            self.show_toast("This track is not in Navidrome yet.");
+            return;
+        }
+        self.playlist_modal
+            .set(Some(PlaylistModalState::AddTracks {
+                item_label: item_label.into(),
+                song_ids: clean_ids,
+            }));
+    }
+
+    pub fn static_playlist_targets(&self) -> Vec<ui::PlaylistTargetOption> {
+        self.playlists
+            .read()
+            .iter()
+            .filter(|pl| !pl.is_smart && !pl.category.is_soulbeet_mix())
+            .map(|pl| ui::PlaylistTargetOption {
+                id: pl.id.clone(),
+                name: pl.name.clone(),
+                song_count: pl.song_count,
+            })
+            .collect()
+    }
+
+    /// Triggers a root-scoped playlist list refresh in `StudioShell` so navigating away
+    /// immediately after a mutation never cancels the in-flight refresh.
+    pub fn refresh_playlists(&mut self) {
+        let next = self.playlists_refresh_tick.peek().wrapping_add(1);
+        self.playlists_refresh_tick.set(next);
+    }
+
+    /// Resolves an artist name in Navidrome and opens `/artist/:id`, falling back to Search.
+    pub fn navigate_to_artist(&mut self, nav: dioxus::router::Navigator, artist_name: String) {
+        let trimmed = artist_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(info) = self.navidrome_info() else {
+            self.search_query_override.set(Some(trimmed));
+            nav.push(crate::Route::SearchPage {});
+            return;
+        };
+        let mut studio = *self;
         spawn(async move {
-            gloo_timers::future::TimeoutFuture::new(3500).await;
-            if sig.peek().as_deref() == Some(text.as_str()) {
-                sig.set(None);
+            if let Ok(hits) = crate::navidrome_web::search_navidrome(&info, &trimmed).await {
+                if let Some(artist) = hits
+                    .artists
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&trimmed))
+                    .or_else(|| hits.artists.first())
+                {
+                    nav.push(crate::Route::ArtistDetailPage {
+                        id: artist.id.clone(),
+                    });
+                    return;
+                }
             }
+            studio.search_query_override.set(Some(trimmed));
+            nav.push(crate::Route::SearchPage {});
+        });
+    }
+
+    /// Resolves an album name in Navidrome and opens `/album/:id`, falling back to Search.
+    pub fn navigate_to_album(&mut self, nav: dioxus::router::Navigator, album_name: String) {
+        let trimmed = album_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(info) = self.navidrome_info() else {
+            self.search_query_override.set(Some(trimmed));
+            nav.push(crate::Route::SearchPage {});
+            return;
+        };
+        let mut studio = *self;
+        spawn(async move {
+            if let Ok(hits) = crate::navidrome_web::search_navidrome(&info, &trimmed).await {
+                if let Some(album) = hits
+                    .albums
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&trimmed))
+                    .or_else(|| hits.albums.first())
+                {
+                    nav.push(crate::Route::AlbumDetailPage {
+                        id: album.id.clone(),
+                    });
+                    return;
+                }
+            }
+            studio.search_query_override.set(Some(trimmed));
+            nav.push(crate::Route::SearchPage {});
         });
     }
 
@@ -1271,10 +1426,21 @@ impl WebStudioContext {
     }
 
     /// Context-aware drop/remove:
-    /// - Pending Discovery: skips immediately if playing, hides optimistically, and shows 5s Undo snackbar.
-    /// - Permanent Library: loads `curation_guard_preview` and opens `MultiListenerGuardModal`.
+    /// - Pending Discovery: captures queue position for Undo, skips immediately if playing,
+    ///   hides optimistically, and shows 5s Undo snackbar.
+    /// - Permanent Library: opens loading modal immediately while `curation_guard_preview` resolves.
     pub fn drop_track(&mut self, auth: Auth, player: PlayerContext, track: PlayerTrack) {
         if track.is_discovery {
+            let prior_idx = if !track.id.is_empty() {
+                player
+                    .state_signal()
+                    .peek()
+                    .queue
+                    .iter()
+                    .position(|t| t.id == track.id)
+            } else {
+                None
+            };
             if !track.id.is_empty() {
                 player.remove_track_from_queue(&track.id);
             }
@@ -1284,6 +1450,19 @@ impl WebStudioContext {
                 track.title.clone(),
                 track.artist.clone(),
             );
+            if let Some(idx) = prior_idx {
+                if let Some(active_key) = self
+                    .pending_drops
+                    .peek()
+                    .active()
+                    .map(|item| item.key.clone())
+                {
+                    self.dropped_queue_backup
+                        .set(Some((active_key, idx, track.clone())));
+                }
+            } else {
+                self.dropped_queue_backup.set(None);
+            }
             if let Some(prev) = displaced {
                 self.commit_pending_drop(auth, prev);
             }
@@ -1295,25 +1474,49 @@ impl WebStudioContext {
         }
         let mut studio = *self;
         let song_id = track.id.clone();
+        studio.guard_modal.set(None);
+        studio.guard_modal_loading.set(Some(track.clone()));
         spawn(async move {
             match auth.call(api::curation_guard_preview(song_id)).await {
                 Ok(preview) => {
-                    studio.guard_modal.set(Some(GuardModalState {
-                        track,
-                        preview,
-                        busy: false,
-                    }));
+                    // Respect user cancelling the loading modal before preview returned.
+                    if studio
+                        .guard_modal_loading
+                        .peek()
+                        .as_ref()
+                        .is_some_and(|t| t.id == track.id)
+                    {
+                        studio.guard_modal_loading.set(None);
+                        studio.guard_modal.set(Some(GuardModalState {
+                            track,
+                            preview,
+                            busy: false,
+                        }));
+                    }
                 }
                 Err(e) => {
+                    if studio
+                        .guard_modal_loading
+                        .peek()
+                        .as_ref()
+                        .is_some_and(|t| t.id == track.id)
+                    {
+                        studio.guard_modal_loading.set(None);
+                    }
                     studio.show_toast(format!("Guard check failed: {}", friendly_error(&e)));
                 }
             }
         });
     }
 
-    pub fn undo_pending_drop(&mut self) {
+    pub fn undo_pending_drop(&mut self, player: PlayerContext) {
         let restored = self.pending_drops.write().undo_active();
         if let Some(restored) = restored {
+            if let Some((backup_key, idx, track)) = self.dropped_queue_backup.write().take() {
+                if backup_key == restored.key {
+                    player.insert_track_at(idx, track);
+                }
+            }
             self.show_toast(format!("Restored \"{}\"", restored.title));
         }
     }
@@ -1997,12 +2200,17 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let in_flight_triage = use_signal(HashSet::<String>::new);
     let optimistic_kept = use_signal(HashSet::<String>::new);
     let guard_modal = use_signal(|| None::<GuardModalState>);
+    let guard_modal_loading = use_signal(|| None::<PlayerTrack>);
+    let playlist_modal = use_signal(|| None::<PlaylistModalState>);
+    let dropped_queue_backup = use_signal(|| None::<(String, usize, PlayerTrack)>);
     let share_modal = use_signal(|| None::<ShareModalTarget>);
     let inspected_track = use_signal(|| None::<PlayerTrack>);
     let drawer_tab = use_signal(|| None::<DrawerTab>);
     let cmdk_open = use_signal(|| false);
     let toast_notice = use_signal(|| None::<String>);
+    let toast_gen = use_signal(|| 0u64);
     let playlists = use_signal(Vec::<SubsonicPlaylistSummary>::new);
+    let playlists_refresh_tick = use_signal(|| 0u64);
     let selected_playlist_id = use_signal(|| None::<String>);
     let recent_albums = use_signal(Vec::<SubsonicAlbumSummary>::new);
     let starred_tracks = use_signal(Vec::<PlayerTrack>::new);
@@ -2048,12 +2256,17 @@ pub fn WebStudioProvider(children: Element) -> Element {
         in_flight_triage,
         optimistic_kept,
         guard_modal,
+        guard_modal_loading,
+        playlist_modal,
+        dropped_queue_backup,
         share_modal,
         inspected_track,
         drawer_tab,
         cmdk_open,
         toast_notice,
+        toast_gen,
         playlists,
+        playlists_refresh_tick,
         selected_playlist_id,
         recent_albums,
         starred_tracks,
@@ -2324,6 +2537,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 | PlayerCommand::LoadQueue { .. }
                 | PlayerCommand::ClearQueue
                 | PlayerCommand::RemoveFromQueue(_)
+                | PlayerCommand::MoveQueueItem { .. }
                 | PlayerCommand::RemoveTrackFromQueue(_)
                 | PlayerCommand::EnqueueNext(_)
                 | PlayerCommand::EnqueueLast(_)
@@ -2373,6 +2587,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 PlayerCommand::ClearQueue => {
                     clear_web_audio(engine);
                 }
+                PlayerCommand::MoveQueueItem { .. } => {}
                 PlayerCommand::LoadQueue { autoplay, .. } => {
                     if next_state.current_track.is_none() {
                         clear_web_audio(engine);

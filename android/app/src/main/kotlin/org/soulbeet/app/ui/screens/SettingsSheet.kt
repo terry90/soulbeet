@@ -1,7 +1,6 @@
 package org.soulbeet.app.ui.screens
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -299,15 +298,14 @@ private fun SegmentedOptionChip(
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     Surface(
+        onClick = onClick,
         color = if (selected) colors.leafSurface else colors.surface,
         shape = SoulbeetShapes.full,
         border = BorderStroke(
             1.dp,
             if (selected) colors.leafText.copy(alpha = 0.5f) else colors.borderSubtle,
         ),
-        modifier = modifier
-            .heightIn(min = 48.dp)
-            .clickable(onClick = onClick),
+        modifier = modifier.heightIn(min = 48.dp),
     ) {
         Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
             Text(

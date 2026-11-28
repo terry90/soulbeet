@@ -6,8 +6,8 @@ use client_core::models::PinTarget;
 use dioxus::prelude::*;
 use shared::recommendation::{CultureSteering, UserCultureProfile};
 use ui::{
-    use_player, IconLoader, IconPlay, IconRefreshCw, IconSettings, IconSparkles, SeasonalHeroCard,
-    StudioNavSection, TasteDnaBar, TrackRow, TrackRowState,
+    use_player, IconListMusic, IconLoader, IconPlay, IconRefreshCw, IconSettings, IconSparkles,
+    SeasonalHeroCard, StudioNavSection, TasteDnaBar, TrackRow, TrackRowState,
 };
 
 use crate::desktop_state::{
@@ -126,7 +126,7 @@ pub fn DiscoverView() -> Element {
                         button {
                             r#type: "button",
                             disabled: is_generating || sync_st.syncing || offline_only,
-                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer transition-[filter]",
+                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-[filter]",
                             onclick: move |_| studio.refresh_discovery(),
                             IconRefreshCw {
                                 size: 14,
@@ -223,51 +223,64 @@ pub fn DiscoverView() -> Element {
                         .unwrap_or_else(|| {
                             "Curated seasonal discovery pack mirrored offline.".to_string()
                         });
+                    let pl_id_inspect = seasonal.playlist.id.clone();
                     rsx! {
-                        SeasonalHeroCard {
-                            title,
-                            subtitle,
-                            window_badge: Some("SEASONAL PACK · AUTO-EXPIRES".to_string()),
-                            mix_slug: Some(slug_art),
-                            track_count: count,
-                            local_ratio: effective_ratio,
-                            local_label: local_code.clone(),
-                            steering: steering(),
-                            is_pinned_offline: is_pinned,
-                            exclude_from_core_taste: true,
-                            on_play: move |_| {
-                                let pid = pl_id.clone();
-                                let label = title_play.clone();
-                                if let Some(core) = studio.core.peek().clone() {
-                                    spawn(async move {
-                                        let tracks = load_tracks_for_playlist(&core, &pid).await;
-                                        studio.play_collection(player, tracks, 0, &label);
-                                    });
+                        div { class: "space-y-2",
+                            SeasonalHeroCard {
+                                title,
+                                subtitle,
+                                window_badge: Some("SEASONAL PACK · AUTO-EXPIRES".to_string()),
+                                mix_slug: Some(slug_art),
+                                track_count: count,
+                                local_ratio: effective_ratio,
+                                local_label: local_code.clone(),
+                                steering: steering(),
+                                is_pinned_offline: is_pinned,
+                                exclude_from_core_taste: true,
+                                on_play: move |_| {
+                                    let pid = pl_id.clone();
+                                    let label = title_play.clone();
+                                    if let Some(core) = studio.core.peek().clone() {
+                                        spawn(async move {
+                                            let tracks = load_tracks_for_playlist(&core, &pid).await;
+                                            studio.play_collection(player, tracks, 0, &label);
+                                        });
+                                    }
+                                },
+                                on_pin_offline: move |_| {
+                                    if is_pinned {
+                                        studio.unpin_target_offline(
+                                            PinTarget::SeasonalPack(slug.clone()),
+                                            title_pin.clone(),
+                                        );
+                                    } else {
+                                        studio.pin_target_offline(
+                                            PinTarget::SeasonalPack(slug.clone()),
+                                            title_pin.clone(),
+                                        );
+                                    }
+                                },
+                                on_steer: move |next| {
+                                    steering.set(next);
+                                    studio.steer_seasonal_pack(slug_steer.clone(), next);
+                                },
+                            }
+                            div { class: "flex justify-end",
+                                button {
+                                    r#type: "button",
+                                    class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer transition-colors",
+                                    onclick: move |_| studio.open_playlist_detail(pl_id_inspect.clone()),
+                                    IconListMusic { size: 13 }
+                                    span { "Inspect Mix Tracklist" }
                                 }
-                            },
-                            on_pin_offline: move |_| {
-                                if is_pinned {
-                                    studio.unpin_target_offline(
-                                        PinTarget::SeasonalPack(slug.clone()),
-                                        title_pin.clone(),
-                                    );
-                                } else {
-                                    studio.pin_target_offline(
-                                        PinTarget::SeasonalPack(slug.clone()),
-                                        title_pin.clone(),
-                                    );
-                                }
-                            },
-                            on_steer: move |next| {
-                                steering.set(next);
-                                studio.steer_seasonal_pack(slug_steer.clone(), next);
-                            },
+                            }
                         }
                     }
                 }
             } else if !visible_tracks.is_empty() || weekly_radar_pl.is_some() {
                 {
                     let radar_id = weekly_radar_pl.as_ref().map(|p| p.playlist.id.clone());
+                    let radar_id_inspect = radar_id.clone();
                     let is_pinned = weekly_radar_pl.as_ref().is_some_and(|p| p.is_pinned);
                     let tracks_play = visible_tracks.clone();
                     let radar_count = if !visible_tracks.is_empty() {
@@ -279,35 +292,46 @@ pub fn DiscoverView() -> Element {
                             .unwrap_or(0)
                     };
                     rsx! {
-                        SeasonalHeroCard {
-                            title: "Fresh Picks".to_string(),
-                            subtitle: "Keep your favorites in permanent lossless storage or drop them with 1 click (5-second Undo safety).".to_string(),
-                            window_badge: Some("DISCOVERY TRIAGE · OFFLINE READY".to_string()),
-                            mix_slug: Some("balanced".to_string()),
-                            track_count: radar_count,
-                            local_ratio: effective_ratio,
-                            local_label: local_code.clone(),
-                            steering: steering(),
-                            is_pinned_offline: is_pinned,
-                            exclude_from_core_taste: false,
-                            on_play: move |_| {
-                                if !tracks_play.is_empty() {
-                                    studio.play_collection(player, tracks_play.clone(), 0, "Fresh Picks");
-                                } else if let (Some(pid), Some(core)) = (radar_id.clone(), studio.core.peek().clone()) {
-                                    spawn(async move {
-                                        let tracks = load_tracks_for_playlist(&core, &pid).await;
-                                        studio.play_collection(player, tracks, 0, "Fresh Picks");
-                                    });
+                        div { class: "space-y-2",
+                            SeasonalHeroCard {
+                                title: "Fresh Picks".to_string(),
+                                subtitle: "Keep your favorites in permanent lossless storage or drop them with 1 click (5-second Undo safety).".to_string(),
+                                window_badge: Some("DISCOVERY TRIAGE · OFFLINE READY".to_string()),
+                                mix_slug: Some("balanced".to_string()),
+                                track_count: radar_count,
+                                local_ratio: effective_ratio,
+                                local_label: local_code.clone(),
+                                is_pinned_offline: is_pinned,
+                                exclude_from_core_taste: false,
+                                on_play: move |_| {
+                                    if !tracks_play.is_empty() {
+                                        studio.play_collection(player, tracks_play.clone(), 0, "Fresh Picks");
+                                    } else if let (Some(pid), Some(core)) = (radar_id.clone(), studio.core.peek().clone()) {
+                                        spawn(async move {
+                                            let tracks = load_tracks_for_playlist(&core, &pid).await;
+                                            studio.play_collection(player, tracks, 0, "Fresh Picks");
+                                        });
+                                    }
+                                },
+                                on_pin_offline: move |_| {
+                                    if is_pinned {
+                                        studio.unpin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
+                                    } else {
+                                        studio.pin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
+                                    }
+                                },
+                            }
+                            if let Some(pid) = radar_id_inspect {
+                                div { class: "flex justify-end",
+                                    button {
+                                        r#type: "button",
+                                        class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer transition-colors",
+                                        onclick: move |_| studio.open_playlist_detail(pid.clone()),
+                                        IconListMusic { size: 13 }
+                                        span { "Inspect Mix Tracklist" }
+                                    }
                                 }
-                            },
-                            on_pin_offline: move |_| {
-                                if is_pinned {
-                                    studio.unpin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
-                                } else {
-                                    studio.pin_target_offline(PinTarget::WeeklyRadar, "Fresh Picks".into());
-                                }
-                            },
-                            on_steer: move |next| steering.set(next),
+                            }
                         }
                     }
                 }

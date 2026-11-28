@@ -41,7 +41,7 @@ pub fn ActivityView() -> Element {
                 button {
                     r#type: "button",
                     disabled: offline_only,
-                    class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary disabled:opacity-40 text-[12px] font-medium cursor-pointer",
+                    class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none text-[12px] font-medium cursor-pointer",
                     onclick: move |_| studio.drain_outbox_bg(),
                     IconRefreshCw { size: 14 }
                     span { "Flush Outbox" }
@@ -150,7 +150,12 @@ pub fn SettingsView() -> Element {
                         span { class: "px-2.5 py-1 rounded-full bg-beet-surface-high border border-beet-border-subtle text-beet-text-secondary tabular-nums-mono text-[10px] font-semibold",
                             if mpris_active { "OS MEDIA KEYS ON" } else { "OS MEDIA KEYS OFF" }
                         }
-                        span { class: "px-2.5 py-1 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text tabular-nums-mono text-[11px] font-semibold",
+                        span {
+                            class: if mpv_err.is_some() {
+                                "px-2.5 py-1 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text tabular-nums-mono text-[11px] font-semibold"
+                            } else {
+                                "px-2.5 py-1 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text tabular-nums-mono text-[11px] font-semibold"
+                            },
                             if mpv_err.is_some() { "ERROR" } else { "GAPLESS READY" }
                         }
                     }
@@ -183,7 +188,7 @@ pub fn SettingsView() -> Element {
                                         class: if active {
                                             "h-8 px-3.5 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/40 text-beet-leaf-text text-[12px] font-semibold cursor-pointer"
                                         } else {
-                                            "h-8 px-3.5 rounded-full text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer"
+                                            "h-8 px-3.5 rounded-full border border-transparent text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer"
                                         },
                                         onclick: move |_| studio.set_replaygain(mode),
                                         "{mode.label()}"

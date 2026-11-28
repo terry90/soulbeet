@@ -19,7 +19,7 @@ use tower_cookies::Cookies;
 use crate::{
     core::connect::{ConnStatus, ConnectEnvelope, KeepaliveCheck, CONNECT_HUB},
     server_fns::{
-        download::{origin_allowed, session_still_valid},
+        download::{origin_allowed_with_proxy, session_still_valid},
         forbidden_error,
         guard::extract_session_token,
         refusal_error,
@@ -63,7 +63,12 @@ pub async fn connect_ws(
     let public_url = crate::config::CONFIG
         .public_url()
         .and_then(|p| p.as_ref().ok());
-    let allowed = origin_allowed(&headers, &uri, public_url)
+    let allowed = origin_allowed_with_proxy(
+        &headers,
+        &uri,
+        public_url,
+        crate::config::trust_proxy_headers(),
+    )
         .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
     if let Err(why) = allowed {
         warn!("Refused a Connect socket for user {user}: {why}");

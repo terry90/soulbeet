@@ -53,7 +53,7 @@ pub fn WhatsNew(props: WhatsNewProps) -> Element {
                         }
                     }
                     button {
-                        class: "ml-auto px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer",
+                        class: "ml-auto px-4 py-2 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer",
                         onclick: move |_| on_close.call(()),
                         "Got it"
                     }

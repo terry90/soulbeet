@@ -155,7 +155,7 @@ impl ListSlots {
 
 impl ListSlots {
     fn peer(&self, cid: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         peers.retain(|_, lock| Arc::strong_count(lock) > 1);
         peers.entry(cid.to_string()).or_default().clone()
     }
@@ -690,13 +690,13 @@ impl Run {
     }
 
     fn show(&self, groups: Vec<DownloadableGroup>, stats: SearchStats) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.groups = groups;
         progress.stats = stats;
     }
 
     fn end(&self, failed: Option<BackendError>) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.phase = match failed {
             Some(e) => Phase::Failed(Instant::now(), e),
             None => Phase::Ended(Instant::now()),
@@ -704,7 +704,7 @@ impl Run {
     }
 
     fn ended_at(&self) -> Option<Instant> {
-        match self.progress.lock().unwrap().phase {
+        match self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).phase {
             Phase::Running => None,
             Phase::Ended(at) | Phase::Failed(at, _) => Some(at),
         }
@@ -761,7 +761,7 @@ impl Searches {
             stop: AtomicBool::new(false),
         });
         {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.insert(id.clone(), run.clone());
         }
@@ -777,14 +777,14 @@ impl Searches {
 
     pub(crate) fn poll(&self, search_id: &str) -> Result<SearchResult, BackendError> {
         let run = {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.get(search_id).cloned()
         };
         let run = run.ok_or_else(|| AirdcppError::UnknownSearch {
             search_id: search_id.to_string(),
         })?;
-        let progress = run.progress.lock().unwrap();
+        let progress = run.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = match &progress.phase {
             // A stopped search reads what it found so far.
             Phase::Running if !run.stopped() => SearchState::InProgress,
@@ -805,13 +805,13 @@ impl Searches {
 
     /// Stops a search: it loads no more lists. One the backend does not run is no error.
     pub(crate) fn stop(&self, search_id: &str) {
-        if let Some(run) = self.runs.lock().unwrap().get(search_id) {
+        if let Some(run) = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(search_id) {
             run.stop.store(true, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn stop_all(&self) {
-        for run in self.runs.lock().unwrap().values() {
+        for run in self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
             run.stop.store(true, Ordering::SeqCst);
         }
     }

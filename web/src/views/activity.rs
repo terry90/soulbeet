@@ -9,6 +9,7 @@ use api::models::track_share::{LinkMode, ShareDirection, ShareHistoryEntry, Shar
 use dioxus::prelude::*;
 use shared::download::{
     AcquireAndPlayRequest, ArchivalUpgradeStatus, ImportChoice, MatchChoices, MatchKind,
+    TriggerArchivalUpgradeRequest,
 };
 use shared::library_import::{
     LibraryImportBatch, LibraryImportBatchStatus, LibraryImportItem, LibraryImportItemStatus,
@@ -18,8 +19,9 @@ use shared::playlist_import::ImportJobSummary;
 use ui::{
     dashboard::DeletionHistoryTab, friendly_error, use_player, AcquireStageBadge, ChoicesLoader,
     IconActivity, IconDisc3, IconDownload, IconLibrary, IconListMusic, IconLoader, IconMusic,
-    IconPause, IconPlay, IconRefreshCw, IconShare2, IconSparkles, IconX, JobDiagnosticsPanel,
-    LibraryImportModal, MatchPicker, MatchPickerFailure, RowAction, TrackRow, TrackRowState,
+    IconPause, IconPlay, IconRefreshCw, IconShare2, IconSparkles, IconTrash2, IconX,
+    JobDiagnosticsPanel, LibraryImportModal, MatchPicker, MatchPickerFailure, RowAction, TrackRow,
+    TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -353,6 +355,8 @@ pub fn ActivityPage() -> Element {
     let mut import_jobs = use_signal(Vec::<ImportJobSummary>::new);
     let mut refreshing_imports = use_signal(|| false);
     let mut resolving_job = use_signal(|| None::<String>);
+    let mut clearing_imports = use_signal(|| false);
+    let mut retrying_upgrade_id = use_signal(|| None::<String>);
 
     // Shared Music history state
     let mut share_direction = use_signal(|| ShareDirection::All);
@@ -948,36 +952,53 @@ pub fn ActivityPage() -> Element {
                                 let a = item.artist.clone();
                                 let t = item.title.clone();
                                 let failed = matches!(item.badge, AcquireStageBadge::Failed { .. });
+                                let key_for_dismiss = map_key.clone();
                                 rsx! {
                                     div {
                                         key: "act-acq-{map_key}",
                                         class: "space-y-1",
-                                        TrackRow {
-                                            title: item.title.clone(),
-                                            artist: item.artist.clone(),
-                                            state: TrackRowState::UnownedCatalog {
-                                                acquiring_stage: Some(item.badge.clone()),
-                                            },
-                                            on_acquire: move |_| {
-                                                studio.trigger_acquire_and_play(
-                                                    auth,
-                                                    player,
-                                                    retry_req.clone(),
-                                                    cid_retry.clone(),
-                                                );
-                                            },
-                                            on_pick_source: move |_| {
-                                                if let Some((search_id, groups)) = manual.clone() {
-                                                    studio.manual_choice_modal.set(Some(ManualChoiceModalState {
-                                                        recording_mbid: mbid.clone(),
-                                                        catalog_id: cid.clone(),
-                                                        artist: a.clone(),
-                                                        title: t.clone(),
-                                                        search_id,
-                                                        groups,
-                                                    }));
+                                        div { class: "flex items-center gap-1.5",
+                                            div { class: "flex-1 min-w-0",
+                                                TrackRow {
+                                                    title: item.title.clone(),
+                                                    artist: item.artist.clone(),
+                                                    state: TrackRowState::UnownedCatalog {
+                                                        acquiring_stage: Some(item.badge.clone()),
+                                                    },
+                                                    on_acquire: move |_| {
+                                                        studio.trigger_acquire_and_play(
+                                                            auth,
+                                                            player,
+                                                            retry_req.clone(),
+                                                            cid_retry.clone(),
+                                                        );
+                                                    },
+                                                    on_pick_source: move |_| {
+                                                        if let Some((search_id, groups)) = manual.clone() {
+                                                            studio.manual_choice_modal.set(Some(ManualChoiceModalState {
+                                                                recording_mbid: mbid.clone(),
+                                                                catalog_id: cid.clone(),
+                                                                artist: a.clone(),
+                                                                title: t.clone(),
+                                                                search_id,
+                                                                groups,
+                                                            }));
+                                                        }
+                                                    },
                                                 }
-                                            },
+                                            }
+                                            if failed {
+                                                button {
+                                                    r#type: "button",
+                                                    aria_label: format!("Dismiss failed acquisition for {}", item.title),
+                                                    title: "Dismiss failed row",
+                                                    class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text hover:bg-beet-crimson-surface transition-colors cursor-pointer shrink-0",
+                                                    onclick: move |_| {
+                                                        studio.dismiss_acquire_state(&key_for_dismiss);
+                                                    },
+                                                    IconX { size: 15 }
+                                                }
+                                            }
                                         }
                                         if let Some(ref job_id) = item.job_id {
                                             div { class: "px-3 pb-1",
@@ -1009,13 +1030,46 @@ pub fn ActivityPage() -> Element {
                                 "{import_job_list.len()}"
                             }
                         }
-                        button {
-                            r#type: "button",
-                            disabled: refreshing_imports(),
-                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer disabled:opacity-50",
-                            onclick: move |_| load_import_jobs.call(()),
-                            IconRefreshCw { size: 13 }
-                            span { "Refresh" }
+                        div { class: "flex items-center gap-2",
+                            if import_job_list.iter().any(|j| !is_active_import_state(&j.state)) {
+                                button {
+                                    r#type: "button",
+                                    disabled: clearing_imports(),
+                                    class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-crimson-text hover:border-beet-crimson-text/30 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none transition-colors",
+                                    onclick: move |_| {
+                                        if clearing_imports() {
+                                            return;
+                                        }
+                                        clearing_imports.set(true);
+                                        spawn(async move {
+                                            match auth.call(api::clear_finished_import_jobs()).await {
+                                                Ok(removed) => {
+                                                    if let Ok(list) = auth.call(api::list_import_jobs()).await {
+                                                        import_jobs.set(list);
+                                                    }
+                                                    if removed > 0 {
+                                                        studio.show_toast(format!("Cleared {removed} finished import jobs"));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    studio.show_toast(format!("Clear failed: {}", friendly_error(&e)));
+                                                }
+                                            }
+                                            clearing_imports.set(false);
+                                        });
+                                    },
+                                    IconTrash2 { size: 12 }
+                                    span { "Clear Finished" }
+                                }
+                            }
+                            button {
+                                r#type: "button",
+                                disabled: refreshing_imports(),
+                                class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none",
+                                onclick: move |_| load_import_jobs.call(()),
+                                IconRefreshCw { size: 13 }
+                                span { "Refresh" }
+                            }
                         }
                     }
 
@@ -1025,6 +1079,8 @@ pub fn ActivityPage() -> Element {
                                 let (badge_cls, status_text) = import_job_badge(&job.state);
                                 let is_resolving = resolving_job().as_deref() == Some(job.job_id.as_str());
                                 let jid_skip = job.job_id.clone();
+                                let jid_retry = job.job_id.clone();
+                                let can_retry = matches!(job.state.as_str(), "failed" | "cancelled");
                                 rsx! {
                                     div {
                                         key: "imp-job-{job.job_id}",
@@ -1045,8 +1101,40 @@ pub fn ActivityPage() -> Element {
                                                     }
                                                 }
                                             }
-                                            span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
-                                                "{status_text}"
+                                            div { class: "flex items-center gap-2 shrink-0",
+                                                if can_retry {
+                                                    button {
+                                                        r#type: "button",
+                                                        disabled: is_resolving,
+                                                        class: "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-surface-high hover:bg-beet-leaf-surface border border-beet-border-default hover:border-beet-leaf-solid/35 text-[11px] font-medium text-beet-text-primary hover:text-beet-leaf-text cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none transition-colors",
+                                                        onclick: move |_| {
+                                                            if resolving_job.peek().is_some() {
+                                                                return;
+                                                            }
+                                                            let jid = jid_retry.clone();
+                                                            resolving_job.set(Some(jid.clone()));
+                                                            spawn(async move {
+                                                                match auth.call(api::retry_import_job(jid)).await {
+                                                                    Ok(()) => {
+                                                                        if let Ok(list) = auth.call(api::list_import_jobs()).await {
+                                                                            import_jobs.set(list);
+                                                                        }
+                                                                        studio.show_toast("Import job queued for retry");
+                                                                    }
+                                                                    Err(e) => {
+                                                                        studio.show_toast(format!("Retry failed: {}", friendly_error(&e)));
+                                                                    }
+                                                                }
+                                                                resolving_job.set(None);
+                                                            });
+                                                        },
+                                                        IconRefreshCw { size: 11 }
+                                                        span { "Retry" }
+                                                    }
+                                                }
+                                                span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
+                                                    "{status_text}"
+                                                }
                                             }
                                         }
 
@@ -1066,7 +1154,7 @@ pub fn ActivityPage() -> Element {
                                                                     r#type: "button",
                                                                     disabled: is_resolving,
                                                                     title: "{cand.label}",
-                                                                    class: "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[8px] bg-beet-surface-high hover:bg-beet-accent-surface border border-beet-border-default hover:border-beet-accent/40 text-[11px] text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50",
+                                                                    class: "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-[8px] bg-beet-surface-high hover:bg-beet-accent-surface border border-beet-border-default hover:border-beet-accent/40 text-[11px] text-beet-text-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none",
                                                                     onclick: move |_| resolve_import_job.call((jid.clone(), Some(idx))),
                                                                     span { class: "font-medium truncate max-w-[160px]", "{cand.source}" }
                                                                     span { class: "tabular-nums-mono text-[10px] text-beet-text-secondary", "{cand.quality}" }
@@ -1082,7 +1170,7 @@ pub fn ActivityPage() -> Element {
                                                     button {
                                                         r#type: "button",
                                                         disabled: is_resolving,
-                                                        class: "inline-flex items-center px-2.5 py-1 rounded-[8px] bg-beet-surface hover:bg-beet-crimson-surface border border-beet-border-subtle text-[11px] text-beet-text-secondary hover:text-beet-crimson-text transition-colors cursor-pointer disabled:opacity-50",
+                                                        class: "inline-flex items-center px-2.5 py-1 rounded-[8px] bg-beet-surface hover:bg-beet-crimson-surface border border-beet-border-subtle text-[11px] text-beet-text-secondary hover:text-beet-crimson-text transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none",
                                                         onclick: move |_| resolve_import_job.call((jid_skip.clone(), None)),
                                                         "Skip"
                                                     }
@@ -1141,7 +1229,7 @@ pub fn ActivityPage() -> Element {
                     button {
                         r#type: "button",
                         disabled: refreshing_upgrades(),
-                        class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer",
+                        class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                         onclick: refresh_upgrades,
                         IconRefreshCw { size: 13 }
                         span { "Refresh" }
@@ -1178,6 +1266,22 @@ pub fn ActivityPage() -> Element {
                                         "FAILED",
                                     ),
                                 };
+                                let upgrade_failed = job.status == ArchivalUpgradeStatus::Failed;
+                                let is_retrying_upgrade =
+                                    retrying_upgrade_id().as_deref() == Some(job.id.as_str());
+                                let upgrade_id = job.id.clone();
+                                let upgrade_req = TriggerArchivalUpgradeRequest {
+                                    navidrome_song_id: job.navidrome_song_id.clone(),
+                                    discovery_track_id: None,
+                                    artist: job.artist.clone(),
+                                    title: job.title.clone(),
+                                    album: job.album.clone(),
+                                    recording_mbid: job.recording_mbid.clone(),
+                                    folder_id: Some(job.folder_id.clone()),
+                                    codec: Some(job.original_codec.clone()),
+                                    duration_s: job.original_duration_s,
+                                    trigger_reason: "manual".to_string(),
+                                };
                                 rsx! {
                                     div {
                                         key: "arch-{job.id}",
@@ -1194,15 +1298,47 @@ pub fn ActivityPage() -> Element {
                                                     p { class: "text-[11px] text-beet-crimson-text mt-1", "{err}" }
                                                 }
                                             }
-                                            span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
-                                                "{status_text}"
+                                            div { class: "flex items-center gap-2 shrink-0",
+                                                if upgrade_failed {
+                                                    button {
+                                                        r#type: "button",
+                                                        disabled: is_retrying_upgrade,
+                                                        class: "inline-flex items-center gap-1 h-7 px-2.5 rounded-full bg-beet-surface-high hover:bg-beet-leaf-surface border border-beet-border-default hover:border-beet-leaf-solid/35 text-[11px] font-medium text-beet-text-primary hover:text-beet-leaf-text cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none transition-colors",
+                                                        onclick: move |_| {
+                                                            if retrying_upgrade_id.peek().is_some() {
+                                                                return;
+                                                            }
+                                                            retrying_upgrade_id.set(Some(upgrade_id.clone()));
+                                                            let req = upgrade_req.clone();
+                                                            spawn(async move {
+                                                                match auth.call(api::trigger_archival_upgrade(req)).await {
+                                                                    Ok(_) => {
+                                                                        if let Ok(list) = auth.call(api::list_archival_upgrades()).await {
+                                                                            studio.archival_upgrades.set(list);
+                                                                        }
+                                                                        studio.show_toast("Archival FLAC upgrade queued");
+                                                                    }
+                                                                    Err(e) => {
+                                                                        studio.show_toast(format!("Retry failed: {}", friendly_error(&e)));
+                                                                    }
+                                                                }
+                                                                retrying_upgrade_id.set(None);
+                                                            });
+                                                        },
+                                                        IconRefreshCw { size: 11 }
+                                                        span { "Retry" }
+                                                    }
+                                                }
+                                                span { class: "px-2.5 py-1 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider shrink-0 {badge_cls}",
+                                                    "{status_text}"
+                                                }
                                             }
                                         }
                                         if let Some(ref job_id) = job.job_id {
                                             JobDiagnosticsPanel {
                                                 key: "{job_id}",
                                                 job_id: job_id.clone(),
-                                                failed: job.status == ArchivalUpgradeStatus::Failed,
+                                                failed: upgrade_failed,
                                             }
                                         }
                                     }
@@ -1365,10 +1501,8 @@ pub fn ActivityPage() -> Element {
                 }
             }
 
-            // 5. Multi-Listener Delete Guard Audit History
-            section { class: "rounded-[12px] bg-beet-surface-low border border-beet-border-subtle p-5",
-                DeletionHistoryTab {}
-            }
+            // 5. Multi-Listener Delete Guard Audit History (single clean card border)
+            DeletionHistoryTab {}
         }
     }
 }

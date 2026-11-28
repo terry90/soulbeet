@@ -64,8 +64,8 @@ pub fn SetupView() -> Element {
     let core_err = studio.core_error.read().clone();
 
     rsx! {
-        div { class: "h-screen w-screen bg-beet-canvas text-beet-text-primary flex items-center justify-center p-6 overflow-y-auto studio-scrollbar",
-            div { class: "w-full max-w-xl rounded-[16px] bg-beet-surface border border-beet-border-default p-6 sm:p-8 space-y-6",
+        div { class: "h-screen w-screen bg-beet-canvas text-beet-text-primary flex items-start justify-center p-6 overflow-y-auto studio-scrollbar",
+            div { class: "w-full max-w-xl my-auto rounded-[16px] bg-beet-surface border border-beet-border-default p-6 sm:p-8 space-y-6",
                 // Header
                 div { class: "flex items-center gap-3.5",
                     Logo { size: 48 }
@@ -86,7 +86,7 @@ pub fn SetupView() -> Element {
                         class: if mode() == SetupMode::PasswordLogin {
                             "h-8 px-3.5 rounded-[7px] bg-beet-surface-high border border-beet-border-default text-beet-text-primary text-[13px] font-semibold cursor-pointer"
                         } else {
-                            "h-8 px-3.5 rounded-[7px] text-beet-text-secondary hover:text-beet-text-primary text-[13px] font-medium cursor-pointer"
+                            "h-8 px-3.5 rounded-[7px] border border-transparent text-beet-text-secondary hover:text-beet-text-primary text-[13px] font-medium cursor-pointer"
                         },
                         onclick: move |_| {
                             form_error.set(None);
@@ -99,7 +99,7 @@ pub fn SetupView() -> Element {
                         class: if mode() == SetupMode::TokenOrNavidrome {
                             "h-8 px-3.5 rounded-[7px] bg-beet-surface-high border border-beet-border-default text-beet-text-primary text-[13px] font-semibold cursor-pointer"
                         } else {
-                            "h-8 px-3.5 rounded-[7px] text-beet-text-secondary hover:text-beet-text-primary text-[13px] font-medium cursor-pointer"
+                            "h-8 px-3.5 rounded-[7px] border border-transparent text-beet-text-secondary hover:text-beet-text-primary text-[13px] font-medium cursor-pointer"
                         },
                         onclick: move |_| {
                             form_error.set(None);
@@ -255,7 +255,7 @@ pub fn SetupView() -> Element {
                     button {
                         r#type: "button",
                         disabled: verifying(),
-                        class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[14px] font-semibold hover:brightness-105 disabled:opacity-50 cursor-pointer transition-[filter]",
+                        class: "inline-flex items-center gap-2 h-10 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[14px] font-semibold hover:brightness-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-[filter]",
                         onclick: move |_| {
                             if verifying() {
                                 return;

@@ -204,7 +204,7 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                     button {
                         r#type: "button",
                         disabled: busy(),
-                        class: "h-9 px-3.5 rounded-[10px] bg-beet-surface border border-beet-border-subtle text-[13px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer disabled:opacity-45",
+                        class: "h-9 px-3.5 rounded-[10px] bg-beet-surface border border-beet-border-subtle text-[13px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none",
                         onclick: move |_| {
                             error.set(None);
                             step.set(ImportStep::UrlInput);
@@ -214,7 +214,7 @@ pub fn PlaylistImportModal(props: PlaylistImportModalProps) -> Element {
                     button {
                         r#type: "button",
                         disabled: !can_import,
-                        class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold transition-opacity cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed",
+                        class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold transition-opacity cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none",
                         onclick: move |_| run_commit.call(()),
                         if busy() {
                             IconLoader { size: 14 }

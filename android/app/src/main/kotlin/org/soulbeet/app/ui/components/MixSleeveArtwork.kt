@@ -2,7 +2,6 @@ package org.soulbeet.app.ui.components
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -635,7 +634,8 @@ fun MixSleeveBackdrop(
 fun MixSleeveCard(
     mix: ContextualMixUi,
     layout: MixSleeveLayout,
-    onClick: () -> Unit,
+    onOpenDetail: () -> Unit,
+    onPlayClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalSoulbeetColors.current
@@ -677,16 +677,15 @@ fun MixSleeveCard(
     val trackWord = if (mix.trackCount == 1) "track" else "tracks"
 
     Surface(
+        onClick = onOpenDetail,
         shape = cardShape,
         color = spec.gradientEnd,
         border = BorderStroke(1.dp, spec.borderColor),
         modifier = modifier
             .then(sizeModifier)
-            .clip(cardShape)
-            .clickable(onClick = onClick)
             .clearAndSetSemantics {
                 role = Role.Button
-                contentDescription = "${mix.title}, $tag, ${mix.subtitle}, ${mix.trackCount} $trackWord. Play mix."
+                contentDescription = "${mix.title}, $tag, ${mix.subtitle}, ${mix.trackCount} $trackWord. Open mix details."
             },
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
@@ -726,19 +725,20 @@ fun MixSleeveCard(
                                     border = spec.borderColor,
                                 )
                             }
-                            Box(
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .clip(CircleShape)
-                                    .background(colors.leafSolid),
-                                contentAlignment = Alignment.Center,
+                            Surface(
+                                onClick = onPlayClick,
+                                shape = CircleShape,
+                                color = colors.leafSolid,
+                                modifier = Modifier.size(36.dp),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.PlayArrow,
-                                    contentDescription = null,
-                                    tint = colors.leafInk,
-                                    modifier = Modifier.size(18.dp),
-                                )
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Filled.PlayArrow,
+                                        contentDescription = "Play ${mix.title}",
+                                        tint = colors.leafInk,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
                             }
                         }
 
@@ -796,19 +796,20 @@ fun MixSleeveCard(
                                     border = spec.borderColor,
                                 )
                             }
-                            Box(
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(CircleShape)
-                                    .background(colors.leafSolid),
-                                contentAlignment = Alignment.Center,
+                            Surface(
+                                onClick = onPlayClick,
+                                shape = CircleShape,
+                                color = colors.leafSolid,
+                                modifier = Modifier.size(32.dp),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.PlayArrow,
-                                    contentDescription = null,
-                                    tint = colors.leafInk,
-                                    modifier = Modifier.size(16.dp),
-                                )
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Filled.PlayArrow,
+                                        contentDescription = "Play ${mix.title}",
+                                        tint = colors.leafInk,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
                         }
 
@@ -909,6 +910,7 @@ fun MixSleeveShelf(
     eyebrow: String,
     mixes: List<ContextualMixUi>,
     layout: MixSleeveLayout,
+    onOpenMix: (ContextualMixUi) -> Unit,
     onPlayMix: (ContextualMixUi) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -945,7 +947,8 @@ fun MixSleeveShelf(
                 MixSleeveCard(
                     mix = mix,
                     layout = layout,
-                    onClick = { onPlayMix(mix) },
+                    onOpenDetail = { onOpenMix(mix) },
+                    onPlayClick = { onPlayMix(mix) },
                 )
             }
         }
@@ -956,6 +959,7 @@ fun LazyListScope.mixSleeveShelves(
     rightNowMixes: List<ContextualMixUi>,
     collectionMixes: List<ContextualMixUi>,
     keyPrefix: String,
+    onOpenMix: (ContextualMixUi) -> Unit,
     onPlayMix: (ContextualMixUi) -> Unit,
 ) {
     if (rightNowMixes.isNotEmpty()) {
@@ -965,6 +969,7 @@ fun LazyListScope.mixSleeveShelves(
                 eyebrow = "LIVE WEATHER & TIME",
                 mixes = rightNowMixes,
                 layout = MixSleeveLayout.WIDE,
+                onOpenMix = onOpenMix,
                 onPlayMix = onPlayMix,
             )
         }
@@ -976,6 +981,7 @@ fun LazyListScope.mixSleeveShelves(
                 eyebrow = "LIBRARY & DECADES",
                 mixes = collectionMixes,
                 layout = MixSleeveLayout.SQUARE,
+                onOpenMix = onOpenMix,
                 onPlayMix = onPlayMix,
             )
         }

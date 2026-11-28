@@ -1135,6 +1135,143 @@ pub fn IconShieldCheck(
 }
 
 #[component]
+pub fn IconMoreHorizontal(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            circle { cx: "12", cy: "12", r: "1" }
+            circle { cx: "19", cy: "12", r: "1" }
+            circle { cx: "5", cy: "12", r: "1" }
+        }
+    }
+}
+
+#[component]
+pub fn IconChevronUp(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            path { d: "m18 15-6-6-6 6" }
+        }
+    }
+}
+
+#[component]
+pub fn IconChevronDown(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            path { d: "m6 9 6 6 6-6" }
+        }
+    }
+}
+
+#[component]
+pub fn IconPencil(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            path { d: "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" }
+            path { d: "m15 5 4 4" }
+        }
+    }
+}
+
+#[component]
+pub fn IconCopy(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            rect { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }
+            path { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }
+        }
+    }
+}
+
+#[component]
+pub fn IconUser(
+    #[props(default = 18)] size: u32,
+    #[props(default)] class: String,
+) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            path { d: "M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" }
+            circle { cx: "12", cy: "7", r: "4" }
+        }
+    }
+}
+
+#[component]
 pub fn IconShare2(#[props(default = 18)] size: u32, #[props(default)] class: String) -> Element {
     rsx! {
         svg {

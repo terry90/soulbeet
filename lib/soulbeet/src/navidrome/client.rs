@@ -21,6 +21,7 @@ pub struct NavidromeClient {
     pub(super) client: Client,
     circuit_breaker: CircuitBreaker,
     native_token: tokio::sync::Mutex<Option<String>>,
+    native_auth_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -78,6 +79,7 @@ impl NavidromeClientBuilder {
             client,
             circuit_breaker: CircuitBreaker::default(),
             native_token: tokio::sync::Mutex::new(None),
+            native_auth_lock: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -383,10 +385,10 @@ impl NavidromeClient {
     /// http.Error's "not found\n" (server/nativeapi/playlists.go:38-48). Any other 404, such as a
     /// proxy's for a path it does not forward, is an Http error with its body, since it says
     /// nothing about the playlist. No `_end` is sent, so the list is not cut short.
-    /// An id that is empty, "." or ".." names no playlist and is not a path segment the URL can
-    /// carry, so it is Ok(None) with no request.
+    /// An id that is empty, ".", "..", or contains path separators names no playlist and is not
+    /// a path segment the URL can carry, so it is Ok(None) with no request.
     pub async fn playlist_tracks(&self, id: &str) -> Result<Option<Vec<PlaylistTrack>>> {
-        if matches!(id, "" | "." | "..") {
+        if !is_safe_path_segment(id) {
             return Ok(None);
         }
         let mut url = self.base_url.clone();
@@ -689,7 +691,7 @@ impl NavidromeClient {
     /// empty, "." or ".." names no playlist and is not a path segment the URL can carry, so it is
     /// Ok(None) with no request.
     pub async fn get_native_playlist(&self, id: &str) -> Result<Option<NativePlaylist>> {
-        if matches!(id, "" | "." | "..") {
+        if !is_safe_path_segment(id) {
             return Ok(None);
         }
         let mut url = self.base_url.clone();
@@ -730,7 +732,7 @@ impl NavidromeClient {
     /// ".." names no song and is not a path segment the URL can carry, so it is a Parse error
     /// with no request: an empty list would say no playlist holds the song.
     pub async fn get_song_playlists(&self, id: &str) -> Result<Vec<NativePlaylist>> {
-        if matches!(id, "" | "." | "..") {
+        if !is_safe_path_segment(id) {
             return Err(NavidromeError::Parse("No song id given".into()));
         }
         let mut url = self.base_url.clone();
@@ -838,18 +840,67 @@ impl NavidromeClient {
 
     // --- Navidrome Native API (for smart playlists) ---
 
-    /// Get a cached JWT token, or fetch a fresh one from Navidrome.
+    /// Get a cached JWT token, or fetch a fresh one from Navidrome via single-flight auth.
     async fn native_token(&self) -> Result<String> {
-        let cached = self.native_token.lock().await;
-        if let Some(ref token) = *cached {
-            return Ok(token.clone());
+        {
+            let cached = self.native_token.lock().await;
+            if let Some(ref token) = *cached {
+                return Ok(token.clone());
+            }
         }
-        drop(cached);
-        self.native_login_fresh().await
+        self.refresh_native_token(None).await
+    }
+
+    /// Serializes native login/re-auth behind `native_auth_lock` so concurrent cold starts
+    /// or 401s never stampede `/auth/login`, and clears any stale cached token on failure.
+    async fn refresh_native_token(&self, stale_token: Option<&str>) -> Result<String> {
+        let _auth_guard = self.native_auth_lock.lock().await;
+        {
+            let cached = self.native_token.lock().await;
+            if let Some(ref current) = *cached {
+                if stale_token != Some(current.as_str()) {
+                    return Ok(current.clone());
+                }
+            }
+        }
+        match self.native_login_fresh().await {
+            Ok(token) => Ok(token),
+            Err(e) => {
+                let mut cached = self.native_token.lock().await;
+                if stale_token.is_none() || cached.as_deref() == stale_token {
+                    *cached = None;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Captures a refreshed JWT from Navidrome's `X-ND-Authorization` response header.
+    async fn capture_refreshed_token(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(raw) = headers
+            .get("x-nd-authorization")
+            .and_then(|v| v.to_str().ok())
+        else {
+            return;
+        };
+        let trimmed = raw.trim();
+        let token = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+            .unwrap_or(trimmed)
+            .trim();
+        if !token.is_empty() {
+            *self.native_token.lock().await = Some(token.to_string());
+        }
     }
 
     /// Fetch a fresh JWT token from Navidrome, replacing any cached value.
     async fn native_login_fresh(&self) -> Result<String> {
+        if self.circuit_breaker.is_open().await {
+            warn!("Circuit breaker open, rejecting Navidrome native login");
+            return Err(NavidromeError::CircuitOpen);
+        }
+
         let url = self.base_url.join("auth/login")?;
 
         #[derive(serde::Serialize)]
@@ -862,7 +913,7 @@ impl NavidromeClient {
             token: String,
         }
 
-        let resp = self
+        let resp = match self
             .client
             .post(url)
             .json(&LoginReq {
@@ -871,7 +922,25 @@ impl NavidromeClient {
             })
             .send()
             .await
-            .map_err(transport)?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker.record_failure().await;
+                return Err(transport(e));
+            }
+        };
+
+        if resp.status().is_server_error() {
+            self.circuit_breaker.record_failure().await;
+            return Err(NavidromeError::Http {
+                action: "Navidrome native login",
+                status: resp.status().as_u16(),
+                body: None,
+                raw: None,
+            });
+        }
+
+        self.circuit_breaker.record_success().await;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(NavidromeError::NativeLoginRefused);
@@ -890,25 +959,59 @@ impl NavidromeClient {
         Ok(login.token)
     }
 
-    /// Send an authenticated native API request. Retries once with a fresh
-    /// token if the first attempt gets a 401.
+    /// Send an authenticated native API request. Honors the circuit breaker,
+    /// captures refreshed JWTs from `X-ND-Authorization`, and retries once on
+    /// 401 using single-flight re-authentication.
     pub(super) async fn native_request(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
+        if self.circuit_breaker.is_open().await {
+            warn!("Circuit breaker open, rejecting Navidrome native request");
+            return Err(NavidromeError::CircuitOpen);
+        }
+
         let send = |r: reqwest::RequestBuilder, token: &str| {
             r.header("x-nd-authorization", format!("Bearer {}", token))
         };
 
         let token = self.native_token().await?;
         let retry_req = req.try_clone();
-        let resp = send(req, &token).send().await.map_err(transport)?;
+        let resp = match send(req, &token).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker.record_failure().await;
+                return Err(transport(e));
+            }
+        };
 
         if resp.status().as_u16() == 401 {
+            self.circuit_breaker.record_success().await;
             if let Some(retry_req) = retry_req {
-                let token = self.native_login_fresh().await?;
-                return send(retry_req, &token).send().await.map_err(transport);
+                let fresh = self.refresh_native_token(Some(&token)).await?;
+                let resp = match send(retry_req, &fresh).send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        self.circuit_breaker.record_failure().await;
+                        return Err(transport(e));
+                    }
+                };
+                if resp.status().is_server_error() {
+                    self.circuit_breaker.record_failure().await;
+                } else {
+                    self.circuit_breaker.record_success().await;
+                    self.capture_refreshed_token(resp.headers()).await;
+                }
+                return Ok(resp);
             }
+            return Ok(resp);
+        }
+
+        if resp.status().is_server_error() {
+            self.circuit_breaker.record_failure().await;
+        } else {
+            self.circuit_breaker.record_success().await;
+            self.capture_refreshed_token(resp.headers()).await;
         }
 
         Ok(resp)
@@ -970,7 +1073,7 @@ impl NavidromeClient {
         if change.name.is_none() && change.rules.is_none() {
             return Ok(());
         }
-        if matches!(id, "" | "." | "..") {
+        if !is_safe_path_segment(id) {
             return Err(NavidromeError::Parse("No playlist id given".into()));
         }
         let mut url = self.base_url.clone();
@@ -989,9 +1092,14 @@ impl NavidromeClient {
 
     /// Delete a smart playlist via Navidrome's native API.
     pub async fn delete_smart_playlist(&self, playlist_id: &str) -> Result<()> {
-        let url = self
-            .base_url
-            .join(&format!("api/playlist/{}", playlist_id))?;
+        if !is_safe_path_segment(playlist_id) {
+            return Err(NavidromeError::Parse("No playlist id given".into()));
+        }
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|()| NavidromeError::Config("base URL cannot hold a path".into()))?
+            .pop_if_empty()
+            .extend(["api", "playlist", playlist_id]);
 
         let resp = self.native_request(self.client.delete(url)).await?;
 
@@ -1311,6 +1419,12 @@ impl NavidromeClient {
 
         resp.json().await.map_err(parse)
     }
+}
+
+/// Returns true when `id` is safe to append as a single URL path segment:
+/// non-empty, not a dot segment, and containing no path separators.
+fn is_safe_path_segment(id: &str) -> bool {
+    !matches!(id, "" | "." | "..") && !id.contains(['/', '\\'])
 }
 
 /// A native track row (model.PlaylistTrack, model/playlist.go:224-229) as its place and song: the
@@ -3164,6 +3278,136 @@ mod tests {
         assert!(seen[1].target.starts_with("/rest/getLyricsBySongId?"));
         assert!(seen[2].target.starts_with("/rest/getLyricsBySongId?"));
         assert!(seen[3].target.starts_with("/rest/getLyrics?"));
+    }
+
+    #[tokio::test]
+    async fn native_request_captures_refreshed_jwt_from_response_header() {
+        let (url, seen) = serve_with_headers(vec![
+            (reply(LOGIN), vec![]),
+            (
+                reply("[]"),
+                vec![("X-ND-Authorization", "refreshed-jwt-token".into())],
+            ),
+            (reply("[]"), vec![]),
+        ]);
+        let c = client(&url);
+        c.list_artists().await.unwrap();
+        c.list_artists().await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "no second login required");
+        assert_eq!(
+            seen[1].x_nd_authorization.as_deref(),
+            Some("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.c2ln")
+        );
+        assert_eq!(
+            seen[2].x_nd_authorization.as_deref(),
+            Some("Bearer refreshed-jwt-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_request_serializes_concurrent_401_reauth_and_clears_stale_token_on_failure() {
+        use crate::test_http::serve_fn;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let logins = std::sync::Arc::new(AtomicUsize::new(0));
+        let logins_srv = logins.clone();
+        let (url, _seen) = serve_fn(move |req| match req.target.as_str() {
+            "/auth/login" => {
+                let n = logins_srv.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Slow slightly so concurrent 401 callers contend on native_auth_lock.
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    reply(r#"{"token":"fresh-jwt-2"}"#)
+                } else {
+                    Reply {
+                        status: 401,
+                        body: "bad credentials".into(),
+                    }
+                }
+            }
+            "/api/artist" => {
+                if req.x_nd_authorization.as_deref() == Some("Bearer fresh-jwt-2") {
+                    reply("[]")
+                } else {
+                    Reply {
+                        status: 401,
+                        body: "expired".into(),
+                    }
+                }
+            }
+            other => panic!("unexpected target: {other}"),
+        });
+
+        let c = std::sync::Arc::new(client(&url));
+        // Seed an expired token so both concurrent calls hit 401 immediately.
+        *c.native_token.lock().await = Some("expired-jwt-1".into());
+
+        let (r1, r2) = tokio::join!(c.list_artists(), c.list_artists());
+        assert!(r1.is_ok(), "{r1:?}");
+        assert!(r2.is_ok(), "{r2:?}");
+        assert_eq!(
+            logins.load(Ordering::SeqCst),
+            1,
+            "concurrent 401s must share one single-flight login"
+        );
+
+        // Now force another 401 while /auth/login refuses: stale token must be cleared.
+        *c.native_token.lock().await = Some("stale-jwt-3".into());
+        let err = c.list_artists().await.unwrap_err();
+        assert!(matches!(err, NavidromeError::NativeLoginRefused), "{err:?}");
+        assert_eq!(*c.native_token.lock().await, None);
+    }
+
+    #[tokio::test]
+    async fn native_request_honors_circuit_breaker_on_5xx_failures() {
+        let mut replies = vec![reply(LOGIN)];
+        for _ in 0..5 {
+            replies.push(Reply {
+                status: 503,
+                body: "unavailable".into(),
+            });
+        }
+        let (url, seen) = serve(replies);
+        let c = client(&url);
+
+        for _ in 0..5 {
+            let err = c.list_artists().await.unwrap_err();
+            assert!(
+                matches!(err, NavidromeError::Http { status: 503, .. }),
+                "{err:?}"
+            );
+        }
+        // 6th call is rejected by the open circuit breaker without hitting the server.
+        let err = c.list_artists().await.unwrap_err();
+        assert!(matches!(err, NavidromeError::CircuitOpen), "{err:?}");
+        assert_eq!(seen.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn delete_smart_playlist_uses_safe_path_segments_and_rejects_traversal_ids() {
+        let (url, seen) = serve(vec![reply(LOGIN), reply("{}")]);
+        let c = client(&url);
+
+        for bad in ["", ".", "..", "../user", "a/b", r"a\b"] {
+            let err = c.delete_smart_playlist(bad).await.unwrap_err();
+            assert!(
+                matches!(err, NavidromeError::Parse(ref m) if m == "No playlist id given"),
+                "expected Parse error for {bad:?}, got {err:?}"
+            );
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "rejected ids must send no request"
+        );
+
+        c.delete_smart_playlist("pl-1?x=1").await.unwrap();
+        let sent = seen.lock().unwrap()[1].clone();
+        assert_eq!(
+            (sent.method.as_str(), sent.target.as_str()),
+            ("DELETE", "/api/playlist/pl-1%3Fx=1")
+        );
     }
 
     #[tokio::test]

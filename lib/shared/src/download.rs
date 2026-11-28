@@ -199,7 +199,8 @@ impl SearchStats {
         reason: impl Into<String>,
     ) {
         let reason = reason.into();
-        *self.rejection_counts.entry(reason.clone()).or_default() += 1;
+        let entry = self.rejection_counts.entry(reason.clone()).or_default();
+        *entry = entry.saturating_add(1);
         self.push_top_rejected(RejectedCandidateSummary {
             source: source.into(),
             label: label.into(),
@@ -236,7 +237,8 @@ impl SearchStats {
             self.unanswered_note = other.unanswered_note.clone();
         }
         for (reason, count) in &other.rejection_counts {
-            *self.rejection_counts.entry(reason.clone()).or_default() += *count;
+            let entry = self.rejection_counts.entry(reason.clone()).or_default();
+            *entry = entry.saturating_add(*count);
         }
         for rejected in &other.top_rejected {
             self.push_top_rejected(rejected.clone());

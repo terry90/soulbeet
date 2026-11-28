@@ -115,13 +115,33 @@ data class TriageCardItem(
     val isOfflineCached: Boolean,
 )
 
+enum class ContainerKind {
+    USER_PLAYLIST,
+    SMART_PLAYLIST,
+    ALBUM,
+    ARTIST,
+}
+
 data class ContainerDetailUi(
+    val id: String,
+    val kind: ContainerKind,
     val title: String,
     val subtitle: String,
+    val comment: String? = null,
     val coverArtId: String?,
     val pinTarget: FfiPinTarget?,
     val isPinned: Boolean,
     val tracks: List<FfiTrack>,
+) {
+    val isStaticUserPlaylist: Boolean get() = kind == ContainerKind.USER_PLAYLIST
+    val isSmartOrSystemPlaylist: Boolean get() = kind == ContainerKind.SMART_PLAYLIST
+}
+
+data class MixDetailUi(
+    val mix: ContextualMixUi,
+    val tracks: List<FfiTrack> = emptyList(),
+    val isLoading: Boolean = true,
+    val error: String? = null,
 )
 
 data class RemoteAlbumDetailUi(
@@ -198,6 +218,9 @@ data class AppUiState(
     val showSettingsSheet: Boolean = false,
     val showCultureEditor: Boolean = false,
     val selectedContainer: ContainerDetailUi? = null,
+    val selectedMixDetail: MixDetailUi? = null,
+    val addToPlaylistTrack: FfiTrack? = null,
+    val playlistMutationInFlight: Boolean = false,
     val remoteAlbumDetail: RemoteAlbumDetailUi? = null,
     val remoteArtistDetail: RemoteArtistDetailUi? = null,
     val guardSheetPreview: DeleteGuardPreviewUi? = null,
@@ -293,6 +316,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var bannerClearJob: Job? = null
     private var contextualMixesJob: Job? = null
     private val contextualMixesGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var mixDetailJob: Job? = null
+    private val mixDetailGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private var containerDetailJob: Job? = null
+    private val containerDetailGeneration = java.util.concurrent.atomic.AtomicLong(0L)
     private var connectWsJob: Job? = null
     private var lyricsJob: Job? = null
     private var lyricsFetchSeq: Long = 0L
@@ -558,6 +585,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             remoteArtistGen.incrementAndGet()
             downloadAlbumJob?.cancel()
             downloadAlbumGen.incrementAndGet()
+            containerDetailJob?.cancel()
+            containerDetailJob = null
+            containerDetailGeneration.incrementAndGet()
             _uiState.update { it.copy(showSettingsSheet = false, showNowPlayingSheet = false) }
             undoController.undo()
             mediaBridge.stopAndClear()
@@ -973,6 +1003,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun skipPrevious() = mediaBridge.skipPrevious()
     fun seekTo(positionMs: Long) = mediaBridge.seekTo(positionMs)
     fun playQueueIndex(index: Int) = mediaBridge.playQueueIndex(index)
+    fun removeQueueItemAt(index: Int) = mediaBridge.removeQueueItemAt(index)
+    fun moveQueueItem(fromIndex: Int, toIndex: Int) = mediaBridge.moveQueueItem(fromIndex, toIndex)
+    fun clearQueue() {
+        mediaBridge.clearQueue()
+        _uiState.update {
+            it.copy(
+                showQueueSheet = false,
+                showNowPlayingSheet = false,
+            )
+        }
+        showNotice("Queue cleared")
+    }
     fun toggleShuffle() = mediaBridge.toggleShuffle()
     fun cycleRepeatMode() = mediaBridge.cycleRepeatMode()
     fun startTrackRadio() {
@@ -980,6 +1022,242 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             mediaBridge.sendCustomActionAndAwait(AutoCustomActions.ACTION_START_RADIO)
         }
         showNotice("Starting track radio…")
+    }
+
+    /**
+     * Opens a dedicated Mix Detail bottom sheet showing sleeve header, Play, Shuffle,
+     * steering pills (if seasonal), and full tracklist.
+     */
+    fun openMixDetail(mix: ContextualMixUi) {
+        mixDetailJob?.cancel()
+        val gen = mixDetailGen.incrementAndGet()
+        _uiState.update {
+            it.copy(
+                selectedMixDetail = MixDetailUi(
+                    mix = mix,
+                    tracks = emptyList(),
+                    isLoading = true,
+                    error = null,
+                ),
+            )
+        }
+        mixDetailJob = viewModelScope.launch {
+            val resolved = resolveMixTracks(mix)
+            if (mixDetailGen.get() != gen) return@launch
+            resolved.fold(
+                onSuccess = { tracks ->
+                    _uiState.update { state ->
+                        val cur = state.selectedMixDetail ?: return@update state
+                        if (cur.mix.slug != mix.slug) return@update state
+                        state.copy(
+                            selectedMixDetail = cur.copy(
+                                tracks = tracks,
+                                isLoading = false,
+                                error = null,
+                            ),
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update { state ->
+                        val cur = state.selectedMixDetail ?: return@update state
+                        if (cur.mix.slug != mix.slug) return@update state
+                        state.copy(
+                            selectedMixDetail = cur.copy(
+                                isLoading = false,
+                                error = err.localizedMessage ?: "Failed to load ${mix.title}",
+                            ),
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    fun closeMixDetail() {
+        mixDetailJob?.cancel()
+        mixDetailGen.incrementAndGet()
+        _uiState.update { it.copy(selectedMixDetail = null) }
+    }
+
+    fun playMixShuffled(mix: ContextualMixUi, tracks: List<FfiTrack>) {
+        if (tracks.isEmpty()) {
+            playContextualMix(mix)
+            return
+        }
+        playQueue(tracks.shuffled(), startIndex = 0, sourceLabel = mix.title)
+    }
+
+    private suspend fun resolveMixTracks(mix: ContextualMixUi): Result<List<FfiTrack>> {
+        val core = SoulbeetCoreProvider.getOrNull()
+        val cfg = _uiState.value.config
+
+        if (cfg.isConfigured && !cfg.offlineOnly) {
+            val remote = apiClient.fetchContextualMixPlaylist(cfg, mix.slug)
+            if (remote.isSuccess) {
+                val mixTracks = remote.getOrDefault(emptyList())
+                val ids = mixTracks.map { it.songId }
+                val localById = if (core != null && ids.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        runCatching { core.getTracksByIds(ids) }
+                            .getOrDefault(emptyList())
+                            .associateBy { it.id }
+                    }
+                } else {
+                    emptyMap()
+                }
+                val tracks = mixTracks.map { mt ->
+                    localById[mt.songId] ?: FfiTrack(
+                        id = mt.songId,
+                        title = mt.title,
+                        artistId = null,
+                        artistName = mt.artist,
+                        albumId = null,
+                        albumName = mt.album.orEmpty(),
+                        trackNumber = null,
+                        discNumber = null,
+                        durationSecs = mt.durationSecs ?: 0L,
+                        year = null,
+                        genre = null,
+                        bitRate = null,
+                        suffix = null,
+                        contentType = null,
+                        sizeBytes = null,
+                        coverArtId = null,
+                        path = null,
+                        starred = mt.starred,
+                        userRating = mt.rating.toLong(),
+                        playCount = 0L,
+                        lastPlayedAt = null,
+                        musicbrainzId = null,
+                        isDiscovery = !mt.owned,
+                        updatedAt = 0L,
+                    )
+                }
+                return Result.success(tracks)
+            }
+        }
+
+        // Offline or network fallback: resolve from synced local playlist if available
+        val syncedId = mix.navidromePlaylistId?.takeIf(String::isNotBlank)
+            ?: _uiState.value.playlists.firstOrNull { pl ->
+                pl.slug.equals(mix.slug, ignoreCase = true) || pl.name.equals(mix.title, ignoreCase = true)
+            }?.id
+        if (core != null && syncedId != null) {
+            val localTracks = withContext(Dispatchers.IO) {
+                runCatching { core.listTracksByPlaylist(syncedId) }.getOrDefault(emptyList())
+            }
+            return Result.success(localTracks)
+        }
+        return Result.failure(IllegalStateException("Connect online or pin ${mix.title} to inspect tracks"))
+    }
+
+    /**
+     * Click-through navigation from Now Playing "PLAYING FROM" header.
+     */
+    fun navigateFromNowPlayingSource() {
+        val state = _uiState.value
+        val pb = state.playback
+        if (pb.currentTrackId == null) return
+        val source = pb.sourceLabel?.trim().orEmpty()
+        setShowNowPlayingSheet(false)
+
+        if (source.equals("Discovery Triage", ignoreCase = true) || source.equals("Discovery", ignoreCase = true)) {
+            selectTab(AppTab.DISCOVER)
+            return
+        }
+        if (source.equals("Starred", ignoreCase = true)) {
+            setLibraryCategory(LibraryCategory.STARRED)
+            selectTab(AppTab.LIBRARY)
+            return
+        }
+        if (source.equals("Cached", ignoreCase = true) || source.equals("Offline Downloaded", ignoreCase = true)) {
+            setLibraryCategory(LibraryCategory.OFFLINE)
+            selectTab(AppTab.LIBRARY)
+            return
+        }
+        if (source.isNotEmpty()) {
+            state.contextualMixes.firstOrNull { it.title.equals(source, ignoreCase = true) }?.let { mix ->
+                openMixDetail(mix)
+                return
+            }
+            state.playlists.firstOrNull { it.name.equals(source, ignoreCase = true) }?.let { pl ->
+                setLibraryCategory(LibraryCategory.PLAYLISTS)
+                selectTab(AppTab.LIBRARY)
+                openPlaylistDetail(pl)
+                return
+            }
+            state.albums.firstOrNull { it.name.equals(source, ignoreCase = true) }?.let { al ->
+                setLibraryCategory(LibraryCategory.ALBUMS)
+                selectTab(AppTab.LIBRARY)
+                openAlbumDetail(al)
+                return
+            }
+            state.artists.firstOrNull { it.name.equals(source, ignoreCase = true) }?.let { ar ->
+                setLibraryCategory(LibraryCategory.ARTISTS)
+                selectTab(AppTab.LIBRARY)
+                openArtistDetail(ar)
+                return
+            }
+        }
+        // Fallback: open current album if known, otherwise search source or album
+        navigateFromNowPlayingAlbum()
+    }
+
+    /**
+     * Click-through navigation from Now Playing track title / album to the album detail or Search.
+     */
+    fun navigateFromNowPlayingAlbum() {
+        val state = _uiState.value
+        val pb = state.playback
+        if (pb.currentTrackId == null) return
+        setShowNowPlayingSheet(false)
+
+        val albumId = state.currentTrackDetails?.albumId
+        val matchedAlbum = albumId?.let { id -> state.albums.firstOrNull { it.id == id } }
+            ?: pb.album.trim().takeIf { it.isNotEmpty() }?.let { albumName ->
+                state.albums.firstOrNull { it.name.equals(albumName, ignoreCase = true) }
+            }
+        if (matchedAlbum != null) {
+            setLibraryCategory(LibraryCategory.ALBUMS)
+            selectTab(AppTab.LIBRARY)
+            openAlbumDetail(matchedAlbum)
+            return
+        }
+        val query = pb.album.trim().ifEmpty { pb.title.trim() }
+        if (query.isNotEmpty()) {
+            setSearchFilter(if (pb.album.isNotBlank()) SearchFilter.ALBUMS else SearchFilter.ALL)
+            selectTab(AppTab.SEARCH)
+            submitSearch(query)
+        }
+    }
+
+    /**
+     * Click-through navigation from Now Playing artist text to the artist detail or Search.
+     */
+    fun navigateFromNowPlayingArtist() {
+        val state = _uiState.value
+        val pb = state.playback
+        if (pb.currentTrackId == null) return
+        setShowNowPlayingSheet(false)
+
+        val artistId = state.currentTrackDetails?.artistId
+        val matchedArtist = artistId?.let { id -> state.artists.firstOrNull { it.id == id } }
+            ?: pb.artist.trim().takeIf { it.isNotEmpty() }?.let { artistName ->
+                state.artists.firstOrNull { it.name.equals(artistName, ignoreCase = true) }
+            }
+        if (matchedArtist != null) {
+            setLibraryCategory(LibraryCategory.ARTISTS)
+            selectTab(AppTab.LIBRARY)
+            openArtistDetail(matchedArtist)
+            return
+        }
+        val query = pb.artist.trim()
+        if (query.isNotEmpty()) {
+            setSearchFilter(SearchFilter.ARTISTS)
+            selectTab(AppTab.SEARCH)
+            submitSearch(query)
+        }
     }
 
     // =========================================================================
@@ -1377,11 +1655,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.update { it.copy(steeringInFlight = true) }
             apiClient.steerSeasonalPack(cfg, slug, steering).fold(
                 onSuccess = { updated ->
+                    var shouldReloadDetail = false
                     _uiState.update { state ->
                         val nextMixes = state.contextualMixes.map {
                             if (it.slug == updated.slug) updated else it
                         }
-                        state.copy(steeringInFlight = false, contextualMixes = nextMixes)
+                        val nextDetail = state.selectedMixDetail?.let { detail ->
+                            if (detail.mix.slug == updated.slug) {
+                                shouldReloadDetail = true
+                                detail.copy(mix = updated, isLoading = true)
+                            } else {
+                                detail
+                            }
+                        }
+                        state.copy(
+                            steeringInFlight = false,
+                            contextualMixes = nextMixes,
+                            selectedMixDetail = nextDetail,
+                        )
+                    }
+                    if (shouldReloadDetail) {
+                        openMixDetail(updated)
                     }
                     showNotice("Steered mix to ${steering.shortLabel}")
                 },
@@ -2074,17 +2368,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openPlaylistDetail(playlist: FfiPlaylist) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 runCatching { core.listTracksByPlaylist(playlist.id) }.getOrDefault(emptyList())
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Playlist(playlist.id)
-            _uiState.update {
-                it.copy(
+            val isStaticUser = playlist.kind == "user" && !playlist.isSmart
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
+                        id = playlist.id,
+                        kind = if (isStaticUser) ContainerKind.USER_PLAYLIST else ContainerKind.SMART_PLAYLIST,
                         title = playlist.name,
-                        subtitle = "${tracks.size} tracks",
+                        subtitle = if (tracks.size == 1) "1 track" else "${tracks.size} tracks",
+                        comment = playlist.comment,
                         coverArtId = playlist.coverArtId,
                         pinTarget = target,
                         isPinned = isPinned(target),
@@ -2096,15 +2398,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openAlbumDetail(album: FfiAlbum) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 runCatching { core.listTracksByAlbum(album.id) }.getOrDefault(emptyList())
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Album(album.id)
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
+                        id = album.id,
+                        kind = ContainerKind.ALBUM,
                         title = album.name,
                         subtitle = buildString {
                             append(album.artistName)
@@ -2121,18 +2429,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openArtistDetail(artist: FfiArtist) {
-        viewModelScope.launch {
+        containerDetailJob?.cancel()
+        val gen = containerDetailGeneration.incrementAndGet()
+        containerDetailJob = viewModelScope.launch {
             val core = SoulbeetCoreProvider.getOrNull() ?: return@launch
             val tracks = withContext(Dispatchers.IO) {
                 val albums = runCatching { core.listAlbums(artist.id) }.getOrDefault(emptyList())
                 albums.flatMap { al ->
+                    if (containerDetailGeneration.get() != gen) return@withContext emptyList()
                     runCatching { core.listTracksByAlbum(al.id) }.getOrDefault(emptyList())
                 }
             }
+            if (containerDetailGeneration.get() != gen) return@launch
             val target = FfiPinTarget.Artist(artist.id)
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                if (containerDetailGeneration.get() != gen) return@update state
+                state.copy(
                     selectedContainer = ContainerDetailUi(
+                        id = artist.id,
+                        kind = ContainerKind.ARTIST,
                         title = artist.name,
                         subtitle = "${artist.albumCount} albums · ${tracks.size} tracks",
                         coverArtId = artist.coverArtId,
@@ -2146,7 +2461,315 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeContainerDetail() {
+        containerDetailJob?.cancel()
+        containerDetailJob = null
+        containerDetailGeneration.incrementAndGet()
         _uiState.update { it.copy(selectedContainer = null) }
+    }
+
+    // =========================================================================
+    // Static Playlist Management (Create, Rename/Edit, Delete, Add/Remove Tracks)
+    // =========================================================================
+
+    private fun tryAcquirePlaylistMutation(): Boolean {
+        while (true) {
+            val current = _uiState.value
+            if (current.playlistMutationInFlight) return false
+            if (_uiState.compareAndSet(current, current.copy(playlistMutationInFlight = true))) {
+                return true
+            }
+        }
+    }
+
+    fun openAddToPlaylist(track: FfiTrack) {
+        _uiState.update { it.copy(addToPlaylistTrack = track) }
+    }
+
+    fun dismissAddToPlaylist() {
+        _uiState.update { it.copy(addToPlaylistTrack = null) }
+    }
+
+    fun createPlaylist(
+        name: String,
+        comment: String? = null,
+        initialTrack: FfiTrack? = null,
+    ) {
+        val trimmedName = name.trim()
+        if (trimmedName.isEmpty()) {
+            showNotice("Playlist name cannot be empty")
+            return
+        }
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            showNotice("Connect online to create a playlist")
+            return
+        }
+        if (!tryAcquirePlaylistMutation()) return
+        viewModelScope.launch {
+            try {
+                val result = apiClient.createPlaylist(
+                    config = cfg,
+                    name = trimmedName,
+                    comment = comment?.trim()?.takeIf { it.isNotEmpty() },
+                    public = null,
+                    songIds = initialTrack?.let { listOf(it.id) },
+                )
+                result.fold(
+                    onSuccess = { created ->
+                        _uiState.update {
+                            it.copy(
+                                addToPlaylistTrack = if (initialTrack != null) null else it.addToPlaylistTrack,
+                            )
+                        }
+                        syncAndRefreshPlaylists()
+                        val msg = if (initialTrack != null) {
+                            "Created \"${created.name}\" with \"${initialTrack.title}\""
+                        } else {
+                            "Created playlist \"${created.name}\""
+                        }
+                        showNotice(msg)
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to create playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
+        }
+    }
+
+    fun updatePlaylist(playlistId: String, name: String, comment: String?) {
+        val trimmedName = name.trim()
+        if (trimmedName.isEmpty()) {
+            showNotice("Playlist name cannot be empty")
+            return
+        }
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            showNotice("Connect online to edit playlists")
+            return
+        }
+        if (!tryAcquirePlaylistMutation()) return
+        viewModelScope.launch {
+            try {
+                val result = apiClient.updatePlaylist(
+                    config = cfg,
+                    playlistId = playlistId,
+                    name = trimmedName,
+                    comment = comment?.trim().orEmpty(),
+                    public = null,
+                )
+                result.fold(
+                    onSuccess = { updated ->
+                        val resolvedName = updated.name.ifBlank { trimmedName }
+                        val resolvedComment = updated.comment.takeIf { it.isNotBlank() }
+                        _uiState.update { state ->
+                            val nextContainer = state.selectedContainer?.let { cur ->
+                                if (cur.isStaticUserPlaylist && cur.id == playlistId) {
+                                    cur.copy(
+                                        title = resolvedName,
+                                        comment = resolvedComment,
+                                    )
+                                } else {
+                                    cur
+                                }
+                            }
+                            val nextPlaylists = state.playlists.map { pl ->
+                                if (pl.id == playlistId) {
+                                    pl.copy(name = resolvedName, comment = resolvedComment)
+                                } else {
+                                    pl
+                                }
+                            }
+                            state.copy(
+                                playlists = nextPlaylists,
+                                selectedContainer = nextContainer,
+                            )
+                        }
+                        syncAndRefreshPlaylists()
+                        showNotice("Updated \"$resolvedName\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to update playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
+        }
+    }
+
+    fun deletePlaylist(playlistId: String, playlistName: String) {
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            showNotice("Connect online to delete playlists")
+            return
+        }
+        if (!tryAcquirePlaylistMutation()) return
+        viewModelScope.launch {
+            try {
+                val result = apiClient.deletePlaylist(cfg, playlistId)
+                result.fold(
+                    onSuccess = {
+                        if (_uiState.value.selectedContainer?.id == playlistId) {
+                            containerDetailJob?.cancel()
+                            containerDetailJob = null
+                            containerDetailGeneration.incrementAndGet()
+                        }
+                        _uiState.update { state ->
+                            val nextContainer = if (state.selectedContainer?.id == playlistId) {
+                                null
+                            } else {
+                                state.selectedContainer
+                            }
+                            state.copy(
+                                playlists = state.playlists.filterNot { it.id == playlistId },
+                                selectedContainer = nextContainer,
+                            )
+                        }
+                        syncAndRefreshPlaylists()
+                        showNotice("Deleted playlist \"$playlistName\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to delete playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
+        }
+    }
+
+    fun addTrackToPlaylist(playlist: FfiPlaylist, track: FfiTrack) {
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            showNotice("Connect online to add tracks to playlists")
+            return
+        }
+        if (!tryAcquirePlaylistMutation()) return
+        viewModelScope.launch {
+            try {
+                val result = apiClient.addPlaylistTracks(cfg, playlist.id, listOf(track.id))
+                result.fold(
+                    onSuccess = {
+                        _uiState.update { it.copy(addToPlaylistTrack = null) }
+                        syncAndRefreshPlaylists(reloadContainerPlaylistId = playlist.id)
+                        showNotice("Added \"${track.title}\" to \"${playlist.name}\"")
+                    },
+                    onFailure = { err ->
+                        showNotice(err.localizedMessage ?: "Failed to add track to playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
+        }
+    }
+
+    /**
+     * Removes a track from a static user playlist via `POST /api/playlists/remove-tracks`.
+     * Never deletes the user's audio file from the music library.
+     */
+    fun removeTrackFromPlaylist(playlistId: String, track: FfiTrack) {
+        val cfg = _uiState.value.config
+        if (cfg.offlineOnly || !cfg.isConfigured) {
+            showNotice("Connect online to edit playlist tracks")
+            return
+        }
+        if (!tryAcquirePlaylistMutation()) return
+        val openGen = containerDetailGeneration.get()
+        var removedEntries: List<Pair<Int, FfiTrack>> = emptyList()
+        _uiState.update { state ->
+            val cur = state.selectedContainer
+            if (cur != null && cur.isStaticUserPlaylist && cur.id == playlistId) {
+                val matches = buildList {
+                    cur.tracks.forEachIndexed { idx, t ->
+                        if (t.id == track.id) add(idx to t)
+                    }
+                }
+                removedEntries = matches
+                if (matches.isEmpty()) {
+                    state
+                } else {
+                    val remaining = cur.tracks.filterNot { it.id == track.id }
+                    state.copy(
+                        selectedContainer = cur.copy(
+                            tracks = remaining,
+                            subtitle = if (remaining.size == 1) "1 track" else "${remaining.size} tracks",
+                        ),
+                    )
+                }
+            } else {
+                removedEntries = emptyList()
+                state
+            }
+        }
+        viewModelScope.launch {
+            try {
+                val result = apiClient.removePlaylistTracks(cfg, playlistId, listOf(track.id))
+                result.fold(
+                    onSuccess = {
+                        syncAndRefreshPlaylists(reloadContainerPlaylistId = playlistId)
+                        showNotice("Removed \"${track.title}\" from playlist")
+                    },
+                    onFailure = { err ->
+                        if (removedEntries.isNotEmpty() && containerDetailGeneration.get() == openGen) {
+                            _uiState.update { state ->
+                                if (containerDetailGeneration.get() != openGen) return@update state
+                                val cur = state.selectedContainer ?: return@update state
+                                if (!cur.isStaticUserPlaylist || cur.id != playlistId) return@update state
+                                val restored = cur.tracks.toMutableList()
+                                for ((idx, removedTrack) in removedEntries) {
+                                    restored.add(idx.coerceIn(0, restored.size), removedTrack)
+                                }
+                                state.copy(
+                                    selectedContainer = cur.copy(
+                                        tracks = restored,
+                                        subtitle = if (restored.size == 1) "1 track" else "${restored.size} tracks",
+                                    ),
+                                )
+                            }
+                        }
+                        showNotice(err.localizedMessage ?: "Failed to remove track from playlist")
+                    },
+                )
+            } finally {
+                _uiState.update { it.copy(playlistMutationInFlight = false) }
+            }
+        }
+    }
+
+    private suspend fun syncAndRefreshPlaylists(reloadContainerPlaylistId: String? = null) {
+        val core = SoulbeetCoreProvider.getOrNull()
+        if (core != null && !core.isOfflineOnly()) {
+            withContext(Dispatchers.IO) {
+                runCatching { core.syncNow(forceFull = false) }
+            }
+        }
+        refreshLibrarySnapshot()
+        if (reloadContainerPlaylistId != null &&
+            _uiState.value.selectedContainer?.id == reloadContainerPlaylistId &&
+            core != null
+        ) {
+            val expectedGen = containerDetailGeneration.get()
+            val refreshedTracks = withContext(Dispatchers.IO) {
+                runCatching { core.listTracksByPlaylist(reloadContainerPlaylistId) }.getOrNull()
+            }
+            if (refreshedTracks != null && containerDetailGeneration.get() == expectedGen) {
+                _uiState.update { state ->
+                    if (containerDetailGeneration.get() != expectedGen) return@update state
+                    val cur = state.selectedContainer ?: return@update state
+                    if (cur.id != reloadContainerPlaylistId) return@update state
+                    state.copy(
+                        selectedContainer = cur.copy(
+                            tracks = refreshedTracks,
+                            subtitle = if (refreshedTracks.size == 1) "1 track" else "${refreshedTracks.size} tracks",
+                        ),
+                    )
+                }
+            }
+        }
     }
 
     // =========================================================================

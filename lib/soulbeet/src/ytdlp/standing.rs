@@ -37,7 +37,7 @@ pub(crate) struct Standing {
 impl Standing {
     /// The pause in force, if one is.
     pub(crate) fn paused(&self) -> Option<Pause> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match state.pause {
             Some((_, ends)) if ends <= Instant::now() => {
                 state.pause = None;
@@ -69,7 +69,7 @@ impl Standing {
 
     fn heard(&self, outcome: Result<(), &Fault>, download: bool) -> Option<Pause> {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A track YouTube does not have, or has in no format asked for, is YouTube answering.
         let fault = outcome
             .err()
@@ -114,14 +114,14 @@ impl Standing {
 
     /// What YouTube answered within `recent`: Ok, or the failure it answered with.
     pub(crate) fn heard_within(&self, recent: Duration) -> Option<Result<(), Fault>> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (at, fault) = state.heard.as_ref()?;
         (at.elapsed() < recent).then(|| fault.clone().map_or(Ok(()), Err))
     }
 
     /// A probe passed: a bot-check pause is over.
     pub(crate) fn passed_probe(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.pause.is_some_and(|(p, _)| p.why == Hold::BotCheck) {
             state.pause = None;
         }

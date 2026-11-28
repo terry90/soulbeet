@@ -308,6 +308,15 @@ impl DiscoveryTrackRow {
         Self::update_song_id_in(&DB, id, song_id).await
     }
 
+    pub(crate) async fn clear_song_id_in(db: &sqlx::SqlitePool, id: &str) -> Result<(), String> {
+        sqlx::query("UPDATE discovery_tracks SET song_id = NULL WHERE id = ?")
+            .bind(id)
+            .execute(db)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub(crate) async fn update_song_id_in(
         db: &sqlx::SqlitePool,
         id: &str,

@@ -485,7 +485,7 @@ pub fn FolderManager() -> Element {
                                                         }
                                                         // Per-profile track count and lifetime
                                                         if active {
-                                                            div { class: "flex gap-3 mt-2 ml-18",
+                                                            div { class: "flex flex-wrap gap-3 mt-2 sm:ml-18",
                                                                 div { class: "flex items-center gap-1.5",
                                                                     span { class: "text-[11px] text-beet-text-tertiary", "Tracks" }
                                                                     input {

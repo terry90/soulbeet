@@ -15,7 +15,7 @@ pub use manual::download;
 
 use crate::auth::UserCtx;
 use crate::core::{database_failure, target_unwritable};
-use crate::globals::{get_or_create_user_channel, register_user_task, unregister_user_task};
+use crate::globals::{get_or_create_user_channel, send_user_event};
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::models::folder::Folder;
 use crate::server_fns::download::enqueue::{
@@ -358,9 +358,9 @@ async fn queue_and_watch_with_durations(
         .collect();
 
     // A request only ever joins a batch of its own user, so every row of it
-    // goes to that user's channel.
+    // goes to that user's live channel.
     let user = ctx.id();
-    let tx = get_or_create_user_channel(&user).await;
+    let _ = get_or_create_user_channel(&user).await;
     let row = |p: DownloadProgress, n: u32| batch.mark(p).with_job(slot(n));
 
     let mut failed = Vec::new();
@@ -402,7 +402,7 @@ async fn queue_and_watch_with_durations(
     }
 
     if !failed.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(failed.clone()));
+        let _ = send_user_event(&user, DownloadEvent::Progress(failed.clone())).await;
     }
     failed.extend(unanswered);
     if !failed.is_empty() {
@@ -413,7 +413,7 @@ async fn queue_and_watch_with_durations(
     }
     // Send initial "Queued" state immediately so UI shows the downloads right away
     if !queued.is_empty() {
-        let _ = tx.send(DownloadEvent::Progress(queued.clone()));
+        let _ = send_user_event(&user, DownloadEvent::Progress(queued.clone())).await;
         ledger.record(JobEvent::Slots {
             state: JobState::Downloading,
             rows: queued,
@@ -452,7 +452,7 @@ async fn queue_and_watch_with_durations(
             let lost = deliver(reservation, slots, &backend, &batch).await;
             if !lost.is_empty() {
                 let rows = stopped_rows(&lost, &batch);
-                let _ = tx.send(DownloadEvent::Progress(rows.clone()));
+                let _ = send_user_event(&user, DownloadEvent::Progress(rows.clone())).await;
                 ledger.record(JobEvent::Slots {
                     state: JobState::Failed,
                     rows,
@@ -486,8 +486,9 @@ async fn queue_and_watch_with_durations(
             let target = batch.target.clone();
             spawn_monitor(
                 &ctx,
-                DownloadMonitor::new(transfers, target, tx, batch, ledger).with_failover(pool),
-            );
+                DownloadMonitor::for_user(transfers, target, batch, ledger).with_failover(pool),
+            )
+            .await;
         }
     }
 
@@ -503,13 +504,13 @@ async fn queue_and_watch_with_durations(
     Ok(results)
 }
 
-/// Registers `ctx`'s user task and runs `monitor` in it.
-pub(crate) fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
-    let user = ctx.id();
+/// Registers `ctx`'s user task synchronously before spawning and runs `monitor` with an RAII
+/// drop guard so panics never leak `active_tasks`.
+pub(crate) async fn spawn_monitor(ctx: &UserCtx, mut monitor: DownloadMonitor) {
+    let guard = crate::globals::UserTaskGuard::acquire(ctx.id()).await;
     tokio::spawn(async move {
-        register_user_task(&user).await;
+        let _guard = guard;
         monitor.run(&Registry).await;
-        unregister_user_task(&user).await;
     });
 }
 

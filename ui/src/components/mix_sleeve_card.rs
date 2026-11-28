@@ -1827,6 +1827,7 @@ pub fn MixSleeveCard(
     #[props(default)] id_prefix: String,
     #[props(default)] show_owned_pct: bool,
     on_play: EventHandler<String>,
+    #[props(default)] on_open: Option<EventHandler<String>>,
 ) -> Element {
     let instance_id = use_hook(next_svg_instance_id);
     let theme = mix_sleeve_theme(&mix.slug);
@@ -1844,7 +1845,9 @@ pub fn MixSleeveCard(
         id_prefix.trim()
     };
     let art_prefix = format!("{base_prefix}-{instance_id}-{}", mix.slug);
-    let slug_for_click = mix.slug.clone();
+    let slug_for_open = mix.slug.clone();
+    let slug_for_key = mix.slug.clone();
+    let slug_for_play = mix.slug.clone();
 
     let (card_padding, card_extra_style, play_size, play_icon_size, scrim_gradient) = match layout {
         MixSleeveLayout::Wide => (
@@ -1856,7 +1859,7 @@ pub fn MixSleeveCard(
         ),
         MixSleeveLayout::Square => (
             "p-4",
-            "aspect-ratio:1/1.08;",
+            "min-height:208px;",
             "w-[30px] h-[30px]",
             11u32,
             "linear-gradient(180deg, rgba(11, 4, 20, 0.08) 0%, rgba(11, 4, 20, 0.22) 48%, rgba(11, 4, 20, 0.68) 100%)",
@@ -1864,11 +1867,33 @@ pub fn MixSleeveCard(
     };
 
     rsx! {
-        button {
-            r#type: "button",
-            class: "group relative w-full h-full overflow-hidden rounded-[14px] border text-left flex flex-col justify-between transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.99] cursor-pointer {card_padding}",
+        div {
+            role: "button",
+            tabindex: "0",
+            aria_label: if on_open.is_some() {
+                format!("Open {title}")
+            } else {
+                format!("Play {title}")
+            },
+            class: "group relative w-full h-full overflow-hidden rounded-[14px] border text-left flex flex-col justify-between transition-[transform,filter] duration-150 hover:-translate-y-0.5 hover:brightness-110 active:scale-[0.99] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-beet-leaf-solid {card_padding}",
             style: "background:{theme.background};border-color:{theme.border};{card_extra_style}",
-            onclick: move |_| on_play.call(slug_for_click.clone()),
+            onclick: move |_| {
+                if let Some(open_cb) = &on_open {
+                    open_cb.call(slug_for_open.clone());
+                } else {
+                    on_play.call(slug_for_open.clone());
+                }
+            },
+            onkeydown: move |evt: KeyboardEvent| {
+                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                    evt.prevent_default();
+                    if let Some(open_cb) = &on_open {
+                        open_cb.call(slug_for_key.clone());
+                    } else {
+                        on_play.call(slug_for_key.clone());
+                    }
+                }
+            },
 
             // Procedural vector sleeve layer
             div {
@@ -1886,15 +1911,27 @@ pub fn MixSleeveCard(
 
             // Foreground copy & play trigger
             div { class: "relative z-10 flex flex-col justify-between h-full w-full",
-                div { class: "flex items-center justify-between gap-3",
+                div { class: "flex items-center justify-between gap-2 min-w-0",
                     span {
-                        class: "tabular-nums-mono text-[10px] font-semibold uppercase tracking-[0.06em] px-2.5 py-[3px] rounded-full inline-flex items-center border",
+                        class: "min-w-0 truncate tabular-nums-mono text-[10px] font-semibold uppercase tracking-[0.06em] px-2.5 py-[3px] rounded-full inline-flex items-center border",
                         style: "background:{theme.pill_bg};color:{theme.pill_fg};border-color:{theme.border};",
                         "{tag}"
                     }
-                    span {
-                        class: "{play_size} rounded-full bg-beet-leaf-solid text-beet-leaf-ink inline-flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform duration-150",
+                    button {
+                        r#type: "button",
+                        aria_label: format!("Play {title}"),
+                        title: format!("Play {title}"),
+                        class: "{play_size} rounded-full bg-beet-leaf-solid text-beet-leaf-ink inline-flex items-center justify-center shrink-0 hover:scale-105 group-hover:scale-105 active:scale-95 transition-transform duration-150 cursor-pointer",
                         style: "box-shadow:0 4px 14px rgba(0,229,141,0.24);",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            on_play.call(slug_for_play.clone());
+                        },
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                evt.stop_propagation();
+                            }
+                        },
                         IconPlay { size: play_icon_size, filled: true, class: "ml-0.5".to_string() }
                     }
                 }
@@ -1919,7 +1956,7 @@ pub fn MixSleeveCard(
                         }
                     }
                 } else {
-                    div { class: "mt-auto pt-11",
+                    div { class: "mt-auto pt-6",
                         h3 { class: "text-[17px] font-bold tracking-[-0.02em] leading-[1.2] text-beet-text-primary",
                             "{title}"
                         }
@@ -1944,7 +1981,7 @@ pub fn MixSleeveCard(
 }
 
 /// Split-shelf layout separating live moment mixes ("Right Now", wide 2-col) from
-/// smart library, decade, and rolling sleeves ("From Your Collection", square 5-col).
+/// smart library, decade, and rolling sleeves ("From Your Collection", square).
 #[component]
 pub fn MixSleeveShelves(
     mixes: Vec<ContextualMixSummary>,
@@ -1952,6 +1989,7 @@ pub fn MixSleeveShelves(
     #[props(default)] show_owned_pct: bool,
     #[props(default)] header_action: Option<Element>,
     on_play: EventHandler<String>,
+    #[props(default)] on_open: Option<EventHandler<String>>,
 ) -> Element {
     let mut right_now = Vec::new();
     let mut collection = Vec::new();
@@ -2002,6 +2040,7 @@ pub fn MixSleeveShelves(
                                 id_prefix: format!("{id_prefix}-rn-{idx}"),
                                 show_owned_pct,
                                 on_play,
+                                on_open,
                             }
                         }
                     }
@@ -2023,7 +2062,7 @@ pub fn MixSleeveShelves(
                             {action}
                         }
                     }
-                    div { class: "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5",
+                    div { class: "grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-3.5",
                         for (idx, mix) in collection.into_iter().enumerate() {
                             MixSleeveCard {
                                 key: "{id_prefix}-col-{idx}-{mix.slug}",
@@ -2032,6 +2071,7 @@ pub fn MixSleeveShelves(
                                 id_prefix: format!("{id_prefix}-col-{idx}"),
                                 show_owned_pct: false,
                                 on_play,
+                                on_open,
                             }
                         }
                     }

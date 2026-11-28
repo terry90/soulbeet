@@ -13,6 +13,9 @@ import:
   resume: no
   duplicate_action: remove
 paths:
+  comp:true disctotal:2..: Compilations/$album%aunique{}/Disc $disc/$track $title
+  comp: Compilations/$album%aunique{}/$track $title
+  disctotal:2..: $albumartist/$album%aunique{}/Disc $disc/$track $title
   default: $albumartist/$album%aunique{}/$track $title
   singleton: $albumartist/$album%aunique{}/$title
 match:

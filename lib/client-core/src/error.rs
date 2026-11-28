@@ -11,7 +11,7 @@ pub enum CoreError {
     Migrate(#[from] sqlx::migrate::MigrateError),
 
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -39,4 +39,12 @@ pub enum CoreError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+}
+
+impl From<reqwest::Error> for CoreError {
+    fn from(err: reqwest::Error) -> Self {
+        // Always strip request URLs (which carry Subsonic `t=`/`s=` auth query parameters)
+        // so credentials never leak into logs, `mutation_outbox.last_error`, or `FfiError`.
+        Self::Http(err.without_url())
+    }
 }

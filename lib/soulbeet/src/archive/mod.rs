@@ -233,7 +233,7 @@ impl crate::DownloadBackend for ArchiveBackend {
 
     async fn source_status(&self, source: &str) -> BackendResult<SourcePresence> {
         let slot = {
-            let mut presence = self.engine.presence.lock().unwrap();
+            let mut presence = self.engine.presence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Kept while a caller holds it or its answer is recent.
             presence.retain(|_, slot| {
                 Arc::strong_count(slot) > 1

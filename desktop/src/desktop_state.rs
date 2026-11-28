@@ -13,9 +13,9 @@ use chrono::Utc;
 use client_core::models::{
     AudioQualityProfile, CachePolicy, CacheStats, ClientConfig, ConnectCommandDto,
     ConnectDeviceDto, ConnectServerEventDto, DevicePlatform as CoreDevicePlatform, LocalAlbum,
-    LocalDiscoveryTrack, LocalPlaylist, LocalTrack, NavidromeCredentials, OutboxMutation,
-    PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource, RemoteCatalogAlbum,
-    RemoteCatalogTrack, SoulbeetAuth, SyncReport,
+    LocalArtist, LocalDiscoveryTrack, LocalPlaylist, LocalTrack, NavidromeCredentials,
+    OutboxMutation, PersistedPlaybackSession, PinTarget, PlaybackSnapshotDto, PlaybackSource,
+    RemoteCatalogAlbum, RemoteCatalogTrack, SoulbeetAuth, SyncReport,
 };
 use client_core::SoulbeetCore;
 use directories::ProjectDirs;
@@ -99,6 +99,34 @@ pub struct PasswordLoginResult {
     pub password_change_required: bool,
 }
 
+/// Builds a configured HTTP client with strict connect (10s) and request (20s) timeouts
+/// so unreachable hosts never hang desktop interactions indefinitely.
+pub fn try_build_desktop_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .build()
+}
+
+/// Builds a shared desktop HTTP client, logging and falling back only if TLS setup fails.
+pub fn build_desktop_http_client() -> reqwest::Client {
+    try_build_desktop_http_client().unwrap_or_else(|err| {
+        tracing::warn!("Failed to build configured reqwest::Client: {err}");
+        reqwest::Client::new()
+    })
+}
+
+/// Summary returned by Soulbeet playlist CRUD endpoints (`/api/playlists/*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopPlaylistMutationResult {
+    pub id: String,
+    pub name: String,
+    pub comment: String,
+    pub public: bool,
+    pub song_count: u32,
+    pub duration: u32,
+}
+
 /// Authenticates against a Soulbeet server with username + password and returns the session cookie.
 pub async fn login_with_password(
     base_url: &str,
@@ -109,11 +137,8 @@ pub async fn login_with_password(
     if base.is_empty() {
         return Err("Enter the Soulbeet server URL first.".to_string());
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client =
+        try_build_desktop_http_client().map_err(|e| format!("HTTP client error: {e}"))?;
 
     let url = format!("{base}/api/auth/login");
     let resp = client
@@ -167,11 +192,8 @@ pub async fn login_with_password(
 pub async fn verify_desktop_config(
     cfg: &DesktopConfig,
 ) -> Result<Option<ClientBootstrap>, String> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client =
+        try_build_desktop_http_client().map_err(|e| format!("HTTP client error: {e}"))?;
 
     if let Some(base) = cfg
         .soulbeet_base_url
@@ -1238,6 +1260,115 @@ pub async fn load_tracks_for_playlist(core: &SoulbeetCore, playlist_id: &str) ->
         .collect()
 }
 
+pub async fn load_album_detail(
+    core: &SoulbeetCore,
+    album_id: &str,
+) -> Option<(LocalAlbum, bool, Vec<PlayerTrack>)> {
+    let album = core.get_album(album_id).await.ok().flatten()?;
+    let pins = load_pinned_targets(core).await;
+    let is_pinned = pins.contains(&("album".to_string(), album.id.clone()));
+    let tracks = load_tracks_for_album(core, album_id).await;
+    Some((album, is_pinned, tracks))
+}
+
+pub async fn load_library_artists(core: &SoulbeetCore, offline_only: bool) -> Vec<LocalArtist> {
+    if offline_only {
+        sqlx::query_as::<_, LocalArtist>(
+            r#"
+            SELECT DISTINCT ar.*
+            FROM artists ar
+            INNER JOIN tracks t ON t.artist_id = ar.id
+            INNER JOIN offline_downloads od ON od.track_id = t.id
+            ORDER BY ar.name COLLATE NOCASE ASC
+            LIMIT 250
+            "#,
+        )
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as::<_, LocalArtist>(
+            "SELECT * FROM artists ORDER BY name COLLATE NOCASE ASC LIMIT 250",
+        )
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    }
+}
+
+pub async fn load_artist_detail(
+    core: &SoulbeetCore,
+    artist_id: &str,
+    offline_only: bool,
+) -> Option<(LocalArtist, Vec<(LocalAlbum, bool)>, Vec<PlayerTrack>)> {
+    let artist = core.get_artist(artist_id).await.ok().flatten()?;
+    let pins = load_pinned_targets(core).await;
+    let cached_ids = load_cached_track_ids(core).await;
+    let disc_map = load_pending_discovery_map(core).await;
+
+    let album_rows = if offline_only {
+        sqlx::query_as::<_, LocalAlbum>(
+            r#"
+            SELECT DISTINCT a.*
+            FROM albums a
+            INNER JOIN tracks t ON t.album_id = a.id
+            INNER JOIN offline_downloads od ON od.track_id = t.id
+            WHERE a.artist_id = ?
+            ORDER BY COALESCE(a.year, 0) DESC, a.name COLLATE NOCASE ASC
+            "#,
+        )
+        .bind(artist_id)
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as::<_, LocalAlbum>(
+            "SELECT * FROM albums WHERE artist_id = ? ORDER BY COALESCE(year, 0) DESC, name COLLATE NOCASE ASC",
+        )
+        .bind(artist_id)
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    };
+    let albums = album_rows
+        .into_iter()
+        .map(|a| {
+            let pinned = pins.contains(&("album".to_string(), a.id.clone()));
+            (a, pinned)
+        })
+        .collect();
+
+    let track_rows = if offline_only {
+        sqlx::query_as::<_, LocalTrack>(
+            r#"
+            SELECT t.* FROM tracks t
+            INNER JOIN offline_downloads od ON od.track_id = t.id
+            WHERE t.artist_id = ?
+            ORDER BY t.album_name COLLATE NOCASE ASC, COALESCE(t.disc_number, 1) ASC, COALESCE(t.track_number, 0) ASC
+            LIMIT 250
+            "#,
+        )
+        .bind(artist_id)
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query_as::<_, LocalTrack>(
+            "SELECT * FROM tracks WHERE artist_id = ? ORDER BY album_name COLLATE NOCASE ASC, COALESCE(disc_number, 1) ASC, COALESCE(track_number, 0) ASC LIMIT 250",
+        )
+        .bind(artist_id)
+        .fetch_all(core.pool())
+        .await
+        .unwrap_or_default()
+    };
+    let tracks = track_rows
+        .iter()
+        .map(|t| local_track_to_player_track(t, &cached_ids, &disc_map))
+        .collect();
+
+    Some((artist, albums, tracks))
+}
+
 pub fn convert_connect_devices(devices: &[ConnectDeviceDto]) -> Vec<ConnectDevice> {
     devices
         .iter()
@@ -1316,8 +1447,13 @@ pub struct DesktopStudio {
     pub bootstrap: Signal<Option<ClientBootstrap>>,
     pub core: Signal<Option<Arc<SoulbeetCore>>>,
     pub core_error: Signal<Option<String>>,
+    pub http_client: Signal<reqwest::Client>,
     pub active_section: Signal<StudioNavSection>,
     pub selected_playlist_id: Signal<Option<String>>,
+    pub selected_album_id: Signal<Option<String>>,
+    pub selected_artist_id: Signal<Option<String>>,
+    pub add_to_playlist_track: Signal<Option<PlayerTrack>>,
+    pub playlist_mutating: Signal<bool>,
     pub search_seed_query: Signal<String>,
     pub active_drawer: Signal<Option<DrawerTab>>,
     pub inspected_track: Signal<Option<PlayerTrack>>,
@@ -1480,6 +1616,121 @@ pub fn use_desktop_studio() -> DesktopStudio {
 }
 
 impl DesktopStudio {
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http_client.peek().clone()
+    }
+
+    pub fn open_album_detail(&mut self, album_id: String) {
+        self.selected_playlist_id.set(None);
+        self.selected_artist_id.set(None);
+        self.selected_album_id.set(Some(album_id));
+        self.active_section.set(StudioNavSection::Library);
+    }
+
+    pub fn open_playlist_detail(&mut self, playlist_id: String) {
+        self.selected_album_id.set(None);
+        self.selected_artist_id.set(None);
+        self.selected_playlist_id.set(Some(playlist_id));
+        self.active_section.set(StudioNavSection::Library);
+    }
+
+    pub fn open_artist_detail(&mut self, artist_id: String) {
+        self.selected_playlist_id.set(None);
+        self.selected_album_id.set(None);
+        self.selected_artist_id.set(Some(artist_id));
+        self.active_section.set(StudioNavSection::Library);
+    }
+
+    /// Resolves an artist name in the local SQLite mirror and opens Artist Detail, falling back to Search.
+    pub fn open_artist_by_name(&mut self, artist_name: String) {
+        let trimmed = artist_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(core) = self.core.peek().clone() else {
+            self.search_seed_query.set(trimmed);
+            self.active_section.set(StudioNavSection::Search);
+            return;
+        };
+        let mut studio = *self;
+        spawn(async move {
+            let exact: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM artists WHERE name = ? COLLATE NOCASE LIMIT 1",
+            )
+            .bind(&trimmed)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = exact {
+                studio.open_artist_detail(id);
+                return;
+            }
+            let pattern = format!("%{trimmed}%");
+            let fuzzy: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM artists WHERE name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1",
+            )
+            .bind(&pattern)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = fuzzy {
+                studio.open_artist_detail(id);
+            } else {
+                studio.search_seed_query.set(trimmed);
+                studio.active_section.set(StudioNavSection::Search);
+            }
+        });
+    }
+
+    /// Resolves an album name in the local SQLite mirror and opens Album Detail, falling back to Search.
+    pub fn open_album_by_name(&mut self, album_name: String) {
+        let trimmed = album_name.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(core) = self.core.peek().clone() else {
+            self.search_seed_query.set(trimmed);
+            self.active_section.set(StudioNavSection::Search);
+            return;
+        };
+        let mut studio = *self;
+        spawn(async move {
+            let exact: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM albums WHERE name = ? COLLATE NOCASE LIMIT 1",
+            )
+            .bind(&trimmed)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = exact {
+                studio.open_album_detail(id);
+                return;
+            }
+            let pattern = format!("%{trimmed}%");
+            let fuzzy: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM albums WHERE name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1",
+            )
+            .bind(&pattern)
+            .fetch_optional(core.pool())
+            .await
+            .ok()
+            .flatten();
+            if let Some(id) = fuzzy {
+                studio.open_album_detail(id);
+            } else {
+                studio.search_seed_query.set(trimmed);
+                studio.active_section.set(StudioNavSection::Search);
+            }
+        });
+    }
+
+    pub fn open_add_to_playlist(&mut self, track: PlayerTrack) {
+        self.add_to_playlist_track.set(Some(track));
+    }
+
     pub fn bump_library(&mut self) {
         let next = self.library_revision.peek().wrapping_add(1);
         self.library_revision.set(next);
@@ -1555,6 +1806,27 @@ impl DesktopStudio {
         }
         let idx = start_index.min(filtered.len() - 1);
         player.play_queue(filtered, idx);
+    }
+
+    /// Shuffles `tracks` (respecting `player.offline_only()`) and starts playback from the top.
+    pub fn shuffle_collection(
+        &mut self,
+        player: PlayerContext,
+        tracks: Vec<PlayerTrack>,
+        label: &str,
+    ) {
+        let offline = player.offline_only();
+        let mut filtered = filter_tracks_for_offline_play(tracks, offline);
+        if filtered.is_empty() {
+            self.status_toast.set(Some(if offline {
+                format!("No tracks in \"{label}\" are cached offline: pin it first")
+            } else {
+                format!("No playable tracks in \"{label}\"")
+            }));
+            return;
+        }
+        shuffle_slice_with_uuid(&mut filtered);
+        player.play_queue(filtered, 0);
     }
 
     pub fn push_mini_snapshot(&self, player: PlayerContext) {
@@ -1872,7 +2144,8 @@ impl DesktopStudio {
             PlayerCommand::ToggleShuffle
             | PlayerCommand::CycleRepeat
             | PlayerCommand::EnqueueNext(_)
-            | PlayerCommand::EnqueueLast(_) => {
+            | PlayerCommand::EnqueueLast(_)
+            | PlayerCommand::MoveQueueItem { .. } => {
                 self.schedule_gapless_prefetch(player);
             }
             PlayerCommand::RemoveFromQueue(idx) => {
@@ -2897,10 +3170,10 @@ impl DesktopStudio {
         );
         let auth = cfg.soulbeet_auth();
         let core_opt = self.core.peek().clone();
+        let client = self.http_client();
         let mut studio = *self;
 
         spawn(async move {
-            let client = reqwest::Client::new();
             let url = format!("{}/api/acquire-and-play", base.trim_end_matches('/'));
             let payload = AcquireAndPlayRequest {
                 artist: remote.artist.clone(),
@@ -3113,9 +3386,9 @@ impl DesktopStudio {
             return;
         };
         let auth = cfg.soulbeet_auth();
+        let client = self.http_client();
         let mut studio = *self;
         spawn(async move {
-            let client = reqwest::Client::new();
             let url = format!(
                 "{}/api/discovery/seasonal/steer",
                 base.trim_end_matches('/')
@@ -3188,26 +3461,8 @@ impl DesktopStudio {
             .set(Some("Starting discovery refresh...".into()));
         studio.discovery_progress_pct.set(Some(8));
 
+        let client = studio.http_client();
         spawn(async move {
-            let client = match reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(20))
-                .build()
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    if poll_gen_arc.load(Ordering::SeqCst) == my_gen {
-                        let msg = format!("HTTP client error: {err}");
-                        studio.discovery_generating.set(false);
-                        studio.discovery_progress_label.set(None);
-                        studio.discovery_progress_pct.set(None);
-                        studio.discovery_refresh_error.set(Some(msg.clone()));
-                        studio.status_toast.set(Some(msg));
-                    }
-                    return;
-                }
-            };
-
             // Snapshot any prior terminal run BEFORE starting so we never consume a stale
             // Complete/Error cached for 5 minutes from a previous run.
             let initial_progress = fetch_discovery_progress(&client, &base, auth.as_ref())
@@ -3532,11 +3787,11 @@ impl DesktopStudio {
             return;
         };
         let auth = cfg.soulbeet_auth();
+        let client = self.http_client();
         self.lyrics_loading.set(true);
         self.lyrics_error.set(None);
         let mut studio = *self;
         spawn(async move {
-            let client = reqwest::Client::new();
             let mut url = match url::Url::parse(&format!(
                 "{}/api/client/lyrics",
                 base.trim_end_matches('/')
@@ -3615,6 +3870,7 @@ impl DesktopStudio {
             return;
         };
         let auth = cfg.soulbeet_auth();
+        let client = self.http_client();
         self.guard_loading.set(true);
         self.guard_preview.set(Some(fail_closed_guard_preview(
             song_id.clone(),
@@ -3622,7 +3878,6 @@ impl DesktopStudio {
         )));
         let mut studio = *self;
         spawn(async move {
-            let client = reqwest::Client::new();
             let encoded_id = percent_encode_param(&song_id);
             let url = format!(
                 "{}/api/curation/guard-preview/{encoded_id}",
@@ -3885,8 +4140,417 @@ impl DesktopStudio {
         self.bootstrap.set(None);
         self.core.set(None);
         self.playlists.set(Vec::new());
+        self.selected_playlist_id.set(None);
+        self.selected_album_id.set(None);
+        self.selected_artist_id.set(None);
+        self.add_to_playlist_track.set(None);
+        self.playlist_mutating.set(false);
         self.connect_devices.set(Vec::new());
         self.sync_status.write().connect_online = false;
+    }
+
+    // --- Authenticated Playlist CRUD against Soulbeet Server (/api/playlists/*) ---
+
+    fn playlist_endpoint_context(&mut self) -> Option<(String, Option<SoulbeetAuth>, reqwest::Client)> {
+        let cfg = self.config.peek().clone();
+        if cfg.offline_only {
+            self.status_toast
+                .set(Some("Disable Offline Only mode to edit playlists.".into()));
+            return None;
+        }
+        let Some(base) = cfg
+            .soulbeet_base_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+        else {
+            self.status_toast.set(Some(
+                "Connect a Soulbeet server in Settings to manage playlists.".into(),
+            ));
+            return None;
+        };
+        Some((base, cfg.soulbeet_auth(), self.http_client()))
+    }
+
+    /// Creates a new static playlist via `POST /api/playlists/create` and syncs the local mirror.
+    pub fn create_playlist(
+        &mut self,
+        name: String,
+        comment: Option<String>,
+        public: Option<bool>,
+        song_ids: Option<Vec<String>>,
+        select_after_create: bool,
+        on_success: Option<EventHandler<()>>,
+    ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            self.status_toast
+                .set(Some("Playlist name cannot be empty.".into()));
+            return;
+        }
+        let Some((base, auth, client)) = self.playlist_endpoint_context() else {
+            return;
+        };
+        let core_opt = self.core.peek().clone();
+        self.playlist_mutating.set(true);
+        let mut studio = *self;
+
+        spawn(async move {
+            let url = format!("{}/api/playlists/create", base.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "name": trimmed,
+                "comment": comment,
+                "public": public,
+                "song_ids": song_ids,
+            });
+            let mut req = client.post(&url).json(&payload);
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<DesktopPlaylistMutationResult>().await {
+                        Ok(created) => {
+                            let created_id = created.id.clone();
+                            let created_name = created.name.clone();
+                            if let Some(core) = core_opt {
+                                let same = studio
+                                    .core
+                                    .peek()
+                                    .as_ref()
+                                    .is_some_and(|active| Arc::ptr_eq(active, &core));
+                                if same && !core.is_offline_only() {
+                                    let _ = core.sync_now(false).await;
+                                    studio.refresh_cache_and_playlists().await;
+                                    studio.bump_library();
+                                }
+                            }
+                            if select_after_create
+                                && studio.selected_album_id.peek().is_none()
+                                && studio.selected_artist_id.peek().is_none()
+                            {
+                                studio.selected_playlist_id.set(Some(created_id));
+                            }
+                            studio.status_toast.set(Some(format!(
+                                "Created playlist \"{created_name}\""
+                            )));
+                            if let Some(cb) = on_success {
+                                cb.call(());
+                            }
+                        }
+                        Err(err) => {
+                            studio.status_toast.set(Some(format!(
+                                "Playlist created, but failed to decode response: {err}"
+                            )));
+                            studio.sync_now(false);
+                            if let Some(cb) = on_success {
+                                cb.call(());
+                            }
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let (msg, _) = parse_server_error_message(&body, status);
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not create playlist: {msg}")));
+                }
+                Err(err) => {
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not create playlist: {err}")));
+                }
+            }
+            studio.playlist_mutating.set(false);
+        });
+    }
+
+    /// Updates playlist metadata via `POST /api/playlists/update` and syncs the local mirror.
+    pub fn update_playlist(
+        &mut self,
+        playlist_id: String,
+        name: Option<String>,
+        comment: Option<String>,
+        public: Option<bool>,
+        on_success: Option<EventHandler<()>>,
+    ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
+        let Some((base, auth, client)) = self.playlist_endpoint_context() else {
+            return;
+        };
+        let core_opt = self.core.peek().clone();
+        self.playlist_mutating.set(true);
+        let mut studio = *self;
+
+        spawn(async move {
+            let url = format!("{}/api/playlists/update", base.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "playlist_id": playlist_id,
+                "name": name,
+                "comment": comment,
+                "public": public,
+            });
+            let mut req = client.post(&url).json(&payload);
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let updated_name = resp
+                        .json::<DesktopPlaylistMutationResult>()
+                        .await
+                        .map(|r| r.name)
+                        .unwrap_or_else(|_| "Playlist".to_string());
+                    if let Some(core) = core_opt {
+                        let same = studio
+                            .core
+                            .peek()
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &core));
+                        if same && !core.is_offline_only() {
+                            let _ = core.sync_now(false).await;
+                            studio.refresh_cache_and_playlists().await;
+                            studio.bump_library();
+                        }
+                    }
+                    studio
+                        .status_toast
+                        .set(Some(format!("Updated playlist \"{updated_name}\"")));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let (msg, _) = parse_server_error_message(&body, status);
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not update playlist: {msg}")));
+                }
+                Err(err) => {
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not update playlist: {err}")));
+                }
+            }
+            studio.playlist_mutating.set(false);
+        });
+    }
+
+    /// Deletes a user playlist via `POST /api/playlists/delete` and syncs the local mirror.
+    pub fn delete_playlist(
+        &mut self,
+        playlist_id: String,
+        playlist_name: String,
+        on_success: Option<EventHandler<()>>,
+    ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
+        let Some((base, auth, client)) = self.playlist_endpoint_context() else {
+            return;
+        };
+        let core_opt = self.core.peek().clone();
+        self.playlist_mutating.set(true);
+        let mut studio = *self;
+
+        spawn(async move {
+            let url = format!("{}/api/playlists/delete", base.trim_end_matches('/'));
+            let payload = serde_json::json!({ "playlist_id": playlist_id });
+            let mut req = client.post(&url).json(&payload);
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if studio.selected_playlist_id.peek().as_deref() == Some(playlist_id.as_str()) {
+                        studio.selected_playlist_id.set(None);
+                    }
+                    studio
+                        .playlists
+                        .write()
+                        .retain(|p| p.playlist.id != playlist_id);
+                    if let Some(core) = core_opt {
+                        let same = studio
+                            .core
+                            .peek()
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &core));
+                        if same && !core.is_offline_only() {
+                            let _ = core.sync_now(false).await;
+                            studio.refresh_cache_and_playlists().await;
+                            studio.bump_library();
+                        }
+                    }
+                    studio
+                        .status_toast
+                        .set(Some(format!("Deleted playlist \"{playlist_name}\"")));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let (msg, _) = parse_server_error_message(&body, status);
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not delete playlist: {msg}")));
+                }
+                Err(err) => {
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not delete playlist: {err}")));
+                }
+            }
+            studio.playlist_mutating.set(false);
+        });
+    }
+
+    /// Appends one or more tracks to a playlist via `POST /api/playlists/add-tracks`.
+    pub fn add_tracks_to_playlist(
+        &mut self,
+        playlist_id: String,
+        playlist_name: String,
+        song_ids: Vec<String>,
+        on_success: Option<EventHandler<()>>,
+    ) {
+        if *self.playlist_mutating.peek() || song_ids.is_empty() {
+            return;
+        }
+        let Some((base, auth, client)) = self.playlist_endpoint_context() else {
+            return;
+        };
+        let count = song_ids.len();
+        let core_opt = self.core.peek().clone();
+        self.playlist_mutating.set(true);
+        let mut studio = *self;
+
+        spawn(async move {
+            let url = format!("{}/api/playlists/add-tracks", base.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "playlist_id": playlist_id,
+                "song_ids": song_ids,
+            });
+            let mut req = client.post(&url).json(&payload);
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Some(core) = core_opt {
+                        let same = studio
+                            .core
+                            .peek()
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &core));
+                        if same && !core.is_offline_only() {
+                            let _ = core.sync_now(false).await;
+                            studio.refresh_cache_and_playlists().await;
+                            studio.bump_library();
+                        }
+                    }
+                    let label = if count == 1 {
+                        format!("Added track to \"{playlist_name}\"")
+                    } else {
+                        format!("Added {count} tracks to \"{playlist_name}\"")
+                    };
+                    studio.status_toast.set(Some(label));
+                    if let Some(cb) = on_success {
+                        cb.call(());
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let (msg, _) = parse_server_error_message(&body, status);
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not add track to playlist: {msg}")));
+                }
+                Err(err) => {
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not add track to playlist: {err}")));
+                }
+            }
+            studio.playlist_mutating.set(false);
+        });
+    }
+
+    /// Removes a track from a static playlist via `POST /api/playlists/remove-tracks`.
+    pub fn remove_track_from_playlist(
+        &mut self,
+        playlist_id: String,
+        song_id: String,
+        track_title: String,
+    ) {
+        if *self.playlist_mutating.peek() {
+            return;
+        }
+        let Some((base, auth, client)) = self.playlist_endpoint_context() else {
+            return;
+        };
+        let core_opt = self.core.peek().clone();
+        self.playlist_mutating.set(true);
+        let mut studio = *self;
+
+        spawn(async move {
+            let url = format!("{}/api/playlists/remove-tracks", base.trim_end_matches('/'));
+            let payload = serde_json::json!({
+                "playlist_id": playlist_id,
+                "song_ids": [song_id],
+            });
+            let mut req = client.post(&url).json(&payload);
+            if let Some(a) = auth {
+                let (k, v) = a.header_name_and_value();
+                req = req.header(k, v);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Some(core) = core_opt {
+                        let same = studio
+                            .core
+                            .peek()
+                            .as_ref()
+                            .is_some_and(|active| Arc::ptr_eq(active, &core));
+                        if same && !core.is_offline_only() {
+                            let _ = core.sync_now(false).await;
+                            studio.refresh_cache_and_playlists().await;
+                            studio.bump_library();
+                        }
+                    }
+                    studio.status_toast.set(Some(format!(
+                        "Removed \"{track_title}\" from playlist"
+                    )));
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    let (msg, _) = parse_server_error_message(&body, status);
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not remove track from playlist: {msg}")));
+                }
+                Err(err) => {
+                    studio
+                        .status_toast
+                        .set(Some(format!("Could not remove track from playlist: {err}")));
+                }
+            }
+            studio.playlist_mutating.set(false);
+        });
     }
 
     // --- Floating 360×110 Mini-Player Window Lifecycle (Generation-Guarded) ---
@@ -4080,6 +4744,22 @@ fn playback_source_to_mpv(source: PlaybackSource) -> MpvPlaybackSource {
     }
 }
 
+/// Fisher-Yates shuffle seeded with OS-random UUID v4 entropy (zero extra crate dependencies).
+pub fn shuffle_slice_with_uuid<T>(items: &mut [T]) {
+    let len = items.len();
+    if len <= 1 {
+        return;
+    }
+    for i in (1..len).rev() {
+        let bytes = *Uuid::new_v4().as_bytes();
+        let rand_u64 = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let j = (rand_u64 as usize) % (i + 1);
+        items.swap(i, j);
+    }
+}
+
 /// Top-level Dioxus provider that owns the `libmpv` worker, `souvlaki` MPRIS2/SMTC bridge,
 /// `PlayerProvider`, Mini-Player watch/action channels, and in-process `SoulbeetCore`.
 #[component]
@@ -4102,8 +4782,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
     let bootstrap = use_signal(|| None::<ClientBootstrap>);
     let core = use_signal(|| None::<Arc<SoulbeetCore>>);
     let core_error = use_signal(|| None::<String>);
+    let http_client = use_signal(build_desktop_http_client);
     let active_section = use_signal(|| StudioNavSection::Home);
     let selected_playlist_id = use_signal(|| None::<String>);
+    let selected_album_id = use_signal(|| None::<String>);
+    let selected_artist_id = use_signal(|| None::<String>);
+    let add_to_playlist_track = use_signal(|| None::<PlayerTrack>);
+    let playlist_mutating = use_signal(|| false);
     let search_seed_query = use_signal(String::new);
     let active_drawer = use_signal(|| None::<DrawerTab>);
     let inspected_track = use_signal(|| None::<PlayerTrack>);
@@ -4213,8 +4898,13 @@ pub fn DesktopStudioProvider(children: Element) -> Element {
         bootstrap,
         core,
         core_error,
+        http_client,
         active_section,
         selected_playlist_id,
+        selected_album_id,
+        selected_artist_id,
+        add_to_playlist_track,
+        playlist_mutating,
         search_seed_query,
         active_drawer,
         inspected_track,
@@ -4878,5 +5568,19 @@ mod tests {
             "Blue Öyster Cult",
             "(Don't Fear) The Reaper",
         ));
+    }
+
+    #[test]
+    fn shared_http_client_builds_with_timeouts() {
+        assert!(try_build_desktop_http_client().is_ok());
+    }
+
+    #[test]
+    fn shuffle_slice_preserves_all_elements() {
+        let mut items: Vec<usize> = (0..16).collect();
+        shuffle_slice_with_uuid(&mut items);
+        assert_eq!(items.len(), 16);
+        items.sort_unstable();
+        assert_eq!(items, (0..16).collect::<Vec<_>>());
     }
 }

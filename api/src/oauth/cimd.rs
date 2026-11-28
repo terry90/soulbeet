@@ -294,6 +294,7 @@ impl CimdFetcher {
             .redirect(Policy::none())
             .no_proxy()
             .https_only(true)
+            .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(FETCH_TIMEOUT)
             .dns_resolver(Arc::new(GlobalOnly))
             .default_headers(headers)

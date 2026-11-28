@@ -249,6 +249,18 @@ pub fn explain_base(
     authority: Option<&str>,
     pin: Option<&BaseUrl>,
 ) -> BaseExplanation {
+    explain_base_with_proxy(headers, authority, pin, true)
+}
+
+/// Like `explain_base`, but only honors `Forwarded`, `X-Forwarded-Host`, and `X-Forwarded-Proto`
+/// when `trust_proxy` is true. When `trust_proxy` is false and `pin` is `None`, proxy headers
+/// are ignored so untrusted peers cannot spoof `X-Forwarded-Proto: https`.
+pub fn explain_base_with_proxy(
+    headers: &HeaderMap,
+    authority: Option<&str>,
+    pin: Option<&BaseUrl>,
+    trust_proxy: bool,
+) -> BaseExplanation {
     let explained = |result, host_from, scheme_from| BaseExplanation {
         result,
         host_from,
@@ -263,10 +275,22 @@ pub fn explain_base(
         );
     }
 
-    let (host, host_from) = if let Some(h) = forwarded_param(headers, "host") {
-        (h, HostSource::Forwarded)
-    } else if let Some(h) = first_element(headers, "x-forwarded-host") {
-        (h.to_string(), HostSource::XForwardedHost)
+    let (host, host_from) = if trust_proxy {
+        if let Some(h) = forwarded_param(headers, "host") {
+            (h, HostSource::Forwarded)
+        } else if let Some(h) = first_element(headers, "x-forwarded-host") {
+            (h.to_string(), HostSource::XForwardedHost)
+        } else if let Some(h) = first_element(headers, header::HOST.as_str()) {
+            (h.to_string(), HostSource::Host)
+        } else if let Some(h) = authority.map(str::trim).filter(|a| !a.is_empty()) {
+            (h.to_string(), HostSource::Authority)
+        } else {
+            return explained(
+                Err(BaseUrlError::MissingHost),
+                HostSource::Missing,
+                SchemeSource::Unread,
+            );
+        }
     } else if let Some(h) = first_element(headers, header::HOST.as_str()) {
         (h.to_string(), HostSource::Host)
     } else if let Some(h) = authority.map(str::trim).filter(|a| !a.is_empty()) {
@@ -279,10 +303,23 @@ pub fn explain_base(
         );
     };
 
-    let (scheme, scheme_from) = if let Some(p) = forwarded_param(headers, "proto") {
-        (Scheme::parse(&p), SchemeSource::Forwarded)
-    } else if let Some(p) = first_element(headers, "x-forwarded-proto") {
-        (Scheme::parse(p), SchemeSource::XForwardedProto)
+    let (scheme, scheme_from) = if trust_proxy {
+        if let Some(p) = forwarded_param(headers, "proto") {
+            (Scheme::parse(&p), SchemeSource::Forwarded)
+        } else if let Some(p) = first_element(headers, "x-forwarded-proto") {
+            (Scheme::parse(p), SchemeSource::XForwardedProto)
+        } else {
+            let probe = host_url(Scheme::Http, &host).and_then(|url| BaseUrl::from_url(&url, &host));
+            match probe {
+                Err(e) => return explained(Err(e), host_from, SchemeSource::Unread),
+                Ok(probe) => match probe.host {
+                    Host::Domain(d) if d != "localhost" => {
+                        (Ok(Scheme::Https), SchemeSource::NamedHostIsHttps)
+                    }
+                    _ => (Ok(Scheme::Http), SchemeSource::LocalHostIsHttp),
+                },
+            }
+        }
     } else {
         let probe = host_url(Scheme::Http, &host).and_then(|url| BaseUrl::from_url(&url, &host));
         match probe {
@@ -309,6 +346,16 @@ pub fn request_base_with(
     explain_request(headers, uri, public_url).result
 }
 
+/// Like `request_base_with`, gating proxy header trust behind `trust_proxy`.
+pub fn request_base_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+    trust_proxy: bool,
+) -> Result<BaseUrl, BaseUrlError> {
+    explain_request_with_proxy(headers, uri, public_url, trust_proxy).result
+}
+
 /// `request_base_with`, also saying where host and scheme came from. An
 /// unusable `PUBLIC_URL` is the source of both.
 pub fn explain_request(
@@ -316,9 +363,19 @@ pub fn explain_request(
     uri: &Uri,
     public_url: Option<&Result<BaseUrl, BaseUrlError>>,
 ) -> BaseExplanation {
+    explain_request_with_proxy(headers, uri, public_url, true)
+}
+
+/// Like `explain_request`, gating proxy header trust behind `trust_proxy`.
+pub fn explain_request_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+    trust_proxy: bool,
+) -> BaseExplanation {
     match public_url {
-        None => explain_base(headers, authority(uri), None),
-        Some(Ok(pin)) => explain_base(headers, authority(uri), Some(pin)),
+        None => explain_base_with_proxy(headers, authority(uri), None, trust_proxy),
+        Some(Ok(pin)) => explain_base_with_proxy(headers, authority(uri), Some(pin), trust_proxy),
         Some(Err(e)) => BaseExplanation {
             result: Err(BaseUrlError::InvalidPublicUrl(e.to_string())),
             host_from: HostSource::PublicUrl,
@@ -330,7 +387,16 @@ pub fn explain_request(
 /// The address the request itself was sent to, from its headers, whatever
 /// `PUBLIC_URL` pins: a page opened at a LAN address talks to that address.
 pub fn addressed_to(headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, BaseUrlError> {
-    derive_base(headers, authority(uri), None)
+    addressed_to_with_proxy(headers, uri, true)
+}
+
+/// Like `addressed_to`, gating proxy header trust behind `trust_proxy`.
+pub fn addressed_to_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    trust_proxy: bool,
+) -> Result<BaseUrl, BaseUrlError> {
+    explain_base_with_proxy(headers, authority(uri), None, trust_proxy).result
 }
 
 fn authority(uri: &Uri) -> Option<&str> {
@@ -605,5 +671,18 @@ mod tests {
             BaseUrl::parse("https://x.example/").unwrap().to_string(),
             "https://x.example"
         );
+    }
+
+    #[test]
+    fn untrusted_proxy_headers_are_ignored_when_trust_proxy_is_false() {
+        let h = headers(&[
+            ("host", "192.168.1.5:9765"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "spoof.example.com"),
+        ]);
+        let e = explain_base_with_proxy(&h, None, None, false);
+        assert_eq!(e.result.unwrap().to_string(), "http://192.168.1.5:9765");
+        assert_eq!(e.host_from, HostSource::Host);
+        assert_eq!(e.scheme_from, SchemeSource::LocalHostIsHttp);
     }
 }

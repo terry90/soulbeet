@@ -148,8 +148,13 @@ impl Date {
 /// `1 Dec 2026`: the same in every locale.
 impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let month = MONTHS[usize::from(self.month) - 1];
-        write!(f, "{} {month} {}", self.day, self.year)
+        match usize::from(self.month)
+            .checked_sub(1)
+            .and_then(|i| MONTHS.get(i))
+        {
+            Some(month) => write!(f, "{} {month} {}", self.day, self.year),
+            None => write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day),
+        }
     }
 }
 
@@ -887,5 +892,36 @@ mod tests {
         assert!(!path.exists());
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn date_display_guards_out_of_bounds_month() {
+        assert_eq!(
+            Date {
+                year: 2026,
+                month: 0,
+                day: 5,
+            }
+            .to_string(),
+            "2026-00-05"
+        );
+        assert_eq!(
+            Date {
+                year: 2026,
+                month: 13,
+                day: 9,
+            }
+            .to_string(),
+            "2026-13-09"
+        );
+        assert_eq!(
+            Date {
+                year: 2026,
+                month: 255,
+                day: 1,
+            }
+            .to_string(),
+            "2026-255-01"
+        );
     }
 }

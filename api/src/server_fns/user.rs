@@ -50,7 +50,7 @@ pub async fn create_user(
 ) -> Result<models::user::User, ServerFnError> {
     use models::user::User;
 
-    if username.is_empty() || password.is_empty() {
+    if username.trim().is_empty() || username != username.trim() || password.is_empty() {
         return Err(refusal_error("Username and password are required"));
     }
     check_username_length(&username)?;
@@ -85,9 +85,10 @@ pub async fn update_username(new_username: String) -> Result<(), ServerFnError> 
 pub(crate) fn user_change_error(e: models::user::UserChangeError) -> ServerFnError {
     use models::user::UserChangeError;
     match e {
-        UserChangeError::NotFound | UserChangeError::LastAdmin | UserChangeError::UsernameTaken => {
-            refusal_error(e)
-        }
+        UserChangeError::NotFound
+        | UserChangeError::LastAdmin
+        | UserChangeError::UsernameTaken
+        | UserChangeError::InvalidInput(_) => refusal_error(e),
         UserChangeError::Db(_) => server_error(e),
     }
 }
@@ -193,6 +194,11 @@ pub(crate) async fn set_user_password_in(
     }
     if password.is_empty() {
         return Err(refusal_error("Password cannot be empty"));
+    }
+    if crate::security::is_default_password(user_id, password) {
+        return Err(refusal_error(
+            "Choose a password other than the default one.",
+        ));
     }
     models::user::User::reset_password_in(db, user_id, password)
         .await

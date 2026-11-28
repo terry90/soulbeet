@@ -24,6 +24,12 @@ const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const HEALTHY_CONNECTION_RESET: Duration = Duration::from_secs(10);
 const CONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3600);
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_LIVENESS_GRACE: Duration = Duration::from_secs(10);
+const OUTBOUND_CHANNEL_CAPACITY: usize = 128;
+const BROADCAST_EVENT_CAPACITY: usize = 256;
 
 type ConnectWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -50,7 +56,7 @@ pub struct ConnectClient {
     state: Arc<RwLock<ConnectState>>,
     state_tx: watch::Sender<ConnectState>,
     events_tx: broadcast::Sender<ConnectServerEventDto>,
-    outbound_tx: Arc<RwLock<Option<mpsc::UnboundedSender<OutboundMessage>>>>,
+    outbound_tx: Arc<RwLock<Option<mpsc::Sender<OutboundMessage>>>>,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     cancel_tx: Arc<StdMutex<Option<watch::Sender<bool>>>>,
     conn_gen: Arc<AtomicU64>,
@@ -64,7 +70,7 @@ impl ConnectClient {
         platform: DevicePlatform,
         soulbeet_auth: Arc<RwLock<Option<SoulbeetAuth>>>,
     ) -> Self {
-        let (events_tx, _) = broadcast::channel(64);
+        let (events_tx, _) = broadcast::channel(BROADCAST_EVENT_CAPACITY);
         let (state_tx, _) = watch::channel(ConnectState::default());
         Self {
             device_id,
@@ -106,7 +112,8 @@ impl ConnectClient {
         soulbeet_base_url: &str,
         heartbeat_interval: Duration,
     ) -> CoreResult<()> {
-        let heartbeat_interval = heartbeat_interval.max(Duration::from_secs(1));
+        let heartbeat_interval =
+            heartbeat_interval.clamp(MIN_HEARTBEAT_INTERVAL, MAX_HEARTBEAT_INTERVAL);
         let ws_base = http_to_ws_url(soulbeet_base_url, "/api/ws/connect")?;
         let mut ws_url = Url::parse(&ws_base)?;
         ws_url
@@ -131,7 +138,7 @@ impl ConnectClient {
 
         let (initial_conn, initial_err) = match dial_result {
             Ok(initial_stream) => {
-                let (out_tx, out_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+                let (out_tx, out_rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_CHANNEL_CAPACITY);
                 let connected_state = {
                     let mut out_guard = self.outbound_tx.write().await;
                     let mut st = self.state.write().await;
@@ -194,7 +201,7 @@ impl ConnectClient {
                                     break;
                                 }
                                 let (new_out_tx, new_out_rx) =
-                                    mpsc::unbounded_channel::<OutboundMessage>();
+                                    mpsc::channel::<OutboundMessage>(OUTBOUND_CHANNEL_CAPACITY);
                                 let reconnected_state = {
                                     let mut out_guard = outbound_tx.write().await;
                                     let mut st = state.write().await;
@@ -216,6 +223,16 @@ impl ConnectClient {
                                     }
                                     None => break,
                                 }
+                            }
+                            Err(CoreError::ServerHttp {
+                                status: status @ (401 | 403),
+                                ..
+                            }) => {
+                                tracing::warn!(
+                                    status,
+                                    "Connect WS reconnect rejected by auth; stopping reconnect loop"
+                                );
+                                break;
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -267,10 +284,18 @@ impl ConnectClient {
             }
         });
 
-        if let Ok(mut guard) = self.cancel_tx.lock() {
+        {
+            let mut guard = self
+                .cancel_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(cancel_tx);
         }
-        if let Ok(mut tasks) = self.tasks.lock() {
+        {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for handle in tasks.drain(..) {
                 handle.abort();
             }
@@ -283,12 +308,20 @@ impl ConnectClient {
     }
 
     pub async fn send(&self, msg: ConnectClientMessageDto) -> CoreResult<()> {
-        let guard = self.outbound_tx.read().await;
-        let tx = guard
-            .as_ref()
-            .ok_or_else(|| CoreError::WebSocket("connect socket is not connected".to_string()))?;
-        tx.send(OutboundMessage::Client(msg))
-            .map_err(|e| CoreError::WebSocket(format!("send failed: {e}")))
+        let tx = {
+            let guard = self.outbound_tx.read().await;
+            guard
+                .clone()
+                .ok_or_else(|| CoreError::WebSocket("connect socket is not connected".to_string()))?
+        };
+        tx.try_send(OutboundMessage::Client(msg)).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                CoreError::WebSocket("connect outbound queue full".to_string())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                CoreError::WebSocket("connect socket is closed".to_string())
+            }
+        })
     }
 
     pub async fn update_state(&self, snapshot: PlaybackSnapshotDto) -> CoreResult<()> {
@@ -334,12 +367,20 @@ impl ConnectClient {
 
     async fn disconnect_locked(&self) {
         self.conn_gen.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.cancel_tx.lock() {
+        {
+            let mut guard = self
+                .cancel_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(tx) = guard.take() {
                 let _ = tx.send(true);
             }
         }
-        if let Ok(mut tasks) = self.tasks.lock() {
+        {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for handle in tasks.drain(..) {
                 handle.abort();
             }
@@ -396,8 +437,8 @@ async fn dial_connect_ws(
 #[allow(clippy::too_many_arguments)]
 async fn run_single_connection(
     ws_stream: ConnectWsStream,
-    out_tx: mpsc::UnboundedSender<OutboundMessage>,
-    mut out_rx: mpsc::UnboundedReceiver<OutboundMessage>,
+    out_tx: mpsc::Sender<OutboundMessage>,
+    mut out_rx: mpsc::Receiver<OutboundMessage>,
     heartbeat_interval: Duration,
     gen: u64,
     conn_gen: &Arc<AtomicU64>,
@@ -425,9 +466,9 @@ async fn run_single_connection(
                 OutboundMessage::Pong(payload) => {
                     let pong_res = tokio::select! {
                         _ = writer_shutdown_rx.changed() => break,
-                        res = ws_sink.send(Message::Pong(payload)) => res,
+                        res = tokio::time::timeout(WS_WRITE_TIMEOUT, ws_sink.send(Message::Pong(payload))) => res,
                     };
-                    if pong_res.is_err() {
+                    if !matches!(pong_res, Ok(Ok(()))) {
                         break;
                     }
                 }
@@ -438,19 +479,20 @@ async fn run_single_connection(
                     };
                     let send_res = tokio::select! {
                         _ = writer_shutdown_rx.changed() => break,
-                        res = ws_sink.send(Message::Text(text.into())) => res,
+                        res = tokio::time::timeout(WS_WRITE_TIMEOUT, ws_sink.send(Message::Text(text.into()))) => res,
                     };
-                    if send_res.is_err() {
+                    if !matches!(send_res, Ok(Ok(()))) {
                         break;
                     }
                     // Send a WebSocket Ping frame alongside every Heartbeat so reverse proxies
-                    // (e.g. Nginx Proxy Manager 60s proxy_read_timeout) see bidirectional traffic.
+                    // (e.g. Nginx Proxy Manager 60s proxy_read_timeout) see bidirectional traffic
+                    // and the peer's Pong refreshes our read liveness deadline.
                     if is_heartbeat {
                         let ping_res = tokio::select! {
                             _ = writer_shutdown_rx.changed() => break,
-                            res = ws_sink.send(Message::Ping(Vec::new().into())) => res,
+                            res = tokio::time::timeout(WS_WRITE_TIMEOUT, ws_sink.send(Message::Ping(Vec::new().into()))) => res,
                         };
-                        if ping_res.is_err() {
+                        if !matches!(ping_res, Ok(Ok(()))) {
                             break;
                         }
                     }
@@ -461,6 +503,7 @@ async fn run_single_connection(
     });
 
     let hb_out_tx = out_tx.clone();
+    let hb_shutdown_tx = shutdown_tx.clone();
     let mut hb_shutdown_rx = shutdown_rx.clone();
     workers.spawn(async move {
         let mut ticker = tokio::time::interval(heartbeat_interval);
@@ -469,17 +512,23 @@ async fn run_single_connection(
             tokio::select! {
                 _ = hb_shutdown_rx.changed() => break,
                 _ = ticker.tick() => {
-                    if hb_out_tx
-                        .send(OutboundMessage::Client(ConnectClientMessageDto::Heartbeat))
-                        .is_err()
-                    {
-                        break;
+                    match hb_out_tx.try_send(OutboundMessage::Client(ConnectClientMessageDto::Heartbeat)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!("Connect WS outbound queue full on heartbeat; recycling connection");
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             }
         }
+        let _ = hb_shutdown_tx.send(true);
     });
 
+    let read_liveness_timeout = heartbeat_interval
+        .saturating_mul(2)
+        .saturating_add(READ_LIVENESS_GRACE);
     let reader_state = state.clone();
     let reader_state_tx = state_tx.clone();
     let reader_gen = conn_gen.clone();
@@ -491,9 +540,16 @@ async fn run_single_connection(
         loop {
             let frame = tokio::select! {
                 _ = reader_shutdown_rx.changed() => break,
-                next = ws_source.next() => match next {
-                    Some(f) => f,
-                    None => break,
+                next = tokio::time::timeout(read_liveness_timeout, ws_source.next()) => match next {
+                    Ok(Some(f)) => f,
+                    Ok(None) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = read_liveness_timeout.as_secs(),
+                            "Connect WS read liveness timeout elapsed; closing half-open socket"
+                        );
+                        break;
+                    }
                 }
             };
             let Ok(msg) = frame else {
@@ -517,9 +573,10 @@ async fn run_single_connection(
                     }
                 }
                 Message::Ping(payload) => {
-                    let _ = reader_out_tx.send(OutboundMessage::Pong(payload));
+                    let _ = reader_out_tx.try_send(OutboundMessage::Pong(payload));
                     None
                 }
+                Message::Pong(_) => None,
                 Message::Close(_) => break,
                 _ => None,
             };
@@ -604,12 +661,20 @@ fn clear_state_on_disconnect(st: &mut ConnectState) -> Option<ConnectState> {
 impl Drop for ConnectClient {
     fn drop(&mut self) {
         self.conn_gen.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.cancel_tx.lock() {
+        {
+            let mut guard = self
+                .cancel_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(tx) = guard.take() {
                 let _ = tx.send(true);
             }
         }
-        if let Ok(mut tasks) = self.tasks.lock() {
+        {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for handle in tasks.drain(..) {
                 handle.abort();
             }

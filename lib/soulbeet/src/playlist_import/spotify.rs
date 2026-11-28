@@ -200,6 +200,7 @@ pub(crate) async fn fetch_playlist_from(
     };
 
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
         .redirect(redirect)
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")

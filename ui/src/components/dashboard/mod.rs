@@ -673,7 +673,7 @@ pub fn StatsOverview(
                                                             "#{rank}"
                                                         }
                                                         span { class: "absolute inset-0 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity",
-                                                            IconPlay { size: 12, filled: true }
+                                                            IconPlay { size: 12, filled: true, class: "ml-0.5".to_string() }
                                                         }
                                                     }
                                                     div { class: "flex-1 min-w-0",
@@ -789,7 +789,7 @@ pub fn DeletionHistoryTab() -> Element {
             }
 
             if items.is_empty() {
-                div { class: "rounded-[10px] bg-beet-surface-low border border-beet-border-subtle p-6 text-center text-[13px] text-beet-text-secondary",
+                p { class: "py-4 text-center text-[13px] text-beet-text-secondary",
                     "No deletion history yet."
                 }
             } else {

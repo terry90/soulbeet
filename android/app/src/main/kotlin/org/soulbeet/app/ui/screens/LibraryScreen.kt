@@ -22,15 +22,23 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RemoveCircleOutline
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.outlined.OfflinePin
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,8 +48,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -81,6 +94,8 @@ fun LibraryScreen(
     onPlayTriageCard: (TriageCardItem) -> Unit,
     onStarTrack: (FfiTrack) -> Unit,
     onRemoveTrack: (FfiTrack) -> Unit,
+    onAddToPlaylist: (FfiTrack) -> Unit,
+    onCreatePlaylist: (name: String, comment: String?) -> Unit,
     onKeepDiscovery: (FfiDiscoveryTrack) -> Unit,
     onDropDiscovery: (FfiDiscoveryTrack) -> Unit,
     modifier: Modifier = Modifier,
@@ -91,6 +106,7 @@ fun LibraryScreen(
     val usedBytes = cacheStats?.totalAudioBytes?.toLong() ?: 0L
     val maxBytes = cacheStats?.maxAudioBytes?.toLong() ?: (4L * 1024L * 1024L * 1024L)
     val budgetFrac = FormattingUtils.cacheBudgetFraction(usedBytes, maxBytes)
+    var showCreatePlaylistDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -104,15 +120,15 @@ fun LibraryScreen(
     ) {
         // 1. Pinned Offline Only Switch + Cache Disk Budget Meter
         item(key = "offline_budget_card") {
-            val offlineAmber = Color(0xFFF59E0B)
-            val offlineAmberBorder = Color(0x73F59E0B)
-            val offlineAmberInk = Color(0xFF1A1002)
+            val offlineGold = colors.gold
+            val offlineGoldBorder = colors.gold.copy(alpha = 0.45f)
+            val offlineGoldInk = colors.leafInk
             Surface(
                 color = colors.surface,
                 shape = SoulbeetShapes.lg,
                 border = BorderStroke(
                     1.dp,
-                    if (state.config.offlineOnly) offlineAmberBorder else colors.borderSubtle,
+                    if (state.config.offlineOnly) offlineGoldBorder else colors.borderSubtle,
                 ),
             ) {
                 Column(
@@ -134,7 +150,7 @@ fun LibraryScreen(
                             Icon(
                                 imageVector = Icons.Filled.CloudOff,
                                 contentDescription = null,
-                                tint = if (state.config.offlineOnly) offlineAmber else colors.textMuted,
+                                tint = if (state.config.offlineOnly) offlineGold else colors.textMuted,
                             )
                             Column {
                                 Text(
@@ -157,8 +173,8 @@ fun LibraryScreen(
                             checked = state.config.offlineOnly,
                             onCheckedChange = { onToggleOfflineOnly() },
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = offlineAmberInk,
-                                checkedTrackColor = offlineAmber,
+                                checkedThumbColor = offlineGoldInk,
+                                checkedTrackColor = offlineGold,
                                 uncheckedThumbColor = colors.textMuted,
                                 uncheckedTrackColor = colors.surfaceHigh,
                             ),
@@ -207,15 +223,14 @@ fun LibraryScreen(
                 items(LibraryCategory.entries) { cat ->
                     val selected = state.libraryCategory == cat
                     Surface(
+                        onClick = { onSelectCategory(cat) },
                         color = if (selected) colors.leafSurface else colors.surfaceHigh,
                         shape = SoulbeetShapes.full,
                         border = BorderStroke(
                             1.dp,
                             if (selected) colors.leafText.copy(alpha = 0.45f) else colors.borderSubtle,
                         ),
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .clickable { onSelectCategory(cat) },
+                        modifier = Modifier.heightIn(min = 48.dp),
                     ) {
                         Box(
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
@@ -239,84 +254,87 @@ fun LibraryScreen(
                 val discoveryAndMixPlaylists = state.playlists.filter { pl ->
                     pl.kind != "user" && !(pl.kind == "seasonal" && pl.songCount == 0L)
                 }
-                if (userPlaylists.isEmpty() && discoveryAndMixPlaylists.isEmpty()) {
-                    item(key = "empty_playlists") { EmptyLibraryNotice("No playlists synced yet.") }
-                } else {
-                    if (userPlaylists.isNotEmpty()) {
-                        item(key = "section_user_playlists") {
-                            PlaylistSectionHeader(
-                                icon = Icons.AutoMirrored.Filled.QueueMusic,
-                                iconTint = colors.leafText,
-                                title = "Your Playlists",
-                                count = userPlaylists.size,
-                            )
-                        }
-                        items(userPlaylists, key = { "user_${it.id}" }) { pl ->
-                            val target = FfiPinTarget.Playlist(pl.id)
-                            val isPinned = state.pinnedTargets.any { it.target == target }
-                            PinnableContainerRow(
-                                title = pl.name,
-                                subtitle = "${pl.songCount} tracks",
-                                coverArtId = pl.coverArtId,
-                                artAuthority = artAuthority,
-                                isPinned = isPinned,
-                                onClick = { onOpenPlaylist(pl) },
-                                onTogglePin = { onTogglePin(target, pl.name) },
-                            )
-                        }
+                item(key = "section_user_playlists") {
+                    PlaylistSectionHeader(
+                        icon = Icons.AutoMirrored.Filled.QueueMusic,
+                        iconTint = colors.leafText,
+                        title = "Your Playlists",
+                        count = userPlaylists.size,
+                        actionLabel = "New Playlist",
+                        actionEnabled = !state.config.offlineOnly && !state.playlistMutationInFlight,
+                        onActionClick = { showCreatePlaylistDialog = true },
+                    )
+                }
+                if (userPlaylists.isEmpty()) {
+                    item(key = "empty_user_playlists") {
+                        EmptyLibraryNotice("No custom playlists yet. Tap + New Playlist to create one.")
                     }
-                    if (discoveryAndMixPlaylists.isNotEmpty()) {
-                        item(key = "section_discovery_mixes") {
-                            PlaylistSectionHeader(
-                                icon = Icons.Filled.AutoAwesome,
-                                iconTint = colors.accentText,
-                                title = "Discovery & Mixes",
-                                count = discoveryAndMixPlaylists.size,
+                } else {
+                    items(userPlaylists, key = { "user_${it.id}" }) { pl ->
+                        val target = FfiPinTarget.Playlist(pl.id)
+                        val isPinned = state.pinnedTargets.any { it.target == target }
+                        PinnableContainerRow(
+                            title = pl.name,
+                            subtitle = "${pl.songCount} tracks",
+                            coverArtId = pl.coverArtId,
+                            artAuthority = artAuthority,
+                            isPinned = isPinned,
+                            onClick = { onOpenPlaylist(pl) },
+                            onTogglePin = { onTogglePin(target, pl.name) },
+                        )
+                    }
+                }
+                if (discoveryAndMixPlaylists.isNotEmpty()) {
+                    item(key = "section_discovery_mixes") {
+                        PlaylistSectionHeader(
+                            icon = Icons.Filled.AutoAwesome,
+                            iconTint = colors.accentText,
+                            title = "Discovery & Mixes",
+                            count = discoveryAndMixPlaylists.size,
+                        )
+                    }
+                    items(discoveryAndMixPlaylists, key = { "mix_${it.id}" }) { pl ->
+                        val target = FfiPinTarget.Playlist(pl.id)
+                        val isPinned = state.pinnedTargets.any { it.target == target }
+                        val (tagLabel, tagIcon, tagTint, tagBg) = when (pl.kind) {
+                            "seasonal" -> Quad(
+                                "SEASONAL",
+                                Icons.Filled.CalendarMonth,
+                                colors.gold,
+                                colors.goldSurface,
+                            )
+                            "moment" -> Quad(
+                                "MOMENT",
+                                Icons.Filled.Schedule,
+                                colors.leafText,
+                                colors.leafSurface,
+                            )
+                            "discovery" -> Quad(
+                                "ROLLING",
+                                Icons.Filled.AutoAwesome,
+                                colors.accentText,
+                                colors.accentSurface,
+                            )
+                            else -> Quad(
+                                "SMART",
+                                Icons.Filled.AutoAwesome,
+                                colors.accentText,
+                                colors.accentSurface,
                             )
                         }
-                        items(discoveryAndMixPlaylists, key = { "mix_${it.id}" }) { pl ->
-                            val target = FfiPinTarget.Playlist(pl.id)
-                            val isPinned = state.pinnedTargets.any { it.target == target }
-                            val (tagLabel, tagIcon, tagTint, tagBg) = when (pl.kind) {
-                                "seasonal" -> Quad(
-                                    "SEASONAL",
-                                    Icons.Filled.CalendarMonth,
-                                    colors.gold,
-                                    colors.goldSurface,
-                                )
-                                "moment" -> Quad(
-                                    "MOMENT",
-                                    Icons.Filled.Schedule,
-                                    colors.leafText,
-                                    colors.leafSurface,
-                                )
-                                "discovery" -> Quad(
-                                    "ROLLING",
-                                    Icons.Filled.AutoAwesome,
-                                    colors.accentText,
-                                    colors.accentSurface,
-                                )
-                                else -> Quad(
-                                    "SMART",
-                                    Icons.Filled.AutoAwesome,
-                                    colors.accentText,
-                                    colors.accentSurface,
-                                )
-                            }
-                            PinnableContainerRow(
-                                title = pl.name,
-                                subtitle = "${pl.songCount} tracks",
-                                coverArtId = pl.coverArtId,
-                                artAuthority = artAuthority,
-                                isPinned = isPinned,
-                                badgeLabel = tagLabel,
-                                badgeIcon = tagIcon,
-                                badgeColor = tagTint,
-                                badgeBackground = tagBg,
-                                onClick = { onOpenPlaylist(pl) },
-                                onTogglePin = { onTogglePin(target, pl.name) },
-                            )
-                        }
+                        PinnableContainerRow(
+                            title = pl.name,
+                            subtitle = "${pl.songCount} tracks",
+                            coverArtId = pl.coverArtId,
+                            artAuthority = artAuthority,
+                            isPinned = isPinned,
+                            badgeLabel = tagLabel,
+                            badgeIcon = tagIcon,
+                            badgeColor = tagTint,
+                            badgeBackground = tagBg,
+                            onClick = { onOpenPlaylist(pl) },
+                            onTogglePin = { onTogglePin(target, pl.name) },
+                        )
                     }
                 }
             }
@@ -385,6 +403,7 @@ fun LibraryScreen(
                             onClick = { onPlayQueue(state.starredTracks, index, "Starred") },
                             onStarClick = { onStarTrack(track) },
                             onRemoveClick = { onRemoveTrack(track) },
+                            onAddToPlaylistClick = { onAddToPlaylist(track) },
                         )
                     }
                 }
@@ -440,11 +459,27 @@ fun LibraryScreen(
                             onClick = { onPlayQueue(state.offlineTracks, index, "Cached") },
                             onStarClick = { onStarTrack(track) },
                             onRemoveClick = { onRemoveTrack(track) },
+                            onAddToPlaylistClick = { onAddToPlaylist(track) },
                         )
                     }
                 }
             }
         }
+    }
+
+    if (showCreatePlaylistDialog) {
+        PlaylistFormDialog(
+            title = "New Playlist",
+            confirmLabel = "Create",
+            initialName = "",
+            initialComment = "",
+            isBusy = state.playlistMutationInFlight,
+            onDismiss = { showCreatePlaylistDialog = false },
+            onConfirm = { name, comment ->
+                showCreatePlaylistDialog = false
+                onCreatePlaylist(name, comment)
+            },
+        )
     }
 }
 
@@ -456,6 +491,9 @@ private fun PlaylistSectionHeader(
     iconTint: Color,
     title: String,
     count: Int,
+    actionLabel: String? = null,
+    actionEnabled: Boolean = true,
+    onActionClick: (() -> Unit)? = null,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -469,6 +507,7 @@ private fun PlaylistSectionHeader(
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.weight(1f),
         ) {
             Icon(
                 imageVector = icon,
@@ -480,13 +519,45 @@ private fun PlaylistSectionHeader(
                 text = title,
                 style = type.titleMd,
                 color = colors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "$count",
+                style = type.monoXs,
+                color = colors.textMuted,
             )
         }
-        Text(
-            text = "$count",
-            style = type.monoXs,
-            color = colors.textMuted,
-        )
+        if (actionLabel != null && onActionClick != null) {
+            Surface(
+                onClick = onActionClick,
+                enabled = actionEnabled,
+                color = colors.leafSurface,
+                shape = SoulbeetShapes.full,
+                border = BorderStroke(1.dp, colors.leafText.copy(alpha = 0.4f)),
+                modifier = Modifier.heightIn(min = 36.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Add,
+                        contentDescription = null,
+                        tint = if (actionEnabled) colors.leafText else colors.textDisabled,
+                        modifier = Modifier.size(15.dp),
+                    )
+                    Text(
+                        text = actionLabel,
+                        style = type.monoXs,
+                        color = if (actionEnabled) colors.leafText else colors.textDisabled,
+                        maxLines = 1,
+                        softWrap = false,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -620,11 +691,18 @@ internal fun ContainerDetailSheet(
     onPlayIndex: (Int) -> Unit,
     onTogglePin: () -> Unit,
     onStarTrack: (FfiTrack) -> Unit,
-    onRemoveTrack: (FfiTrack) -> Unit,
+    onAddToPlaylist: (FfiTrack) -> Unit,
+    onRemoveFromPlaylist: (FfiTrack) -> Unit,
+    onRemoveFromLibrary: (FfiTrack) -> Unit,
+    onRenamePlaylist: (name: String, comment: String?) -> Unit,
+    onDeletePlaylist: () -> Unit,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var showOverflowMenu by remember(detail.id) { mutableStateOf(false) }
+    var showRenameDialog by remember(detail.id) { mutableStateOf(false) }
+    var showDeleteConfirm by remember(detail.id) { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -664,6 +742,75 @@ internal fun ContainerDetailSheet(
                         style = type.bodySm,
                         color = colors.textSecondary,
                     )
+                    if (!detail.comment.isNullOrBlank()) {
+                        Text(
+                            text = detail.comment,
+                            style = type.bodySm,
+                            color = colors.textMuted,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                if (detail.isStaticUserPlaylist) {
+                    Box {
+                        IconButton(
+                            onClick = { showOverflowMenu = true },
+                            modifier = Modifier.size(48.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.MoreVert,
+                                contentDescription = "Playlist actions",
+                                tint = colors.textSecondary,
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = showOverflowMenu,
+                            onDismissRequest = { showOverflowMenu = false },
+                            containerColor = colors.surfaceHigh,
+                        ) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Rename / Edit",
+                                        style = type.bodySm,
+                                        color = colors.textPrimary,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Filled.Edit,
+                                        contentDescription = null,
+                                        tint = colors.leafText,
+                                    )
+                                },
+                                onClick = {
+                                    showOverflowMenu = false
+                                    showRenameDialog = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Delete Playlist",
+                                        style = type.bodySm,
+                                        color = colors.crimsonText,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Filled.DeleteOutline,
+                                        contentDescription = null,
+                                        tint = colors.crimsonText,
+                                    )
+                                },
+                                onClick = {
+                                    showOverflowMenu = false
+                                    showDeleteConfirm = true
+                                },
+                            )
+                        }
+                    }
                 }
             }
 
@@ -716,6 +863,21 @@ internal fun ContainerDetailSheet(
             ) {
                 itemsIndexed(detail.tracks, key = { idx, t -> "cd_${idx}_${t.id}" }) { idx, track ->
                     val isCached = state.offlineTrackIds.contains(track.id)
+                    val removeAction: (() -> Unit)? = when {
+                        detail.isStaticUserPlaylist -> ({ onRemoveFromPlaylist(track) })
+                        detail.isSmartOrSystemPlaylist -> null
+                        else -> ({ onRemoveFromLibrary(track) })
+                    }
+                    val removeLabel = if (detail.isStaticUserPlaylist) {
+                        "Remove from playlist"
+                    } else {
+                        "Remove from library"
+                    }
+                    val removeIcon = if (detail.isStaticUserPlaylist) {
+                        Icons.Filled.RemoveCircleOutline
+                    } else {
+                        Icons.Filled.DeleteOutline
+                    }
                     TrackRow(
                         title = track.title,
                         artist = track.artistName,
@@ -730,10 +892,65 @@ internal fun ContainerDetailSheet(
                         userRating = track.userRating.toInt(),
                         onClick = { onPlayIndex(idx) },
                         onStarClick = { onStarTrack(track) },
-                        onRemoveClick = { onRemoveTrack(track) },
+                        onRemoveClick = removeAction,
+                        removeLabel = removeLabel,
+                        removeIcon = removeIcon,
+                        onAddToPlaylistClick = { onAddToPlaylist(track) },
                     )
                 }
             }
         }
+    }
+
+    if (showRenameDialog && detail.isStaticUserPlaylist) {
+        PlaylistFormDialog(
+            title = "Edit Playlist",
+            confirmLabel = "Save",
+            initialName = detail.title,
+            initialComment = detail.comment.orEmpty(),
+            isBusy = state.playlistMutationInFlight,
+            onDismiss = { showRenameDialog = false },
+            onConfirm = { name, comment ->
+                showRenameDialog = false
+                onRenamePlaylist(name, comment)
+            },
+        )
+    }
+
+    if (showDeleteConfirm && detail.isStaticUserPlaylist) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            containerColor = colors.surfaceHigh,
+            title = {
+                Text(
+                    text = "Delete Playlist?",
+                    style = type.titleMd,
+                    color = colors.textPrimary,
+                )
+            },
+            text = {
+                Text(
+                    text = "Delete \"${detail.title}\"? Your audio files stay safe in your library.",
+                    style = type.bodySm,
+                    color = colors.textSecondary,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirm = false
+                        onDeletePlaylist()
+                    },
+                    enabled = !state.playlistMutationInFlight,
+                ) {
+                    Text("Delete", color = colors.crimsonText)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
     }
 }

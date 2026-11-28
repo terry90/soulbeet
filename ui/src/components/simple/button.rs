@@ -8,10 +8,12 @@ pub enum ButtonVariant {
 }
 
 impl ButtonVariant {
-    fn get_classes(&self) -> &'static str {
-        match self {
-            ButtonVariant::Primary => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-all cursor-pointer",
-            ButtonVariant::Secondary => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer",
+    fn get_classes(&self, disabled: bool) -> &'static str {
+        match (self, disabled) {
+            (ButtonVariant::Primary, false) => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 transition-[color,background-color,border-color,filter] cursor-pointer",
+            (ButtonVariant::Primary, true) => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-semibold rounded-[10px] bg-beet-leaf-solid text-beet-leaf-ink transition-[color,background-color,border-color,filter]",
+            (ButtonVariant::Secondary, false) => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary hover:bg-beet-surface-high hover:text-beet-text-primary transition-colors cursor-pointer",
+            (ButtonVariant::Secondary, true) => "inline-flex items-center justify-center gap-2 px-4 h-10 text-sm font-medium rounded-[10px] bg-beet-surface border border-beet-border-default text-beet-text-secondary transition-colors",
         }
     }
 }
@@ -38,10 +40,10 @@ pub struct Props {
 
 #[component]
 pub fn Button(props: Props) -> Element {
-    let variant_classes = props.variant.get_classes();
     let disabled = props.disabled || props.busy;
+    let variant_classes = props.variant.get_classes(disabled);
     let disabled_classes = if props.busy {
-        "opacity-80 pointer-events-none"
+        "opacity-80 cursor-not-allowed pointer-events-none"
     } else if props.disabled {
         "opacity-50 cursor-not-allowed grayscale pointer-events-none"
     } else {

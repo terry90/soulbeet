@@ -99,15 +99,15 @@ pub fn cut_chars(text: String, max_chars: usize) -> String {
         return text;
     }
     let marker = |left_out: usize| format!("\n[{left_out} characters left out]\n");
-    debug_assert!(
-        max_chars >= marker(total).chars().count(),
-        "cut_chars: {max_chars} characters cannot hold the line saying what was left out"
-    );
-    let mut kept = max_chars - marker(total).chars().count();
+    let initial_marker_len = marker(total).chars().count();
+    if max_chars < initial_marker_len {
+        return text.chars().take(max_chars).collect();
+    }
+    let mut kept = max_chars - initial_marker_len;
     // Each character kept is one fewer left out, whose count can be a
     // digit shorter: keep characters until the marker leaves no room.
     loop {
-        let room = max_chars - marker(total - kept).chars().count();
+        let room = max_chars.saturating_sub(marker(total - kept).chars().count());
         if room == kept {
             break;
         }
@@ -162,10 +162,19 @@ pub fn cut_json(text: String, max_chars: usize) -> String {
     // No more characters are left out than the text has, so the line takes
     // at most this much.
     let marker_room = json_chars(&marker(count));
-    debug_assert!(
-        max_chars >= marker_room,
-        "cut_json: {max_chars} characters cannot hold the line saying what was left out"
-    );
+    if max_chars < marker_room {
+        let mut out = String::new();
+        let mut used = 0;
+        for c in text.chars() {
+            let w = json_width(c);
+            if used + w > max_chars {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        return out;
+    }
     let room = max_chars - marker_room;
     let (mut head_end, mut head_chars, mut used) = (0, 0, 0);
     for (at, c) in text.char_indices() {
@@ -880,5 +889,23 @@ mod tests {
         )
         .with_retry_after(7);
         assert_eq!(f.retry_after_seconds, Some(7));
+    }
+
+    #[test]
+    fn cut_chars_and_cut_json_handle_tiny_max_chars_without_underflow() {
+        let long = "abcdef\n\"\\\u{0001}ghijklmnopqrstuvwxyz0123456789".to_string();
+        for max in [0usize, 1, 2, 5, 10, 20, 26, 27, 28, 35] {
+            let c = cut_chars(long.clone(), max);
+            assert!(
+                c.chars().count() <= max,
+                "cut_chars exceeded max={max}: {c:?}"
+            );
+            let j = cut_json(long.clone(), max);
+            assert!(
+                json_chars(&j) <= max,
+                "cut_json exceeded max={max}: {j:?} (json_chars={})",
+                json_chars(&j)
+            );
+        }
     }
 }

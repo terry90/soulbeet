@@ -4,7 +4,7 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use crate::{
     auth::{self, PasswordProof, RegistrationMode, NO_PASSWORD},
-    base_url::{request_base_with, BaseUrl, BaseUrlError},
+    base_url::{explain_request_with_proxy, BaseUrl, BaseUrlError, SchemeSource},
     config::CONFIG,
     login_limiter::{Budget, LoginLimiter, LOGIN_LIMITER},
     models,
@@ -69,22 +69,41 @@ impl SessionCookie {
         headers: &HeaderMap,
         uri: &Uri,
     ) -> Result<SessionCookie, ServerFnError> {
-        Self::for_request_with(headers, uri, CONFIG.public_url())
+        Self::for_request_with_proxy(
+            headers,
+            uri,
+            CONFIG.public_url(),
+            crate::config::trust_proxy_headers(),
+        )
     }
 
     /// `for_request` with `public_url`, the parsed `PUBLIC_URL`.
+    #[cfg(test)]
     pub(crate) fn for_request_with(
         headers: &HeaderMap,
         uri: &Uri,
         public_url: Option<&Result<BaseUrl, BaseUrlError>>,
     ) -> Result<SessionCookie, ServerFnError> {
-        let base = request_base_with(headers, uri, public_url)
+        Self::for_request_with_proxy(headers, uri, public_url, true)
+    }
+
+    pub(crate) fn for_request_with_proxy(
+        headers: &HeaderMap,
+        uri: &Uri,
+        public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+        trust_proxy: bool,
+    ) -> Result<SessionCookie, ServerFnError> {
+        let explained = explain_request_with_proxy(headers, uri, public_url, trust_proxy);
+        let base = explained
+            .result
             .map_err(|e| refusal_error(format!("Cannot tell this request's address: {e}")))?;
         let origin = headers
             .get(axum::http::header::ORIGIN)
             .and_then(|v| v.to_str().ok());
+        // Never drop the Secure flag when PUBLIC_URL is explicitly pinned to https://.
+        let pinned_https = explained.scheme_from == SchemeSource::PublicUrl && base.is_https();
         Ok(SessionCookie {
-            secure: secure_for(&base, origin),
+            secure: pinned_https || secure_for(&base, origin),
         })
     }
 }
@@ -145,10 +164,49 @@ pub async fn get_login_options() -> Result<LoginOptions, ServerFnError> {
     })
 }
 
+#[cfg(feature = "server")]
+static REGISTER_LIMITER: std::sync::LazyLock<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+#[cfg(feature = "server")]
+const REGISTER_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg(feature = "server")]
+const REGISTER_MAX_PER_WINDOW: usize = 10;
+
+#[cfg(feature = "server")]
+fn check_register_rate_limit() -> Result<(), ServerFnError> {
+    let now = std::time::Instant::now();
+    let mut attempts = REGISTER_LIMITER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while attempts
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= REGISTER_WINDOW)
+    {
+        attempts.pop_front();
+    }
+    if attempts.len() >= REGISTER_MAX_PER_WINDOW {
+        return Err(rate_limited_error(
+            "Too many registration attempts. Please try again later.",
+        ));
+    }
+    attempts.push_back(now);
+    Ok(())
+}
+
 #[post("/api/auth/register")]
 pub async fn register(username: String, password: String) -> Result<(), ServerFnError> {
     if let Some(msg) = registration_refusal(CONFIG.registration()) {
         return Err(refusal_error(msg));
+    }
+    check_register_rate_limit()?;
+    if username.trim().is_empty() || username != username.trim() {
+        return Err(refusal_error(
+            "Username cannot be empty or have leading/trailing whitespace",
+        ));
+    }
+    if password.is_empty() {
+        return Err(refusal_error("Password cannot be empty"));
     }
     super::user::check_username_length(&username)?;
     let user = models::user::User::create(&username, &password)
@@ -775,18 +833,29 @@ pub(crate) async fn end_session_in(
         .await
 }
 
-/// Ends the session the request's cookie holds, then clears the cookie. The
-/// cookie stays when the token could not be revoked, so a failed sign-out
-/// leaves the browser signed in rather than out while the token still works.
-#[cfg(feature = "server")]
+/// Ends the session the request's cookie or Bearer Authorization header holds, then clears
+/// the cookie. The cookie stays when the token could not be revoked, so a failed sign-out
+/// leaves the client signed in rather than out while the token still works.
+#[cfg(all(test, feature = "server"))]
 pub(crate) async fn sign_out_in(
     cookies: &Cookies,
     db: &sqlx::SqlitePool,
     key: &crate::secret_key::SecretKey,
     now: i64,
 ) -> Result<(), String> {
-    if let Some(token) = cookies.get(AUTH_COOKIE_NAME) {
-        end_session_in(db, key, token.value(), now).await?;
+    sign_out_with_headers_in(cookies, &HeaderMap::new(), db, key, now).await
+}
+
+#[cfg(feature = "server")]
+pub(crate) async fn sign_out_with_headers_in(
+    cookies: &Cookies,
+    headers: &HeaderMap,
+    db: &sqlx::SqlitePool,
+    key: &crate::secret_key::SecretKey,
+    now: i64,
+) -> Result<(), String> {
+    if let Some(token) = super::guard::extract_session_token(Some(cookies), headers) {
+        end_session_in(db, key, &token, now).await?;
     }
     let mut cookie = Cookie::new(AUTH_COOKIE_NAME, "");
     cookie.set_path("/");
@@ -794,10 +863,11 @@ pub(crate) async fn sign_out_in(
     Ok(())
 }
 
-#[post("/api/auth/logout", cookies: Cookies)]
+#[post("/api/auth/logout", cookies: Cookies, headers: HeaderMap)]
 pub async fn logout() -> Result<(), ServerFnError> {
-    sign_out_in(
+    sign_out_with_headers_in(
         &cookies,
+        &headers,
         &crate::db::DB,
         crate::secret_key::current(),
         chrono::Utc::now().timestamp(),
@@ -2235,5 +2305,58 @@ mod tests {
         assert_eq!(load(other_device).await.unwrap().user_id, ann.id);
         // A token that does not verify has nothing to end.
         end_session_in(&db, &key, "not-a-token", 0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bearer_token_sign_out_revokes_session() {
+        use crate::secret_key::SecretKey;
+        let db = test_db::migrated().await;
+        let ann = User::create_in(&db, "ann", "pw").await.unwrap();
+        let key = SecretKey::new("k".repeat(32));
+        let token = auth::create_token(&key, &ann.id, 0).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let cookies = Cookies::default();
+        sign_out_with_headers_in(&cookies, &headers, &db, &key, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let ended = crate::server_fns::guard::load_session(Some(&token), &db, &key).await;
+        assert_eq!(ended.unwrap_err().0.as_u16(), 401);
+    }
+
+    #[test]
+    fn pinned_https_public_url_never_drops_secure_cookie_flag() {
+        let pin = BaseUrl::parse("https://music.example.com");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://evil.example.com"),
+        );
+        let uri: Uri = "/api/auth/login".parse().unwrap();
+        let cookie = SessionCookie::for_request_with(&headers, &uri, Some(&pin)).unwrap();
+        assert!(cookie.secure());
+    }
+
+    #[test]
+    fn session_cookie_respects_trust_proxy_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("192.168.1.5:9765"),
+        );
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-forwarded-proto"),
+            axum::http::HeaderValue::from_static("https"),
+        );
+        let uri: Uri = "/api/auth/login".parse().unwrap();
+
+        let trusted = SessionCookie::for_request_with_proxy(&headers, &uri, None, true).unwrap();
+        assert!(trusted.secure());
+
+        let untrusted = SessionCookie::for_request_with_proxy(&headers, &uri, None, false).unwrap();
+        assert!(!untrusted.secure());
     }
 }

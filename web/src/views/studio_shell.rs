@@ -8,18 +8,19 @@ use shared::download::DownloadableItem;
 use shared::recommendation::ContextualMixKind;
 use shared::system::NavidromeStatus;
 use ui::{
-    format_mix_title, friendly_error, use_player, CommandPalette, Downloads, DrawerTab,
-    IconLoader, IconPlay, Modal, MultiListenerGuardModal, PaletteCategory, PaletteCommand,
-    SearchPrefill, SearchReset, ShareModal, SidebarPlaylistItem, StatusAction, StatusBanner,
-    StudioMobileNav, StudioNavSection, StudioPlayerBar, StudioRightDrawer, StudioSidebar,
-    StudioTopBar, UndoSnackbar, WhatsNew,
+    format_mix_title, friendly_error, use_player, AddToPlaylistModal, CommandPalette,
+    CreateEditPlaylistModal, Downloads, DrawerTab, IconLoader, IconPlay, IconX, Modal,
+    MultiListenerGuardModal, PaletteCategory, PaletteCommand, SearchPrefill, SearchReset,
+    ShareModal, SidebarPlaylistItem, StatusAction, StatusBanner, StudioMobileNav, StudioNavSection,
+    StudioPlayerBar, StudioRightDrawer, StudioSidebar, StudioTopBar, UndoSnackbar, WhatsNew,
 };
 
 use crate::auth::use_auth;
 use crate::shortcuts::use_studio_shortcuts;
 use crate::views::{SettingsTab, SettingsTabRequest, SsoLinkNotice};
 use crate::web_player::{
-    build_connect_snapshot, use_studio, ManualChoiceModalState, WebStudioProvider,
+    build_connect_snapshot, use_studio, ManualChoiceModalState, PlaylistModalState,
+    WebStudioProvider,
 };
 use crate::Route;
 
@@ -41,8 +42,54 @@ fn StudioShellContent() -> Element {
     let nav = use_navigator();
     let route = use_route::<Route>();
 
-    // Install global keyboard shortcuts (Space, Arrows, S, 1-5, P, X, L, Q, I, R, M, Ctrl+K)
+    // Install global keyboard shortcuts (Space, Arrows, /, S, 1-5, P, X, L, Q, I, R, M, Ctrl+K, Esc)
     use_studio_shortcuts();
+
+    // Auto-close StudioRightDrawer whenever the user navigates to a new route.
+    let mut prev_route = use_signal(|| route.clone());
+    if *prev_route.peek() != route {
+        prev_route.set(route.clone());
+        if studio.drawer_tab.peek().is_some() {
+            studio.drawer_tab.set(None);
+        }
+    }
+
+    // Shell-scoped 3.5s auto-dismiss for status toasts so route transitions never orphan a toast.
+    use_effect(move || {
+        let gen = (studio.toast_gen)();
+        if studio.toast_notice.peek().is_none() {
+            return;
+        }
+        spawn(async move {
+            ui::sleep_ms(3500).await;
+            if *studio.toast_gen.peek() == gen {
+                studio.toast_notice.set(None);
+            }
+        });
+    });
+
+    // Shell-scoped playlist refresh so child route unmounts (e.g. deleting a playlist then
+    // navigating to Library) never cancel the spawned fetch.
+    let mut playlists_refresh_req_id = use_signal(|| 0u64);
+    use_effect(move || {
+        let tick = (studio.playlists_refresh_tick)();
+        if tick == 0 {
+            return;
+        }
+        let Some(info) = studio.navidrome_info() else {
+            return;
+        };
+        let next_req = playlists_refresh_req_id.peek().wrapping_add(1);
+        playlists_refresh_req_id.set(next_req);
+        spawn(async move {
+            if let Ok(list) = crate::navidrome_web::fetch_playlists(&info).await {
+                if *playlists_refresh_req_id.peek() == next_req {
+                    studio.playlists.set(list);
+                    studio.reclassify_playlists();
+                }
+            }
+        });
+    });
 
     // Contexts expected by existing Search & Settings views
     let search_reset = use_signal(|| 0);
@@ -122,9 +169,12 @@ fn StudioShellContent() -> Element {
 
     let active_drop = studio.pending_drops.read().active().cloned();
     let current_guard_modal = studio.guard_modal.read().clone();
+    let current_guard_loading = studio.guard_modal_loading.read().clone();
+    let current_playlist_modal = studio.playlist_modal.read().clone();
     let current_share_modal = studio.share_modal.read().clone();
     let current_manual_modal = studio.manual_choice_modal.read().clone();
     let current_toast = studio.toast_notice.read().clone();
+    let hide_topbar_search = matches!(route, Route::SearchPage {});
 
     rsx! {
         div { class: "h-screen w-screen overflow-hidden flex flex-col bg-beet-canvas text-beet-text-primary",
@@ -138,13 +188,25 @@ fn StudioShellContent() -> Element {
                     show_offline_toggle: false,
                     active_transfers_count: active_transfers,
                     pinned_seasonal,
-                    on_open_seasonal: move |_slug| {
-                        nav.push(Route::DiscoverPage {});
+                    on_open_seasonal: move |slug| {
+                        nav.push(Route::MixDetailPage { slug });
                     },
                     playlists: sidebar_playlists,
-                    on_select_playlist: move |pid| {
-                        studio.selected_playlist_id.set(Some(pid));
-                        nav.push(Route::LibraryPage {});
+                    on_select_playlist: move |pid: String| {
+                        let matching_mix_slug = studio
+                            .contextual_mixes
+                            .peek()
+                            .iter()
+                            .find(|m| m.navidrome_playlist_id.as_deref() == Some(pid.as_str()))
+                            .map(|m| m.slug.clone());
+                        if let Some(slug) = matching_mix_slug {
+                            nav.push(Route::MixDetailPage { slug });
+                        } else {
+                            nav.push(Route::PlaylistDetailPage { id: pid });
+                        }
+                    },
+                    on_create_playlist: move |_| {
+                        studio.open_create_playlist("", Vec::new());
                     },
                     username: auth.username(),
                     on_whats_new: move |_| showing_all_whats_new.set(true),
@@ -166,6 +228,7 @@ fn StudioShellContent() -> Element {
                         on_logout: move |_| do_logout(),
                         active_transfers_count: active_transfers,
                         culture_badge,
+                        hide_search_bar: hide_topbar_search,
                     }
 
                     // Status & System Health Banners
@@ -230,6 +293,22 @@ fn StudioShellContent() -> Element {
                     on_drop: move |track| studio.drop_track(auth, player, track),
                     on_rate: move |(track, rating)| studio.rate_track(auth, player, track, rating),
                     on_start_radio: move |track| studio.start_radio(auth, player, track),
+                    on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                    on_album_click: move |album| studio.navigate_to_album(nav, album),
+                    on_save_queue_as_playlist: move |_| {
+                        let ids: Vec<String> = player
+                            .snapshot()
+                            .queue
+                            .into_iter()
+                            .map(|t| t.id)
+                            .filter(|id| !id.trim().is_empty())
+                            .collect();
+                        if ids.is_empty() {
+                            studio.show_toast("No playable library tracks in queue to save.");
+                        } else {
+                            studio.open_create_playlist("Queue Playlist", ids);
+                        }
+                    },
                     on_share: move |track| studio.open_share_track(&track),
                 }
             }
@@ -238,6 +317,24 @@ fn StudioShellContent() -> Element {
             StudioPlayerBar {
                 active_drawer_tab: (studio.drawer_tab)(),
                 on_toggle_drawer: move |tab| studio.toggle_drawer(tab),
+                on_inspect_current: move |_| {
+                    let showing_current_inspector = *studio.drawer_tab.peek()
+                        == Some(DrawerTab::Inspector)
+                        && studio.inspected_track.peek().is_none();
+                    if showing_current_inspector {
+                        studio.drawer_tab.set(None);
+                    } else {
+                        studio.inspected_track.set(None);
+                        studio.drawer_tab.set(Some(DrawerTab::Inspector));
+                        if let Some(cur) = player.current_track() {
+                            if !cur.id.is_empty() {
+                                studio.fetch_guard_preview(auth, cur.id);
+                            }
+                        }
+                    }
+                },
+                on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                on_album_click: move |album| studio.navigate_to_album(nav, album),
                 connect_devices: (studio.connect_devices)(),
                 local_device_id: (studio.local_device_id)(),
                 acquiring_in_flight,
@@ -279,31 +376,84 @@ fn StudioShellContent() -> Element {
             }
 
             // Floating 5-Second Undo Snackbar (Discovery Drops)
-            if let Some(drop_item) = active_drop {
-                {
-                    let drop_key = drop_item.key.clone();
-                    rsx! {
-                        div { class: "fixed bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
-                            UndoSnackbar {
-                                message: drop_item.snackbar_message(),
-                                action_label: "Undo".to_string(),
-                                duration_ms: 5000,
-                                key_id: Some(drop_key.clone()),
-                                on_undo: move |_| studio.undo_pending_drop(),
-                                on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth, drop_key.clone()),
+            {
+                let has_active_drop = active_drop.is_some();
+                let toast_position_cls = if has_active_drop {
+                    "pointer-events-none fixed bottom-[232px] md:bottom-[220px] lg:bottom-[168px] inset-x-0 z-50 flex justify-center px-4"
+                } else {
+                    "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] inset-x-0 z-50 flex justify-center px-4"
+                };
+                rsx! {
+                    if let Some(drop_item) = active_drop {
+                        {
+                            let drop_key = drop_item.key.clone();
+                            rsx! {
+                                div { class: "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
+                                    div { class: "pointer-events-auto",
+                                        UndoSnackbar {
+                                            message: drop_item.snackbar_message(),
+                                            action_label: "Undo".to_string(),
+                                            duration_ms: 5000,
+                                            key_id: Some(drop_key.clone()),
+                                            on_undo: move |_| studio.undo_pending_drop(player),
+                                            on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth, drop_key.clone()),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Floating Subtle Toast Notice (bottom-center above player bar; offsets above UndoSnackbar when visible)
+                    if let Some(msg) = current_toast {
+                        div {
+                            class: "{toast_position_cls}",
+                            div {
+                                role: "status",
+                                aria_live: "polite",
+                                class: "pointer-events-none inline-flex items-center gap-2.5 pl-4 pr-2.5 py-2 rounded-full bg-beet-surface-high border border-beet-border-default shadow-xl text-[13px] font-medium text-beet-text-primary max-w-md",
+                                span { class: "truncate", "{msg}" }
+                                button {
+                                    r#type: "button",
+                                    aria_label: "Dismiss notification",
+                                    class: "pointer-events-auto w-6 h-6 rounded-full inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-highest transition-colors cursor-pointer shrink-0",
+                                    onclick: move |_| studio.dismiss_toast(),
+                                    IconX { size: 13 }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Floating Subtle Toast Notice (Keep / Radio / Transfers)
-            if let Some(msg) = current_toast {
-                div {
-                    role: "status",
-                    aria_live: "polite",
-                    class: "fixed top-16 right-6 z-50 px-4 py-2.5 rounded-[10px] bg-beet-surface-high border border-beet-border-default shadow-xl text-[13px] font-medium text-beet-text-primary max-w-sm",
-                    "{msg}"
+            // Multi-Listener Delete Guard Loading Modal (opens immediately while preview resolves)
+            if let Some(loading_track) = current_guard_loading {
+                Modal {
+                    on_close: move |_| studio.guard_modal_loading.set(None),
+                    header: rsx! {
+                        div { class: "min-w-0",
+                            h2 { class: "text-[16px] font-semibold text-beet-text-primary leading-tight",
+                                "Checking household protection..."
+                            }
+                            p { class: "text-[12px] text-beet-text-secondary truncate mt-0.5",
+                                "{loading_track.title} · {loading_track.artist}"
+                            }
+                        }
+                    },
+                    footer: rsx! {
+                        div { class: "flex justify-end",
+                            button {
+                                r#type: "button",
+                                class: "h-9 px-4 rounded-[8px] text-[13px] font-medium text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors cursor-pointer",
+                                onclick: move |_| studio.guard_modal_loading.set(None),
+                                "Cancel"
+                            }
+                        }
+                    },
+                    div { class: "py-6 flex items-center justify-center gap-2.5 text-[13px] text-beet-text-secondary",
+                        IconLoader { size: 16, class: "animate-spin text-beet-leaf-text".to_string() }
+                        span { "Inspecting listener marks and shared playlists..." }
+                    }
                 }
             }
 
@@ -316,6 +466,63 @@ fn StudioShellContent() -> Element {
                     busy: modal_state.busy,
                     on_confirm: move |_| studio.confirm_guard_modal(auth, player),
                     on_cancel: move |_| studio.guard_modal.set(None),
+                }
+            }
+
+            // Global Playlist Management Modals (Create, Edit, Add Tracks)
+            if let Some(pl_modal) = current_playlist_modal {
+                match pl_modal {
+                    PlaylistModalState::Create {
+                        initial_name,
+                        initial_song_ids,
+                    } => rsx! {
+                        CreateEditPlaylistModal {
+                            initial_name,
+                            initial_song_ids,
+                            on_saved: move |saved: api::PlaylistMutationResult| {
+                                studio.playlist_modal.set(None);
+                                studio.refresh_playlists();
+                                studio.show_toast(format!("Created playlist \"{}\"", saved.name));
+                                nav.push(Route::PlaylistDetailPage { id: saved.id });
+                            },
+                            on_close: move |_| studio.playlist_modal.set(None),
+                        }
+                    },
+                    PlaylistModalState::Edit {
+                        playlist_id,
+                        initial_name,
+                        initial_comment,
+                        initial_public,
+                    } => rsx! {
+                        CreateEditPlaylistModal {
+                            editing_playlist_id: Some(playlist_id),
+                            initial_name,
+                            initial_comment,
+                            initial_public,
+                            on_saved: move |saved: api::PlaylistMutationResult| {
+                                studio.playlist_modal.set(None);
+                                studio.refresh_playlists();
+                                studio.show_toast(format!("Updated playlist \"{}\"", saved.name));
+                            },
+                            on_close: move |_| studio.playlist_modal.set(None),
+                        }
+                    },
+                    PlaylistModalState::AddTracks {
+                        item_label,
+                        song_ids,
+                    } => rsx! {
+                        AddToPlaylistModal {
+                            item_label,
+                            song_ids,
+                            playlists: studio.static_playlist_targets(),
+                            on_added: move |saved: api::PlaylistMutationResult| {
+                                studio.playlist_modal.set(None);
+                                studio.refresh_playlists();
+                                studio.show_toast(format!("Added to \"{}\"", saved.name));
+                            },
+                            on_close: move |_| studio.playlist_modal.set(None),
+                        }
+                    },
                 }
             }
 
@@ -384,9 +591,13 @@ fn StudioShellContent() -> Element {
 fn route_to_section(route: &Route) -> StudioNavSection {
     match route {
         Route::HomePage {} => StudioNavSection::Home,
-        Route::DiscoverPage {} => StudioNavSection::Discover,
+        Route::DiscoverPage {} | Route::MixDetailPage { .. } => StudioNavSection::Discover,
         Route::SearchPage {} => StudioNavSection::Search,
-        Route::LibraryPage {} | Route::DashboardPage {} => StudioNavSection::Library,
+        Route::LibraryPage {}
+        | Route::DashboardPage {}
+        | Route::PlaylistDetailPage { .. }
+        | Route::AlbumDetailPage { .. }
+        | Route::ArtistDetailPage { .. } => StudioNavSection::Library,
         Route::ActivityPage {} => StudioNavSection::Activity,
         Route::SettingsPage {} | Route::SsoLinkResultPage { .. } => StudioNavSection::Settings,
         _ => StudioNavSection::Home,
@@ -440,10 +651,10 @@ fn build_palette_commands(
         PaletteCommand {
             id: "nav.search".into(),
             label: "Go to Search".into(),
-            subtitle: Some("Unified library + MusicBrainz Acquire & Play".into()),
+            subtitle: Some("Unified library + catalog Acquire & Play".into()),
             category: PaletteCategory::Navigation,
-            shortcut: None,
-            keywords: vec!["find".into(), "acquire".into(), "musicbrainz".into()],
+            shortcut: Some("/".into()),
+            keywords: vec!["find".into(), "acquire".into(), "catalog".into()],
         },
         PaletteCommand {
             id: "nav.library".into(),
@@ -580,6 +791,31 @@ fn build_palette_commands(
         });
     }
 
+    cmds.push(PaletteCommand {
+        id: "playlist.new".into(),
+        label: "Create New Playlist".into(),
+        subtitle: Some("Start a fresh personal playlist".into()),
+        category: PaletteCategory::Navigation,
+        shortcut: None,
+        keywords: vec!["playlist".into(), "create".into(), "new".into()],
+    });
+
+    for pl in studio
+        .playlists
+        .read()
+        .iter()
+        .filter(|pl| !pl.category.is_soulbeet_mix())
+    {
+        cmds.push(PaletteCommand {
+            id: format!("pl.{}", pl.id),
+            label: pl.name.clone(),
+            subtitle: Some(format!("Playlist · {} tracks", pl.song_count)),
+            category: PaletteCategory::Navigation,
+            shortcut: None,
+            keywords: vec!["playlist".into(), pl.name.to_ascii_lowercase()],
+        });
+    }
+
     for mix in studio
         .contextual_mixes
         .read()
@@ -588,7 +824,7 @@ fn build_palette_commands(
     {
         cmds.push(PaletteCommand {
             id: format!("mix.{}", mix.slug),
-            label: format!("Play {}", format_mix_title(mix)),
+            label: format!("Open {}", format_mix_title(mix)),
             subtitle: Some(format!("{} tracks", mix.track_count)),
             category: PaletteCategory::Mixes,
             shortcut: None,
@@ -613,6 +849,7 @@ fn execute_palette_command(
         "nav.library" => navigate_to_section(nav, StudioNavSection::Library),
         "nav.activity" => navigate_to_section(nav, StudioNavSection::Activity),
         "nav.settings" => navigate_to_section(nav, StudioNavSection::Settings),
+        "playlist.new" => studio.open_create_playlist("", Vec::new()),
         "play.toggle" => player.toggle_play_pause(),
         "play.next" => player.next(),
         "play.prev" => player.previous(),
@@ -643,7 +880,13 @@ fn execute_palette_command(
         }
         other => {
             if let Some(slug) = other.strip_prefix("mix.") {
-                studio.play_contextual_mix(auth, player, slug.to_string());
+                nav.push(Route::MixDetailPage {
+                    slug: slug.to_string(),
+                });
+            } else if let Some(pid) = other.strip_prefix("pl.") {
+                nav.push(Route::PlaylistDetailPage {
+                    id: pid.to_string(),
+                });
             }
         }
     }

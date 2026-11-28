@@ -5,10 +5,98 @@ use shared::client::{
 };
 
 #[cfg(feature = "server")]
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+#[cfg(feature = "server")]
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+#[cfg(feature = "server")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "server")]
 static LRCLIB_FETCHER: LazyLock<LiveExtrasFetcher> = LazyLock::new(LiveExtrasFetcher::new);
+
+#[cfg(feature = "server")]
+const CURATION_IDEMPOTENCY_TTL: Duration = Duration::from_secs(300);
+#[cfg(feature = "server")]
+const CURATION_IDEMPOTENCY_MAX: usize = 4096;
+
+#[cfg(feature = "server")]
+type CurationIdempotencyKey = (String, &'static str, String);
+
+#[cfg(feature = "server")]
+type CurationIdempotencyMap = HashMap<CurationIdempotencyKey, (Instant, CurationResult)>;
+
+#[cfg(feature = "server")]
+static CURATION_IDEMPOTENCY: LazyLock<Mutex<CurationIdempotencyMap>> =
+    LazyLock::new(Default::default);
+
+#[cfg(feature = "server")]
+fn extract_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && k.len() <= 128)
+        .map(str::to_string)
+}
+
+#[cfg(feature = "server")]
+fn cached_idempotent_curation(
+    user_id: &str,
+    action: &'static str,
+    key: &str,
+) -> Option<CurationResult> {
+    let now = Instant::now();
+    let mut cache = CURATION_IDEMPOTENCY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < CURATION_IDEMPOTENCY_TTL);
+    cache
+        .get(&(user_id.to_string(), action, key.to_string()))
+        .map(|(_, result)| result.clone())
+}
+
+#[cfg(feature = "server")]
+fn store_idempotent_curation(
+    user_id: &str,
+    action: &'static str,
+    key: String,
+    result: &CurationResult,
+) {
+    let now = Instant::now();
+    let mut cache = CURATION_IDEMPOTENCY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cache.len() >= CURATION_IDEMPOTENCY_MAX {
+        cache.retain(|_, (at, _)| now.saturating_duration_since(*at) < CURATION_IDEMPOTENCY_TTL);
+        if cache.len() >= CURATION_IDEMPOTENCY_MAX {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+    }
+    cache.insert((user_id.to_string(), action, key), (now, result.clone()));
+}
+
+#[cfg(feature = "server")]
+fn looks_like_internal_navidrome_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    if lower == "host.docker.internal" || lower.ends_with(".internal") || lower.ends_with(".svc") {
+        return true;
+    }
+    // Single-label non-localhost hostnames (e.g. `http://navidrome:4533`) are typically
+    // Docker/compose internal service names that external browsers and phones cannot route to.
+    !lower.contains('.') && !lower.contains(':') && lower != "localhost"
+}
 
 #[cfg(feature = "server")]
 use shared::client::{NavidromeSessionInfo, ServerCapabilities, TrackLyricLine};
@@ -96,13 +184,20 @@ pub async fn get_client_bootstrap() -> Result<ClientBootstrap, ServerFnError> {
                         }
                     };
                     let (subsonic_salt, subsonic_token) = client.subsonic_credentials();
-                    let base_url = crate::config::CONFIG
-                        .navidrome_public_url()
+                    let public_override = crate::config::CONFIG.navidrome_public_url();
+                    let base_url = public_override
                         .or_else(|| crate::config::CONFIG.navidrome_url())
                         .map(|u| u.trim_end_matches('/').to_string())
                         .unwrap_or_else(|| {
                             client.base_url().as_str().trim_end_matches('/').to_string()
                         });
+                    if public_override.is_none() && looks_like_internal_navidrome_url(&base_url) {
+                        tracing::warn!(
+                            "Bootstrap is advertising likely internal NAVIDROME_URL '{}' to clients; \
+                             set NAVIDROME_PUBLIC_URL to an externally reachable Navidrome URL",
+                            base_url
+                        );
+                    }
                     Some(NavidromeSessionInfo {
                         base_url,
                         username: client.username().to_string(),
@@ -390,45 +485,85 @@ async fn cache_lrc_sidecar_best_effort(
 ///
 /// Note: `/api/curation/*` endpoints are Dioxus `#[post]` server functions taking a single `req`
 /// parameter, so external HTTP clients must send JSON wrapped as `{"req": { ... }}`.
-#[post("/api/curation/keep", auth: AuthSession)]
+#[post("/api/curation/keep", auth: AuthSession, headers: axum::http::HeaderMap)]
 pub async fn curation_keep(req: KeepTrackRequest) -> Result<CurationResult, ServerFnError> {
+    let idempotency_key = extract_idempotency_key(&headers);
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) = cached_idempotent_curation(&auth.0.user_id, "keep", key) {
+            return Ok(cached);
+        }
+    }
     let guard = Guard::live();
     let effects: Arc<dyn DiscoveryEffects> = Arc::new(LiveDiscovery);
-    keep_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
+    let result = keep_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
         .await
-        .map_err(failure_error)
+        .map_err(failure_error)?;
+    if let Some(key) = idempotency_key {
+        store_idempotent_curation(&auth.0.user_id, "keep", key, &result);
+    }
+    Ok(result)
 }
 
 /// Stars or unstars a track. Starring a Pending Discovery track automatically promotes it into
 /// the permanent library.
-#[post("/api/curation/star", auth: AuthSession)]
+#[post("/api/curation/star", auth: AuthSession, headers: axum::http::HeaderMap)]
 pub async fn curation_star(req: StarTrackRequest) -> Result<CurationResult, ServerFnError> {
+    let idempotency_key = extract_idempotency_key(&headers);
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) = cached_idempotent_curation(&auth.0.user_id, "star", key) {
+            return Ok(cached);
+        }
+    }
     let guard = Guard::live();
     let effects: Arc<dyn DiscoveryEffects> = Arc::new(LiveDiscovery);
-    star_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
+    let result = star_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
         .await
-        .map_err(failure_error)
+        .map_err(failure_error)?;
+    if let Some(key) = idempotency_key {
+        store_idempotent_curation(&auth.0.user_id, "star", key, &result);
+    }
+    Ok(result)
 }
 
 /// Sets a 0–5★ rating on a track, promoting Pending Discovery tracks at or above the promote
 /// threshold and removing them at 1★.
-#[post("/api/curation/rate", auth: AuthSession)]
+#[post("/api/curation/rate", auth: AuthSession, headers: axum::http::HeaderMap)]
 pub async fn curation_rate(req: RateTrackRequest) -> Result<CurationResult, ServerFnError> {
+    let idempotency_key = extract_idempotency_key(&headers);
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) = cached_idempotent_curation(&auth.0.user_id, "rate", key) {
+            return Ok(cached);
+        }
+    }
     let guard = Guard::live();
     let effects: Arc<dyn DiscoveryEffects> = Arc::new(LiveDiscovery);
-    rate_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
+    let result = rate_track_in(&guard, &LiveCurationNavidrome, &effects, &IMPORT_QUEUE, &auth.0, &req)
         .await
-        .map_err(failure_error)
+        .map_err(failure_error)?;
+    if let Some(key) = idempotency_key {
+        store_idempotent_curation(&auth.0.user_id, "rate", key, &result);
+    }
+    Ok(result)
 }
 
 /// Drops a Pending Discovery track or removes/protects a Permanent Library track through
 /// Soulbeet's Multi-Listener Delete Guard.
-#[post("/api/curation/drop", auth: AuthSession)]
+#[post("/api/curation/drop", auth: AuthSession, headers: axum::http::HeaderMap)]
 pub async fn curation_drop(req: DropTrackRequest) -> Result<CurationResult, ServerFnError> {
+    let idempotency_key = extract_idempotency_key(&headers);
+    if let Some(ref key) = idempotency_key {
+        if let Some(cached) = cached_idempotent_curation(&auth.0.user_id, "drop", key) {
+            return Ok(cached);
+        }
+    }
     let guard = Guard::live();
-    drop_track_in(&guard, &LiveCurationNavidrome, &IMPORT_QUEUE, &auth.0, &req)
+    let result = drop_track_in(&guard, &LiveCurationNavidrome, &IMPORT_QUEUE, &auth.0, &req)
         .await
-        .map_err(failure_error)
+        .map_err(failure_error)?;
+    if let Some(key) = idempotency_key {
+        store_idempotent_curation(&auth.0.user_id, "drop", key, &result);
+    }
+    Ok(result)
 }
 
 /// Previews Soulbeet's Multi-Listener Delete Guard verdict for `song_id` without mutating state.

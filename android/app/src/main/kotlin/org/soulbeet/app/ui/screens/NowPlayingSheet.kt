@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.Check
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -84,7 +86,6 @@ import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.app.ui.components.StarStrip
 import org.soulbeet.app.ui.components.TrackArtwork
-import org.soulbeet.app.ui.components.TrackRow
 import org.soulbeet.app.ui.components.UndoDropSnackbar
 
 /**
@@ -110,12 +111,19 @@ fun NowPlayingSheet(
     onStarToggle: () -> Unit,
     onRate: (Int) -> Unit,
     onRequestLibraryRemoval: () -> Unit,
+    onAddToPlaylist: () -> Unit,
     onStartRadio: () -> Unit,
+    onClickPlayingFrom: () -> Unit,
+    onClickTitleOrAlbum: () -> Unit,
+    onClickArtist: () -> Unit,
     onToggleLyrics: () -> Unit,
     onFetchLyrics: () -> Unit,
     onOpenQueue: () -> Unit,
     onDismissQueue: () -> Unit,
     onPlayQueueIndex: (Int) -> Unit,
+    onRemoveQueueIndex: (Int) -> Unit,
+    onMoveQueueItem: (fromIndex: Int, toIndex: Int) -> Unit,
+    onClearQueue: () -> Unit,
     onOpenConnect: () -> Unit,
     onDismissConnect: () -> Unit,
     onReconnectConnect: () -> Unit,
@@ -203,7 +211,11 @@ fun NowPlayingSheet(
 
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(SoulbeetShapes.xs)
+                            .clickable(enabled = pb.currentTrackId != null, onClick = onClickPlayingFrom)
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
                     ) {
                         Text(
                             text = "PLAYING FROM",
@@ -297,7 +309,7 @@ fun NowPlayingSheet(
 
                 // --- Bottom 35%: Thumb-Zone Ergonomics ---
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    // Title, Artist & Discovery Reason Pill
+                    // Title/Album, Artist & Discovery Reason Pill (clickable navigation)
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
                             text = pb.title.ifBlank { "Nothing Playing" },
@@ -305,6 +317,10 @@ fun NowPlayingSheet(
                             color = colors.textPrimary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .clip(SoulbeetShapes.xs)
+                                .clickable(enabled = pb.currentTrackId != null, onClick = onClickTitleOrAlbum)
+                                .padding(vertical = 1.dp),
                         )
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -316,7 +332,11 @@ fun NowPlayingSheet(
                                 color = colors.textSecondary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false),
+                                modifier = Modifier
+                                    .weight(1f, fill = false)
+                                    .clip(SoulbeetShapes.xs)
+                                    .clickable(enabled = pb.artist.isNotBlank(), onClick = onClickArtist)
+                                    .padding(vertical = 1.dp),
                             )
                             if (pb.isOfflineCached) {
                                 Surface(
@@ -331,6 +351,19 @@ fun NowPlayingSheet(
                                     )
                                 }
                             }
+                        }
+                        if (pb.album.isNotBlank()) {
+                            Text(
+                                text = pb.album,
+                                style = type.bodySm,
+                                color = colors.textMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .clip(SoulbeetShapes.xs)
+                                    .clickable(enabled = pb.currentTrackId != null, onClick = onClickTitleOrAlbum)
+                                    .padding(vertical = 1.dp),
+                            )
                         }
                         if (!reasonPill.isNullOrBlank()) {
                             Text(
@@ -373,24 +406,18 @@ fun NowPlayingSheet(
                                 style = type.monoSm,
                                 color = colors.textMuted,
                             )
-                            Box(
-                                modifier = Modifier
-                                    .heightIn(min = 48.dp)
-                                    .clickable { showCodecInfo = !showCodecInfo },
-                                contentAlignment = Alignment.Center,
+                            Surface(
+                                onClick = { showCodecInfo = !showCodecInfo },
+                                color = colors.surfaceHigh,
+                                shape = SoulbeetShapes.full,
+                                border = BorderStroke(1.dp, colors.borderDefault),
                             ) {
-                                Surface(
-                                    color = colors.surfaceHigh,
-                                    shape = SoulbeetShapes.full,
-                                    border = BorderStroke(1.dp, colors.borderDefault),
-                                ) {
-                                    Text(
-                                        text = codecBadge,
-                                        style = type.monoXs,
-                                        color = colors.leafText,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                                    )
-                                }
+                                Text(
+                                    text = codecBadge,
+                                    style = type.monoXs,
+                                    color = colors.leafText,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                )
                             }
                             Text(
                                 text = FormattingUtils.formatDurationMs(pb.durationMs),
@@ -435,12 +462,12 @@ fun NowPlayingSheet(
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Surface(
+                                        onClick = onDropDiscovery,
                                         color = colors.crimsonSurface,
                                         shape = SoulbeetShapes.full,
                                         modifier = Modifier
                                             .weight(1f)
-                                            .heightIn(min = 48.dp)
-                                            .clickable(onClick = onDropDiscovery),
+                                            .heightIn(min = 48.dp),
                                     ) {
                                         Row(
                                             modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
@@ -495,7 +522,9 @@ fun NowPlayingSheet(
                                 )
                             }
                         } else {
-                            // Permanent Library Curation Row: Remove (muted tertiary -> Guard Sheet), Star, 1-5★ Strip, Radio
+                            // Permanent Library Curation Rows:
+                            // Row 1: evenly spaced actions [Remove] [Favorite] [Add to Playlist] [Radio]
+                            // Row 2: centered 1-5 star rating strip (prevents horizontal overflow on 360-390dp phones)
                             Column(
                                 verticalArrangement = Arrangement.spacedBy(4.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -503,7 +532,7 @@ fun NowPlayingSheet(
                             ) {
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    horizontalArrangement = Arrangement.SpaceEvenly,
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     IconButton(
@@ -516,35 +545,42 @@ fun NowPlayingSheet(
                                             tint = colors.textMuted,
                                         )
                                     }
-
-                                    StarStrip(
-                                        rating = pb.userRating,
-                                        onRate = onRate,
-                                    )
-
-                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        IconButton(
-                                            onClick = onStarToggle,
-                                            modifier = Modifier.size(48.dp),
-                                        ) {
-                                            Icon(
-                                                imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                                contentDescription = if (pb.isStarred) "Remove from favorites" else "Favorite",
-                                                tint = if (pb.isStarred) colors.accentText else colors.textSecondary,
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = onStartRadio,
-                                            modifier = Modifier.size(48.dp),
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Radio,
-                                                contentDescription = "Start track radio",
-                                                tint = colors.textSecondary,
-                                            )
-                                        }
+                                    IconButton(
+                                        onClick = onStarToggle,
+                                        modifier = Modifier.size(48.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = if (pb.isStarred) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                                            contentDescription = if (pb.isStarred) "Remove from favorites" else "Favorite",
+                                            tint = if (pb.isStarred) colors.accentText else colors.textSecondary,
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = onAddToPlaylist,
+                                        modifier = Modifier.size(48.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                            contentDescription = "Add to playlist",
+                                            tint = colors.textSecondary,
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = onStartRadio,
+                                        modifier = Modifier.size(48.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Radio,
+                                            contentDescription = "Start track radio",
+                                            tint = colors.textSecondary,
+                                        )
                                     }
                                 }
+
+                                StarStrip(
+                                    rating = pb.userRating,
+                                    onRate = onRate,
+                                )
                             }
                         }
                     }
@@ -571,11 +607,10 @@ fun NowPlayingSheet(
                             )
                         }
                         Surface(
+                            onClick = onTogglePlayPause,
                             color = colors.leafSolid,
                             shape = CircleShape,
-                            modifier = Modifier
-                                .size(64.dp)
-                                .clickable(onClick = onTogglePlayPause),
+                            modifier = Modifier.size(64.dp),
                         ) {
                             Box(contentAlignment = Alignment.Center) {
                                 Icon(
@@ -710,6 +745,9 @@ fun NowPlayingSheet(
                 onPlayQueueIndex(idx)
                 onDismissQueue()
             },
+            onRemoveIndex = onRemoveQueueIndex,
+            onMoveItem = onMoveQueueItem,
+            onClearQueue = onClearQueue,
         )
     }
 
@@ -839,6 +877,9 @@ private fun UpNextQueueSheet(
     artAuthority: String,
     onDismiss: () -> Unit,
     onPlayIndex: (Int) -> Unit,
+    onRemoveIndex: (Int) -> Unit,
+    onMoveItem: (fromIndex: Int, toIndex: Int) -> Unit,
+    onClearQueue: () -> Unit,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -860,8 +901,22 @@ private fun UpNextQueueSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Up Next", style = type.titleMd, color = colors.textPrimary)
-                Text("${state.queueTracks.size} TRACKS", style = type.monoXs, color = colors.textMuted)
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Up Next", style = type.titleMd, color = colors.textPrimary)
+                    Text("${state.queueTracks.size} TRACKS", style = type.monoXs, color = colors.textMuted)
+                }
+                if (state.queueTracks.isNotEmpty()) {
+                    TextButton(
+                        onClick = onClearQueue,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Text(
+                            text = "Clear Queue",
+                            style = type.monoSm,
+                            color = colors.crimsonText,
+                        )
+                    }
+                }
             }
 
             if (state.queueTracks.isEmpty()) {
@@ -875,21 +930,84 @@ private fun UpNextQueueSheet(
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 400.dp),
+                        .heightIn(max = 420.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     itemsIndexed(state.queueTracks, key = { idx, t -> "q_${idx}_${t.id}" }) { idx, track ->
-                        TrackRow(
-                            title = track.title,
-                            artist = track.artistName,
-                            durationSecs = track.durationSecs,
-                            coverArtId = track.coverArtId,
-                            artAuthority = artAuthority,
-                            isPlaying = idx == state.playback.currentIndex,
-                            isOfflineCached = state.offlineTrackIds.contains(track.id),
-                            isPendingDiscovery = track.isDiscovery,
-                            userRating = track.userRating.toInt(),
-                            onClick = { onPlayIndex(idx) },
-                        )
+                        val isPlaying = idx == state.playback.currentIndex
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 56.dp)
+                                .clip(SoulbeetShapes.sm)
+                                .background(if (isPlaying) colors.surfaceLow else Color.Transparent)
+                                .clickable { onPlayIndex(idx) }
+                                .padding(start = 8.dp, end = 2.dp, top = 6.dp, bottom = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TrackArtwork(
+                                coverArtId = track.coverArtId,
+                                artAuthority = artAuthority,
+                                fallbackTitle = track.title,
+                                size = 40.dp,
+                                shape = SoulbeetShapes.xs,
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Text(
+                                    text = track.title,
+                                    style = type.body,
+                                    color = if (isPlaying) colors.leafText else colors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = track.artistName,
+                                    style = type.bodySm,
+                                    color = colors.textSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(
+                                onClick = { onMoveItem(idx, idx - 1) },
+                                enabled = idx > 0,
+                                modifier = Modifier.size(36.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.KeyboardArrowUp,
+                                    contentDescription = "Move up in queue",
+                                    tint = if (idx > 0) colors.textSecondary else colors.textDisabled,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                            IconButton(
+                                onClick = { onMoveItem(idx, idx + 1) },
+                                enabled = idx < state.queueTracks.lastIndex,
+                                modifier = Modifier.size(36.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = "Move down in queue",
+                                    tint = if (idx < state.queueTracks.lastIndex) colors.textSecondary else colors.textDisabled,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                            IconButton(
+                                onClick = { onRemoveIndex(idx) },
+                                modifier = Modifier.size(36.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Remove from queue",
+                                    tint = colors.textMuted,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -979,6 +1097,9 @@ private fun ConnectDevicesSheet(
                     items(devices, key = { it.deviceId }) { dev ->
                         val isSelf = dev.deviceId == state.config.deviceId
                         Surface(
+                            onClick = {
+                                if (isSelf) onClaimActive() else onTransferTo(dev.deviceId)
+                            },
                             color = if (dev.isActive) colors.leafSurface else colors.surface,
                             shape = SoulbeetShapes.md,
                             border = BorderStroke(
@@ -987,10 +1108,7 @@ private fun ConnectDevicesSheet(
                             ),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(min = 56.dp)
-                                .clickable {
-                                    if (isSelf) onClaimActive() else onTransferTo(dev.deviceId)
-                                },
+                                .heightIn(min = 56.dp),
                         ) {
                             Row(
                                 modifier = Modifier

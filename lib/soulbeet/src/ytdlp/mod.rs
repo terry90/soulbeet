@@ -153,7 +153,7 @@ impl Engine {
     /// The helper's versions, read again when the last read is 10 minutes old.
     async fn versions(&self) -> Result<Versions, Fault> {
         let _reading = self.reading.lock().await;
-        if let Some((at, versions)) = &*self.versions.lock().unwrap() {
+        if let Some((at, versions)) = &*self.versions.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             if at.elapsed() < VERSIONS_KEPT {
                 return versions.clone();
             }
@@ -170,7 +170,7 @@ impl Engine {
             )),
             Err(fault) => Err(fault),
         };
-        *self.versions.lock().unwrap() = Some((Instant::now(), read.clone()));
+        *self.versions.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), read.clone()));
         read
     }
 
@@ -485,7 +485,7 @@ impl crate::DownloadBackend for YtDlpBackend {
                 error::Hold::BotCheck => SourcePresence::Offline,
             });
         }
-        let known = self.engine.versions.lock().unwrap();
+        let known = self.engine.versions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let broken = known
             .as_ref()
             .is_some_and(|(_, v)| v.as_ref().map_or(true, |v| !v.missing().is_empty()));

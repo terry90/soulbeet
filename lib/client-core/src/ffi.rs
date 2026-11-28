@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::connect::ConnectState;
@@ -1496,24 +1497,34 @@ pub trait CoreEventListener: Send + Sync {
 }
 
 enum CoreEvent {
-    ConnectStateChanged(FfiConnectState),
     ConnectEvent(FfiConnectEvent),
     SyncCompleted(FfiSyncReport),
     OutboxDrained(FfiDrainReport),
-    CacheChanged(FfiCacheStats),
 }
 
-/// Bounded capacity for FFI listener event delivery so a slow foreign listener
+/// Bounded capacity for FFI discrete event delivery so a slow foreign listener
 /// cannot trigger unbounded memory growth.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Aborts the wrapped Tokio [`JoinHandle`] if the outer future is dropped (e.g.
 /// when Kotlin cancels a `suspend fun` coroutine) instead of detaching a zombie task.
+/// Only used for pure read/query futures; state mutators use cooperative cancellation.
 struct AbortOnDrop<T>(JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// Signals cooperative cancellation to a spawned state-mutating task when the caller
+/// future is dropped, allowing any in-flight HTTP dispatch + DB commit to finish
+/// atomically before stopping at the next item boundary.
+struct CancelFlagGuard(Arc<AtomicBool>);
+
+impl Drop for CancelFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1575,6 +1586,7 @@ pub struct SoulbeetCoreHandle {
     runtime: OwnedRuntime,
     listener: Arc<StdRwLock<Option<Arc<dyn CoreEventListener>>>>,
     event_tx: mpsc::Sender<CoreEvent>,
+    cache_stats_tx: watch::Sender<Option<FfiCacheStats>>,
     background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
@@ -1591,10 +1603,12 @@ impl Drop for SoulbeetCoreHandle {
         };
         drop(prev);
 
-        if let Ok(mut tasks) = self.background_tasks.lock() {
-            for handle in tasks.drain(..) {
-                handle.abort();
-            }
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for handle in tasks.drain(..) {
+            handle.abort();
         }
     }
 }
@@ -1605,14 +1619,74 @@ impl SoulbeetCoreHandle {
         let listener: Arc<StdRwLock<Option<Arc<dyn CoreEventListener>>>> =
             Arc::new(StdRwLock::new(None));
         let (event_tx, mut event_rx) = mpsc::channel::<CoreEvent>(EVENT_CHANNEL_CAPACITY);
+        let (cache_stats_tx, mut cache_stats_rx) = watch::channel::<Option<FfiCacheStats>>(None);
+        let (resync_state_tx, mut resync_state_rx) = watch::channel::<Option<FfiConnectState>>(None);
 
         // 1. Dedicated sequential event dispatcher: clones the listener Arc out of the
         //    RwLock (dropping the lock immediately) and runs each callback on Tokio's
         //    blocking pool so foreign code can safely call back into `SoulbeetCoreHandle`
         //    without deadlocking or blocking async workers.
+        //    Latest-value state updates (`ConnectState`, `CacheStats`) travel via `watch`
+        //    channels so they coalesce cleanly and are never dropped under queue pressure.
         let dispatch_listener = listener.clone();
+        let mut connect_state_rx = core.connect_client().subscribe_state();
         let dispatcher_task = runtime.handle().spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
+            let mut event_open = true;
+            let mut state_open = true;
+            let mut resync_open = true;
+            let mut cache_open = true;
+
+            while event_open || state_open || resync_open || cache_open {
+                enum DispatchItem {
+                    Event(CoreEvent),
+                    ConnectState(FfiConnectState),
+                    CacheStats(FfiCacheStats),
+                }
+
+                let item = tokio::select! {
+                    maybe_ev = event_rx.recv(), if event_open => match maybe_ev {
+                        Some(ev) => Some(DispatchItem::Event(ev)),
+                        None => {
+                            event_open = false;
+                            None
+                        }
+                    },
+                    changed = connect_state_rx.changed(), if state_open => match changed {
+                        Ok(()) => {
+                            let st = connect_state_rx.borrow_and_update().clone();
+                            Some(DispatchItem::ConnectState(st.into()))
+                        }
+                        Err(_) => {
+                            state_open = false;
+                            None
+                        }
+                    },
+                    changed = resync_state_rx.changed(), if resync_open => match changed {
+                        Ok(()) => resync_state_rx
+                            .borrow_and_update()
+                            .clone()
+                            .map(DispatchItem::ConnectState),
+                        Err(_) => {
+                            resync_open = false;
+                            None
+                        }
+                    },
+                    changed = cache_stats_rx.changed(), if cache_open => match changed {
+                        Ok(()) => cache_stats_rx
+                            .borrow_and_update()
+                            .clone()
+                            .map(DispatchItem::CacheStats),
+                        Err(_) => {
+                            cache_open = false;
+                            None
+                        }
+                    },
+                };
+
+                let Some(item) = item else {
+                    continue;
+                };
+
                 let cb = {
                     let guard = dispatch_listener
                         .read()
@@ -1622,12 +1696,18 @@ impl SoulbeetCoreHandle {
                 let Some(cb) = cb else {
                     continue;
                 };
-                let res = tokio::task::spawn_blocking(move || match ev {
-                    CoreEvent::ConnectStateChanged(state) => cb.on_connect_state_changed(state),
-                    CoreEvent::ConnectEvent(event) => cb.on_connect_event(event),
-                    CoreEvent::SyncCompleted(report) => cb.on_sync_completed(report),
-                    CoreEvent::OutboxDrained(report) => cb.on_outbox_drained(report),
-                    CoreEvent::CacheChanged(stats) => cb.on_cache_changed(stats),
+                let res = tokio::task::spawn_blocking(move || match item {
+                    DispatchItem::ConnectState(state) => cb.on_connect_state_changed(state),
+                    DispatchItem::CacheStats(stats) => cb.on_cache_changed(stats),
+                    DispatchItem::Event(CoreEvent::ConnectEvent(event)) => {
+                        cb.on_connect_event(event)
+                    }
+                    DispatchItem::Event(CoreEvent::SyncCompleted(report)) => {
+                        cb.on_sync_completed(report)
+                    }
+                    DispatchItem::Event(CoreEvent::OutboxDrained(report)) => {
+                        cb.on_outbox_drained(report)
+                    }
                 })
                 .await;
                 if let Err(err) = res {
@@ -1638,52 +1718,49 @@ impl SoulbeetCoreHandle {
             }
         });
 
-        // 2. Forward ConnectClient live state changes & server events into the dispatcher.
-        let mut state_rx = core.connect_client().subscribe_state();
+        // 2. Forward ConnectClient server events into the dispatcher.
+        //    Commands (`TransferPlayback`, `LoadQueue`, etc.) await channel space instead of
+        //    dropping; on `broadcast` lag or full channel for state-carrying events, immediately
+        //    push an authoritative `ConnectState` resync so the foreign listener never drifts.
         let mut connect_ev_rx = core.connect_client().subscribe();
         let connect_tx = event_tx.clone();
+        let forwarder_core = core.clone();
         let connect_forwarder_task = runtime.handle().spawn(async move {
             loop {
-                tokio::select! {
-                    changed = state_rx.changed() => {
-                        match changed {
-                            Ok(()) => {
-                                let state = state_rx.borrow_and_update().clone();
-                                match connect_tx.try_send(CoreEvent::ConnectStateChanged(state.into())) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        tracing::warn!(
-                                            "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping ConnectStateChanged"
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                }
+                match connect_ev_rx.recv().await {
+                    Ok(event) => {
+                        let is_command = matches!(event, ConnectServerEventDto::Command { .. });
+                        if is_command {
+                            if connect_tx
+                                .send(CoreEvent::ConnectEvent(event.into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
-                            Err(_) => break,
+                        } else {
+                            match connect_tx.try_send(CoreEvent::ConnectEvent(event.into())) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); triggering ConnectState resync"
+                                    );
+                                    let latest = forwarder_core.connect_client().state().await;
+                                    let _ = resync_state_tx.send(Some(latest.into()));
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
                         }
                     }
-                    ev = connect_ev_rx.recv() => {
-                        match ev {
-                            Ok(event) => {
-                                match connect_tx.try_send(CoreEvent::ConnectEvent(event.into())) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        tracing::warn!(
-                                            "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping ConnectEvent"
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(
-                                    skipped,
-                                    "FFI Connect event forwarder lagged; some events were dropped"
-                                );
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "FFI Connect event forwarder lagged; triggering ConnectState resync"
+                        );
+                        let latest = forwarder_core.connect_client().state().await;
+                        let _ = resync_state_tx.send(Some(latest.into()));
                     }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -1693,6 +1770,7 @@ impl SoulbeetCoreHandle {
             runtime,
             listener,
             event_tx,
+            cache_stats_tx,
             background_tasks: StdMutex::new(vec![dispatcher_task, connect_forwarder_task]),
         })
     }
@@ -1708,6 +1786,39 @@ impl SoulbeetCoreHandle {
         })?
     }
 
+    /// Runs a non-cancel-safe state mutator on the internal Tokio runtime without aborting
+    /// mid-flight if the foreign coroutine cancels; the task runs its atomic operation to completion.
+    async fn run_async_uninterruptible<F, T>(&self, fut: F) -> Result<T, FfiError>
+    where
+        F: Future<Output = Result<T, FfiError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.runtime
+            .handle()
+            .spawn(fut)
+            .await
+            .map_err(|e| FfiError::Internal {
+                detail: format!("core runtime task failed: {e}"),
+            })?
+    }
+
+    /// Runs a multi-step state mutator with cooperative cancellation between items.
+    /// Dropping the outer future sets the cancellation flag instead of aborting the Tokio task,
+    /// guaranteeing in-flight HTTP dispatches and SQLite commits finish cleanly.
+    async fn run_async_cooperative<Mk, F, T>(&self, make_fut: Mk) -> Result<T, FfiError>
+    where
+        Mk: FnOnce(Arc<AtomicBool>) -> F,
+        F: Future<Output = Result<T, FfiError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let _cancel_guard = CancelFlagGuard(cancel_flag.clone());
+        let handle = self.runtime.handle().spawn(make_fut(cancel_flag));
+        handle.await.map_err(|e| FfiError::Internal {
+            detail: format!("core runtime task failed: {e}"),
+        })?
+    }
+
     fn run_blocking<F, T>(&self, fut: F) -> Result<T, FfiError>
     where
         F: Future<Output = Result<T, FfiError>> + Send + 'static,
@@ -1715,7 +1826,12 @@ impl SoulbeetCoreHandle {
     {
         if tokio::runtime::Handle::try_current().is_ok() {
             let handle = self.runtime.handle().clone();
-            std::thread::spawn(move || handle.block_on(fut))
+            std::thread::Builder::new()
+                .name("soulbeet-core-bridge".to_string())
+                .spawn(move || handle.block_on(fut))
+                .map_err(|e| FfiError::Internal {
+                    detail: format!("failed to spawn core blocking bridge thread: {e}"),
+                })?
                 .join()
                 .map_err(|_| FfiError::Internal {
                     detail: "core blocking bridge thread panicked".to_string(),
@@ -1731,6 +1847,10 @@ impl SoulbeetCoreHandle {
                 "FFI event channel full ({EVENT_CHANNEL_CAPACITY}); dropping event notification"
             );
         }
+    }
+
+    fn emit_cache_changed(&self, stats: FfiCacheStats) {
+        let _ = self.cache_stats_tx.send(Some(stats));
     }
 
     /// Exposes the underlying Rust [`SoulbeetCore`] for in-process Rust tests and callers.
@@ -1771,7 +1891,12 @@ impl SoulbeetCoreHandle {
         let core_config: ClientConfig = config.into();
         let core = if tokio::runtime::Handle::try_current().is_ok() {
             let handle = runtime.handle().clone();
-            std::thread::spawn(move || handle.block_on(SoulbeetCore::init(core_config)))
+            std::thread::Builder::new()
+                .name("soulbeet-core-init".to_string())
+                .spawn(move || handle.block_on(SoulbeetCore::init(core_config)))
+                .map_err(|e| FfiError::Internal {
+                    detail: format!("failed to spawn core init bridge thread: {e}"),
+                })?
                 .join()
                 .map_err(|_| FfiError::Internal {
                     detail: "core init bridge thread panicked".to_string(),
@@ -1829,13 +1954,17 @@ impl SoulbeetCoreHandle {
     /// forwarder tasks, and closes the SQLite connection pool.
     pub async fn shutdown(&self) -> Result<(), FfiError> {
         self.clear_event_listener();
-        if let Ok(mut tasks) = self.background_tasks.lock() {
+        {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for handle in tasks.drain(..) {
                 handle.abort();
             }
         }
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.disconnect_ws().await;
             core.pool().close().await;
             Ok(())
@@ -1871,7 +2000,7 @@ impl SoulbeetCoreHandle {
     pub async fn set_soulbeet_auth(&self, auth: FfiSoulbeetAuth) -> Result<(), FfiError> {
         let core = self.core.clone();
         let native_auth: Option<SoulbeetAuth> = auth.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.set_soulbeet_auth(native_auth).await;
             Ok(())
         })
@@ -1884,7 +2013,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<(), FfiError> {
         let core = self.core.clone();
         let native_creds: NavidromeCredentials = creds.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.set_navidrome_credentials(native_creds).await;
             Ok(())
         })
@@ -1893,7 +2022,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn clear_navidrome_credentials(&self) -> Result<(), FfiError> {
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.clear_navidrome_credentials().await;
             Ok(())
         })
@@ -1914,8 +2043,11 @@ impl SoulbeetCoreHandle {
     pub async fn sync_now(&self, force_full: bool) -> Result<FfiSyncReport, FfiError> {
         let core = self.core.clone();
         let report: FfiSyncReport = self
-            .run_async(async move {
-                let rep = core.sync_now(force_full).await.map_err(FfiError::from)?;
+            .run_async_cooperative(|cancel| async move {
+                let rep = core
+                    .sync_now_cancellable(force_full, &cancel)
+                    .await
+                    .map_err(FfiError::from)?;
                 Ok(rep.into())
             })
             .await?;
@@ -2080,16 +2212,22 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_profile: AudioQualityProfile = profile.into();
         let (outcome, stats) = self
-            .run_async(async move {
+            .run_async_cooperative(|cancel| async move {
                 let entry = core
-                    .download_track(&track_id, &native_profile, pinned, pin_source.as_deref())
+                    .download_track_cancellable(
+                        &track_id,
+                        &native_profile,
+                        pinned,
+                        pin_source.as_deref(),
+                        &cancel,
+                    )
                     .await
                     .map_err(FfiError::from)?;
                 let stats = core.cache_stats().await.map_err(FfiError::from)?;
                 Ok((FfiDownloadOutcome::from(entry), FfiCacheStats::from(stats)))
             })
             .await?;
-        self.emit_event(CoreEvent::CacheChanged(stats));
+        self.emit_cache_changed(stats);
         Ok(outcome)
     }
 
@@ -2103,13 +2241,14 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_profile: AudioQualityProfile = profile.into();
         let (downloaded, maybe_stats) = self
-            .run_async(async move {
+            .run_async_cooperative(|cancel| async move {
                 let ids = core
-                    .prefetch_queue(
+                    .prefetch_queue_cancellable(
                         &queue_track_ids,
                         current_index as usize,
                         &native_profile,
                         is_wifi,
+                        &cancel,
                     )
                     .await
                     .map_err(FfiError::from)?;
@@ -2124,7 +2263,7 @@ impl SoulbeetCoreHandle {
             })
             .await?;
         if let Some(stats) = maybe_stats {
-            self.emit_event(CoreEvent::CacheChanged(stats));
+            self.emit_cache_changed(stats);
         }
         Ok(downloaded)
     }
@@ -2137,9 +2276,9 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_profile: AudioQualityProfile = profile.into();
         let (completed, maybe_stats) = self
-            .run_async(async move {
+            .run_async_cooperative(|cancel| async move {
                 let ids = core
-                    .run_auto_cache_rules(&native_profile, is_wifi)
+                    .run_auto_cache_rules_cancellable(&native_profile, is_wifi, &cancel)
                     .await
                     .map_err(FfiError::from)?;
                 let stats = if ids.is_empty() {
@@ -2153,7 +2292,7 @@ impl SoulbeetCoreHandle {
             })
             .await?;
         if let Some(stats) = maybe_stats {
-            self.emit_event(CoreEvent::CacheChanged(stats));
+            self.emit_cache_changed(stats);
         }
         Ok(completed)
     }
@@ -2162,13 +2301,13 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_target: PinTarget = target.into();
         let (missing, stats) = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 let missing = core.pin(&native_target).await.map_err(FfiError::from)?;
                 let stats = core.cache_stats().await.map_err(FfiError::from)?;
                 Ok((missing, FfiCacheStats::from(stats)))
             })
             .await?;
-        self.emit_event(CoreEvent::CacheChanged(stats));
+        self.emit_cache_changed(stats);
         Ok(missing)
     }
 
@@ -2176,13 +2315,13 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_target: PinTarget = target.into();
         let (evicted, stats) = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 let evicted = core.unpin(&native_target).await.map_err(FfiError::from)?;
                 let stats = core.cache_stats().await.map_err(FfiError::from)?;
                 Ok((evicted as u64, FfiCacheStats::from(stats)))
             })
             .await?;
-        self.emit_event(CoreEvent::CacheChanged(stats));
+        self.emit_cache_changed(stats);
         Ok(evicted)
     }
 
@@ -2214,7 +2353,7 @@ impl SoulbeetCoreHandle {
         let core = self.core.clone();
         let native_policy: CachePolicy = policy.into();
         let stats = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 core.set_cache_policy(native_policy)
                     .await
                     .map_err(FfiError::from)?;
@@ -2222,21 +2361,21 @@ impl SoulbeetCoreHandle {
                 Ok(FfiCacheStats::from(stats))
             })
             .await?;
-        self.emit_event(CoreEvent::CacheChanged(stats));
+        self.emit_cache_changed(stats);
         Ok(())
     }
 
     pub async fn enforce_cache_budget(&self) -> Result<u64, FfiError> {
         let core = self.core.clone();
         let (evicted, stats) = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 let evicted = core.enforce_cache_budget().await.map_err(FfiError::from)?;
                 let stats = core.cache_stats().await.map_err(FfiError::from)?;
                 Ok((evicted as u64, FfiCacheStats::from(stats)))
             })
             .await?;
         if evicted > 0 {
-            self.emit_event(CoreEvent::CacheChanged(stats));
+            self.emit_cache_changed(stats);
         }
         Ok(evicted)
     }
@@ -2272,7 +2411,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<String, FfiError> {
         let core = self.core.clone();
         let (path, maybe_stats) = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 let (path, newly_fetched) = core
                     .get_or_fetch_cover_art_with_status(&cover_art_id, size)
                     .await
@@ -2288,7 +2427,7 @@ impl SoulbeetCoreHandle {
             })
             .await?;
         if let Some(stats) = maybe_stats {
-            self.emit_event(CoreEvent::CacheChanged(stats));
+            self.emit_cache_changed(stats);
         }
         Ok(path)
     }
@@ -2298,8 +2437,12 @@ impl SoulbeetCoreHandle {
     pub async fn enqueue_mutation(&self, mutation: FfiOutboxMutation) -> Result<i64, FfiError> {
         let core = self.core.clone();
         let native_mut: OutboxMutation = mutation.try_into()?;
-        self.run_async(async move { core.enqueue_mutation(native_mut).await.map_err(FfiError::from) })
-            .await
+        self.run_async_uninterruptible(async move {
+            core.enqueue_mutation(native_mut)
+                .await
+                .map_err(FfiError::from)
+        })
+        .await
     }
 
     pub async fn enqueue_mutation_with_key(
@@ -2309,7 +2452,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<i64, FfiError> {
         let core = self.core.clone();
         let native_mut: OutboxMutation = mutation.try_into()?;
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.enqueue_mutation_with_key(native_mut, idempotency_key)
                 .await
                 .map_err(FfiError::from)
@@ -2346,7 +2489,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn retry_dead_letters(&self) -> Result<u64, FfiError> {
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             let n = core.retry_dead_letters().await.map_err(FfiError::from)?;
             Ok(n as u64)
         })
@@ -2356,8 +2499,11 @@ impl SoulbeetCoreHandle {
     pub async fn drain_outbox(&self) -> Result<FfiDrainReport, FfiError> {
         let core = self.core.clone();
         let report: FfiDrainReport = self
-            .run_async(async move {
-                let rep = core.drain_outbox().await.map_err(FfiError::from)?;
+            .run_async_cooperative(|cancel| async move {
+                let rep = core
+                    .drain_outbox_cancellable(&cancel)
+                    .await
+                    .map_err(FfiError::from)?;
                 Ok(rep.into())
             })
             .await?;
@@ -2449,7 +2595,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<String, FfiError> {
         let core = self.core.clone();
         let native_album: RemoteCatalogAlbum = album.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.download_remote_album(&native_album)
                 .await
                 .map_err(FfiError::from)
@@ -2487,7 +2633,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<(), FfiError> {
         let core = self.core.clone();
         let native_session: PersistedPlaybackSession = session.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.save_playback_session(&native_session)
                 .await
                 .map_err(FfiError::from)
@@ -2513,7 +2659,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn connect_ws(&self, heartbeat_interval_secs: u64) -> Result<(), FfiError> {
         let core = self.core.clone();
-        let interval = Duration::from_secs(heartbeat_interval_secs.max(1));
+        let interval = Duration::from_secs(heartbeat_interval_secs.clamp(1, 3600));
         self.run_async(async move {
             core.connect_ws(interval).await.map_err(FfiError::from)
         })
@@ -2522,7 +2668,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn disconnect_ws(&self) -> Result<(), FfiError> {
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.disconnect_ws().await;
             Ok(())
         })

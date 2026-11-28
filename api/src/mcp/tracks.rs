@@ -2,7 +2,7 @@
 
 use rmcp::model::{CallToolResult, JsonObject};
 use serde_json::{json, Map, Value};
-use shared::failure::{cut_json, Stage, RAW_MAX_CHARS};
+use shared::failure::{cut_json, Failure, FailureCode, RetryAdvice, Stage, RAW_MAX_CHARS};
 use soulbeet::{DriverChoice, TagEdits};
 
 use super::args::Args;
@@ -295,11 +295,25 @@ async fn retag_tracks(
     );
     let same_call = args.same_call();
     let work = async move {
-        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
-        let origin = Origin::Mcp { grant_id };
-        match retag::retag_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req).await {
-            Ok(report) => Keyed::Kept(retag_answer(report)),
-            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+        // Run the mutation phase in a detached task so a client disconnect mid-retag never
+        // aborts after `queue.forget` before beets registration and Navidrome scan finish.
+        let handle = tokio::spawn(async move {
+            let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+            let origin = Origin::Mcp { grant_id };
+            retag::retag_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req).await
+        });
+        match handle.await {
+            Ok(Ok(report)) => Keyed::Kept(retag_answer(report)),
+            Ok(Err(f)) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+            Err(e) => {
+                let f = Failure::new(
+                    FailureCode::RetagFailed,
+                    Stage::Retag,
+                    RetryAdvice::SameSourceLater,
+                    format!("Retag task stopped unexpectedly: {e}"),
+                );
+                Keyed::Released(failed(upstream_error(f, Map::new(), same_call)))
+            }
         }
     };
     keyed(&state.acquire, caller, RETAG_TRACKS.name, key, &call, work).await

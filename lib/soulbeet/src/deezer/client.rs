@@ -80,9 +80,21 @@ fn encode_query(query: &str) -> String {
     url::form_urlencoded::byte_serialize(query.as_bytes()).collect()
 }
 
-/// Deezer's keyless public API, reduced to the two calls discovery needs.
+/// Caps a `Pace` at `Pace::DEEZER_INTERACTIVE` for interactive user-facing search
+/// while preserving zero-delay test paces such as `Pace::immediate()`.
+fn interactive_pace(pace: Pace) -> Pace {
+    Pace {
+        min_interval: pace.min_interval.min(Pace::DEEZER_INTERACTIVE.min_interval),
+        backoff: pace.backoff.min(Pace::DEEZER_INTERACTIVE.backoff),
+        retries: pace.retries.min(Pace::DEEZER_INTERACTIVE.retries),
+        timeout: pace.timeout.min(Pace::DEEZER_INTERACTIVE.timeout),
+    }
+}
+
+/// Deezer's keyless public API, reduced to the calls discovery and catalog search need.
 pub struct DeezerClient {
     http: PoliteClient,
+    interactive_http: PoliteClient,
     base_url: String,
     pace: Pace,
     cache: Arc<dyn KnowledgeCache>,
@@ -95,8 +107,12 @@ impl DeezerClient {
         cache: Arc<dyn KnowledgeCache>,
     ) -> Result<Self, RemoteError> {
         let http = PoliteClient::new(base_url, "Deezer", pace)?.with_quota_check(is_quota_error);
+        let interactive_http =
+            PoliteClient::new(base_url, "Deezer", interactive_pace(pace))?
+                .with_quota_check(is_quota_error);
         Ok(Self {
             http,
+            interactive_http,
             base_url: base_url.trim_end_matches('/').to_string(),
             pace,
             cache,
@@ -110,8 +126,12 @@ impl DeezerClient {
     ) -> Result<Self, RemoteError> {
         let http = PoliteClient::without_redirects(base_url, "Deezer", pace)?
             .with_quota_check(is_quota_error);
+        let interactive_http =
+            PoliteClient::without_redirects(base_url, "Deezer", interactive_pace(pace))?
+                .with_quota_check(is_quota_error);
         Ok(Self {
             http,
+            interactive_http,
             base_url: base_url.trim_end_matches('/').to_string(),
             pace,
             cache,
@@ -158,6 +178,15 @@ impl DeezerClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<DeezerSearchTrack>, KnowledgeError> {
+        self.search_tracks_with(&self.http, query, limit).await
+    }
+
+    async fn search_tracks_with(
+        &self,
+        http: &PoliteClient,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DeezerSearchTrack>, KnowledgeError> {
         let trimmed = bound_query(query);
         if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -168,7 +197,7 @@ impl DeezerClient {
         );
         cached(self.cache.as_ref(), &key, TTL_DEEZER_SEARCH, async {
             let q = encode_query(trimmed);
-            self.list(&format!("/search/track?q={q}&limit={limit}"))
+            self.list_with(http, &format!("/search/track?q={q}&limit={limit}"))
                 .await
         })
         .await
@@ -176,6 +205,15 @@ impl DeezerClient {
 
     pub async fn search_albums(
         &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DeezerSearchAlbum>, KnowledgeError> {
+        self.search_albums_with(&self.http, query, limit).await
+    }
+
+    async fn search_albums_with(
+        &self,
+        http: &PoliteClient,
         query: &str,
         limit: usize,
     ) -> Result<Vec<DeezerSearchAlbum>, KnowledgeError> {
@@ -189,7 +227,7 @@ impl DeezerClient {
         );
         cached(self.cache.as_ref(), &key, TTL_DEEZER_SEARCH, async {
             let q = encode_query(trimmed);
-            self.list(&format!("/search/album?q={q}&limit={limit}"))
+            self.list_with(http, &format!("/search/album?q={q}&limit={limit}"))
                 .await
         })
         .await
@@ -197,6 +235,15 @@ impl DeezerClient {
 
     pub async fn search_artists(
         &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DeezerSearchArtist>, KnowledgeError> {
+        self.search_artists_with(&self.http, query, limit).await
+    }
+
+    async fn search_artists_with(
+        &self,
+        http: &PoliteClient,
         query: &str,
         limit: usize,
     ) -> Result<Vec<DeezerSearchArtist>, KnowledgeError> {
@@ -210,7 +257,7 @@ impl DeezerClient {
         );
         cached(self.cache.as_ref(), &key, TTL_DEEZER_SEARCH, async {
             let q = encode_query(trimmed);
-            self.list(&format!("/search/artist?q={q}&limit={limit}"))
+            self.list_with(http, &format!("/search/artist?q={q}&limit={limit}"))
                 .await
         })
         .await
@@ -367,7 +414,9 @@ impl DeezerClient {
     }
 
     /// Unified catalog search across tracks, albums, and artists, ranked and deduplicated
-    /// through the canonical catalog ranking engine.
+    /// through the canonical catalog ranking engine. Uses `tokio::join!` so partial results
+    /// succeed if at least one of the three endpoints responds, returning an error only when
+    /// all three fail.
     pub async fn search_unified(
         &self,
         query: &str,
@@ -385,11 +434,39 @@ impl DeezerClient {
             });
         }
 
-        let (raw_tracks, raw_albums, raw_artists) = tokio::try_join!(
-            self.search_tracks(trimmed, 50),
-            self.search_albums(trimmed, 25),
-            self.search_artists(trimmed, 15),
-        )?;
+        let (tracks_res, albums_res, artists_res) = tokio::join!(
+            self.search_tracks_with(&self.interactive_http, trimmed, 50),
+            self.search_albums_with(&self.interactive_http, trimmed, 25),
+            self.search_artists_with(&self.interactive_http, trimmed, 15),
+        );
+
+        let (raw_tracks, raw_albums, raw_artists) = match (tracks_res, albums_res, artists_res) {
+            (Err(e_tracks), Err(_), Err(_)) => return Err(e_tracks),
+            (tracks_res, albums_res, artists_res) => {
+                let raw_tracks = match tracks_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("Deezer unified track search failed (continuing with partial results): {e}");
+                        Vec::new()
+                    }
+                };
+                let raw_albums = match albums_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("Deezer unified album search failed (continuing with partial results): {e}");
+                        Vec::new()
+                    }
+                };
+                let raw_artists = match artists_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("Deezer unified artist search failed (continuing with partial results): {e}");
+                        Vec::new()
+                    }
+                };
+                (raw_tracks, raw_albums, raw_artists)
+            }
+        };
 
         Ok(UnifiedCatalogSearch {
             query: trimmed.to_string(),
@@ -746,7 +823,15 @@ impl DeezerClient {
     }
 
     async fn list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, KnowledgeError> {
-        let Some(envelope) = self.http.get::<Envelope<T>>(path).await? else {
+        self.list_with(&self.http, path).await
+    }
+
+    async fn list_with<T: DeserializeOwned>(
+        &self,
+        http: &PoliteClient,
+        path: &str,
+    ) -> Result<Vec<T>, KnowledgeError> {
+        let Some(envelope) = http.get::<Envelope<T>>(path).await? else {
             return Ok(Vec::new());
         };
         match envelope.error {
@@ -1192,5 +1277,62 @@ mod tests {
             ttls[0].0
         );
         assert!(ttls[0].0.len() <= 220, "cache key too long: {}", ttls[0].0.len());
+    }
+
+    #[tokio::test]
+    async fn search_unified_returns_partial_results_when_one_endpoint_fails() {
+        use crate::test_http::serve_fn;
+
+        let (base, _seen) = serve_fn(|req| match req.target.as_str() {
+            t if t.starts_with("/search/track?") => ok(r#"{
+                "data": [{
+                    "id": 101,
+                    "title": "Digital Love",
+                    "duration": 298,
+                    "rank": 500000,
+                    "artist": {"id": 27, "name": "Daft Punk"},
+                    "album": {"id": 302127, "title": "Discovery"}
+                }]
+            }"#),
+            t if t.starts_with("/search/album?") => Reply {
+                status: 503,
+                body: "Service Unavailable".into(),
+            },
+            t if t.starts_with("/search/artist?") => ok(r#"{
+                "data": [{"id": 27, "name": "Daft Punk", "nb_fan": 4000000, "nb_album": 32}]
+            }"#),
+            other => panic!("unexpected target: {other}"),
+        });
+
+        let dz = client(&base);
+        let res = dz.search_unified("Daft Punk", 10).await.unwrap();
+        assert_eq!(res.tracks.len(), 1);
+        assert_eq!(res.tracks[0].title, "Digital Love");
+        assert!(res.albums.is_empty());
+        assert_eq!(res.artists.len(), 1);
+        assert_eq!(res.artists[0].name, "Daft Punk");
+    }
+
+    #[tokio::test]
+    async fn search_unified_returns_error_when_all_three_endpoints_fail() {
+        use crate::test_http::serve_fn;
+
+        let (base, _seen) = serve_fn(|_req| Reply {
+            status: 503,
+            body: "Service Unavailable".into(),
+        });
+
+        let dz = client(&base);
+        let err = dz.search_unified("Daft Punk", 10).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                KnowledgeError::Remote(RemoteError::Unavailable {
+                    service: "Deezer",
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
     }
 }

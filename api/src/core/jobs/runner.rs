@@ -106,7 +106,12 @@ struct Runners {
 impl Runners {
     /// Tells the runner that has job `id`, when one has, to look at it again.
     fn look_again(&self, id: &str) {
-        if let Some(look_again) = self.jobs.lock().unwrap().get(id) {
+        if let Some(look_again) = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+        {
             look_again.notify_one();
         }
     }
@@ -120,7 +125,10 @@ impl Runners {
             // Registered before the look, so a runner ending after it still wakes this one.
             ended.as_mut().enable();
             {
-                let mut jobs = self.jobs.lock().unwrap();
+                let mut jobs = self
+                    .jobs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match jobs.get(id) {
                     Some(look_again) => look_again.notify_one(),
                     None => {
@@ -149,7 +157,11 @@ struct RunnerOf<'a> {
 
 impl Drop for RunnerOf<'_> {
     fn drop(&mut self) {
-        self.runners.jobs.lock().unwrap().remove(&self.id);
+        self.runners
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
         self.runners.ended.notify_waiters();
     }
 }

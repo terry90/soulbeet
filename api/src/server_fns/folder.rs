@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "server")]
 use super::{failure_error, refusal_error, server_error};
-#[cfg(feature = "server")]
-use crate::auth::UserCtx;
 use crate::folder_policy::FolderAdminView;
 #[cfg(feature = "server")]
 use crate::folder_policy::{
@@ -18,7 +16,7 @@ use crate::AdminSession;
 #[cfg(feature = "server")]
 use crate::AuthSession;
 #[cfg(feature = "server")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NavidromeLibraryWarningDto {
@@ -66,37 +64,95 @@ pub async fn create_user_folder(
     name: String,
     path: String,
 ) -> Result<models::folder::Folder, ServerFnError> {
-    if let Some(existing) = models::folder::Folder::get_for_user(&auth.0.user_id)
-        .await
-        .map_err(server_error)?
-    {
-        let canonical = checked_folder_path(
-            &auth.0,
-            &path,
-            FolderChange::Update {
-                stored: &existing.path,
-            },
-        )
-        .await?;
-        let canonical_str = path_str(&canonical);
-        crate::core::folders::update(&auth.0, &existing.id, &name, canonical_str)
-            .await
-            .map_err(failure_error)?;
-        let uid = auth.0.user_id.clone();
-        tokio::spawn(async move {
-            crate::core::navidrome_libraries::sync_single_user_library_best_effort(&uid).await;
-        });
-        return Ok(models::folder::Folder {
-            id: existing.id,
-            user_id: existing.user_id,
-            name,
-            path: canonical_str.to_string(),
-        });
-    }
-    let canonical = checked_folder_path(&auth.0, &path, FolderChange::Create).await?;
-    let folder = models::folder::Folder::create(&auth.0.user_id, &name, path_str(&canonical))
+    let candidate = canonical_folder_path(Path::new(&path))
+        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
+
+    let mut tx = crate::db::DB
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(server_error)?;
+
+    let existing = sqlx::query_as::<_, models::folder::Folder>(
+        "SELECT * FROM folders WHERE user_id = ? LIMIT 1",
+    )
+    .bind(&auth.0.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(server_error)?;
+
+    let rows = PolicyRows::load_tx(&mut tx).await.map_err(server_error)?;
+    let (folders, roots) = rows.inputs();
+    match existing.as_ref() {
+        Some(existing) => {
+            check_folder_update(&candidate, &existing.path, &auth.0, &folders, &roots)
+        }
+        None => check_folder_path(&candidate, &auth.0, &folders, &roots),
+    }
+    .map_err(refusal_error)?;
+
+    let dir_existed = tokio::fs::try_exists(&candidate).await.unwrap_or(true);
+    if !dir_existed {
+        tokio::fs::create_dir_all(&candidate)
+            .await
+            .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
+    }
+    let created = match canonical_folder_path(&candidate) {
+        Ok(c) if c == candidate => c,
+        Ok(_) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Changed));
+        }
+        Err(e) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Path(e)));
+        }
+    };
+
+    let folder_res = if let Some(existing) = existing {
+        sqlx::query_as::<_, models::folder::Folder>(
+            "UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ? RETURNING *",
+        )
+        .bind(&name)
+        .bind(path_str(&created))
+        .bind(&existing.id)
+        .bind(&auth.0.user_id)
+        .fetch_one(&mut *tx)
+        .await
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query_as::<_, models::folder::Folder>(
+            "INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?) RETURNING *",
+        )
+        .bind(&id)
+        .bind(&auth.0.user_id)
+        .bind(&name)
+        .bind(path_str(&created))
+        .fetch_one(&mut *tx)
+        .await
+    };
+
+    let folder = match folder_res {
+        Ok(folder) => folder,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(server_error(e));
+        }
+    };
+
+    if let Err(e) = tx.commit().await {
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
+
     let uid = auth.0.user_id.clone();
     tokio::spawn(async move {
         crate::core::navidrome_libraries::sync_single_user_library_best_effort(&uid).await;
@@ -109,68 +165,86 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("canonical paths are UTF-8")
 }
 
-/// What a folder path is checked for.
-#[cfg(feature = "server")]
-#[derive(Clone, Copy)]
-enum FolderChange<'a> {
-    Create,
-    /// An existing folder, currently stored at `stored`.
-    Update {
-        stored: &'a str,
-    },
-}
-
-/// The canonical form of `path` once the folder rules allow `actor` to keep a
-/// folder there. For both create and update, the directory is made only after
-/// the checks pass, and its canonical path must not move while it is made.
-#[cfg(feature = "server")]
-async fn checked_folder_path(
-    actor: &UserCtx,
-    path: &str,
-    change: FolderChange<'_>,
-) -> Result<PathBuf, ServerFnError> {
-    let candidate = canonical_folder_path(Path::new(path))
-        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
-    let rows = PolicyRows::load().await.map_err(server_error)?;
-    let (folders, roots) = rows.inputs();
-    match change {
-        FolderChange::Create => check_folder_path(&candidate, actor, &folders, &roots),
-        FolderChange::Update { stored } => {
-            check_folder_update(&candidate, stored, actor, &folders, &roots)
-        }
-    }
-    .map_err(refusal_error)?;
-    tokio::fs::create_dir_all(&candidate)
-        .await
-        .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
-    let created =
-        canonical_folder_path(&candidate).map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
-    if created != candidate {
-        return Err(refusal_error(FolderRefusal::Changed));
-    }
-    Ok(candidate)
-}
-
 #[put("/api/folders/update", auth: AuthSession)]
 pub async fn update_folder(
     folder_id: String,
     name: String,
     path: String,
 ) -> Result<(), ServerFnError> {
-    let folder = crate::core::folders::owned(&auth.0, &folder_id)
+    let candidate = canonical_folder_path(Path::new(&path))
+        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
+
+    let mut tx = crate::db::DB
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map_err(failure_error)?;
-    let canonical = checked_folder_path(
-        &auth.0,
-        &path,
-        FolderChange::Update {
-            stored: &folder.path,
-        },
+        .map_err(server_error)?;
+
+    let existing = sqlx::query_as::<_, models::folder::Folder>(
+        "SELECT * FROM folders WHERE id = ? AND user_id = ?",
     )
-    .await?;
-    crate::core::folders::update(&auth.0, &folder_id, &name, path_str(&canonical))
+    .bind(&folder_id)
+    .bind(&auth.0.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(server_error)?
+    .ok_or_else(|| {
+        failure_error(shared::failure::Failure::new(
+            shared::failure::FailureCode::UnknownHandle,
+            shared::failure::Stage::Input,
+            shared::failure::RetryAdvice::NotRetryable,
+            "Folder not found",
+        ))
+    })?;
+
+    let rows = PolicyRows::load_tx(&mut tx).await.map_err(server_error)?;
+    let (folders, roots) = rows.inputs();
+    check_folder_update(&candidate, &existing.path, &auth.0, &folders, &roots)
+        .map_err(refusal_error)?;
+
+    let dir_existed = tokio::fs::try_exists(&candidate).await.unwrap_or(true);
+    if !dir_existed {
+        tokio::fs::create_dir_all(&candidate)
+            .await
+            .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
+    }
+    let created = match canonical_folder_path(&candidate) {
+        Ok(c) if c == candidate => c,
+        Ok(_) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Changed));
+        }
+        Err(e) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Path(e)));
+        }
+    };
+
+    if let Err(e) = sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ?")
+        .bind(&name)
+        .bind(path_str(&created))
+        .bind(&folder_id)
+        .bind(&auth.0.user_id)
+        .execute(&mut *tx)
         .await
-        .map_err(failure_error)?;
+    {
+        let _ = tx.rollback().await;
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
+
+    if let Err(e) = tx.commit().await {
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
+
     let uid = auth.0.user_id.clone();
     tokio::spawn(async move {
         crate::core::navidrome_libraries::sync_single_user_library_best_effort(&uid).await;

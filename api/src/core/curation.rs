@@ -8,6 +8,7 @@ use shared::client::{
     CurationAction, CurationResult, DeleteGuardPreview, DropTrackRequest, KeepTrackRequest,
     ListenerProtection, ListenerProtectionKind, RateTrackRequest, StarTrackRequest,
 };
+use shared::download::{ArchivalUpgradeOutcome, TriggerArchivalUpgradeRequest};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use shared::navidrome::{DeletionReason, DiscoveryStatus, DiscoveryTrack};
 use soulbeet::navidrome::models::SubsonicSong;
@@ -18,7 +19,8 @@ use crate::auth::UserCtx;
 use crate::core::database_failure;
 use crate::core::delete_guard::{pending_track_of, song_not_found, ForgetVia, Guard, Origin, Verdict};
 use crate::core::discovery::{
-    is_not_pending, promote_to, remove_in, track_not_pending, DiscoveryEffects, Replace,
+    is_not_pending, promote_to_with_archival, remove_in, track_not_pending, DiscoveryEffects,
+    Replace,
 };
 use crate::core::index::ServerNavidrome;
 use crate::core::library::{navidrome_failure, navidrome_for};
@@ -259,6 +261,48 @@ async fn find_pending_for_rating(
     )
 }
 
+async fn maybe_enqueue_archival_for_library_song(
+    db: &sqlx::SqlitePool,
+    ctx: &UserCtx,
+    song: &SubsonicSong,
+    folder_id: Option<String>,
+    trigger_reason: &str,
+) -> bool {
+    let artist = song.artist.as_deref().map(str::trim).unwrap_or("");
+    let title = song.title.trim();
+    if artist.is_empty() || title.is_empty() {
+        return false;
+    }
+    let req = TriggerArchivalUpgradeRequest {
+        navidrome_song_id: Some(song.id.clone()),
+        discovery_track_id: None,
+        artist: artist.to_string(),
+        title: title.to_string(),
+        album: song.album.clone().filter(|a| !a.trim().is_empty()),
+        recording_mbid: song
+            .music_brainz_id
+            .clone()
+            .filter(|m| !m.trim().is_empty()),
+        folder_id,
+        codec: None,
+        duration_s: song.duration.filter(|&d| d > 0),
+        trigger_reason: trigger_reason.to_string(),
+    };
+    match crate::core::archival::enqueue_on_keep_in(db, ctx, &req).await {
+        Ok(ArchivalUpgradeOutcome::Enqueued { .. }) => true,
+        Ok(_) => false,
+        Err(f) => {
+            warn!(
+                "Failed to evaluate archival FLAC upgrade on {} for '{}': {}",
+                trigger_reason,
+                song.title,
+                crate::core::logged(&f)
+            );
+            false
+        }
+    }
+}
+
 /// Builds the `CurationResult` for a promoted (or already-promoted) discovery track without
 /// modifying its Navidrome star rating.
 async fn kept_discovery_result(
@@ -266,6 +310,7 @@ async fn kept_discovery_result(
     ctx: &UserCtx,
     req_song_id: &str,
     track: &DiscoveryTrack,
+    archival_upgrade_queued: bool,
 ) -> CurationResult {
     let song_id = effective_song_id(req_song_id, track);
     let mut current_rating = track.rating.filter(|r| *r > 0);
@@ -276,10 +321,6 @@ async fn kept_discovery_result(
             current_rating = song.user_rating.filter(|r| *r > 0);
         }
     }
-
-    // PR 1C will plug the On-Keep archival FLAC upgrade worker in here when a track was
-    // fast-acquired in lossy quality.
-    let archival_upgrade_queued = false;
 
     CurationResult {
         song_id,
@@ -363,7 +404,7 @@ pub(crate) async fn keep_track_in(
 
     match lookup_discovery(guard, ctx, &req.song_id, req.discovery_track_id.as_deref()).await? {
         DiscoveryLookup::Pending(track) => {
-            match promote_to(
+            match promote_to_with_archival(
                 guard.db,
                 effects,
                 queue,
@@ -374,8 +415,16 @@ pub(crate) async fn keep_track_in(
             )
             .await
             {
-                Ok((promoted, _)) => {
-                    return Ok(kept_discovery_result(navi, ctx, &req.song_id, &promoted).await);
+                Ok((promoted, _, archival_queued)) => {
+                    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
+                    return Ok(kept_discovery_result(
+                        navi,
+                        ctx,
+                        &req.song_id,
+                        &promoted,
+                        archival_queued,
+                    )
+                    .await);
                 }
                 Err(not_done) => {
                     let failure = not_done.into_failure();
@@ -387,9 +436,14 @@ pub(crate) async fn keep_track_in(
                                 existing.status,
                                 DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
                             ) {
-                                return Ok(
-                                    kept_discovery_result(navi, ctx, &req.song_id, &existing).await,
-                                );
+                                return Ok(kept_discovery_result(
+                                    navi,
+                                    ctx,
+                                    &req.song_id,
+                                    &existing,
+                                    false,
+                                )
+                                .await);
                             }
                         }
                     }
@@ -402,7 +456,9 @@ pub(crate) async fn keep_track_in(
                 track.status,
                 DiscoveryStatus::Promoted | DiscoveryStatus::Promoting
             ) {
-                return Ok(kept_discovery_result(navi, ctx, &req.song_id, &track).await);
+                return Ok(
+                    kept_discovery_result(navi, ctx, &req.song_id, &track, false).await,
+                );
             }
             return Err(track_not_pending());
         }
@@ -414,6 +470,16 @@ pub(crate) async fn keep_track_in(
         .await?
         .ok_or_else(song_not_found)?;
 
+    let archival_upgrade_queued = maybe_enqueue_archival_for_library_song(
+        guard.db,
+        ctx,
+        &song,
+        req.target_folder_id.clone(),
+        "keep",
+    )
+    .await;
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
+
     Ok(CurationResult {
         song_id: req.song_id.clone(),
         action: CurationAction::Kept,
@@ -421,7 +487,7 @@ pub(crate) async fn keep_track_in(
         starred: Some(song.starred.is_some()),
         rating: song.user_rating.filter(|r| *r > 0),
         deleted_from_disk: false,
-        archival_upgrade_queued: false,
+        archival_upgrade_queued,
         guard_preview: None,
         message: format!("Kept '{}' in your library", song.title),
     })
@@ -489,13 +555,13 @@ pub(crate) async fn star_track_in(
 
     let mut promoted_discovery = false;
     let applied_rating = song.user_rating.filter(|r| *r > 0);
-    let archival_upgrade_queued = false;
+    let mut archival_upgrade_queued = false;
 
     if let Some(lookup) = discovery_lookup {
         match lookup {
             DiscoveryLookup::Pending(track) => {
                 let user = ctx.id();
-                match promote_to(
+                match promote_to_with_archival(
                     guard.db,
                     effects,
                     queue,
@@ -506,7 +572,10 @@ pub(crate) async fn star_track_in(
                 )
                 .await
                 {
-                    Ok(_) => promoted_discovery = true,
+                    Ok((_, _, queued)) => {
+                        promoted_discovery = true;
+                        archival_upgrade_queued = queued;
+                    }
                     Err(not_done) => {
                         let failure = not_done.into_failure();
                         if is_not_pending(&failure) {
@@ -532,10 +601,18 @@ pub(crate) async fn star_track_in(
             }
             DiscoveryLookup::Already(_) => {
                 promoted_discovery = true;
+                archival_upgrade_queued =
+                    maybe_enqueue_archival_for_library_song(guard.db, ctx, &song, None, "star")
+                        .await;
             }
-            DiscoveryLookup::NotDiscovery => {}
+            DiscoveryLookup::NotDiscovery => {
+                archival_upgrade_queued =
+                    maybe_enqueue_archival_for_library_song(guard.db, ctx, &song, None, "star")
+                        .await;
+            }
         }
     }
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
 
     let (action, message) = if req.starred && promoted_discovery {
         (
@@ -634,6 +711,8 @@ pub(crate) async fn rate_track_in(
         None
     };
 
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
+
     Ok(CurationResult {
         song_id: effective_id,
         action: CurationAction::Rated,
@@ -731,6 +810,7 @@ pub(crate) async fn drop_track_in(
                 )
                 .await
                 .map_err(|e| e.into_failure())?;
+            crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
 
             Ok(CurationResult {
                 song_id: req.song_id.clone(),
@@ -784,6 +864,7 @@ pub(crate) async fn drop_track_in(
                     None
                 }
             };
+            crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
 
             Ok(CurationResult {
                 song_id: req.song_id.clone(),
@@ -844,6 +925,7 @@ async fn drop_pending_discovery(
         None
     };
 
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
     Ok(dropped_discovery_result(song_id, &track, starred))
 }
 
@@ -1782,5 +1864,127 @@ mod tests {
         .unwrap();
         assert_eq!(res_promoting.action, CurationAction::Starred);
         assert!(res_promoting.promoted_discovery);
+    }
+
+    #[tokio::test]
+    async fn keep_and_star_on_fast_acquired_library_song_enqueues_archival_upgrade() {
+        let lib = Library::new().await;
+        let folder_id: String =
+            sqlx::query_scalar("SELECT id FROM folders WHERE user_id = 'alice' LIMIT 1")
+                .fetch_one(&lib.db)
+                .await
+                .unwrap();
+        lib.write("alice/Fast/01.opus", b"fast-opus");
+        lib.fake.file(
+            soulbeet::navidrome::models::NativeSong {
+                id: "s-fast-1".into(),
+                path: "alice/Fast/01.opus".into(),
+                size: 9,
+                artist: "Fast Artist".into(),
+                title: "Fast Track".into(),
+                album: "LP".into(),
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+        lib.fake.sees("alice", "s-fast-1");
+
+        lib.write("alice/Fast/02.mp3", b"fast-mp3");
+        lib.fake.file(
+            soulbeet::navidrome::models::NativeSong {
+                id: "s-fast-2".into(),
+                path: "alice/Fast/02.mp3".into(),
+                size: 8,
+                artist: "Fast Artist".into(),
+                title: "Fast Track 2".into(),
+                album: "LP".into(),
+                ..lib.record("s1")
+            },
+            "al1",
+        );
+        lib.fake.sees("alice", "s-fast-2");
+
+        let music_root = lib.root.join("music");
+        let guard = Guard::new(&lib.db, &*lib.fake, Some(&music_root));
+        let navi = FakeCurationNavi::new(lib.fake.clone());
+        let effects: Arc<dyn DiscoveryEffects> = Arc::new(StubDiscoveryEffects::default());
+        let queue = test_queue();
+        let alice = test_ctx("alice");
+
+        let s1 = navi.get_song(&alice, "s-fast-1").await.unwrap().unwrap();
+        crate::core::archival::record_fast_acquisition_in(
+            &lib.db,
+            crate::models::archival_upgrade::NewFastAcquisition {
+                user_id: "alice",
+                folder_id: &folder_id,
+                navidrome_song_id: Some("s-fast-1"),
+                discovery_track_id: None,
+                artist: s1.artist.as_deref().unwrap_or("Artist"),
+                title: &s1.title,
+                album: s1.album.as_deref(),
+                recording_mbid: Some("11111111-1111-1111-1111-111111111111"),
+                backend_id: "ytdlp",
+                codec: "opus",
+                is_lossy: true,
+                duration_s: Some(200),
+                imported_as_is: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let kept = keep_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &KeepTrackRequest {
+                song_id: "s-fast-1".into(),
+                discovery_track_id: None,
+                target_folder_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(kept.archival_upgrade_queued);
+
+        let s2 = navi.get_song(&alice, "s-fast-2").await.unwrap().unwrap();
+        crate::core::archival::record_fast_acquisition_in(
+            &lib.db,
+            crate::models::archival_upgrade::NewFastAcquisition {
+                user_id: "alice",
+                folder_id: &folder_id,
+                navidrome_song_id: Some("s-fast-2"),
+                discovery_track_id: None,
+                artist: s2.artist.as_deref().unwrap_or("Artist"),
+                title: &s2.title,
+                album: s2.album.as_deref(),
+                recording_mbid: Some("22222222-2222-2222-2222-222222222222"),
+                backend_id: "ytdlp",
+                codec: "mp3",
+                is_lossy: true,
+                duration_s: Some(210),
+                imported_as_is: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let starred = star_track_in(
+            &guard,
+            &navi,
+            &effects,
+            &queue,
+            &alice,
+            &StarTrackRequest {
+                song_id: "s-fast-2".into(),
+                starred: true,
+                discovery_track_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(starred.archival_upgrade_queued);
     }
 }

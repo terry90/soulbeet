@@ -268,15 +268,19 @@ pub(crate) async fn candidates(
     Ok(Some(songs))
 }
 
+/// Upper bound on pages read by `page_through` so a broad title query or stuck pagination cannot
+/// stall the global `IndexRunner` indefinitely.
+const MAX_LOOKUP_PAGES: u32 = 20;
+
 /// Hands `take` each page of LOOKUP_PAGE songs the native `title` filter matches for `text`,
-/// in order, up to a short page.
+/// in order, up to a short page or `MAX_LOOKUP_PAGES`.
 async fn page_through(
     navi: &NavidromeClient,
     text: &str,
     mut take: impl FnMut(Vec<NativeSong>),
 ) -> Result<(), NavidromeError> {
     let mut start = 0;
-    loop {
+    for _ in 0..MAX_LOOKUP_PAGES {
         let page = navi.find_songs(text, start, start + LOOKUP_PAGE).await?;
         let short = page.len() < LOOKUP_PAGE as usize;
         take(page);
@@ -285,6 +289,11 @@ async fn page_through(
         }
         start += LOOKUP_PAGE;
     }
+    warn!(
+        "Index lookup for '{}' hit MAX_LOOKUP_PAGES ({}); stopping pagination",
+        text, MAX_LOOKUP_PAGES
+    );
+    Ok(())
 }
 
 pub(crate) fn not_found_after_scan() -> Failure {
@@ -789,21 +798,29 @@ fn listing(result: SlotResult, songs: &[SongFacts]) -> SlotResult {
 }
 
 /// Spawns the loop: index_round(&DB, &LEDGER, the server's NavidromeOf, ..) every INDEX_POLL.
+/// Recovers from panics inside any single round so server-wide indexing never stalls permanently.
 pub fn start() {
+    use futures::FutureExt;
+
     tokio::spawn(async move {
         let mut runner = IndexRunner::default();
         let mut every = tokio::time::interval(INDEX_POLL);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
-            index_round(
+            let res = std::panic::AssertUnwindSafe(index_round(
                 &crate::db::DB,
                 &crate::ledger::LEDGER,
                 &ServerNavidrome,
                 &mut runner,
                 chrono::Utc::now().timestamp(),
-            )
+            ))
+            .catch_unwind()
             .await;
+            if res.is_err() {
+                warn!("Index round panicked; resetting runner state and continuing");
+                runner = IndexRunner::default();
+            }
         }
     });
 }

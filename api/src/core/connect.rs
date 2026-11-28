@@ -91,11 +91,15 @@ struct DeviceEntry {
     awaiting_pause_ack: bool,
 }
 
+/// Maximum concurrent registered devices kept per user in `ConnectHub`.
+const MAX_DEVICES_PER_USER: usize = 64;
+
 struct UserConnectRoom {
     devices: HashMap<String, DeviceEntry>,
-    /// Highest `conn_id` ever registered for each `device_id` in this room, so a superseded
-    /// older socket can never resurrect even after the newer socket disconnects.
-    latest_conn_id: HashMap<String, u64>,
+    /// Highest `conn_id` ever registered for each `device_id` in this room, with the unix
+    /// timestamp when it was recorded so `prune_stale` can bound memory over time while still
+    /// preventing superseded older sockets from resurrecting immediately after disconnect.
+    latest_conn_id: HashMap<String, (u64, i64)>,
     active_device_id: Option<String>,
     sender: broadcast::Sender<ConnectEnvelope>,
 }
@@ -155,7 +159,33 @@ impl UserConnectRoom {
     fn is_superseded(&self, device_id: &str, conn_id: u64) -> bool {
         self.latest_conn_id
             .get(device_id)
-            .is_some_and(|&latest| conn_id < latest)
+            .is_some_and(|&(latest, _)| conn_id < latest)
+    }
+
+    /// Ensures the room does not exceed `MAX_DEVICES_PER_USER` when adding a new `device_id` by
+    /// evicting the oldest idle non-active device first (or the oldest device if all are active).
+    fn enforce_device_cap(&mut self, incoming_device_id: &str) {
+        if self.devices.contains_key(incoming_device_id) {
+            return;
+        }
+        while self.devices.len() >= MAX_DEVICES_PER_USER {
+            let victim = self
+                .devices
+                .iter()
+                .filter(|(id, _)| self.active_device_id.as_deref() != Some(id.as_str()))
+                .min_by_key(|(_, e)| e.device.last_seen_unix)
+                .or_else(|| self.devices.iter().min_by_key(|(_, e)| e.device.last_seen_unix))
+                .map(|(id, _)| id.clone());
+            match victim {
+                Some(id) => {
+                    self.devices.remove(&id);
+                    if self.active_device_id.as_deref() == Some(id.as_str()) {
+                        self.active_device_id = None;
+                    }
+                }
+                None => break,
+            }
+        }
     }
 
     /// Ensures `(device_id, conn_id)` is present in `self.devices` (touching `last_seen_unix`).
@@ -192,6 +222,7 @@ impl UserConnectRoom {
                 if self.active_device_id.is_none() {
                     self.active_device_id = Some(device_id.to_string());
                 }
+                self.enforce_device_cap(device_id);
                 self.devices.insert(
                     device_id.to_string(),
                     DeviceEntry {
@@ -319,7 +350,9 @@ impl ConnectHub {
             room.active_device_id = Some(device_id.clone());
         }
 
-        room.latest_conn_id.insert(device_id.clone(), conn_id);
+        let now = Self::now_unix();
+        room.enforce_device_cap(&device_id);
+        room.latest_conn_id.insert(device_id.clone(), (conn_id, now));
         room.devices.insert(
             device_id.clone(),
             DeviceEntry {
@@ -328,7 +361,7 @@ impl ConnectHub {
                     name,
                     platform,
                     is_active: room.active_device_id.as_deref() == Some(device_id.as_str()),
-                    last_seen_unix: Self::now_unix(),
+                    last_seen_unix: now,
                     snapshot: existing_snapshot,
                 },
                 conn_id,
@@ -710,6 +743,10 @@ impl ConnectHub {
         for (user, room) in rooms.iter_mut() {
             let before = room.devices.len();
             room.devices.retain(|_, e| e.device.last_seen_unix >= cutoff);
+            room.latest_conn_id
+                .retain(|id, &mut (_, updated_at)| {
+                    room.devices.contains_key(id) || updated_at >= cutoff
+                });
             if room.devices.len() != before {
                 if room
                     .active_device_id

@@ -270,7 +270,7 @@ pub async fn run_multi_backend_source_search(
                         if done {
                             break;
                         }
-                        gloo_timers::future::TimeoutFuture::new(350).await;
+                        crate::sleep_ms(350).await;
                     }
                     Err(e) => {
                         info!("Failed to poll {} search: {:?}", meta.id, e);
@@ -546,7 +546,7 @@ pub fn Search() -> Element {
                         }
                     }
                     spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(5000).await;
+                        crate::sleep_ms(5000).await;
                         let current = download_states.peek().get(&item_id_timer).cloned();
                         if matches!(current, Some(DownloadRowState::Done)) {
                             download_states
@@ -579,7 +579,7 @@ pub fn Search() -> Element {
                         reason,
                     });
                     spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(8000).await;
+                        crate::sleep_ms(8000).await;
                         fallback_toasts.write().retain(|t| t.id != toast_id);
                     });
                 }
@@ -638,7 +638,7 @@ pub fn Search() -> Element {
                         }
                     }
                     spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(5000).await;
+                        crate::sleep_ms(5000).await;
                         let current = download_states.peek().get(&item_id_timer).cloned();
                         if matches!(current, Some(DownloadRowState::Done)) {
                             download_states
@@ -671,7 +671,7 @@ pub fn Search() -> Element {
                         reason,
                     });
                     spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(8000).await;
+                        crate::sleep_ms(8000).await;
                         fallback_toasts.write().retain(|t| t.id != toast_id);
                     });
                 }

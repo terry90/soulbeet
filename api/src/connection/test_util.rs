@@ -77,6 +77,7 @@ impl ConnectionState {
             discovery: Arc::new(TestDiscovery::default()),
             ratings: Arc::new(FixedSync::new(Err(sync_running()))),
             listeners: Arc::new(FakeNavidrome::default()),
+            trust_proxy_headers: true,
             library_import: Arc::new(
                 crate::core::library_import::LibraryImportCoordinator::default(),
             ),

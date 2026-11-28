@@ -35,7 +35,7 @@ pub fn OfflineTogglePill(
     #[props(default)] class: String,
 ) -> Element {
     let surface_class = if offline_only {
-        "bg-amber-500/15 border-amber-400/45 text-amber-300 hover:bg-amber-500/20"
+        "bg-beet-gold-surface border-beet-gold/45 text-beet-gold hover:brightness-110"
     } else {
         "bg-beet-surface border-beet-border-default text-beet-text-primary hover:bg-beet-surface-high"
     };
@@ -122,7 +122,8 @@ mod tests {
         offline_dom.rebuild_in_place();
         let offline_html = dioxus_ssr::render(&offline_dom);
         assert!(offline_html.contains(">Offline Only</span>"), "{offline_html}");
-        assert!(offline_html.contains("bg-amber-500/15"), "{offline_html}");
-        assert!(offline_html.contains("text-amber-300"), "{offline_html}");
+        assert!(offline_html.contains("bg-beet-gold-surface"), "{offline_html}");
+        assert!(offline_html.contains("text-beet-gold"), "{offline_html}");
+        assert!(!offline_html.contains("amber-"), "{offline_html}");
     }
 }

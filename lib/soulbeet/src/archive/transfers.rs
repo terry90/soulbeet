@@ -543,7 +543,7 @@ impl Transfers {
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.state.lock().unwrap().generation
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation
     }
 
     /// Runs `f` while `generation` is the current one, so no stop can come between the check
@@ -553,7 +553,7 @@ impl Transfers {
         generation: u64,
         f: impl FnOnce() -> Result<T, ArchiveError>,
     ) -> Result<T, ArchiveError> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.generation != generation {
             return Err(ArchiveError::TurnedOff);
         }
@@ -562,7 +562,7 @@ impl Transfers {
 
     /// Starts the queued transfers that may start now.
     fn pump(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while state.running() < self.limits.total {
             let Some(id) = state.next_to_start(self.limits.per_item) else {
                 break;
@@ -642,7 +642,7 @@ impl Transfers {
             // Held in memory before it goes in the book, so a call at the same time sees it
             // and nothing goes in the book that is already fetched or was turned off.
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.generation != generation {
                     return Err(ArchiveError::TurnedOff);
                 }
@@ -658,7 +658,7 @@ impl Transfers {
                 state.records.insert(id.clone(), record);
             }
             if let Err(e) = self.book.put(&entry).await {
-                self.state.lock().unwrap().records.remove(&id);
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.remove(&id);
                 let failure = ArchiveError::Book(e).failure(
                     Stage::Enqueue,
                     "The Internet Archive transfer could not be recorded",
@@ -667,7 +667,7 @@ impl Transfers {
                 continue;
             }
             let admitted = {
-                let mut guard = self.state.lock().unwrap();
+                let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let state = &mut *guard;
                 let current = state.generation == generation;
                 if let Some(record) = state.records.get_mut(&id).filter(|_| current) {
@@ -696,7 +696,7 @@ impl Transfers {
 
     /// The transfers from any of `sources`.
     pub(crate) fn listed(&self, sources: &[String]) -> Vec<DownloadProgress> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.records.values())
             .filter(|r| r.phase != Phase::Recording && sources.contains(&r.source))
             .map(|r| self.progress(&state, r))
@@ -709,12 +709,12 @@ impl Transfers {
     }
 
     pub(crate) fn one(&self, source: &str, id: &str) -> Option<DownloadProgress> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::answered(&state, source, id).map(|r| self.progress(&state, r))
     }
 
     pub(crate) fn queue_position(&self, source: &str, id: &str) -> Option<u32> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = Self::answered(&state, source, id)?;
         Some(match record.phase {
             Phase::Queued => state.place(record, self.limits.per_item).1,
@@ -771,7 +771,7 @@ impl Transfers {
         remove: bool,
     ) -> Result<(), ArchiveError> {
         let task = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(record) = (state.records.get_mut(id))
                 .filter(|r| r.phase != Phase::Recording && r.source == source)
             else {
@@ -798,11 +798,11 @@ impl Transfers {
         };
         if remove {
             self.book.forget(BACKEND_ID, id).await?;
-            self.state.lock().unwrap().records.remove(id);
+            self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.remove(id);
         } else if data.state.unfinished() {
             let data = data.ended(Stored::Cancelled, None);
             self.book.set_data(BACKEND_ID, id, &data.value()).await?;
-            if let Some(record) = self.state.lock().unwrap().records.get_mut(id) {
+            if let Some(record) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get_mut(id) {
                 record.data = data;
                 record.phase = Phase::Ended;
             }
@@ -818,7 +818,7 @@ impl Transfers {
     /// keeps its record and its part, so the next stop forgets it.
     pub(crate) async fn stop(&self) {
         let tasks: Vec<(String, Option<JoinHandle<()>>)> = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation += 1;
             (state.records.values_mut())
                 .filter(|r| r.phase != Phase::Ended)
@@ -839,7 +839,7 @@ impl Transfers {
             }
             match self.book.forget(BACKEND_ID, &id).await {
                 Ok(()) => {
-                    self.state.lock().unwrap().records.remove(&id);
+                    self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.remove(&id);
                     self.remove_part(&id);
                 }
                 Err(e) => warn!("Could not forget archive transfer {id} on turning off: {e}"),
@@ -848,7 +848,7 @@ impl Transfers {
     }
 
     fn data_of(&self, id: &str) -> Option<Data> {
-        Some(self.state.lock().unwrap().records.get(id)?.data.clone())
+        Some(self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get(id)?.data.clone())
     }
 
     fn remove_part(&self, id: &str) {
@@ -882,7 +882,7 @@ impl Transfers {
         };
         let data = data.ended(stored, failure);
         self.write(id, &data).await;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             record.data = data;
             record.phase = Phase::Ended;
@@ -894,7 +894,7 @@ impl Transfers {
     }
 
     fn job(&self, id: &str) -> Option<Job> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let r = state.records.get(id)?;
         Some(Job {
             id: r.id.clone(),
@@ -909,7 +909,63 @@ impl Transfers {
     }
 
     /// One transfer's task: fetch, then end it as it went.
+    /// Uses an RAII drop guard so worker slots are always released and `pump()`
+    /// runs even on early return or panic.
     async fn run(self: Arc<Self>, id: String) {
+        struct RunGuard {
+            transfers: Arc<Transfers>,
+            id: String,
+            finished: bool,
+        }
+
+        impl Drop for RunGuard {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let failed_data = {
+                        let mut state = self
+                            .transfers
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(record) = state.records.get_mut(&self.id) {
+                            if record.phase == Phase::Running {
+                                let failure = ended::connection(
+                                    "Internet Archive transfer task exited unexpectedly",
+                                );
+                                let ended_data = record.data.ended(Stored::Failed, Some(failure));
+                                record.data = ended_data.clone();
+                                record.phase = Phase::Ended;
+                                record.task = None;
+                                Some(ended_data)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        if let Some(data) = failed_data {
+                            let transfers = Arc::clone(&self.transfers);
+                            let id = self.id.clone();
+                            handle.spawn(async move {
+                                transfers.write(&id, &data).await;
+                                transfers.remove_part(&id);
+                            });
+                        }
+                        self.transfers.pump();
+                    } else if failed_data.is_some() {
+                        self.transfers.remove_part(&self.id);
+                    }
+                }
+            }
+        }
+
+        let mut guard = RunGuard {
+            transfers: Arc::clone(&self),
+            id: id.clone(),
+            finished: false,
+        };
         let Some(job) = self.job(&id) else {
             return;
         };
@@ -932,11 +988,12 @@ impl Transfers {
                 self.remove_part(&id);
             }
         }
+        guard.finished = true;
         self.pump();
     }
 
     fn set_progress(&self, id: &str, transferred: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             record.transferred = transferred;
             record.speed.record(Instant::now(), transferred);
@@ -944,7 +1001,7 @@ impl Transfers {
     }
 
     fn count_attempt(&self, id: &str) {
-        if let Some(record) = self.state.lock().unwrap().records.get_mut(id) {
+        if let Some(record) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get_mut(id) {
             record.attempts += 1;
         }
     }
@@ -958,7 +1015,7 @@ impl Transfers {
         }
         job.etag.clone_from(&etag);
         let data = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(record) = state.records.get_mut(&job.id) else {
                 return;
             };
@@ -1228,7 +1285,7 @@ impl Transfers {
         if let Some(mut data) = self.data_of(&job.id) {
             data.state = Stored::Landing;
             self.write(&job.id, &data).await;
-            if let Some(record) = self.state.lock().unwrap().records.get_mut(&job.id) {
+            if let Some(record) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get_mut(&job.id) {
                 record.data = data;
             }
         }

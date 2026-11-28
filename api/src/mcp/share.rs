@@ -254,23 +254,36 @@ async fn share_tracks(
     );
     let same_call = args.same_call();
     let work = async move {
-        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
-        match core_share_tracks(
-            &guard,
-            navidrome.as_ref(),
-            &queue,
-            &ctx,
-            ShareTracksRequest {
-                selection,
-                recipient_user_ids,
-                dry_run: false,
-                origin: ShareOrigin::Mcp,
-            },
-        )
-        .await
-        {
-            Ok(report) => Keyed::Kept(share_answer(report, is_admin)),
-            Err(f) => Keyed::Released(failed(share_call_error(f, same_call))),
+        // Run the mutation phase in a detached task so a client disconnect mid-share never
+        // aborts between filesystem linking, beets registration, Navidrome scan, and audit writes.
+        let handle = tokio::spawn(async move {
+            let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+            core_share_tracks(
+                &guard,
+                navidrome.as_ref(),
+                &queue,
+                &ctx,
+                ShareTracksRequest {
+                    selection,
+                    recipient_user_ids,
+                    dry_run: false,
+                    origin: ShareOrigin::Mcp,
+                },
+            )
+            .await
+        });
+        match handle.await {
+            Ok(Ok(report)) => Keyed::Kept(share_answer(report, is_admin)),
+            Ok(Err(f)) => Keyed::Released(failed(share_call_error(f, same_call))),
+            Err(e) => {
+                let f = Failure::new(
+                    FailureCode::ShareFailed,
+                    Stage::Share,
+                    RetryAdvice::SameSourceLater,
+                    format!("Share task stopped unexpectedly: {e}"),
+                );
+                Keyed::Released(failed(share_call_error(f, same_call)))
+            }
         }
     };
     keyed(&state.acquire, caller, SHARE_TRACKS.name, key, &call, work).await
@@ -539,10 +552,24 @@ async fn migrate_legacy_folders(
     );
     let same_call = args.same_call();
     let work = async move {
-        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
-        match migrate_legacy_folder(&guard, navidrome.as_ref(), &queue, &ctx, req).await {
-            Ok(report) => Keyed::Kept(migrate_answer(report)),
-            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+        // Run the mutation phase in a detached task so a client disconnect mid-migration never
+        // aborts between hardlinking files, beets registration, Navidrome scan, and cleanup.
+        let handle = tokio::spawn(async move {
+            let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+            migrate_legacy_folder(&guard, navidrome.as_ref(), &queue, &ctx, req).await
+        });
+        match handle.await {
+            Ok(Ok(report)) => Keyed::Kept(migrate_answer(report)),
+            Ok(Err(f)) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+            Err(e) => {
+                let f = Failure::new(
+                    FailureCode::ShareFailed,
+                    Stage::Share,
+                    RetryAdvice::SameSourceLater,
+                    format!("Legacy folder migration task stopped unexpectedly: {e}"),
+                );
+                Keyed::Released(failed(upstream_error(f, Map::new(), same_call)))
+            }
         }
     };
     keyed(

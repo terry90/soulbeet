@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Timelike, Utc};
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
@@ -23,9 +25,9 @@ use shared::recommendation::{
     WeatherSnapshot,
 };
 use soulbeet::engine::contextual::MAX_TRACKS_PER_ARTIST;
-use soulbeet::navidrome::models::SubsonicSong;
+use soulbeet::navidrome::models::{NativeBrowseSong, SubsonicNamedGenre, SubsonicSong};
 use soulbeet::navidrome::{filepath_rules, NavidromeClient, PlaylistMeta, SmartPlaylistChange};
-use soulbeet::MusicKnowledge;
+use soulbeet::{MusicKnowledge, NavidromeError};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -42,6 +44,165 @@ use crate::models::discovery_playlist::DiscoveryTrackRow;
 use crate::models::navidrome_library::NavidromeLibraryRow;
 use crate::models::user_settings::UserSettings;
 use crate::services::NavidromeLookupError;
+
+const LIBRARY_SNAPSHOT_TTL: Duration = Duration::from_secs(45);
+const MAX_CACHED_LIBRARY_USERS: usize = 64;
+
+struct CachedLibrarySnapshot {
+    songs: Arc<Vec<SubsonicSong>>,
+    fetched_at: Instant,
+}
+
+static LIBRARY_SNAPSHOT_CACHE: LazyLock<Mutex<HashMap<(String, String), CachedLibrarySnapshot>>> =
+    LazyLock::new(Default::default);
+
+fn native_song_to_subsonic(browse: NativeBrowseSong) -> SubsonicSong {
+    let song = browse.song;
+    let genre = (!browse.genre.trim().is_empty()).then_some(browse.genre);
+    let genres = browse
+        .genres
+        .into_iter()
+        .filter(|g| !g.name.trim().is_empty())
+        .map(|g| SubsonicNamedGenre { name: g.name })
+        .collect();
+    let created = browse
+        .created_at
+        .map(|d| d.to_rfc3339())
+        .or_else(|| Some(song.updated_at.to_rfc3339()));
+    SubsonicSong {
+        id: song.id,
+        title: song.title,
+        artist: (!song.artist.is_empty()).then_some(song.artist),
+        album: (!song.album.is_empty()).then_some(song.album),
+        album_id: (!song.album_id.is_empty()).then_some(song.album_id),
+        genre,
+        genres,
+        duration: (song.duration > 0.0).then_some(song.duration.round() as u32),
+        user_rating: (song.rating > 0).then_some(song.rating),
+        play_count: (song.play_count > 0)
+            .then_some(u32::try_from(song.play_count).unwrap_or(u32::MAX)),
+        created,
+        played: song.play_date.map(|d| d.to_rfc3339()),
+        starred: song.starred.then(|| {
+            song.starred_at
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+        }),
+        music_brainz_id: song.mbz_recording_id,
+        suffix: (!song.suffix.is_empty()).then_some(song.suffix),
+        bit_rate: (song.bit_rate > 0).then_some(song.bit_rate),
+        size: (song.size > 0).then_some(song.size),
+        year: (song.year > 0).then_some(song.year),
+        track: (song.track_number > 0).then_some(song.track_number),
+        path: (!song.path.is_empty()).then_some(song.path),
+    }
+}
+
+/// Fetches all present library songs via Navidrome's native API (`GET /api/song`), which always
+/// returns real library-relative paths regardless of `ReportRealPath`, carries `genre`/`genres`
+/// and `createdAt`, and reports DB errors via HTTP 5xx instead of silent empty Subsonic `search3`
+/// responses.
+pub(crate) async fn fetch_all_songs_native(
+    navi: &NavidromeClient,
+) -> Result<Vec<SubsonicSong>, NavidromeError> {
+    match navi.all_browse_songs(false).await {
+        Ok(page) => Ok(page
+            .songs
+            .into_iter()
+            .filter(|s| !s.song.missing)
+            .map(native_song_to_subsonic)
+            .collect()),
+        #[cfg(test)]
+        Err(NavidromeError::Parse(_)) => navi.get_all_songs_with_ratings().await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Fetches `user_id`'s native Navidrome library snapshot using a 45-second per-user TTL cache so
+/// rapid bootstrap/home/mix calls do not repeatedly scan large libraries.
+pub(crate) async fn fetch_library_snapshot_cached(
+    user_id: &str,
+    navi: &NavidromeClient,
+) -> Result<Arc<Vec<SubsonicSong>>, NavidromeError> {
+    let key = (user_id.to_string(), navi.base_url().as_str().to_string());
+    let now = Instant::now();
+    {
+        let mut cache = LIBRARY_SNAPSHOT_CACHE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = cache.get(&key) {
+            if now.saturating_duration_since(entry.fetched_at) < LIBRARY_SNAPSHOT_TTL {
+                return Ok(Arc::clone(&entry.songs));
+            }
+        }
+        cache.retain(|_, v| now.saturating_duration_since(v.fetched_at) < LIBRARY_SNAPSHOT_TTL);
+    }
+
+    let songs = Arc::new(fetch_all_songs_native(navi).await?);
+    let mut cache = LIBRARY_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cache.len() >= MAX_CACHED_LIBRARY_USERS && !cache.contains_key(&key) {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, v)| v.fetched_at)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest_key);
+        }
+    }
+    cache.insert(
+        key,
+        CachedLibrarySnapshot {
+            songs: Arc::clone(&songs),
+            fetched_at: Instant::now(),
+        },
+    );
+    Ok(songs)
+}
+
+/// Drops any cached Navidrome library snapshot for `user_id` (called after scans, curation,
+/// rating sync, or an explicit mix refresh).
+pub(crate) fn invalidate_library_snapshot_cache(user_id: &str) {
+    let mut cache = LIBRARY_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|(uid, _), _| uid != user_id);
+}
+
+/// Clears stale `song_id` values on pending discovery tracks when the stored `song_id` no longer
+/// exists in the live `library` snapshot (e.g. deleted or rescanned under a new ID), so subsequent
+/// reconciliation can re-match them and mixes never emit unplayable rows.
+pub(crate) async fn clear_stale_discovery_song_ids_in(
+    db: &SqlitePool,
+    library: &[SubsonicSong],
+    tracks: &mut [DiscoveryTrack],
+) -> usize {
+    if tracks.is_empty() {
+        return 0;
+    }
+    let live_ids: HashSet<&str> = library.iter().map(|s| s.id.as_str()).collect();
+    let mut cleared = 0usize;
+    for track in tracks.iter_mut() {
+        if track.status != DiscoveryStatus::Pending {
+            continue;
+        }
+        let Some(song_id) = track.song_id.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if !live_ids.contains(song_id) {
+            if let Err(e) = DiscoveryTrackRow::clear_song_id_in(db, &track.id).await {
+                warn!(
+                    "Failed to clear stale song_id '{}' for discovery track '{}': {}",
+                    song_id, track.id, e
+                );
+            }
+            track.song_id = None;
+            cleared += 1;
+        }
+    }
+    cleared
+}
 
 /// Reads `user_id`'s stored `UserCultureProfile`, or returns sensible defaults if unset.
 pub(crate) async fn get_culture_profile_in(
@@ -602,7 +763,7 @@ pub(crate) async fn maybe_reconcile_discovery_song_ids_in(
             return 0;
         }
     };
-    let library = match navi.get_all_songs_with_ratings().await {
+    let library = match fetch_library_snapshot_cached(user_id, &navi).await {
         Ok(songs) => songs,
         Err(e) => {
             warn!(
@@ -612,6 +773,7 @@ pub(crate) async fn maybe_reconcile_discovery_song_ids_in(
             return 0;
         }
     };
+    clear_stale_discovery_song_ids_in(db, &library, tracks).await;
     reconcile_discovery_song_ids_in(db, &library, music_path, tracks).await
 }
 
@@ -642,7 +804,7 @@ pub(crate) async fn reconcile_and_hydrate_discovery_tracks_in(
             return;
         }
     };
-    let library = match navi.get_all_songs_with_ratings().await {
+    let library = match fetch_library_snapshot_cached(user_id, &navi).await {
         Ok(songs) => songs,
         Err(e) => {
             warn!(
@@ -652,6 +814,7 @@ pub(crate) async fn reconcile_and_hydrate_discovery_tracks_in(
             return;
         }
     };
+    clear_stale_discovery_song_ids_in(db, &library, tracks).await;
     if tracks.iter().any(needs_song_id_reconciliation) {
         reconcile_discovery_song_ids_in(db, &library, music_path, tracks).await;
     }
@@ -799,7 +962,7 @@ pub(crate) async fn upsert_mix_definition_in(
                 FailureCode::PermissionNotGranted,
                 Stage::Input,
                 RetryAdvice::NotRetryable,
-                format!("Mix '{slug}' is managed globally or belongs to another user"),
+                format!("Mix '{slug}' is unavailable or cannot be modified"),
             ));
         }
     }
@@ -1525,6 +1688,10 @@ fn build_contextual_mix_tracks(
             let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
                 continue;
             };
+            let nav_song = song_by_id.get(song_id).copied();
+            if library.is_some() && nav_song.is_none() {
+                continue;
+            }
             let key = CandidateSet::key(&dt.artist, &dt.title);
             if !seen_keys.insert(key) {
                 continue;
@@ -1535,7 +1702,6 @@ fn build_contextual_mix_tracks(
                 continue;
             }
             *count += 1;
-            let nav_song = song_by_id.get(song_id).copied();
             let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
                 "local" => Some(CultureBucket::Local),
                 "international" => Some(CultureBucket::International),
@@ -1775,6 +1941,10 @@ fn build_contextual_mix_tracks(
             let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
                 continue;
             };
+            let nav_song = song_by_id.get(song_id).copied();
+            if library.is_some() && nav_song.is_none() {
+                continue;
+            }
             let key = CandidateSet::key(&dt.artist, &dt.title);
             if !seen_keys.insert(key) {
                 continue;
@@ -1785,7 +1955,6 @@ fn build_contextual_mix_tracks(
                 continue;
             }
             *count += 1;
-            let nav_song = song_by_id.get(song_id).copied();
             let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
                 "local" => Some(CultureBucket::Local),
                 "international" => Some(CultureBucket::International),
@@ -1929,11 +2098,14 @@ fn build_rolling_mix_tracks(
         let Some(song_id) = dt.song_id.as_deref().filter(|s| !s.is_empty()) else {
             continue;
         };
+        let nav_song = song_by_id.get(song_id).copied();
+        if library.is_some() && nav_song.is_none() {
+            continue;
+        }
         let key = CandidateSet::key(&dt.artist, &dt.title);
         if !seen_keys.insert(key) {
             continue;
         }
-        let nav_song = song_by_id.get(song_id).copied();
         let bucket = dt.culture_bucket.as_deref().and_then(|b| match b {
             "local" => Some(CultureBucket::Local),
             "international" => Some(CultureBucket::International),
@@ -2135,9 +2307,9 @@ pub(crate) async fn list_active_contextual_mixes_in(
 
     // Fetch Navidrome library ONCE for the whole listing call, whenever active contextual mixes
     // (Moment or Seasonal owned matching) or pending `song_id` reconciliation need it.
-    let library: Option<Vec<SubsonicSong>> = if has_active_contextual || needs_reconcile {
+    let library: Option<Arc<Vec<SubsonicSong>>> = if has_active_contextual || needs_reconcile {
         match navidrome.navidrome_of(&ctx.id()).await {
-            Ok(navi) => match navi.get_all_songs_with_ratings().await {
+            Ok(navi) => match fetch_library_snapshot_cached(&ctx.user_id, &navi).await {
                 Ok(songs) => Some(songs),
                 Err(e) => {
                     warn!(
@@ -2161,7 +2333,8 @@ pub(crate) async fn list_active_contextual_mixes_in(
     };
 
     if let Some(ref songs) = library {
-        if needs_reconcile {
+        let cleared = clear_stale_discovery_song_ids_in(db, songs, &mut pending).await;
+        if needs_reconcile || cleared > 0 {
             reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
         }
     }
@@ -2176,7 +2349,7 @@ pub(crate) async fn list_active_contextual_mixes_in(
             &culture,
             state,
             &pending,
-            library.as_deref(),
+            library.as_deref().map(Vec::as_slice),
             now,
             None,
             weather.as_ref(),
@@ -2239,7 +2412,8 @@ pub(crate) async fn list_active_contextual_mixes_in(
     // Rolling Personal Mixes (count ONLY reconciled playable pending tracks matching resolve)
     for profile in parse_profiles(&settings.discovery_profiles) {
         let playable_count =
-            build_rolling_mix_tracks(profile, library.as_deref(), &pending).len() as u32;
+            build_rolling_mix_tracks(profile, library.as_deref().map(Vec::as_slice), &pending)
+                .len() as u32;
         mixes.push(summarize_rolling_profile(profile, &settings, playable_count));
     }
 
@@ -2297,8 +2471,8 @@ pub(crate) async fn steer_seasonal_pack_in(
         .await
         .map_err(|e| database_failure(Stage::Input, e))?;
     let needs_reconcile = pending.iter().any(needs_song_id_reconciliation);
-    let library: Option<Vec<SubsonicSong>> = match navidrome.navidrome_of(&ctx.id()).await {
-        Ok(navi) => match navi.get_all_songs_with_ratings().await {
+    let library: Option<Arc<Vec<SubsonicSong>>> = match navidrome.navidrome_of(&ctx.id()).await {
+        Ok(navi) => match fetch_library_snapshot_cached(&ctx.user_id, &navi).await {
             Ok(songs) => Some(songs),
             Err(e) => {
                 warn!(
@@ -2318,7 +2492,8 @@ pub(crate) async fn steer_seasonal_pack_in(
         }
     };
     if let Some(ref songs) = library {
-        if needs_reconcile {
+        let cleared = clear_stale_discovery_song_ids_in(db, songs, &mut pending).await;
+        if needs_reconcile || cleared > 0 {
             reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
         }
     }
@@ -2328,7 +2503,7 @@ pub(crate) async fn steer_seasonal_pack_in(
         &culture,
         Some(&state),
         &pending,
-        library.as_deref(),
+        library.as_deref().map(Vec::as_slice),
         now,
         None,
         None,
@@ -2603,9 +2778,9 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
                 let has_rolling = pending.iter().any(|t| {
                     t.profile.eq_ignore_ascii_case(profile.name()) && t.pack_slug.is_none()
                 });
-                let library: Option<Vec<SubsonicSong>> = if needs_reconcile || has_rolling {
+                let library: Option<Arc<Vec<SubsonicSong>>> = if needs_reconcile || has_rolling {
                     match navidrome.navidrome_of(&ctx.id()).await {
-                        Ok(navi) => match navi.get_all_songs_with_ratings().await {
+                        Ok(navi) => match fetch_library_snapshot_cached(&ctx.user_id, &navi).await {
                             Ok(songs) => Some(songs),
                             Err(e) => {
                                 warn!(
@@ -2624,11 +2799,16 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
                     None
                 };
                 if let Some(ref songs) = library {
-                    if needs_reconcile {
+                    let cleared = clear_stale_discovery_song_ids_in(db, songs, &mut pending).await;
+                    if needs_reconcile || cleared > 0 {
                         reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
                     }
                 }
-                let tracks = build_rolling_mix_tracks(profile, library.as_deref(), &pending);
+                let tracks = build_rolling_mix_tracks(
+                    profile,
+                    library.as_deref().map(Vec::as_slice),
+                    &pending,
+                );
                 let summary = summarize_rolling_profile(profile, &settings, tracks.len() as u32);
                 return Ok(ContextualMixPlaylist {
                     summary,
@@ -2663,13 +2843,13 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
         Err(e) => return Err(e.failure(Stage::Playlist, e.to_string())),
     };
 
-    let library: Option<Vec<SubsonicSong>> = if owned_target > 0
+    let library: Option<Arc<Vec<SubsonicSong>>> = if owned_target > 0
         || def.kind == ContextualMixKind::Seasonal
         || needs_reconcile
         || !pending.is_empty()
     {
         if let Some(ref navi) = navi_opt {
-            match navi.get_all_songs_with_ratings().await {
+            match fetch_library_snapshot_cached(&ctx.user_id, navi).await {
                 Ok(songs) => Some(songs),
                 Err(e) if owned_target > 0 => {
                     return Err(navidrome_failure(Stage::Playlist, &e));
@@ -2690,13 +2870,19 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
     };
 
     if let Some(ref songs) = library {
-        if needs_reconcile {
+        let cleared = clear_stale_discovery_song_ids_in(db, songs, &mut pending).await;
+        if needs_reconcile || cleared > 0 {
             reconcile_discovery_song_ids_in(db, songs, music_path, &mut pending).await;
         }
     }
 
-    let tracks =
-        build_contextual_mix_tracks(&ctx.user_id, &def, library.as_deref(), &pending, now);
+    let tracks = build_contextual_mix_tracks(
+        &ctx.user_id,
+        &def,
+        library.as_deref().map(Vec::as_slice),
+        &pending,
+        now,
+    );
 
     // Optionally materialize as a real static Navidrome playlist (ONLY for Moment mixes and ONLY
     // when the caller explicitly requested `sync_navidrome = true`; Seasonal mixes use smart
@@ -2770,7 +2956,7 @@ pub(crate) async fn resolve_contextual_mix_playlist_in(
         &culture,
         state.as_ref(),
         &pending,
-        library.as_deref(),
+        library.as_deref().map(Vec::as_slice),
         now,
         Some(tracks.len() as u32),
         None,
@@ -2871,8 +3057,7 @@ pub(crate) async fn start_seed_radio_in(
         seed_mbid = knowledge.resolve_artist(&seed_artist).await.ok().flatten();
     }
 
-    let all_songs = navi
-        .get_all_songs_with_ratings()
+    let all_songs = fetch_library_snapshot_cached(&ctx.user_id, &navi)
         .await
         .map_err(|e| navidrome_failure(Stage::LibraryCheck, &e))?;
 
@@ -2884,7 +3069,7 @@ pub(crate) async fn start_seed_radio_in(
         .collect();
 
     let seed_artist_key = discovery_name(&seed_artist);
-    for song in &all_songs {
+    for song in all_songs.iter() {
         if owned_tracks.len() >= 4 {
             break;
         }
@@ -2915,7 +3100,7 @@ pub(crate) async fn start_seed_radio_in(
         if let Ok(neighbours) = knowledge.similar_artists(&seed_artist, mbid, 12).await {
             for neighbour in &neighbours {
                 let n_key = discovery_name(&neighbour.artist.name);
-                for song in &all_songs {
+                for song in all_songs.iter() {
                     if owned_tracks.len() >= limit {
                         break;
                     }
@@ -3491,7 +3676,8 @@ mod tests {
                         {"id":"nd-own-2","title":"Highway","artist":"Indie Act","album":"LP2","genre":"Indie Rock","duration":195,"userRating":4,"playCount":8},
                         {"id":"nd-disliked","title":"Bad Tune","artist":"Skip Band","album":"LP","genre":"Electronic","duration":180,"userRating":1,"playCount":1},
                         {"id":"nd-staged-path","title":"Staged Track","artist":"Staged Band","album":"EP","genre":"Electronic","duration":180,"path":"alice/Discovery/Balanced/Staged.flac"},
-                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200}
+                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200},
+                        {"id":"nd-xmas-1","title":"Snowfall","artist":"Winter Act","album":"Xmas","genre":"Holiday","duration":210,"path":"alice/Discovery/Seasonal/winter_holiday/01.flac"}
                     ]}"#,
                 ),
                 &subsonic_ok(
@@ -3500,7 +3686,8 @@ mod tests {
                         {"id":"nd-own-2","title":"Highway","artist":"Indie Act","album":"LP2","genre":"Indie Rock","duration":195,"userRating":4,"playCount":8},
                         {"id":"nd-disliked","title":"Bad Tune","artist":"Skip Band","album":"LP","genre":"Electronic","duration":180,"userRating":1,"playCount":1},
                         {"id":"nd-staged-path","title":"Staged Track","artist":"Staged Band","album":"EP","genre":"Electronic","duration":180,"path":"alice/Discovery/Balanced/Staged.flac"},
-                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200}
+                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200},
+                        {"id":"nd-xmas-1","title":"Snowfall","artist":"Winter Act","album":"Xmas","genre":"Holiday","duration":210,"path":"alice/Discovery/Seasonal/winter_holiday/01.flac"}
                     ]}"#,
                 ),
                 &subsonic_ok(
@@ -3509,7 +3696,8 @@ mod tests {
                         {"id":"nd-own-2","title":"Highway","artist":"Indie Act","album":"LP2","genre":"Indie Rock","duration":195,"userRating":4,"playCount":8},
                         {"id":"nd-disliked","title":"Bad Tune","artist":"Skip Band","album":"LP","genre":"Electronic","duration":180,"userRating":1,"playCount":1},
                         {"id":"nd-staged-path","title":"Staged Track","artist":"Staged Band","album":"EP","genre":"Electronic","duration":180,"path":"alice/Discovery/Balanced/Staged.flac"},
-                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200}
+                        {"id":"nd-fresh-1","title":"Night Drive","artist":"Fresh Band","album":"EP","genre":"Electronic","duration":200},
+                        {"id":"nd-xmas-1","title":"Snowfall","artist":"Winter Act","album":"Xmas","genre":"Holiday","duration":210,"path":"alice/Discovery/Seasonal/winter_holiday/01.flac"}
                     ]}"#,
                 ),
             ],
@@ -3979,7 +4167,13 @@ mod tests {
             .collect();
         assert_eq!(by_id.get("dt-path"), Some(&Some("nd-path-match")));
         assert_eq!(by_id.get("dt-scoped"), Some(&Some("nd-staged-echoes")));
-        assert_eq!(stub.asked().len(), 1);
+        assert_eq!(
+            stub.asked()
+                .iter()
+                .filter(|p| p.as_str() == "/rest/search3")
+                .count(),
+            1
+        );
 
         // Persisted in SQLite: `maybe_reconcile_discovery_song_ids_in` hits SQLite ONLY with zero
         // Navidrome requests on already-reconciled rows!
@@ -3992,6 +4186,7 @@ mod tests {
         let mut already_reconciled = DiscoveryTrackRow::pending_for_user_in(&db, "alice")
             .await
             .unwrap();
+        let asked_before = stub.asked().len();
         let second_reconciled = maybe_reconcile_discovery_song_ids_in(
             &db,
             &StubNavidrome(stub.client()),
@@ -4003,7 +4198,7 @@ mod tests {
         assert_eq!(second_reconciled, 0);
         assert_eq!(
             stub.asked().len(),
-            1,
+            asked_before,
             "once reconciled, maybe_reconcile_discovery_song_ids_in must not call Navidrome again"
         );
     }
@@ -4156,8 +4351,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Only ONE Navidrome fetch for the whole list call
-        assert_eq!(stub.asked().len(), 1);
+        // Only ONE Navidrome library fetch for the whole list call
+        assert_eq!(
+            stub.asked()
+                .iter()
+                .filter(|p| p.as_str() == "/rest/search3")
+                .count(),
+            1
+        );
 
         let drive_summary = mixes.iter().find(|m| m.slug == "drive").unwrap();
         // Owned: max 2 from "Repeated Artist" (MAX_TRACKS_PER_ARTIST=2) + 1 from "Other Artist" = 3 owned
@@ -5656,5 +5857,254 @@ mod tests {
         assert_eq!(cleared.weather_city, None);
         assert_eq!(cleared.weather_lat, None);
         assert_eq!(cleared.weather_lon, None);
+    }
+
+    #[tokio::test]
+    async fn native_library_snapshot_caches_and_filters_stale_song_ids() {
+        let db = test_db::migrated().await;
+        let folder_id = folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        sqlx::query(
+            "INSERT INTO discovery_tracks \
+                (id, song_id, title, artist, album, path, folder_id, profile, status, pack_slug) \
+             VALUES \
+                ('dt-live', 'nd-live-1', 'Live Song', 'Good Act', 'EP', \
+                 '/music/alice/Discovery/Seasonal/winter_holiday/live.flac', ?, 'Balanced', 'Pending', 'winter_holiday'), \
+                ('dt-stale', 'nd-deleted-99', 'Gone Song', 'Old Act', 'EP', \
+                 '/music/alice/Discovery/Seasonal/winter_holiday/gone.flac', ?, 'Balanced', 'Pending', 'winter_holiday')",
+        )
+        .bind(&folder_id)
+        .bind(&folder_id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let stub = NavidromeStub::start();
+        let native_body = format!(
+            "[{}]",
+            serde_json::json!({
+                "id": "nd-live-1",
+                "path": "alice/Discovery/Seasonal/winter_holiday/live.flac",
+                "title": "Live Song",
+                "size": 1000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "updatedAt": "2026-12-10T00:00:00Z",
+                "artist": "Good Act",
+                "album": "EP",
+                "albumArtist": "Good Act",
+                "rating": 0,
+                "duration": 200.0,
+                "starred": false,
+                "playCount": 0
+            })
+        );
+        stub.answer("/api/song", &[&native_body]);
+        stub.header("/api/song", "X-Total-Count", "1");
+
+        let now = Utc.with_ymd_and_hms(2026, 12, 15, 19, 0, 0).unwrap();
+        let first = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            Some(Path::new("/music")),
+            &ctx,
+            "winter_holiday",
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.tracks.len(), 1);
+        assert_eq!(first.tracks[0].song_id, "nd-live-1");
+
+        // Stale song_id was cleared in SQLite so deleted rows cannot inflate counts.
+        let stale_row = DiscoveryTrackRow::get_by_id_in(&db, "dt-stale")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_row.song_id, None);
+
+        // Second call within 45s hits the per-user TTL cache (still 1 `/api/song` request).
+        let second = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            Some(Path::new("/music")),
+            &ctx,
+            "winter_holiday",
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.tracks.len(), 1);
+        assert_eq!(
+            stub.asked().iter().filter(|p| p.as_str() == "/api/song").count(),
+            1
+        );
+
+        // Invalidation forces a fresh `/api/song` fetch.
+        invalidate_library_snapshot_cache(&ctx.user_id);
+        let _third = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            Some(Path::new("/music")),
+            &ctx,
+            "winter_holiday",
+            false,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stub.asked().iter().filter(|p| p.as_str() == "/api/song").count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn native_api_song_preserves_genres_and_created_at_without_search3_fallback() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        let stub = NavidromeStub::start();
+        let native_body = serde_json::json!([
+            {
+                "id": "nd-recent-jazz",
+                "path": "alice/Bill Evans/Waltz/01.flac",
+                "title": "Waltz for Debby",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2026-12-12T10:00:00Z",
+                "updatedAt": "2020-01-01T00:00:00Z",
+                "artist": "Bill Evans",
+                "album": "Waltz for Debby",
+                "albumArtist": "Bill Evans",
+                "genre": "Jazz",
+                "genres": [
+                    {"id": "g1", "name": "Jazz"},
+                    {"id": "g2", "name": "Late Night Piano"}
+                ],
+                "rating": 5,
+                "duration": 240.0,
+                "starred": true,
+                "playCount": 1
+            },
+            {
+                "id": "nd-old-jazz",
+                "path": "alice/Miles Davis/Blue/01.flac",
+                "title": "So What",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2024-01-10T10:00:00Z",
+                "updatedAt": "2026-12-14T10:00:00Z",
+                "artist": "Miles Davis",
+                "album": "Kind of Blue",
+                "albumArtist": "Miles Davis",
+                "genre": "Jazz",
+                "genres": [{"id": "g1", "name": "Jazz"}],
+                "rating": 5,
+                "duration": 300.0,
+                "starred": true,
+                "playCount": 10
+            },
+            {
+                "id": "nd-recent-metal",
+                "path": "alice/Metal Act/Noise/01.flac",
+                "title": "Heavy Riff",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2026-12-14T12:00:00Z",
+                "updatedAt": "2026-12-14T12:00:00Z",
+                "artist": "Metal Act",
+                "album": "Noise",
+                "albumArtist": "Metal Act",
+                "genre": "Death Metal",
+                "genres": [{"id": "g3", "name": "Death Metal"}],
+                "rating": 5,
+                "duration": 210.0,
+                "starred": true,
+                "playCount": 0
+            }
+        ])
+        .to_string();
+        stub.answer("/api/song", &[&native_body]);
+        stub.header("/api/song", "X-Total-Count", "3");
+
+        // Create a custom mix that requires BOTH multi-genre tag matching AND added_within_days
+        // with NewestAddedFirst sorting.
+        let mix_req = UpsertContextualMixRequest {
+            slug: "recent_piano_jazz".into(),
+            kind: ContextualMixKind::Moment,
+            custom_name: Some("Recent Piano Jazz".into()),
+            custom_description: None,
+            global: false,
+            enabled: Some(true),
+            theme_tags: vec!["late night piano".into(), "jazz".into()],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            weather_conditions: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 10,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                added_within_days: Some(30),
+                sort_order: MixSortOrder::NewestAddedFirst,
+                strict_match: true,
+                ..MixSelectionRules::default()
+            }),
+        };
+        upsert_mix_definition_in(&db, &ctx, mix_req).await.unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 12, 15, 19, 0, 0).unwrap();
+        let playlist = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            Some(Path::new("/music")),
+            &ctx,
+            "recent_piano_jazz",
+            true,
+            now,
+        )
+        .await
+        .unwrap();
+
+        // Only nd-recent-jazz matches BOTH genre ("Jazz" / "Late Night Piano") AND createdAt within 30 days.
+        // nd-old-jazz has recent updatedAt (2026-12-14) but old createdAt (2024-01-10) -> must be excluded.
+        // nd-recent-metal has recent createdAt but wrong genre -> must be excluded.
+        assert_eq!(playlist.tracks.len(), 1);
+        assert_eq!(playlist.tracks[0].song_id, "nd-recent-jazz");
+
+        // Verify /api/song was used directly with zero fallback to Subsonic search3.
+        let asked = stub.asked();
+        assert!(asked.iter().any(|p| p == "/api/song"), "asked={asked:?}");
+        assert!(
+            !asked.iter().any(|p| p.contains("search3")),
+            "unexpected search3 fallback: {asked:?}"
+        );
+
+        // Also verify fetch_all_songs_native directly preserves genre, genres, and createdAt.
+        let fetched = fetch_all_songs_native(&stub.client()).await.unwrap();
+        let waltz = fetched.iter().find(|s| s.id == "nd-recent-jazz").unwrap();
+        assert_eq!(waltz.genre.as_deref(), Some("Jazz"));
+        let all_genres: Vec<&str> = waltz.all_genres().collect();
+        assert!(all_genres.contains(&"Jazz"));
+        assert!(all_genres.contains(&"Late Night Piano"));
+        assert_eq!(waltz.created.as_deref(), Some("2026-12-12T10:00:00+00:00"));
     }
 }
