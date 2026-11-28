@@ -233,6 +233,7 @@ pub struct WebStudioContext {
     pub toast_notice: Signal<Option<String>>,
     pub toast_gen: Signal<u64>,
     pub playlists: Signal<Vec<SubsonicPlaylistSummary>>,
+    pub playlists_refresh_tick: Signal<u64>,
     pub selected_playlist_id: Signal<Option<String>>,
     pub recent_albums: Signal<Vec<SubsonicAlbumSummary>>,
     pub starred_tracks: Signal<Vec<PlayerTrack>>,
@@ -545,17 +546,11 @@ impl WebStudioContext {
             .collect()
     }
 
+    /// Triggers a root-scoped playlist list refresh in `StudioShell` so navigating away
+    /// immediately after a mutation never cancels the in-flight refresh.
     pub fn refresh_playlists(&mut self) {
-        let Some(info) = self.navidrome_info() else {
-            return;
-        };
-        let mut studio = *self;
-        spawn(async move {
-            if let Ok(list) = fetch_playlists(&info).await {
-                studio.playlists.set(list);
-                studio.reclassify_playlists();
-            }
-        });
+        let next = self.playlists_refresh_tick.peek().wrapping_add(1);
+        self.playlists_refresh_tick.set(next);
     }
 
     /// Resolves an artist name in Navidrome and opens `/artist/:id`, falling back to Search.
@@ -2196,6 +2191,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let toast_notice = use_signal(|| None::<String>);
     let toast_gen = use_signal(|| 0u64);
     let playlists = use_signal(Vec::<SubsonicPlaylistSummary>::new);
+    let playlists_refresh_tick = use_signal(|| 0u64);
     let selected_playlist_id = use_signal(|| None::<String>);
     let recent_albums = use_signal(Vec::<SubsonicAlbumSummary>::new);
     let starred_tracks = use_signal(Vec::<PlayerTrack>::new);
@@ -2248,6 +2244,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         toast_notice,
         toast_gen,
         playlists,
+        playlists_refresh_tick,
         selected_playlist_id,
         recent_albums,
         starred_tracks,
@@ -2517,6 +2514,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 | PlayerCommand::LoadQueue { .. }
                 | PlayerCommand::ClearQueue
                 | PlayerCommand::RemoveFromQueue(_)
+                | PlayerCommand::MoveQueueItem { .. }
                 | PlayerCommand::RemoveTrackFromQueue(_)
                 | PlayerCommand::EnqueueNext(_)
                 | PlayerCommand::EnqueueLast(_)
@@ -2566,6 +2564,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
                 PlayerCommand::ClearQueue => {
                     clear_web_audio(engine);
                 }
+                PlayerCommand::MoveQueueItem { .. } => {}
                 PlayerCommand::LoadQueue { autoplay, .. } => {
                     if next_state.current_track.is_none() {
                         clear_web_audio(engine);

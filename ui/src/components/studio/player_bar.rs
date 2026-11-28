@@ -465,7 +465,6 @@ pub fn StudioPlayerBar(
     #[props(default)] on_album_click: Option<EventHandler<String>>,
 ) -> Element {
     let _ = on_rate;
-    let _ = on_album_click;
     let player = use_player();
     let state = player.snapshot();
     let mut connect_open = use_signal(|| false);
@@ -613,16 +612,38 @@ pub fn StudioPlayerBar(
                                         }
                                     }
                                 }
-                                if let Some(artist_cb) = on_artist_click {
-                                    button {
-                                        r#type: "button",
-                                        class: "block max-w-full text-left text-[12px] text-beet-text-secondary hover:text-beet-text-primary hover:underline truncate mt-0.5 cursor-pointer",
-                                        onclick: move |_| artist_cb.call(artist_for_click.clone()),
-                                        "{track.artist}"
+                                div { class: "flex items-center gap-1 min-w-0 mt-0.5 text-[12px] text-beet-text-secondary",
+                                    if let Some(artist_cb) = on_artist_click {
+                                        button {
+                                            r#type: "button",
+                                            class: "min-w-0 truncate text-left hover:text-beet-text-primary hover:underline cursor-pointer",
+                                            onclick: move |_| artist_cb.call(artist_for_click.clone()),
+                                            "{track.artist}"
+                                        }
+                                    } else {
+                                        span { class: "min-w-0 truncate",
+                                            "{track.artist}"
+                                        }
                                     }
-                                } else {
-                                    p { class: "text-[12px] text-beet-text-secondary truncate mt-0.5",
-                                        "{track.artist}"
+                                    if let Some(alb) = track.album.as_deref().filter(|a| !a.trim().is_empty()) {
+                                        span { class: "hidden xl:inline text-beet-text-disabled shrink-0", "·" }
+                                        if let Some(album_cb) = on_album_click {
+                                            {
+                                                let alb_for_click = alb.to_string();
+                                                rsx! {
+                                                    button {
+                                                        r#type: "button",
+                                                        class: "hidden xl:inline min-w-0 truncate text-left text-beet-text-tertiary hover:text-beet-text-primary hover:underline cursor-pointer",
+                                                        onclick: move |_| album_cb.call(alb_for_click.clone()),
+                                                        "{alb}"
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            span { class: "hidden xl:inline min-w-0 truncate text-beet-text-tertiary",
+                                                "{alb}"
+                                            }
+                                        }
                                     }
                                 }
                                 if let Some(ref err) = error_msg {

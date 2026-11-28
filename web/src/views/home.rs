@@ -159,6 +159,7 @@ pub fn HomePage() -> Element {
                         for alb in recent_albums.iter().take(4) {
                             {
                                 let aid_open = alb.id.clone();
+                                let aid_key = alb.id.clone();
                                 let aid_play = alb.id.clone();
                                 let aname = alb.name.clone();
                                 rsx! {
@@ -169,6 +170,12 @@ pub fn HomePage() -> Element {
                                         class: "group flex items-center gap-3 p-2.5 rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle hover:border-beet-border-default text-left transition-colors cursor-pointer",
                                         onclick: move |_| {
                                             nav.push(Route::AlbumDetailPage { id: aid_open.clone() });
+                                        },
+                                        onkeydown: move |evt: KeyboardEvent| {
+                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                evt.prevent_default();
+                                                nav.push(Route::AlbumDetailPage { id: aid_key.clone() });
+                                            }
                                         },
                                         div { class: "w-12 h-12 rounded-[8px] overflow-hidden bg-beet-surface-low border border-beet-border-subtle shrink-0 flex items-center justify-center",
                                             if let Some(url) = alb.cover_art_url.as_deref() {
@@ -194,6 +201,11 @@ pub fn HomePage() -> Element {
                                                 evt.stop_propagation();
                                                 play_album.call((aid_play.clone(), aname.clone()));
                                             },
+                                            onkeydown: move |evt: KeyboardEvent| {
+                                                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                    evt.stop_propagation();
+                                                }
+                                            },
                                             IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                         }
                                     }
@@ -204,9 +216,11 @@ pub fn HomePage() -> Element {
                         for pl in jump_playlists.iter() {
                             {
                                 let pid_open = pl.id.clone();
+                                let pid_key = pl.id.clone();
                                 let pid_play = pl.id.clone();
                                 let pname = pl.name.clone();
                                 let category = pl.category;
+                                let track_word = if pl.song_count == 1 { "TRACK" } else { "TRACKS" };
                                 let icon_cls = match category {
                                     PlaylistCategory::Seasonal | PlaylistCategory::Discovery => {
                                         "bg-beet-accent-surface border-beet-accent/25 text-beet-accent-text"
@@ -227,6 +241,12 @@ pub fn HomePage() -> Element {
                                         onclick: move |_| {
                                             nav.push(Route::PlaylistDetailPage { id: pid_open.clone() });
                                         },
+                                        onkeydown: move |evt: KeyboardEvent| {
+                                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                evt.prevent_default();
+                                                nav.push(Route::PlaylistDetailPage { id: pid_key.clone() });
+                                            }
+                                        },
                                         div { class: "w-12 h-12 rounded-[8px] border shrink-0 flex items-center justify-center {icon_cls}",
                                             match category {
                                                 PlaylistCategory::Seasonal => rsx! { IconSparkles { size: 20 } },
@@ -241,7 +261,7 @@ pub fn HomePage() -> Element {
                                             }
                                             div { class: "flex items-center gap-1.5 mt-0.5",
                                                 span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                                    "{pl.song_count} TRACKS"
+                                                    "{pl.song_count} {track_word}"
                                                 }
                                                 if let Some(tag) = category.badge_label() {
                                                     span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[9px] font-semibold tracking-wider text-beet-text-tertiary",
@@ -258,6 +278,11 @@ pub fn HomePage() -> Element {
                                             onclick: move |evt: MouseEvent| {
                                                 evt.stop_propagation();
                                                 play_playlist.call((pid_play.clone(), pname.clone()));
+                                            },
+                                            onkeydown: move |evt: KeyboardEvent| {
+                                                if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                                    evt.stop_propagation();
+                                                }
                                             },
                                             IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                         }

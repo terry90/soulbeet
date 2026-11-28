@@ -22,25 +22,29 @@ pub fn MixDetailPage(slug: String) -> Element {
     let mut studio = use_studio();
     let nav = use_navigator();
 
+    let mut target_slug = use_signal(|| slug.clone());
+    if *target_slug.peek() != slug {
+        target_slug.set(slug.clone());
+    }
+
     let mut playlist = use_signal(|| None::<ContextualMixPlaylist>);
     let mut loading = use_signal(|| true);
     let mut refreshing = use_signal(|| false);
     let mut steering_busy = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut req_id = use_signal(|| 0u64);
-    let mut loaded_slug = use_signal(String::new);
+    let mut reload_tick = use_signal(|| 0u64);
 
-    let slug_for_effect = slug.clone();
     use_effect(move || {
-        let target = slug_for_effect.clone();
-        if *loaded_slug.peek() == target && playlist.peek().is_some() {
-            return;
-        }
-        loaded_slug.set(target.clone());
+        let target = target_slug();
+        let _tick = reload_tick();
         let next_req = req_id.peek().wrapping_add(1);
         req_id.set(next_req);
-        loading.set(true);
+        playlist.set(None);
         error.set(None);
+        refreshing.set(false);
+        steering_busy.set(false);
+        loading.set(true);
         spawn(async move {
             match auth
                 .call(api::get_contextual_mix_playlist(target.clone(), Some(false)))
@@ -68,14 +72,16 @@ pub fn MixDetailPage(slug: String) -> Element {
         });
     });
 
-    let slug_for_refresh = slug.clone();
     let handle_refresh = move |_| {
         if refreshing() {
             return;
         }
+        let target = target_slug.peek().clone();
+        let next_req = req_id.peek().wrapping_add(1);
+        req_id.set(next_req);
         refreshing.set(true);
+        steering_busy.set(false);
         error.set(None);
-        let target = slug_for_refresh.clone();
         spawn(async move {
             match auth.call(api::refresh_contextual_mix(target.clone())).await {
                 Ok(data) => {
@@ -85,14 +91,19 @@ pub fn MixDetailPage(slug: String) -> Element {
                             *slot = data.summary.clone();
                         }
                     }
-                    playlist.set(Some(data));
-                    studio.show_toast("Mix refreshed");
+                    if *req_id.peek() == next_req {
+                        playlist.set(Some(data));
+                        studio.show_toast("Mix refreshed");
+                        refreshing.set(false);
+                    }
                 }
                 Err(err) => {
-                    studio.show_toast(format!("Refresh failed: {}", friendly_error(&err)));
+                    if *req_id.peek() == next_req {
+                        studio.show_toast(format!("Refresh failed: {}", friendly_error(&err)));
+                        refreshing.set(false);
+                    }
                 }
             }
-            refreshing.set(false);
         });
     };
 
@@ -132,7 +143,11 @@ pub fn MixDetailPage(slug: String) -> Element {
                     button {
                         r#type: "button",
                         class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-surface-high border border-beet-border-default text-[13px] font-medium text-beet-text-primary hover:bg-beet-surface-highest cursor-pointer",
-                        onclick: handle_refresh,
+                        onclick: move |_| {
+                            error.set(None);
+                            loading.set(true);
+                            reload_tick += 1;
+                        },
                         IconRefreshCw { size: 14 }
                         span { "Try Again" }
                     }
@@ -216,7 +231,13 @@ pub fn MixDetailPage(slug: String) -> Element {
                                     }
                                 }
                                 div { class: "flex flex-wrap items-center gap-2 tabular-nums-mono text-[11px] text-beet-text-tertiary",
-                                    span { "{track_count} TRACKS" }
+                                    span {
+                                        if track_count == 1 {
+                                            "1 TRACK"
+                                        } else {
+                                            "{track_count} TRACKS"
+                                        }
+                                    }
                                     if total_secs > 0 {
                                         span { "· {format_duration(total_secs)}" }
                                     }
@@ -303,7 +324,10 @@ pub fn MixDetailPage(slug: String) -> Element {
                                                             if steering_busy() {
                                                                 return;
                                                             }
+                                                            let next_req = req_id.peek().wrapping_add(1);
+                                                            req_id.set(next_req);
                                                             steering_busy.set(true);
+                                                            refreshing.set(false);
                                                             let target = steer_slug.clone();
                                                             spawn(async move {
                                                                 match auth
@@ -320,18 +344,26 @@ pub fn MixDetailPage(slug: String) -> Element {
                                                                                 *slot = updated;
                                                                             }
                                                                         }
-                                                                        if let Ok(fresh) = auth
-                                                                            .call(api::get_contextual_mix_playlist(target, Some(false)))
-                                                                            .await
-                                                                        {
-                                                                            playlist.set(Some(fresh));
+                                                                        if *req_id.peek() == next_req {
+                                                                            if let Ok(fresh) = auth
+                                                                                .call(api::get_contextual_mix_playlist(target, Some(false)))
+                                                                                .await
+                                                                            {
+                                                                                if *req_id.peek() == next_req {
+                                                                                    playlist.set(Some(fresh));
+                                                                                }
+                                                                            }
                                                                         }
                                                                     }
                                                                     Err(err) => {
-                                                                        studio.show_toast(format!("Steering failed: {}", friendly_error(&err)));
+                                                                        if *req_id.peek() == next_req {
+                                                                            studio.show_toast(format!("Steering failed: {}", friendly_error(&err)));
+                                                                        }
                                                                     }
                                                                 }
-                                                                steering_busy.set(false);
+                                                                if *req_id.peek() == next_req {
+                                                                    steering_busy.set(false);
+                                                                }
                                                             });
                                                         },
                                                         "{label}"

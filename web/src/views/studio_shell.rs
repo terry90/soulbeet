@@ -68,6 +68,29 @@ fn StudioShellContent() -> Element {
         });
     });
 
+    // Shell-scoped playlist refresh so child route unmounts (e.g. deleting a playlist then
+    // navigating to Library) never cancel the spawned fetch.
+    let mut playlists_refresh_req_id = use_signal(|| 0u64);
+    use_effect(move || {
+        let tick = (studio.playlists_refresh_tick)();
+        if tick == 0 {
+            return;
+        }
+        let Some(info) = studio.navidrome_info() else {
+            return;
+        };
+        let next_req = playlists_refresh_req_id.peek().wrapping_add(1);
+        playlists_refresh_req_id.set(next_req);
+        spawn(async move {
+            if let Ok(list) = crate::navidrome_web::fetch_playlists(&info).await {
+                if *playlists_refresh_req_id.peek() == next_req {
+                    studio.playlists.set(list);
+                    studio.reclassify_playlists();
+                }
+            }
+        });
+    });
+
     // Contexts expected by existing Search & Settings views
     let search_reset = use_signal(|| 0);
     let search_prefill = use_signal(|| None::<(String, String)>);
@@ -350,41 +373,51 @@ fn StudioShellContent() -> Element {
             }
 
             // Floating 5-Second Undo Snackbar (Discovery Drops)
-            if let Some(drop_item) = active_drop {
-                {
-                    let drop_key = drop_item.key.clone();
-                    rsx! {
-                        div { class: "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
-                            div { class: "pointer-events-auto",
-                                UndoSnackbar {
-                                    message: drop_item.snackbar_message(),
-                                    action_label: "Undo".to_string(),
-                                    duration_ms: 5000,
-                                    key_id: Some(drop_key.clone()),
-                                    on_undo: move |_| studio.undo_pending_drop(player),
-                                    on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth, drop_key.clone()),
+            {
+                let has_active_drop = active_drop.is_some();
+                let toast_position_cls = if has_active_drop {
+                    "pointer-events-none fixed bottom-[232px] md:bottom-[220px] lg:bottom-[168px] inset-x-0 z-50 flex justify-center px-4"
+                } else {
+                    "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] inset-x-0 z-50 flex justify-center px-4"
+                };
+                rsx! {
+                    if let Some(drop_item) = active_drop {
+                        {
+                            let drop_key = drop_item.key.clone();
+                            rsx! {
+                                div { class: "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
+                                    div { class: "pointer-events-auto",
+                                        UndoSnackbar {
+                                            message: drop_item.snackbar_message(),
+                                            action_label: "Undo".to_string(),
+                                            duration_ms: 5000,
+                                            key_id: Some(drop_key.clone()),
+                                            on_undo: move |_| studio.undo_pending_drop(player),
+                                            on_dismiss: move |_| studio.dismiss_and_commit_active_drop(auth, drop_key.clone()),
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
 
-            // Floating Subtle Toast Notice (bottom-center above player bar; never blocks top banners or drawer)
-            if let Some(msg) = current_toast {
-                div {
-                    class: "pointer-events-none fixed bottom-[164px] md:bottom-[152px] lg:bottom-[100px] inset-x-0 z-50 flex justify-center px-4",
-                    div {
-                        role: "status",
-                        aria_live: "polite",
-                        class: "pointer-events-auto inline-flex items-center gap-2.5 pl-4 pr-2.5 py-2 rounded-full bg-beet-surface-high border border-beet-border-default shadow-xl text-[13px] font-medium text-beet-text-primary max-w-md",
-                        span { class: "truncate", "{msg}" }
-                        button {
-                            r#type: "button",
-                            aria_label: "Dismiss notification",
-                            class: "w-6 h-6 rounded-full inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-highest transition-colors cursor-pointer shrink-0",
-                            onclick: move |_| studio.dismiss_toast(),
-                            IconX { size: 13 }
+                    // Floating Subtle Toast Notice (bottom-center above player bar; offsets above UndoSnackbar when visible)
+                    if let Some(msg) = current_toast {
+                        div {
+                            class: "{toast_position_cls}",
+                            div {
+                                role: "status",
+                                aria_live: "polite",
+                                class: "pointer-events-none inline-flex items-center gap-2.5 pl-4 pr-2.5 py-2 rounded-full bg-beet-surface-high border border-beet-border-default shadow-xl text-[13px] font-medium text-beet-text-primary max-w-md",
+                                span { class: "truncate", "{msg}" }
+                                button {
+                                    r#type: "button",
+                                    aria_label: "Dismiss notification",
+                                    class: "pointer-events-auto w-6 h-6 rounded-full inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-highest transition-colors cursor-pointer shrink-0",
+                                    onclick: move |_| studio.dismiss_toast(),
+                                    IconX { size: 13 }
+                                }
+                            }
                         }
                     }
                 }

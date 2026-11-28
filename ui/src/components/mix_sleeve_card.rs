@@ -1927,6 +1927,11 @@ pub fn MixSleeveCard(
                             evt.stop_propagation();
                             on_play.call(slug_for_play.clone());
                         },
+                        onkeydown: move |evt: KeyboardEvent| {
+                            if matches!(evt.key(), Key::Enter) || matches!(evt.key(), Key::Character(ref s) if s == " ") {
+                                evt.stop_propagation();
+                            }
+                        },
                         IconPlay { size: play_icon_size, filled: true, class: "ml-0.5".to_string() }
                     }
                 }
