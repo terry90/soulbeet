@@ -4,13 +4,13 @@ use std::pin::Pin;
 use dioxus::prelude::*;
 use shared::download::{AsIsTagOverrides, ImportChoice, MatchCandidate, MatchChoices, MatchKind};
 
-use super::Failure;
+use super::MatchPickerFailure;
 use crate::{use_open_handler, Choice, ChoiceList, Disclosure, RowAction, TextInput};
 
 /// Resolves to the matches of the row's item, or to where the failure to
 /// load them shows.
 pub type ChoicesLoader =
-    Callback<String, Pin<Box<dyn Future<Output = Result<MatchChoices, Failure>>>>>;
+    Callback<String, Pin<Box<dyn Future<Output = Result<MatchChoices, MatchPickerFailure>>>>>;
 
 /// "71.4%" for 714 per mille.
 fn percent(per_mille: u16) -> String {
@@ -130,12 +130,12 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
                     true
                 }
                 // A failed reopen still shows the list it loaded before.
-                Err(Failure::InPicker(message)) => {
+                Err(MatchPickerFailure::InPicker(message)) => {
                     notice.set(Some(message));
                     found.read().is_some()
                 }
                 // The row took the picker away and says why.
-                Err(Failure::OnRow) => false,
+                Err(MatchPickerFailure::OnRow) => false,
             }
         }
     });
@@ -317,6 +317,7 @@ pub fn MatchPicker(props: MatchPickerProps) -> Element {
 
 #[cfg(test)]
 mod tests {
+    use super::MatchPickerFailure as Failure;
     use super::*;
     use crate::components::simple::ToggleDriver;
     use shared::download::TrackFit;

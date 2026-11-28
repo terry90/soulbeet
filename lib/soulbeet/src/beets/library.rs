@@ -6,6 +6,8 @@ use super::{BeetsSettings, NO_PYTHON};
 use crate::traits::{BeetsTrackInfo, ForgetOutcome, PruneOutcome, Relocation, TagEdits};
 use serde::Deserialize;
 use shared::failure::{Cause, Failure, FailureCode, RetryAdvice, Service, Stage};
+use sqlx::{Connection, Row};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
@@ -139,6 +141,86 @@ async fn remove_present(path: &Path) -> std::io::Result<()> {
 /// Whether the music folder `root` has a library db.
 pub(crate) async fn has_library(s: &BeetsSettings, root: &Path) -> Result<bool, String> {
     exists(&library_db(s, root).await?).await
+}
+
+fn decode_path_bytes(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// Reads all file paths currently stored in `target`'s beets library database.
+/// Returns an empty set without creating a database if none exists yet.
+/// Resolves beets 2.10+ relative BLOB paths against `target` and inserts both
+/// the joined path and its canonicalized form (when present on disk) so
+/// symlinked library roots do not false-miss.
+pub(crate) async fn indexed_paths(
+    s: &BeetsSettings,
+    target: &Path,
+) -> Result<HashSet<PathBuf>, String> {
+    let db = library_db(s, target).await?;
+    if !exists(&db).await? {
+        return Ok(HashSet::new());
+    }
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .read_only(true)
+        .create_if_missing(false);
+    let mut conn = sqlx::sqlite::SqliteConnection::connect_with(&opts)
+        .await
+        .map_err(|e| format!("Could not open beets library database {}: {e}", db.display()))?;
+
+    let rows = match sqlx::query("SELECT path FROM items").fetch_all(&mut conn).await {
+        Ok(rows) => rows,
+        Err(e) if e.to_string().contains("no such table: items") => {
+            let _ = conn.close().await;
+            return Ok(HashSet::new());
+        }
+        Err(e) => {
+            let _ = conn.close().await;
+            return Err(format!(
+                "Could not read items from beets library database {}: {e}",
+                db.display()
+            ));
+        }
+    };
+    let _ = conn.close().await;
+
+    let mut paths = HashSet::with_capacity(rows.len() * 2);
+    for row in rows {
+        let raw_bytes = match row.try_get::<Vec<u8>, _>(0) {
+            Ok(bytes) => bytes,
+            Err(_) => match row.try_get::<String, _>(0) {
+                Ok(text) => text.into_bytes(),
+                Err(e) => {
+                    return Err(format!(
+                        "Could not decode item path from beets library database {}: {e}",
+                        db.display()
+                    ));
+                }
+            },
+        };
+        if raw_bytes.is_empty() {
+            continue;
+        }
+        let raw_path = decode_path_bytes(raw_bytes);
+        let full = if raw_path.is_absolute() {
+            raw_path
+        } else {
+            target.join(raw_path)
+        };
+        paths.insert(full.clone());
+        if let Ok(canon) = tokio::fs::canonicalize(&full).await {
+            paths.insert(canon);
+        }
+    }
+    Ok(paths)
 }
 
 /// Looks up item ids at `file` inside `root`'s library; empty when none or no library exists.
@@ -1426,5 +1508,77 @@ mod tests {
             forget_item(&settings, &root, &root.join("a.flac")).await,
             ForgetOutcome::Failed(e) if e.starts_with(&expected)
         ));
+    }
+
+    #[tokio::test]
+    async fn indexed_paths_returns_empty_without_creating_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("music");
+        std::fs::create_dir_all(&target).unwrap();
+        let settings = BeetsSettings {
+            config: dir.path().join("config.yaml"),
+            beet: dir.path().join("beet"),
+            python: None,
+            libraries: dir.path().join("libraries"),
+            limits: RunLimits::default(),
+        };
+        let found = indexed_paths(&settings, &target).await.unwrap();
+        assert!(found.is_empty());
+        assert!(!library_folder(&settings.libraries, &target)
+            .join(LIBRARY_DB)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn indexed_paths_resolves_relative_and_legacy_absolute_blob_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("music");
+        let album_dir = target.join("Artist/Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        let rel_file = album_dir.join("01 Track.flac");
+        let abs_file = album_dir.join("02 Legacy.mp3");
+        std::fs::write(&rel_file, b"audio").unwrap();
+        std::fs::write(&abs_file, b"audio").unwrap();
+
+        let settings = BeetsSettings {
+            config: dir.path().join("config.yaml"),
+            beet: dir.path().join("beet"),
+            python: None,
+            libraries: dir.path().join("libraries"),
+            limits: RunLimits::default(),
+        };
+        let db_dir = library_folder(&settings.libraries, &target);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(LIBRARY_DB);
+
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let mut conn = sqlx::sqlite::SqliteConnection::connect_with(&opts)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB NOT NULL)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // beets 2.10+ relative BLOB path
+        sqlx::query("INSERT INTO items (path) VALUES (?)")
+            .bind(b"Artist/Album/01 Track.flac".as_slice())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // legacy absolute BLOB path
+        sqlx::query("INSERT INTO items (path) VALUES (?)")
+            .bind(abs_file.to_string_lossy().as_bytes())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+
+        let found = indexed_paths(&settings, &target).await.unwrap();
+        assert!(found.contains(&rel_file));
+        assert!(found.contains(&std::fs::canonicalize(&rel_file).unwrap()));
+        assert!(found.contains(&abs_file));
+        assert!(found.contains(&std::fs::canonicalize(&abs_file).unwrap()));
     }
 }

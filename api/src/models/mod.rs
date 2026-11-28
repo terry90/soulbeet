@@ -19,6 +19,8 @@ pub mod folder_root;
 pub mod knowledge_cache;
 pub mod legacy_folder;
 #[cfg(feature = "server")]
+pub mod library_import;
+#[cfg(feature = "server")]
 pub mod navidrome_library;
 #[cfg(feature = "server")]
 pub mod navidrome_read_failure;

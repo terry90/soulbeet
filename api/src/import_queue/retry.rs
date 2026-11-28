@@ -1159,6 +1159,7 @@ mod tests {
             duplicates: crate::import_queue::Duplicates::AsConfigured,
             last_run: None,
             lock_retries: 0,
+            placement: soulbeet::ImportPlacement::Default,
         })
     }
 

@@ -75,6 +75,7 @@ fn main() {
             api::core::index::start();
             // Reads the unfinished jobs before the router below takes a request.
             api::core::reconcile::start().await;
+            api::core::library_import::recover_on_startup().await;
             // Start background cleanup task for user channels
             api::globals::start_channel_cleanup_task();
             api::oauth::start_prune_task();

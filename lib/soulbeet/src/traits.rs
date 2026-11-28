@@ -14,7 +14,7 @@ use shared::{
     },
     system::ImporterHealth,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -122,6 +122,21 @@ pub trait DownloadBackend: Send + Sync {
 pub enum ImportMode {
     Album,
     Singleton,
+}
+
+/// How the importer places files on disk during an import run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPlacement {
+    /// Use beets' configured `copy` / `move` settings.
+    #[default]
+    Default,
+    /// Copy files from an external source into the library without modifying the source (`-c -M`).
+    CopyOnly,
+    /// Reorganize files already inside the library by moving them (`-m -C`).
+    MoveInPlace,
+    /// Autotag files in place without copying or moving (`-C -M`).
+    InPlaceNoMove,
 }
 
 /// How the importer decides on a match. Kept with an import the ledger stores, so a restart
@@ -537,6 +552,33 @@ pub trait MusicImporter: Send + Sync {
         mode: ImportMode,
         choice: &DriverChoice,
         duplicates: DuplicateRun,
+    ) -> ImportResult;
+
+    /// Like `import`, with an explicit file placement policy (`CopyOnly`, `MoveInPlace`,
+    /// `InPlaceNoMove`, or `Default`).
+    async fn import_with_placement(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        duplicates: DuplicateRun,
+        _placement: ImportPlacement,
+    ) -> ImportResult {
+        self.import(sources, target, mode, choice, duplicates).await
+    }
+
+    /// Reads all item paths already indexed in `library`'s beets database without creating an
+    /// empty database when none exists yet.
+    async fn indexed_paths(&self, library: &Path) -> std::result::Result<HashSet<PathBuf>, String>;
+
+    /// Registers a batch of existing `sources` in `library`'s beets database in one run
+    /// (`-A -C -M -W`, duplicate skip, no plugins).
+    async fn register_in_place_batch(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        mode: ImportMode,
     ) -> ImportResult;
 
     /// Moves the items with `item_ids` of the library of `library` to the paths the importer

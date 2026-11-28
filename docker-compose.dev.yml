@@ -1,3 +1,7 @@
+# Build-from-source Docker Compose stack for local development.
+# Run with: docker compose -f docker-compose.dev.yml up --build
+# For ready-to-run production deployments with prebuilt images, use compose.yaml.
+
 services:
   soulbeet:
     build: .
@@ -15,7 +19,9 @@ services:
       # (at least 32 random bytes, for example openssl rand -hex 32).
       # Passed on only when it is set.
       - SECRET_KEY
-      - NAVIDROME_URL=http://localhost:4533 # Your Navidrome server URL
+      # Your Navidrome server URL (set ND_MUSICFOLDER=/music/_default on Navidrome
+      # so per-user hardlinked libraries under /music/<username> do not duplicate).
+      - NAVIDROME_URL=http://localhost:4533
       # - BEETS_CONFIG=/config/config.yaml # Needs the ./beets:/config volume below
     volumes:
       # Soulbeet's database, secret.key and the beets library databases. Keep it

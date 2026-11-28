@@ -36,7 +36,7 @@ Soulbeet only ever asks AirDC++ to remove a bundle with `remove_finished` off: f
 
 ## Setting up AirDC++
 
-1. Run the AirDC++ Web Client 2.14 image, pinned: `gangefors/airdcpp-webclient:2.14.0` (the commented `airdcpp` service in `docker-compose.yml`), on a network Soulbeet reaches. Never publish its web port (5600) to the internet.
+1. Run the AirDC++ Web Client 2.14 image, pinned: `gangefors/airdcpp-webclient:2.14.0` (the commented `airdcpp` service in `docker-compose.dev.yml`), on a network Soulbeet reaches. Never publish its web port (5600) to the internet.
 2. Mount the same downloads folder in both containers: AirDC++'s `/Downloads` and Soulbeet's `DOWNLOAD_PATH`. Run AirDC++ with Soulbeet's user and group (`PUID`, `PGID`, the same `UMASK`), so Soulbeet and beets can move what AirDC++ saves.
 3. Mount nothing under AirDC++'s `/Share`: the image shares every folder mounted there with every hub. Remove its default `/Share/` share root.
 4. Change the `admin` password. Create a web user for Soulbeet with exactly these permissions: `search`, `download`, `transfers`, `queue_view`, `queue_edit`, `hubs_view`, `settings_view`, `share_view`, `filelists_view`, `filelists_edit`, `filesystem_view`, `filesystem_edit`. Not an admin, no `share_edit`, no `settings_edit`: Soulbeet never changes AirDC++'s settings, hubs or share. Soulbeet refuses the image's default `admin`/`password` login.

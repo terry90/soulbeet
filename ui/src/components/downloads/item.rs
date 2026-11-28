@@ -6,7 +6,7 @@ use shared::download::{DownloadProgress, DownloadState, ImportChoice, IndexState
 
 use super::diagnostics::JobDiagnosticsPanel;
 use super::picker::{ChoicesLoader, MatchPicker};
-use super::Failure;
+use super::MatchPickerFailure as Failure;
 use crate::{Disclosure, IconLoader, IconX, LossyChip, RowAction};
 
 /// How a row's state is shown: badge text and tooltip, plus row and badge classes.

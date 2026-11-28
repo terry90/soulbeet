@@ -65,6 +65,8 @@ pub struct ConnectionState {
     pub(crate) ratings: Arc<dyn RatingSync>,
     /// Navidrome as each user sees it, which the delete tools' guard checks through.
     pub(crate) listeners: Arc<dyn Listeners>,
+    /// Coordinator for 1-Click Existing Library Import batches.
+    pub(crate) library_import: Arc<crate::core::library_import::LibraryImportCoordinator>,
 }
 
 impl ConnectionState {
@@ -93,6 +95,7 @@ impl ConnectionState {
             discovery: Arc::new(LiveDiscovery),
             ratings: Arc::new(LiveSync),
             listeners: Arc::new(LiveListeners),
+            library_import: crate::core::library_import::COORDINATOR.clone(),
         }
     }
 }

@@ -12,11 +12,11 @@ use shared::download::{
 use shared::system::{HealthIssue, HealthLevel, ImporterHealth};
 use soulbeet::{
     BeetsTrackInfo, DriverChoice, DuplicateRun, ForgetOutcome, ImportMode, ImportOutcome,
-    ImportResult, ImportedItem, MusicImporter, PruneOutcome, RegisterOutcome, Relocation,
-    SkipReason, TagEdits, TaskCount,
+    ImportPlacement, ImportResult, ImportedItem, MusicImporter, PruneOutcome, RegisterOutcome,
+    Relocation, SkipReason, TagEdits, TaskCount,
 };
 use sqlx::SqlitePool;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -139,6 +139,9 @@ pub struct StubImporter {
     seen: Mutex<Vec<(Vec<PathBuf>, PathBuf)>>,
     choices: Mutex<Vec<DriverChoice>>,
     duplicate_runs: Mutex<Vec<DuplicateRun>>,
+    placements: Mutex<Vec<ImportPlacement>>,
+    indexed_answer: Mutex<Result<HashSet<PathBuf>, String>>,
+    register_batches: Mutex<Vec<(PathBuf, Vec<PathBuf>, ImportMode)>>,
     forget_answer: Mutex<ForgetOutcome>,
     forgets: Mutex<Vec<(PathBuf, PathBuf)>>,
     prune_answer: Mutex<PruneOutcome>,
@@ -169,6 +172,9 @@ impl StubImporter {
             seen: Mutex::new(vec![]),
             choices: Mutex::new(vec![]),
             duplicate_runs: Mutex::new(vec![]),
+            placements: Mutex::new(vec![]),
+            indexed_answer: Mutex::new(Ok(HashSet::new())),
+            register_batches: Mutex::new(vec![]),
             forget_answer: Mutex::new(ForgetOutcome::Removed),
             forgets: Mutex::new(vec![]),
             prune_answer: Mutex::new(PruneOutcome::Pruned {
@@ -265,6 +271,20 @@ impl StubImporter {
         self.relocate_files.lock().unwrap().clone()
     }
 
+    #[allow(dead_code)]
+    pub fn script_indexed(&self, answer: Result<HashSet<PathBuf>, String>) {
+        *self.indexed_answer.lock().unwrap() = answer;
+    }
+
+    pub fn placements(&self) -> Vec<ImportPlacement> {
+        self.placements.lock().unwrap().clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn register_batches(&self) -> Vec<(PathBuf, Vec<PathBuf>, ImportMode)> {
+        self.register_batches.lock().unwrap().clone()
+    }
+
     pub fn panic_next(&self) {
         self.panic_next.store(true, Ordering::SeqCst);
     }
@@ -355,13 +375,34 @@ impl MusicImporter for StubImporter {
         &self,
         sources: &[&Path],
         target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        duplicates: DuplicateRun,
+    ) -> ImportResult {
+        self.import_with_placement(
+            sources,
+            target,
+            mode,
+            choice,
+            duplicates,
+            ImportPlacement::Default,
+        )
+        .await
+    }
+
+    async fn import_with_placement(
+        &self,
+        sources: &[&Path],
+        target: &Path,
         _: ImportMode,
         choice: &DriverChoice,
         duplicates: DuplicateRun,
+        placement: ImportPlacement,
     ) -> ImportResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.choices.lock().unwrap().push(choice.clone());
         self.duplicate_runs.lock().unwrap().push(duplicates);
+        self.placements.lock().unwrap().push(placement);
         self.seen.lock().unwrap().push((
             sources.iter().map(|s| s.to_path_buf()).collect(),
             target.to_path_buf(),
@@ -386,6 +427,95 @@ impl MusicImporter for StubImporter {
             .unwrap()
             .pop_front()
             .unwrap_or_else(imported)
+    }
+
+    async fn indexed_paths(&self, _library: &Path) -> Result<HashSet<PathBuf>, String> {
+        self.indexed_answer.lock().unwrap().clone()
+    }
+
+    async fn register_in_place_batch(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        mode: ImportMode,
+    ) -> ImportResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.register_batches.lock().unwrap().push((
+            library.to_path_buf(),
+            sources.iter().map(|p| p.to_path_buf()).collect(),
+            mode,
+        ));
+        if let Some(scripted) = self.results.lock().unwrap().pop_front() {
+            return scripted;
+        }
+        let mut items = Vec::new();
+        for src in sources {
+            if src.is_dir() {
+                let mut found = false;
+                if let Ok(entries) = std::fs::read_dir(src) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() && soulbeet::audio::is_audio_path(&p) {
+                            found = true;
+                            items.push(ImportedItem {
+                                path: p.strip_prefix(library).unwrap_or(&p).to_path_buf(),
+                                recording_mbid: None,
+                                artist: "Artist".into(),
+                                title: "Track".into(),
+                                album: "Album".into(),
+                                beets_id: None,
+                                release_mbid: None,
+                                match_per_mille: None,
+                            });
+                        }
+                    }
+                }
+                if !found {
+                    let fallback = src.join("01.flac");
+                    items.push(ImportedItem {
+                        path: fallback
+                            .strip_prefix(library)
+                            .unwrap_or(&fallback)
+                            .to_path_buf(),
+                        recording_mbid: None,
+                        artist: "Artist".into(),
+                        title: "Track".into(),
+                        album: "Album".into(),
+                        beets_id: None,
+                        release_mbid: None,
+                        match_per_mille: None,
+                    });
+                }
+            } else {
+                items.push(ImportedItem {
+                    path: src.strip_prefix(library).unwrap_or(src).to_path_buf(),
+                    recording_mbid: None,
+                    artist: "Artist".into(),
+                    title: "Track".into(),
+                    album: "Album".into(),
+                    beets_id: None,
+                    release_mbid: None,
+                    match_per_mille: None,
+                });
+            }
+        }
+        ImportResult {
+            outcome: ImportOutcome::Imported {
+                untagged: true,
+                warnings: vec![],
+                items,
+                failure: None,
+            },
+            output_tail: "registered tail".into(),
+            tasks: TaskCount {
+                imported: sources.len() as u32,
+                total: sources.len() as u32,
+            },
+            choices: None,
+            user_action: None,
+            removals: vec![],
+            files: vec![],
+        }
     }
 
     async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {

@@ -4,7 +4,7 @@ This page covers how Soulbeet runs beets: the config file, the import flags, ski
 
 ## Beets configuration
 
-Soulbeet uses `beets` to import music. The image ships a config at `/app/beets_config.yaml`, with the `plugins:` line set for your image tier. Setting `BEETS_CONFIG` to another file **replaces** it, it does not merge with it. Copy the shipped file (see [Quick Start](../README.md#quick-start)) and edit the copy.
+Soulbeet uses `beets` to import music. The image ships a ready-to-use config at `/app/beets_config.yaml`, with the `plugins:` line matched to your image tier, so `compose.yaml` does not require extracting or mounting a config file. Setting `BEETS_CONFIG` to another file **replaces** the shipped config (it does not merge with it). If you want to customize beets, copy the shipped file out of the image first (`docker create --name sb docker.io/docccccc/soulbeet:latest && docker cp sb:/app/beets_config.yaml ./beets/config.yaml && docker rm sb`) and edit the copy.
 
 -   Which plugins each tier installs is listed in [beets-plugins.md](beets-plugins.md). A plugin in `plugins:` that the tier does not install shows as a warning in Settings.
 -   `plugins:` must contain `musicbrainz`. Without a metadata source plugin, Soulbeet marks beets as broken.
@@ -35,6 +35,22 @@ In quiet mode beets skips files it cannot match closely, and the row says "No cl
 When beets handled the import as one task (one track, or one album folder that beets reads as one album) and Soulbeet could read the matches beets weighed for it, the row also offers the two choices below. Otherwise it offers only Retry import.
 -   **Show matches**: the matches beets weighed for that import, with their score and what differs. Pick one, or paste a MusicBrainz link or ID (a recording for singletons, a release in album mode), then click **Import with this match**. beets applies exactly that match (`-S <id>`), however low its score.
 -   **Import as-is**: beets imports the files with their own tags (`-A`) and looks nothing up. Every file needs artist and title tags, and in album mode an album tag too. If one lacks them, nothing is imported and the row names the files that lack them: beets would file untagged music under empty names, and with `duplicate_action: remove` a second untagged import would replace the first.
+
+## Existing library import
+
+If you already have music files on disk, you can import them into your personal library in one click from **Settings > Library** (or the import banner on the **Home** page) using **Import Existing Library**.
+
+Three import modes are available:
+
+-   **Tag & Organize** (recommended): matches albums and tracks against MusicBrainz, writes clean metadata tags, and organizes files into your personal library folder.
+-   **Tag In-Place**: matches against MusicBrainz and updates file tags where they sit, without moving or renaming files.
+-   **Register As-Is**: registers files directly into your folder's beets library database using their existing tags without looking up external metadata or modifying the audio files.
+
+How Soulbeet handles existing libraries safely:
+
+-   **Already-indexed files are skipped**: files already tracked in your folder's beets library database are detected and skipped automatically, so re-running an import on a folder that already has indexed music only processes new or untracked files.
+-   **Uncertain matches go to the Match Picker**: any album or track that beets cannot match confidently in quiet mode is surfaced in the **Match Picker** on the **Activity** page, where you can review candidate MusicBrainz releases, pick a match (or paste a MusicBrainz ID/URL), or import it as-is.
+-   **Source files are never deleted on skip or cancel**: skipping an uncertain album, cancelling a running library import, or hitting a tagging error leaves your original files untouched on disk.
 
 ## Image tiers
 

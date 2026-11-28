@@ -122,9 +122,47 @@ pub(crate) fn effective_seed_root(configured: Option<&Path>) -> &Path {
     root
 }
 
+/// Best-effort creation of the empty `_default` directory Navidrome uses for
+/// Library 1 (`ND_MUSICFOLDER=/music/_default`), so Navidrome does not log a
+/// missing-folder warning on a fresh start.
+pub(crate) async fn ensure_navidrome_default_dir_at(
+    configured: Option<&Path>,
+    navidrome_configured: bool,
+) {
+    let explicit_default = configured
+        .filter(|p| p.file_name() == Some(std::ffi::OsStr::new("_default")))
+        .map(Path::to_path_buf);
+    let target = if let Some(path) = explicit_default {
+        let parent_ok = path.parent().is_some_and(Path::is_dir);
+        parent_ok.then_some(path)
+    } else if navidrome_configured {
+        let root = effective_seed_root(configured);
+        root.is_dir().then(|| root.join("_default"))
+    } else {
+        None
+    };
+
+    if let Some(dir) = target {
+        if !dir.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                warn!(
+                    "Could not create Navidrome default placeholder directory {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+}
+
 /// Seeds a default folder root (`/music` or `NAVIDROME_MUSIC_PATH`) if no roots
 /// are approved yet and the directory exists on disk.
 pub(crate) async fn seed_default_root_in(db: &SqlitePool) {
+    ensure_navidrome_default_dir_at(
+        crate::config::CONFIG.navidrome_music_path(),
+        crate::config::CONFIG.navidrome_url().is_some(),
+    )
+    .await;
+
     let existing = match FolderRoot::get_all_in(db).await {
         Ok(r) => r,
         Err(e) => {
@@ -461,5 +499,22 @@ mod tests {
             effective_seed_root(Some(Path::new("/data/music/_default"))),
             Path::new("/data/music")
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_navidrome_default_dir_creates_placeholder_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("_default");
+        ensure_navidrome_default_dir_at(Some(&explicit), false).await;
+        assert!(explicit.is_dir());
+
+        let dir2 = tempfile::tempdir().unwrap();
+        ensure_navidrome_default_dir_at(Some(dir2.path()), true).await;
+        assert!(dir2.path().join("_default").is_dir());
+
+        // When Navidrome is not configured and path does not end with _default, do not create it.
+        let dir3 = tempfile::tempdir().unwrap();
+        ensure_navidrome_default_dir_at(Some(dir3.path()), false).await;
+        assert!(!dir3.path().join("_default").exists());
     }
 }
