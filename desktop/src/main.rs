@@ -16,9 +16,10 @@ use dioxus::prelude::*;
 use dioxus_desktop::{Config, LogicalSize, WindowBuilder};
 use tracing_subscriber::EnvFilter;
 use ui::{
-    use_player, CommandPalette, DrawerTab, MultiListenerGuardModal, PaletteCategory,
-    PaletteCommand, StudioMobileNav, StudioNavSection, StudioPlayerBar, StudioRightDrawer,
-    StudioSidebar, StudioTopBar, UndoSnackbar,
+    classify_local_playlist_category, use_player, CommandPalette, DrawerTab, IconListMusic,
+    IconPlus, Modal, MultiListenerGuardModal, PaletteCategory, PaletteCommand, PlayerTrack,
+    StudioMobileNav, StudioNavSection, StudioPlayerBar, StudioRightDrawer, StudioSidebar,
+    StudioTopBar, UndoSnackbar,
 };
 
 use crate::assets::StudioAssets;
@@ -201,6 +202,8 @@ fn DesktopShell() -> Element {
                         st.cmdk_open.set(false);
                     } else if st.guard_modal_track.peek().is_some() {
                         st.guard_modal_track.set(None);
+                    } else if !dialog_open && st.active_drawer.peek().is_some() {
+                        st.active_drawer.set(None);
                     }
                     continue;
                 }
@@ -284,8 +287,7 @@ fn DesktopShell() -> Element {
                     active_transfers_count: sync_st.pending_outbox_count,
                     playlists: sidebar_playlists,
                     on_select_playlist: move |pid| {
-                        studio.selected_playlist_id.set(Some(pid));
-                        studio.active_section.set(StudioNavSection::Library);
+                        studio.open_playlist_detail(pid);
                     },
                     username: Some(cfg.device_name.clone()),
                     on_logout: move |_| studio.disconnect_server(player),
@@ -350,12 +352,6 @@ fn DesktopShell() -> Element {
                 }
             }
 
-            // Compact Mobile Navigation on narrow windows
-            StudioMobileNav {
-                active: active_section,
-                on_navigate: move |sec| studio.active_section.set(sec),
-            }
-
             // Persistent 84px Studio Bottom Player Bar (+ Desktop Mini-Player Pop-Out)
             StudioPlayerBar {
                 active_drawer_tab: active_drawer,
@@ -378,13 +374,19 @@ fn DesktopShell() -> Element {
                 })),
             }
 
+            // Compact Mobile Navigation on narrow windows (< 1024px, below Player Bar)
+            StudioMobileNav {
+                active: active_section,
+                on_navigate: move |sec| studio.active_section.set(sec),
+            }
+
             // Floating 5-second Undo Snackbar for Pending Discovery Drops (or brief status toast)
             if let Some(pending) = pending_drop_active {
                 {
                     let key_id = pending.key.clone();
                     let msg = pending.snackbar_message();
                     rsx! {
-                        div { class: "fixed bottom-24 left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
+                        div { class: "fixed bottom-[152px] lg:bottom-24 left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
                             UndoSnackbar {
                                 message: msg,
                                 duration_ms: 5000,
@@ -396,7 +398,7 @@ fn DesktopShell() -> Element {
                     }
                 }
             } else if let Some(msg) = status_toast {
-                div { class: "fixed bottom-24 left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
+                div { class: "fixed bottom-[152px] lg:bottom-24 left-1/2 -translate-x-1/2 z-50 px-4 w-full max-w-md",
                     UndoSnackbar {
                         message: msg,
                         action_label: "OK".to_string(),
@@ -404,6 +406,14 @@ fn DesktopShell() -> Element {
                         on_undo: move |_| studio.status_toast.set(None),
                         on_dismiss: move |_| studio.status_toast.set(None),
                     }
+                }
+            }
+
+            // Shared Add-to-Playlist Picker Modal
+            if let Some(track) = studio.add_to_playlist_track.read().clone() {
+                AddToPlaylistModal {
+                    track,
+                    on_close: move |_| studio.add_to_playlist_track.set(None),
                 }
             }
 
@@ -621,4 +631,176 @@ fn build_palette_commands(
             keywords: vec!["codec".into(), "flac".into()],
         },
     ]
+}
+
+#[component]
+fn AddToPlaylistModal(track: PlayerTrack, on_close: EventHandler<()>) -> Element {
+    let mut studio = use_desktop_studio();
+    let player = use_player();
+    let offline_only = player.offline_only();
+    let has_server = studio
+        .config
+        .read()
+        .soulbeet_base_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty());
+    let mut filter_text = use_signal(String::new);
+    let mut new_name = use_signal(String::new);
+    let mutating = (studio.playlist_mutating)();
+    let can_edit = !offline_only && has_server && !mutating;
+
+    let editable_playlists: Vec<_> = studio
+        .playlists
+        .read()
+        .iter()
+        .filter(|item| {
+            let cat = classify_local_playlist_category(
+                &item.playlist.kind,
+                item.playlist.comment.as_deref(),
+                item.playlist.is_smart,
+            );
+            !item.playlist.is_smart && !cat.is_soulbeet_mix()
+        })
+        .cloned()
+        .collect();
+
+    let query = filter_text().trim().to_ascii_lowercase();
+    let filtered_playlists: Vec<_> = if query.is_empty() {
+        editable_playlists.clone()
+    } else {
+        editable_playlists
+            .iter()
+            .filter(|p| p.playlist.name.to_ascii_lowercase().contains(&query))
+            .cloned()
+            .collect()
+    };
+
+    let track_id_create = track.id.clone();
+
+    rsx! {
+        Modal {
+            on_close: move |_| on_close.call(()),
+            header: rsx! {
+                div { class: "min-w-0",
+                    h2 { class: "text-base font-semibold text-beet-text-primary truncate",
+                        "Add to Playlist"
+                    }
+                    p { class: "text-[12px] text-beet-text-secondary truncate mt-0.5",
+                        "{track.title} · {track.artist}"
+                    }
+                }
+            },
+            div { class: "space-y-4",
+                if !has_server {
+                    div { class: "p-3 rounded-[10px] bg-beet-crimson-surface border border-beet-crimson-text/30 text-[12px] text-beet-crimson-text",
+                        "Connect a Soulbeet server in Settings to edit playlists."
+                    }
+                } else if offline_only {
+                    div { class: "p-3 rounded-[10px] bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary",
+                        "Disable Offline Only mode to add tracks to playlists."
+                    }
+                }
+
+                // Quick create new playlist with this track
+                div { class: "space-y-2",
+                    p { class: "tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Quick Create"
+                    }
+                    div { class: "flex items-center gap-2",
+                        input {
+                            r#type: "text",
+                            value: "{new_name}",
+                            placeholder: "New playlist name...",
+                            disabled: !can_edit,
+                            class: "flex-1 h-9 px-3 rounded-[8px] bg-beet-surface border border-beet-border-default text-[13px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none disabled:opacity-50",
+                            oninput: move |evt| new_name.set(evt.value()),
+                        }
+                        button {
+                            r#type: "button",
+                            disabled: !can_edit || new_name().trim().is_empty(),
+                            class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-[8px] bg-beet-leaf-solid text-beet-leaf-ink text-[12px] font-semibold hover:brightness-105 disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer shrink-0",
+                            onclick: move |_| {
+                                let name = new_name().trim().to_string();
+                                if !name.is_empty() {
+                                    studio.create_playlist(
+                                        name,
+                                        None,
+                                        Some(false),
+                                        Some(vec![track_id_create.clone()]),
+                                    );
+                                    on_close.call(());
+                                }
+                            },
+                            IconPlus { size: 13 }
+                            span { "Create & Add" }
+                        }
+                    }
+                }
+
+                // Existing editable playlists
+                div { class: "space-y-2",
+                    div { class: "flex items-center justify-between gap-2",
+                        p { class: "tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                            "Your Playlists ({editable_playlists.len()})"
+                        }
+                    }
+
+                    if editable_playlists.len() > 5 {
+                        input {
+                            r#type: "text",
+                            value: "{filter_text}",
+                            placeholder: "Filter playlists...",
+                            class: "w-full h-8 px-3 rounded-[8px] bg-beet-surface border border-beet-border-subtle text-[12px] text-beet-text-primary placeholder:text-beet-text-disabled focus:border-beet-leaf-solid outline-none",
+                            oninput: move |evt| filter_text.set(evt.value()),
+                        }
+                    }
+
+                    if filtered_playlists.is_empty() {
+                        p { class: "text-[12px] text-beet-text-tertiary py-3 text-center",
+                            if editable_playlists.is_empty() {
+                                "No editable playlists yet. Create one above."
+                            } else {
+                                "No playlists match your filter."
+                            }
+                        }
+                    } else {
+                        div { class: "space-y-1.5 max-h-64 overflow-y-auto studio-scrollbar",
+                            for item in filtered_playlists.iter() {
+                                {
+                                    let pid = item.playlist.id.clone();
+                                    let pname = item.playlist.name.clone();
+                                    let tid = track.id.clone();
+                                    rsx! {
+                                        button {
+                                            key: "pick-pl-{item.playlist.id}",
+                                            r#type: "button",
+                                            disabled: !can_edit,
+                                            class: "w-full flex items-center justify-between gap-3 px-3 py-2 rounded-[10px] bg-beet-surface border border-beet-border-subtle hover:border-beet-leaf-solid/40 hover:bg-beet-surface-high text-left disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
+                                            onclick: move |_| {
+                                                studio.add_tracks_to_playlist(
+                                                    pid.clone(),
+                                                    pname.clone(),
+                                                    vec![tid.clone()],
+                                                );
+                                                on_close.call(());
+                                            },
+                                            div { class: "flex items-center gap-2.5 min-w-0",
+                                                IconListMusic { size: 14, class: "text-beet-text-tertiary shrink-0".to_string() }
+                                                span { class: "text-[13px] font-medium text-beet-text-primary truncate",
+                                                    "{item.playlist.name}"
+                                                }
+                                            }
+                                            span { class: "tabular-nums-mono text-[10px] text-beet-text-tertiary shrink-0",
+                                                "{item.playlist.song_count} TRACKS"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1000,7 +1000,7 @@ pub fn SearchView() -> Element {
                                                                             icon_size: 22,
                                                                         }
                                                                         span { class: "absolute bottom-2 right-2 w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity",
-                                                                            IconPlay { size: 13, filled: true }
+                                                                            IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                                                         }
                                                                     }
                                                                     p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{album.name}" }
@@ -1205,7 +1205,7 @@ pub fn SearchView() -> Element {
                                                     button {
                                                         r#type: "button",
                                                         disabled: is_remote_loading,
-                                                        class: "inline-flex items-center gap-2 text-[12px] font-medium text-beet-text-secondary hover:text-beet-leaf-text disabled:opacity-50 cursor-pointer transition-colors",
+                                                        class: "inline-flex items-center gap-2 text-[12px] font-medium text-beet-text-secondary hover:text-beet-leaf-text disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
                                                         onclick: move |_| trigger_remote_now(Some("musicbrainz")),
                                                         IconDisc3 { size: 14 }
                                                         span { "Didn't find a niche release? Search deeper catalog (MusicBrainz)" }
@@ -1218,7 +1218,7 @@ pub fn SearchView() -> Element {
                                                         button {
                                                             r#type: "button",
                                                             disabled: is_remote_loading,
-                                                            class: "text-[12px] font-medium text-beet-leaf-text hover:underline disabled:opacity-50 cursor-pointer",
+                                                            class: "text-[12px] font-medium text-beet-leaf-text hover:underline disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                                                             onclick: move |_| trigger_remote_now(None),
                                                             "Return to default catalog"
                                                         }
@@ -1578,7 +1578,7 @@ fn LocalArtistDetailPanel(
                                                 icon_size: 22,
                                             }
                                             span { class: "absolute bottom-2 right-2 w-8 h-8 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity",
-                                                IconPlay { size: 13, filled: true }
+                                                IconPlay { size: 13, filled: true, class: "ml-0.5".to_string() }
                                             }
                                         }
                                         p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{album.name}" }

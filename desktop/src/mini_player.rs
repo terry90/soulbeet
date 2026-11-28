@@ -213,7 +213,7 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
                                 r#type: "button",
                                 aria_label: "Previous track",
                                 disabled: current.is_none(),
-                                class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 cursor-pointer transition-colors",
+                                class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
                                 onclick: move |_| {
                                     let _ = tx_prev.send(MiniPlayerAction::Previous);
                                 },
@@ -223,7 +223,7 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
                                 r#type: "button",
                                 aria_label: if is_playing { "Pause" } else { "Play" },
                                 disabled: current.is_none(),
-                                class: "w-8 h-8 rounded-full inline-flex items-center justify-center bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 active:scale-95 disabled:opacity-40 cursor-pointer transition-[filter,transform]",
+                                class: "w-8 h-8 rounded-full inline-flex items-center justify-center bg-beet-leaf-solid text-beet-leaf-ink hover:brightness-105 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-[filter,transform]",
                                 onclick: move |_| {
                                     let _ = tx_toggle.send(MiniPlayerAction::TogglePlayPause);
                                 },
@@ -239,7 +239,7 @@ fn MiniPlayerApp(props: MiniPlayerProps) -> Element {
                                 r#type: "button",
                                 aria_label: "Next track",
                                 disabled: current.is_none(),
-                                class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 cursor-pointer transition-colors",
+                                class: "w-7 h-7 rounded-md inline-flex items-center justify-center text-beet-text-secondary hover:text-beet-text-primary hover:bg-beet-surface-high disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-colors",
                                 onclick: move |_| {
                                     let _ = tx_next.send(MiniPlayerAction::Next);
                                 },
