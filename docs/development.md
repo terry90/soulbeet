@@ -21,6 +21,14 @@ This page covers running Soulbeet (server/web, desktop app, and Android app) fro
    python -m pytest -q lib/soulbeet/tests/probe lib/soulbeet/tests/import
    ```
 
+### Building and running with Docker from source
+
+The root `compose.yaml` runs prebuilt images for production. To build and run Soulbeet from your local source checkout with Docker Compose, use `docker-compose.dev.yml`:
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
 ## Seeded local dev build
 
 To review UI and UX changes interactively in desktop and mobile browsers without touching real data or external services, run the one-command seeded dev stack (debug binary on port `9766` with passwordless `admin` auto-login, mock Navidrome with SVG covers and playable demo audio, local service stubs, and an isolated SQLite DB under `.runtime-dev/`):

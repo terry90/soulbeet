@@ -119,6 +119,20 @@ mod tests {
         ) -> ImportResult {
             unreachable!()
         }
+        async fn indexed_paths(
+            &self,
+            _: &Path,
+        ) -> Result<std::collections::HashSet<std::path::PathBuf>, String> {
+            unreachable!()
+        }
+        async fn register_in_place_batch(
+            &self,
+            _: &[&Path],
+            _: &Path,
+            _: ImportMode,
+        ) -> ImportResult {
+            unreachable!()
+        }
         async fn relocate(&self, _: &Path, _: &[u64]) -> Relocation {
             unreachable!()
         }

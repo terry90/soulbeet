@@ -1,6 +1,15 @@
 # Configuration
 
-This page lists the environment variables Soulbeet reads and the settings kept in the web UI.
+This page covers the ready-to-run `compose.yaml` defaults, the environment variables Soulbeet reads, and the settings kept in the web UI.
+
+## Ready-to-run `compose.yaml` defaults
+
+Running `docker compose up -d` with the root `compose.yaml` launches `soulbeet`, `navidrome`, and `slskd` pre-wired together. Copy `.env.example` to `.env` if you want to customize host paths (`MUSIC_DIR`, `DOWNLOADS_DIR`), exposed ports, or `SOULBEET_TAG`.
+
+-   **Auto-generated `SECRET_KEY`**: you do not need to generate or pass `SECRET_KEY` manually. On first start, Soulbeet generates a random key and saves it to `/data/secret.key` inside `./soulbeet-data`. Back up `/data/secret.key` together with `soulbeet.db`.
+-   **Baked-in `/app/beets_config.yaml`**: you do not need to extract or mount a `beets_config.yaml` file. Each image tier ships its own preconfigured `/app/beets_config.yaml` with the tier's plugins already enabled. Only set `BEETS_CONFIG` and mount a file if you want to override the shipped config.
+-   **Single-folder-per-user layout**: each user gets a single personal music folder under `/music/<username>` (for example `/music/admin`, `/music/alice`), created automatically on setup or first sign-in. Each personal folder has its own beets library database under `/data/beets-libraries/` and its own dedicated Navidrome library.
+-   **Why `ND_MUSICFOLDER=/music/_default`**: Navidrome's default library (Library ID 1) should point to an empty sibling folder (`/music/_default`) rather than `/music`. Soulbeet provisions a separate Navidrome library per user (`/music/alice`, `/music/bob`). When users share tracks or albums via filesystem hardlinks, keeping Library 1 on `/music/_default` ensures Navidrome never scans `/music` as an overlapping parent library and never shows duplicate tracks for shared hardlinks.
 
 ## Environment variables
 

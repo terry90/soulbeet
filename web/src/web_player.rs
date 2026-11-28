@@ -233,6 +233,7 @@ pub struct WebStudioContext {
     pub transfer_gen: Signal<u64>,
     pub search_query_override: Signal<Option<String>>,
     pub archival_upgrades: Signal<Vec<ArchivalUpgradeJob>>,
+    pub library_import_event: Signal<Option<shared::library_import::LibraryImportEvent>>,
     pub live_weather_location: Signal<bool>,
 }
 
@@ -2024,6 +2025,8 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let mut transfer_gen = use_signal(|| 0u64);
     let search_query_override = use_signal(|| None::<String>);
     let archival_upgrades = use_signal(Vec::<ArchivalUpgradeJob>::new);
+    let library_import_event =
+        use_signal(|| None::<shared::library_import::LibraryImportEvent>);
     let live_weather_location = use_signal(load_live_weather_location);
 
     #[allow(unused_mut)]
@@ -2072,6 +2075,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         transfer_gen,
         search_query_override,
         archival_upgrades,
+        library_import_event,
         live_weather_location,
     });
 
@@ -2664,6 +2668,8 @@ pub fn WebStudioProvider(children: Element) -> Element {
     {
         let mut dl_sig = downloads;
         let mut outdated_sig = outdated;
+        let mut lib_import_sig = library_import_event;
+        let mut completed_import_toasts = use_signal(HashSet::<String>::new);
         crate::websocket::use_resilient_websocket(
             || {
                 api::download_updates_ws(
@@ -2699,6 +2705,28 @@ pub fn WebStudioProvider(children: Element) -> Element {
                     }
                     DownloadEvent::AcquireAndPlay(acquire_event) => {
                         handle_acquire_event(studio, player_ctx, acquire_event);
+                    }
+                    DownloadEvent::LibraryImport(import_event) => {
+                        let ev = (*import_event).clone();
+                        let should_toast = ev.batch.status
+                            == shared::library_import::LibraryImportBatchStatus::Completed
+                            && completed_import_toasts.write().insert(ev.batch.id.clone());
+                        lib_import_sig.set(Some(ev.clone()));
+                        if should_toast {
+                            let mut s = studio;
+                            let msg = if ev.batch.needs_decision_units > 0 {
+                                format!(
+                                    "Library import finished: {} imported, {} need attention.",
+                                    ev.batch.imported_units, ev.batch.needs_decision_units
+                                )
+                            } else {
+                                format!(
+                                    "Library import finished: {} imported.",
+                                    ev.batch.imported_units
+                                )
+                            };
+                            s.show_toast(msg);
+                        }
                     }
                     DownloadEvent::Build(server_build) => {
                         if !api::build_id::is_current(&server_build) {

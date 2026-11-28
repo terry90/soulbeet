@@ -7,13 +7,14 @@ use dioxus::prelude::*;
 use serde_json::Value;
 use shared::recommendation::DiscoveryProfile;
 
+use super::library_import_modal::LibraryImportModal;
 use super::panel::{
     LoadError, Loading, Messages, Panel, LABEL_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
 };
 use super::save_setting::{typed_number, SettingSaver};
 use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
-use crate::{friendly_error, TextInput};
+use crate::{friendly_error, IconLibrary, TextInput};
 
 /// The numbers typed for the Safe, Mix and Wild profiles as the JSON object the server stores, or
 /// why one of them cannot be saved. `what` names the number in that reason.
@@ -86,6 +87,7 @@ pub fn FolderManager() -> Element {
     let mut folder_path = use_signal(String::new);
     let mut error = use_signal(String::new);
     let mut success_msg = use_signal(String::new);
+    let mut import_modal_open = use_signal(|| false);
 
     // Library settings state
     let mut accept_shares = use_signal(|| true);
@@ -298,19 +300,42 @@ pub fn FolderManager() -> Element {
                             "Used automatically for downloads, Discovery playlists, and shared tracks."
                         }
                     }
-                    button {
-                        r#type: "button",
-                        class: SECONDARY_BUTTON_CLASS,
-                        onclick: move |_| {
-                            folder_name.set(existing.name.clone());
-                            folder_path.set(existing.path.clone());
-                            error.set(String::new());
-                            success_msg.set(String::new());
-                            editing.set(true);
-                        },
-                        "Edit Folder"
+                    div { class: "flex flex-wrap items-center gap-2 shrink-0",
+                        button {
+                            r#type: "button",
+                            class: "inline-flex items-center justify-center gap-2 px-3.5 h-9 text-xs font-semibold rounded-[10px] bg-beet-accent-solid text-beet-text-primary hover:brightness-110 transition-all cursor-pointer",
+                            onclick: move |_| {
+                                error.set(String::new());
+                                import_modal_open.set(true);
+                            },
+                            IconLibrary { size: 14 }
+                            span { "Import Existing Library" }
+                        }
+                        button {
+                            r#type: "button",
+                            class: SECONDARY_BUTTON_CLASS,
+                            onclick: move |_| {
+                                folder_name.set(existing.name.clone());
+                                folder_path.set(existing.path.clone());
+                                error.set(String::new());
+                                success_msg.set(String::new());
+                                editing.set(true);
+                            },
+                            "Edit Folder"
+                        }
                     }
                 }
+            }
+            LibraryImportModal {
+                open: import_modal_open,
+                on_started: move |batch: shared::library_import::LibraryImportBatch| {
+                    let unit_word = if batch.total_units == 1 { "unit" } else { "units" };
+                    success_msg.set(format!(
+                        "Started library import ({} {unit_word}). Track live progress on the Activity page.",
+                        batch.total_units
+                    ));
+                    error.set(String::new());
+                },
             }
         }
 

@@ -18,7 +18,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 use super::contract::{failed, rate_limited};
 use super::{
     batches, browse, deletion, discovery, ensure, extras, imports, insights, jobs, library,
-    metadata, playlists, ratings, settings, share, sources, status, sync, tracks, McpCaller,
+    library_import, metadata, playlists, ratings, settings, share, sources, status, sync, tracks,
+    McpCaller,
 };
 use crate::connection::ConnectionState;
 
@@ -295,6 +296,11 @@ pub(crate) const TOOLS: &[ToolSpec] = &[
     insights::GET_RECOMMENDATIONS,
     extras::AUDIT_LIBRARY,
     extras::FETCH_ARTWORK_AND_LYRICS,
+    library_import::SCAN_UNIMPORTED_FILES,
+    library_import::START_LIBRARY_IMPORT,
+    library_import::GET_LIBRARY_IMPORT,
+    library_import::RESOLVE_LIBRARY_IMPORT_ITEM,
+    library_import::CONTROL_LIBRARY_IMPORT,
 ];
 
 impl ToolSpec {
@@ -489,7 +495,9 @@ mod tests {
                 "run_discovery",
                 "get_listening_history",
                 "get_recommendations",
-                "fetch_artwork_and_lyrics"
+                "fetch_artwork_and_lyrics",
+                "start_library_import",
+                "resolve_library_import_item"
             ]
         );
         assert!(tools[0]["description"]
@@ -597,6 +605,14 @@ mod tests {
             }
             "get_library_artist" => json!({"artist_id": "2kD9pWq4ZxC1vBnM6yTjLs"}),
             "fetch_artwork_and_lyrics" => json!({"song_ids": ["3sG8kPq0WmZ1xYbN4vTcDe"]}),
+            "scan_unimported_files" | "get_library_import" => json!({}),
+            "start_library_import" => json!({"mode": "register_as_is"}),
+            "resolve_library_import_item" => {
+                json!({"item_id": "item-1", "action": "dismiss"})
+            }
+            "control_library_import" => {
+                json!({"batch_id": "batch-1", "action": "pause"})
+            }
             other => panic!("no valid call for {other} in valid_args"),
         }
     }
@@ -696,6 +712,11 @@ mod tests {
         ("get_recommendations", true, false, false, true),
         ("audit_library", true, false, true, false),
         ("fetch_artwork_and_lyrics", false, true, true, true),
+        ("scan_unimported_files", true, false, true, false),
+        ("start_library_import", false, false, true, true),
+        ("get_library_import", true, false, true, false),
+        ("resolve_library_import_item", false, false, false, true),
+        ("control_library_import", false, false, true, false),
     ];
 
     /// Without the switch an app is refused exactly the delete tools. The others that can lead to

@@ -1407,6 +1407,7 @@ pub async fn generate_discovery_playlist_internal(
                         duplicates: Duplicates::AsConfigured,
                         last_run: None,
                         lock_retries: 0,
+                        placement: soulbeet::ImportPlacement::Default,
                     })
                     .await
                     .wait()
@@ -2290,6 +2291,7 @@ async fn generate_seasonal_packs_with_work(
                         duplicates: Duplicates::AsConfigured,
                         last_run: None,
                         lock_retries: 0,
+                        placement: soulbeet::ImportPlacement::Default,
                     })
                     .await
                     .wait()

@@ -1392,6 +1392,12 @@
       border-color: color-mix(in oklab, var(--color-beet-accent) 40%, transparent);
     }
   }
+  .border-beet-accent\/50 {
+    border-color: color-mix(in srgb, #ff00ff 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--color-beet-accent) 50%, transparent);
+    }
+  }
   .border-beet-border-default {
     border-color: var(--color-beet-border-default);
   }
@@ -1437,6 +1443,12 @@
       border-color: color-mix(in oklab, var(--color-beet-crimson-text) 35%, transparent);
     }
   }
+  .border-beet-crimson-text\/45 {
+    border-color: color-mix(in srgb, #ff668c 45%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--color-beet-crimson-text) 45%, transparent);
+    }
+  }
   .border-beet-gold\/25 {
     border-color: color-mix(in srgb, #ffd166 25%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1459,6 +1471,12 @@
     border-color: color-mix(in srgb, #ffd166 40%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       border-color: color-mix(in oklab, var(--color-beet-gold) 40%, transparent);
+    }
+  }
+  .border-beet-gold\/45 {
+    border-color: color-mix(in srgb, #ffd166 45%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--color-beet-gold) 45%, transparent);
     }
   }
   .border-beet-leaf-ink\/30 {
@@ -1588,6 +1606,12 @@
     background-color: color-mix(in srgb, rgba(255, 0, 255, 0.12) 40%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
       background-color: color-mix(in oklab, var(--color-beet-accent-surface) 40%, transparent);
+    }
+  }
+  .bg-beet-accent-surface\/50 {
+    background-color: color-mix(in srgb, rgba(255, 0, 255, 0.12) 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-accent-surface) 50%, transparent);
     }
   }
   .bg-beet-border-strong {
@@ -2880,6 +2904,22 @@
     @supports (color: color-mix(in lab, red, red)) {
       .hover\:border-beet-crimson-text\/30:hover {
         border-color: color-mix(in oklab, var(--color-beet-crimson-text) 30%, transparent);
+      }
+    }
+    .hover\:border-beet-crimson-text\/40:hover {
+      border-color: color-mix(in srgb, #ff668c 40%, transparent);
+    }
+    @supports (color: color-mix(in lab, red, red)) {
+      .hover\:border-beet-crimson-text\/40:hover {
+        border-color: color-mix(in oklab, var(--color-beet-crimson-text) 40%, transparent);
+      }
+    }
+    .hover\:border-beet-gold\/40:hover {
+      border-color: color-mix(in srgb, #ffd166 40%, transparent);
+    }
+    @supports (color: color-mix(in lab, red, red)) {
+      .hover\:border-beet-gold\/40:hover {
+        border-color: color-mix(in oklab, var(--color-beet-gold) 40%, transparent);
       }
     }
     .hover\:border-beet-leaf-solid:hover {

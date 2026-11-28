@@ -15,6 +15,7 @@ mod picker;
 use api::CancelDownloadRequest;
 pub use diagnostics::JobDiagnosticsPanel;
 use item::DownloadItem;
+pub use picker::{ChoicesLoader, MatchPicker};
 
 use crate::{friendly_error, IconDownload, IconX};
 
@@ -257,12 +258,14 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
 
 /// Where a failed request from a row shows why.
 #[derive(Debug, Clone, PartialEq)]
-enum Failure {
+pub enum MatchPickerFailure {
     /// On the row's reason line.
     OnRow,
     /// In the picker that sent it, which stays.
     InPicker(String),
 }
+
+type Failure = MatchPickerFailure;
 
 /// Moves keyboard focus to `element`, once it is mounted.
 fn focus(element: Option<Rc<MountedData>>) {

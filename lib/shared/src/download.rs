@@ -873,6 +873,8 @@ pub enum DownloadEvent {
     /// used by clients to animate the `seam-light` sweep and start playback the instant
     /// Navidrome indexes the track.
     AcquireAndPlay(AcquireAndPlayEvent),
+    /// Existing library import batch progress and item decision events.
+    LibraryImport(Box<crate::library_import::LibraryImportEvent>),
     /// The server's build id, the first frame on a socket whose client asked
     /// for it. A bundle from another build may misread every event after it.
     Build(String),

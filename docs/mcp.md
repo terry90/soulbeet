@@ -388,6 +388,14 @@ What each tool does, in the order an MCP client sees them. Every tool answers on
 - `audit_library`: read-only health audit of the user's library folders against Navidrome, reporting untracked audio files on disk, missing Navidrome files, albums split across folders/libraries, missing recording MBIDs, missing cover art, and missing lyrics.
 - `fetch_artwork_and_lyrics`: fetches missing album cover art (Cover Art Archive / MusicBrainz) and/or synced/plain `.lrc` lyrics (LRCLIB) for up to 25 songs or one album, writing files atomically inside the caller's owned folders and triggering a Navidrome scan. Supports `dry_run: true`; `overwrite: true` requires the file-management switch.
 
+### Existing library import
+
+- `scan_unimported_files`: read-only scan of the user's personal library folder (or a validated external `source_path`) against the folder's beets database, returning counts and a sample of unimported album folders and loose audio files.
+- `start_library_import`: starts a persistent background import batch in `tag_and_organize`, `tag_in_place`, or `register_as_is` mode (`tag_and_organize` and `tag_in_place` require the file-management switch; `register_as_is` does not). Never deletes source files; supports `request_key` for idempotency.
+- `get_library_import`: shows a library import batch (the caller's latest batch when `batch_id` is omitted) with progress counters and a paginated, status-filtered list of items and Match Picker choices.
+- `resolve_library_import_item`: resolves a `needs_decision` or `failed` library import item (`auto`, `as_is` with optional `tag_overrides`, `candidate`, `musicbrainz`, or `dismiss`). Non-dismiss actions on `tag_and_organize` / `tag_in_place` batches and any `tag_overrides` require the file-management switch; `dismiss` and `register_as_is` do not.
+- `control_library_import`: pauses, resumes, or cancels a library import batch (`action`: `pause`, `resume`, or `cancel`) without modifying or deleting source files. Resuming a `tag_and_organize` or `tag_in_place` batch requires the file-management switch; `pause`, `cancel`, and resuming `register_as_is` do not.
+
 ## Limits
 
 Soulbeet's limits:

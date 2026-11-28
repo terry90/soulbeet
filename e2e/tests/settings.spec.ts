@@ -3,7 +3,15 @@
 
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import { admin, loginViaApi, openSettings, registerUser, uniqueUser, type TestUser } from '../helpers/app.js';
+import {
+  admin,
+  loginViaApi,
+  openLibraryTab,
+  openSettings,
+  registerUser,
+  uniqueUser,
+  type TestUser,
+} from '../helpers/app.js';
 import { musicDirForApp } from '../helpers/env.js';
 
 
@@ -18,7 +26,7 @@ test.beforeEach(async ({ context, page }) => {
 });
 
 test('views and updates the personal music library folder', async ({ page }) => {
-  await page.getByRole('button', { name: 'Library' }).click();
+  await openLibraryTab(page);
 
   // Registration auto-provisions the user's single personal library folder.
   await expect(page.getByText(`${musicDirForApp}/${user.username}`, { exact: true })).toBeVisible();
@@ -35,7 +43,7 @@ test('views and updates the personal music library folder', async ({ page }) => 
 
   // Persisted across reload.
   await page.reload();
-  await page.getByRole('button', { name: 'Library' }).click();
+  await openLibraryTab(page);
   await expect(page.getByText('Vault', { exact: true })).toBeVisible();
   await expect(page.getByText(updatedPath, { exact: true })).toBeVisible();
 });

@@ -6,6 +6,7 @@ pub mod client;
 pub mod download;
 pub mod failure;
 pub mod gdstudio;
+pub mod library_import;
 pub mod metadata;
 pub mod navidrome;
 pub mod oauth;

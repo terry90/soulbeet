@@ -32,6 +32,7 @@ mod insights;
 mod jobs;
 mod keys;
 pub(crate) mod library;
+mod library_import;
 pub(crate) mod metadata;
 pub(crate) mod next;
 mod paging;

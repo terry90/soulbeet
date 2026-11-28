@@ -10,7 +10,8 @@ pub use runner::{run_beet, RunEnd, RunLimits, RunOutcome, RunSpec, Stream};
 use crate::audio::count_audio_files;
 use crate::{
     BeetsTrackInfo, DriverChoice, DuplicateRun, FailKind, ForgetOutcome, ImportMode, ImportOutcome,
-    ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation, TagEdits,
+    ImportPlacement, ImportResult, MusicImporter, PruneOutcome, RegisterOutcome, Relocation,
+    TagEdits,
 };
 use classify::{parse_run_log, Classifier};
 use probe::{assess, fingerprint, run_probe, Fingerprint, ProbeFailure, ProbeReport};
@@ -91,6 +92,7 @@ impl BeetsImporter {
         mode: ImportMode,
         choice: &DriverChoice,
         duplicates: DuplicateRun,
+        placement: ImportPlacement,
     ) -> ImportResult {
         let s = &self.settings;
         let Some(python) = s.python.as_deref() else {
@@ -132,13 +134,27 @@ impl BeetsImporter {
             || self.state().report.as_ref().is_some_and(|r| !r.autotag);
 
         info!(
-            "beets import into {} ({mode:?}, {choice:?}, {duplicates:?}): {:?}",
+            "beets import into {} ({mode:?}, {choice:?}, {duplicates:?}, {placement:?}): {:?}",
             target.display(),
             sources
         );
         let started = Instant::now();
         let mut classifier = Classifier::new(mode, target, submitted, autotag_off);
-        let beet_args = import_args(s, &db, sources, target, mode, &run_log.0);
+        let mut beet_args = import_args(s, &db, sources, target, mode, &run_log.0);
+        if let Some(pos) = beet_args.iter().position(|a| a == "import") {
+            let extra: &[&str] = match placement {
+                ImportPlacement::Default => &[],
+                ImportPlacement::CopyOnly => &["-c", "-M"],
+                ImportPlacement::MoveInPlace => &["-m", "-C"],
+                ImportPlacement::InPlaceNoMove => &["-C", "-M"],
+            };
+            if !extra.is_empty() {
+                beet_args.splice(
+                    pos + 1..pos + 1,
+                    extra.iter().map(|flag| OsString::from(*flag)),
+                );
+            }
+        }
         let spec = RunSpec {
             program: python,
             args: driver_args(&report_file.0, duplicates, choice, beet_args),
@@ -176,6 +192,83 @@ impl BeetsImporter {
             warn!("beets output tail:\n{}", result.output_tail);
         }
         result
+    }
+
+    /// Registers a batch of existing `sources` inside `target`'s beets DB in a single run
+    /// (`-A -C -M -W`, duplicate skip, no plugins).
+    async fn run_register_in_place_batch(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+    ) -> ImportResult {
+        if sources.is_empty() {
+            return ImportResult::nothing_to_import();
+        }
+        let s = &self.settings;
+        let Some(python) = s.python.as_deref() else {
+            return ImportResult::failed(FailKind::Setup, NO_PYTHON.into());
+        };
+        if let Err(e) = tokio::fs::create_dir_all(target).await {
+            return ImportResult::failed(
+                FailKind::TargetUnwritable,
+                format!("Could not create library folder {}: {e}", target.display()),
+            );
+        }
+        let db_folder = library::library_folder(&s.libraries, target);
+        if let Err(e) = tokio::fs::create_dir_all(&db_folder).await {
+            return ImportResult::failed(
+                FailKind::Setup,
+                format!(
+                    "Could not create the folder of the beets library database {}: {e}",
+                    db_folder.display()
+                ),
+            );
+        }
+        let db = match library::library_db(s, target).await {
+            Ok(db) => db,
+            Err(e) => return ImportResult::failed(FailKind::Setup, e),
+        };
+        let submitted = count_audio_files(sources).await;
+        let (run_log, report_file) = match (TempFile::create("log"), TempFile::create("json")) {
+            (Ok(log), Ok(report)) => (log, report),
+            (Err(e), _) | (_, Err(e)) => {
+                return ImportResult::failed(
+                    FailKind::Setup,
+                    format!("Could not create the beets run files: {e}"),
+                )
+            }
+        };
+        let beet_args = import_args(s, &db, sources, target, mode, &run_log.0);
+        let mut args: Vec<OsString> = vec![
+            "-P".into(),
+            "-c".into(),
+            IMPORT_PY.into(),
+            report_file.0.clone().into(),
+            "skip".into(),
+            "register".into(),
+            "--".into(),
+        ];
+        args.extend(beet_args);
+        let spec = RunSpec {
+            program: python,
+            args,
+            limits: s.limits,
+        };
+        let mut classifier = Classifier::new(mode, target, submitted, true);
+        let run = run_beet(spec, &mut |stream, line| classifier.feed(stream, line)).await;
+        let entries = tokio::fs::read_to_string(&run_log.0)
+            .await
+            .map(|text| parse_run_log(&text))
+            .unwrap_or_default();
+        drop(run_log);
+        let report = read_report(&run.end, &report_file.0).await;
+        drop(report_file);
+        let result = classifier.finish(&run.end, &s.limits, &entries, run.tail);
+        match report {
+            Some(report) => report.apply(result, mode, &DriverChoice::AsIs, target),
+            None => result,
+        }
     }
 
     /// Registers an existing file in `target`'s beets DB without moving, copying, writing tags,
@@ -481,9 +574,47 @@ impl MusicImporter for BeetsImporter {
         duplicates: DuplicateRun,
     ) -> ImportResult {
         with_own_action(
-            self.run_import(sources, target, mode, choice, duplicates)
+            self.run_import(
+                sources,
+                target,
+                mode,
+                choice,
+                duplicates,
+                ImportPlacement::Default,
+            )
+            .await,
+        )
+    }
+
+    async fn import_with_placement(
+        &self,
+        sources: &[&Path],
+        target: &Path,
+        mode: ImportMode,
+        choice: &DriverChoice,
+        duplicates: DuplicateRun,
+        placement: ImportPlacement,
+    ) -> ImportResult {
+        with_own_action(
+            self.run_import(sources, target, mode, choice, duplicates, placement)
                 .await,
         )
+    }
+
+    async fn indexed_paths(
+        &self,
+        library: &Path,
+    ) -> std::result::Result<std::collections::HashSet<PathBuf>, String> {
+        library::indexed_paths(&self.settings, library).await
+    }
+
+    async fn register_in_place_batch(
+        &self,
+        sources: &[&Path],
+        library: &Path,
+        mode: ImportMode,
+    ) -> ImportResult {
+        with_own_action(self.run_register_in_place_batch(sources, library, mode).await)
     }
 
     async fn relocate(&self, library: &Path, item_ids: &[u64]) -> Relocation {
