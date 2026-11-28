@@ -1,11 +1,14 @@
-//! Track management core operations: inspect, move across folders/libraries, and re-tag/re-match.
-//! Both the MCP tools and any future UI server functions call into this module.
+//! Track management core operations: inspect, hardlink track sharing, legacy folder
+//! migration, and re-tag/re-match.
 
 pub mod audit;
+pub mod cow;
 pub mod extras;
 pub mod inspect;
-pub mod move_tracks;
+pub mod link;
+pub mod migrate_legacy;
 pub mod retag;
+pub mod share;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

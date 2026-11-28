@@ -58,6 +58,7 @@ pub async fn create_user(
         .await
         .map_err(user_change_error)?;
     name_taken_by_account(&user.username);
+    crate::core::folders::ensure_user_folder(&user).await;
     Ok(user)
 }
 

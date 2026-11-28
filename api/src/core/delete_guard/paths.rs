@@ -390,7 +390,8 @@ async fn learn_one(
 }
 
 /// What the folders of one user taught of a library root.
-enum FromFolders {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FromFolders {
     /// A root is stored or already known.
     Learned,
     /// No file proves a root, or more than one does.
@@ -407,7 +408,7 @@ enum FromFolders {
 /// and skipped, and then nothing is learned, since it may be a second copy. The others are
 /// taken through proven_root, and only when exactly one root is proven is it stored
 /// (store_root): two files that each prove a root may each be the song's.
-async fn learn_from_folders(
+pub(super) async fn learn_from_folders(
     db: &SqlitePool,
     song: &NativeSong,
     folders: &[&Path],

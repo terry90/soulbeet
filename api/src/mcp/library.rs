@@ -678,7 +678,7 @@ mod tests {
         );
         assert_eq!(
             doc["results"][0]["matches"][0]["folder"],
-            json!({"folder_id": "alice-music", "name": "alice-music", "shared": false})
+            json!({"folder_id": "alice-music", "name": "alice-music"})
         );
     }
 

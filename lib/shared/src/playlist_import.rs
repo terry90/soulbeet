@@ -122,7 +122,6 @@ pub struct CommitPlaylistImportTrack {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPlaylistImportRequest {
     pub target: PlaylistImportTarget,
-    pub folder_id: String,
     pub tracks: Vec<CommitPlaylistImportTrack>,
 }
 

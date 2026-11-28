@@ -40,6 +40,7 @@ mod ratings;
 mod refs;
 pub(crate) mod server;
 pub(crate) mod settings;
+mod share;
 mod sources;
 pub(crate) mod status;
 pub(crate) mod sync;

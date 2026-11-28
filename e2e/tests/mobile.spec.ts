@@ -1,26 +1,13 @@
-// Mobile interaction coverage (Pixel 7 emulation, touch enabled). Guards the
-// long-press/tap gesture handling on the download icon, which once shipped a
-// WASM panic that froze the whole UI on phones.
+// Mobile interaction coverage (Pixel 7 emulation, touch enabled). Guards tap
+// handling on the download icon and source picker so the UI stays responsive
+// on phones.
 
-import type { Locator } from '@playwright/test';
 import { expect, test } from '@playwright/test';
 import { freshSession, performSearch } from '../helpers/app.js';
 import { expectFileAppears, importedTrackPath } from '../helpers/files.js';
 import { foglight } from '../fixtures/dataset.js';
 
 test.describe.configure({ timeout: 180_000 });
-
-
-function dispatchPointer(locator: Locator, type: string): Promise<void> {
-  return locator.dispatchEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    pointerId: 1,
-    pointerType: 'touch',
-    isPrimary: true,
-  });
-}
 
 test('taps a track to download it', async ({ context, page }) => {
   const { folder } = await freshSession(context, page, 'mobile-tap');
@@ -44,37 +31,17 @@ test('taps a track to download it', async ({ context, page }) => {
   await expectFileAppears(imported, 120_000);
 });
 
-test('opens the folder menu with a long-press instead of downloading', async ({
+test('taps search sources to open download options and returns to catalog', async ({
   context,
   page,
 }) => {
-  const { folder } = await freshSession(context, page, 'mobile-press');
+  await freshSession(context, page, 'mobile-sources');
 
   await performSearch(page, 'Paper Lanterns', 'TRACK');
   const row = page.locator('li').filter({ hasText: 'Paper Lanterns' }).first();
-  const button = row.getByRole('button', { name: 'Download' });
+  await row.getByRole('button', { name: 'Search sources' }).tap();
 
-  await dispatchPointer(button, 'pointerdown');
-  await page.waitForTimeout(700);
-  await dispatchPointer(button, 'pointerup');
-
-  // Long-press opens the folder picker; the tap-download must NOT have fired,
-  // so the menu lists the folder instead of the row showing a spinner. The
-  // menu shortens long names, so the row is found by its full-name title.
-  await expect(row.getByTitle(folder.name, { exact: true })).toBeVisible();
-});
-
-test('cancels the long-press when the touch turns into a scroll', async ({ context, page }) => {
-  const { folder } = await freshSession(context, page, 'mobile-scroll');
-
-  await performSearch(page, 'Undertow', 'TRACK');
-  const row = page.locator('li').filter({ hasText: 'Undertow' }).first();
-  const button = row.getByRole('button', { name: 'Download' });
-
-  await dispatchPointer(button, 'pointerdown');
-  await dispatchPointer(button, 'pointercancel');
-  await page.waitForTimeout(700);
-
-  // No menu: the gesture was abandoned, not held.
-  await expect(row.getByText(folder.name)).not.toBeVisible();
+  await expect(page.getByText('Download Options')).toBeVisible();
+  await page.getByRole('button', { name: 'Back' }).tap();
+  await expect(page.getByRole('heading', { name: 'Catalog', exact: true })).toBeVisible();
 });

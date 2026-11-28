@@ -7,6 +7,7 @@ pub mod i18n;
 pub mod lyrics;
 pub mod player_bar;
 pub mod right_drawer;
+pub mod share_modal;
 pub mod shell;
 pub mod undo_queue;
 
@@ -25,6 +26,7 @@ pub use lyrics::{
 };
 pub use player_bar::StudioPlayerBar;
 pub use right_drawer::{DrawerTab, StudioRightDrawer};
+pub use share_modal::{ShareModal, ShareModalTarget};
 pub use shell::{
     classify_local_playlist_category, classify_playlist_category, PlaylistCategory,
     SidebarPlaylistItem, StudioMobileNav, StudioNavSection, StudioSidebar, StudioTopBar,

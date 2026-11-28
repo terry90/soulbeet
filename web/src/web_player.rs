@@ -35,7 +35,7 @@ use ui::{
     classify_guard_mode, discovery_days_remaining, format_candidate_reason, friendly_error,
     subsonic_cover_art_url, AcquireStageBadge, Auth, AutoDownloadSignal, DrawerTab, GuardModalMode,
     PendingDropItem, PendingDropQueue, PlaybackStatus, PlayerCommand, PlayerContext,
-    PlayerProvider, PlayerState, PlayerTrack,
+    PlayerProvider, PlayerState, PlayerTrack, ShareModalTarget,
 };
 
 use crate::auth::use_auth;
@@ -205,6 +205,7 @@ pub struct WebStudioContext {
     pub in_flight_triage: Signal<HashSet<String>>,
     pub optimistic_kept: Signal<HashSet<String>>,
     pub guard_modal: Signal<Option<GuardModalState>>,
+    pub share_modal: Signal<Option<ShareModalTarget>>,
     pub inspected_track: Signal<Option<PlayerTrack>>,
     pub drawer_tab: Signal<Option<DrawerTab>>,
     pub cmdk_open: Signal<bool>,
@@ -245,6 +246,22 @@ impl WebStudioContext {
             .read()
             .as_ref()
             .and_then(|b| b.navidrome.clone())
+    }
+
+    pub fn open_share_modal(&mut self, target: ShareModalTarget) {
+        self.share_modal.set(Some(target));
+    }
+
+    pub fn open_share_track(&mut self, track: &PlayerTrack) {
+        if track.id.is_empty() || track.is_discovery {
+            return;
+        }
+        self.open_share_modal(ShareModalTarget::Track {
+            song_id: track.id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+        });
     }
 
     pub fn set_live_weather_location(&self, enabled: bool) {
@@ -1979,6 +1996,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
     let in_flight_triage = use_signal(HashSet::<String>::new);
     let optimistic_kept = use_signal(HashSet::<String>::new);
     let guard_modal = use_signal(|| None::<GuardModalState>);
+    let share_modal = use_signal(|| None::<ShareModalTarget>);
     let inspected_track = use_signal(|| None::<PlayerTrack>);
     let drawer_tab = use_signal(|| None::<DrawerTab>);
     let cmdk_open = use_signal(|| false);
@@ -2027,6 +2045,7 @@ pub fn WebStudioProvider(children: Element) -> Element {
         in_flight_triage,
         optimistic_kept,
         guard_modal,
+        share_modal,
         inspected_track,
         drawer_tab,
         cmdk_open,

@@ -1,4 +1,3 @@
-use api::models::folder::Folder;
 use dioxus::prelude::*;
 use shared::metadata::Track;
 use std::collections::HashMap;
@@ -12,18 +11,14 @@ const SKELETON_WIDTHS: [u8; 4] = [60, 75, 50, 65];
 pub struct Props {
     pub tracks: Option<Vec<Track>>,
     pub download_states: Signal<HashMap<String, DownloadRowState>>,
-    pub folders: Vec<Folder>,
-    pub selected_folder_id: Option<String>,
-    pub active_menu: Signal<Option<String>>,
+    pub has_folder: bool,
     #[props(into)]
     pub on_track_download: EventHandler<Track>,
-    #[props(into)]
-    pub on_track_override_download: EventHandler<(Track, Folder)>,
 }
 
 #[component]
 pub fn InlineTrackPanel(props: Props) -> Element {
-    let has_folders = !props.folders.is_empty();
+    let has_folder = props.has_folder;
 
     rsx! {
         div {
@@ -56,27 +51,20 @@ pub fn InlineTrackPanel(props: Props) -> Element {
                             class: "max-h-[400px] overflow-y-auto studio-scrollbar space-y-0.5",
                             for (idx, track) in tracks.iter().enumerate() {
                                 {
-                                    let dl_state = if !has_folders {
+                                    let dl_state = if !has_folder {
                                         DownloadRowState::Disabled
                                     } else {
                                         props.download_states.read().get(&track.id).cloned().unwrap_or_default()
                                     };
                                     let track_for_dl = track.clone();
-                                    let track_for_override = track.clone();
                                     rsx! {
                                         InlineTrackRow {
                                             key: "{track.id}",
                                             track: track.clone(),
                                             index: idx,
                                             download_state: dl_state,
-                                            folders: props.folders.clone(),
-                                            selected_folder_id: props.selected_folder_id.clone(),
-                                            active_menu: props.active_menu,
                                             on_download: move |_| {
                                                 props.on_track_download.call(track_for_dl.clone());
-                                            },
-                                            on_override_download: move |folder: Folder| {
-                                                props.on_track_override_download.call((track_for_override.clone(), folder));
                                             },
                                         }
                                     }

@@ -34,7 +34,6 @@ pub struct AuditedFolder {
     pub folder_id: String,
     pub name: String,
     pub path: String,
-    pub shared: bool,
     pub exists: bool,
 }
 
@@ -511,7 +510,6 @@ pub(crate) async fn audit_library(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(f.folder.path)),
-            shared: f.folder.shared,
             exists: f.exists,
         })
         .collect();
@@ -740,9 +738,6 @@ mod tests {
     #[tokio::test]
     async fn audit_detects_all_six_issue_categories_and_ignores_hidden_and_discovery() {
         let lib = Library::new().await;
-        // Add a second folder for alice so we can test split albums across folders.
-        lib.folder("alice", "alice-shared", "music/shared", true)
-            .await;
 
         let music_root = lib.root.join("music");
         let music_root_str = music_root.to_string_lossy().into_owned();
@@ -762,13 +757,13 @@ mod tests {
         lib.write("alice/.hidden/ignored.flac", b"audio");
         lib.write("alice/Discovery/Balanced/staged.flac", b"audio");
 
-        // 5. Split album: track 1 in alice-music, track 2 in alice-shared.
+        // 5. Split album: track 1 in Navidrome library 1, track 2 in Navidrome library 2.
         lib.write("alice/SplitAlbum/01 - Part1.flac", b"audio");
         lib.write("alice/SplitAlbum/cover.jpg", b"jpg");
         lib.write("alice/SplitAlbum/01 - Part1.lrc", b"lyrics");
-        lib.write("shared/SplitAlbum/02 - Part2.flac", b"audio");
-        lib.write("shared/SplitAlbum/cover.jpg", b"jpg");
-        lib.write("shared/SplitAlbum/02 - Part2.lrc", b"lyrics");
+        lib.write("alice/SplitAlbum2/02 - Part2.flac", b"audio");
+        lib.write("alice/SplitAlbum2/cover.jpg", b"jpg");
+        lib.write("alice/SplitAlbum2/02 - Part2.lrc", b"lyrics");
 
         // 6. Missing on disk: Navidrome lists alice/Gone/01 - Missing.flac, which does not exist.
         // Also remove the default Library::new() track alice/A/x.flac so it doesn't pollute untracked.
@@ -813,12 +808,12 @@ mod tests {
             ),
             song_json(
                 "s-split-2",
-                "shared/SplitAlbum/02 - Part2.flac",
+                "alice/SplitAlbum2/02 - Part2.flac",
                 "Part 2",
                 "Artist C",
                 "Split Album",
                 "al-split",
-                1,
+                2,
                 &music_root_str,
                 Some("33333333-3333-4333-8333-333333333333"),
                 false,
@@ -853,7 +848,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(report.folders_audited.len(), 2);
+        assert_eq!(report.folders_audited.len(), 1);
         assert_eq!(report.summary.total_songs_in_navidrome, 5);
         assert_eq!(report.summary.total_audio_files_on_disk, 5);
         assert!(!report.truncated);
@@ -876,10 +871,7 @@ mod tests {
         // 3. split_albums
         assert_eq!(report.summary.split_albums, 1);
         assert_eq!(report.split_albums[0].album, "Split Album");
-        assert_eq!(
-            report.split_albums[0].folders,
-            vec!["alice-music".to_string(), "alice-shared".to_string()]
-        );
+        assert_eq!(report.split_albums[0].library_ids, vec![1, 2]);
         assert_eq!(report.split_albums[0].track_count, 2);
 
         // 4. missing_mbids

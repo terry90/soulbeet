@@ -1,19 +1,19 @@
 use std::ops::RangeInclusive;
 
+use api::models::folder::Folder;
 use api::models::user_settings::{LossyFallback, LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS};
-use api::{create_user_folder, delete_folder, get_user_folders, update_folder, UserSettings};
+use api::{create_user_folder, get_user_folder, update_folder, UserSettings};
 use dioxus::prelude::*;
 use serde_json::Value;
 use shared::recommendation::DiscoveryProfile;
 
 use super::panel::{
-    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, PRIMARY_BUTTON_CLASS,
-    REMOVE_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
+    LoadError, Loading, Messages, Panel, LABEL_CLASS, PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
 };
 use super::save_setting::{typed_number, SettingSaver};
 use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
-use crate::{friendly_error, FieldLook, TextInput};
+use crate::{friendly_error, TextInput};
 
 /// The numbers typed for the Safe, Mix and Wild profiles as the JSON object the server stores, or
 /// why one of them cannot be saved. `what` names the number in that reason.
@@ -75,19 +75,20 @@ fn lossy_label(choice: LossyFallback) -> &'static str {
 
 #[component]
 pub fn FolderManager() -> Element {
-    let mut folder_name = use_signal(|| "".to_string());
-    let mut folder_path = use_signal(|| "".to_string());
-    let mut folders = use_signal(Vec::new);
-
-    let mut editing_folder_id = use_signal(|| None::<String>);
-    let mut edit_folder_name = use_signal(|| "".to_string());
-    let mut edit_folder_path = use_signal(|| "".to_string());
-
-    let mut error = use_signal(|| "".to_string());
-    let mut success_msg = use_signal(|| "".to_string());
     let auth = use_auth();
 
+    // Single personal library folder state
+    let mut folder = use_signal(|| None::<Folder>);
+    let mut folder_loading = use_signal(|| true);
+    let mut editing = use_signal(|| false);
+    let mut saving_folder = use_signal(|| false);
+    let mut folder_name = use_signal(String::new);
+    let mut folder_path = use_signal(String::new);
+    let mut error = use_signal(String::new);
+    let mut success_msg = use_signal(String::new);
+
     // Library settings state
+    let mut accept_shares = use_signal(|| true);
     let mut auto_delete_enabled = use_signal(|| false);
     let mut external_rating_sync_enabled = use_signal(|| true);
     let mut discovery_promote_threshold = use_signal(|| "3".to_string());
@@ -97,8 +98,9 @@ pub fn FolderManager() -> Element {
     let mut lossy_fallback = use_signal(LossyFallback::default);
     let library_error = use_signal(String::new);
     // The backends an admin turned on whose files are lossy only; the choice shows while one is.
-    let lossy_backends = use_resource(|| async {
-        let backends = api::get_backends()
+    let lossy_backends = use_resource(move || async move {
+        let backends = auth
+            .call(api::get_backends())
             .await
             .map(|b| b.download)
             .unwrap_or_default();
@@ -107,7 +109,6 @@ pub fn FolderManager() -> Element {
 
     // Discovery settings state
     let mut discovery_enabled = use_signal(|| false);
-    let mut discovery_folder_id = use_signal(String::new);
     let mut discovery_profiles = use_signal(|| "Conservative,Balanced,Adventurous".to_string());
     let pl_name_safe = use_signal(|| "Comfort Zone".to_string());
     let pl_name_mix = use_signal(|| "Fresh Picks".to_string());
@@ -120,7 +121,8 @@ pub fn FolderManager() -> Element {
     let lt_mix = use_signal(|| "7".to_string());
     let lt_wild = use_signal(|| "7".to_string());
 
-    let mut settings_resource = use_resource(|| async { api::get_user_settings().await });
+    let mut settings_resource =
+        use_resource(move || async move { auth.call(api::get_user_settings()).await });
     let saver = SettingSaver {
         stored: settings_resource,
         error: library_error,
@@ -128,6 +130,7 @@ pub fn FolderManager() -> Element {
 
     // Each puts one input's stored value in place: after a save only the saved input is
     // refilled, so the reply never overwrites another field being typed in.
+    let mut show_accept_shares = move |s: &UserSettings| accept_shares.set(s.accept_shares);
     let mut show_threshold = move |s: &UserSettings| {
         discovery_promote_threshold.set(s.discovery_promote_threshold.to_string())
     };
@@ -136,15 +139,13 @@ pub fn FolderManager() -> Element {
     };
     let mut show_lb_token =
         move |s: &UserSettings| lb_token.set(s.listenbrainz_token.clone().unwrap_or_default());
-    let mut show_discovery_folder = move |s: &UserSettings| {
-        discovery_folder_id.set(s.discovery_folder_id.clone().unwrap_or_default())
-    };
     let mut show_profiles =
         move |s: &UserSettings| discovery_profiles.set(s.discovery_profiles.clone());
     let mut show_lossy = move |s: &UserSettings| lossy_fallback.set(s.lossy_fallback);
 
     use_effect(move || {
         if let Some(Ok(s)) = &*settings_resource.read() {
+            show_accept_shares(s);
             auto_delete_enabled.set(s.auto_delete_enabled);
             external_rating_sync_enabled.set(s.external_rating_sync_enabled);
             deezer_recommendations.set(s.deezer_recommendations);
@@ -153,7 +154,6 @@ pub fn FolderManager() -> Element {
             show_threshold(s);
             show_lb_username(s);
             show_lb_token(s);
-            show_discovery_folder(s);
             show_profiles(s);
             let fields = [
                 (pl_name_safe, tc_safe, lt_safe),
@@ -170,163 +170,145 @@ pub fn FolderManager() -> Element {
         }
     });
 
-    let fetch_folders = move || async move {
-        match auth.call(get_user_folders()).await {
-            Ok(fetched_folders) => folders.set(fetched_folders),
+    let fetch_folder = move || async move {
+        match auth.call(get_user_folder()).await {
+            Ok(fetched) => {
+                if let Some(ref f) = fetched {
+                    folder_name.set(f.name.clone());
+                    folder_path.set(f.path.clone());
+                }
+                folder.set(fetched);
+            }
             Err(e) => error.set(friendly_error(&e)),
         }
+        folder_loading.set(false);
     };
 
     use_future(move || async move {
-        fetch_folders().await;
+        fetch_folder().await;
     });
 
-    let handle_add_folder = move |_| async move {
-        error.set("".to_string());
-        success_msg.set("".to_string());
+    let handle_save_folder = move |_| async move {
+        error.set(String::new());
+        success_msg.set(String::new());
 
-        if folder_name().is_empty() || folder_path().is_empty() {
-            error.set("Name and Path are required".to_string());
+        let name = folder_name().trim().to_string();
+        let path = folder_path().trim().to_string();
+        if name.is_empty() || path.is_empty() {
+            error.set("Folder name and path are required.".to_string());
             return;
         }
 
-        match auth
-            .call(create_user_folder(folder_name(), folder_path()))
-            .await
-        {
-            Ok(_) => {
-                success_msg.set("Folder added successfully".to_string());
-                folder_name.set("".to_string());
-                folder_path.set("".to_string());
-                fetch_folders().await;
+        saving_folder.set(true);
+        let existing_id = folder.peek().as_ref().map(|f| f.id.clone());
+        let result = if let Some(id) = existing_id {
+            auth.call(update_folder(id, name, path)).await
+        } else {
+            auth.call(create_user_folder(name, path))
+                .await
+                .map(|_| ())
+        };
+
+        match result {
+            Ok(()) => {
+                success_msg.set("Music library folder saved.".to_string());
+                editing.set(false);
+                fetch_folder().await;
             }
             Err(e) => error.set(friendly_error(&e)),
         }
+        saving_folder.set(false);
     };
 
-    let handle_delete_folder = move |id: String| async move {
-        match auth.call(delete_folder(id)).await {
-            Ok(_) => {
-                success_msg.set("Folder deleted successfully".to_string());
-                fetch_folders().await;
-            }
-            Err(e) => error.set(friendly_error(&e)),
-        }
-    };
-
-    let handle_update_folder = move |id: String| async move {
-        match auth
-            .call(update_folder(id, edit_folder_name(), edit_folder_path()))
-            .await
-        {
-            Ok(_) => {
-                success_msg.set("Folder updated successfully".to_string());
-                editing_folder_id.set(None);
-                fetch_folders().await;
-            }
-            Err(e) => error.set(friendly_error(&e)),
-        }
-    };
+    let current_folder = folder.read().clone();
+    let show_form = editing() || (!folder_loading() && current_folder.is_none());
 
     rsx! {
         div { class: "space-y-6",
-        Panel { title: "Manage Music Folders",
+        // My Music Library (Single Folder per User)
+        Panel { title: "My Music Library",
             Messages { error: error(), success: success_msg() }
 
-            div { class: "grid grid-cols-1 md:grid-cols-2 gap-4 mb-4",
-                div {
-                    label { class: LABEL_CLASS, "Folder Name (e.g., 'Music/Common')" }
-                    TextInput {
-                        value: folder_name(),
-                        oninput: move |v| folder_name.set(v),
-                        placeholder: "My Music",
+            if folder_loading() {
+                Loading {}
+            } else if show_form {
+                div { class: "space-y-4",
+                    p { class: "text-xs text-beet-text-secondary leading-relaxed",
+                        "Each user has one personal music library folder. Downloads, Discovery tracks, and music shared with you are organized here."
+                    }
+                    div { class: "grid grid-cols-1 md:grid-cols-2 gap-4",
+                        div {
+                            label { class: LABEL_CLASS, "Library Name" }
+                            TextInput {
+                                value: folder_name(),
+                                oninput: move |v| folder_name.set(v),
+                                placeholder: "My Music",
+                            }
+                        }
+                        div {
+                            label { class: LABEL_CLASS, "Folder Path" }
+                            TextInput {
+                                value: folder_path(),
+                                oninput: move |v| folder_path.set(v),
+                                placeholder: "/music/alice",
+                                class: "tabular-nums-mono",
+                            }
+                        }
+                    }
+                    div { class: "flex items-center gap-2.5",
+                        button {
+                            r#type: "button",
+                            disabled: saving_folder(),
+                            class: PRIMARY_BUTTON_CLASS,
+                            onclick: handle_save_folder,
+                            if saving_folder() {
+                                "Saving..."
+                            } else if current_folder.is_some() {
+                                "Save Changes"
+                            } else {
+                                "Set Library Folder"
+                            }
+                        }
+                        if let Some(existing) = current_folder.clone() {
+                            button {
+                                r#type: "button",
+                                disabled: saving_folder(),
+                                class: SECONDARY_BUTTON_CLASS,
+                                onclick: move |_| {
+                                    folder_name.set(existing.name.clone());
+                                    folder_path.set(existing.path.clone());
+                                    error.set(String::new());
+                                    editing.set(false);
+                                },
+                                "Cancel"
+                            }
+                        }
                     }
                 }
-                div {
-                    label { class: LABEL_CLASS, "Folder Path" }
-                    TextInput {
-                        value: folder_path(),
-                        oninput: move |v| folder_path.set(v),
-                        placeholder: "/home/user/Music",
-                        class: "tabular-nums-mono",
+            } else if let Some(existing) = current_folder.clone() {
+                div { class: "p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle flex flex-wrap justify-between items-center gap-4",
+                    div { class: "min-w-0 space-y-1",
+                        span { class: "font-semibold text-beet-text-primary block font-display text-sm",
+                            "{existing.name}"
+                        }
+                        span { class: "text-beet-text-tertiary text-xs tabular-nums-mono break-all block",
+                            "{existing.path}"
+                        }
+                        p { class: "text-[11px] text-beet-text-tertiary pt-0.5",
+                            "Used automatically for downloads, Discovery playlists, and shared tracks."
+                        }
                     }
-                }
-            }
-
-            button { class: "{PRIMARY_BUTTON_CLASS} mb-6", onclick: handle_add_folder, "Add Folder" }
-
-            // Existing Folders List
-            SectionTitle { title: "Existing Folders" }
-            if folders.read().is_empty() {
-                p { class: "text-xs text-beet-text-tertiary italic", "No folders added yet." }
-            } else {
-                ul { class: "space-y-2",
-                    {
-                        folders
-                            .read()
-                            .clone()
-                            .into_iter()
-                            .map(|folder| {
-                                let id_edit = folder.id.clone();
-                                let id_delete = folder.id.clone();
-                                let id_update = folder.id.clone();
-                                rsx! {
-                                    ListRow {
-                                        if editing_folder_id() == Some(folder.id.clone()) {
-                                            div { class: "flex flex-col gap-2.5",
-                                                TextInput {
-                                                    look: FieldLook::Compact,
-                                                    value: edit_folder_name(),
-                                                    oninput: move |v| edit_folder_name.set(v),
-                                                    placeholder: "Name",
-                                                }
-                                                TextInput {
-                                                    look: FieldLook::Compact,
-                                                    value: edit_folder_path(),
-                                                    oninput: move |v| edit_folder_path.set(v),
-                                                    placeholder: "Path",
-                                                    class: "tabular-nums-mono",
-                                                }
-                                                div { class: "flex gap-2 mt-1",
-                                                    button {
-                                                        class: "{PRIMARY_BUTTON_CLASS} h-8 px-3 text-xs",
-                                                        onclick: move |_| handle_update_folder(id_update.clone()),
-                                                        "[ Save ]"
-                                                    }
-                                                    button {
-                                                        class: "{SECONDARY_BUTTON_CLASS} h-8 px-3",
-                                                        onclick: move |_| editing_folder_id.set(None),
-                                                        "[ Cancel ]"
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            div { class: "flex justify-between items-center gap-3",
-                                                div { class: "min-w-0",
-                                                    span { class: "font-semibold text-beet-text-primary block font-display text-sm", "{folder.name}" }
-                                                    span { class: "text-beet-text-tertiary text-xs tabular-nums-mono break-all", "{folder.path}" }
-                                                }
-                                                div { class: "flex gap-3 shrink-0",
-                                                    button {
-                                                        class: "text-xs font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors underline decoration-dotted underline-offset-4 cursor-pointer",
-                                                        onclick: move |_| {
-                                                            edit_folder_name.set(folder.name.clone());
-                                                            edit_folder_path.set(folder.path.clone());
-                                                            editing_folder_id.set(Some(id_edit.clone()));
-                                                        },
-                                                        "Edit"
-                                                    }
-                                                    button {
-                                                        class: REMOVE_BUTTON_CLASS,
-                                                        onclick: move |_| handle_delete_folder(id_delete.clone()),
-                                                        "Delete"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            })
+                    button {
+                        r#type: "button",
+                        class: SECONDARY_BUTTON_CLASS,
+                        onclick: move |_| {
+                            folder_name.set(existing.name.clone());
+                            folder_path.set(existing.path.clone());
+                            error.set(String::new());
+                            success_msg.set(String::new());
+                            editing.set(true);
+                        },
+                        "Edit Folder"
                     }
                 }
             }
@@ -342,6 +324,31 @@ pub fn FolderManager() -> Element {
                 },
                 Some(Ok(_)) => rsx! {
                 div { class: "space-y-4",
+                    // Track Sharing
+                    div { class: "flex items-center justify-between gap-4 p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
+                        div {
+                            p { class: "text-sm text-beet-text-primary font-medium",
+                                "Allow other users to share music to my library"
+                            }
+                            p { class: "text-xs text-beet-text-tertiary mt-0.5 leading-relaxed",
+                                "Let other household members share tracks and albums directly into your personal library via zero-copy hardlinks."
+                            }
+                        }
+                        Toggle {
+                            on: accept_shares(),
+                            on_class: "bg-beet-leaf-solid",
+                            onclick: move |_| async move {
+                                let next = !accept_shares();
+                                accept_shares.set(next);
+                                let change = api::UpdateUserSettings {
+                                    accept_shares: Some(next),
+                                    ..Default::default()
+                                };
+                                saver.save(Ok(change), show_accept_shares).await;
+                            },
+                        }
+                    }
+
                     // Discovery (user-level)
                     div {
                         h3 { class: "text-sm font-semibold text-beet-text-primary mb-1.5", "Discovery" }
@@ -354,49 +361,25 @@ pub fn FolderManager() -> Element {
                                 div {
                                     p { class: "text-sm text-beet-text-primary font-medium", "Enable Discovery" }
                                     p { class: "text-xs text-beet-text-tertiary mt-0.5",
-                                        "Periodically generate a playlist of new tracks to try"
+                                        "Periodically generate playlists of new tracks inside your music library folder"
                                     }
                                 }
                                 Toggle {
                                     on: discovery_enabled(),
                                     on_class: "bg-beet-leaf-solid",
-                                    onclick: move |_| save_switch(discovery_enabled, library_error, |on| {
-                                        api::update_user_settings(api::UpdateUserSettings {
+                                    onclick: move |_| save_switch(discovery_enabled, library_error, move |on| {
+                                        auth.call(api::update_user_settings(api::UpdateUserSettings {
                                             discovery_enabled: Some(on),
                                             ..Default::default()
-                                        })
+                                        }))
                                     }),
                                 }
                             }
 
                             if discovery_enabled() {
-                                // Folder selector
-                                div { class: "p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
-                                    label { class: LABEL_CLASS, "Download Folder" }
-                                    if folders.read().is_empty() {
-                                        p { class: "text-beet-text-tertiary text-sm italic", "No folders configured. Add a folder above first." }
-                                    } else {
-                                        select {
-                                            class: "w-full h-10 px-3 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-beet-text-primary text-sm transition-colors",
-                                            value: "{discovery_folder_id}",
-                                            onchange: move |e| {
-                                                let val = e.value();
-                                                discovery_folder_id.set(val.clone());
-                                                let change = api::UpdateUserSettings {
-                                                    discovery_folder_id: Some(val),
-                                                    ..Default::default()
-                                                };
-                                                saver.save(Ok(change), show_discovery_folder)
-                                            },
-                                            option { value: "", "Select a folder..." }
-                                            for f in folders.read().iter() {
-                                                option {
-                                                    value: "{f.id}",
-                                                    selected: discovery_folder_id() == f.id,
-                                                    "{f.name} ({f.path})"
-                                                }
-                                            }
-                                        }
+                                if current_folder.is_none() && !folder_loading() {
+                                    div { class: "p-3.5 rounded-[10px] bg-beet-gold-surface border border-beet-gold/30 text-xs text-beet-gold",
+                                        "Set your music library folder above before running Discovery."
                                     }
                                 }
 
@@ -601,11 +584,11 @@ pub fn FolderManager() -> Element {
                         Toggle {
                             on: deezer_recommendations(),
                             on_class: "bg-beet-leaf-solid",
-                            onclick: move |_| save_switch(deezer_recommendations, library_error, |on| {
-                                api::update_user_settings(api::UpdateUserSettings {
+                            onclick: move |_| save_switch(deezer_recommendations, library_error, move |on| {
+                                auth.call(api::update_user_settings(api::UpdateUserSettings {
                                     deezer_recommendations: Some(on),
                                     ..Default::default()
-                                })
+                                }))
                             }),
                         }
                     }
@@ -663,11 +646,11 @@ pub fn FolderManager() -> Element {
                             Toggle {
                                 on: external_rating_sync_enabled(),
                                 on_class: "bg-beet-leaf-solid",
-                                onclick: move |_| save_switch(external_rating_sync_enabled, library_error, |on| {
-                                    api::update_user_settings(api::UpdateUserSettings {
+                                onclick: move |_| save_switch(external_rating_sync_enabled, library_error, move |on| {
+                                    auth.call(api::update_user_settings(api::UpdateUserSettings {
                                         external_rating_sync_enabled: Some(on),
                                         ..Default::default()
-                                    })
+                                    }))
                                 }),
                             }
                         }
@@ -717,11 +700,11 @@ pub fn FolderManager() -> Element {
                             Toggle {
                                 on: auto_delete_enabled(),
                                 on_class: "bg-beet-crimson-solid",
-                                onclick: move |_| save_switch(auto_delete_enabled, library_error, |on| {
-                                    api::update_user_settings(api::UpdateUserSettings {
+                                onclick: move |_| save_switch(auto_delete_enabled, library_error, move |on| {
+                                    auth.call(api::update_user_settings(api::UpdateUserSettings {
                                         auto_delete_enabled: Some(on),
                                         ..Default::default()
-                                    })
+                                    }))
                                 }),
                             }
                         }

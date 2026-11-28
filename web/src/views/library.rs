@@ -8,7 +8,8 @@ use shared::navidrome::{LibraryStats, TopPlayedTrack};
 use ui::{
     dashboard::StatsOverview, friendly_error, subsonic_cover_art_url, use_player, IconCompass,
     IconDisc3, IconListMusic, IconListPlus, IconLoader, IconPlay, IconRadio, IconRefreshCw,
-    IconSparkles, PlayerTrack, PlaylistCategory, PlaylistImportModal, TrackRow, TrackRowState,
+    IconShare2, IconSparkles, PlayerTrack, PlaylistCategory, PlaylistImportModal, ShareModalTarget,
+    TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -86,6 +87,8 @@ pub fn LibraryPage() -> Element {
         navigator.push(Route::ActivityPage {});
     });
     let mut detail_title = use_signal(|| None::<String>);
+    let mut detail_album_id = use_signal(|| None::<String>);
+    let mut detail_album_artist = use_signal(|| None::<String>);
     let mut detail_tracks = use_signal(Vec::<PlayerTrack>::new);
     let mut detail_loading = use_signal(|| false);
     let mut detail_req_id = use_signal(|| 0u64);
@@ -251,6 +254,8 @@ pub fn LibraryPage() -> Element {
         let next_req = detail_req_id.peek().wrapping_add(1);
         detail_req_id.set(next_req);
         detail_title.set(Some(name));
+        detail_album_id.set(None);
+        detail_album_artist.set(None);
         detail_loading.set(true);
         spawn(async move {
             let res = fetch_playlist_tracks(&info, &pid).await;
@@ -271,7 +276,7 @@ pub fn LibraryPage() -> Element {
         });
     });
 
-    let load_album = use_callback(move |(aid, name): (String, String)| {
+    let load_album = use_callback(move |(aid, name, artist): (String, String, String)| {
         if player.offline_only() {
             studio.show_toast("Offline Only mode is active: remote albums cannot be loaded.");
             return;
@@ -282,6 +287,8 @@ pub fn LibraryPage() -> Element {
         let next_req = detail_req_id.peek().wrapping_add(1);
         detail_req_id.set(next_req);
         detail_title.set(Some(name));
+        detail_album_id.set(Some(aid.clone()));
+        detail_album_artist.set(Some(artist));
         detail_loading.set(true);
         spawn(async move {
             let res = fetch_album_tracks(&info, &aid).await;
@@ -358,6 +365,8 @@ pub fn LibraryPage() -> Element {
                                     onclick: move |_| {
                                         active_tab.set(tab);
                                         detail_title.set(None);
+                                        detail_album_id.set(None);
+                                        detail_album_artist.set(None);
                                     },
                                     span { "{label}" }
                                     if let Some(count) = badge {
@@ -400,11 +409,46 @@ pub fn LibraryPage() -> Element {
                                     IconPlay { size: 14, filled: true }
                                     span { "Play All" }
                                 }
+                                if let Some(aid) = detail_album_id() {
+                                    {
+                                        let share_title = title.clone();
+                                        let share_artist = detail_album_artist()
+                                            .filter(|a| !a.trim().is_empty())
+                                            .or_else(|| {
+                                                detail_tracks
+                                                    .read()
+                                                    .first()
+                                                    .map(|t| t.artist.clone())
+                                            })
+                                            .unwrap_or_default();
+                                        let share_count = detail_tracks.read().len();
+                                        rsx! {
+                                            button {
+                                                r#type: "button",
+                                                class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] font-medium text-beet-text-primary hover:border-beet-leaf-solid/40 hover:text-beet-leaf-text transition-colors cursor-pointer",
+                                                onclick: move |_| {
+                                                    studio.open_share_modal(ShareModalTarget::Album {
+                                                        album_id: aid.clone(),
+                                                        title: share_title.clone(),
+                                                        artist: share_artist.clone(),
+                                                        track_count: share_count,
+                                                    });
+                                                },
+                                                IconShare2 { size: 14 }
+                                                span { "Share Album" }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             button {
                                 r#type: "button",
                                 class: "h-9 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer",
-                                onclick: move |_| detail_title.set(None),
+                                onclick: move |_| {
+                                    detail_title.set(None);
+                                    detail_album_id.set(None);
+                                    detail_album_artist.set(None);
+                                },
                                 "Back"
                             }
                         }
@@ -437,6 +481,7 @@ pub fn LibraryPage() -> Element {
                                             let all = list.clone();
                                             let t_star = track.clone();
                                             let t_rate = track.clone();
+                                            let t_share = track.clone();
                                             let t_inspect = track.clone();
                                             let state = if offline_only && !track.is_offline_cached {
                                                 TrackRowState::OfflineUnavailable
@@ -462,6 +507,7 @@ pub fn LibraryPage() -> Element {
                                                     on_play: move |_| player.play_queue(all.clone(), idx),
                                                     on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                     on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                                    on_share: move |_| studio.open_share_track(&t_share),
                                                     on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                                 }
                                             }
@@ -641,12 +687,13 @@ pub fn LibraryPage() -> Element {
                                         {
                                             let aid = alb.id.clone();
                                             let name = alb.name.clone();
+                                            let artist = alb.artist.clone();
                                             rsx! {
                                                 button {
                                                     key: "lib-alb-{alb.id}",
                                                     r#type: "button",
                                                     class: "group rounded-[12px] bg-beet-surface hover:bg-beet-surface-high border border-beet-border-subtle p-3 text-left transition-colors cursor-pointer space-y-2.5",
-                                                    onclick: move |_| load_album.call((aid.clone(), name.clone())),
+                                                    onclick: move |_| load_album.call((aid.clone(), name.clone(), artist.clone())),
                                                     div { class: "aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center relative",
                                                         if let Some(url) = alb.cover_art_url.as_deref() {
                                                             img { src: "{url}", alt: "", class: "w-full h-full object-cover", loading: "lazy" }
@@ -697,6 +744,7 @@ pub fn LibraryPage() -> Element {
                                         let all = starred.clone();
                                         let t_star = track.clone();
                                         let t_rate = track.clone();
+                                        let t_share = track.clone();
                                         let t_inspect = track.clone();
                                         let state = if offline_only && !track.is_offline_cached {
                                             TrackRowState::OfflineUnavailable
@@ -721,6 +769,7 @@ pub fn LibraryPage() -> Element {
                                                 on_play: move |_| player.play_queue(all.clone(), idx),
                                                 on_star: move |next| studio.star_track(auth, player, t_star.clone(), next),
                                                 on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
+                                                on_share: move |_| studio.open_share_track(&t_share),
                                                 on_inspect: move |_| studio.inspect_track(auth, t_inspect.clone()),
                                             }
                                         }

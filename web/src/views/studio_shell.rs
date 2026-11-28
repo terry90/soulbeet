@@ -10,9 +10,9 @@ use shared::system::NavidromeStatus;
 use ui::{
     format_mix_title, friendly_error, use_player, CommandPalette, Downloads, DrawerTab,
     IconLoader, IconPlay, Modal, MultiListenerGuardModal, PaletteCategory, PaletteCommand,
-    SearchPrefill, SearchReset, SidebarPlaylistItem, StatusAction, StatusBanner, StudioMobileNav,
-    StudioNavSection, StudioPlayerBar, StudioRightDrawer, StudioSidebar, StudioTopBar,
-    UndoSnackbar, WhatsNew,
+    SearchPrefill, SearchReset, ShareModal, SidebarPlaylistItem, StatusAction, StatusBanner,
+    StudioMobileNav, StudioNavSection, StudioPlayerBar, StudioRightDrawer, StudioSidebar,
+    StudioTopBar, UndoSnackbar, WhatsNew,
 };
 
 use crate::auth::use_auth;
@@ -122,6 +122,7 @@ fn StudioShellContent() -> Element {
 
     let active_drop = studio.pending_drops.read().active().cloned();
     let current_guard_modal = studio.guard_modal.read().clone();
+    let current_share_modal = studio.share_modal.read().clone();
     let current_manual_modal = studio.manual_choice_modal.read().clone();
     let current_toast = studio.toast_notice.read().clone();
 
@@ -229,6 +230,7 @@ fn StudioShellContent() -> Element {
                     on_drop: move |track| studio.drop_track(auth, player, track),
                     on_rate: move |(track, rating)| studio.rate_track(auth, player, track, rating),
                     on_start_radio: move |track| studio.start_radio(auth, player, track),
+                    on_share: move |track| studio.open_share_track(&track),
                 }
             }
 
@@ -244,6 +246,7 @@ fn StudioShellContent() -> Element {
                 on_star: move |(track, starred)| studio.star_track(auth, player, track, starred),
                 on_rate: move |(track, rating)| studio.rate_track(auth, player, track, rating),
                 on_start_radio: move |track| studio.start_radio(auth, player, track),
+                on_share: move |track| studio.open_share_track(&track),
                 on_claim_active_device: move |_| {
                     studio.send_connect(ConnectClientMessage::ClaimActive);
                 },
@@ -313,6 +316,14 @@ fn StudioShellContent() -> Element {
                     busy: modal_state.busy,
                     on_confirm: move |_| studio.confirm_guard_modal(auth, player),
                     on_cancel: move |_| studio.guard_modal.set(None),
+                }
+            }
+
+            // Track / Album Hardlink Share Modal
+            if let Some(share_target) = current_share_modal {
+                ShareModal {
+                    target: share_target,
+                    on_close: move |_| studio.share_modal.set(None),
                 }
             }
 
@@ -645,7 +656,6 @@ fn ManualSourceChoiceModal(
     on_close: EventHandler<()>,
 ) -> Element {
     let auth = use_auth();
-    let settings = ui::use_settings();
     let mut studio = use_studio();
     let mut queueing = use_signal(|| false);
     let mut err_msg = use_signal(|| None::<String>);
@@ -659,25 +669,10 @@ fn ManualSourceChoiceModal(
     let queue_item = use_callback(move |(item, search_id): (DownloadableItem, String)| {
         queueing.set(true);
         err_msg.set(None);
-        let preferred_folder_id = settings.get().and_then(|s| s.default_download_folder_id);
         let acq_key = acquire_state_key.clone();
         spawn(async move {
-            let target_folder = match auth.call(api::get_user_folders()).await {
-                Ok(folders) => preferred_folder_id
-                    .as_deref()
-                    .and_then(|pref| folders.iter().find(|f| f.id == pref))
-                    .or_else(|| folders.first())
-                    .map(|f| f.path.clone()),
-                Err(_) => None,
-            };
-            let Some(target_folder) = target_folder else {
-                err_msg.set(Some("No download folder configured. Set one in Settings.".to_string()));
-                queueing.set(false);
-                return;
-            };
             let req = api::DownloadRequest {
                 items: vec![item.clone()],
-                target_folder,
                 search_id,
             };
             match auth.call(api::download(req)).await {

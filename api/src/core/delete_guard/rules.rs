@@ -166,14 +166,13 @@ mod tests {
     use shared::failure::FailureCode;
     use std::path::PathBuf;
 
-    fn pf(user: &str, path: &Path, shared: bool) -> PolicyFolder {
+    fn pf(user: &str, path: &Path, _shared: bool) -> PolicyFolder {
         PolicyFolder {
             id: format!("{user}:{}", path.display()),
             user_id: user.to_string(),
             owner_is_admin: false,
             path: Ok(path.to_path_buf()),
             stored_path: path.to_path_buf(),
-            shared,
         }
     }
 

@@ -1133,3 +1133,26 @@ pub fn IconShieldCheck(
         }
     }
 }
+
+#[component]
+pub fn IconShare2(#[props(default = 18)] size: u32, #[props(default)] class: String) -> Element {
+    rsx! {
+        svg {
+            width: "{size}",
+            height: "{size}",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "1.75",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            "aria-hidden": "true",
+            class: "shrink-0 {class}",
+            circle { cx: "18", cy: "5", r: "3" }
+            circle { cx: "6", cy: "12", r: "3" }
+            circle { cx: "18", cy: "19", r: "3" }
+            line { x1: "8.59", x2: "15.42", y1: "13.51", y2: "17.49" }
+            line { x1: "15.41", x2: "8.59", y1: "6.51", y2: "10.49" }
+        }
+    }
+}

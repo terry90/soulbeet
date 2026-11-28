@@ -117,7 +117,6 @@ struct JobRow {
     folder_owner: String,
     folder_name: String,
     folder_path: String,
-    folder_shared: bool,
     batch_id: String,
     origin: String,
     kind: String,
@@ -137,7 +136,7 @@ struct JobRow {
 /// The query of a JobRow, from `jobs j` joined with its user `u`, folder `f` and batch `b`.
 const JOB_SELECT: &str = "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, \
             f.user_id AS folder_owner, f.name AS folder_name, f.path AS folder_path, \
-            f.shared AS folder_shared, j.batch_id, b.origin, j.kind, j.wanted, j.options, \
+            j.batch_id, b.origin, j.kind, j.wanted, j.options, \
             j.state, j.search_id, j.excluded_sources, j.created_at, j.updated_at, \
             j.changed_seq, j.user_seq, j.failure, \
             j.monitor_batch_id IS NOT NULL OR j.request IS NOT NULL AS sent \
@@ -228,7 +227,6 @@ fn job_of(row: JobRow) -> Result<JobRecord, sqlx::Error> {
             user_id: row.folder_owner,
             name: row.folder_name,
             path: row.folder_path,
-            shared: row.folder_shared,
         },
         batch_id: row.batch_id,
         origin: origin_named(&row.origin)?,
@@ -435,7 +433,6 @@ struct UnfinishedRow {
     folder_owner: String,
     folder_name: String,
     folder_path: String,
-    folder_shared: bool,
     wanted: String,
     import_mode: String,
     state: String,
@@ -498,7 +495,7 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
     // created_at has one-second resolution: insertion order breaks its ties.
     let jobs: Vec<UnfinishedRow> = sqlx::query_as(&format!(
         "SELECT j.id, j.user_id, u.username, u.role, j.folder_id, f.user_id AS folder_owner, \
-                f.name AS folder_name, f.path AS folder_path, f.shared AS folder_shared, \
+                f.name AS folder_name, f.path AS folder_path, \
                 j.wanted, j.import_mode, j.state, j.search_id, j.monitor_batch_id, j.batch_label, \
                 j.request, b.origin, j.options, j.excluded_sources, j.cancel_requested \
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN folders f ON f.id = j.folder_id \
@@ -594,7 +591,6 @@ pub async fn unfinished(db: &SqlitePool) -> Result<Unfinished, sqlx::Error> {
                     user_id: row.folder_owner,
                     name: row.folder_name,
                     path: row.folder_path,
-                    shared: row.folder_shared,
                 },
                 search_id: row.search_id,
                 monitor_batch_id: row.monitor_batch_id,

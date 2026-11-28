@@ -891,9 +891,6 @@ pub struct AcquireAndPlayRequest {
     pub release_mbid: Option<String>,
     #[serde(default)]
     pub duration_s: Option<u32>,
-    /// Target folder id; when omitted, uses the user's default download folder (or first owned folder).
-    #[serde(default)]
-    pub folder_id: Option<String>,
     /// Prefer fast secondary backends before falling back to archival P2P (Soulseek).
     #[serde(default = "default_prefer_fast")]
     pub prefer_fast: bool,

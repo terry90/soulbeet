@@ -48,7 +48,6 @@ pub(crate) struct TrackFolderInfo {
     pub folder_id: String,
     pub name: String,
     pub path: String,
-    pub shared: bool,
     pub in_navidrome: Listing,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
@@ -186,7 +185,6 @@ pub(crate) async fn inspect_tracks(
                     folder_id: owned_row.folder.id.clone(),
                     name: cut_json(owned_row.folder.name.clone(), TEXT_MAX_CHARS),
                     path: owned_root.to_string_lossy().into_owned(),
-                    shared: owned_row.folder.shared,
                     in_navidrome: listing(owned_root, &library_roots),
                     owner: Some(cut_json(owned_row.owner.clone(), TEXT_MAX_CHARS)),
                     is_own: Some(is_own),
@@ -202,7 +200,6 @@ pub(crate) async fn inspect_tracks(
                     folder_id: owned_row.folder.id.clone(),
                     name: cut_json(owned_row.folder.name.clone(), TEXT_MAX_CHARS),
                     path: owned_root.to_string_lossy().into_owned(),
-                    shared: owned_row.folder.shared,
                     in_navidrome: listing(owned_root, &library_roots),
                     owner: None,
                     is_own: None,
@@ -336,7 +333,6 @@ pub(crate) async fn inspect_tracks(
         song_facts.folder = folder_info.as_ref().map(|f| FolderRef {
             folder_id: f.folder_id.clone(),
             name: f.name.clone(),
-            shared: f.shared,
             owner: f.owner.clone(),
             is_own: f.is_own,
         });

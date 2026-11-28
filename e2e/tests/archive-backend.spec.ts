@@ -76,7 +76,7 @@ test('a source picked by hand names the archive and links its page', async ({
   context,
   page,
 }) => {
-  const { folder } = await freshSession(context, page, 'archive-pick');
+  await freshSession(context, page, 'archive-pick');
 
   await performSearch(page, driftwoodCodes.title, 'ALBUM');
   const card = page.locator('li').filter({ hasText: driftwoodCodes.title }).first();
@@ -107,7 +107,6 @@ test('a source picked by hand names the archive and links its page', async ({
     await group.getByText(ARCHIVE, { exact: true }).click();
   }
   await selectAll.click();
-  await page.locator('select[name="dl_folder"]').selectOption({ label: folder.name });
   await page.getByRole('button', { name: 'Start download' }).click();
 
   await openDownloadsPanel(page);

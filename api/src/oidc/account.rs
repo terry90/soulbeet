@@ -254,6 +254,7 @@ async fn enter_account(
                         loggable(&user.username)
                     );
                     name_taken_by_account(&user.username);
+                    crate::core::folders::ensure_user_folder_in(db, &user).await;
                     Ok(user)
                 }
                 // Created by a concurrent sign-in or registration meanwhile.

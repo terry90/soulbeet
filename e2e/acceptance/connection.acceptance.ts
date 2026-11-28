@@ -34,7 +34,7 @@ test('a user connects with the MCP SDK, sees every tool with its hints and their
       'dismiss_job',
       'ensure_in_library',
       'fetch_artwork_and_lyrics',
-      'move_tracks',
+      'migrate_legacy_folders',
       'promote_discovery_track',
       'remove_discovery_track',
       'remove_playlist_tracks',

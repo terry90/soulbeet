@@ -604,7 +604,6 @@ mod tests {
             user_id: ctx.user_id.clone(),
             name: "Music".into(),
             path: "/music".into(),
-            shared: false,
         };
         let stub = StubBackend::new(vec![]);
         stub.script_polls(vec![Ok(search_result(
@@ -665,7 +664,6 @@ mod tests {
             user_id: ctx.user_id.clone(),
             name: "Music".into(),
             path: "/music".into(),
-            shared: false,
         };
         let stored = vec![group(
             "peer_a",
@@ -725,7 +723,6 @@ mod tests {
             user_id: ctx.user_id.clone(),
             name: "Music".into(),
             path: dir.path().to_string_lossy().into_owned(),
-            shared: false,
         }
     }
 
@@ -1320,7 +1317,6 @@ mod tests {
             user_id: ctx.user_id.clone(),
             name: "Music".into(),
             path: dir.path().to_string_lossy().into_owned(),
-            shared: false,
         };
         let ledger = Ledger::start(db.clone());
 

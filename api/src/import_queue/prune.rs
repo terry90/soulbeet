@@ -80,8 +80,7 @@ mod tests {
         let lib = Library::new().await;
         let balanced = lib.root.join("music/alice/Discovery/Balanced");
         std::fs::create_dir_all(&balanced).unwrap();
-        // carol's folder is bob's, and alice's carries no other profile folder.
-        lib.folder("carol", "carol-music", "music/bob", false).await;
+        // carol's folder does not exist on disk, and alice's carries no other profile folder.
         lib.folder("carol", "carol-gone", "music/carol", false)
             .await;
         let (queue, stub) = stub_queue();

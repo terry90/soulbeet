@@ -1,4 +1,3 @@
-use api::models::folder::Folder;
 use dioxus::prelude::*;
 use shared::metadata::{Album, Track};
 use std::collections::HashMap;
@@ -25,19 +24,13 @@ pub struct Props {
     pub on_toggle: Callback,
     pub on_search_sources: Callback,
     pub download_state: DownloadRowState,
-    pub folders: Vec<Folder>,
-    pub selected_folder_id: Option<String>,
-    pub active_menu: Signal<Option<String>>,
+    pub has_folder: bool,
     pub tracks: Option<Vec<Track>>,
     pub download_states: Signal<HashMap<String, DownloadRowState>>,
     #[props(into)]
     pub on_download: EventHandler<()>,
     #[props(into)]
-    pub on_override_download: EventHandler<Folder>,
-    #[props(into)]
     pub on_track_download: EventHandler<Track>,
-    #[props(into)]
-    pub on_track_override_download: EventHandler<(Track, Folder)>,
 }
 
 #[component]
@@ -46,7 +39,7 @@ pub fn AlbumResult(props: Props) -> Element {
 
     rsx! {
         div { class: "space-y-0",
-            // Album row (keep overflow visible so DownloadIcon's FolderDropdown is never clipped)
+            // Album row
             div {
                 class: "bg-beet-surface hover:bg-beet-surface-high border transition-colors duration-150 flex items-center gap-3 p-3 group cursor-pointer",
                 class: if props.is_expanded {
@@ -120,13 +113,8 @@ pub fn AlbumResult(props: Props) -> Element {
 
                     // Auto-download button
                     DownloadIcon {
-                        item_id: props.album.id.clone(),
                         state: props.download_state.clone(),
-                        folders: props.folders.clone(),
-                        selected_folder_id: props.selected_folder_id.clone(),
-                        active_menu: props.active_menu,
                         on_download: props.on_download,
-                        on_override_download: props.on_override_download,
                     }
                 }
             }
@@ -141,11 +129,8 @@ pub fn AlbumResult(props: Props) -> Element {
                     InlineTrackPanel {
                         tracks: if props.is_expanded { props.tracks.clone() } else { Some(vec![]) },
                         download_states: props.download_states,
-                        folders: props.folders.clone(),
-                        selected_folder_id: props.selected_folder_id.clone(),
-                        active_menu: props.active_menu,
+                        has_folder: props.has_folder,
                         on_track_download: props.on_track_download,
-                        on_track_override_download: props.on_track_override_download,
                     }
                 }
             }

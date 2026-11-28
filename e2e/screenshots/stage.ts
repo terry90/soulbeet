@@ -11,9 +11,9 @@ import type { Page, Route } from '@playwright/test';
 import { expect } from '@playwright/test';
 import { baseUrl, e2eRoot } from '../helpers/env.js';
 
-/** The folders the account shows, as a typical install mounts them. */
-const LIBRARY = { id: 'shot-library', user_id: 'shot', name: 'Library', path: '/music/library', shared: false };
-const FOLDERS = [LIBRARY, { id: 'shot-shared', user_id: 'shot', name: 'Shared', path: '/music/shared', shared: true }];
+/** The user's single personal library folder, as a typical install mounts it. */
+const LIBRARY = { id: 'shot-library', user_id: 'shot', name: 'Library', path: '/music/library' };
+const FOLDERS = [LIBRARY];
 
 /** The dashboard's library, as Navidrome would count it. */
 const LIBRARY_STATS = {
@@ -101,10 +101,7 @@ export async function stageApp(page: Page): Promise<void> {
   await page.route('**/api/folders', (route) =>
     route.request().method() === 'GET' ? route.fulfill({ json: FOLDERS }) : route.fallback(),
   );
-  // Downloads go to the library, which the search bar shows.
-  await page.route('**/api/settings', (route) =>
-    route.request().method() === 'GET'
-      ? edited(route, (settings) => ({ ...settings, default_download_folder_id: LIBRARY.id }))
-      : route.fallback(),
+  await page.route('**/api/folder', (route) =>
+    route.request().method() === 'GET' ? route.fulfill({ json: LIBRARY }) : route.fallback(),
   );
 }

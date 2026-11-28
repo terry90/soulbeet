@@ -325,9 +325,6 @@
   .top-16 {
     top: calc(var(--spacing) * 16);
   }
-  .top-full {
-    top: 100%;
-  }
   .right-0 {
     right: 0px;
   }
@@ -396,9 +393,6 @@
   }
   .z-50 {
     z-index: 50;
-  }
-  .z-\[60\] {
-    z-index: 60;
   }
   .container {
     width: 100%;
@@ -696,9 +690,6 @@
   .h-\[36px\] {
     height: 36px;
   }
-  .h-\[38px\] {
-    height: 38px;
-  }
   .h-\[40px\] {
     height: 40px;
   }
@@ -719,6 +710,12 @@
   }
   .max-h-48 {
     max-height: calc(var(--spacing) * 48);
+  }
+  .max-h-56 {
+    max-height: calc(var(--spacing) * 56);
+  }
+  .max-h-60 {
+    max-height: calc(var(--spacing) * 60);
   }
   .max-h-72 {
     max-height: calc(var(--spacing) * 72);
@@ -836,9 +833,6 @@
   }
   .w-36 {
     width: calc(var(--spacing) * 36);
-  }
-  .w-56 {
-    width: calc(var(--spacing) * 56);
   }
   .w-72 {
     width: calc(var(--spacing) * 72);
@@ -1115,9 +1109,6 @@
   }
   .gap-\[2px\] {
     gap: 2px;
-  }
-  .gap-\[6px\] {
-    gap: 6px;
   }
   :where(.space-y-0 > :not(:last-child)) {
     --tw-space-y-reverse: 0;
@@ -1593,6 +1584,12 @@
   .bg-beet-accent-surface {
     background-color: var(--color-beet-accent-surface);
   }
+  .bg-beet-accent-surface\/40 {
+    background-color: color-mix(in srgb, rgba(255, 0, 255, 0.12) 40%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-accent-surface) 40%, transparent);
+    }
+  }
   .bg-beet-border-strong {
     background-color: var(--color-beet-border-strong);
   }
@@ -1638,6 +1635,12 @@
       background-color: color-mix(in oklab, var(--color-beet-crimson-surface) 40%, transparent);
     }
   }
+  .bg-beet-crimson-surface\/60 {
+    background-color: color-mix(in srgb, rgba(255, 102, 140, 0.14) 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-crimson-surface) 60%, transparent);
+    }
+  }
   .bg-beet-crimson-surface\/70 {
     background-color: color-mix(in srgb, rgba(255, 102, 140, 0.14) 70%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1652,6 +1655,12 @@
   }
   .bg-beet-gold-surface {
     background-color: var(--color-beet-gold-surface);
+  }
+  .bg-beet-gold-surface\/50 {
+    background-color: color-mix(in srgb, rgba(255, 209, 102, 0.12) 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-gold-surface) 50%, transparent);
+    }
   }
   .bg-beet-gold\/15 {
     background-color: color-mix(in srgb, #ffd166 15%, transparent);
@@ -1697,6 +1706,24 @@
   }
   .bg-beet-leaf-surface {
     background-color: var(--color-beet-leaf-surface);
+  }
+  .bg-beet-leaf-surface\/40 {
+    background-color: color-mix(in srgb, rgba(0, 255, 157, 0.12) 40%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-leaf-surface) 40%, transparent);
+    }
+  }
+  .bg-beet-leaf-surface\/50 {
+    background-color: color-mix(in srgb, rgba(0, 255, 157, 0.12) 50%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-leaf-surface) 50%, transparent);
+    }
+  }
+  .bg-beet-leaf-surface\/60 {
+    background-color: color-mix(in srgb, rgba(0, 255, 157, 0.12) 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      background-color: color-mix(in oklab, var(--color-beet-leaf-surface) 60%, transparent);
+    }
   }
   .bg-beet-leaf-surface\/70 {
     background-color: color-mix(in srgb, rgba(0, 255, 157, 0.12) 70%, transparent);
@@ -1827,6 +1854,9 @@
   .p-0 {
     padding: 0px;
   }
+  .p-0\.5 {
+    padding: calc(var(--spacing) * 0.5);
+  }
   .p-1 {
     padding: var(--spacing);
   }
@@ -1886,9 +1916,6 @@
   }
   .px-6 {
     padding-inline: calc(var(--spacing) * 6);
-  }
-  .px-\[2px\] {
-    padding-inline: 2px;
   }
   .py-0\.5 {
     padding-block: calc(var(--spacing) * 0.5);
@@ -2015,6 +2042,9 @@
   }
   .pl-3\.5 {
     padding-left: calc(var(--spacing) * 3.5);
+  }
+  .pl-4 {
+    padding-left: calc(var(--spacing) * 4);
   }
   .pl-5 {
     padding-left: calc(var(--spacing) * 5);
@@ -2370,12 +2400,6 @@
   }
   .opacity-55 {
     opacity: 55%;
-  }
-  .opacity-60 {
-    opacity: 60%;
-  }
-  .opacity-70 {
-    opacity: 70%;
   }
   .opacity-75 {
     opacity: 75%;
@@ -2745,41 +2769,12 @@
     :is(:where(.group\/art):hover .group-hover\/art\:opacity-100) {
       opacity: 100%;
     }
-    :is(:where(.group\/chip):hover .group-hover\/chip\:border-beet-border-default) {
-      border-color: var(--color-beet-border-default);
-    }
-    :is(:where(.group\/chip):hover .group-hover\/chip\:border-beet-gold\/60) {
-      border-color: color-mix(in srgb, #ffd166 60%, transparent);
-    }
-    @supports (color: color-mix(in lab, red, red)) {
-      :is(:where(.group\/chip):hover .group-hover\/chip\:border-beet-gold\/60) {
-        border-color: color-mix(in oklab, var(--color-beet-gold) 60%, transparent);
-      }
-    }
-    :is(:where(.group\/chip):hover .group-hover\/chip\:bg-beet-surface-highest) {
-      background-color: var(--color-beet-surface-highest);
-    }
-    :is(:where(.group\/chip):hover .group-hover\/chip\:text-beet-text-primary) {
-      color: var(--color-beet-text-primary);
-    }
     :is(:where(.group\/dl):hover .group-hover\/dl\:text-beet-leaf-text) {
       color: var(--color-beet-leaf-text);
     }
     :is(:where(.group\/src):hover .group-hover\/src\:text-beet-text-primary) {
       color: var(--color-beet-text-primary);
     }
-  }
-  :is(:where(.group\/chip):focus-visible .group-focus-visible\/chip\:outline-2) {
-    outline-style: var(--tw-outline-style);
-    outline-width: 2px;
-  }
-  :is(:where(.group\/chip):focus-visible .group-focus-visible\/chip\:outline-offset-1) {
-    outline-offset: 1px;
-  }
-  :is(:where(.group\/chip):focus-visible .group-focus-visible\/chip\:outline-beet-leaf) {
-    outline-color: var(--color-beet-leaf);
-  }
-  @media (hover: hover) {
     :is(:where(.peer):hover ~ .peer-hover\:bg-beet-surface-high) {
       background-color: var(--color-beet-surface-high);
     }
@@ -3061,12 +3056,6 @@
       filter: var(--tw-blur, ) var(--tw-brightness, ) var(--tw-contrast, ) var(--tw-grayscale, ) var(--tw-hue-rotate, ) var(--tw-invert, ) var(--tw-saturate, ) var(--tw-sepia, ) var(--tw-drop-shadow, );
     }
   }
-  .focus\:border-beet-accent:focus {
-    border-color: var(--color-beet-accent);
-  }
-  .focus\:border-beet-border-strong:focus {
-    border-color: var(--color-beet-border-strong);
-  }
   .focus\:border-beet-leaf-solid:focus {
     border-color: var(--color-beet-leaf-solid);
   }
@@ -3092,10 +3081,6 @@
   }
   .focus-visible\:outline-beet-leaf:focus-visible {
     outline-color: var(--color-beet-leaf);
-  }
-  .focus-visible\:outline-none:focus-visible {
-    --tw-outline-style: none;
-    outline-style: none;
   }
   .active\:scale-95:active {
     --tw-scale-x: 95%;
@@ -3158,9 +3143,6 @@
     }
   }
   @media (width < 399px) {
-    .max-\[399px\]\:hidden {
-      display: none;
-    }
     .max-\[399px\]\:px-2 {
       padding-inline: calc(var(--spacing) * 2);
     }

@@ -1075,7 +1075,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO folders (id, user_id, name, path, shared) VALUES ('f-alice', 'alice', 'Alice', ?, 0), ('f-shared', 'alice', 'Shared', ?, 1), ('f-bob', 'bob', 'Bob', '/music/bob', 0)")
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f-alice', 'alice', 'Alice', ?), ('f-bob', 'bob', 'Bob', ?)")
             .bind(alice_dir.to_string_lossy().as_ref())
             .bind(shared_dir.to_string_lossy().as_ref())
             .execute(&db)
@@ -1231,7 +1231,7 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO folders (id, user_id, name, path, shared) VALUES ('f-alice', 'alice', 'Alice', ?, 0)")
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f-alice', 'alice', 'Alice', ?)")
             .bind(alice_dir.to_string_lossy().as_ref())
             .execute(&db)
             .await

@@ -9,13 +9,8 @@ pub use track::TrackResult;
 mod download_icon;
 pub use download_icon::{DownloadIcon, DownloadRowState};
 
-mod download_options_menu;
-
 mod inline_track_panel;
 mod inline_track_row;
-
-mod folder_chip;
-pub use folder_chip::FolderChip;
 
 mod search_bar;
 pub use search_bar::SearchBar;
@@ -315,7 +310,6 @@ pub async fn submit_multi_backend_download(
     auth: Auth,
     choices: &SourceChoices,
     items: Vec<DownloadableItem>,
-    target_folder: String,
 ) -> Result<(), String> {
     let mut by_backend: Vec<(String, Vec<DownloadableItem>)> = Vec::new();
     for item in items {
@@ -333,7 +327,6 @@ pub async fn submit_multi_backend_download(
         match auth
             .call(api::download(api::DownloadRequest {
                 items: batch,
-                target_folder: target_folder.clone(),
                 search_id,
             }))
             .await
@@ -447,11 +440,9 @@ pub fn Search() -> Element {
     // Download state tracking
     let mut download_states = use_signal::<HashMap<String, DownloadRowState>>(HashMap::new);
     let mut batch_to_item = use_signal::<HashMap<String, String>>(HashMap::new);
-    let mut folders = use_signal::<Vec<Folder>>(Vec::new);
-    let mut selected_folder_id = use_signal::<Option<String>>(|| None);
+    let mut user_folder = use_signal::<Option<Folder>>(|| None);
     let mut fallback_toasts = use_signal::<Vec<FallbackToastData>>(Vec::new);
     let mut batch_to_name = use_signal::<HashMap<String, String>>(HashMap::new);
-    let mut active_menu = use_signal::<Option<String>>(|| None);
 
     let mut synced = use_signal(|| false);
 
@@ -471,22 +462,9 @@ pub fn Search() -> Element {
         }
     });
 
-    use_effect(move || {
-        if settings.is_loaded() {
-            if let Some(us) = settings.get() {
-                if us.default_download_folder_id.is_some() {
-                    selected_folder_id.set(us.default_download_folder_id.clone());
-                }
-            }
-        }
-    });
-
     use_future(move || async move {
-        if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
-            if user_folders.len() == 1 {
-                selected_folder_id.set(Some(user_folders[0].id.clone()));
-            }
-            folders.set(user_folders);
+        if let Ok(folder) = auth.call(api::get_user_folder()).await {
+            user_folder.set(folder);
         }
     });
 
@@ -712,7 +690,10 @@ pub fn Search() -> Element {
         return rsx! {};
     }
 
-    let mut start_auto_download = move |item_id: String, query: DownloadQuery, folder: Folder| {
+    let mut start_auto_download = move |item_id: String, query: DownloadQuery| {
+        if user_folder.read().is_none() {
+            return;
+        }
         download_states
             .write()
             .insert(item_id.clone(), DownloadRowState::Searching);
@@ -740,11 +721,7 @@ pub fn Search() -> Element {
 
         spawn(async move {
             let result = auth
-                .call(api::auto_download(api::AutoDownloadRequest {
-                    query,
-                    folder_id: folder.id.clone(),
-                    folder_path: folder.path.clone(),
-                }))
+                .call(api::auto_download(api::AutoDownloadRequest { query }))
                 .await;
 
             match result {
@@ -767,31 +744,7 @@ pub fn Search() -> Element {
     };
 
     let mut handle_auto_download = move |item_id: String, query: DownloadQuery| {
-        let folder_id = selected_folder_id();
-        let folder = folder_id
-            .as_ref()
-            .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
-        let Some(folder) = folder else {
-            return;
-        };
-        start_auto_download(item_id, query, folder);
-    };
-
-    let mut handle_override_download =
-        move |item_id: String, query: DownloadQuery, folder: Folder| {
-            start_auto_download(item_id, query, folder);
-        };
-
-    let handle_folder_change = move |folder: Folder| {
-        selected_folder_id.set(Some(folder.id.clone()));
-        spawn(async move {
-            let _ = settings
-                .update(api::UpdateUserSettings {
-                    default_download_folder_id: Some(folder.id),
-                    ..Default::default()
-                })
-                .await;
-        });
+        start_auto_download(item_id, query);
     };
 
     let mut open_source_picker = move |query: DownloadQuery| {
@@ -904,28 +857,12 @@ pub fn Search() -> Element {
     };
 
     let mut handle_track_download = move |track: Track| {
-        let folder_id = selected_folder_id();
-        let folder = folder_id
-            .as_ref()
-            .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned());
-        let Some(folder) = folder else {
-            return;
-        };
-        start_auto_download(track.id.clone(), DownloadQuery::from(track), folder);
-    };
-
-    let mut handle_track_override_download = move |(track, folder): (Track, Folder)| {
-        start_auto_download(track.id.clone(), DownloadQuery::from(track), folder);
+        start_auto_download(track.id.clone(), DownloadQuery::from(track));
     };
 
     rsx! {
       div {
         class: "w-full max-w-4xl space-y-6 mx-auto",
-        onclick: move |_| {
-            if active_menu().is_some() {
-                active_menu.set(None);
-            }
-        },
 
         if let Some(choices) = download_options.read().clone() {
           if !download_error().is_empty() {
@@ -939,11 +876,11 @@ pub fn Search() -> Element {
             unanswered_note: choices.unanswered_note.clone(),
             is_searching: source_searching(),
             is_downloading,
-            on_download: move |(items, folder)| {
+            on_download: move |items| {
                 let choices_c = choices.clone();
                 spawn(async move {
                     download_error.set(String::new());
-                    if let Err(err) = submit_multi_backend_download(auth, &choices_c, items, folder).await {
+                    if let Err(err) = submit_multi_backend_download(auth, &choices_c, items).await {
                         download_error.set(err);
                     }
                     is_downloading.set(false);
@@ -965,10 +902,6 @@ pub fn Search() -> Element {
               artist_open,
               search_type,
               loading: loading(),
-              folders: folders.read().clone(),
-              selected_folder_id,
-              on_folder_change: handle_folder_change,
-              active_menu,
               on_search: move |_| {
                   spawn(perform_search());
               },
@@ -1024,13 +957,10 @@ pub fn Search() -> Element {
                                     let track_clone = track.clone();
                                     let track_clone_2 = track.clone();
                                     let track_for_dl = track.clone();
-                                    let track_for_override = track.clone();
                                     let track_id = track.id.clone();
                                     let dl_state = download_states.read().get(&track_id).cloned().unwrap_or_default();
-                                    let has_folders = !folders.read().is_empty();
-                                    let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                    let current_folders = folders.read().clone();
-                                    let current_folder_id = selected_folder_id();
+                                    let has_folder = user_folder.read().is_some();
+                                    let effective_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                     rsx! {
                                       li { key: "{track.id}",
                                         TrackResult {
@@ -1047,18 +977,8 @@ pub fn Search() -> Element {
                                           },
                                           track: track.clone(),
                                           download_state: effective_state,
-                                          folders: current_folders,
-                                          selected_folder_id: current_folder_id.clone(),
-                                          active_menu,
                                           on_download: move |_| {
                                               handle_auto_download(track_for_dl.id.clone(), DownloadQuery::from(track_for_dl.clone()));
-                                          },
-                                          on_override_download: move |folder: Folder| {
-                                              handle_override_download(
-                                                  track_for_override.id.clone(),
-                                                  DownloadQuery::from(track_for_override.clone()),
-                                                  folder,
-                                              );
                                           },
                                         }
                                       }
@@ -1067,13 +987,10 @@ pub fn Search() -> Element {
                                 SearchResult::Album(ref album) => {
                                     let album_clone = album.clone();
                                     let album_for_dl = album.clone();
-                                    let album_for_override = album.clone();
                                     let album_id = album.id.clone();
                                     let dl_state = download_states.read().get(&album_id).cloned().unwrap_or_default();
-                                    let has_folders = !folders.read().is_empty();
-                                    let effective_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
-                                    let current_folders = folders.read().clone();
-                                    let current_folder_id = selected_folder_id();
+                                    let has_folder = user_folder.read().is_some();
+                                    let effective_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
 
                                     let is_expanded = expanded_albums.read().contains(&album_id);
                                     let cached = album_cache.read().get(&album_id).cloned();
@@ -1101,24 +1018,15 @@ pub fn Search() -> Element {
                                           },
                                           album: album.clone(),
                                           download_state: effective_state,
-                                          folders: current_folders,
-                                          selected_folder_id: current_folder_id.clone(),
-                                          active_menu,
+                                          has_folder,
                                           on_download: move |_| {
                                               let query = album_query(&album_for_dl);
                                               handle_auto_download(album_for_dl.id.clone(), query);
-                                          },
-                                          on_override_download: move |folder: Folder| {
-                                              let query = album_query(&album_for_override);
-                                              handle_override_download(album_for_override.id.clone(), query, folder);
                                           },
                                           tracks: tracks_for_panel,
                                           download_states,
                                           on_track_download: move |track: Track| {
                                               handle_track_download(track);
-                                          },
-                                          on_track_override_download: move |(track, folder): (Track, Folder)| {
-                                              handle_track_override_download((track, folder));
                                           },
                                         }
                                       }
