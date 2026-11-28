@@ -6,7 +6,7 @@
 
 use client_core::models::NavidromeCredentials;
 use dioxus::prelude::*;
-use ui::{use_player, IconCheck, IconLoader, IconMusic, Logo};
+use ui::{use_player, IconCheck, IconLoader, IconMusic, Logo, SelectOption, StudioSelect};
 
 use crate::desktop_state::{
     login_with_password, normalize_auth_token, use_desktop_studio, verify_desktop_config,
@@ -168,23 +168,31 @@ pub fn SetupView() -> Element {
                                     oninput: move |evt| auth_token.set(evt.value()),
                                 }
                             }
-                            label { class: "block space-y-1",
-                                span { class: "text-[12px] text-beet-text-secondary", "Auth Header" }
-                                select {
-                                    class: "w-full h-10 px-2.5 rounded-[8px] bg-beet-surface-low border border-beet-border-default text-[13px] text-beet-text-primary outline-none",
+                            div { class: "space-y-1",
+                                label {
+                                    r#for: "desktop-setup-auth-kind",
+                                    class: "block text-[12px] text-beet-text-secondary",
+                                    "Auth Header"
+                                }
+                                StudioSelect {
+                                    id: "desktop-setup-auth-kind",
+                                    name: "auth_kind",
+                                    aria_label: "Auth Header",
                                     value: match auth_kind() {
                                         DesktopAuthKind::Bearer => "bearer",
                                         DesktopAuthKind::SessionCookie => "cookie",
                                     },
-                                    onchange: move |evt| {
-                                        auth_kind.set(if evt.value() == "cookie" {
+                                    options: vec![
+                                        SelectOption::new("bearer", "Bearer"),
+                                        SelectOption::new("cookie", "Session Cookie"),
+                                    ],
+                                    on_change: move |val: String| {
+                                        auth_kind.set(if val == "cookie" {
                                             DesktopAuthKind::SessionCookie
                                         } else {
                                             DesktopAuthKind::Bearer
                                         });
                                     },
-                                    option { value: "bearer", "Bearer" }
-                                    option { value: "cookie", "Session Cookie" }
                                 }
                             }
                         }

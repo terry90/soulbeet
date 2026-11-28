@@ -14,7 +14,7 @@ use super::panel::{
 use super::save_setting::{typed_number, SettingSaver};
 use super::toggle::{save_switch, Toggle};
 use crate::auth::use_auth;
-use crate::{friendly_error, IconLibrary, TextInput};
+use crate::{friendly_error, IconLibrary, SelectOption, StudioSelect, TextInput};
 
 /// The numbers typed for the Safe, Mix and Wild profiles as the JSON object the server stores, or
 /// why one of them cannot be saved. `what` names the number in that reason.
@@ -620,15 +620,29 @@ pub fn FolderManager() -> Element {
 
                     if let Some(Some(names)) = lossy_backends.read().as_ref() {
                         div { class: "p-4 bg-beet-surface rounded-[12px] border border-beet-border-subtle",
-                            p { class: "text-sm text-beet-text-primary font-medium", "When only {names} has it" }
+                            label {
+                                r#for: "lossy-fallback-select",
+                                class: "block text-sm text-beet-text-primary font-medium",
+                                "When only {names} has it"
+                            }
                             p { class: "text-xs text-beet-text-tertiary mt-0.5 mb-2.5 leading-relaxed",
                                 "Its files are lossy. Auto-download looks there only when no other source has a match it would take, and never replaces a copy already in your library."
                             }
-                            select {
-                                class: "w-full h-10 px-3 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-leaf-solid/60 focus:outline-none text-beet-text-primary text-sm transition-colors",
+                            StudioSelect {
+                                id: "lossy-fallback-select",
                                 name: "lossy_fallback",
-                                onchange: move |e| {
-                                    let change = LossyFallback::parse(&e.value())
+                                aria_label: format!("When only {names} has it"),
+                                value: lossy_fallback().as_str().to_string(),
+                                options: LossyFallback::ALL
+                                    .into_iter()
+                                    .map(|choice| SelectOption::new(choice.as_str(), lossy_label(choice)))
+                                    .collect(),
+                                on_change: move |val: String| {
+                                    let parsed = LossyFallback::parse(&val);
+                                    if let Some(choice) = parsed {
+                                        lossy_fallback.set(choice);
+                                    }
+                                    let change = parsed
                                         .map(|choice| api::UpdateUserSettings {
                                             lossy_fallback: Some(choice),
                                             ..Default::default()
@@ -636,13 +650,6 @@ pub fn FolderManager() -> Element {
                                         .ok_or_else(|| "Choose one of the three".to_string());
                                     saver.save(change, show_lossy)
                                 },
-                                for choice in LossyFallback::ALL {
-                                    option {
-                                        value: choice.as_str(),
-                                        selected: lossy_fallback() == choice,
-                                        {lossy_label(choice)}
-                                    }
-                                }
                             }
                         }
                     }

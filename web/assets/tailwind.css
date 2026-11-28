@@ -331,6 +331,9 @@
   .top-12 {
     top: calc(var(--spacing) * 12);
   }
+  .top-full {
+    top: 100%;
+  }
   .right-0 {
     right: 0px;
   }
@@ -1013,6 +1016,9 @@
   .rotate-90 {
     rotate: 90deg;
   }
+  .rotate-180 {
+    rotate: 180deg;
+  }
   .transform {
     transform: var(--tw-rotate-x, ) var(--tw-rotate-y, ) var(--tw-rotate-z, ) var(--tw-skew-x, ) var(--tw-skew-y, );
   }
@@ -1542,6 +1548,12 @@
       border-color: color-mix(in oklab, var(--color-beet-leaf-solid) 45%, transparent);
     }
   }
+  .border-beet-leaf-solid\/60 {
+    border-color: color-mix(in srgb, #00e58d 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--color-beet-leaf-solid) 60%, transparent);
+    }
+  }
   .border-beet-leaf\/20 {
     border-color: color-mix(in srgb, #00ff9d 20%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -2027,6 +2039,9 @@
   }
   .pr-2\.5 {
     padding-right: calc(var(--spacing) * 2.5);
+  }
+  .pr-3 {
+    padding-right: calc(var(--spacing) * 3);
   }
   .pr-3\.5 {
     padding-right: calc(var(--spacing) * 3.5);
@@ -3028,6 +3043,14 @@
     .hover\:bg-beet-surface-high:hover {
       background-color: var(--color-beet-surface-high);
     }
+    .hover\:bg-beet-surface-high\/40:hover {
+      background-color: color-mix(in srgb, #26133d 40%, transparent);
+    }
+    @supports (color: color-mix(in lab, red, red)) {
+      .hover\:bg-beet-surface-high\/40:hover {
+        background-color: color-mix(in oklab, var(--color-beet-surface-high) 40%, transparent);
+      }
+    }
     .hover\:bg-beet-surface-high\/60:hover {
       background-color: color-mix(in srgb, #26133d 60%, transparent);
     }
@@ -3147,6 +3170,12 @@
   .focus\:outline-none:focus {
     --tw-outline-style: none;
     outline-style: none;
+  }
+  .focus-visible\:border-beet-leaf-solid\/60:focus-visible {
+    border-color: color-mix(in srgb, #00e58d 60%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      border-color: color-mix(in oklab, var(--color-beet-leaf-solid) 60%, transparent);
+    }
   }
   .focus-visible\:opacity-100:focus-visible {
     opacity: 100%;
@@ -3849,6 +3878,22 @@ html {
     line-height: var(--tw-leading, var(--text-base--line-height));
   }
   color-scheme: dark;
+}
+@layer base {
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    color-scheme: dark;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239e8eb3' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1rem 1rem;
+    padding-right: 2.5rem;
+  }
+  select option {
+    background-color: var(--beet-surface-high);
+    color: var(--beet-text-primary);
+  }
 }
 @media (width < 48rem) {
   input:not([type="checkbox"], [type="radio"]), select, textarea {

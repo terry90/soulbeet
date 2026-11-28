@@ -122,9 +122,11 @@ fn DesktopShell() -> Element {
                     window.removeEventListener("keydown", window.__soulbeetKeyHandler);
                 }
                 window.__soulbeetKeyHandler = (evt) => {
+                    if (evt.defaultPrevented) return;
                     const active = document.activeElement;
                     const tag = active ? active.tagName : "BODY";
                     const role = active ? active.getAttribute("role") : null;
+                    const lowerRole = role ? role.toLowerCase() : "";
                     const editable = !!(active && active.isContentEditable);
                     const dialogOpen = !!document.querySelector('dialog[open], [role="dialog"]:not([inert])');
                     const ctrlOrMeta = !!(evt.ctrlKey || evt.metaKey);
@@ -142,10 +144,19 @@ fn DesktopShell() -> Element {
                     const isEscape = key === "Escape";
                     const isCmdK = ctrlOrMeta && key.toLowerCase() === "k";
                     if (!isEscape && !isCmdK) {
-                        if (dialogOpen || editable || upperTag === "INPUT" || upperTag === "TEXTAREA" || upperTag === "SELECT") {
+                        if (
+                            dialogOpen
+                            || editable
+                            || upperTag === "INPUT"
+                            || upperTag === "TEXTAREA"
+                            || upperTag === "SELECT"
+                            || lowerRole === "combobox"
+                            || lowerRole === "listbox"
+                            || lowerRole === "option"
+                        ) {
                             return;
                         }
-                        if (key === " " && (upperTag === "BUTTON" || upperTag === "A" || (role && role.toLowerCase() === "button"))) {
+                        if (key === " " && (upperTag === "BUTTON" || upperTag === "A" || lowerRole === "button")) {
                             return;
                         }
                     }
