@@ -1445,10 +1445,14 @@ async fn full_and_delta_sync_populates_mirror_normalizes_triage_prunes_playlists
     let preserved = core.sync_now(false).await.unwrap();
     assert!(!preserved.full_sync);
 
-    // Explicit auth rejection (HTTP 401 from bootstrap) clears cached Navidrome credentials.
+    // Explicit auth rejection (HTTP 401 from bootstrap) clears cached Navidrome credentials
+    // and propagates ServerHttp(401) immediately instead of swallowing it as NotConfigured.
     *state.accepted_auth_token.lock().await = "rotated-token".to_string();
     let err = core.sync_now(false).await.unwrap_err();
-    assert!(matches!(err, CoreError::NotConfigured("navidrome credentials")));
+    assert!(
+        matches!(err, CoreError::ServerHttp { status: 401, .. }),
+        "expected ServerHttp(401), got {err:?}"
+    );
 }
 
 #[tokio::test]

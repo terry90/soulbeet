@@ -342,7 +342,7 @@ impl CacheManager {
         part_guard.disarm();
 
         let new_path_str = final_path.display().to_string();
-        match self
+        let entry = match self
             .register_cached_file_locked(
                 track_id,
                 &final_path,
@@ -356,14 +356,18 @@ impl CacheManager {
             )
             .await
         {
-            Ok(entry) => Ok(entry),
+            Ok(entry) => entry,
             Err(err) => {
                 if prev_path.as_deref() != Some(new_path_str.as_str()) {
                     let _ = tokio::fs::remove_file(&final_path).await;
                 }
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+        // Enforce LRU budget strictly after the DB commit-rollback guard so a post-commit
+        // budget error can never unlink the newly committed audio file.
+        self.enforce_budget_locked(Some(track_id)).await?;
+        Ok(entry)
     }
 
     /// Registers a locally written audio file in `offline_downloads` and enforces the LRU budget
@@ -386,18 +390,21 @@ impl CacheManager {
                 .bind(track_id)
                 .fetch_optional(&self.pool)
                 .await?;
-        self.register_cached_file_locked(
-            track_id,
-            local_path,
-            format,
-            bit_rate,
-            size_bytes,
-            pinned,
-            pin_source,
-            accessed_at,
-            prev_path,
-        )
-        .await
+        let entry = self
+            .register_cached_file_locked(
+                track_id,
+                local_path,
+                format,
+                bit_rate,
+                size_bytes,
+                pinned,
+                pin_source,
+                accessed_at,
+                prev_path,
+            )
+            .await?;
+        self.enforce_budget_locked(Some(track_id)).await?;
+        Ok(entry)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -482,7 +489,6 @@ impl CacheManager {
             }
         }
 
-        self.enforce_budget_locked(Some(track_id)).await?;
         Ok(entry)
     }
 

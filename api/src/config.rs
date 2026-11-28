@@ -262,7 +262,7 @@ pub struct AppConfig {
     /// `PUBLIC_URL`, parsed once; `None` when unset or empty
     public_url: Option<Result<BaseUrl, BaseUrlError>>,
     /// Whether to trust `Forwarded` / `X-Forwarded-Proto` / `X-Forwarded-Host` when `PUBLIC_URL`
-    /// is unset (`TRUST_PROXY_HEADERS`, default `false`).
+    /// is unset (`TRUST_PROXY_HEADERS`, default `true`).
     trust_proxy_headers: bool,
     /// `NAVIDROME_URL`; `None` when unset or empty
     navidrome_url: Option<String>,
@@ -347,7 +347,9 @@ impl AppConfig {
             beet_bin,
             beets_python,
             public_url,
-            trust_proxy_headers: parse_bool_env("TRUST_PROXY_HEADERS", false),
+            trust_proxy_headers: parse_trust_proxy_headers(
+                std::env::var("TRUST_PROXY_HEADERS").ok().as_deref(),
+            ),
             navidrome_url,
             navidrome_public_url,
             navidrome_music_path: std::env::var_os("NAVIDROME_MUSIC_PATH")
@@ -505,6 +507,20 @@ fn navidrome_music_path_problem(path: Option<&Path>) -> Option<String> {
 #[cfg(feature = "server")]
 use std::sync::LazyLock;
 
+/// Parse `TRUST_PROXY_HEADERS` (default `true` so zero-config reverse proxies work when
+/// `PUBLIC_URL` is unset; set `TRUST_PROXY_HEADERS=false` to ignore forwarded headers).
+#[cfg(feature = "server")]
+pub(crate) fn parse_trust_proxy_headers(value: Option<&str>) -> bool {
+    parse_bool_setting("TRUST_PROXY_HEADERS", value, true)
+}
+
+/// Whether proxy forwarding headers (`Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`)
+/// are trusted by the running instance (`TRUST_PROXY_HEADERS`, default `true`).
+#[cfg(feature = "server")]
+pub fn trust_proxy_headers() -> bool {
+    CONFIG.trust_proxy_headers()
+}
+
 /// Global application configuration singleton.
 /// Loaded once at startup from environment variables.
 #[cfg(feature = "server")]
@@ -599,6 +615,18 @@ mod tests {
             parse_registration(Some("bogus"), false),
             RegistrationMode::Admin
         );
+    }
+
+    #[test]
+    fn trust_proxy_headers_defaults_true_and_honors_explicit_false() {
+        assert!(parse_trust_proxy_headers(None));
+        assert!(parse_trust_proxy_headers(Some("true")));
+        assert!(parse_trust_proxy_headers(Some("1")));
+        assert!(parse_trust_proxy_headers(Some("bogus")));
+        assert!(!parse_trust_proxy_headers(Some("false")));
+        assert!(!parse_trust_proxy_headers(Some("FALSE")));
+        assert!(!parse_trust_proxy_headers(Some("0")));
+        assert!(!parse_trust_proxy_headers(Some("no")));
     }
 }
 

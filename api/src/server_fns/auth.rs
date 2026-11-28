@@ -69,10 +69,16 @@ impl SessionCookie {
         headers: &HeaderMap,
         uri: &Uri,
     ) -> Result<SessionCookie, ServerFnError> {
-        Self::for_request_with_proxy(headers, uri, CONFIG.public_url(), CONFIG.trust_proxy_headers())
+        Self::for_request_with_proxy(
+            headers,
+            uri,
+            CONFIG.public_url(),
+            crate::config::trust_proxy_headers(),
+        )
     }
 
     /// `for_request` with `public_url`, the parsed `PUBLIC_URL`.
+    #[cfg(test)]
     pub(crate) fn for_request_with(
         headers: &HeaderMap,
         uri: &Uri,
@@ -81,7 +87,7 @@ impl SessionCookie {
         Self::for_request_with_proxy(headers, uri, public_url, true)
     }
 
-    fn for_request_with_proxy(
+    pub(crate) fn for_request_with_proxy(
         headers: &HeaderMap,
         uri: &Uri,
         public_url: Option<&Result<BaseUrl, BaseUrlError>>,
@@ -2330,5 +2336,25 @@ mod tests {
         let uri: Uri = "/api/auth/login".parse().unwrap();
         let cookie = SessionCookie::for_request_with(&headers, &uri, Some(&pin)).unwrap();
         assert!(cookie.secure());
+    }
+
+    #[test]
+    fn session_cookie_respects_trust_proxy_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("192.168.1.5:9765"),
+        );
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-forwarded-proto"),
+            axum::http::HeaderValue::from_static("https"),
+        );
+        let uri: Uri = "/api/auth/login".parse().unwrap();
+
+        let trusted = SessionCookie::for_request_with_proxy(&headers, &uri, None, true).unwrap();
+        assert!(trusted.secure());
+
+        let untrusted = SessionCookie::for_request_with_proxy(&headers, &uri, None, false).unwrap();
+        assert!(!untrusted.secure());
     }
 }

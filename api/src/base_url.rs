@@ -346,6 +346,16 @@ pub fn request_base_with(
     explain_request(headers, uri, public_url).result
 }
 
+/// Like `request_base_with`, gating proxy header trust behind `trust_proxy`.
+pub fn request_base_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+    trust_proxy: bool,
+) -> Result<BaseUrl, BaseUrlError> {
+    explain_request_with_proxy(headers, uri, public_url, trust_proxy).result
+}
+
 /// `request_base_with`, also saying where host and scheme came from. An
 /// unusable `PUBLIC_URL` is the source of both.
 pub fn explain_request(
@@ -377,7 +387,16 @@ pub fn explain_request_with_proxy(
 /// The address the request itself was sent to, from its headers, whatever
 /// `PUBLIC_URL` pins: a page opened at a LAN address talks to that address.
 pub fn addressed_to(headers: &HeaderMap, uri: &Uri) -> Result<BaseUrl, BaseUrlError> {
-    derive_base(headers, authority(uri), None)
+    addressed_to_with_proxy(headers, uri, true)
+}
+
+/// Like `addressed_to`, gating proxy header trust behind `trust_proxy`.
+pub fn addressed_to_with_proxy(
+    headers: &HeaderMap,
+    uri: &Uri,
+    trust_proxy: bool,
+) -> Result<BaseUrl, BaseUrlError> {
+    explain_base_with_proxy(headers, authority(uri), None, trust_proxy).result
 }
 
 fn authority(uri: &Uri) -> Option<&str> {

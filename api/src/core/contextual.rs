@@ -25,7 +25,7 @@ use shared::recommendation::{
     WeatherSnapshot,
 };
 use soulbeet::engine::contextual::MAX_TRACKS_PER_ARTIST;
-use soulbeet::navidrome::models::{NativeSong, SubsonicSong};
+use soulbeet::navidrome::models::{NativeBrowseSong, SubsonicNamedGenre, SubsonicSong};
 use soulbeet::navidrome::{filepath_rules, NavidromeClient, PlaylistMeta, SmartPlaylistChange};
 use soulbeet::{MusicKnowledge, NavidromeError};
 use sqlx::SqlitePool;
@@ -56,20 +56,32 @@ struct CachedLibrarySnapshot {
 static LIBRARY_SNAPSHOT_CACHE: LazyLock<Mutex<HashMap<(String, String), CachedLibrarySnapshot>>> =
     LazyLock::new(Default::default);
 
-fn native_song_to_subsonic(song: NativeSong) -> SubsonicSong {
+fn native_song_to_subsonic(browse: NativeBrowseSong) -> SubsonicSong {
+    let song = browse.song;
+    let genre = (!browse.genre.trim().is_empty()).then_some(browse.genre);
+    let genres = browse
+        .genres
+        .into_iter()
+        .filter(|g| !g.name.trim().is_empty())
+        .map(|g| SubsonicNamedGenre { name: g.name })
+        .collect();
+    let created = browse
+        .created_at
+        .map(|d| d.to_rfc3339())
+        .or_else(|| Some(song.updated_at.to_rfc3339()));
     SubsonicSong {
         id: song.id,
         title: song.title,
         artist: (!song.artist.is_empty()).then_some(song.artist),
         album: (!song.album.is_empty()).then_some(song.album),
         album_id: (!song.album_id.is_empty()).then_some(song.album_id),
-        genre: None,
-        genres: Vec::new(),
+        genre,
+        genres,
         duration: (song.duration > 0.0).then_some(song.duration.round() as u32),
         user_rating: (song.rating > 0).then_some(song.rating),
         play_count: (song.play_count > 0)
             .then_some(u32::try_from(song.play_count).unwrap_or(u32::MAX)),
-        created: Some(song.updated_at.to_rfc3339()),
+        created,
         played: song.play_date.map(|d| d.to_rfc3339()),
         starred: song.starred.then(|| {
             song.starred_at
@@ -87,16 +99,17 @@ fn native_song_to_subsonic(song: NativeSong) -> SubsonicSong {
 }
 
 /// Fetches all present library songs via Navidrome's native API (`GET /api/song`), which always
-/// returns real library-relative paths regardless of `ReportRealPath` and reports DB errors via
-/// HTTP 5xx instead of silent empty Subsonic `search3` responses.
+/// returns real library-relative paths regardless of `ReportRealPath`, carries `genre`/`genres`
+/// and `createdAt`, and reports DB errors via HTTP 5xx instead of silent empty Subsonic `search3`
+/// responses.
 pub(crate) async fn fetch_all_songs_native(
     navi: &NavidromeClient,
 ) -> Result<Vec<SubsonicSong>, NavidromeError> {
-    match navi.all_songs().await {
+    match navi.all_browse_songs(false).await {
         Ok(page) => Ok(page
             .songs
             .into_iter()
-            .filter(|s| !s.missing)
+            .filter(|s| !s.song.missing)
             .map(native_song_to_subsonic)
             .collect()),
         #[cfg(test)]
@@ -5948,5 +5961,150 @@ mod tests {
             stub.asked().iter().filter(|p| p.as_str() == "/api/song").count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn native_api_song_preserves_genres_and_created_at_without_search3_fallback() {
+        let db = test_db::migrated().await;
+        folder_of(&db, "alice").await;
+        let ctx = test_ctx("alice");
+
+        let stub = NavidromeStub::start();
+        let native_body = serde_json::json!([
+            {
+                "id": "nd-recent-jazz",
+                "path": "alice/Bill Evans/Waltz/01.flac",
+                "title": "Waltz for Debby",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2026-12-12T10:00:00Z",
+                "updatedAt": "2020-01-01T00:00:00Z",
+                "artist": "Bill Evans",
+                "album": "Waltz for Debby",
+                "albumArtist": "Bill Evans",
+                "genre": "Jazz",
+                "genres": [
+                    {"id": "g1", "name": "Jazz"},
+                    {"id": "g2", "name": "Late Night Piano"}
+                ],
+                "rating": 5,
+                "duration": 240.0,
+                "starred": true,
+                "playCount": 1
+            },
+            {
+                "id": "nd-old-jazz",
+                "path": "alice/Miles Davis/Blue/01.flac",
+                "title": "So What",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2024-01-10T10:00:00Z",
+                "updatedAt": "2026-12-14T10:00:00Z",
+                "artist": "Miles Davis",
+                "album": "Kind of Blue",
+                "albumArtist": "Miles Davis",
+                "genre": "Jazz",
+                "genres": [{"id": "g1", "name": "Jazz"}],
+                "rating": 5,
+                "duration": 300.0,
+                "starred": true,
+                "playCount": 10
+            },
+            {
+                "id": "nd-recent-metal",
+                "path": "alice/Metal Act/Noise/01.flac",
+                "title": "Heavy Riff",
+                "size": 2000,
+                "libraryId": 1,
+                "libraryPath": "/music",
+                "missing": false,
+                "createdAt": "2026-12-14T12:00:00Z",
+                "updatedAt": "2026-12-14T12:00:00Z",
+                "artist": "Metal Act",
+                "album": "Noise",
+                "albumArtist": "Metal Act",
+                "genre": "Death Metal",
+                "genres": [{"id": "g3", "name": "Death Metal"}],
+                "rating": 5,
+                "duration": 210.0,
+                "starred": true,
+                "playCount": 0
+            }
+        ])
+        .to_string();
+        stub.answer("/api/song", &[&native_body]);
+        stub.header("/api/song", "X-Total-Count", "3");
+
+        // Create a custom mix that requires BOTH multi-genre tag matching AND added_within_days
+        // with NewestAddedFirst sorting.
+        let mix_req = UpsertContextualMixRequest {
+            slug: "recent_piano_jazz".into(),
+            kind: ContextualMixKind::Moment,
+            custom_name: Some("Recent Piano Jazz".into()),
+            custom_description: None,
+            global: false,
+            enabled: Some(true),
+            theme_tags: vec!["late night piano".into(), "jazz".into()],
+            international_queries: vec![],
+            calendar_window: None,
+            hour_window: None,
+            days_of_week: vec![],
+            weather_conditions: vec![],
+            always_surfaced: true,
+            countries: vec![],
+            owned_ratio: 1.0,
+            default_local_ratio: None,
+            exclude_from_core_taste: false,
+            offline_priority: false,
+            target_tracks: 10,
+            sync_to_navidrome: false,
+            selection_rules: Some(MixSelectionRules {
+                added_within_days: Some(30),
+                sort_order: MixSortOrder::NewestAddedFirst,
+                strict_match: true,
+                ..MixSelectionRules::default()
+            }),
+        };
+        upsert_mix_definition_in(&db, &ctx, mix_req).await.unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 12, 15, 19, 0, 0).unwrap();
+        let playlist = resolve_contextual_mix_playlist_in(
+            &db,
+            &StubNavidrome(stub.client()),
+            Some(Path::new("/music")),
+            &ctx,
+            "recent_piano_jazz",
+            true,
+            now,
+        )
+        .await
+        .unwrap();
+
+        // Only nd-recent-jazz matches BOTH genre ("Jazz" / "Late Night Piano") AND createdAt within 30 days.
+        // nd-old-jazz has recent updatedAt (2026-12-14) but old createdAt (2024-01-10) -> must be excluded.
+        // nd-recent-metal has recent createdAt but wrong genre -> must be excluded.
+        assert_eq!(playlist.tracks.len(), 1);
+        assert_eq!(playlist.tracks[0].song_id, "nd-recent-jazz");
+
+        // Verify /api/song was used directly with zero fallback to Subsonic search3.
+        let asked = stub.asked();
+        assert!(asked.iter().any(|p| p == "/api/song"), "asked={asked:?}");
+        assert!(
+            !asked.iter().any(|p| p.contains("search3")),
+            "unexpected search3 fallback: {asked:?}"
+        );
+
+        // Also verify fetch_all_songs_native directly preserves genre, genres, and createdAt.
+        let fetched = fetch_all_songs_native(&stub.client()).await.unwrap();
+        let waltz = fetched.iter().find(|s| s.id == "nd-recent-jazz").unwrap();
+        assert_eq!(waltz.genre.as_deref(), Some("Jazz"));
+        let all_genres: Vec<&str> = waltz.all_genres().collect();
+        assert!(all_genres.contains(&"Jazz"));
+        assert!(all_genres.contains(&"Late Night Piano"));
+        assert_eq!(waltz.created.as_deref(), Some("2026-12-12T10:00:00+00:00"));
     }
 }

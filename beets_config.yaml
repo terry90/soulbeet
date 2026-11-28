@@ -13,9 +13,11 @@ import:
   resume: no
   duplicate_action: remove
 paths:
-  default: $albumartist/$album%aunique{}/%if{$multidisc,Disc $disc/}$track $title
+  comp:true disctotal:2..: Compilations/$album%aunique{}/Disc $disc/$track $title
+  comp: Compilations/$album%aunique{}/$track $title
+  disctotal:2..: $albumartist/$album%aunique{}/Disc $disc/$track $title
+  default: $albumartist/$album%aunique{}/$track $title
   singleton: $albumartist/$album%aunique{}/$title
-  comp: Compilations/$album%aunique{}/%if{$multidisc,Disc $disc/}$track $title
 match:
   strong_rec_thresh: 0.10
   max_rec:

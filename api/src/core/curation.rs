@@ -810,6 +810,7 @@ pub(crate) async fn drop_track_in(
                 )
                 .await
                 .map_err(|e| e.into_failure())?;
+            crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
 
             Ok(CurationResult {
                 song_id: req.song_id.clone(),
@@ -863,6 +864,7 @@ pub(crate) async fn drop_track_in(
                     None
                 }
             };
+            crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
 
             Ok(CurationResult {
                 song_id: req.song_id.clone(),
@@ -923,6 +925,7 @@ async fn drop_pending_discovery(
         None
     };
 
+    crate::core::contextual::invalidate_library_snapshot_cache(&ctx.user_id);
     Ok(dropped_discovery_result(song_id, &track, starred))
 }
 

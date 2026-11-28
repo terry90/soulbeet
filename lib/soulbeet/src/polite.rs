@@ -383,7 +383,9 @@ impl PoliteClient {
                 | RemoteError::RateLimited { .. }
                 | RemoteError::Challenged { .. }),
             ) => {
-                failed.probing = false;
+                if probe_guard.is_some() {
+                    failed.probing = false;
+                }
                 failed.calls = failed.calls.saturating_add(1);
                 failed.last = Some(e.clone());
                 if failed.calls >= FAILED_CALLS_BEFORE_GIVING_UP {

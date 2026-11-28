@@ -12,7 +12,7 @@ use tower_cookies::{
 
 use super::provider::Provider;
 use crate::auth::{SsoError, OIDC_CALLBACK_PATH, OIDC_LOGIN_PATH};
-use crate::base_url::{addressed_to, request_base_with, BaseUrl, BaseUrlError};
+use crate::base_url::{addressed_to_with_proxy, request_base_with_proxy, BaseUrl, BaseUrlError};
 use crate::config::OidcConfig;
 use crate::crypto;
 use crate::secret_key::SecretKey;
@@ -67,6 +67,7 @@ impl Start {
     /// password login's session cookie there. The provider checks the
     /// address against the ones registered there. `moved`: the request is
     /// the move to the pinned address.
+    #[cfg(test)]
     pub(super) fn for_request(
         pin: Option<&BaseUrl>,
         public_url: Option<&Result<BaseUrl, BaseUrlError>>,
@@ -74,14 +75,26 @@ impl Start {
         uri: &Uri,
         moved: bool,
     ) -> Result<Start, String> {
+        Self::for_request_with_proxy(pin, public_url, headers, uri, moved, true)
+    }
+
+    pub(super) fn for_request_with_proxy(
+        pin: Option<&BaseUrl>,
+        public_url: Option<&Result<BaseUrl, BaseUrlError>>,
+        headers: &HeaderMap,
+        uri: &Uri,
+        moved: bool,
+        trust_proxy: bool,
+    ) -> Result<Start, String> {
         // The pin is this sign-in's address, as PUBLIC_URL is a password
         // login's: the move to it is a GET, which carries no Origin to tell
         // plain http, so the pin's own scheme must decide.
         let pin = pin.map(|pin| Ok(pin.clone()));
         let address = pin.as_ref().or(public_url);
         let session =
-            SessionCookie::for_request_with(headers, uri, address).map_err(|e| e.to_string())?;
-        let base = request_base_with(headers, uri, address)
+            SessionCookie::for_request_with_proxy(headers, uri, address, trust_proxy)
+                .map_err(|e| e.to_string())?;
+        let base = request_base_with_proxy(headers, uri, address, trust_proxy)
             .map_err(|e| format!("cannot tell this request's address: {e}"))?;
         let callback = match address {
             None if !session.secure() => base.on_http(),
@@ -97,7 +110,7 @@ impl Start {
                 .ok()
                 .and_then(|origin| BaseUrl::parse(origin).ok()),
             None if moved => None,
-            None => addressed_to(headers, uri).ok(),
+            None => addressed_to_with_proxy(headers, uri, trust_proxy).ok(),
         };
         let elsewhere =
             address.is_some() && browser.is_some_and(|browser| !browser.same_host(&callback));
@@ -714,5 +727,23 @@ mod tests {
         assert!(!set_cookies.iter().any(|c| c.starts_with(&first_cookie.0)));
         let (taken, _) = callback(Some(&first.state), &[first_cookie]).await;
         assert!(taken.is_ok_and(|flow| flow.state == first.state));
+    }
+
+    #[test]
+    fn start_respects_trust_proxy_false() {
+        let h = headers(&[
+            ("host", "192.168.1.5:9765"),
+            ("x-forwarded-host", "spoof.example.com"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        let uri = Uri::from_static(OIDC_LOGIN_PATH);
+
+        let trusted = Start::for_request_with_proxy(None, None, &h, &uri, false, true).unwrap();
+        assert_eq!(trusted.callback.to_string(), "https://spoof.example.com");
+        assert!(trusted.session.secure());
+
+        let strict = Start::for_request_with_proxy(None, None, &h, &uri, false, false).unwrap();
+        assert_eq!(strict.callback.to_string(), "http://192.168.1.5:9765");
+        assert!(!strict.session.secure());
     }
 }

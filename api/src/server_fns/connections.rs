@@ -7,7 +7,7 @@ use crate::connections::{ConnectedApp, RemoteAccess};
 
 #[cfg(feature = "server")]
 use crate::{
-    base_url::{explain_request, BaseExplanation, BaseUrl, HostSource},
+    base_url::{explain_request_with_proxy, BaseExplanation, BaseUrl, HostSource},
     config::CONFIG,
     connection::log::{base_and_problem, LIVE_LOG},
     connection::GATE_CLOSED,
@@ -64,7 +64,12 @@ pub async fn revoke_connected_app(grant_id: String) -> Result<(), ServerFnError>
 /// connection requests.
 #[post("/api/remote-access", _: AdminSession, headers: HeaderMap, uri: Uri)]
 pub async fn get_remote_access(browser_origin: String) -> Result<RemoteAccess, ServerFnError> {
-    let explained = explain_request(&headers, &uri, CONFIG.public_url());
+    let explained = explain_request_with_proxy(
+        &headers,
+        &uri,
+        CONFIG.public_url(),
+        crate::config::trust_proxy_headers(),
+    );
     let closed = closed_because(
         CONFIG.mcp_off(),
         !crate::security::gate_reasons().is_empty(),
