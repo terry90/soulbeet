@@ -19,6 +19,7 @@ pub(crate) struct Seen {
     pub content_type: Option<String>,
     pub user_agent: Option<String>,
     pub authorization: Option<String>,
+    pub x_nd_authorization: Option<String>,
     /// The `Range` header, for `serve_file`.
     pub range: Option<String>,
     pub if_range: Option<String>,
@@ -115,6 +116,7 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
     let mut content_type = None;
     let mut user_agent = None;
     let mut authorization = None;
+    let mut x_nd_authorization = None;
     let mut range = None;
     let mut if_range = None;
     let mut content_length = 0;
@@ -137,6 +139,8 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
             user_agent = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("authorization") {
             authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("x-nd-authorization") {
+            x_nd_authorization = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("range") {
             range = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("if-range") {
@@ -152,6 +156,7 @@ fn read_request(reader: &mut impl BufRead) -> Seen {
         content_type,
         user_agent,
         authorization,
+        x_nd_authorization,
         range,
         if_range,
         body: String::from_utf8(body).unwrap(),

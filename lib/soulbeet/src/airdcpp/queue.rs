@@ -398,7 +398,7 @@ impl Engine {
                 self.remove_bundle(&link.sidecar, bundle_id).await?;
             }
             self.book.forget(BACKEND_ID, &entry.key).await?;
-            self.state.lock().unwrap().watches.remove(&bundle_id);
+            self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&bundle_id);
             return Ok(());
         }
         if ended || bundle.as_ref().is_some_and(finished) {
@@ -416,7 +416,7 @@ impl Engine {
                 .set_data(BACKEND_ID, &entry.key, &cancelled.value())
                 .await?;
         }
-        self.state.lock().unwrap().watches.remove(&bundle_id);
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watches.remove(&bundle_id);
         Ok(())
     }
 }

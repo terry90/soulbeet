@@ -222,12 +222,12 @@ impl Heard {
     }
 
     fn set(&self, heard: Answer) {
-        *self.0.lock().unwrap() = Some((Instant::now(), heard));
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), heard));
     }
 
     /// What archive.org said less than `age` ago; None when it said nothing as recent.
     pub(crate) fn within(&self, age: Duration) -> Option<Answer> {
-        (self.0.lock().unwrap().as_ref())
+        (self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref())
             .filter(|(at, _)| at.elapsed() < age)
             .map(|(_, heard)| heard.clone())
     }

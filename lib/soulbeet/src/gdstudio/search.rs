@@ -46,7 +46,7 @@ struct Run {
 
 impl Run {
     fn ended_at(&self) -> Option<Instant> {
-        match self.progress.lock().unwrap().phase {
+        match self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).phase {
             Phase::Running => None,
             Phase::Ended(at, _) | Phase::Failed(at, _) => Some(at),
         }
@@ -83,7 +83,7 @@ impl Searches {
             stop,
         });
         {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.insert(id.clone(), run.clone());
         }
@@ -103,7 +103,7 @@ impl Searches {
         };
         tokio::spawn(async move {
             let ended = task.run().await;
-            let mut progress = run.progress.lock().unwrap();
+            let mut progress = run.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             progress.groups = ended.groups;
             // Stable: equal groups keep the order NetEase listed them in.
             progress.groups.sort_by(|a, b| {
@@ -123,14 +123,14 @@ impl Searches {
     /// In progress with no groups while the search runs; once it ended, what it found.
     pub(crate) fn poll(&self, search_id: &str) -> Result<SearchResult, GdError> {
         let run = {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.get(search_id).cloned()
         };
         let run = run.ok_or_else(|| GdError::UnknownSearch {
             search_id: search_id.to_string(),
         })?;
-        let progress = run.progress.lock().unwrap();
+        let progress = run.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, groups, stats) = match &progress.phase {
             Phase::Running => (SearchState::InProgress, vec![], SearchStats::default()),
             Phase::Ended(_, state) => (
@@ -152,13 +152,13 @@ impl Searches {
     /// Ends a search at its next wait; its poll then reads what it resolved. One the backend
     /// does not run is no error.
     pub(crate) fn stop(&self, search_id: &str) {
-        if let Some(run) = self.runs.lock().unwrap().get(search_id) {
+        if let Some(run) = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(search_id) {
             run.stop.send_replace(true);
         }
     }
 
     pub(crate) fn stop_all(&self) {
-        for run in self.runs.lock().unwrap().values() {
+        for run in self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
             run.stop.send_replace(true);
         }
     }

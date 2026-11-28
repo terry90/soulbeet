@@ -127,7 +127,10 @@ impl Engine {
     }
 
     fn generation(&self) -> u64 {
-        self.state.lock().unwrap().generation
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
     }
 
     fn current(&self, generation: u64) -> Result<(), AirdcppError> {
@@ -141,7 +144,10 @@ impl Engine {
     /// unfinished bundle the book holds, forgetting its entry. Finished bundles and their
     /// entries stay. Entries whose bundle cannot be read now stay too, for the next stop.
     pub async fn stop(&self, sidecar: Option<&Sidecar>) {
-        self.state.lock().unwrap().generation += 1;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation += 1;
         self.searches.stop_all();
         // A download call in flight sees the new generation at its next file and returns.
         let _queueing = self.queueing.write().await;
@@ -210,11 +216,19 @@ impl Link {
 
     /// The sidecar's settings, as last read, else read now.
     pub(crate) async fn settings(&self) -> Result<SidecarSettings, AirdcppError> {
-        if let Some(settings) = self.settings.lock().unwrap().clone() {
+        if let Some(settings) = self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
             return Ok(settings);
         }
         let read = health::read_settings(&self.sidecar).await?;
-        *self.settings.lock().unwrap() = Some(read.clone());
+        *self
+            .settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read.clone());
         Ok(read)
     }
 }

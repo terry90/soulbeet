@@ -274,7 +274,7 @@ impl Queue {
         generation: u64,
         f: impl FnOnce() -> Result<T, YtDlpError>,
     ) -> Result<T, YtDlpError> {
-        let _state = self.state.lock().unwrap();
+        let _state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.generation() != generation {
             return Err(YtDlpError::TurnedOff);
         }
@@ -283,7 +283,7 @@ impl Queue {
 
     /// How many transfers wait now.
     pub(crate) fn waiting(&self) -> u64 {
-        self.state.lock().unwrap().queued().count() as u64
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queued().count() as u64
     }
 
     /// The worker: starts one queued transfer at a time, when the pace allows, and fails what
@@ -294,7 +294,7 @@ impl Queue {
                 self.fail_queued(&ended::paused(pause));
             }
             let wait = {
-                let state = self.state.lock().unwrap();
+                let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let waiting = state.queued().next().is_some();
                 waiting.then(|| state.pacer.wait(Instant::now(), self.pace.per_hour))
             };
@@ -324,7 +324,7 @@ impl Queue {
     }
 
     fn running(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .records
             .values()
@@ -333,7 +333,7 @@ impl Queue {
 
     /// Starts the next queued transfer: whether one started.
     fn start_next(self: &Arc<Self>) -> bool {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = &mut *guard;
         let Some(id) = state.next() else {
             return false;
@@ -352,7 +352,7 @@ impl Queue {
 
     /// Fails every queued transfer with `failure`.
     fn fail_queued(&self, failure: &Failure) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for record in state.records.values_mut() {
             if record.phase == Phase::Queued {
                 record.phase = Phase::Failed(failure.clone());
@@ -371,7 +371,7 @@ impl Queue {
         request: &str,
         owner: &str,
     ) -> Result<Vec<QueuedDownload>, YtDlpError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.generation() != generation {
             return Err(YtDlpError::TurnedOff);
         }
@@ -457,7 +457,7 @@ impl Queue {
 
     /// The transfers from any of `sources`.
     pub(crate) fn listed(&self, sources: &[String]) -> Vec<DownloadProgress> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.prune();
         (state.records.values())
             .filter(|r| sources.contains(&r.source))
@@ -466,13 +466,13 @@ impl Queue {
     }
 
     pub(crate) fn one(&self, source: &str, id: &str) -> Option<DownloadProgress> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = state.records.get(id).filter(|r| r.source == source)?;
         Some(progress(&state, record))
     }
 
     pub(crate) fn queue_position(&self, source: &str, id: &str) -> Option<u32> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = state.records.get(id).filter(|r| r.source == source)?;
         Some(match record.phase {
             Phase::Queued => state.place(record),
@@ -485,7 +485,7 @@ impl Queue {
     /// never touched.
     pub(crate) async fn cancel(&self, source: &str, id: &str, remove: bool) {
         let task = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(record) = state.records.get_mut(id).filter(|r| r.source == source) else {
                 return;
             };
@@ -499,7 +499,7 @@ impl Queue {
             let _ = task.await;
         }
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if remove {
                 state.records.remove(id);
             } else if let Some(record) = state.records.get_mut(id) {
@@ -517,7 +517,7 @@ impl Queue {
     /// deletes the staging folders and forgets the transfers. Ended transfers stay.
     pub(crate) async fn stop(&self) {
         let tasks: Vec<(String, Option<JoinHandle<()>>)> = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             self.generation.send_modify(|g| *g += 1);
             (state.records.values_mut())
                 .filter(|r| !r.phase.ended())
@@ -533,7 +533,7 @@ impl Queue {
                 let _ = task.await;
             }
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // One that ended just before it was stopped stays.
                 if state.records.get(&id).is_some_and(|r| !r.phase.ended()) {
                     state.records.remove(&id);
@@ -553,7 +553,7 @@ impl Queue {
     }
 
     fn job(&self, id: &str) -> Option<Job> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let r = state.records.get(id)?;
         Some(Job {
             id: r.id.clone(),
@@ -564,7 +564,7 @@ impl Queue {
     }
 
     fn set_progress(&self, id: &str, progress: Progress) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             record.transferred = progress.downloaded;
             if let Some(total) = progress.total {
@@ -575,13 +575,13 @@ impl Queue {
     }
 
     fn count_attempt(&self, id: &str) {
-        if let Some(record) = self.state.lock().unwrap().records.get_mut(id) {
+        if let Some(record) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get_mut(id) {
             record.attempts += 1;
         }
     }
 
     fn end(&self, id: &str, outcome: Result<PathBuf, Failure>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             record.phase = match outcome {
                 Ok(_) => {
@@ -596,7 +596,53 @@ impl Queue {
     }
 
     /// One transfer's task: fetch, land, then end it as it went.
+    /// Uses an RAII drop guard so worker wakeup and Running->Failed cleanup
+    /// always execute even on early return or panic.
     async fn run(self: Arc<Self>, id: String) {
+        struct RunGuard {
+            queue: Arc<Queue>,
+            id: String,
+            finished: bool,
+        }
+
+        impl Drop for RunGuard {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let panicked_running = {
+                        let mut state = self
+                            .queue
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(record) = state.records.get_mut(&self.id) {
+                            if record.phase == Phase::Running {
+                                record.phase = Phase::Failed(ended::helper(&Fault::new(
+                                    Kind::Internal,
+                                    "YouTube Music transfer task exited unexpectedly",
+                                )));
+                                record.ended_at = Some(Instant::now());
+                                record.task = None;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if panicked_running {
+                        self.queue.remove_staging(&self.id);
+                    }
+                    self.queue.ended.notify_one();
+                }
+            }
+        }
+
+        let mut guard = RunGuard {
+            queue: Arc::clone(&self),
+            id: id.clone(),
+            finished: false,
+        };
         let Some(job) = self.job(&id) else {
             return;
         };
@@ -614,6 +660,7 @@ impl Queue {
         }
         self.end(&id, outcome);
         self.remove_staging(&id);
+        guard.finished = true;
         self.ended.notify_one();
     }
 

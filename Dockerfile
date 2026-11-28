@@ -26,11 +26,11 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY api/Cargo.toml api/
 COPY desktop/Cargo.toml desktop/
-COPY mobile/Cargo.toml mobile/
 COPY ui/Cargo.toml ui/
 COPY web/Cargo.toml web/
 COPY lib/shared/Cargo.toml lib/shared/
 COPY lib/soulbeet/Cargo.toml lib/soulbeet/
+COPY lib/client-core/Cargo.toml lib/client-core/
 
 # Copy source code
 COPY . .

@@ -214,12 +214,12 @@ type Answer = Result<(), RemoteError>;
 
 impl Heard {
     fn set(&self, answer: Answer) {
-        *self.0.lock().unwrap() = Some((Instant::now(), answer));
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), answer));
     }
 
     /// What it said less than `age` ago.
     pub(crate) fn within(&self, age: Duration) -> Option<Answer> {
-        (self.0.lock().unwrap().as_ref())
+        (self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref())
             .filter(|(at, _)| at.elapsed() < age)
             .map(|(_, answer)| answer.clone())
     }
@@ -362,7 +362,7 @@ impl Api {
 
     /// The URL last named for `track_id`, while it may still be used.
     pub(crate) fn fresh(&self, track_id: &str) -> Option<Located> {
-        let located = self.located.lock().unwrap();
+        let located = self.located.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (located.get(track_id))
             .filter(|l| l.issued.elapsed() < self.reuse)
             .cloned()
@@ -383,7 +383,7 @@ impl Api {
         }
         Ok(match Located::of(answer, self.test_host()) {
             Ok(located) => {
-                let mut kept = self.located.lock().unwrap();
+                let mut kept = self.located.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 kept.retain(|_, l| l.issued.elapsed() < self.reuse);
                 kept.insert(track_id.to_string(), located.clone());
                 Resolved::Located(located)

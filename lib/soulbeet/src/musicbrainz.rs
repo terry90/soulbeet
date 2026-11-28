@@ -69,6 +69,7 @@ fn new_client(host: Option<&str>) -> MusicBrainzClient {
         .user_agent(format!(
             "Soulbeet/{version} ( https://github.com/terry90/soulbeet )"
         ))
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         // As MusicBrainzClient::new sets it (hyperium/hyper#2136).
         .pool_max_idle_per_host(0)

@@ -42,7 +42,7 @@ impl Run {
     }
 
     fn add(&self, group: DownloadableGroup) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.groups.push(group);
         // Stable: equal groups keep the order their items were read in.
         progress.groups.sort_by(|a, b| {
@@ -53,7 +53,7 @@ impl Run {
     }
 
     fn end(&self, stats: SearchStats, failed: Option<RemoteError>) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.stats = stats;
         progress.phase = match failed {
             Some(e) => Phase::Failed(Instant::now(), e),
@@ -62,7 +62,7 @@ impl Run {
     }
 
     fn ended_at(&self) -> Option<Instant> {
-        match self.progress.lock().unwrap().phase {
+        match self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).phase {
             Phase::Running => None,
             Phase::Ended(at) | Phase::Failed(at, _) => Some(at),
         }
@@ -94,7 +94,7 @@ impl Searches {
             stop: AtomicBool::new(false),
         });
         {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.insert(id.clone(), run.clone());
         }
@@ -108,14 +108,14 @@ impl Searches {
 
     pub(crate) fn poll(&self, search_id: &str) -> Result<SearchResult, ArchiveError> {
         let run = {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.get(search_id).cloned()
         };
         let run = run.ok_or_else(|| ArchiveError::UnknownSearch {
             search_id: search_id.to_string(),
         })?;
-        let progress = run.progress.lock().unwrap();
+        let progress = run.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, stats) = match &progress.phase {
             Phase::Running => (SearchState::InProgress, SearchStats::default()),
             Phase::Ended(_) => (SearchState::Completed, progress.stats.clone()),
@@ -132,13 +132,13 @@ impl Searches {
 
     /// Stops a search before its next request; one the backend does not run is no error.
     pub(crate) fn stop(&self, search_id: &str) {
-        if let Some(run) = self.runs.lock().unwrap().get(search_id) {
+        if let Some(run) = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(search_id) {
             run.stop.store(true, Ordering::SeqCst);
         }
     }
 
     pub(crate) fn stop_all(&self) {
-        for run in self.runs.lock().unwrap().values() {
+        for run in self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
             run.stop.store(true, Ordering::SeqCst);
         }
     }

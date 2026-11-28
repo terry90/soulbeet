@@ -41,7 +41,7 @@ struct Run {
 
 impl Run {
     fn add(&self, groups: impl IntoIterator<Item = DownloadableGroup>) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         progress.groups.extend(groups);
         // Stable: equal groups keep the order they were found in.
         progress.groups.sort_by(|a, b| {
@@ -52,7 +52,7 @@ impl Run {
     }
 
     fn count(&self, counts: Counts, responses: u32) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = &mut progress.stats;
         stats.response_count += responses;
         stats.file_count += counts.weighed;
@@ -62,7 +62,7 @@ impl Run {
     }
 
     fn asked(&self, query: &str) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if progress.stats.query_text.is_empty() {
             progress.stats.query_text = query.to_string();
         }
@@ -70,7 +70,7 @@ impl Run {
 
     /// Ends the run, unless it ended already.
     fn end(&self, failed: Option<Fault>) {
-        let mut progress = self.progress.lock().unwrap();
+        let mut progress = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(progress.phase, Phase::Running) {
             return;
         }
@@ -84,7 +84,7 @@ impl Run {
     }
 
     fn ended_at(&self) -> Option<Instant> {
-        match self.progress.lock().unwrap().phase {
+        match self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).phase {
             Phase::Running => None,
             Phase::Ended(at) | Phase::Failed(at, _) => Some(at),
         }
@@ -156,7 +156,7 @@ impl Searches {
             task: Mutex::new(None),
         });
         {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.insert(id.clone(), run.clone());
         }
@@ -166,20 +166,20 @@ impl Searches {
             let failed = search(&asker, &wanted, text.as_deref(), keep, queued, &running).await;
             running.end(failed);
         });
-        *run.task.lock().unwrap() = Some(task.abort_handle());
+        *run.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task.abort_handle());
         Ok(id)
     }
 
     pub(crate) fn poll(&self, search_id: &str) -> Result<SearchResult, YtDlpError> {
         let run = {
-            let mut runs = self.runs.lock().unwrap();
+            let mut runs = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::prune(&mut runs);
             runs.get(search_id).cloned()
         };
         let run = run.ok_or_else(|| YtDlpError::UnknownSearch {
             search_id: search_id.to_string(),
         })?;
-        let progress = run.progress.lock().unwrap();
+        let progress = run.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, stats) = match &progress.phase {
             Phase::Running => (SearchState::InProgress, SearchStats::default()),
             Phase::Ended(_) => (SearchState::Completed, progress.stats.clone()),
@@ -197,19 +197,19 @@ impl Searches {
     /// Stops a search: its helper is killed, and it ends with what it found so far. One the
     /// backend does not run is no error.
     pub(crate) fn stop(&self, search_id: &str) {
-        if let Some(run) = self.runs.lock().unwrap().get(search_id) {
+        if let Some(run) = self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(search_id) {
             Self::halt(run);
         }
     }
 
     pub(crate) fn stop_all(&self) {
-        for run in self.runs.lock().unwrap().values() {
+        for run in self.runs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
             Self::halt(run);
         }
     }
 
     fn halt(run: &Run) {
-        if let Some(task) = run.task.lock().unwrap().take() {
+        if let Some(task) = run.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             task.abort();
         }
         run.end(None);

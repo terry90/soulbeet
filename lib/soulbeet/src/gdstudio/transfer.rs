@@ -329,7 +329,7 @@ impl Transfers {
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.state.lock().unwrap().generation
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation
     }
 
     /// Runs `f` while `generation` is the current one, so no stop can come between the check
@@ -339,7 +339,7 @@ impl Transfers {
         generation: u64,
         f: impl FnOnce() -> Result<T, GdError>,
     ) -> Result<T, GdError> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.generation != generation {
             return Err(GdError::TurnedOff);
         }
@@ -356,7 +356,7 @@ impl Transfers {
 
     /// Starts the queued transfers that may start now.
     fn pump(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         while state.running() < self.limits.workers {
             let Some(id) = state.next_to_start() else {
                 break;
@@ -381,7 +381,7 @@ impl Transfers {
     ) -> Result<Vec<QueuedDownload>, GdError> {
         let mut answers = Vec::new();
         {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = &mut *guard;
             if state.generation != generation {
                 return Err(GdError::TurnedOff);
@@ -447,21 +447,21 @@ impl Transfers {
         if !sources.iter().any(|s| s == SOURCE) {
             return vec![];
         }
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.records.values())
             .map(|r| Self::progress(&state, r))
             .collect()
     }
 
     pub(crate) fn one(&self, source: &str, id: &str) -> Option<DownloadProgress> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.records.get(id))
             .filter(|_| source == SOURCE)
             .map(|r| Self::progress(&state, r))
     }
 
     pub(crate) fn queue_position(&self, source: &str, id: &str) -> Option<u32> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let record = state.records.get(id).filter(|_| source == SOURCE)?;
         Some(match record.phase {
             Phase::Queued => state.place(record),
@@ -477,7 +477,11 @@ impl Transfers {
         row.request = Some(r.request.clone());
         row.attempts = r.attempts;
         row.transferred = r.transferred.min(size);
-        row.percent = row.transferred as f64 * 100.0 / size as f64;
+        row.percent = if size == 0 {
+            0.0
+        } else {
+            row.transferred as f64 * 100.0 / size as f64
+        };
         match &r.phase {
             Phase::Queued => row.queue_position = Some(state.place(r)),
             Phase::Running if !r.fetching => row.queue_position = Some(0),
@@ -505,7 +509,7 @@ impl Transfers {
     /// never touched. One this backend does not have is no error.
     pub(crate) async fn cancel(self: &Arc<Self>, source: &str, id: &str, remove: bool) {
         let (task, part) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(record) = state.records.get_mut(id).filter(|_| source == SOURCE) else {
                 return;
             };
@@ -519,7 +523,7 @@ impl Transfers {
             let _ = task.await;
         }
         let cancelled = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let cancelled = (state.records.get(id)).is_some_and(|r| r.phase == Phase::Stopping);
             if remove {
                 state.records.remove(id);
@@ -537,7 +541,7 @@ impl Transfers {
     /// Refuses older handles from now on and marks every unfinished transfer stopping: what
     /// `clear` then stops.
     pub(crate) fn halt(&self) -> Halted {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.generation += 1;
         let halted = (state.records.values_mut())
             .filter(|r| r.unfinished())
@@ -557,7 +561,7 @@ impl Transfers {
                 task.abort();
                 let _ = task.await;
             }
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // One that ended just before it was stopped stays.
             if state.records.get(&id).is_some_and(Record::unfinished) {
                 state.records.remove(&id);
@@ -576,7 +580,7 @@ impl Transfers {
     }
 
     fn end(&self, id: &str, outcome: Outcome) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             if outcome == Outcome::Completed {
                 record.transferred = record.track.size;
@@ -588,7 +592,7 @@ impl Transfers {
     }
 
     fn job(&self, id: &str) -> Option<Job> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let r = state.records.get(id)?;
         Some(Job {
             id: r.id.clone(),
@@ -599,7 +603,58 @@ impl Transfers {
     }
 
     /// One transfer's task: fetch, then end it as it went.
+    /// Uses an RAII drop guard so worker slots are always released and `pump()`
+    /// runs even on early return or panic.
     async fn run(self: Arc<Self>, id: String) {
+        struct RunGuard {
+            transfers: Arc<Transfers>,
+            id: String,
+            finished: bool,
+        }
+
+        impl Drop for RunGuard {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let part = {
+                        let mut state = self
+                            .transfers
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(record) = state.records.get_mut(&self.id) {
+                            if record.phase == Phase::Running {
+                                let part = record.part();
+                                record.phase = Phase::Ended(
+                                    Outcome::Failed(ended::connection(
+                                        "GD Studio transfer task exited unexpectedly",
+                                    )),
+                                    Instant::now(),
+                                );
+                                record.task = None;
+                                record.fetching = false;
+                                Some(part)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(part) = part {
+                        self.transfers.remove_part(&part);
+                    }
+                    if tokio::runtime::Handle::try_current().is_ok() {
+                        self.transfers.pump();
+                    }
+                }
+            }
+        }
+
+        let mut guard = RunGuard {
+            transfers: Arc::clone(&self),
+            id: id.clone(),
+            finished: false,
+        };
         let Some(job) = self.job(&id) else {
             return;
         };
@@ -623,11 +678,12 @@ impl Transfers {
                 self.end(&id, Outcome::Failed(failure));
             }
         }
+        guard.finished = true;
         self.pump();
     }
 
     fn set_progress(&self, id: &str, transferred: u64, fetching: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = state.records.get_mut(id) {
             record.transferred = transferred;
             record.fetching = fetching;
@@ -636,7 +692,7 @@ impl Transfers {
     }
 
     fn count_attempt(&self, id: &str) {
-        if let Some(record) = self.state.lock().unwrap().records.get_mut(id) {
+        if let Some(record) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).records.get_mut(id) {
             record.attempts += 1;
         }
     }
@@ -1687,5 +1743,20 @@ pub(crate) mod tests {
         // Even again, the earliest goes first.
         assert_eq!(state.next_to_start().as_deref(), Some("a2"));
         assert_eq!(state.place(&state.records["a3"]), 2);
+    }
+
+    #[test]
+    fn progress_with_zero_size_does_not_produce_nan() {
+        let state = State::default();
+        let mut r = record("z1", "alice", Phase::Running, 0);
+        r.track.size = 0;
+        r.transferred = 0;
+        r.fetching = true;
+        let row = Transfers::progress(&state, &r);
+        assert!(!row.percent.is_nan(), "percent must not be NaN");
+        assert_eq!(row.percent, 0.0);
+        let json = serde_json::to_string(&row).unwrap();
+        let round_trip: DownloadProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip.percent, 0.0);
     }
 }
