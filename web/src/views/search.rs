@@ -23,12 +23,12 @@ use shared::search_norm::{
 };
 use ui::{
     format_mix_title, friendly_error, run_multi_backend_source_search,
-    submit_multi_backend_download, use_player, AcquireStageBadge, AutoDownloadSignal,
-    DirectSearchEscape, DownloadIcon, DownloadResults, DownloadRowState, FallbackToast,
-    FallbackToastData, IconChevronLeft, IconDisc3, IconDownload, IconLoader, IconMoreHorizontal,
-    IconMusic, IconPlay, IconRefreshCw, IconSearch, IconSlidersHorizontal, IconSparkles,
-    IconWifiOff, IconX, PlayerTrack, SearchPrefill, SearchReset, SourceChoices, TrackRow,
-    TrackRowState,
+    submit_multi_backend_download, use_player, AcquireStageBadge, ArtFallbackKind,
+    AutoDownloadSignal, CoverImage, DirectSearchEscape, DownloadIcon, DownloadResults,
+    DownloadRowState, FallbackToast, FallbackToastData, IconChevronLeft, IconDisc3, IconDownload,
+    IconLoader, IconMoreHorizontal, IconMusic, IconPlay, IconRefreshCw, IconSearch,
+    IconSlidersHorizontal, IconSparkles, IconWifiOff, IconX, PlayerTrack, SearchPrefill,
+    SearchReset, SourceChoices, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -2041,10 +2041,11 @@ pub fn SearchPage() -> Element {
                                                                     }
                                                                 },
                                                                 div { class: "relative aspect-square rounded-[8px] overflow-hidden bg-beet-surface-low flex items-center justify-center",
-                                                                    if let Some(url) = alb.cover_art_url.as_deref() {
-                                                                        img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
-                                                                    } else {
-                                                                        IconDisc3 { size: 24, class: "text-beet-text-disabled".to_string() }
+                                                                    CoverImage {
+                                                                        src: alb.cover_art_url.clone(),
+                                                                        alt: alb.name.clone(),
+                                                                        kind: ArtFallbackKind::Album,
+                                                                        icon_size: 24,
                                                                     }
                                                                     button {
                                                                         r#type: "button",

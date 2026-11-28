@@ -3,6 +3,7 @@
 //! Designed to be shared identically between `web` (`dioxus-web`) and `desktop` (`dioxus-desktop`).
 
 pub mod command_palette;
+pub mod cover_image;
 pub mod i18n;
 pub mod lyrics;
 pub mod player_bar;
@@ -15,10 +16,11 @@ pub use command_palette::{
     filter_palette_commands, should_ignore_shortcut_target, CommandPalette, PaletteCategory,
     PaletteCommand,
 };
+pub use cover_image::{ArtFallbackKind, CoverImage, PlaylistArtwork};
 pub use i18n::{
     discovery_days_remaining, format_candidate_reason, format_mix_subtitle, format_mix_title,
     format_mix_window_badge, percent_encode_param, subsonic_cover_art_url, subsonic_rest_url,
-    subsonic_stream_url,
+    subsonic_stream_url, web_cover_art_url,
 };
 pub use lyrics::{
     find_active_lyric_line, normalize_track_lyrics, parse_lrc_lines, LyricsPanel,

@@ -14,6 +14,7 @@ import org.soulbeet.core.FfiAutoBrowseNode
 import org.soulbeet.core.FfiAutoNodeKind
 import org.soulbeet.core.FfiTrack
 import org.soulbeet.corebindings.CoreClient
+import java.io.File
 
 /**
  * Parsed contextual track reference (`ctx:<parentId>|track:<trackId>`) allowing Android Auto
@@ -208,6 +209,7 @@ object AutoBrowseTree {
         trackDetails: FfiTrack? = null,
         parentBrowseId: String? = null,
         packageName: String? = null,
+        isArtCached: Boolean = false,
     ): MediaItem {
         if (node.kind == FfiAutoNodeKind.TAB) {
             return mapRootTabs(listOf(node), artAuthority, packageName).first()
@@ -282,6 +284,7 @@ object AutoBrowseTree {
             effectiveCoverArtId = effectiveCoverArtId,
             artAuthority = artAuthority,
             packageName = packageName,
+            isArtCached = isArtCached,
         )
 
         val metadataBuilder = MediaMetadata.Builder()
@@ -320,6 +323,7 @@ object AutoBrowseTree {
         isOfflineCached: Boolean = false,
         mediaUri: Uri? = null,
         sourceLabel: String? = null,
+        isArtCached: Boolean = false,
     ): MediaItem {
         val extras = Bundle().apply {
             putBoolean(EXTRA_IS_DISCOVERY, track.isDiscovery)
@@ -355,6 +359,7 @@ object AutoBrowseTree {
                 coverArtId = cid,
                 fallbackKind = "track",
                 fallbackSeed = seed,
+                isCached = isArtCached,
             )
         } ?: CoverArtContentProvider.tileUriFor(artAuthority, "track", seed)
 
@@ -444,12 +449,21 @@ object AutoBrowseTree {
             } else {
                 null
             }
+            val effectiveCoverArtId = details?.coverArtId ?: node.coverArtId
+            val artCached = if (effectiveCoverArtId == node.coverArtId) {
+                node.coverArtLocalPath?.trim()?.takeIf { it.isNotEmpty() }?.let { path ->
+                    !NavidromePlaceholderDetector.isPlaceholder(File(path))
+                } ?: false
+            } else {
+                isArtLocallyCached(core, effectiveCoverArtId)
+            }
             mapNode(
                 node = node,
                 artAuthority = artAuthority,
                 trackDetails = details,
                 parentBrowseId = parentId,
                 packageName = packageName,
+                isArtCached = artCached,
             )
         }
         return PagedChildrenResult(mapped, filteredNodes.size)
@@ -553,11 +567,20 @@ object AutoBrowseTree {
         }
     }
 
+    internal fun isArtLocallyCached(core: CoreClient?, coverArtId: String?): Boolean {
+        val cid = coverArtId?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        val rawPath = runCatching { core?.coverArtLocalPathSync(cid) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: return false
+        return !NavidromePlaceholderDetector.isPlaceholder(File(rawPath))
+    }
+
     private fun resolveNodeArtworkUri(
         node: FfiAutoBrowseNode,
         effectiveCoverArtId: String?,
         artAuthority: String,
         packageName: String?,
+        isArtCached: Boolean = false,
     ): Uri? {
         // 1. Procedural Midnight Studio Mix Sleeve takes priority for mixes & curated tiles.
         node.sleeveSlug?.trim()?.takeIf { it.isNotEmpty() }?.let { slug ->
@@ -568,11 +591,18 @@ object AutoBrowseTree {
 
         // 2. Real cover art URI with automatic Midnight Studio fallback (never Navidrome logo or warning sign).
         effectiveCoverArtId?.trim()?.takeIf { it.isNotEmpty() }?.let { cid ->
+            val cachedFlag = isArtCached || (
+                cid == node.coverArtId?.trim() &&
+                    (node.coverArtLocalPath?.trim()?.takeIf { it.isNotEmpty() }?.let { path ->
+                        !NavidromePlaceholderDetector.isPlaceholder(File(path))
+                    } ?: false)
+                )
             return CoverArtContentProvider.uriFor(
                 authority = artAuthority,
                 coverArtId = cid,
                 fallbackKind = fallbackKind,
                 fallbackSeed = node.title,
+                isCached = cachedFlag,
             )
         }
 

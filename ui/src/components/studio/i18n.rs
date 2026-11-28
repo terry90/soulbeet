@@ -342,6 +342,14 @@ pub fn subsonic_cover_art_url(info: &NavidromeSessionInfo, cover_id: &str, size:
     )
 }
 
+/// Builds a same-origin authenticated Web cover art proxy URL (`/api/cover-art/{id}?size={size}`).
+pub fn web_cover_art_url(cover_art_id: &str, size: u32) -> String {
+    format!(
+        "/api/cover-art/{}?size={size}",
+        percent_encode_param(cover_art_id.trim())
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +685,11 @@ mod tests {
 
         let art = subsonic_cover_art_url(&info, "al-42", 300);
         assert!(art.starts_with("https://music.example.com/rest/getCoverArt.view?id=al-42&size=300&"));
+
+        assert_eq!(web_cover_art_url("al-42", 300), "/api/cover-art/al-42?size=300");
+        assert_eq!(
+            web_cover_art_url("pl-abc/1 2", 256),
+            "/api/cover-art/pl-abc%2F1%202?size=256"
+        );
     }
 }

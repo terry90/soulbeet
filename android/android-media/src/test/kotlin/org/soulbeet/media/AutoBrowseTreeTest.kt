@@ -340,4 +340,69 @@ class AutoBrowseTreeTest {
         assertEquals("t2", recent[0].mediaId)
         assertEquals("Resumed Track", recent[0].mediaMetadata.title?.toString())
     }
+
+    @Test
+    fun artworkUriIncludesCachedQueryParamOnlyWhenCoverArtIsCachedLocally() = runTest {
+        val core = FakeCoreClient()
+        core.coverArtPaths["cov-cached"] = "/cache/cover_art/cov-cached.jpg"
+        core.childrenByParent[AutoBrowseTree.LIB_RECENT] = listOf(
+            FakeCoreClient.browseNode(
+                id = "album:al-cached",
+                title = "Discovery",
+                subtitle = "Daft Punk",
+                kind = FfiAutoNodeKind.ALBUM,
+                playable = true,
+                browsable = true,
+                coverArtId = "cov-cached",
+            ),
+            FakeCoreClient.browseNode(
+                id = "album:al-cold",
+                title = "Homework",
+                subtitle = "Daft Punk",
+                kind = FfiAutoNodeKind.ALBUM,
+                playable = true,
+                browsable = true,
+                coverArtId = "cov-cold",
+            ),
+        )
+
+        val initial = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.LIB_RECENT,
+            page = 0,
+            pageSize = 20,
+            artAuthority = authority,
+        )
+        assertEquals(2, initial.size)
+        assertEquals(
+            "loadChildren must reuse bulk-loaded node.coverArtLocalPath without N+1 FFI calls",
+            0,
+            core.coverArtLocalPathSyncCalls,
+        )
+
+        val cachedUri = initial[0].mediaMetadata.artworkUri
+        assertNotNull(cachedUri)
+        assertEquals("1", cachedUri!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+
+        val coldUriBefore = initial[1].mediaMetadata.artworkUri
+        assertNotNull(coldUriBefore)
+        assertNull(coldUriBefore!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+
+        // Simulate background prefetch caching cov-cold and notifyChildrenChanged() reloading the grid.
+        core.coverArtPaths["cov-cold"] = "/cache/cover_art/cov-cold.jpg"
+        val refreshed = AutoBrowseTree.loadChildren(
+            core = core,
+            parentId = AutoBrowseTree.LIB_RECENT,
+            page = 0,
+            pageSize = 20,
+            artAuthority = authority,
+        )
+        val coldUriAfter = refreshed[1].mediaMetadata.artworkUri
+        assertNotNull(coldUriAfter)
+        assertEquals("1", coldUriAfter!!.getQueryParameter(CoverArtContentProvider.QUERY_CACHED))
+        assertFalse(
+            "Cached URI must differ from cold URI to bust Android Auto's bitmap cache",
+            coldUriBefore.toString() == coldUriAfter.toString(),
+        )
+    }
 }

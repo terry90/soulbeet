@@ -6,16 +6,20 @@ import android.content.Context
 import android.database.Cursor
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import org.soulbeet.core.FfiException
 import org.soulbeet.corebindings.CoreClient
 import org.soulbeet.corebindings.SoulbeetCoreProvider
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileNotFoundException
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 /**
  * Read-only [ContentProvider] serving locally cached cover art and procedural Midnight Studio
@@ -41,8 +45,8 @@ class CoverArtContentProvider : ContentProvider() {
     internal var allowedCacheRoot: File? = null
 
     /**
-     * Enables bounded on-demand fetch on Binder threads when Android Auto requests an uncached
-     * `/art/<id>?fallback=...` URI while online.
+     * Enables bounded on-demand fetch when an uncached `/art/<id>` URI is requested while online
+     * (both bare Phone app URIs and Android Auto `?fallback=...` URIs).
      */
     internal var allowBoundedOnlineFetch: Boolean = true
 
@@ -50,6 +54,12 @@ class CoverArtContentProvider : ContentProvider() {
      * Allows a short cold-start wait when `CoreClient` is still opening SQLite during car ignition.
      */
     internal var allowColdStartAwait: Boolean = true
+
+    /** Overridable timeouts and permit waits for unit tests. */
+    internal var phoneFetchTimeoutMs: Long = PHONE_ONLINE_FETCH_TIMEOUT_MS
+    internal var autoFetchTimeoutMs: Long = AUTO_ONLINE_FETCH_TIMEOUT_MS
+    internal var phonePermitWaitMs: Long = PHONE_PERMIT_WAIT_MS
+    internal var autoPermitWaitMs: Long = AUTO_PERMIT_WAIT_MS
 
     override fun onCreate(): Boolean {
         if (allowedCacheRoot == null) {
@@ -146,10 +156,15 @@ class CoverArtContentProvider : ContentProvider() {
         if (core != null) {
             resolveCachedArtFileWithCore(core, coverArtId)?.let { return it }
 
-            // If online and this request permits bounded fetch, wait briefly (capped concurrency so
-            // Binder threads never starve on large grids or in tunnels).
-            if (allowFetch && fallbackKind != null && !core.isOfflineOnly()) {
-                val fetched = fetchArtBoundedSingleFlight(core, coverArtId)
+            // If online and this request permits bounded fetch, fetch on demand for both bare
+            // Phone URIs (`/art/<id>`) and Android Auto URIs (`/art/<id>?fallback=...`), using
+            // separate concurrency pools and timeouts so phone grids never starve Auto Binder IPC.
+            if (allowFetch && !core.isOfflineOnly()) {
+                val fetched = fetchArtBoundedSingleFlight(
+                    core = core,
+                    coverArtId = coverArtId,
+                    isAutoRequest = fallbackKind != null,
+                )
                 if (fetched != null && isValidNonPlaceholderFile(fetched)) {
                     return fetched
                 }
@@ -199,57 +214,159 @@ class CoverArtContentProvider : ContentProvider() {
         return true
     }
 
-    private fun fetchArtBoundedSingleFlight(core: CoreClient, coverArtId: String): File? {
-        val failedAt = recentPlaceholderOrFailureMs[coverArtId]
-        if (failedAt != null && (System.currentTimeMillis() - failedAt) < NEGATIVE_CACHE_TTL_MS) {
-            return null
-        }
-
-        // Non-blocking semaphore prevents Binder thread-pool starvation when AA opens 16-24 uncached tiles at once.
-        if (!onlineFetchPermits.tryAcquire()) {
-            return null
-        }
-        try {
-            val stripe = fetchStripes[(coverArtId.hashCode() and 0x7FFFFFFF) % FETCH_LOCK_STRIPES]
-            return synchronized(stripe) {
-                val existing = runCatching { core.coverArtLocalPathSync(coverArtId) }.getOrNull()
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { runCatching { File(it).canonicalFile }.getOrNull() }
-                if (existing != null && existing.exists() && existing.isFile) {
-                    if (NavidromePlaceholderDetector.isPlaceholder(existing)) {
-                        recordNegativeCache(coverArtId)
-                        return@synchronized null
-                    }
-                    return@synchronized existing
-                }
-
-                val path = runCatching {
-                    runBlocking(Dispatchers.IO) {
-                        withTimeoutOrNull(ONLINE_FETCH_TIMEOUT_MS) {
-                            core.getOrFetchCoverArt(coverArtId, ON_DEMAND_ART_SIZE_PX)
-                        }
-                    }
-                }.getOrNull()
-
-                val file = path?.takeIf { it.isNotBlank() }?.let { runCatching { File(it).canonicalFile }.getOrNull() }
-                if (file == null || NavidromePlaceholderDetector.isPlaceholder(file)) {
-                    recordNegativeCache(coverArtId)
-                    null
-                } else {
-                    recentPlaceholderOrFailureMs.remove(coverArtId)
-                    file
-                }
-            }
-        } finally {
-            onlineFetchPermits.release()
-        }
+    private sealed interface FetchOutcome {
+        data class Ready(val file: File) : FetchOutcome
+        data object DefinitiveMissing : FetchOutcome
+        data object TransientFailure : FetchOutcome
     }
 
-    private fun recordNegativeCache(coverArtId: String) {
-        if (recentPlaceholderOrFailureMs.size >= MAX_NEGATIVE_CACHE_ENTRIES) {
-            recentPlaceholderOrFailureMs.clear()
+    private sealed interface RawFetchResult {
+        data class Path(val rawPath: String) : RawFetchResult
+        data object DefinitiveMissing : RawFetchResult
+        data object TransientFailure : RawFetchResult
+    }
+
+    private fun checkLocalCacheOrNegative(core: CoreClient, coverArtId: String): FetchOutcome? {
+        val existing = runCatching { core.coverArtLocalPathSync(coverArtId) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { runCatching { File(it).canonicalFile }.getOrNull() }
+        if (existing != null && existing.exists() && existing.isFile) {
+            if (NavidromePlaceholderDetector.isPlaceholder(existing)) {
+                recordNegativeCache(coverArtId)
+                return FetchOutcome.DefinitiveMissing
+            }
+            clearNegativeCache(coverArtId)
+            return FetchOutcome.Ready(existing)
         }
-        recentPlaceholderOrFailureMs[coverArtId] = System.currentTimeMillis()
+        return null
+    }
+
+    private fun fetchArtBoundedSingleFlight(
+        core: CoreClient,
+        coverArtId: String,
+        isAutoRequest: Boolean,
+    ): File? {
+        if (isNegativelyCached(coverArtId)) {
+            return null
+        }
+
+        // Single-flight deduplication BEFORE acquiring semaphore permits so multiple concurrent
+        // rows sharing the same coverArtId (e.g. album tracks) consume only one permit and never
+        // starve unrelated cover fetches.
+        val myFuture = CompletableFuture<FetchOutcome>()
+        val existingFuture = inFlightFetches.putIfAbsent(coverArtId, myFuture)
+        if (existingFuture != null) {
+            val followerWaitMs = if (isAutoRequest) autoFetchTimeoutMs else phoneFetchTimeoutMs
+            val sharedOutcome = try {
+                existingFuture.get(followerWaitMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                null
+            } catch (_: Exception) {
+                null
+            }
+            return (sharedOutcome as? FetchOutcome.Ready)?.file
+        }
+
+        var outcome: FetchOutcome = FetchOutcome.TransientFailure
+        try {
+            if (isNegativelyCached(coverArtId)) {
+                outcome = FetchOutcome.DefinitiveMissing
+                return null
+            }
+            checkLocalCacheOrNegative(core, coverArtId)?.let { cached ->
+                outcome = cached
+                return (cached as? FetchOutcome.Ready)?.file
+            }
+
+            val permits = if (isAutoRequest) autoFetchPermits else phoneFetchPermits
+            val permitWaitMs = if (isAutoRequest) autoPermitWaitMs else phonePermitWaitMs
+            val acquired = try {
+                permits.tryAcquire(permitWaitMs, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!acquired) {
+                // Never put permit contention into the negative cache so retries and prefetch succeed.
+                outcome = FetchOutcome.TransientFailure
+                return null
+            }
+
+            try {
+                checkLocalCacheOrNegative(core, coverArtId)?.let { cached ->
+                    outcome = cached
+                    return (cached as? FetchOutcome.Ready)?.file
+                }
+
+                val timeoutMs = if (isAutoRequest) autoFetchTimeoutMs else phoneFetchTimeoutMs
+                val rawResult = runBlocking(Dispatchers.IO) {
+                    withTimeoutOrNull(timeoutMs) {
+                        try {
+                            val raw = core.getOrFetchCoverArt(coverArtId, ON_DEMAND_ART_SIZE_PX)
+                            if (raw.isBlank()) {
+                                RawFetchResult.DefinitiveMissing
+                            } else {
+                                RawFetchResult.Path(raw)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: FfiException.InvalidInput) {
+                            // Rust get_or_fetch_cover_art rejects Navidrome placeholders and
+                            // non-image responses with FfiException.InvalidInput.
+                            RawFetchResult.DefinitiveMissing
+                        } catch (e: FfiException.Subsonic) {
+                            if (e.code == SUBSONIC_ERR_DATA_NOT_FOUND) {
+                                RawFetchResult.DefinitiveMissing
+                            } else {
+                                RawFetchResult.TransientFailure
+                            }
+                        } catch (e: FfiException.ServerHttp) {
+                            val code = e.status.toInt()
+                            if (code == 404 || code == 410) {
+                                RawFetchResult.DefinitiveMissing
+                            } else {
+                                RawFetchResult.TransientFailure
+                            }
+                        } catch (_: Exception) {
+                            RawFetchResult.TransientFailure
+                        }
+                    } ?: RawFetchResult.TransientFailure
+                }
+
+                outcome = when (rawResult) {
+                    is RawFetchResult.Path -> {
+                        val file = runCatching { File(rawResult.rawPath).canonicalFile }.getOrNull()
+                        when {
+                            file == null || !file.exists() || !file.isFile -> FetchOutcome.TransientFailure
+                            NavidromePlaceholderDetector.isPlaceholder(file) -> {
+                                recordNegativeCache(coverArtId)
+                                FetchOutcome.DefinitiveMissing
+                            }
+                            else -> {
+                                clearNegativeCache(coverArtId)
+                                FetchOutcome.Ready(file)
+                            }
+                        }
+                    }
+                    RawFetchResult.DefinitiveMissing -> {
+                        recordNegativeCache(coverArtId)
+                        FetchOutcome.DefinitiveMissing
+                    }
+                    RawFetchResult.TransientFailure -> {
+                        // Do not negative-cache timeouts or transient network errors so immediate
+                        // retries and background prefetch succeed once connectivity recovers.
+                        FetchOutcome.TransientFailure
+                    }
+                }
+                return (outcome as? FetchOutcome.Ready)?.file
+            } finally {
+                permits.release()
+            }
+        } finally {
+            inFlightFetches.remove(coverArtId, myFuture)
+            myFuture.complete(outcome)
+        }
     }
 
     companion object {
@@ -259,18 +376,49 @@ class CoverArtContentProvider : ContentProvider() {
         const val QUERY_FALLBACK_KIND: String = "fallback"
         const val QUERY_FALLBACK_SEED: String = "seed"
         const val QUERY_LABEL: String = "label"
+        const val QUERY_CACHED: String = "cached"
+
+        internal const val SUBSONIC_ERR_DATA_NOT_FOUND: Long = 70L
 
         private const val COLD_START_AWAIT_MS: Long = 300L
-        private const val ONLINE_FETCH_TIMEOUT_MS: Long = 2_000L
+        private const val PHONE_ONLINE_FETCH_TIMEOUT_MS: Long = 8_000L
+        private const val AUTO_ONLINE_FETCH_TIMEOUT_MS: Long = 4_000L
+        private const val PHONE_PERMIT_WAIT_MS: Long = 3_000L
+        private const val AUTO_PERMIT_WAIT_MS: Long = 600L
         private const val ON_DEMAND_ART_SIZE_PX: UInt = 512u
         private const val NEGATIVE_CACHE_TTL_MS: Long = 120_000L
         private const val MAX_NEGATIVE_CACHE_ENTRIES: Int = 256
-        private const val MAX_CONCURRENT_BINDER_FETCHES: Int = 3
-        private const val FETCH_LOCK_STRIPES: Int = 32
+        private const val MAX_CONCURRENT_PHONE_FETCHES: Int = 4
+        private const val MAX_CONCURRENT_AUTO_FETCHES: Int = 3
 
-        private val onlineFetchPermits = Semaphore(MAX_CONCURRENT_BINDER_FETCHES)
-        private val fetchStripes = Array(FETCH_LOCK_STRIPES) { Any() }
-        private val recentPlaceholderOrFailureMs = ConcurrentHashMap<String, Long>()
+        private val phoneFetchPermits = Semaphore(MAX_CONCURRENT_PHONE_FETCHES)
+        private val autoFetchPermits = Semaphore(MAX_CONCURRENT_AUTO_FETCHES)
+        private val inFlightFetches = ConcurrentHashMap<String, CompletableFuture<FetchOutcome>>()
+        private val recentPlaceholderOrMissingMs = ConcurrentHashMap<String, Long>()
+
+        internal fun isNegativelyCached(coverArtId: String): Boolean {
+            val failedAt = recentPlaceholderOrMissingMs[coverArtId] ?: return false
+            if ((System.currentTimeMillis() - failedAt) < NEGATIVE_CACHE_TTL_MS) {
+                return true
+            }
+            recentPlaceholderOrMissingMs.remove(coverArtId, failedAt)
+            return false
+        }
+
+        internal fun recordNegativeCache(coverArtId: String) {
+            if (recentPlaceholderOrMissingMs.size >= MAX_NEGATIVE_CACHE_ENTRIES) {
+                recentPlaceholderOrMissingMs.clear()
+            }
+            recentPlaceholderOrMissingMs[coverArtId] = System.currentTimeMillis()
+        }
+
+        fun clearNegativeCache(coverArtId: String) {
+            recentPlaceholderOrMissingMs.remove(coverArtId)
+        }
+
+        internal fun clearAllNegativeCache() {
+            recentPlaceholderOrMissingMs.clear()
+        }
 
         fun authorityFor(context: Context): String = "${context.packageName}.art"
 
@@ -279,6 +427,7 @@ class CoverArtContentProvider : ContentProvider() {
             coverArtId: String,
             fallbackKind: String? = null,
             fallbackSeed: String? = null,
+            isCached: Boolean = false,
         ): Uri =
             Uri.Builder()
                 .scheme("content")
@@ -291,6 +440,9 @@ class CoverArtContentProvider : ContentProvider() {
                     }
                     if (!fallbackSeed.isNullOrBlank()) {
                         appendQueryParameter(QUERY_FALLBACK_SEED, fallbackSeed.take(64))
+                    }
+                    if (isCached) {
+                        appendQueryParameter(QUERY_CACHED, "1")
                     }
                 }
                 .build()

@@ -79,6 +79,8 @@ import org.soulbeet.app.formatRemoteAlbumMeta
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
+import org.soulbeet.app.ui.components.ArtworkFallbackKind
+import org.soulbeet.app.ui.components.PlaylistArtwork
 import org.soulbeet.app.ui.components.SeamLightBar
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.TrackRow
@@ -405,6 +407,7 @@ fun SearchScreen(
                                     fallbackTitle = artist.name,
                                     size = 44.dp,
                                     shape = SoulbeetShapes.full,
+                                    fallbackKind = ArtworkFallbackKind.ARTIST,
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))
                                 Column(modifier = Modifier.weight(1f)) {
@@ -480,6 +483,7 @@ fun SearchScreen(
                                     fallbackTitle = album.name,
                                     size = 44.dp,
                                     shape = SoulbeetShapes.xs,
+                                    fallbackKind = ArtworkFallbackKind.ALBUM,
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))
                                 Column(modifier = Modifier.weight(1f)) {
@@ -525,11 +529,13 @@ fun SearchScreen(
                                     .padding(horizontal = 4.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                TrackArtwork(
+                                PlaylistArtwork(
+                                    name = pl.name,
                                     coverArtId = pl.coverArtId,
                                     artAuthority = artAuthority,
-                                    fallbackTitle = pl.name,
                                     size = 44.dp,
+                                    slug = pl.slug,
+                                    kind = pl.kind,
                                     shape = SoulbeetShapes.xs,
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))

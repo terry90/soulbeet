@@ -57,6 +57,8 @@ open class FakeCoreClient : CoreClient {
     var enqueueMutationException: Exception? = null
     var onEnqueueMutationCallback: ((FfiOutboxMutation) -> Unit)? = null
     var voiceSearchHandler: (String) -> FfiVoiceMatchResult? = { null }
+    var getOrFetchCoverArtHandler: (suspend (String, UInt?) -> String)? = null
+    var coverArtLocalPathSyncCalls: Int = 0
     var playbackSourceHandler: (String, FfiAudioQualityProfile) -> FfiPlaybackSource = { _, _ ->
         throw FfiException.Offline("not cached")
     }
@@ -64,12 +66,22 @@ open class FakeCoreClient : CoreClient {
     override fun autoRootTabs(): List<FfiAutoBrowseNode> = rootTabs
 
     override suspend fun autoChildren(parentId: String): List<FfiAutoBrowseNode> =
-        childrenByParent[parentId].orEmpty()
+        hydrateNodeCoverArtPaths(childrenByParent[parentId].orEmpty())
 
     override suspend fun autoChildrenWithOffline(
         parentId: String,
         offlineOnly: Boolean,
-    ): List<FfiAutoBrowseNode> = childrenByParent[parentId].orEmpty()
+    ): List<FfiAutoBrowseNode> = hydrateNodeCoverArtPaths(childrenByParent[parentId].orEmpty())
+
+    private fun hydrateNodeCoverArtPaths(nodes: List<FfiAutoBrowseNode>): List<FfiAutoBrowseNode> =
+        nodes.map { node ->
+            if (node.coverArtLocalPath == null && node.coverArtId != null) {
+                val localPath = coverArtPaths[node.coverArtId]
+                if (localPath != null) node.copy(coverArtLocalPath = localPath) else node
+            } else {
+                node
+            }
+        }
 
     override fun isOfflineOnly(): Boolean = offlineOnlyFlag
 
@@ -77,7 +89,10 @@ open class FakeCoreClient : CoreClient {
         offlineOnlyFlag = offlineOnly
     }
 
-    override fun coverArtLocalPathSync(coverArtId: String): String? = coverArtPaths[coverArtId]
+    override fun coverArtLocalPathSync(coverArtId: String): String? {
+        coverArtLocalPathSyncCalls++
+        return coverArtPaths[coverArtId]
+    }
 
     override suspend fun coverArtLocalPath(coverArtId: String): String? = coverArtPaths[coverArtId]
 
@@ -149,7 +164,8 @@ open class FakeCoreClient : CoreClient {
     override suspend fun enforceCacheBudget(): ULong = 0uL
     override suspend fun fetchBootstrap(): FfiClientBootstrap? = null
     override suspend fun getOrFetchCoverArt(coverArtId: String, size: UInt?): String =
-        coverArtPaths[coverArtId] ?: ""
+        getOrFetchCoverArtHandler?.invoke(coverArtId, size) ?: coverArtPaths[coverArtId] ?: ""
+    override suspend fun warmCoverArtCache(maxItems: UInt, size: UInt?): UInt = 0u
     override suspend fun libraryStats(): FfiLibraryStats = throw UnsupportedOperationException()
     override suspend fun listAlbums(artistId: String?): List<FfiAlbum> = albumsById.values.toList()
     override suspend fun listArtists(): List<FfiArtist> = artistsById.values.toList()

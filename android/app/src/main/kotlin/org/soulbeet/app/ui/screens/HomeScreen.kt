@@ -41,8 +41,10 @@ import org.soulbeet.app.data.CultureSteeringOption
 import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
+import org.soulbeet.app.ui.components.ArtworkFallbackKind
 import org.soulbeet.app.ui.components.MixShelfBucket
 import org.soulbeet.app.ui.components.OfflineDot
+import org.soulbeet.app.ui.components.PlaylistArtwork
 import org.soulbeet.app.ui.components.SeasonalHeroCard
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.TrackRow
@@ -232,11 +234,13 @@ fun HomeScreen(
                                     modifier = Modifier.padding(10.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp),
                                 ) {
-                                    TrackArtwork(
+                                    PlaylistArtwork(
+                                        name = pl.name,
                                         coverArtId = pl.coverArtId,
                                         artAuthority = artAuthority,
-                                        fallbackTitle = pl.name,
                                         size = 128.dp,
+                                        slug = pl.slug,
+                                        kind = pl.kind,
                                         shape = SoulbeetShapes.sm,
                                     )
                                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -400,14 +404,29 @@ private fun QuickResumeTile(
             modifier = Modifier.fillMaxSize(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TrackArtwork(
-                coverArtId = item.coverArtId,
-                artAuthority = artAuthority,
-                fallbackTitle = item.title,
-                size = 56.dp,
-                shape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp),
-                showBorder = false,
-            )
+            val tileArtShape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp)
+            if (item.isPlaylist) {
+                PlaylistArtwork(
+                    name = item.title,
+                    coverArtId = item.coverArtId,
+                    artAuthority = artAuthority,
+                    size = 56.dp,
+                    slug = item.playlistSlug,
+                    kind = item.playlistKind,
+                    shape = tileArtShape,
+                    showBorder = false,
+                )
+            } else {
+                TrackArtwork(
+                    coverArtId = item.coverArtId,
+                    artAuthority = artAuthority,
+                    fallbackTitle = item.title,
+                    size = 56.dp,
+                    shape = tileArtShape,
+                    showBorder = false,
+                    fallbackKind = ArtworkFallbackKind.ALBUM,
+                )
+            }
             Column(
                 modifier = Modifier
                     .weight(1f)

@@ -6,12 +6,12 @@ use shared::client::{DeleteGuardPreview, TrackLyrics};
 use crate::{
     classify_guard_mode, format_discovery_badge, format_duration, protection_kind_label,
     use_player, GuardModalMode, IconCheck, IconChevronDown, IconChevronUp, IconInfo, IconListMusic,
-    IconListPlus, IconLoader, IconMic2, IconMusic, IconPlay, IconRadio, IconShare2,
+    IconListPlus, IconLoader, IconMic2, IconPlay, IconRadio, IconShare2,
     IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown, IconTrash2, IconX, PlayerTrack,
     StarStrip, StarStripSize,
 };
 
-use super::LyricsPanel;
+use super::{ArtFallbackKind, CoverImage, LyricsPanel};
 
 /// Segmented contextual drawer tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,10 +492,11 @@ fn InspectorTabBody(
             div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-3.5 space-y-3",
                 div { class: "flex items-center gap-3",
                     div { class: "w-14 h-14 rounded-[8px] overflow-hidden bg-beet-surface-high border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                        if let Some(url) = track.cover_art_url.as_deref().filter(|u| !u.is_empty()) {
-                            img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
-                        } else {
-                            IconMusic { size: 22, class: "text-beet-text-disabled".to_string() }
+                        CoverImage {
+                            src: track.cover_art_url.clone(),
+                            alt: track.title.clone(),
+                            kind: ArtFallbackKind::Track,
+                            icon_size: 22,
                         }
                     }
                     div { class: "min-w-0 flex-1",

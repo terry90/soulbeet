@@ -2436,6 +2436,34 @@ impl SoulbeetCoreHandle {
         Ok(path)
     }
 
+    pub async fn warm_cover_art_cache(
+        &self,
+        max_items: u32,
+        size: Option<u32>,
+    ) -> Result<u32, FfiError> {
+        let core = self.core.clone();
+        let (warmed, maybe_stats) = self
+            .run_async_cooperative(|cancel| async move {
+                let count = core
+                    .warm_cover_art_cache_cancellable(max_items as usize, size, &cancel)
+                    .await
+                    .map_err(FfiError::from)?;
+                let stats = if count > 0 {
+                    Some(FfiCacheStats::from(
+                        core.cache_stats().await.map_err(FfiError::from)?,
+                    ))
+                } else {
+                    None
+                };
+                Ok((u32::try_from(count).unwrap_or(u32::MAX), stats))
+            })
+            .await?;
+        if let Some(stats) = maybe_stats {
+            self.emit_cache_changed(stats);
+        }
+        Ok(warmed)
+    }
+
     // --- Outbox & Curation ---
 
     pub async fn enqueue_mutation(&self, mutation: FfiOutboxMutation) -> Result<i64, FfiError> {

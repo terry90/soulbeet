@@ -1866,12 +1866,32 @@
   .bg-transparent {
     background-color: transparent;
   }
+  .bg-gradient-to-br {
+    --tw-gradient-position: to bottom right in oklab;
+    background-image: linear-gradient(var(--tw-gradient-stops));
+  }
   .bg-gradient-to-r {
     --tw-gradient-position: to right in oklab;
     background-image: linear-gradient(var(--tw-gradient-stops));
   }
+  .bg-\[radial-gradient\(circle_at_30\%_25\%\,rgba\(168\,85\,247\,0\.16\)\,transparent_65\%\)\] {
+    background-image: radial-gradient(circle at 30% 25%,rgba(168,85,247,0.16),transparent 65%);
+  }
+  .from-beet-panel {
+    --tw-gradient-from: var(--color-beet-panel);
+    --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  }
   .from-white {
     --tw-gradient-from: var(--color-white);
+    --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
+  }
+  .via-\[\#191627\] {
+    --tw-gradient-via: #191627;
+    --tw-gradient-via-stops: var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-via) var(--tw-gradient-via-position), var(--tw-gradient-to) var(--tw-gradient-to-position);
+    --tw-gradient-stops: var(--tw-gradient-via-stops);
+  }
+  .to-\[\#110f1a\] {
+    --tw-gradient-to: #110f1a;
     --tw-gradient-stops: var(--tw-gradient-via-stops, var(--tw-gradient-position), var(--tw-gradient-from) var(--tw-gradient-from-position), var(--tw-gradient-to) var(--tw-gradient-to-position));
   }
   .to-gray-400 {
@@ -2096,6 +2116,9 @@
   }
   .pl-42 {
     padding-left: calc(var(--spacing) * 42);
+  }
+  .pl-123 {
+    padding-left: calc(var(--spacing) * 123);
   }
   .text-center {
     text-align: center;
@@ -2364,6 +2387,12 @@
   }
   .text-beet-text-tertiary {
     color: var(--color-beet-text-tertiary);
+  }
+  .text-beet-text-tertiary\/70 {
+    color: color-mix(in srgb, #9e8eb3 70%, transparent);
+    @supports (color: color-mix(in lab, red, red)) {
+      color: color-mix(in oklab, var(--color-beet-text-tertiary) 70%, transparent);
+    }
   }
   .text-cyan-800 {
     color: var(--color-cyan-800);
@@ -3289,6 +3318,9 @@
     .sm\:h-11 {
       height: calc(var(--spacing) * 11);
     }
+    .sm\:h-24 {
+      height: calc(var(--spacing) * 24);
+    }
     .sm\:h-28 {
       height: calc(var(--spacing) * 28);
     }
@@ -3315,6 +3347,9 @@
     }
     .sm\:w-11 {
       width: calc(var(--spacing) * 11);
+    }
+    .sm\:w-24 {
+      width: calc(var(--spacing) * 24);
     }
     .sm\:w-28 {
       width: calc(var(--spacing) * 28);

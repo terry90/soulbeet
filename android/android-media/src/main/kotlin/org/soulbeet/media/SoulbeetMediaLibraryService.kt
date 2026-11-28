@@ -26,7 +26,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
@@ -34,12 +37,16 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.soulbeet.core.FfiAutoNodeKind
+import org.soulbeet.core.FfiException
 import org.soulbeet.core.FfiTrack
 import org.soulbeet.corebindings.CoreClient
 import org.soulbeet.corebindings.SoulbeetCoreProvider
+import java.io.File
 
 /**
  * Hydrated queue resolution result produced for Media3 `onSetMediaItems` / voice playback.
@@ -120,21 +127,42 @@ internal object MediaLibraryResolver {
             val libNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_LIBRARY) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (libNode != null) return AutoBrowseTree.mapNode(libNode, artAuthority, packageName = packageName)
+            if (libNode != null) {
+                return AutoBrowseTree.mapNode(
+                    node = libNode,
+                    artAuthority = artAuthority,
+                    packageName = packageName,
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, libNode.coverArtId),
+                )
+            }
         }
 
         if (mediaId == AutoBrowseTree.FOR_YOU_TRIAGE || mediaId == AutoBrowseTree.FOR_YOU_DRIVE_MIX) {
             val forYouNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_FOR_YOU) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (forYouNode != null) return AutoBrowseTree.mapNode(forYouNode, artAuthority, packageName = packageName)
+            if (forYouNode != null) {
+                return AutoBrowseTree.mapNode(
+                    node = forYouNode,
+                    artAuthority = artAuthority,
+                    packageName = packageName,
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, forYouNode.coverArtId),
+                )
+            }
         }
 
         if (mediaId == AutoBrowseTree.PLAYLIST_STARRED) {
             val starredNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_PLAYLISTS) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (starredNode != null) return AutoBrowseTree.mapNode(starredNode, artAuthority, packageName = packageName)
+            if (starredNode != null) {
+                return AutoBrowseTree.mapNode(
+                    node = starredNode,
+                    artAuthority = artAuthority,
+                    packageName = packageName,
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, starredNode.coverArtId),
+                )
+            }
         }
 
         if (mediaId == AutoBrowseTree.RADIO_SHUFFLE ||
@@ -144,7 +172,14 @@ internal object MediaLibraryResolver {
             val radioNode = runCatching { core.autoChildren(AutoBrowseTree.TAB_RADIO) }
                 .getOrDefault(emptyList())
                 .firstOrNull { it.id == mediaId }
-            if (radioNode != null) return AutoBrowseTree.mapNode(radioNode, artAuthority, packageName = packageName)
+            if (radioNode != null) {
+                return AutoBrowseTree.mapNode(
+                    node = radioNode,
+                    artAuthority = artAuthority,
+                    packageName = packageName,
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, radioNode.coverArtId),
+                )
+            }
         }
 
         if (mediaId.startsWith(AutoBrowseTree.PREFIX_PLAYLIST)) {
@@ -156,7 +191,13 @@ internal object MediaLibraryResolver {
                 val artworkUri = playlist.slug?.takeIf { it.isNotBlank() }?.let { slug ->
                     CoverArtContentProvider.sleeveUriFor(artAuthority, slug)
                 } ?: playlist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                    CoverArtContentProvider.uriFor(artAuthority, cid, "playlist", playlist.name)
+                    CoverArtContentProvider.uriFor(
+                        authority = artAuthority,
+                        coverArtId = cid,
+                        fallbackKind = "playlist",
+                        fallbackSeed = playlist.name,
+                        isCached = AutoBrowseTree.isArtLocallyCached(core, cid),
+                    )
                 } ?: CoverArtContentProvider.tileUriFor(artAuthority, "playlist", playlist.name)
                 val metadata = MediaMetadata.Builder()
                     .setTitle(playlist.name)
@@ -178,7 +219,13 @@ internal object MediaLibraryResolver {
             val albumId = mediaId.removePrefix(AutoBrowseTree.PREFIX_ALBUM)
             val album = runCatching { core.getAlbum(albumId) }.getOrNull() ?: return null
             val artUri = album.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                CoverArtContentProvider.uriFor(artAuthority, cid, "album", album.name)
+                CoverArtContentProvider.uriFor(
+                    authority = artAuthority,
+                    coverArtId = cid,
+                    fallbackKind = "album",
+                    fallbackSeed = album.name,
+                    isCached = AutoBrowseTree.isArtLocallyCached(core, cid),
+                )
             } ?: CoverArtContentProvider.tileUriFor(artAuthority, "album", album.name)
             val metadata = MediaMetadata.Builder()
                 .setTitle(album.name)
@@ -204,7 +251,13 @@ internal object MediaLibraryResolver {
                 .removePrefix(AutoBrowseTree.PREFIX_ARTIST)
             val artist = runCatching { core.getArtist(artistId) }.getOrNull() ?: return null
             val artUri = artist.coverArtId?.takeIf { it.isNotBlank() }?.let { cid ->
-                CoverArtContentProvider.uriFor(artAuthority, cid, "artist", artist.name)
+                CoverArtContentProvider.uriFor(
+                    authority = artAuthority,
+                    coverArtId = cid,
+                    fallbackKind = "artist",
+                    fallbackSeed = artist.name,
+                    isCached = AutoBrowseTree.isArtLocallyCached(core, cid),
+                )
             } ?: CoverArtContentProvider.tileUriFor(artAuthority, "artist", artist.name)
             val metadata = MediaMetadata.Builder()
                 .setTitle(if (isRadio) "${artist.name} Radio" else artist.name)
@@ -233,6 +286,7 @@ internal object MediaLibraryResolver {
             artAuthority = artAuthority,
             isOfflineCached = isCached,
             mediaUri = SoulbeetDataSourceFactory.trackUri(track.id),
+            isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
         )
     }
 
@@ -378,6 +432,7 @@ internal object MediaLibraryResolver {
                 isOfflineCached = offlineIds.contains(track.id),
                 mediaUri = SoulbeetDataSourceFactory.trackUri(track.id),
                 sourceLabel = label,
+                isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
             )
         }
     }
@@ -406,6 +461,7 @@ internal object MediaLibraryResolver {
                 isOfflineCached = offlineIds.contains(track.id),
                 mediaUri = SoulbeetDataSourceFactory.trackUri(track.id),
                 sourceLabel = match.label,
+                isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
             )
         }
     }
@@ -503,6 +559,7 @@ internal object MediaLibraryResolver {
                 isOfflineCached = offlineIds.contains(track.id),
                 mediaUri = SoulbeetDataSourceFactory.trackUri(track.id),
                 sourceLabel = sourceLabel,
+                isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
             )
         }
     }
@@ -1184,22 +1241,73 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
 
         serviceScope.launch(Dispatchers.IO) {
             try {
-                var attemptedFetches = 0
-                var newlyFetched = 0
-                for (artId in uniqueIds) {
-                    if (!isActive || core.isOfflineOnly() || attemptedFetches >= MAX_COVER_ART_PREFETCH_BATCH) {
-                        break
+                val toFetch = uniqueIds
+                    .filter { artId ->
+                        if (CoverArtContentProvider.isNegativelyCached(artId)) {
+                            return@filter false
+                        }
+                        val alreadyLocal = try {
+                            core.coverArtLocalPathSync(artId)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            null
+                        }
+                        alreadyLocal.isNullOrBlank()
                     }
-                    val alreadyLocal = runCatching { core.coverArtLocalPathSync(artId) }.getOrNull()
-                    if (!alreadyLocal.isNullOrBlank()) continue
-                    attemptedFetches++
-                    val fetched = runCatching {
-                        core.getOrFetchCoverArt(artId, COVER_ART_PREFETCH_SIZE_PX)
-                    }.getOrNull()
-                    if (!fetched.isNullOrBlank()) {
-                        newlyFetched++
-                    }
+                    .take(MAX_COVER_ART_PREFETCH_BATCH)
+
+                val prefetchSemaphore = Semaphore(COVER_ART_PREFETCH_CONCURRENCY)
+                val newlyFetched = coroutineScope {
+                    toFetch.map { artId ->
+                        async {
+                            prefetchSemaphore.withPermit {
+                                if (!isActive ||
+                                    core.isOfflineOnly() ||
+                                    CoverArtContentProvider.isNegativelyCached(artId)
+                                ) {
+                                    return@withPermit false
+                                }
+                                val fetchedPath = try {
+                                    core.getOrFetchCoverArt(artId, COVER_ART_PREFETCH_SIZE_PX)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (_: FfiException.InvalidInput) {
+                                    CoverArtContentProvider.recordNegativeCache(artId)
+                                    return@withPermit false
+                                } catch (e: FfiException.Subsonic) {
+                                    if (e.code == CoverArtContentProvider.SUBSONIC_ERR_DATA_NOT_FOUND) {
+                                        CoverArtContentProvider.recordNegativeCache(artId)
+                                    }
+                                    return@withPermit false
+                                } catch (e: FfiException.ServerHttp) {
+                                    val code = e.status.toInt()
+                                    if (code == 404 || code == 410) {
+                                        CoverArtContentProvider.recordNegativeCache(artId)
+                                    }
+                                    return@withPermit false
+                                } catch (_: Exception) {
+                                    return@withPermit false
+                                }
+                                if (fetchedPath.isNullOrBlank()) {
+                                    CoverArtContentProvider.recordNegativeCache(artId)
+                                    return@withPermit false
+                                }
+                                val file = File(fetchedPath)
+                                if (!file.exists() || !file.isFile) {
+                                    return@withPermit false
+                                }
+                                if (NavidromePlaceholderDetector.isPlaceholder(file)) {
+                                    CoverArtContentProvider.recordNegativeCache(artId)
+                                    return@withPermit false
+                                }
+                                CoverArtContentProvider.clearNegativeCache(artId)
+                                true
+                            }
+                        }
+                    }.awaitAll().count { it }
                 }
+
                 if (newlyFetched > 0 && parentKey != null) {
                     val nowMs = System.currentTimeMillis()
                     val lastMs = lastNotifyChangedByParentMs[parentKey] ?: 0L
@@ -1245,6 +1353,7 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
                     isOfflineCached = offlineIds.contains(track.id),
                     mediaUri = SoulbeetDataSourceFactory.trackUri(track.id),
                     sourceLabel = "${seedTrack.artistName} Radio",
+                    isArtCached = AutoBrowseTree.isArtLocallyCached(core, track.coverArtId),
                 )
             }
         }
@@ -1331,8 +1440,9 @@ class SoulbeetMediaLibraryService : MediaLibraryService() {
         private const val PROGRESS_POLL_INTERVAL_MS: Long = 1_000L
         private const val DETACHED_SAVE_TIMEOUT_MS: Long = 2_000L
         private const val MAX_COVER_ART_PREFETCH_BATCH: Int = 24
+        private const val COVER_ART_PREFETCH_CONCURRENCY: Int = 2
         private const val COVER_ART_PREFETCH_SIZE_PX: UInt = 512u
-        private const val PREFETCH_NOTIFY_COOLDOWN_MS: Long = 15_000L
+        private const val PREFETCH_NOTIFY_COOLDOWN_MS: Long = 3_000L
 
         /**
          * Persists an immutable [SessionSnapshot] inside a detached short-lived IO scope so

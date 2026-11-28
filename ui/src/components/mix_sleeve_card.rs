@@ -80,12 +80,108 @@ pub enum MixSleeveLayout {
 
 fn normalize_slug(slug: &str) -> String {
     let lower = slug.trim().to_ascii_lowercase();
-    lower
+    let stripped = lower
         .strip_prefix("mix.seasonal.")
         .or_else(|| lower.strip_prefix("mix.moment."))
         .or_else(|| lower.strip_prefix("mix.rolling."))
-        .unwrap_or(&lower)
-        .to_string()
+        .unwrap_or(&lower);
+    if stripped == "drive_mix" {
+        "drive".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// Resolves a curated Soulbeet Mix Sleeve slug from an explicit slug, playlist comment
+/// (`soulbeet:contextual:<slug>` or `soulbeet discovery`), or canonical Soulbeet playlist name.
+///
+/// Returns `None` for normal user playlists and non-Soulbeet smart playlists (such as
+/// `[T] 3+ Stars - Random`) so those playlists render their real Navidrome cover art.
+pub fn resolve_playlist_mix_sleeve_slug(
+    explicit_slug: Option<&str>,
+    name: &str,
+    comment: Option<&str>,
+) -> Option<String> {
+    if let Some(slug) = explicit_slug.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(normalize_slug(slug));
+    }
+
+    if let Some(comment_raw) = comment.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = comment_raw.to_ascii_lowercase();
+        if let Some(idx) = lower.find("soulbeet:contextual:") {
+            let after = &lower[idx + "soulbeet:contextual:".len()..];
+            let token: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                .collect();
+            if !token.is_empty() {
+                return Some(normalize_slug(&token));
+            }
+        }
+        if lower.contains("soulbeet discovery") {
+            let combined = format!("{lower} {}", name.to_ascii_lowercase());
+            if combined.contains("comfort") || combined.contains("conservative") {
+                return Some("comfort".to_string());
+            }
+            if combined.contains("deep cuts") || combined.contains("adventurous") {
+                return Some("deep_cuts".to_string());
+            }
+            return Some("weekly_radar".to_string());
+        }
+    }
+
+    let name_lower = name.trim().to_lowercase();
+    let stripped_name = name_lower
+        .strip_prefix("soulbeet - ")
+        .or_else(|| name_lower.strip_prefix("soulbeet: "))
+        .or_else(|| name_lower.strip_prefix("soulbeet "))
+        .unwrap_or(&name_lower)
+        .trim();
+
+    let matched = match stripped_name {
+        "fresh picks" | "weekly radar" | "balanced" | "discovery - balanced"
+        | "discovery (balanced)" => Some("weekly_radar"),
+        "comfort zone" | "conservative" | "discovery - conservative"
+        | "discovery (conservative)" => Some("comfort"),
+        "deep cuts" | "adventurous" | "discovery - adventurous" | "discovery (adventurous)" => {
+            Some("deep_cuts")
+        }
+        "fresh arrivals" => Some("fresh_arrivals"),
+        "forgotten gems" => Some("forgotten_gems"),
+        "drive mix" | "drive" => Some("drive"),
+        "morning" | "morning mix" | "morning boost" => Some("morning"),
+        "focus" | "deep focus" | "focus flow" => Some("focus"),
+        "evening unwind" => Some("evening_unwind"),
+        "dinner groove" => Some("dinner_groove"),
+        "late night" | "late night session" => Some("late_night"),
+        "rainy day" => Some("rainy_day"),
+        "snow day" => Some("snow_day"),
+        "storm & thunder" | "storm night" => Some("storm_night"),
+        "sunny vibes" | "sunny day" => Some("sunny_day"),
+        "friday night warmup" | "friday night" => Some("friday_night"),
+        "sunday morning coffee" | "sunday morning" => Some("sunday_morning"),
+        "80s wave" | "80s mix" => Some("decade_80s"),
+        "90s mix" => Some("decade_90s"),
+        "2000s mix" => Some("decade_2000s"),
+        "christmas mix" | "christmas" | "noël" | "noel" | "winter holiday" | "holiday mix" => {
+            Some("winter_holiday")
+        }
+        "new year's eve" | "new years eve" | "nye" => Some("new_years_eve"),
+        "cozy winter" => Some("cozy_winter"),
+        "lunar new year" => Some("lunar_new_year"),
+        "date night" | "valentine's" | "valentines" => Some("valentines"),
+        "carnival" => Some("carnival"),
+        "celtic folk" | "celtic spring" => Some("celtic_spring"),
+        "spring" | "spring mix" | "spring refresh" => Some("spring"),
+        "summer anthems" | "summer mix" | "summer" => Some("summer"),
+        "midsummer solstice" | "summer solstice" => Some("summer_solstice"),
+        "late summer reset" => Some("late_summer_reset"),
+        "autumn" | "autumn mix" | "autumn acoustics" => Some("autumn"),
+        "halloween" | "halloween mix" => Some("halloween"),
+        _ => None,
+    };
+
+    matched.map(str::to_string)
 }
 
 /// Sanitizes an SVG `<defs>` ID prefix to ASCII alphanumeric characters and hyphens.
@@ -2487,5 +2583,62 @@ mod tests {
                 "wide/seasonal motif `{slug}` must not use slice: {html}"
             );
         }
+    }
+
+    #[test]
+    fn resolves_curated_mix_sleeves_and_leaves_smart_or_user_playlists_unmatched() {
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(Some("drive_mix"), "Anything", None).as_deref(),
+            Some("drive")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(
+                None,
+                "My Custom Name",
+                Some("soulbeet:contextual:winter_holiday | managed")
+            )
+            .as_deref(),
+            Some("winter_holiday")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Fresh Picks", None).as_deref(),
+            Some("weekly_radar")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Comfort Zone", None).as_deref(),
+            Some("comfort")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Deep Cuts", None).as_deref(),
+            Some("deep_cuts")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Noël", None).as_deref(),
+            Some("winter_holiday")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "NOËL", None).as_deref(),
+            Some("winter_holiday")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Drive Mix", None).as_deref(),
+            Some("drive")
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(
+                None,
+                "[T] 3+ Stars - Random",
+                Some("Smart playlist of 3+ star tracks")
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "[T] 3+ Stars - Rotation 2 days", None),
+            None
+        );
+        assert_eq!(
+            resolve_playlist_mix_sleeve_slug(None, "Weekend Roadtrip", Some("Personal mix")),
+            None
+        );
     }
 }

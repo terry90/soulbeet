@@ -3573,3 +3573,678 @@ async fn android_auto_drive_mix_groups_sleeves_starred_radio_and_placeholder_rej
     // 4. Placeholder detector never falsely flags normal image bytes
     assert!(!is_navidrome_placeholder_bytes(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]));
 }
+
+fn build_test_jpeg_colorful(size: u32) -> Vec<u8> {
+    let mut img = image::RgbImage::new(size, size);
+    for y in 0..size {
+        for x in 0..size {
+            let color = match (x < size / 2, y < size / 2) {
+                (true, true) => [215, 65, 50],
+                (false, true) => [45, 170, 115],
+                (true, false) => [235, 185, 55],
+                (false, false) => [125, 60, 180],
+            };
+            img.put_pixel(x, y, image::Rgb(color));
+        }
+    }
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+    buf.into_inner()
+}
+
+fn build_test_jpeg_blue_vinyl(size: u32) -> Vec<u8> {
+    let mut img = image::RgbImage::from_pixel(size, size, image::Rgb([0, 0, 0]));
+    let cx = (size as f32) * 0.5;
+    let cy = (size as f32) * 0.5;
+    let outer_r = (size as f32) * 0.45;
+    let inner_r = (size as f32) * 0.14;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = (x as f32) - cx;
+            let dy = (y as f32) - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= inner_r {
+                img.put_pixel(x, y, image::Rgb([34, 33, 30]));
+            } else if dist <= outer_r {
+                img.put_pixel(x, y, image::Rgb([0, 92, 214]));
+            }
+        }
+    }
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+    buf.into_inner()
+}
+
+#[tokio::test]
+async fn cover_art_local_path_self_heals_stale_placeholder_and_keeps_valid_art() {
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, None, 10_000_000))
+        .await
+        .unwrap();
+    let cover_dir = dir.path().join("cover_art");
+    tokio::fs::create_dir_all(&cover_dir).await.unwrap();
+
+    let now = now_unix();
+    let stale_path = cover_dir.join("pl-stale-vinyl.jpg");
+    let vinyl_bytes = build_test_jpeg_blue_vinyl(320);
+    tokio::fs::write(&stale_path, &vinyl_bytes).await.unwrap();
+    sqlx::query(
+        "INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at) VALUES (?, ?, 'image/jpeg', ?, ?, ?)",
+    )
+    .bind("pl-stale-vinyl")
+    .bind(stale_path.display().to_string())
+    .bind(vinyl_bytes.len() as i64)
+    .bind(now)
+    .bind(now)
+    .execute(core.pool())
+    .await
+    .unwrap();
+
+    let valid_path = cover_dir.join("al-valid-art.jpg");
+    let valid_bytes = build_test_jpeg_colorful(320);
+    tokio::fs::write(&valid_path, &valid_bytes).await.unwrap();
+    sqlx::query(
+        "INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at) VALUES (?, ?, 'image/jpeg', ?, ?, ?)",
+    )
+    .bind("al-valid-art")
+    .bind(valid_path.display().to_string())
+    .bind(valid_bytes.len() as i64)
+    .bind(now)
+    .bind(now)
+    .execute(core.pool())
+    .await
+    .unwrap();
+
+    // Stale blue-vinyl JPEG is evicted from both disk and SQLite on lookup.
+    assert!(core
+        .cover_art_local_path("pl-stale-vinyl")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        !tokio::fs::try_exists(&stale_path).await.unwrap(),
+        "stale placeholder file must be deleted from disk"
+    );
+    let remaining_row: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM cover_art_cache WHERE cover_art_id = 'pl-stale-vinyl'",
+    )
+    .fetch_one(core.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining_row, 0, "stale placeholder row must be deleted from DB");
+
+    // Valid colorful cover art stays cached and passes repeated lookups.
+    let resolved_1 = core.cover_art_local_path("al-valid-art").await.unwrap();
+    let resolved_2 = core.cover_art_local_path("al-valid-art").await.unwrap();
+    assert_eq!(resolved_1, Some(valid_path.clone()));
+    assert_eq!(resolved_2, Some(valid_path));
+}
+
+#[tokio::test]
+async fn warm_cover_art_cache_prioritizes_buckets_skips_placeholders_and_cached_ids() {
+    let requested_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let valid_jpeg = Arc::new(build_test_jpeg_colorful(128));
+    let vinyl_jpeg = Arc::new(build_test_jpeg_blue_vinyl(320));
+    let heal_pl_empty = Arc::new(AtomicBool::new(false));
+
+    let req_log = requested_ids.clone();
+    let ok_bytes = valid_jpeg.clone();
+    let bad_bytes = vinyl_jpeg.clone();
+    let heal_flag = heal_pl_empty.clone();
+    let app = Router::new().route(
+        "/rest/getCoverArt",
+        get(move |Query(params): Query<HashMap<String, String>>| {
+            let req_log = req_log.clone();
+            let ok_bytes = ok_bytes.clone();
+            let bad_bytes = bad_bytes.clone();
+            let heal_flag = heal_flag.clone();
+            async move {
+                let id = params.get("id").cloned().unwrap_or_default();
+                req_log.lock().await.push(id.clone());
+                if id == "pl-empty-vinyl" && !heal_flag.load(Ordering::SeqCst) {
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                        (*bad_bytes).clone(),
+                    )
+                        .into_response()
+                } else if id == "al-missing-404" {
+                    (StatusCode::NOT_FOUND, "not found").into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                        (*ok_bytes).clone(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, Some(base_url), 10_000_000))
+        .await
+        .unwrap();
+    let now = now_unix();
+
+    // Seed prioritized buckets:
+    // 1. Playlists: pl-art-1 (valid, newer) and pl-empty-vinyl (placeholder, older)
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-1".into(),
+            name: "Workout".into(),
+            comment: None,
+            owner: Some("alice".into()),
+            song_count: 2,
+            duration_secs: 300,
+            cover_art_id: Some("pl-art-1".into()),
+            is_smart: false,
+            kind: "user".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now + 10,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-2".into(),
+            name: "Empty Smart".into(),
+            comment: None,
+            owner: Some("alice".into()),
+            song_count: 0,
+            duration_secs: 0,
+            cover_art_id: Some("pl-empty-vinyl".into()),
+            is_smart: true,
+            kind: "smart".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // 2. Albums: al-cached (already cached) + al-art-2 (uncached)
+    upsert_album(
+        core.pool(),
+        &LocalAlbum {
+            id: "al-1".into(),
+            name: "Already Cached".into(),
+            artist_id: None,
+            artist_name: "Artist".into(),
+            year: Some(2024),
+            genre: None,
+            song_count: 1,
+            duration_secs: 200,
+            cover_art_id: Some("al-cached".into()),
+            starred: false,
+            created_at: None,
+            updated_at: now + 5,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_album(
+        core.pool(),
+        &LocalAlbum {
+            id: "al-2".into(),
+            name: "Recent Album".into(),
+            artist_id: None,
+            artist_name: "Artist".into(),
+            year: Some(2025),
+            genre: None,
+            song_count: 1,
+            duration_secs: 200,
+            cover_art_id: Some("al-art-2".into()),
+            starred: false,
+            created_at: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Pre-cache al-cached so warmer skips it.
+    let cached_path = dir.path().join("cover_art").join("al-cached.jpg");
+    tokio::fs::create_dir_all(cached_path.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&cached_path, valid_jpeg.as_slice())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO cover_art_cache (cover_art_id, local_path, content_type, size_bytes, downloaded_at, last_accessed_at) VALUES ('al-cached', ?, 'image/jpeg', ?, ?, ?)",
+    )
+    .bind(cached_path.display().to_string())
+    .bind(valid_jpeg.len() as i64)
+    .bind(now)
+    .bind(now)
+    .execute(core.pool())
+    .await
+    .unwrap();
+
+    // 3. Tracks: starred + offline included; unstarred non-offline excluded
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-star".into(),
+            title: "Starred".into(),
+            artist_id: None,
+            artist_name: "A".into(),
+            album_id: None,
+            album_name: "B".into(),
+            track_number: None,
+            disc_number: None,
+            duration_secs: 180,
+            year: None,
+            genre: None,
+            bit_rate: None,
+            suffix: None,
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: Some("tr-star-art".into()),
+            path: None,
+            starred: true,
+            user_rating: 5,
+            play_count: 3,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now + 2,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-off".into(),
+            title: "Offline".into(),
+            artist_id: None,
+            artist_name: "A".into(),
+            album_id: None,
+            album_name: "B".into(),
+            track_number: None,
+            disc_number: None,
+            duration_secs: 180,
+            year: None,
+            genre: None,
+            bit_rate: None,
+            suffix: None,
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: Some("tr-off-art".into()),
+            path: None,
+            starred: false,
+            user_rating: 0,
+            play_count: 0,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now + 1,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO offline_downloads (track_id, local_path, format, bit_rate, size_bytes, pinned, pin_source, downloaded_at, last_accessed_at) VALUES ('tr-off', '/tmp/tr-off.opus', 'opus', 160, 1024, 1, 'track', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(core.pool())
+    .await
+    .unwrap();
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-plain".into(),
+            title: "Unstarred".into(),
+            artist_id: None,
+            artist_name: "A".into(),
+            album_id: None,
+            album_name: "B".into(),
+            track_number: None,
+            disc_number: None,
+            duration_secs: 180,
+            year: None,
+            genre: None,
+            bit_rate: None,
+            suffix: None,
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: Some("tr-ignore-art".into()),
+            path: None,
+            starred: false,
+            user_rating: 0,
+            play_count: 0,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now + 9,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    // 4. Artists: Alpha (fetched next) and Zeta (excluded by limit=6)
+    upsert_artist(
+        core.pool(),
+        &LocalArtist {
+            id: "ar-a".into(),
+            name: "Alpha".into(),
+            album_count: 1,
+            cover_art_id: Some("ar-art-a".into()),
+            starred: false,
+            musicbrainz_id: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    upsert_artist(
+        core.pool(),
+        &LocalArtist {
+            id: "ar-z".into(),
+            name: "Zeta".into(),
+            album_count: 1,
+            cover_art_id: Some("ar-art-z".into()),
+            starred: false,
+            musicbrainz_id: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Offline mode must skip warming entirely.
+    core.set_offline_only(true);
+    assert_eq!(core.warm_cover_art_cache(10, Some(320)).await.unwrap(), 0);
+    assert!(requested_ids.lock().await.is_empty());
+    core.set_offline_only(false);
+
+    // Limit 6 covers: pl-art-1, pl-empty-vinyl (rejected), al-art-2, tr-star-art, tr-off-art, ar-art-a.
+    // Expect 5 newly cached items (pl-empty-vinyl is rejected as placeholder).
+    let warmed = core.warm_cover_art_cache(6, Some(320)).await.unwrap();
+    assert_eq!(warmed, 5);
+
+    let reqs: HashSet<String> = requested_ids.lock().await.iter().cloned().collect();
+    assert!(reqs.contains("pl-art-1"));
+    assert!(reqs.contains("pl-empty-vinyl"));
+    assert!(reqs.contains("al-art-2"));
+    assert!(reqs.contains("tr-star-art"));
+    assert!(reqs.contains("tr-off-art"));
+    assert!(reqs.contains("ar-art-a"));
+    assert!(!reqs.contains("al-cached"), "already cached ID must be skipped");
+    assert!(!reqs.contains("tr-ignore-art"), "non-starred non-offline track must be skipped");
+    assert!(!reqs.contains("ar-art-z"), "artist beyond limit must wait for next pass");
+
+    assert!(core.cover_art_local_path("pl-art-1").await.unwrap().is_some());
+    assert!(core.cover_art_local_path("pl-empty-vinyl").await.unwrap().is_none());
+    assert!(core.cover_art_local_path("ar-art-a").await.unwrap().is_some());
+
+    // Negative cache recorded pl-empty-vinyl in cover_art_missing.
+    let missing_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM cover_art_missing WHERE cover_art_id = 'pl-empty-vinyl'",
+    )
+    .fetch_one(core.pool())
+    .await
+    .unwrap();
+    assert_eq!(missing_count, 1);
+
+    // Also add an HTTP 404 album to verify 404s are negative-cached too.
+    upsert_album(
+        core.pool(),
+        &LocalAlbum {
+            id: "al-404".into(),
+            name: "Missing Art Album".into(),
+            artist_id: None,
+            artist_name: "Artist".into(),
+            year: Some(2025),
+            genre: None,
+            song_count: 1,
+            duration_secs: 200,
+            cover_art_id: Some("al-missing-404".into()),
+            starred: false,
+            created_at: None,
+            updated_at: now + 20,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Second pass with limit=2 skips pl-empty-vinyl (negative-cached!) so al-missing-404 and
+    // ar-art-z both get attempted without pl-empty-vinyl starving ar-art-z.
+    requested_ids.lock().await.clear();
+    let warmed_second = core.warm_cover_art_cache(2, Some(320)).await.unwrap();
+    assert_eq!(warmed_second, 1);
+    let second_reqs: HashSet<String> = requested_ids.lock().await.iter().cloned().collect();
+    assert!(
+        !second_reqs.contains("pl-empty-vinyl"),
+        "negative-cached placeholder ID must not be refetched within 24h TTL"
+    );
+    assert!(second_reqs.contains("al-missing-404"));
+    assert!(second_reqs.contains("ar-art-z"));
+    assert!(core.cover_art_local_path("ar-art-z").await.unwrap().is_some());
+
+    let missing_404: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM cover_art_missing WHERE cover_art_id = 'al-missing-404'",
+    )
+    .fetch_one(core.pool())
+    .await
+    .unwrap();
+    assert_eq!(missing_404, 1);
+
+    // Once valid artwork succeeds for pl-empty-vinyl (e.g. after TTL expiry or explicit fetch),
+    // its negative-cache entry is cleared.
+    heal_pl_empty.store(true, Ordering::SeqCst);
+    sqlx::query("UPDATE cover_art_missing SET checked_at = 0 WHERE cover_art_id = 'pl-empty-vinyl'")
+        .execute(core.pool())
+        .await
+        .unwrap();
+    let warmed_healed = core.warm_cover_art_cache(2, Some(320)).await.unwrap();
+    assert_eq!(warmed_healed, 1);
+    let missing_after_heal: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM cover_art_missing WHERE cover_art_id = 'pl-empty-vinyl'",
+    )
+    .fetch_one(core.pool())
+    .await
+    .unwrap();
+    assert_eq!(missing_after_heal, 0);
+}
+
+#[tokio::test]
+async fn classify_playlist_and_playlist_nodes_sleeves_and_fallback_cover() {
+    use client_core::sync::classify_playlist;
+
+    assert_eq!(
+        classify_playlist("Comfort Zone", None),
+        ("discovery".into(), Some("comfort".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Comfort Mix", None),
+        ("discovery".into(), Some("comfort".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Fresh Picks", None),
+        ("discovery".into(), Some("weekly_radar".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Fresh Arrivals", None),
+        ("discovery".into(), Some("fresh_arrivals".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Christmas Mix", None),
+        ("seasonal".into(), Some("winter_holiday".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Christmas", None),
+        ("seasonal".into(), Some("winter_holiday".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Winter Holiday", None),
+        ("seasonal".into(), Some("winter_holiday".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("Holiday Mix", None),
+        ("seasonal".into(), Some("winter_holiday".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("NOËL", None),
+        ("seasonal".into(), Some("winter_holiday".into()), true)
+    );
+    // Personal user playlists containing "Holiday" or "Noel" must NOT be hijacked as seasonal.
+    assert_eq!(
+        classify_playlist("Summer Holiday Roadtrip", None),
+        ("user".into(), None, false)
+    );
+    assert_eq!(
+        classify_playlist("Noel Gallagher Essentials", None),
+        ("user".into(), None, false)
+    );
+    // Explicit soulbeet:contextual slug still takes precedence over name heuristics.
+    assert_eq!(
+        classify_playlist("Holiday Cozy", Some("soulbeet:contextual:cozy_winter")),
+        ("seasonal".into(), Some("cozy_winter".into()), true)
+    );
+    assert_eq!(
+        classify_playlist("[T] 3+ Stars - Random", Some("Smart playlist")),
+        ("smart".into(), None, true)
+    );
+
+    // Verify playlist_nodes: curated playlists get sleeve_slug with cover_art_id cleared,
+    // while user/custom smart playlists keep cover_art_id or fall back to first track's cover_art_id.
+    let dir = TempDir::new().unwrap();
+    let core = SoulbeetCore::init(test_config(&dir, None, 10_000_000))
+        .await
+        .unwrap();
+    let now = now_unix();
+
+    upsert_track(
+        core.pool(),
+        &LocalTrack {
+            id: "tr-rot-1".into(),
+            title: "First Track".into(),
+            artist_id: None,
+            artist_name: "Artist".into(),
+            album_id: None,
+            album_name: "Album".into(),
+            track_number: Some(1),
+            disc_number: Some(1),
+            duration_secs: 200,
+            year: Some(2024),
+            genre: None,
+            bit_rate: None,
+            suffix: None,
+            content_type: None,
+            size_bytes: None,
+            cover_art_id: Some("ca-first-track".into()),
+            path: None,
+            starred: false,
+            user_rating: 4,
+            play_count: 1,
+            last_played_at: None,
+            musicbrainz_id: None,
+            is_discovery: false,
+            updated_at: now,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Custom smart playlist with explicit Navidrome pl-* collage cover art
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-3star-random".into(),
+            name: "[T] 3+ Stars - Random".into(),
+            comment: Some("Smart playlist".into()),
+            owner: Some("alice".into()),
+            song_count: 10,
+            duration_secs: 2000,
+            cover_art_id: Some("pl-collage-3star".into()),
+            is_smart: true,
+            kind: "smart".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now + 3,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Custom smart playlist with empty cover_art_id -> falls back to first track's cover_art_id
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-3star-rot".into(),
+            name: "[T] 3+ Stars - Rotation 2 days".into(),
+            comment: Some("Smart playlist".into()),
+            owner: Some("alice".into()),
+            song_count: 1,
+            duration_secs: 200,
+            cover_art_id: None,
+            is_smart: true,
+            kind: "smart".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now + 2,
+        },
+    )
+    .await
+    .unwrap();
+    replace_playlist_tracks(core.pool(), "pl-3star-rot", &["tr-rot-1".to_string()])
+        .await
+        .unwrap();
+
+    // Curated playlist that landed in kind="user" -> gets sleeve_slug and clears cover_art_id
+    upsert_playlist(
+        core.pool(),
+        &LocalPlaylist {
+            id: "pl-summer-user".into(),
+            name: "Summer Vibes".into(),
+            comment: None,
+            owner: Some("alice".into()),
+            song_count: 8,
+            duration_secs: 1600,
+            cover_art_id: Some("pl-summer-art".into()),
+            is_smart: false,
+            kind: "user".into(),
+            slug: None,
+            changed_at: None,
+            updated_at: now + 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let nodes = core.auto_browse().children(AUTO_TAB_PLAYLISTS, false).await.unwrap();
+
+    let random_pl = nodes.iter().find(|n| n.id == "playlist:pl-3star-random").unwrap();
+    assert_eq!(random_pl.sleeve_slug, None);
+    assert_eq!(random_pl.cover_art_id.as_deref(), Some("pl-collage-3star"));
+
+    let rot_pl = nodes.iter().find(|n| n.id == "playlist:pl-3star-rot").unwrap();
+    assert_eq!(rot_pl.sleeve_slug, None);
+    assert_eq!(rot_pl.cover_art_id.as_deref(), Some("ca-first-track"));
+
+    let summer_pl = nodes.iter().find(|n| n.id == "playlist:pl-summer-user").unwrap();
+    assert_eq!(summer_pl.sleeve_slug.as_deref(), Some("summer"));
+    assert_eq!(summer_pl.cover_art_id, None);
+    assert_eq!(summer_pl.cover_art_local_path, None);
+}

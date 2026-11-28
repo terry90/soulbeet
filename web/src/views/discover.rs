@@ -11,10 +11,10 @@ use shared::recommendation::{
 use shared::system::NavidromeStatus;
 use ui::{
     format_discovery_badge, format_mix_subtitle, format_mix_title, format_mix_window_badge,
-    friendly_error, subsonic_cover_art_url, use_player, IconCheck, IconHeart, IconLoader,
-    IconMusic, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSkipForward, IconSparkles,
-    IconThumbsDown, MixSleeveShelves, PlayerTrack, SeasonalHeroCard, StarStrip, StarStripSize,
-    TasteDnaBar, TrackRow, TrackRowState,
+    friendly_error, use_player, web_cover_art_url, ArtFallbackKind, CoverImage, IconCheck,
+    IconHeart, IconLoader, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSkipForward,
+    IconSparkles, IconThumbsDown, MixSleeveShelves, PlayerTrack, SeasonalHeroCard, StarStrip,
+    StarStripSize, TasteDnaBar, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -440,7 +440,7 @@ pub fn DiscoverPage() -> Element {
                         .map(|t| {
                             let cover = nav
                                 .as_ref()
-                                .map(|i| subsonic_cover_art_url(i, &t.song_id, 256));
+                                .map(|_| web_cover_art_url(&t.song_id, 256));
                             let mut pt = PlayerTrack {
                                 id: t.song_id.clone(),
                                 title: t.title,
@@ -677,10 +677,11 @@ pub fn DiscoverPage() -> Element {
                                             true,
                                         )
                                     },
-                                    if let Some(url) = track.cover_art_url.as_deref() {
-                                        img { src: "{url}", alt: "", class: "w-full h-full object-cover" }
-                                    } else {
-                                        IconMusic { size: 36, class: "text-beet-text-disabled".to_string() }
+                                    CoverImage {
+                                        src: track.cover_art_url.clone(),
+                                        alt: track.title.clone(),
+                                        kind: ArtFallbackKind::Track,
+                                        icon_size: 36,
                                     }
                                     span { class: "absolute inset-0 bg-beet-canvas/55 flex items-center justify-center opacity-90 group-hover:opacity-100 transition-opacity",
                                         span { class: "w-12 h-12 rounded-full bg-beet-leaf-solid text-beet-leaf-ink flex items-center justify-center shadow-lg group-hover:scale-105 transition-transform",

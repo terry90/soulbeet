@@ -29,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
@@ -42,6 +43,8 @@ import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.StarOutline
+import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
@@ -95,6 +98,7 @@ import org.soulbeet.app.theme.LocalSoulbeetColors
 import org.soulbeet.app.theme.LocalSoulbeetTypography
 import org.soulbeet.app.theme.SoulbeetShapes
 import org.soulbeet.media.CoverArtContentProvider
+import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
@@ -137,9 +141,160 @@ fun SeamLightBar(
     )
 }
 
+enum class ArtworkFallbackKind {
+    TRACK,
+    ALBUM,
+    ARTIST,
+    PLAYLIST,
+}
+
+private data class FallbackGradientPalette(
+    val start: Color,
+    val end: Color,
+    val tint: Color,
+)
+
+private val FALLBACK_STUDIO_PALETTES = listOf(
+    FallbackGradientPalette(Color(0xFF281242), Color(0xFF130924), Color(0xFFD8B4FE)),
+    FallbackGradientPalette(Color(0xFF12283A), Color(0xFF110A22), Color(0xFF7DD3FC)),
+    FallbackGradientPalette(Color(0xFF102A26), Color(0xFF100920), Color(0xFF6EE7B7)),
+    FallbackGradientPalette(Color(0xFF34142E), Color(0xFF130922), Color(0xFFF9A8D4)),
+    FallbackGradientPalette(Color(0xFF2E1E16), Color(0xFF130920), Color(0xFFFCD34D)),
+)
+
+private val LEADING_BRACKET_PREFIX = Regex("^\\[[^\\]]*]\\s*")
+
 /**
- * Loads artwork via Coil from [CoverArtContentProvider] (`content://<authority>/art/<coverArtId>`)
- * with zero network blocking, falling back to a refined Midnight Studio monogram tile.
+ * Extracts a clean alphanumeric monogram initial from [title], stripping leading bracketed
+ * prefixes (e.g. `[T] 3+ Stars` -> `3`) and leading punctuation so fallback tiles never show `[`.
+ */
+internal fun extractCleanFallbackInitial(title: String): String? {
+    val trimmed = title.trim()
+    if (trimmed.isEmpty()) return null
+    val withoutPrefix = LEADING_BRACKET_PREFIX.replace(trimmed, "").trim()
+    val source = withoutPrefix.ifEmpty { trimmed }
+    val firstAlnum = source.firstOrNull { it.isLetterOrDigit() } ?: return null
+    return firstAlnum.uppercaseChar().toString()
+}
+
+/**
+ * Resolves a playlist's [slug], [name], and [kind] to a known Midnight Studio Mix Sleeve slug
+ * when it matches a curated/seasonal/moment Soulbeet mix. Returns `null` for regular user
+ * playlists and custom smart playlists (e.g. `[T] 3+ Stars - Random`) so they display Navidrome's
+ * real 2x2 collage or the Midnight Studio playlist emblem fallback.
+ */
+internal fun resolvePlaylistSleeveSlug(
+    name: String,
+    slug: String? = null,
+    kind: String? = null,
+): String? {
+    val trimmedSlug = slug?.trim()?.takeIf { it.isNotEmpty() }
+    if (trimmedSlug != null) {
+        val normalized = normalizeMixSlug(trimmedSlug)
+        if (mixSleeveSpecFor(normalized).motif != MixMotif.FALLBACK) {
+            return normalized
+        }
+    }
+
+    val lowerName = name.trim().lowercase(Locale.ROOT)
+    if (lowerName.isEmpty()) return null
+    val kindLower = kind?.trim()?.lowercase(Locale.ROOT)
+
+    return when {
+        lowerName.contains("fresh picks") || lowerName.contains("weekly radar") || lowerName == "radar" -> "weekly_radar"
+        lowerName.contains("fresh arrivals") -> "fresh_arrivals"
+        lowerName.contains("comfort zone") || lowerName == "comfort" -> "comfort"
+        lowerName.contains("deep cuts") -> "deep_cuts"
+        lowerName.contains("forgotten gems") -> "forgotten_gems"
+        lowerName.contains("drive mix") -> "drive"
+        lowerName.contains("evening unwind") -> "evening_unwind"
+        lowerName.contains("friday night") -> "friday_night"
+        lowerName.contains("sunday morning") -> "sunday_morning"
+        lowerName.contains("morning boost") || lowerName == "morning" -> "morning"
+        lowerName.contains("deep focus") || lowerName == "focus" -> "focus"
+        lowerName.contains("dinner groove") -> "dinner_groove"
+        lowerName.contains("late night") -> "late_night"
+        lowerName.contains("rainy day") -> "rainy_day"
+        lowerName.contains("snow day") -> "snow_day"
+        lowerName.contains("storm night") -> "storm_night"
+        lowerName.contains("sunny day") -> "sunny_day"
+        lowerName.contains("80s") && kindLower != "user" -> "decade_80s"
+        lowerName.contains("90s") && kindLower != "user" -> "decade_90s"
+        (lowerName.contains("2000s") || lowerName.contains("00s")) && kindLower != "user" -> "decade_2000s"
+        lowerName.contains("christmas") ||
+            lowerName.contains("winter holiday") ||
+            lowerName.contains("holiday mix") ||
+            lowerName.contains("noël") ||
+            (kindLower == "seasonal" && lowerName.contains("noel")) -> "winter_holiday"
+        lowerName.contains("new year's eve") || lowerName.contains("new years eve") -> "new_years_eve"
+        lowerName.contains("cozy winter") -> "cozy_winter"
+        lowerName.contains("lunar new year") -> "lunar_new_year"
+        lowerName.contains("valentine") -> "valentines"
+        lowerName.contains("carnival") -> "carnival"
+        lowerName.contains("celtic spring") -> "celtic_spring"
+        lowerName.contains("summer solstice") -> "summer_solstice"
+        lowerName.contains("late summer") -> "late_summer_reset"
+        lowerName.contains("halloween") -> "halloween"
+        kindLower == "seasonal" && lowerName.contains("spring") -> "spring"
+        kindLower == "seasonal" && lowerName.contains("summer") -> "summer"
+        kindLower == "seasonal" && lowerName.contains("autumn") -> "autumn"
+        else -> null
+    }
+}
+
+/**
+ * Renders artwork for a playlist card, row, or detail header:
+ * - Known Soulbeet Mixes (by [slug] or curated mix name) render their crisp [MixSleeveBackdrop].
+ * - User playlists and custom smart playlists (such as `[T] 3+ Stars - Random`) load Navidrome's
+ *   2x2 collage via [TrackArtwork] and fall back to a Midnight Studio playlist emblem tile.
+ */
+@Composable
+fun PlaylistArtwork(
+    name: String,
+    coverArtId: String?,
+    artAuthority: String,
+    size: Dp,
+    modifier: Modifier = Modifier,
+    slug: String? = null,
+    kind: String? = null,
+    shape: Shape = SoulbeetShapes.xs,
+    showBorder: Boolean = true,
+) {
+    val sleeveSlug = remember(name, slug, kind) {
+        resolvePlaylistSleeveSlug(name = name, slug = slug, kind = kind)
+    }
+    if (sleeveSlug != null) {
+        val spec = remember(sleeveSlug) { mixSleeveSpecFor(sleeveSlug) }
+        Box(
+            modifier = modifier
+                .size(size)
+                .clip(shape)
+                .then(
+                    if (showBorder) Modifier.border(1.dp, spec.borderColor, shape) else Modifier,
+                ),
+        ) {
+            MixSleeveBackdrop(
+                slug = sleeveSlug,
+                modifier = Modifier.matchParentSize(),
+            )
+        }
+    } else {
+        TrackArtwork(
+            coverArtId = coverArtId,
+            artAuthority = artAuthority,
+            fallbackTitle = name,
+            size = size,
+            modifier = modifier,
+            shape = shape,
+            showBorder = showBorder,
+            fallbackKind = ArtworkFallbackKind.PLAYLIST,
+        )
+    }
+}
+
+/**
+ * Loads artwork via Coil from [CoverArtContentProvider] (`content://<authority>/art/<coverArtId>`),
+ * falling back to a refined Midnight Studio emblem or clean alphanumeric monogram tile.
  */
 @Composable
 fun TrackArtwork(
@@ -150,6 +305,7 @@ fun TrackArtwork(
     modifier: Modifier = Modifier,
     shape: Shape = SoulbeetShapes.xs,
     showBorder: Boolean = true,
+    fallbackKind: ArtworkFallbackKind = ArtworkFallbackKind.TRACK,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -159,6 +315,10 @@ fun TrackArtwork(
             CoverArtContentProvider.uriFor(artAuthority, it)
         }
     }
+    val palette = remember(fallbackTitle, fallbackKind) {
+        val seed = "${fallbackKind.name}:${fallbackTitle.trim().lowercase(Locale.ROOT)}"
+        FALLBACK_STUDIO_PALETTES[(seed.hashCode() and 0x7FFFFFFF) % FALLBACK_STUDIO_PALETTES.size]
+    }
 
     val placeholder: @Composable (Boolean) -> Unit = { drawBorder ->
         Box(
@@ -167,30 +327,58 @@ fun TrackArtwork(
                 .clip(shape)
                 .background(
                     Brush.linearGradient(
-                        colors = listOf(colors.surfaceHigh, colors.surfaceLow),
+                        colors = if (fallbackKind == ArtworkFallbackKind.PLAYLIST) {
+                            listOf(palette.start, palette.end)
+                        } else {
+                            listOf(colors.surfaceHigh, colors.surfaceLow)
+                        },
                         start = Offset.Zero,
-                        end = Offset(120f, 120f),
+                        end = Offset(140f, 140f),
                     ),
                 )
                 .then(
-                    if (drawBorder) Modifier.border(1.dp, colors.borderSubtle, shape) else Modifier,
+                    if (drawBorder) {
+                        val borderColor = if (fallbackKind == ArtworkFallbackKind.PLAYLIST) {
+                            palette.tint.copy(alpha = 0.28f)
+                        } else {
+                            colors.borderSubtle
+                        }
+                        Modifier.border(1.dp, borderColor, shape)
+                    } else {
+                        Modifier
+                    },
                 ),
             contentAlignment = Alignment.Center,
         ) {
-            val initial = fallbackTitle.trim().firstOrNull()?.uppercaseChar()?.toString()
-            if (initial != null && size >= 44.dp) {
-                Text(
-                    text = initial,
-                    style = if (size >= 120.dp) type.display else type.titleMd,
-                    color = colors.textMuted,
+            if (fallbackKind == ArtworkFallbackKind.PLAYLIST) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.QueueMusic,
+                    contentDescription = null,
+                    tint = palette.tint,
+                    modifier = Modifier.size((size * 0.44f).coerceIn(18.dp, 44.dp)),
                 )
             } else {
-                Icon(
-                    imageVector = Icons.Filled.MusicNote,
-                    contentDescription = null,
-                    tint = colors.textMuted,
-                    modifier = Modifier.size((size * 0.45f).coerceIn(16.dp, 40.dp)),
-                )
+                val initial = remember(fallbackTitle) { extractCleanFallbackInitial(fallbackTitle) }
+                if (initial != null && size >= 44.dp) {
+                    Text(
+                        text = initial,
+                        style = if (size >= 120.dp) type.display else type.titleMd,
+                        color = colors.textMuted,
+                    )
+                } else {
+                    val fallbackIcon = when (fallbackKind) {
+                        ArtworkFallbackKind.ALBUM -> Icons.Rounded.Album
+                        ArtworkFallbackKind.ARTIST -> Icons.Rounded.Person
+                        ArtworkFallbackKind.TRACK -> Icons.Filled.MusicNote
+                        ArtworkFallbackKind.PLAYLIST -> Icons.AutoMirrored.Rounded.QueueMusic
+                    }
+                    Icon(
+                        imageVector = fallbackIcon,
+                        contentDescription = null,
+                        tint = colors.textMuted,
+                        modifier = Modifier.size((size * 0.45f).coerceIn(16.dp, 40.dp)),
+                    )
+                }
             }
         }
     }

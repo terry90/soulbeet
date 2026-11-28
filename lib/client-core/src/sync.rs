@@ -382,6 +382,12 @@ impl SyncEngine {
             };
 
             let mut tx = self.pool.begin().await?;
+            let normalized_cover_art = pl
+                .cover_art
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
             upsert_playlist_exec(
                 &mut *tx,
                 &LocalPlaylist {
@@ -391,7 +397,7 @@ impl SyncEngine {
                     owner: pl.owner.clone(),
                     song_count: initial_song_count,
                     duration_secs: initial_duration_secs,
-                    cover_art_id: pl.cover_art.clone(),
+                    cover_art_id: normalized_cover_art.clone(),
                     is_smart,
                     kind,
                     slug,
@@ -404,13 +410,23 @@ impl SyncEngine {
             if let Some(detail) = detail_opt {
                 let mut track_ids = Vec::with_capacity(detail.entry.len());
                 let mut total_duration_secs: i64 = 0;
+                let mut first_track_cover_art: Option<String> = None;
                 for song in detail.entry {
                     total_duration_secs += song.duration.max(0);
                     let track_id = song.id.clone();
                     if full_sync {
                         synced_track_ids.insert(track_id.clone());
                     }
-                    upsert_track_exec(&mut *tx, &song_to_local(song, now), false).await?;
+                    let local_song = song_to_local(song, now);
+                    if first_track_cover_art.is_none() {
+                        first_track_cover_art = local_song
+                            .cover_art_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string);
+                    }
+                    upsert_track_exec(&mut *tx, &local_song, false).await?;
                     track_ids.push(track_id);
                 }
                 replace_playlist_tracks_tx(&mut tx, &pl.id, &track_ids).await?;
@@ -420,15 +436,55 @@ impl SyncEngine {
                 } else {
                     detail.duration
                 };
+                let effective_cover_art = normalized_cover_art.or(first_track_cover_art);
                 sqlx::query(
-                    "UPDATE playlists SET song_count = ?, duration_secs = ?, updated_at = ? WHERE id = ?",
+                    r#"
+                    UPDATE playlists
+                    SET song_count = ?,
+                        duration_secs = ?,
+                        cover_art_id = COALESCE(NULLIF(TRIM(cover_art_id), ''), ?),
+                        updated_at = ?
+                    WHERE id = ?
+                    "#,
                 )
                 .bind(live_song_count)
                 .bind(live_duration_secs)
+                .bind(&effective_cover_art)
                 .bind(now)
                 .bind(&pl.id)
                 .execute(&mut *tx)
                 .await?;
+            } else if normalized_cover_art.is_none() {
+                let first_track_cover_art: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT t.cover_art_id
+                    FROM playlist_tracks pt
+                    INNER JOIN tracks t ON t.id = pt.track_id
+                    WHERE pt.playlist_id = ?
+                      AND t.cover_art_id IS NOT NULL
+                      AND TRIM(t.cover_art_id) != ''
+                    ORDER BY pt.position ASC
+                    LIMIT 1
+                    "#,
+                )
+                .bind(&pl.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(fallback_art) = first_track_cover_art {
+                    sqlx::query(
+                        r#"
+                        UPDATE playlists
+                        SET cover_art_id = COALESCE(NULLIF(TRIM(cover_art_id), ''), ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        "#,
+                    )
+                    .bind(&fallback_art)
+                    .bind(now)
+                    .bind(&pl.id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
             tx.commit().await?;
             report.playlists_synced += 1;
@@ -1137,7 +1193,7 @@ impl SyncEngine {
                             suffix: None,
                             content_type: None,
                             size_bytes: None,
-                            cover_art_id: None,
+                            cover_art_id: (!mt.song_id.trim().is_empty()).then(|| mt.song_id.clone()),
                             path: None,
                             starred: mt.starred,
                             user_rating: i64::from(mt.rating.unwrap_or(0)),
@@ -1339,20 +1395,47 @@ fn is_moment_slug(slug: &str) -> bool {
 }
 
 fn infer_discovery_slug(lower_name: &str) -> Option<String> {
-    if lower_name.contains("weekly radar") || lower_name.contains("balanced") {
+    if lower_name.contains("weekly radar")
+        || lower_name.contains("fresh picks")
+        || lower_name.contains("balanced")
+    {
         Some("weekly_radar".to_string())
     } else if lower_name.contains("comfort") || lower_name.contains("conservative") {
         Some("comfort".to_string())
     } else if lower_name.contains("deep cuts") || lower_name.contains("adventurous") {
         Some("deep_cuts".to_string())
+    } else if lower_name.contains("fresh arrivals") {
+        Some("fresh_arrivals".to_string())
     } else {
         None
     }
 }
 
-fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<String>, bool) {
-    let lower_name = name.to_ascii_lowercase();
-    let lower_comment = comment.unwrap_or_default().to_ascii_lowercase();
+fn is_canonical_winter_holiday_name(lower_name: &str) -> bool {
+    let trimmed = lower_name.trim();
+    let stripped = trimmed
+        .strip_prefix("soulbeet:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    matches!(
+        stripped,
+        "christmas"
+            | "christmas mix"
+            | "winter holiday"
+            | "winter holiday mix"
+            | "holiday mix"
+            | "noël"
+            | "noel"
+            | "noël mix"
+            | "noel mix"
+            | "noël à la française"
+            | "noel a la francaise"
+    )
+}
+
+pub fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<String>, bool) {
+    let lower_name = name.to_lowercase();
+    let lower_comment = comment.unwrap_or_default().to_lowercase();
 
     if let Some(rest) = lower_comment.split("soulbeet:contextual:").nth(1) {
         let slug = rest
@@ -1381,16 +1464,32 @@ fn classify_playlist(name: &str, comment: Option<&str>) -> (String, Option<Strin
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .map(ToString::to_string)
-            .or_else(|| Some(slugify(&lower_name)));
+            .or_else(|| {
+                if is_canonical_winter_holiday_name(&lower_name) {
+                    Some("winter_holiday".to_string())
+                } else {
+                    Some(slugify(&lower_name))
+                }
+            });
         return ("seasonal".to_string(), slug, true);
     }
     if lower_name.contains("weekly radar")
         || lower_name.contains("comfort mix")
+        || lower_name.contains("comfort zone")
         || lower_name.contains("deep cuts")
+        || lower_name.contains("fresh picks")
+        || lower_name.contains("fresh arrivals")
         || lower_name.contains("discovery")
     {
         let slug = infer_discovery_slug(&lower_name).or_else(|| Some(slugify(&lower_name)));
         return ("discovery".to_string(), slug, true);
+    }
+    if is_canonical_winter_holiday_name(&lower_name) {
+        return (
+            "seasonal".to_string(),
+            Some("winter_holiday".to_string()),
+            true,
+        );
     }
     if lower_comment.contains("moment:")
         || lower_name.contains("drive mix")

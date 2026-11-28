@@ -107,6 +107,9 @@ data class QuickResumeItem(
     val coverArtId: String?,
     val isOfflineReady: Boolean,
     val containerMediaId: String,
+    val isPlaylist: Boolean = false,
+    val playlistSlug: String? = null,
+    val playlistKind: String? = null,
 )
 
 data class TriageCardItem(
@@ -132,6 +135,8 @@ data class ContainerDetailUi(
     val pinTarget: FfiPinTarget?,
     val isPinned: Boolean,
     val tracks: List<FfiTrack>,
+    val slug: String? = null,
+    val playlistKind: String? = null,
 ) {
     val isStaticUserPlaylist: Boolean get() = kind == ContainerKind.USER_PLAYLIST
     val isSmartOrSystemPlaylist: Boolean get() = kind == ContainerKind.SMART_PLAYLIST
@@ -321,6 +326,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var containerDetailJob: Job? = null
     private val containerDetailGeneration = java.util.concurrent.atomic.AtomicLong(0L)
     private var connectWsJob: Job? = null
+    private var coverArtWarmJob: Job? = null
     private var lyricsJob: Job? = null
     private var lyricsFetchSeq: Long = 0L
     private var eventListenerAttachedCore: WeakReference<CoreClient>? = null
@@ -553,10 +559,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             _uiState.update { it.copy(isConnecting = false, connectError = null, isSyncing = true) }
-            withContext(Dispatchers.IO) {
-                runCatching { core.syncNow(forceFull = false) }
+            val syncSucceeded = withContext(Dispatchers.IO) {
+                runCatching { core.syncNow(forceFull = false) }.isSuccess
             }
             _uiState.update { it.copy(isSyncing = false) }
+            if (syncSucceeded) {
+                warmCoverArtInBackground(core)
+            }
             refreshLibrarySnapshot()
             refreshRemoteDiscoveryData()
             connectWsIfOnline(core)
@@ -588,6 +597,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             containerDetailJob?.cancel()
             containerDetailJob = null
             containerDetailGeneration.incrementAndGet()
+            coverArtWarmJob?.cancel()
+            coverArtWarmJob = null
             _uiState.update { it.copy(showSettingsSheet = false, showNowPlayingSheet = false) }
             undoController.undo()
             mediaBridge.stopAndClear()
@@ -802,6 +813,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 onSuccess = { report ->
                     refreshLibrarySnapshot()
                     refreshRemoteDiscoveryData()
+                    warmCoverArtInBackground(core)
                     showNotice("Synced ${report.tracksSynced} tracks · ${report.playlistsSynced} playlists")
                 },
                 onFailure = { err ->
@@ -978,7 +990,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             suffix = null,
                             contentType = null,
                             sizeBytes = null,
-                            coverArtId = null,
+                            coverArtId = mt.songId.takeIf { it.isNotBlank() },
                             path = null,
                             starred = mt.starred,
                             userRating = mt.rating.toLong(),
@@ -1123,7 +1135,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         suffix = null,
                         contentType = null,
                         sizeBytes = null,
-                        coverArtId = null,
+                        coverArtId = mt.songId.takeIf { it.isNotBlank() },
                         path = null,
                         starred = mt.starred,
                         userRating = mt.rating.toLong(),
@@ -2391,6 +2403,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         pinTarget = target,
                         isPinned = isPinned(target),
                         tracks = tracks,
+                        slug = playlist.slug,
+                        playlistKind = playlist.kind,
                     ),
                 )
             }
@@ -2989,6 +3003,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    private fun warmCoverArtInBackground(core: CoreClient, maxItems: UInt = 40u) {
+        if (core.isOfflineOnly() || _uiState.value.config.offlineOnly) return
+        if (coverArtWarmJob?.isActive == true) return
+        coverArtWarmJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core.warmCoverArtCache(maxItems = maxItems, size = 512u)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Best-effort background cover art warming after foreground sync.
+            }
+        }
+    }
+
     private fun connectWsIfOnline(
         core: CoreClient,
         cfg: PersistedAppConfig = _uiState.value.config,
@@ -3074,6 +3102,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             coverArtId = pl.coverArtId,
                             isOfflineReady = pinned,
                             containerMediaId = "${AutoBrowseTree.PREFIX_PLAYLIST}${pl.id}",
+                            isPlaylist = true,
+                            playlistSlug = pl.slug,
+                            playlistKind = pl.kind,
                         ),
                     )
                 }

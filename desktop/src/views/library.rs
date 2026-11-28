@@ -2,14 +2,31 @@
 //! Pin/Unpin offline playlists & albums, Playlist CRUD (create/rename/delete/add/remove),
 //! Album & Artist Detail views, local track browser, and Sync Now / Outbox controls.
 
-use client_core::models::PinTarget;
+use client_core::models::{LocalPlaylist, PinTarget};
 use dioxus::prelude::*;
 use ui::{
-    classify_local_playlist_category, format_duration, use_player, ConfirmModal, IconChevronLeft,
-    IconCloudCheck, IconCompass, IconDownload, IconListMusic, IconListPlus, IconMusic, IconPlay,
-    IconPlus, IconRadio, IconRefreshCw, IconShuffle, IconSlidersHorizontal, IconSparkles,
-    IconTrash2, IconX, Modal, PlaylistCategory, TrackRow, TrackRowState,
+    classify_local_playlist_category, format_duration, resolve_playlist_mix_sleeve_slug,
+    use_player, ArtFallbackKind, ConfirmModal, CoverImage, IconChevronLeft, IconCloudCheck,
+    IconDownload, IconListPlus, IconPlay, IconPlus, IconRefreshCw, IconShuffle,
+    IconSlidersHorizontal, IconTrash2, IconX, Modal, PlaylistArtwork, PlaylistCategory, TrackRow,
+    TrackRowState,
 };
+
+fn desktop_playlist_cover_url(pl: &LocalPlaylist) -> Option<String> {
+    if let Some(cid) = pl
+        .cover_art_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return desktop_cover_art_url(Some(cid));
+    }
+    let id = pl.id.trim();
+    if !id.is_empty() && pl.song_count > 0 {
+        return desktop_cover_art_url(Some(&format!("pl-{id}")));
+    }
+    None
+}
 
 use crate::desktop_state::{
     desktop_cover_art_url, load_album_detail, load_artist_detail, load_library_albums,
@@ -399,40 +416,58 @@ pub fn LibraryView() -> Element {
                                         .filter_map(|t| t.duration_secs)
                                         .sum();
 
+                                    let mix_slug = resolve_playlist_mix_sleeve_slug(
+                                        pl_item.playlist.slug.as_deref(),
+                                        &pl_name,
+                                        pl_item.playlist.comment.as_deref(),
+                                    );
+                                    let pl_cover_url = desktop_playlist_cover_url(&pl_item.playlist);
+
                                     rsx! {
                                         // Playlist Header Card
                                         div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-4 space-y-3",
                                             div { class: "flex flex-wrap items-start justify-between gap-3",
-                                                div { class: "min-w-0 space-y-1",
-                                                    div { class: "flex items-center gap-2 flex-wrap",
-                                                        h3 { class: "text-[18px] font-bold text-beet-text-primary truncate",
-                                                            "{pl_name}"
-                                                        }
-                                                        if let Some(tag) = category.badge_label() {
-                                                            span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold tracking-wider text-beet-text-tertiary",
-                                                                "{tag}"
-                                                            }
+                                                div { class: "flex items-center gap-3.5 min-w-0 flex-1",
+                                                    div { class: "w-20 h-20 sm:w-24 sm:h-24 rounded-[10px] overflow-hidden border border-beet-border-subtle shrink-0 flex items-center justify-center",
+                                                        PlaylistArtwork {
+                                                            mix_slug,
+                                                            cover_art_url: pl_cover_url,
+                                                            alt: pl_name.clone(),
+                                                            svg_id_prefix: format!("desk-pl-hdr-{pl_id}"),
+                                                            icon_size: 32,
                                                         }
                                                     }
-                                                    {
-                                                        let track_word = if pl_tracks.len() == 1 {
-                                                            "TRACK"
-                                                        } else {
-                                                            "TRACKS"
-                                                        };
-                                                        rsx! {
-                                                            p { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                                                                if total_secs > 0 {
-                                                                    "{pl_tracks.len()} {track_word} · {format_duration(total_secs)}"
-                                                                } else {
-                                                                    "{pl_tracks.len()} {track_word}"
+                                                    div { class: "min-w-0 space-y-1",
+                                                        div { class: "flex items-center gap-2 flex-wrap",
+                                                            h3 { class: "text-[18px] font-bold text-beet-text-primary truncate",
+                                                                "{pl_name}"
+                                                            }
+                                                            if let Some(tag) = category.badge_label() {
+                                                                span { class: "px-1.5 py-0.5 rounded bg-beet-surface-high border border-beet-border-subtle tabular-nums-mono text-[10px] font-semibold tracking-wider text-beet-text-tertiary",
+                                                                    "{tag}"
                                                                 }
                                                             }
                                                         }
-                                                    }
-                                                    if let Some(ref desc) = visible_comment {
-                                                        p { class: "text-[12px] text-beet-text-secondary",
-                                                            "{desc}"
+                                                        {
+                                                            let track_word = if pl_tracks.len() == 1 {
+                                                                "TRACK"
+                                                            } else {
+                                                                "TRACKS"
+                                                            };
+                                                            rsx! {
+                                                                p { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                                                    if total_secs > 0 {
+                                                                        "{pl_tracks.len()} {track_word} · {format_duration(total_secs)}"
+                                                                    } else {
+                                                                        "{pl_tracks.len()} {track_word}"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(ref desc) = visible_comment {
+                                                            p { class: "text-[12px] text-beet-text-secondary",
+                                                                "{desc}"
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -608,10 +643,11 @@ pub fn LibraryView() -> Element {
                                         // Album Header Card
                                         div { class: "rounded-[14px] bg-beet-surface border border-beet-border-subtle p-5 flex flex-col sm:flex-row items-start sm:items-center gap-5",
                                             div { class: "w-32 h-32 rounded-[10px] overflow-hidden bg-beet-surface-high border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                                                if let Some(u) = art {
-                                                    img { src: "{u}", alt: "{album.name}", class: "w-full h-full object-cover" }
-                                                } else {
-                                                    IconMusic { size: 36, class: "text-beet-text-disabled".to_string() }
+                                                CoverImage {
+                                                    src: art,
+                                                    alt: album.name.clone(),
+                                                    kind: ArtFallbackKind::Album,
+                                                    icon_size: 36,
                                                 }
                                             }
                                             div { class: "flex-1 min-w-0 space-y-2.5",
@@ -784,10 +820,11 @@ pub fn LibraryView() -> Element {
                                                     class: "group rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 flex flex-col gap-2 cursor-pointer transition-colors",
                                                     onclick: move |_| studio.selected_album_id.set(Some(aid_open.clone())),
                                                     div { class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center",
-                                                        if let Some(u) = art {
-                                                            img { src: "{u}", alt: "{album.name}", class: "w-full h-full object-cover" }
-                                                        } else {
-                                                            IconMusic { size: 26, class: "text-beet-text-disabled".to_string() }
+                                                        CoverImage {
+                                                            src: art,
+                                                            alt: album.name.clone(),
+                                                            kind: ArtFallbackKind::Album,
+                                                            icon_size: 26,
                                                         }
                                                         button {
                                                             r#type: "button",
@@ -867,10 +904,12 @@ pub fn LibraryView() -> Element {
 
                                         div { class: "rounded-[14px] bg-beet-surface border border-beet-border-subtle p-5 flex flex-col sm:flex-row items-start sm:items-center gap-5",
                                             div { class: "w-24 h-24 rounded-full overflow-hidden bg-beet-surface-high border border-beet-border-subtle shrink-0 flex items-center justify-center",
-                                                if let Some(u) = art {
-                                                    img { src: "{u}", alt: "{artist.name}", class: "w-full h-full object-cover" }
-                                                } else {
-                                                    IconMusic { size: 30, class: "text-beet-text-disabled".to_string() }
+                                                CoverImage {
+                                                    src: art,
+                                                    alt: artist.name.clone(),
+                                                    kind: ArtFallbackKind::Artist,
+                                                    icon_size: 30,
+                                                    rounded_full: true,
                                                 }
                                             }
                                             div { class: "flex-1 min-w-0 space-y-2.5",
@@ -925,10 +964,11 @@ pub fn LibraryView() -> Element {
                                                                     class: "group rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-2.5 flex flex-col gap-2 cursor-pointer transition-colors",
                                                                     onclick: move |_| studio.open_album_detail(aid_open.clone()),
                                                                     div { class: "relative aspect-square w-full rounded-[8px] overflow-hidden bg-beet-surface-high flex items-center justify-center",
-                                                                        if let Some(u) = alb_art {
-                                                                            img { src: "{u}", alt: "{album.name}", class: "w-full h-full object-cover" }
-                                                                        } else {
-                                                                            IconMusic { size: 24, class: "text-beet-text-disabled".to_string() }
+                                                                        CoverImage {
+                                                                            src: alb_art,
+                                                                            alt: album.name.clone(),
+                                                                            kind: ArtFallbackKind::Album,
+                                                                            icon_size: 24,
                                                                         }
                                                                         button {
                                                                             r#type: "button",
@@ -1062,10 +1102,12 @@ pub fn LibraryView() -> Element {
                                                         class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle hover:border-beet-border-default p-3 flex flex-col items-center text-center gap-2.5 cursor-pointer transition-colors",
                                                         onclick: move |_| studio.selected_artist_id.set(Some(arid.clone())),
                                                         div { class: "w-20 h-20 rounded-full overflow-hidden bg-beet-surface-high border border-beet-border-subtle flex items-center justify-center",
-                                                            if let Some(u) = art {
-                                                                img { src: "{u}", alt: "{artist.name}", class: "w-full h-full object-cover" }
-                                                            } else {
-                                                                IconMusic { size: 24, class: "text-beet-text-disabled".to_string() }
+                                                            CoverImage {
+                                                                src: art,
+                                                                alt: artist.name.clone(),
+                                                                kind: ArtFallbackKind::Artist,
+                                                                icon_size: 24,
+                                                                rounded_full: true,
                                                             }
                                                         }
                                                         div { class: "w-full min-w-0",
@@ -1385,19 +1427,18 @@ fn DesktopPlaylistRow(
                 r#type: "button",
                 class: "flex items-center gap-2.5 flex-1 min-w-0 text-left cursor-pointer",
                 onclick: move |_| on_select.call(pid_select.clone()),
-                match category {
-                    PlaylistCategory::Seasonal => rsx! {
-                        IconSparkles { size: 15, class: "text-beet-accent-text shrink-0".to_string() }
-                    },
-                    PlaylistCategory::Discovery => rsx! {
-                        IconCompass { size: 15, class: "text-beet-accent-text shrink-0".to_string() }
-                    },
-                    PlaylistCategory::MomentMix => rsx! {
-                        IconRadio { size: 15, class: "text-beet-leaf-text shrink-0".to_string() }
-                    },
-                    PlaylistCategory::Smart | PlaylistCategory::User => rsx! {
-                        IconListMusic { size: 15, class: "text-beet-text-tertiary shrink-0".to_string() }
-                    },
+                div { class: "w-10 h-10 rounded-[8px] overflow-hidden border border-beet-border-subtle shrink-0 flex items-center justify-center",
+                    PlaylistArtwork {
+                        mix_slug: resolve_playlist_mix_sleeve_slug(
+                            item.playlist.slug.as_deref(),
+                            &item.playlist.name,
+                            item.playlist.comment.as_deref(),
+                        ),
+                        cover_art_url: desktop_playlist_cover_url(&item.playlist),
+                        alt: item.playlist.name.clone(),
+                        svg_id_prefix: format!("desk-pl-row-{}", item.playlist.id),
+                        icon_size: 18,
+                    }
                 }
                 div { class: "min-w-0 space-y-0.5",
                     p { class: "text-[13px] font-semibold text-beet-text-primary truncate", "{item.playlist.name}" }

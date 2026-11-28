@@ -27,11 +27,13 @@ import org.soulbeet.app.ui.components.MixMotif
 import org.soulbeet.app.ui.components.MixShelfBucket
 import org.soulbeet.app.ui.components.ViewBoxScaleMode
 import org.soulbeet.app.ui.components.classifyMixShelf
+import org.soulbeet.app.ui.components.extractCleanFallbackInitial
 import org.soulbeet.app.ui.components.formatMixSleeveMeta
 import org.soulbeet.app.ui.components.formatMixSleeveTag
 import org.soulbeet.app.ui.components.mixSleeveSpecFor
 import org.soulbeet.app.ui.components.motifViewBoxSpecFor
 import org.soulbeet.app.ui.components.normalizeMixSlug
+import org.soulbeet.app.ui.components.resolvePlaylistSleeveSlug
 import org.soulbeet.app.ui.components.seasonalHeroScrimSpec
 import org.soulbeet.core.FfiAudioQualityProfile
 
@@ -1129,5 +1131,38 @@ class FormattingAndThemeTest {
         val albumContainer = userPlaylist.copy(kind = ContainerKind.ALBUM)
         assertFalse(albumContainer.isStaticUserPlaylist)
         assertFalse(albumContainer.isSmartOrSystemPlaylist)
+    }
+
+    @Test
+    fun playlistSleeveResolutionAndCleanFallbackInitialsHandleSmartPlaylists() {
+        // Explicit slugs resolve to canonical sleeve slugs.
+        assertEquals("winter_holiday", resolvePlaylistSleeveSlug("Custom Name", slug = "mix.seasonal.winter_holiday"))
+        assertEquals("drive_mix", resolvePlaylistSleeveSlug("My Commute", slug = "drive_mix"))
+        assertEquals(MixMotif.DRIVE, mixSleeveSpecFor("drive_mix").motif)
+
+        // Curated mix titles resolve even without explicit slug.
+        assertEquals("weekly_radar", resolvePlaylistSleeveSlug("Fresh Picks", slug = null, kind = "discovery"))
+        assertEquals("fresh_arrivals", resolvePlaylistSleeveSlug("Fresh Arrivals", slug = null, kind = "moment"))
+        assertEquals("comfort", resolvePlaylistSleeveSlug("Comfort Zone", slug = null, kind = "discovery"))
+        assertEquals("deep_cuts", resolvePlaylistSleeveSlug("Deep Cuts", slug = null, kind = "discovery"))
+        assertEquals("weekly_radar", resolvePlaylistSleeveSlug("Weekly Radar", slug = null, kind = "discovery"))
+        assertEquals("winter_holiday", resolvePlaylistSleeveSlug("Noël à la Française", slug = null, kind = "seasonal"))
+        assertEquals("winter_holiday", resolvePlaylistSleeveSlug("Christmas Mix", slug = null, kind = "seasonal"))
+        assertEquals("winter_holiday", resolvePlaylistSleeveSlug("Holiday Mix", slug = null, kind = "seasonal"))
+        assertEquals("drive", resolvePlaylistSleeveSlug("Drive Mix", slug = null, kind = "moment"))
+
+        // Custom smart playlists and personal user playlists return null so they show real 2x2 art or emblem.
+        assertNull(resolvePlaylistSleeveSlug("[T] 3+ Stars - Random", slug = null, kind = "smart"))
+        assertNull(resolvePlaylistSleeveSlug("[T] 3+ Stars - Rotation 2 days", slug = null, kind = "smart"))
+        assertNull(resolvePlaylistSleeveSlug("Road Trip", slug = null, kind = "user"))
+        assertNull(resolvePlaylistSleeveSlug("Summer Holiday Roadtrip", slug = null, kind = "user"))
+        assertNull(resolvePlaylistSleeveSlug("Noel Gallagher Essentials", slug = null, kind = "user"))
+
+        // Clean fallback monogram strips leading bracket tags and punctuation (never '[').
+        assertEquals("3", extractCleanFallbackInitial("[T] 3+ Stars - Random"))
+        assertEquals("A", extractCleanFallbackInitial("...And Justice for All"))
+        assertEquals("D", extractCleanFallbackInitial("Daft Punk"))
+        assertNull(extractCleanFallbackInitial("   "))
+        assertNull(extractCleanFallbackInitial("[ ] ---"))
     }
 }

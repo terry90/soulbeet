@@ -538,7 +538,20 @@ impl AutoBrowseEngine {
                         ELSE p.song_count
                     END AS song_count,
                     p.duration_secs,
-                    p.cover_art_id,
+                    COALESCE(
+                        NULLIF(TRIM(p.cover_art_id), ''),
+                        (
+                            SELECT t3.cover_art_id
+                            FROM playlist_tracks pt3
+                            INNER JOIN tracks t3 ON t3.id = pt3.track_id
+                            INNER JOIN offline_downloads od3 ON od3.track_id = pt3.track_id
+                            WHERE pt3.playlist_id = p.id
+                              AND t3.cover_art_id IS NOT NULL
+                              AND TRIM(t3.cover_art_id) != ''
+                            ORDER BY pt3.position ASC
+                            LIMIT 1
+                        )
+                    ) AS cover_art_id,
                     p.is_smart,
                     p.kind,
                     p.slug,
@@ -569,7 +582,19 @@ impl AutoBrowseEngine {
                         ELSE p.song_count
                     END AS song_count,
                     p.duration_secs,
-                    p.cover_art_id,
+                    COALESCE(
+                        NULLIF(TRIM(p.cover_art_id), ''),
+                        (
+                            SELECT t3.cover_art_id
+                            FROM playlist_tracks pt3
+                            INNER JOIN tracks t3 ON t3.id = pt3.track_id
+                            WHERE pt3.playlist_id = p.id
+                              AND t3.cover_art_id IS NOT NULL
+                              AND TRIM(t3.cover_art_id) != ''
+                            ORDER BY pt3.position ASC
+                            LIMIT 1
+                        )
+                    ) AS cover_art_id,
                     p.is_smart,
                     p.kind,
                     p.slug,
@@ -598,6 +623,8 @@ impl AutoBrowseEngine {
         let offline_playlists = self.offline_playlist_set().await?;
         for pl in playlists {
             let offline_ready = offline_only || offline_playlists.contains(&pl.id);
+            let sleeve = resolve_playlist_sleeve_slug(&pl);
+            let use_sleeve = sleeve.is_some();
             let subtitle = if pl.is_smart {
                 format!("Smart · {} tracks", pl.song_count)
             } else if offline_ready {
@@ -612,16 +639,19 @@ impl AutoBrowseEngine {
                 kind: AutoBrowseKind::Playlist,
                 playable: true,
                 browsable: true,
-                cover_art_local_path: pl
-                    .cover_art_id
-                    .as_deref()
-                    .and_then(|cid| art_map.get(cid))
-                    .cloned(),
-                cover_art_id: pl.cover_art_id,
+                cover_art_local_path: if use_sleeve {
+                    None
+                } else {
+                    pl.cover_art_id
+                        .as_deref()
+                        .and_then(|cid| art_map.get(cid))
+                        .cloned()
+                },
+                cover_art_id: if use_sleeve { None } else { pl.cover_art_id },
                 is_offline_ready: offline_ready,
                 is_pending_discovery: false,
                 group_title: None,
-                sleeve_slug: None,
+                sleeve_slug: sleeve,
             });
         }
         Ok(nodes)
@@ -2202,7 +2232,10 @@ fn resolve_playlist_sleeve_slug(pl: &LocalPlaylist) -> Option<String> {
     let lower = fold_diacritics_ascii(&pl.name);
     if lower.contains("drive") {
         Some("drive".to_string())
-    } else if lower.contains("weekly radar") || lower.contains("balanced") {
+    } else if lower.contains("weekly radar")
+        || lower.contains("fresh picks")
+        || lower.contains("balanced")
+    {
         Some("weekly_radar".to_string())
     } else if lower.contains("comfort") || lower.contains("conservative") {
         Some("comfort".to_string())
