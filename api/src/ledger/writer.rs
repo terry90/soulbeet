@@ -499,7 +499,10 @@ impl Writer {
         if !committed {
             return;
         }
-        let mut rows = self.live.lock().unwrap();
+        let mut rows = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for change in live {
             match change {
                 LiveChange::Set(slot, row) => {
@@ -548,7 +551,10 @@ impl Writer {
                 if self.changes(slot, *state, row) {
                     changed = true;
                 } else if !state.is_terminal() {
-                    self.live.lock().unwrap().insert(slot.clone(), row.clone());
+                    self.live
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(slot.clone(), row.clone());
                 }
             }
             if !changed {

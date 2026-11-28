@@ -320,7 +320,8 @@ impl TransferRegistry {
 
     fn cancel_job_at(&self, job: &str, now: Instant) {
         let mut held = self.held();
-        (held.cancelled_jobs).retain(|_, marked| now.duration_since(*marked) < JOB_MARK_KEPT);
+        (held.cancelled_jobs)
+            .retain(|_, marked| now.saturating_duration_since(*marked) < JOB_MARK_KEPT);
         held.cancelled_jobs.insert(job.to_string(), now);
     }
 

@@ -23,11 +23,12 @@ use tokio::time::Instant;
 use super::enqueue::{stopped_rows, transfer_key};
 use super::failover::{Sent, SourcePool, MAX_SOURCES_PER_TRACK};
 use super::process::{
-    album_jobs, find_on_disk, import_job, resolve_on_disk, unresolved_row, Downloaded, ResolvedSlot,
+    album_jobs, find_on_disk_async, import_job, resolve_on_disk, unresolved_row, Downloaded,
+    ResolvedSlot,
 };
 use super::utils::{file_id, FileId, Unresolved};
 use crate::config::CONFIG;
-use crate::globals::send_user_event;
+use crate::globals::{send_user_event, send_user_event_now};
 use crate::import_queue::IMPORT_QUEUE;
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::services::{BackendLookupError, Backends};
@@ -537,8 +538,9 @@ pub struct DownloadMonitor {
     tracked_files: Vec<TrackedFile>,
     /// Target directory for imports.
     target_path: PathBuf,
-    /// Broadcast sender for UI updates.
-    tx: broadcast::Sender<DownloadEvent>,
+    /// Optional test-local broadcast sender; `None` in production so every update routes
+    /// through the live channel in `USER_CHANNELS` via `send_user_event_now`.
+    tx: Option<broadcast::Sender<DownloadEvent>>,
     /// Per-track state, parallel to `tracked_files` by index.
     track_states: Vec<TrackState>,
     /// Alternate sources per slot, parallel to `tracked_files` by index.
@@ -581,14 +583,33 @@ impl DownloadMonitor {
         shared::backends::service(&self.batch.backend)
     }
 
-    /// Create a new download monitor. The transfers must have been enqueued
-    /// into `batch.destination`. Dropping the monitor closes the batch's
-    /// inbox and releases every registry key the batch holds. Every row it
-    /// sends is recorded in `ledger`.
+    /// Create a production download monitor whose broadcasts always look up the
+    /// user's live channel in `USER_CHANNELS` (preventing channel orphaning).
+    pub fn for_user(
+        transfers: Vec<WatchedTransfer>,
+        target_path: PathBuf,
+        batch: BatchRef,
+        ledger: Ledger,
+    ) -> Self {
+        Self::build(transfers, target_path, None, batch, ledger)
+    }
+
+    /// Create a new download monitor sending UI updates to `tx` (used by unit tests
+    /// that inspect events on an isolated channel).
     pub fn new(
         transfers: Vec<WatchedTransfer>,
         target_path: PathBuf,
         tx: broadcast::Sender<DownloadEvent>,
+        batch: BatchRef,
+        ledger: Ledger,
+    ) -> Self {
+        Self::build(transfers, target_path, Some(tx), batch, ledger)
+    }
+
+    fn build(
+        transfers: Vec<WatchedTransfer>,
+        target_path: PathBuf,
+        tx: Option<broadcast::Sender<DownloadEvent>>,
         batch: BatchRef,
         ledger: Ledger,
     ) -> Self {
@@ -708,11 +729,11 @@ impl DownloadMonitor {
     }
 
     /// The peers this batch is currently waiting on, deduplicated. Follows
-    /// failover: a rebound slot names its new peer.
+    /// failover: a rebound slot names its new peer, and settled/handed-off slots are skipped.
     fn sources(&self) -> Vec<String> {
         let mut sources: Vec<String> = Vec::new();
-        for file in &self.tracked_files {
-            if !sources.contains(&file.source) {
+        for (slot, file) in self.tracked_files.iter().enumerate() {
+            if self.watching(slot) && !sources.contains(&file.source) {
                 sources.push(file.source.clone());
             }
         }
@@ -982,8 +1003,19 @@ impl DownloadMonitor {
     /// in place of `previous_item`'s row, and records it as downloading. One
     /// slot is still one download, so the panel replaces the abandoned
     /// peer's row instead of gaining a second one for the same track.
+    fn emit_event(&self, event: DownloadEvent) {
+        match &self.tx {
+            Some(tx) => {
+                let _ = tx.send(event);
+            }
+            None => {
+                let _ = send_user_event_now(&self.batch.owner.user_id, event);
+            }
+        }
+    }
+
     fn replace_row(&self, previous_item: String, entry: DownloadProgress) {
-        let _ = self.tx.send(DownloadEvent::Replaced {
+        self.emit_event(DownloadEvent::Replaced {
             previous_item,
             entry: Box::new(entry.clone()),
         });
@@ -1476,7 +1508,7 @@ impl DownloadMonitor {
     /// only when no tab is open to receive it, which is no failure: the rows
     /// are recorded, and a tab opened later reads them.
     fn send_rows(&self, rows: Vec<DownloadProgress>) {
-        let _ = self.tx.send(DownloadEvent::Progress(rows));
+        self.emit_event(DownloadEvent::Progress(rows));
     }
 
     /// `entry` marked with the batch and its backend, and with `slot`'s job.
@@ -1595,7 +1627,9 @@ impl DownloadMonitor {
             // so corrupt/silent/truncated/fake-lossless files delete and fail over.
             if self.batch.import_mode != ImportMode::Album && is_completed(&download.state) {
                 let dest = self.tracked_files[slot].destination.as_deref();
-                match find_on_disk(&download.item, &self.download_base, dest, &self.claimed) {
+                match find_on_disk_async(&download.item, &self.download_base, dest, &self.claimed)
+                    .await
+                {
                     Ok(path) => {
                         let policy = self.batch.verify_policy;
                         let expected_s = self.tracked_files[slot].expected_duration_s;
@@ -1644,7 +1678,8 @@ impl DownloadMonitor {
             {
                 let dest = self.tracked_files[slot].destination.as_deref();
                 if let Ok(path) =
-                    find_on_disk(&download.item, &self.download_base, dest, &self.claimed)
+                    find_on_disk_async(&download.item, &self.download_base, dest, &self.claimed)
+                        .await
                 {
                     let policy = self.batch.verify_policy;
                     let expected_s = self.tracked_files[slot].expected_duration_s;
@@ -2296,11 +2331,29 @@ impl DownloadMonitor {
 }
 
 impl Drop for DownloadMonitor {
-    /// Whatever ended the monitor, its batch takes no more slots, and its
-    /// files may be downloaded again by anyone.
+    /// Whatever ended the monitor, its batch takes no more slots, its remaining
+    /// watching slots are failed in the ledger so they never strand unfinished, and
+    /// its files may be downloaded again by anyone.
     fn drop(&mut self) {
         // Nothing can be cancelled here; run() already did unless it never finished.
         let _ = self.close_inbox();
+        let failure = Failure::new(
+            FailureCode::TransferAborted,
+            Stage::Transfer,
+            RetryAdvice::SameSourceLater,
+            "Download monitor stopped unexpectedly",
+        );
+        let mut stranded = Vec::new();
+        for slot in 0..self.tracked_files.len() {
+            if self.watching(slot) {
+                self.track_states[slot].phase = SlotPhase::Settled;
+                let row = make_failed_progress(&self.tracked_files[slot], failure.clone());
+                stranded.push(self.stamp(slot, row));
+            }
+        }
+        if !stranded.is_empty() {
+            self.report(JobState::Failed, stranded);
+        }
         TransferRegistry::global().release_batch(&self.batch.owner);
     }
 }
@@ -4922,7 +4975,7 @@ mod tests {
             &["one.flac"],
         )
         .await;
-        m.tx = tx;
+        m.tx = Some(tx);
         m.batch.import_mode = ImportMode::Singleton;
         let backend: Arc<dyn DownloadBackend> = StubBackend::new(vec![]);
         let listing = || {
@@ -4960,7 +5013,7 @@ mod tests {
             &[],
         )
         .await;
-        m.tx = tx;
+        m.tx = Some(tx);
         m.batch.import_mode = ImportMode::Singleton;
         // Write garbage bytes so post-download verification fails with AudioCorrupt.
         let bad_path = base.path().join(&m.batch.destination).join("bad.flac");

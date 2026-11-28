@@ -41,9 +41,7 @@ use crate::core::folders;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::library::{self, MatchKind, Reference};
 use crate::core::sources::{self, Searched};
-use crate::globals::{
-    get_or_create_user_channel, register_user_task, send_user_event, unregister_user_task,
-};
+use crate::globals::{get_or_create_user_channel, send_user_event};
 use crate::ledger::{
     store, DuplicateRule, JobEvent, JobKind, JobState, Ledger, NewJob, NewSearch, SlotResult,
     LEDGER,
@@ -333,7 +331,7 @@ pub(crate) async fn acquire_and_play_in(
 
     // Ensure channel exists and keep it alive for the duration of the background pipeline.
     let _ = get_or_create_user_channel(&ctx.id()).await;
-    register_user_task(&ctx.id()).await;
+    let task_guard = crate::globals::UserTaskGuard::acquire(ctx.id()).await;
 
     let bg_db = db.clone();
     let bg_ledger = ledger.clone();
@@ -349,9 +347,9 @@ pub(crate) async fn acquire_and_play_in(
         .chain(fallback_tier.iter())
         .cloned()
         .collect();
-    let task_user = ctx.id();
 
     tokio::spawn(async move {
+        let _task_guard = task_guard;
         run_acquire_and_play_pipeline(
             bg_db,
             bg_ledger,
@@ -371,7 +369,6 @@ pub(crate) async fn acquire_and_play_in(
             lossy_fallback,
         )
         .await;
-        unregister_user_task(&task_user).await;
     });
 
     Ok(AcquireAndPlayResponse {
@@ -662,6 +659,11 @@ async fn run_acquire_and_play_pipeline(
             rx,
         } => (routed_id, picked_quality, rx),
         EnqueueAttempt::AlreadyRunning(failure) => {
+            ledger.record(JobEvent::Ended {
+                job: active_job_id,
+                state: JobState::Failed,
+                failure: Some(failure.clone()),
+            });
             emit_stage(
                 &user,
                 &request_id,
@@ -850,6 +852,11 @@ async fn run_acquire_and_play_pipeline(
                     rx,
                 } => (routed_id, picked_quality, rx),
                 EnqueueAttempt::AlreadyRunning(failure) => {
+                    ledger.record(JobEvent::Ended {
+                        job: active_job_id,
+                        state: JobState::Failed,
+                        failure: Some(failure.clone()),
+                    });
                     emit_stage(
                         &user,
                         &request_id,

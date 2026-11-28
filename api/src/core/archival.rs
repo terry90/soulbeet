@@ -577,32 +577,21 @@ pub async fn process_next_upgrade_in(
     let backend = match backends.get(archival_backend_id).await {
         Ok(b) => b,
         Err(e) => {
+            // Do not burn retry attempts on transient backend lookup/connectivity downtime;
+            // keep the upgrade queued and defer until the archival backend comes back.
             let reason = format!("Archival backend '{archival_backend_id}' unavailable: {e}");
-            let next_attempts = upgrade.attempts + 1;
-            let next_status = if next_attempts >= MAX_UPGRADE_ATTEMPTS {
-                ArchivalUpgradeStatus::Failed
-            } else {
-                ArchivalUpgradeStatus::Queued
-            };
             let _ = ArchivalUpgradeRow::mark_status_in(
                 db,
                 &upgrade.id,
-                next_status,
+                ArchivalUpgradeStatus::Queued,
                 None,
-                1,
+                0,
                 Some(&reason),
             )
             .await;
-            return Ok(if next_status == ArchivalUpgradeStatus::Failed {
-                WorkerTickOutcome::Failed {
-                    upgrade_id: upgrade.id,
-                    reason,
-                }
-            } else {
-                WorkerTickOutcome::Deferred {
-                    upgrade_id: upgrade.id,
-                    reason,
-                }
+            return Ok(WorkerTickOutcome::Deferred {
+                upgrade_id: upgrade.id,
+                reason,
             });
         }
     };
@@ -897,6 +886,11 @@ pub async fn process_next_upgrade_in(
         }
         Ok(results) => {
             let failure = not_enqueued_failure(&results);
+            ledger.record(crate::ledger::JobEvent::Ended {
+                job: job_id.clone(),
+                state: JobState::Failed,
+                failure: Some(failure.clone()),
+            });
             let next_attempts = upgrade.attempts + 1;
             let next_status = if next_attempts >= MAX_UPGRADE_ATTEMPTS {
                 ArchivalUpgradeStatus::Failed
@@ -925,6 +919,11 @@ pub async fn process_next_upgrade_in(
             })
         }
         Err(failure) => {
+            ledger.record(crate::ledger::JobEvent::Ended {
+                job: job_id.clone(),
+                state: JobState::Failed,
+                failure: Some(failure.clone()),
+            });
             let next_attempts = upgrade.attempts + 1;
             let next_status = if next_attempts >= MAX_UPGRADE_ATTEMPTS {
                 ArchivalUpgradeStatus::Failed

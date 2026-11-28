@@ -2,7 +2,7 @@
 use dioxus::fullstack::Lazy;
 #[cfg(feature = "server")]
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     SqlitePool,
 };
 #[cfg(feature = "server")]
@@ -14,11 +14,14 @@ use crate::config::CONFIG;
 #[cfg(feature = "server")]
 pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// The file a `sqlite:` database URL names; `None` for an in-memory database
-/// or another kind of URL.
+/// The file a `sqlite:` or `sqlite://` database URL names; `None` for an
+/// in-memory database or another kind of URL. Any `?query` suffix is stripped.
 #[cfg(feature = "server")]
 pub(crate) fn database_file(database_url: &str) -> Option<&std::path::Path> {
-    let path = database_url.strip_prefix("sqlite:")?;
+    let rest = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or("");
     (!path.is_empty() && path != ":memory:").then(|| std::path::Path::new(path))
 }
 
@@ -43,7 +46,10 @@ pub(crate) const MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 #[cfg(feature = "server")]
 pub(crate) fn connect_options(database_url: &str) -> Result<SqliteConnectOptions, sqlx::Error> {
     Ok(SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(BUSY_TIMEOUT))
 }
 
@@ -60,11 +66,10 @@ pub static DB: Lazy<SqlitePool> = Lazy::new(|| async move {
     let database_url = CONFIG.database_url();
 
     if let Some(path) = database_file(database_url) {
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).expect("Failed to create database directory");
             }
-            std::fs::File::create(path).expect("Failed to create database file");
         }
     }
 
@@ -245,6 +250,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(timeout, super::BUSY_TIMEOUT.as_millis() as i64);
+        let fks: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(fks, 1);
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(sync, 1); // NORMAL
+    }
+
+    #[tokio::test]
+    async fn database_file_strips_scheme_and_query_and_creates_missing_db() {
+        assert_eq!(
+            super::database_file("sqlite:data/app.db?mode=rwc"),
+            Some(std::path::Path::new("data/app.db"))
+        );
+        assert_eq!(
+            super::database_file("sqlite://data/app.db?foreign_keys=false"),
+            Some(std::path::Path::new("data/app.db"))
+        );
+        assert_eq!(super::database_file("sqlite::memory:"), None);
+        assert_eq!(super::database_file("sqlite::memory:?cache=shared"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        assert!(!path.exists());
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let db = super::pool_options()
+            .connect_with(super::connect_options(&url).unwrap())
+            .await
+            .unwrap();
+        assert!(path.exists());
+        let fks: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(fks, 1);
     }
 
     #[tokio::test]

@@ -46,7 +46,7 @@ static WEATHER_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .timeout(HTTP_TIMEOUT)
         .user_agent("Soulbeet/1.0")
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build weather HTTP client")
 });
 
 #[derive(Debug, Clone)]

@@ -306,13 +306,27 @@ async fn move_tracks(
     let same_call = args.same_call();
     let req_clone = req.clone();
     let work = async move {
-        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
-        let origin = Origin::Mcp { grant_id };
-        match move_tracks::move_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req_clone)
-            .await
-        {
-            Ok(report) => Keyed::Kept(move_answer(&req, report)),
-            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+        // Run the mutation phase in a detached task so a client disconnect mid-move never
+        // aborts between `atomic_move_file`, beets registration, Navidrome scan, and
+        // annotation restoration.
+        let handle = tokio::spawn(async move {
+            let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+            let origin = Origin::Mcp { grant_id };
+            move_tracks::move_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req_clone)
+                .await
+        });
+        match handle.await {
+            Ok(Ok(report)) => Keyed::Kept(move_answer(&req, report)),
+            Ok(Err(f)) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+            Err(e) => {
+                let f = Failure::new(
+                    FailureCode::MoveFailed,
+                    Stage::Move,
+                    RetryAdvice::SameSourceLater,
+                    format!("Move task stopped unexpectedly: {e}"),
+                );
+                Keyed::Released(failed(upstream_error(f, Map::new(), same_call)))
+            }
         }
     };
     keyed(&state.acquire, caller, MOVE_TRACKS.name, key, &call, work).await
@@ -705,11 +719,25 @@ async fn retag_tracks(
     );
     let same_call = args.same_call();
     let work = async move {
-        let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
-        let origin = Origin::Mcp { grant_id };
-        match retag::retag_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req).await {
-            Ok(report) => Keyed::Kept(retag_answer(report)),
-            Err(f) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+        // Run the mutation phase in a detached task so a client disconnect mid-retag never
+        // aborts after `queue.forget` before beets registration and Navidrome scan finish.
+        let handle = tokio::spawn(async move {
+            let guard = Guard::new(&db, listeners.as_ref(), music_path.as_deref());
+            let origin = Origin::Mcp { grant_id };
+            retag::retag_tracks(&guard, navidrome.as_ref(), &queue, &ctx, &origin, req).await
+        });
+        match handle.await {
+            Ok(Ok(report)) => Keyed::Kept(retag_answer(report)),
+            Ok(Err(f)) => Keyed::Released(failed(upstream_error(f, Map::new(), same_call))),
+            Err(e) => {
+                let f = Failure::new(
+                    FailureCode::RetagFailed,
+                    Stage::Retag,
+                    RetryAdvice::SameSourceLater,
+                    format!("Retag task stopped unexpectedly: {e}"),
+                );
+                Keyed::Released(failed(upstream_error(f, Map::new(), same_call)))
+            }
         }
     };
     keyed(&state.acquire, caller, RETAG_TRACKS.name, key, &call, work).await

@@ -1100,6 +1100,32 @@ pub(crate) async fn remove_tracks(
     .await
 }
 
+/// Under `playlist_key`: removes one matching entry per song id in `song_ids` from the caller's
+/// playlist `id`. Unmatched ids are ignored; entries Navidrome hides from the caller stay.
+pub(crate) async fn remove_song_ids(
+    navi: &NavidromeClient,
+    ctx: &UserCtx,
+    id: &str,
+    song_ids: &[String],
+) -> Result<Written, PlaylistRefusal> {
+    let _playlist = lock(&playlist_key(id)).await;
+    write_tracks(navi, ctx, id, |_, tracks| {
+        let mut remaining = counts(song_ids);
+        let mut positions = Vec::new();
+        let mut after = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            if take(&mut remaining, &track.song.id) {
+                positions.push(position_of(track));
+            } else {
+                after.push(track.song.id.clone());
+            }
+        }
+        let write = NonEmpty::new(positions).map_or(TrackWrite::Nothing, TrackWrite::Remove);
+        Ok((write, after))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -2559,5 +2585,39 @@ mod tests {
             "static playlist should not trigger extra getPlaylist call: {:?}",
             navi.asked()
         );
+    }
+
+    #[tokio::test]
+    async fn remove_song_ids_removes_matching_entries_atomically() {
+        let navi = NavidromeStub::start();
+        navi.answer(
+            "/rest/getPlaylist",
+            &[&playlist_body(ADVENT, "Advent", "alice", false, "", &[])],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}/tracks"),
+            &[
+                &playlist_rows(&[
+                    (1, HOLY.0, HOLY.1, false),
+                    (2, SILENT.0, SILENT.1, false),
+                    (3, AWAY.0, AWAY.1, false),
+                ]),
+                &playlist_rows(&[(1, HOLY.0, HOLY.1, false), (2, AWAY.0, AWAY.1, false)]),
+            ],
+        );
+        navi.answer(
+            &format!("/api/playlist/{ADVENT}"),
+            &[&native_playlist(ADVENT, "Advent", 3, false, None)],
+        );
+
+        let written = remove_song_ids(
+            &navi.client(),
+            &alice(Role::User),
+            ADVENT,
+            &[SILENT.0.to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.song_ids, vec![HOLY.0, AWAY.0]);
     }
 }

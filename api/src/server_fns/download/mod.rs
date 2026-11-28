@@ -190,9 +190,7 @@ pub async fn download_updates_ws(
             "Download updates can only be opened from Soulbeet's own page",
         ));
     }
-    let token = cookies
-        .get(crate::AUTH_COOKIE_NAME)
-        .map(|c| c.value().to_string());
+    let token = super::guard::extract_session_token(Some(&cookies), &headers);
 
     let rx = {
         let map = USER_CHANNELS.read().await;

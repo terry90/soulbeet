@@ -622,6 +622,25 @@ pub(crate) async fn promote_to(
     target_folder_id: Option<&str>,
     replace: Replace,
 ) -> Result<(DiscoveryTrack, Folder), NotDone> {
+    promote_to_with_archival(db, effects, queue, user, track_id, target_folder_id, replace)
+        .await
+        .map(|(track, folder, _)| (track, folder))
+}
+
+/// Like `promote_to`, also returning whether a background archival FLAC upgrade was enqueued
+/// for the promoted track. Resets `Promoting -> Pending` if the detached task panics before
+/// completing the promotion.
+pub(crate) async fn promote_to_with_archival(
+    db: &SqlitePool,
+    effects: &Arc<dyn DiscoveryEffects>,
+    queue: &ImportQueue,
+    user: &UserId,
+    track_id: &str,
+    target_folder_id: Option<&str>,
+    replace: Replace,
+) -> Result<(DiscoveryTrack, Folder, bool), NotDone> {
+    let revert_db = db.clone();
+    let revert_track_id = track_id.to_string();
     let (db, effects, queue, user, track_id, target_folder_id) = (
         db.clone(),
         effects.clone(),
@@ -630,7 +649,7 @@ pub(crate) async fn promote_to(
         track_id.to_string(),
         target_folder_id.map(str::to_string),
     );
-    tokio::spawn(async move {
+    match tokio::spawn(async move {
         promote_detached(
             &db,
             &*effects,
@@ -643,7 +662,25 @@ pub(crate) async fn promote_to(
         .await
     })
     .await
-    .unwrap_or_else(|e| Err(NotDone::Claimed(promote_stopped(&e))))
+    {
+        Ok(res) => res,
+        Err(e) => {
+            if let Err(db_err) = sqlx::query(
+                "UPDATE discovery_tracks SET status = 'Pending' \
+                 WHERE id = ? AND status = 'Promoting'",
+            )
+            .bind(&revert_track_id)
+            .execute(&revert_db)
+            .await
+            {
+                warn!(
+                    "Could not reset track '{}' from Promoting back to Pending after task stop: {}",
+                    revert_track_id, db_err
+                );
+            }
+            Err(NotDone::Claimed(promote_stopped(&e)))
+        }
+    }
 }
 
 async fn promote_detached(
@@ -654,7 +691,7 @@ async fn promote_detached(
     track_id: &str,
     target_folder_id: Option<&str>,
     replace: Replace,
-) -> Result<(DiscoveryTrack, Folder), NotDone> {
+) -> Result<(DiscoveryTrack, Folder, bool), NotDone> {
     // Validate an explicit target folder before claiming the track, so an invalid folder leaves
     // the track untouched.
     let explicit_target = match target_folder_id {
@@ -682,7 +719,7 @@ async fn promote_detached(
         replace,
     )
     .await
-    .map(|track| (track, target_folder))
+    .map(|(track, archival_queued)| (track, target_folder, archival_queued))
     .map_err(NotDone::Claimed)
 }
 
@@ -710,7 +747,7 @@ async fn promote_claimed(
     source_folder: Folder,
     target_folder: Folder,
     replace: Replace,
-) -> Result<DiscoveryTrack, Failure> {
+) -> Result<(DiscoveryTrack, bool), Failure> {
     let track_id = track.id.as_str();
     let back_to_pending = || async {
         if let Err(e) =
@@ -747,7 +784,7 @@ async fn promote_claimed(
         .await
         .map_err(|e| database_failure(Stage::Import, e))?;
 
-    if let Err(f) = crate::core::archival::maybe_enqueue_for_promoted_discovery_in(
+    let archival_upgrade_queued = match crate::core::archival::maybe_enqueue_for_promoted_discovery_in(
         db,
         &source_folder.user_id,
         &target_folder.id,
@@ -755,12 +792,17 @@ async fn promote_claimed(
     )
     .await
     {
-        warn!(
-            "Failed to evaluate archival FLAC upgrade for promoted track '{}': {}",
-            track.title,
-            crate::core::logged(&f)
-        );
-    }
+        Ok(shared::download::ArchivalUpgradeOutcome::Enqueued { .. }) => true,
+        Ok(_) => false,
+        Err(f) => {
+            warn!(
+                "Failed to evaluate archival FLAC upgrade for promoted track '{}': {}",
+                track.title,
+                crate::core::logged(&f)
+            );
+            false
+        }
+    };
 
     if let Err(e) = DiscoveryHistoryRow::update_outcome_in(
         db,
@@ -781,10 +823,13 @@ async fn promote_claimed(
         "Promoted discovery track: {} -> {}",
         track.title, target_folder.path
     );
-    Ok(DiscoveryTrack {
-        status: DiscoveryStatus::Promoted,
-        ..track
-    })
+    Ok((
+        DiscoveryTrack {
+            status: DiscoveryStatus::Promoted,
+            ..track
+        },
+        archival_upgrade_queued,
+    ))
 }
 
 /// Deletes `user`'s pending track `track_id` from its profile folder and marks it removed,

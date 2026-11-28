@@ -712,13 +712,48 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
         match item {
             Work::Import(waiting) => {
                 let Waiting { job, state } = *waiting;
-                let outcome = AssertUnwindSafe(shared.execute(&key, &job))
+                let mut outcome = AssertUnwindSafe(shared.execute(&key, &job))
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| {
                         warn!("Import into {} panicked", key.display());
                         JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
                     });
+                // Ownerless imports (Discovery staging, background promotes) have no UI Retry
+                // store, so retry bounded beets SQLite lock errors inline before finishing.
+                if job.owner.is_none() {
+                    let mut retries = 0usize;
+                    while matches!(
+                        outcome.result.outcome,
+                        ImportOutcome::Failed {
+                            kind: FailKind::LibraryLocked,
+                            ..
+                        }
+                    ) {
+                        let Some(wait) = shared.lock_waits.get(retries).copied() else {
+                            break;
+                        };
+                        retries += 1;
+                        warn!(
+                            "Ownerless import into {} hit locked library DB; retrying in {:?} ({}/{})",
+                            key.display(),
+                            wait,
+                            retries,
+                            shared.lock_waits.len()
+                        );
+                        tokio::time::sleep(wait).await;
+                        outcome = AssertUnwindSafe(shared.execute(&key, &job))
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| {
+                                warn!("Import into {} panicked", key.display());
+                                JobOutcome::of(ImportResult::failed(
+                                    FailKind::Beets,
+                                    WORKER_STOPPED.into(),
+                                ))
+                            });
+                    }
+                }
                 shared.finish(&key, &job, outcome, &state).await;
             }
             Work::Forget { file, done } => {

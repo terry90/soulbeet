@@ -809,16 +809,15 @@ pub(crate) async fn move_tracks(
             let mut another_user_sees_song = false;
             if !source_folder_row.shared && !other_folder_overlaps_source {
                 for other in &other_users {
-                    if guard
-                        .listeners
-                        .song(other, &song.id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        another_user_sees_song = true;
-                        break;
+                    match guard.listeners.song(other, &song.id).await {
+                        Ok(Some(_)) | Err(_) => {
+                            // Fail closed: if another listener sees the song or cannot be checked
+                            // (unreachable Navidrome, expired token, open circuit), require full
+                            // multi-user veto check rather than assuming invisibility.
+                            another_user_sees_song = true;
+                            break;
+                        }
+                        Ok(None) => {}
                     }
                 }
             }

@@ -27,6 +27,7 @@ pub(super) const MAX_BODY: usize = 1024 * 1024;
 
 pub(super) static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(HTTP_TIMEOUT)
         // Endpoints come from the discovery document; never follow a redirect
         // to somewhere else with a code or a client secret.

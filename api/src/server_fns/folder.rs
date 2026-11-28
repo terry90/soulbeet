@@ -3,8 +3,6 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use super::{failure_error, refusal_error, server_error};
-#[cfg(feature = "server")]
-use crate::auth::UserCtx;
 use crate::folder_policy::FolderAdminView;
 #[cfg(feature = "server")]
 use crate::folder_policy::{
@@ -17,7 +15,7 @@ use crate::AdminSession;
 #[cfg(feature = "server")]
 use crate::AuthSession;
 #[cfg(feature = "server")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[get("/api/folders", auth: AuthSession)]
 pub async fn get_user_folders() -> Result<Vec<models::folder::Folder>, ServerFnError> {
@@ -31,59 +29,73 @@ pub async fn create_user_folder(
     name: String,
     path: String,
 ) -> Result<models::folder::Folder, ServerFnError> {
-    let canonical = checked_folder_path(&auth.0, &path, FolderChange::Create).await?;
-    models::folder::Folder::create(&auth.0.user_id, &name, path_str(&canonical))
+    let candidate = canonical_folder_path(Path::new(&path))
+        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
+
+    let mut tx = crate::db::DB
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map_err(server_error)
+        .map_err(server_error)?;
+
+    let rows = PolicyRows::load_tx(&mut tx).await.map_err(server_error)?;
+    let (folders, roots) = rows.inputs();
+    check_folder_path(&candidate, &auth.0, &folders, &roots).map_err(refusal_error)?;
+
+    let dir_existed = tokio::fs::try_exists(&candidate).await.unwrap_or(true);
+    if !dir_existed {
+        tokio::fs::create_dir_all(&candidate)
+            .await
+            .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
+    }
+    let created = match canonical_folder_path(&candidate) {
+        Ok(c) if c == candidate => c,
+        Ok(_) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Changed));
+        }
+        Err(e) => {
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(refusal_error(FolderRefusal::Path(e)));
+        }
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let folder = match sqlx::query_as::<_, models::folder::Folder>(
+        "INSERT INTO folders (id, user_id, name, path) VALUES (?, ?, ?, ?) RETURNING *",
+    )
+    .bind(&id)
+    .bind(&auth.0.user_id)
+    .bind(&name)
+    .bind(path_str(&created))
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(folder) => folder,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            if !dir_existed {
+                let _ = tokio::fs::remove_dir(&candidate).await;
+            }
+            return Err(server_error(e));
+        }
+    };
+
+    if let Err(e) = tx.commit().await {
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir(&candidate).await;
+        }
+        return Err(server_error(e));
+    }
+    Ok(folder)
 }
 
 #[cfg(feature = "server")]
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("canonical paths are UTF-8")
-}
-
-/// What a folder path is checked for.
-#[cfg(feature = "server")]
-#[derive(Clone, Copy)]
-enum FolderChange<'a> {
-    Create,
-    /// An existing folder, currently stored at `stored`.
-    Update {
-        stored: &'a str,
-    },
-}
-
-/// The canonical form of `path` once the folder rules allow `actor` to keep a
-/// folder there. On create, the directory is made only after the checks
-/// pass, and its canonical path must not move while it is made.
-#[cfg(feature = "server")]
-async fn checked_folder_path(
-    actor: &UserCtx,
-    path: &str,
-    change: FolderChange<'_>,
-) -> Result<PathBuf, ServerFnError> {
-    let candidate = canonical_folder_path(Path::new(path))
-        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
-    let rows = PolicyRows::load().await.map_err(server_error)?;
-    let (folders, roots) = rows.inputs();
-    match change {
-        FolderChange::Create => check_folder_path(&candidate, actor, &folders, &roots),
-        FolderChange::Update { stored } => {
-            check_folder_update(&candidate, stored, actor, &folders, &roots)
-        }
-    }
-    .map_err(refusal_error)?;
-    if let FolderChange::Create = change {
-        tokio::fs::create_dir_all(&candidate)
-            .await
-            .map_err(|e| server_error(format!("Failed to create directory: {}", e)))?;
-        let created =
-            canonical_folder_path(&candidate).map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
-        if created != candidate {
-            return Err(refusal_error(FolderRefusal::Changed));
-        }
-    }
-    Ok(candidate)
 }
 
 #[put("/api/folders/update", auth: AuthSession)]
@@ -92,20 +104,47 @@ pub async fn update_folder(
     name: String,
     path: String,
 ) -> Result<(), ServerFnError> {
-    let folder = crate::core::folders::owned(&auth.0, &folder_id)
+    let candidate = canonical_folder_path(Path::new(&path))
+        .map_err(|e| refusal_error(FolderRefusal::Path(e)))?;
+
+    let mut tx = crate::db::DB
+        .begin_with("BEGIN IMMEDIATE")
         .await
-        .map_err(failure_error)?;
-    let canonical = checked_folder_path(
-        &auth.0,
-        &path,
-        FolderChange::Update {
-            stored: &folder.path,
-        },
+        .map_err(server_error)?;
+
+    let existing = sqlx::query_as::<_, models::folder::Folder>(
+        "SELECT * FROM folders WHERE id = ? AND user_id = ?",
     )
-    .await?;
-    crate::core::folders::update(&auth.0, &folder_id, &name, path_str(&canonical))
+    .bind(&folder_id)
+    .bind(&auth.0.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(server_error)?
+    .ok_or_else(|| {
+        failure_error(shared::failure::Failure::new(
+            shared::failure::FailureCode::UnknownHandle,
+            shared::failure::Stage::Input,
+            shared::failure::RetryAdvice::NotRetryable,
+            "Folder not found",
+        ))
+    })?;
+
+    let rows = PolicyRows::load_tx(&mut tx).await.map_err(server_error)?;
+    let (folders, roots) = rows.inputs();
+    check_folder_update(&candidate, &existing.path, &auth.0, &folders, &roots)
+        .map_err(refusal_error)?;
+
+    sqlx::query("UPDATE folders SET name = ?, path = ? WHERE id = ? AND user_id = ?")
+        .bind(&name)
+        .bind(path_str(&candidate))
+        .bind(&folder_id)
+        .bind(&auth.0.user_id)
+        .execute(&mut *tx)
         .await
-        .map_err(failure_error)
+        .map_err(server_error)?;
+
+    tx.commit().await.map_err(server_error)?;
+    Ok(())
 }
 
 #[delete("/api/folders/delete", auth: AuthSession)]
