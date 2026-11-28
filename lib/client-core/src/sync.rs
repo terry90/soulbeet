@@ -137,6 +137,9 @@ impl SyncEngine {
 
         if self.soulbeet_base_url.is_some() {
             if let Err(err) = self.fetch_bootstrap().await {
+                if matches!(err, CoreError::ServerHttp { status: 401 | 403, .. }) {
+                    return Err(err);
+                }
                 report.warnings.push(format!("bootstrap failed: {err}"));
             }
         }
@@ -446,6 +449,12 @@ impl SyncEngine {
                     .bind(&pl_id)
                     .execute(&mut *tx)
                     .await?;
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'playlist' AND target_id = ?",
+                )
+                .bind(&pl_id)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query("DELETE FROM playlists WHERE id = ?")
                     .bind(&pl_id)
                     .execute(&mut *tx)
@@ -556,7 +565,7 @@ impl SyncEngine {
         // 4b. Incremental rating/annotation refresh via paginated search3 (empty query)
         // Delta sync skips unchanged albums, so tracks rated in Navidrome would otherwise keep stale user_rating.
         if !full_sync && !cancelled.load(Ordering::Relaxed) {
-            if let Err(err) = self.sync_song_ratings(&subsonic, now).await {
+            if let Err(err) = self.sync_song_ratings(&subsonic, now, cancelled).await {
                 report
                     .warnings
                     .push(format!("rating sync failed: {err}"));
@@ -594,6 +603,7 @@ impl SyncEngine {
         synced_track_ids: &HashSet<String>,
     ) -> CoreResult<()> {
         let mut tx = self.pool.begin().await?;
+        let mut orphan_audio_paths: Vec<String> = Vec::new();
 
         let local_track_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM tracks")
             .fetch_all(&mut *tx)
@@ -604,6 +614,25 @@ impl SyncEngine {
                     .bind(&tid)
                     .execute(&mut *tx)
                     .await?;
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'track' AND target_id = ?",
+                )
+                .bind(&tid)
+                .execute(&mut *tx)
+                .await?;
+                if let Some(local_path) = sqlx::query_scalar::<_, String>(
+                    "SELECT local_path FROM offline_downloads WHERE track_id = ?",
+                )
+                .bind(&tid)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    orphan_audio_paths.push(local_path);
+                    sqlx::query("DELETE FROM offline_downloads WHERE track_id = ?")
+                        .bind(&tid)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 sqlx::query("DELETE FROM tracks WHERE id = ?")
                     .bind(&tid)
                     .execute(&mut *tx)
@@ -616,6 +645,12 @@ impl SyncEngine {
             .await?;
         for aid in local_album_ids {
             if !synced_album_ids.contains(&aid) {
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'album' AND target_id = ?",
+                )
+                .bind(&aid)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query("DELETE FROM albums WHERE id = ?")
                     .bind(&aid)
                     .execute(&mut *tx)
@@ -628,6 +663,12 @@ impl SyncEngine {
             .await?;
         for arid in local_artist_ids {
             if !synced_artist_ids.contains(&arid) {
+                sqlx::query(
+                    "DELETE FROM offline_pins WHERE target_kind = 'artist' AND target_id = ?",
+                )
+                .bind(&arid)
+                .execute(&mut *tx)
+                .await?;
                 sqlx::query("DELETE FROM artists WHERE id = ?")
                     .bind(&arid)
                     .execute(&mut *tx)
@@ -635,7 +676,34 @@ impl SyncEngine {
             }
         }
 
+        // Sweep any pre-existing orphaned offline_downloads or offline_pins whose target
+        // rows no longer exist in the mirrored library.
+        let dangling_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT local_path FROM offline_downloads WHERE track_id NOT IN (SELECT id FROM tracks)",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        orphan_audio_paths.extend(dangling_paths);
+        sqlx::query("DELETE FROM offline_downloads WHERE track_id NOT IN (SELECT id FROM tracks)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM offline_pins
+            WHERE (target_kind = 'track' AND target_id NOT IN (SELECT id FROM tracks))
+               OR (target_kind = 'album' AND target_id NOT IN (SELECT id FROM albums))
+               OR (target_kind = 'artist' AND target_id NOT IN (SELECT id FROM artists))
+               OR (target_kind = 'playlist' AND target_id NOT IN (SELECT id FROM playlists))
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
+
+        for path in orphan_audio_paths {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
         Ok(())
     }
 
@@ -643,12 +711,16 @@ impl SyncEngine {
         &self,
         subsonic: &SubsonicClient,
         now: i64,
+        cancelled: &AtomicBool,
     ) -> CoreResult<usize> {
         let mut offset = 0usize;
         let mut remote_songs: Vec<(String, i64, bool)> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
 
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
             let page = subsonic
                 .search3_songs("", RATING_SYNC_PAGE_SIZE, offset)
                 .await?;
@@ -669,6 +741,10 @@ impl SyncEngine {
                 break;
             }
             offset += count;
+        }
+
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(0);
         }
 
         let mut tx = self.pool.begin().await?;

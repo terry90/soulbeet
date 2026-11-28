@@ -921,7 +921,7 @@ impl Transfers {
         impl Drop for RunGuard {
             fn drop(&mut self) {
                 if !self.finished {
-                    {
+                    let failed_data = {
                         let mut state = self
                             .transfers
                             .state
@@ -932,14 +932,30 @@ impl Transfers {
                                 let failure = ended::connection(
                                     "Internet Archive transfer task exited unexpectedly",
                                 );
-                                record.data = record.data.ended(Stored::Failed, Some(failure));
+                                let ended_data = record.data.ended(Stored::Failed, Some(failure));
+                                record.data = ended_data.clone();
                                 record.phase = Phase::Ended;
                                 record.task = None;
+                                Some(ended_data)
+                            } else {
+                                None
                             }
+                        } else {
+                            None
                         }
-                    }
-                    if tokio::runtime::Handle::try_current().is_ok() {
+                    };
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        if let Some(data) = failed_data {
+                            let transfers = Arc::clone(&self.transfers);
+                            let id = self.id.clone();
+                            handle.spawn(async move {
+                                transfers.write(&id, &data).await;
+                                transfers.remove_part(&id);
+                            });
+                        }
                         self.transfers.pump();
+                    } else if failed_data.is_some() {
+                        self.transfers.remove_part(&self.id);
                     }
                 }
             }

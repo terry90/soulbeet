@@ -489,6 +489,28 @@ enum SingleAttempt<T> {
     RateLimited { retry_after_secs: u64, body: String },
 }
 
+/// True when a 404 or 500 error body from slskd indicates the Soulseek peer is offline
+/// (avoiding false positives on HTTP 409 replays, proxy 502-504 HTML pages, or filenames
+/// containing the word "offline").
+fn is_peer_offline_error(status: u16, body: &str) -> bool {
+    if !matches!(status, 404 | 500) {
+        return false;
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype") || lower.contains("<html") {
+        return false;
+    }
+    lower.contains("appears to be offline")
+        || lower.contains("user is offline")
+        || lower.contains("peer is offline")
+        || lower.contains("userofflineexception")
+        || lower.trim_matches('"') == "offline"
+}
+
 /// True when a 404 body from `POST /api/v0/transfers/downloads/batches` indicates
 /// the route itself does not exist (slskd < 0.26) rather than an application error.
 fn is_missing_batches_route(body: &str) -> bool {
@@ -613,6 +635,7 @@ impl SoulseekClient {
         body: Option<B>,
     ) -> Result<T> {
         const MAX_429_RETRIES: u32 = 3;
+        const MAX_RETRY_AFTER_SECS: u64 = 60;
 
         for attempt in 0..=MAX_429_RETRIES {
             match self
@@ -625,14 +648,15 @@ impl SoulseekClient {
                     body,
                 } => {
                     if attempt < MAX_429_RETRIES {
+                        let wait_secs = retry_after_secs.min(MAX_RETRY_AFTER_SECS);
                         warn!(
                             "Rate limited (429) on {}, waiting {}s before retry {}/{}",
                             endpoint,
-                            retry_after_secs,
+                            wait_secs,
                             attempt + 1,
                             MAX_429_RETRIES
                         );
-                        tokio::time::sleep(StdDuration::from_secs(retry_after_secs)).await;
+                        tokio::time::sleep(StdDuration::from_secs(wait_secs)).await;
                         continue;
                     }
                     return Err(SoulseekError::Api {
@@ -679,31 +703,52 @@ impl SoulseekClient {
         }
     }
 
-    /// Prunes expired or abandoned searches from `active_searches` and deletes them at slskd
-    /// so abandoned UI tabs or timed-out searches cannot leak memory or slskd state.
-    async fn prune_expired_searches(&self) {
+    /// Evicts expired or abandoned searches from `active_searches` and returns their slskd IDs
+    /// for best-effort background cleanup.
+    async fn take_expired_searches(&self) -> Vec<String> {
         let now = Utc::now();
-        let expired: Vec<String> = {
-            let mut active = self.active_searches.lock().await;
-            let mut to_remove = Vec::new();
-            let mut slskd_ids = Vec::new();
-            for (id, ctx) in active.iter() {
-                let past_deadline = now - ctx.start_time > ctx.timeout + CANCEL_GRACE;
-                let stale_stopped = ctx
-                    .stopped_at
-                    .is_some_and(|at| now - at > CANCEL_GRACE);
-                if past_deadline || stale_stopped {
-                    to_remove.push(id.clone());
-                    slskd_ids.push(ctx.slskd_id.clone());
+        let mut active = self.active_searches.lock().await;
+        let mut to_remove = Vec::new();
+        let mut slskd_ids = Vec::new();
+        for (id, ctx) in active.iter() {
+            let past_deadline = now - ctx.start_time > ctx.timeout + CANCEL_GRACE;
+            let stale_stopped = ctx
+                .stopped_at
+                .is_some_and(|at| now - at > CANCEL_GRACE);
+            if past_deadline || stale_stopped {
+                to_remove.push(id.clone());
+                slskd_ids.push(ctx.slskd_id.clone());
+            }
+        }
+        for id in to_remove {
+            active.remove(&id);
+        }
+        slskd_ids
+    }
+
+    /// Spawns detached best-effort `DELETE /api/v0/searches/{id}` requests for expired searches
+    /// without blocking new searches or tripping the circuit breaker.
+    fn spawn_expired_search_cleanup(&self, expired: Vec<String>) {
+        const MAX_BACKGROUND_DELETES: usize = 32;
+        if expired.is_empty() {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            let base_url = self.base_url.clone();
+            let api_key = self.api_key.clone();
+            handle.spawn(async move {
+                for slskd_id in expired.into_iter().take(MAX_BACKGROUND_DELETES) {
+                    let Ok(url) = base_url.join(&format!("api/v0/searches/{slskd_id}")) else {
+                        continue;
+                    };
+                    let mut req = client.request(Method::DELETE, url);
+                    if let Some(key) = &api_key {
+                        req = req.header("X-API-Key", key);
+                    }
+                    let _ = req.send().await;
                 }
-            }
-            for id in to_remove {
-                active.remove(&id);
-            }
-            slskd_ids
-        };
-        for slskd_id in expired {
-            let _ = self.delete_search(&slskd_id).await;
+            });
         }
     }
 
@@ -713,7 +758,7 @@ impl SoulseekClient {
     /// again under the same id with the texts `wildcard::retry_texts` gives
     /// for the caller's text, or for the artist and title.
     pub async fn start_search(&self, spec: SearchSpec, timeout: Duration) -> Result<String> {
-        self.prune_expired_searches().await;
+        let expired = self.take_expired_searches().await;
 
         let SearchSpec {
             album,
@@ -768,6 +813,7 @@ impl SoulseekClient {
         );
 
         info!("Search initiated with ID: {search_id}");
+        self.spawn_expired_search_cleanup(expired);
         Ok(search_id)
     }
 
@@ -1192,25 +1238,11 @@ impl SoulseekClient {
         );
 
         if !status.is_success() {
-            // slskd answers 404 (or 500) with offline text for offline or
-            // blacklisted users. Match any "offline" text before checking 404.
-            if resp_text.to_ascii_lowercase().contains("offline") {
-                warn!("User '{}' is offline, not retrying", batch.username);
-                return Err(SoulseekError::UserOffline {
-                    username: batch.username.clone(),
-                    status: status.as_u16(),
-                    body: resp_text,
-                });
-            }
+            let status_code = status.as_u16();
 
-            // The batches route only exists since slskd 0.26. Only treat empty or
-            // route-not-found 404 responses as an older slskd missing the endpoint.
-            if status.as_u16() == 404 && is_missing_batches_route(&resp_text) {
-                return Err(SoulseekError::SlskdTooOld { body: resp_text });
-            }
-
-            // An earlier attempt created this batch and its answer was lost.
-            if status.as_u16() == 409 {
+            // An earlier attempt created this batch and its answer was lost. Check 409 before
+            // offline matching so filenames containing "offline" never bypass replay recovery.
+            if status_code == 409 {
                 warn!(
                     "Batch {} already exists in slskd, reading its transfers back",
                     batch.id
@@ -1221,8 +1253,25 @@ impl SoulseekClient {
                 return Ok(replayed_batch_responses(batch, &listing));
             }
 
+            // slskd answers 404 (or 500) with peer-offline text for offline or
+            // blacklisted users. Match peer-offline phrases before checking 404 route-missing.
+            if is_peer_offline_error(status_code, &resp_text) {
+                warn!("User '{}' is offline, not retrying", batch.username);
+                return Err(SoulseekError::UserOffline {
+                    username: batch.username.clone(),
+                    status: status_code,
+                    body: resp_text,
+                });
+            }
+
+            // The batches route only exists since slskd 0.26. Only treat empty or
+            // route-not-found 404 responses as an older slskd missing the endpoint.
+            if status_code == 404 && is_missing_batches_route(&resp_text) {
+                return Err(SoulseekError::SlskdTooOld { body: resp_text });
+            }
+
             return Err(SoulseekError::Api {
-                status: status.as_u16(),
+                status: status_code,
                 message: resp_text,
             });
         }
@@ -4117,8 +4166,8 @@ mod tests {
     async fn start_search_prunes_expired_entries_and_deletes_them_at_slskd() {
         let (url, seen) = serve(vec![
             started("old-search"),
-            no_content(),
             started("new-search"),
+            no_content(),
         ]);
         let client = client_at(&url);
         let spec = SearchSpec::of(None, vec![track("Marrow Choir", "O Holy Night")]);
@@ -4144,10 +4193,86 @@ mod tests {
         assert!(active.contains_key("new-search"));
         drop(active);
 
+        // Wait briefly for the detached background cleanup DELETE to complete.
+        for _ in 0..50 {
+            if seen.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
         let seen = seen.lock().unwrap();
         assert_eq!(
-            (seen[1].method.as_str(), seen[1].target.as_str()),
+            (seen[2].method.as_str(), seen[2].target.as_str()),
             ("DELETE", "/api/v0/searches/old-search")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_409_with_offline_in_body_replays_and_502_proxy_page_is_api_error() {
+        let file = DownloadRequestFile {
+            filename: r"music\offline-mix\01.flac".into(),
+            size: 1000,
+        };
+        let batches = plan_batches(vec![("peer".into(), file)], "offline-mix", 50, REQUEST);
+
+        let batch_id = batches[0].id.clone();
+        let replay_listing = serde_json::json!([{
+            "username": "peer",
+            "directories": [{
+                "directory": r"music\offline-mix",
+                "files": [{
+                    "id": "dl-1",
+                    "username": "peer",
+                    "direction": "Download",
+                    "filename": r"music\offline-mix\01.flac",
+                    "size": 1000,
+                    "state": "Queued",
+                    "requestedAt": "2026-07-26T00:00:00Z",
+                    "bytesTransferred": 0,
+                    "percentComplete": 0.0,
+                    "batchId": batch_id
+                }]
+            }]
+        }])
+        .to_string();
+
+        // 409 whose body mentions "offline" (e.g. filename) must still replay via GET downloads.
+        let (url, _) = serve(vec![
+            Reply {
+                status: 409,
+                body: r#"Conflict: transfer for music\offline-mix\01.flac already exists"#.into(),
+            },
+            Reply {
+                status: 200,
+                body: replay_listing,
+            },
+            // 502 reverse-proxy HTML page mentioning "offline" must stay Api(502), not UserOffline.
+            Reply {
+                status: 502,
+                body: "<html><body>502 Bad Gateway: upstream server offline</body></html>".into(),
+            },
+            // 404 naming a filename with "offline" (no peer-offline phrase) must stay Api(404).
+            Reply {
+                status: 404,
+                body: r#"File music\offline-mix\01.flac not found"#.into(),
+            },
+        ]);
+        let client = client_at(&url);
+
+        let replayed = client.send_download_batch(&batches[0]).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].transfer_id.as_deref(), Some("dl-1"));
+
+        let err_502 = client.send_download_batch(&batches[0]).await.unwrap_err();
+        assert!(
+            matches!(err_502, SoulseekError::Api { status: 502, .. }),
+            "expected Api(502), got {err_502:?}"
+        );
+
+        let err_404 = client.send_download_batch(&batches[0]).await.unwrap_err();
+        assert!(
+            matches!(err_404, SoulseekError::Api { status: 404, .. }),
+            "expected Api(404), got {err_404:?}"
         );
     }
 }

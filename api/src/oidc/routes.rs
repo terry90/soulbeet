@@ -75,12 +75,13 @@ async fn start_sign_in(
     let Some(config) = CONFIG.oidc() else {
         return to_login(SsoError::Disabled, return_to.as_deref());
     };
-    let started = Start::for_request(
+    let started = Start::for_request_with_proxy(
         config.redirect_pin.as_ref(),
         CONFIG.public_url(),
         headers,
         uri,
         params.moved,
+        crate::config::trust_proxy_headers(),
     );
     let begun = match started {
         // Started there, the flow cookie is where the callback reads it.
@@ -123,12 +124,13 @@ pub(crate) async fn begin_link(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Result<url::Url, LinkStartError> {
-    let start = Start::for_request(
+    let start = Start::for_request_with_proxy(
         config.redirect_pin.as_ref(),
         CONFIG.public_url(),
         headers,
         uri,
         false,
+        crate::config::trust_proxy_headers(),
     )
     .map_err(LinkStartError::Failed)?;
     if start.elsewhere {

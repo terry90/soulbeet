@@ -96,7 +96,7 @@ impl ConnectionState {
             discovery: Arc::new(LiveDiscovery),
             ratings: Arc::new(LiveSync),
             listeners: Arc::new(LiveListeners),
-            trust_proxy_headers: CONFIG.trust_proxy_headers(),
+            trust_proxy_headers: crate::config::trust_proxy_headers(),
         }
     }
 }
@@ -651,5 +651,39 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_headers_work_by_default_and_are_ignored_when_trust_proxy_is_false() {
+        let proxied = [
+            ("host", "192.168.1.5:9765"),
+            ("x-forwarded-host", "music.example.com"),
+            ("x-forwarded-proto", "https"),
+        ];
+
+        // Default policy (trust_proxy_headers = true): zero-config reverse proxy works.
+        let state = ConnectionState::for_test(test_db::migrated().await);
+        let (status, _, body) = get_json(
+            router(state),
+            "/.well-known/oauth-protected-resource/mcp",
+            &proxied,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["resource"], "https://music.example.com/mcp");
+
+        // Explicit TRUST_PROXY_HEADERS=false: spoofed forwarded headers are ignored and
+        // the LAN HTTP host is refused with https_required.
+        let mut strict = ConnectionState::for_test(test_db::migrated().await);
+        strict.trust_proxy_headers = false;
+        let (status, _, body) = get_json(
+            router(strict),
+            "/.well-known/oauth-protected-resource/mcp",
+            &proxied,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "https_required");
+        assert_eq!(body["derived_base"], "http://192.168.1.5:9765");
     }
 }

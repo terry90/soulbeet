@@ -2000,7 +2000,7 @@ impl SoulbeetCoreHandle {
     pub async fn set_soulbeet_auth(&self, auth: FfiSoulbeetAuth) -> Result<(), FfiError> {
         let core = self.core.clone();
         let native_auth: Option<SoulbeetAuth> = auth.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.set_soulbeet_auth(native_auth).await;
             Ok(())
         })
@@ -2013,7 +2013,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<(), FfiError> {
         let core = self.core.clone();
         let native_creds: NavidromeCredentials = creds.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.set_navidrome_credentials(native_creds).await;
             Ok(())
         })
@@ -2022,7 +2022,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn clear_navidrome_credentials(&self) -> Result<(), FfiError> {
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.clear_navidrome_credentials().await;
             Ok(())
         })
@@ -2411,7 +2411,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<String, FfiError> {
         let core = self.core.clone();
         let (path, maybe_stats) = self
-            .run_async(async move {
+            .run_async_uninterruptible(async move {
                 let (path, newly_fetched) = core
                     .get_or_fetch_cover_art_with_status(&cover_art_id, size)
                     .await
@@ -2595,7 +2595,7 @@ impl SoulbeetCoreHandle {
     ) -> Result<String, FfiError> {
         let core = self.core.clone();
         let native_album: RemoteCatalogAlbum = album.into();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.download_remote_album(&native_album)
                 .await
                 .map_err(FfiError::from)
@@ -2668,7 +2668,7 @@ impl SoulbeetCoreHandle {
 
     pub async fn disconnect_ws(&self) -> Result<(), FfiError> {
         let core = self.core.clone();
-        self.run_async(async move {
+        self.run_async_uninterruptible(async move {
             core.disconnect_ws().await;
             Ok(())
         })
