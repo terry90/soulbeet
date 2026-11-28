@@ -19,7 +19,7 @@ use super::NewPlaylist;
 use crate::auth::UserCtx;
 use crate::core::acquire::AUTO_SELECT_SCORE_THRESHOLD;
 use crate::core::database_failure;
-use crate::core::folders::owned_in;
+use crate::core::folders::for_user_in;
 use crate::core::index::NavidromeOf;
 use crate::core::jobs::retry::{cancel, download_source, RetryAnswer, SourceTarget};
 use crate::core::jobs::runner::Acquire;
@@ -210,12 +210,9 @@ pub(crate) async fn commit_playlist_import(
             "Playlists are capped at {MAX_PLAYLIST_TRACKS} tracks per import."
         )));
     }
-    if req.folder_id.trim().is_empty() {
-        return Err(invalid_input("Choose a target library folder."));
-    }
 
-    // Verify folder ownership up front before touching Navidrome or the ledger.
-    let folder = owned_in(&acquire.db, ctx, &req.folder_id).await?;
+    // Resolve the user's single personal library folder up front before touching Navidrome or the ledger.
+    let folder = for_user_in(&acquire.db, &ctx.user_id).await?;
 
     let (target, batch_label) = match req.target {
         PlaylistImportTarget::Create {
@@ -741,7 +738,6 @@ mod tests {
                 comment: Some("Imported from Spotify".into()),
                 allow_duplicate_name: false,
             },
-            folder_id: "alice-folder".into(),
             tracks: vec![
                 CommitPlaylistImportTrack {
                     artist: "Marrow Choir".into(),
@@ -819,7 +815,6 @@ mod tests {
                 comment: None,
                 allow_duplicate_name: false,
             },
-            folder_id: "alice-folder".into(),
             tracks: vec![CommitPlaylistImportTrack {
                 artist: "Carbon Based Lifeforms".into(),
                 title: "Fauna".into(),

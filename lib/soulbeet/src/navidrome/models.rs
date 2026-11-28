@@ -662,6 +662,40 @@ pub struct LegacyLyrics {
     pub value: String,
 }
 
+/// A Navidrome library (`model.Library`, model/library.go:9-28) returned by
+/// `GET /api/library`, `POST /api/library`, and embedded on `GET /api/user`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavidromeLibrary {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub default_new_users: bool,
+}
+
+/// A Navidrome user (`model.User`, model/user.go:7-20) returned by `GET /api/user`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavidromeUserInfo {
+    pub id: String,
+    pub user_name: String,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub libraries: Vec<NavidromeLibrary>,
+}
+
+impl NavidromeUserInfo {
+    /// Mirrors `model.User.HasLibraryAccess` (model/user.go:30-38): admins can see
+    /// every library; regular users can see only libraries explicitly assigned to them.
+    pub fn has_library_access(&self, library_id: i64) -> bool {
+        self.is_admin || self.libraries.iter().any(|l| l.id == library_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -23,12 +23,11 @@ use shared::search_norm::{
 };
 use ui::{
     format_mix_title, friendly_error, run_multi_backend_source_search,
-    submit_multi_backend_download, use_player, use_settings, use_system_health, AcquireStageBadge,
+    submit_multi_backend_download, use_player, use_system_health, AcquireStageBadge,
     AutoDownloadSignal, DirectSearchEscape, DownloadIcon, DownloadResults, DownloadRowState,
-    FallbackToast, FallbackToastData, FolderChip, IconChevronLeft, IconDisc3, IconLoader,
-    IconMusic, IconPlay, IconRefreshCw, IconSearch, IconSlidersHorizontal, IconSparkles,
-    IconWifiOff, IconX, PlayerTrack, SearchPrefill, SearchReset, SourceChoices, SystemStatus,
-    TrackRow, TrackRowState,
+    FallbackToast, FallbackToastData, IconChevronLeft, IconDisc3, IconLoader, IconMusic, IconPlay,
+    IconRefreshCw, IconSearch, IconSlidersHorizontal, IconSparkles, IconWifiOff, IconX,
+    PlayerTrack, SearchPrefill, SearchReset, SourceChoices, SystemStatus, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -281,7 +280,6 @@ pub fn SearchPage() -> Element {
     let auth = use_auth();
     let player = use_player();
     let mut studio = use_studio();
-    let mut settings = use_settings();
     let system_health = use_system_health();
     let search_reset = try_use_context::<SearchReset>();
     let search_prefill = try_use_context::<SearchPrefill>();
@@ -309,11 +307,9 @@ pub fn SearchPage() -> Element {
     let mut expanded_albums = use_signal::<HashSet<String>>(HashSet::new);
     let mut album_cache = use_signal::<HashMap<String, CatalogAlbumDetail>>(HashMap::new);
 
-    // Enabled download backends, folders, auto-download tracking & multi-backend source picker
+    // Enabled download backends, personal library folder, auto-download tracking & multi-backend source picker
     let mut enabled_backends = use_signal::<Vec<BackendMeta>>(Vec::new);
-    let mut folders = use_signal::<Vec<Folder>>(Vec::new);
-    let mut selected_folder_id = use_signal::<Option<String>>(|| None);
-    let mut active_menu = use_signal::<Option<String>>(|| None);
+    let mut user_folder = use_signal::<Option<Folder>>(|| None);
     let mut download_states = use_signal::<HashMap<String, DownloadRowState>>(HashMap::new);
     let mut batch_to_item = use_signal::<HashMap<String, String>>(HashMap::new);
     let mut batch_to_name = use_signal::<HashMap<String, String>>(HashMap::new);
@@ -326,24 +322,10 @@ pub fn SearchPage() -> Element {
     let mut is_downloading = use_signal(|| false);
     let mut download_error = use_signal(String::new);
 
-    // Sync default download folder from settings
-    use_effect(move || {
-        if settings.is_loaded() {
-            if let Some(us) = settings.get() {
-                if us.default_download_folder_id.is_some() {
-                    selected_folder_id.set(us.default_download_folder_id.clone());
-                }
-            }
-        }
-    });
-
-    // Fetch user folders
+    // Fetch user's single library folder
     use_future(move || async move {
-        if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
-            if user_folders.len() == 1 {
-                selected_folder_id.set(Some(user_folders[0].id.clone()));
-            }
-            folders.set(user_folders);
+        if let Ok(folder) = auth.call(api::get_user_folder()).await {
+            user_folder.set(folder);
         }
     });
 
@@ -972,7 +954,10 @@ pub fn SearchPage() -> Element {
         });
     };
 
-    let mut start_auto_download = move |item_id: String, query: DownloadQuery, folder: Folder| {
+    let mut start_auto_download = move |item_id: String, query: DownloadQuery| {
+        if user_folder.read().is_none() {
+            return;
+        }
         set_album_and_tracks_download_state(&item_id, DownloadRowState::Searching);
 
         let display_name = query
@@ -989,11 +974,7 @@ pub fn SearchPage() -> Element {
 
         spawn(async move {
             let result = auth
-                .call(api::auto_download(api::AutoDownloadRequest {
-                    query,
-                    folder_id: folder.id.clone(),
-                    folder_path: folder.path.clone(),
-                }))
+                .call(api::auto_download(api::AutoDownloadRequest { query }))
                 .await;
 
             match result {
@@ -1018,32 +999,7 @@ pub fn SearchPage() -> Element {
     };
 
     let mut handle_auto_download = move |item_id: String, query: DownloadQuery| {
-        let folder_id = selected_folder_id();
-        let folder = folder_id
-            .as_ref()
-            .and_then(|fid| folders.read().iter().find(|f| f.id == *fid).cloned())
-            .or_else(|| folders.read().first().cloned());
-        let Some(folder) = folder else {
-            return;
-        };
-        start_auto_download(item_id, query, folder);
-    };
-
-    let mut handle_override_download =
-        move |item_id: String, query: DownloadQuery, folder: Folder| {
-            start_auto_download(item_id, query, folder);
-        };
-
-    let handle_folder_change = move |folder: Folder| {
-        selected_folder_id.set(Some(folder.id.clone()));
-        spawn(async move {
-            let _ = settings
-                .update(api::UpdateUserSettings {
-                    default_download_folder_id: Some(folder.id),
-                    ..Default::default()
-                })
-                .await;
-        });
+        start_auto_download(item_id, query);
     };
 
     let mut open_source_picker = move |query: DownloadQuery| {
@@ -1179,9 +1135,7 @@ pub fn SearchPage() -> Element {
     let total_all_count = total_tracks_count + total_albums_count + total_artists_count;
 
     let acquire_map = studio.acquire_states.read().clone();
-    let current_folders = folders.read().clone();
-    let current_folder_id = selected_folder_id();
-    let has_folders = !current_folders.is_empty();
+    let has_folder = user_folder.read().is_some();
     let any_loading = local_loading() || remote_loading();
 
     let mixes: Vec<_> = studio
@@ -1213,11 +1167,6 @@ pub fn SearchPage() -> Element {
     rsx! {
         div {
             class: "space-y-6",
-            onclick: move |_| {
-                if active_menu().is_some() {
-                    active_menu.set(None);
-                }
-            },
 
             if let Some(choices) = download_options.read().clone() {
                 if !download_error().is_empty() {
@@ -1231,11 +1180,11 @@ pub fn SearchPage() -> Element {
                     unanswered_note: choices.unanswered_note.clone(),
                     is_searching: source_searching(),
                     is_downloading,
-                    on_download: move |(items, folder)| {
+                    on_download: move |items| {
                         let choices_c = choices.clone();
                         spawn(async move {
                             download_error.set(String::new());
-                            if let Err(err) = submit_multi_backend_download(auth, &choices_c, items, folder).await {
+                            if let Err(err) = submit_multi_backend_download(auth, &choices_c, items).await {
                                 download_error.set(err);
                             }
                             is_downloading.set(false);
@@ -1319,18 +1268,6 @@ pub fn SearchPage() -> Element {
                                 title: "Search",
                                 class: "inline-flex items-center justify-center h-8 px-3 rounded-full bg-beet-surface-high hover:bg-beet-surface-highest border border-beet-border-subtle text-[12px] font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors cursor-pointer shrink-0",
                                 "Search"
-                            }
-
-                            // Compact FolderChip when multiple folders exist
-                            if current_folders.len() > 1 {
-                                div { class: "shrink-0 pl-1 border-l border-beet-border-subtle",
-                                    FolderChip {
-                                        folders: current_folders.clone(),
-                                        selected_folder_id,
-                                        on_folder_change: handle_folder_change,
-                                        active_menu,
-                                    }
-                                }
                             }
                         }
                     }
@@ -1512,9 +1449,8 @@ pub fn SearchPage() -> Element {
                                                         {
                                                             let track_for_src = track.clone();
                                                             let track_for_dl = track.clone();
-                                                            let track_for_ov = track.clone();
                                                             let dl_state = download_states.read().get(&track.id).cloned().unwrap_or_default();
-                                                            let eff_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                                            let eff_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                                             let key = acquire_key(
                                                                 track.mbid.as_deref(),
                                                                 Some(&track.id),
@@ -1522,7 +1458,7 @@ pub fn SearchPage() -> Element {
                                                                 &track.title,
                                                             );
                                                             let acq_entry = acquire_map.get(&key).cloned();
-                                                            let acq_req = build_acquire_request(track, current_folder_id.clone());
+                                                            let acq_req = build_acquire_request(track);
                                                             let acq_track_id = track.id.clone();
                                                             let artist_id_click = track.artist_id.clone().unwrap_or_default();
                                                             let artist_name_click = track.artist.clone();
@@ -1533,9 +1469,6 @@ pub fn SearchPage() -> Element {
                                                                         track: track.clone(),
                                                                         acquire_entry: acq_entry,
                                                                         download_state: eff_state,
-                                                                        folders: current_folders.clone(),
-                                                                        selected_folder_id: current_folder_id.clone(),
-                                                                        active_menu,
                                                                         on_acquire_and_play: move |_| {
                                                                             studio.trigger_acquire_and_play(
                                                                                 auth,
@@ -1575,13 +1508,6 @@ pub fn SearchPage() -> Element {
                                                                                 DownloadQuery::from(track_for_dl.to_track()),
                                                                             );
                                                                         },
-                                                                        on_override_download: move |folder: Folder| {
-                                                                            handle_override_download(
-                                                                                track_for_ov.id.clone(),
-                                                                                DownloadQuery::from(track_for_ov.to_track()),
-                                                                                folder,
-                                                                            );
-                                                                        },
                                                                     }
                                                                 }
                                                             }
@@ -1617,10 +1543,9 @@ pub fn SearchPage() -> Element {
                                                                 None
                                                             };
                                                             let dl_state = download_states.read().get(&aid).cloned().unwrap_or_default();
-                                                            let eff_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                                            let eff_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                                             let alb_src = album.clone();
                                                             let alb_dl = album.clone();
-                                                            let alb_ov = album.clone();
                                                             let art_id = album.artist_id.clone().unwrap_or_default();
                                                             let art_name = album.artist.clone();
                                                             rsx! {
@@ -1632,9 +1557,7 @@ pub fn SearchPage() -> Element {
                                                                         download_state: eff_state,
                                                                         download_states,
                                                                         acquire_map: acquire_map.clone(),
-                                                                        folders: current_folders.clone(),
-                                                                        selected_folder_id: current_folder_id.clone(),
-                                                                        active_menu,
+                                                                        has_folder,
                                                                         on_toggle: move |_| toggle_expand_album(aid.clone()),
                                                                         on_artist_click: move |_| open_catalog_artist(art_id.clone(), art_name.clone()),
                                                                         on_search_sources: move |_| {
@@ -1646,15 +1569,8 @@ pub fn SearchPage() -> Element {
                                                                                 DownloadQuery::new(vec![]).album(alb_dl.to_album()),
                                                                             );
                                                                         },
-                                                                        on_override_download: move |folder: Folder| {
-                                                                            handle_override_download(
-                                                                                alb_ov.id.clone(),
-                                                                                DownloadQuery::new(vec![]).album(alb_ov.to_album()),
-                                                                                folder,
-                                                                            );
-                                                                        },
                                                                         on_track_acquire: move |t: CatalogTrack| {
-                                                                            let req = build_acquire_request(&t, selected_folder_id());
+                                                                            let req = build_acquire_request(&t);
                                                                             studio.trigger_acquire_and_play(
                                                                                 auth,
                                                                                 player,
@@ -1670,13 +1586,6 @@ pub fn SearchPage() -> Element {
                                                                         },
                                                                         on_track_download: move |t: CatalogTrack| {
                                                                             handle_auto_download(t.id.clone(), DownloadQuery::from(t.to_track()));
-                                                                        },
-                                                                        on_track_override_download: move |(t, folder): (CatalogTrack, Folder)| {
-                                                                            handle_override_download(
-                                                                                t.id.clone(),
-                                                                                DownloadQuery::from(t.to_track()),
-                                                                                folder,
-                                                                            );
                                                                         },
                                                                     }
                                                                 }
@@ -1760,13 +1669,12 @@ pub fn SearchPage() -> Element {
                                             let alb_art_name = alb.artist.clone();
                                             let alb_src = alb.clone();
                                             let alb_dl = alb.clone();
-                                            let alb_ov = alb.clone();
                                             let alb_dl_state = download_states
                                                 .read()
                                                 .get(&alb.id)
                                                 .cloned()
                                                 .unwrap_or_default();
-                                            let alb_eff_state = if !has_folders {
+                                            let alb_eff_state = if !has_folder {
                                                 DownloadRowState::Disabled
                                             } else {
                                                 alb_dl_state
@@ -1813,22 +1721,11 @@ pub fn SearchPage() -> Element {
                                                             span { "Search sources" }
                                                         }
                                                         DownloadIcon {
-                                                            item_id: alb.id.clone(),
                                                             state: alb_eff_state,
-                                                            folders: current_folders.clone(),
-                                                            selected_folder_id: current_folder_id.clone(),
-                                                            active_menu,
                                                             on_download: move |_| {
                                                                 handle_auto_download(
                                                                     alb_dl.id.clone(),
                                                                     DownloadQuery::new(vec![]).album(alb_dl.to_album()),
-                                                                );
-                                                            },
-                                                            on_override_download: move |folder: Folder| {
-                                                                handle_override_download(
-                                                                    alb_ov.id.clone(),
-                                                                    DownloadQuery::new(vec![]).album(alb_ov.to_album()),
-                                                                    folder,
                                                                 );
                                                             },
                                                         }
@@ -1847,13 +1744,12 @@ pub fn SearchPage() -> Element {
                                                                 let track_acq = track.clone();
                                                                 let track_src = track.clone();
                                                                 let track_dl = track.clone();
-                                                                let track_ov = track.clone();
                                                                 let dl_state = download_states
                                                                     .read()
                                                                     .get(&track.id)
                                                                     .cloned()
                                                                     .unwrap_or_default();
-                                                                let eff_state = if !has_folders {
+                                                                let eff_state = if !has_folder {
                                                                     DownloadRowState::Disabled
                                                                 } else {
                                                                     dl_state
@@ -1907,10 +1803,7 @@ pub fn SearchPage() -> Element {
                                                                                 title: track.title.clone(),
                                                                                 compact: true,
                                                                                 on_acquire: move |_| {
-                                                                                    let req = build_acquire_request(
-                                                                                        &track_acq,
-                                                                                        selected_folder_id(),
-                                                                                    );
+                                                                                    let req = build_acquire_request(&track_acq);
                                                                                     studio.trigger_acquire_and_play(
                                                                                         auth,
                                                                                         player,
@@ -1937,22 +1830,11 @@ pub fn SearchPage() -> Element {
                                                                                 }
                                                                             }
                                                                             DownloadIcon {
-                                                                                item_id: track.id.clone(),
                                                                                 state: eff_state,
-                                                                                folders: current_folders.clone(),
-                                                                                selected_folder_id: current_folder_id.clone(),
-                                                                                active_menu,
                                                                                 on_download: move |_| {
                                                                                     handle_auto_download(
                                                                                         track_dl.id.clone(),
                                                                                         DownloadQuery::from(track_dl.to_track()),
-                                                                                    );
-                                                                                },
-                                                                                on_override_download: move |folder: Folder| {
-                                                                                    handle_override_download(
-                                                                                        track_ov.id.clone(),
-                                                                                        DownloadQuery::from(track_ov.to_track()),
-                                                                                        folder,
                                                                                     );
                                                                                 },
                                                                             }
@@ -2457,9 +2339,8 @@ pub fn SearchPage() -> Element {
                                                     {
                                                         let track_for_src = track.clone();
                                                         let track_for_dl = track.clone();
-                                                        let track_for_ov = track.clone();
                                                         let dl_state = download_states.read().get(&track.id).cloned().unwrap_or_default();
-                                                        let eff_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                                        let eff_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                                         let key = acquire_key(
                                                             track.mbid.as_deref(),
                                                             Some(&track.id),
@@ -2467,7 +2348,7 @@ pub fn SearchPage() -> Element {
                                                             &track.title,
                                                         );
                                                         let acq_entry = acquire_map.get(&key).cloned();
-                                                        let acq_req = build_acquire_request(track, current_folder_id.clone());
+                                                        let acq_req = build_acquire_request(track);
                                                         let acq_track_id = track.id.clone();
                                                         let art_id = track.artist_id.clone().unwrap_or_default();
                                                         let art_name = track.artist.clone();
@@ -2481,9 +2362,6 @@ pub fn SearchPage() -> Element {
                                                                     track: track.clone(),
                                                                     acquire_entry: acq_entry,
                                                                     download_state: eff_state,
-                                                                    folders: current_folders.clone(),
-                                                                    selected_folder_id: current_folder_id.clone(),
-                                                                    active_menu,
                                                                     on_acquire_and_play: move |_| {
                                                                         studio.trigger_acquire_and_play(
                                                                             auth,
@@ -2517,13 +2395,6 @@ pub fn SearchPage() -> Element {
                                                                             DownloadQuery::from(track_for_dl.to_track()),
                                                                         );
                                                                     },
-                                                                    on_override_download: move |folder: Folder| {
-                                                                        handle_override_download(
-                                                                            track_for_ov.id.clone(),
-                                                                            DownloadQuery::from(track_for_ov.to_track()),
-                                                                            folder,
-                                                                        );
-                                                                    },
                                                                 }
                                                             }
                                                         }
@@ -2555,10 +2426,9 @@ pub fn SearchPage() -> Element {
                                                             None
                                                         };
                                                         let dl_state = download_states.read().get(&aid).cloned().unwrap_or_default();
-                                                        let eff_state = if !has_folders { DownloadRowState::Disabled } else { dl_state };
+                                                        let eff_state = if !has_folder { DownloadRowState::Disabled } else { dl_state };
                                                         let alb_src = album.clone();
                                                         let alb_dl = album.clone();
-                                                        let alb_ov = album.clone();
                                                         let art_id = album.artist_id.clone().unwrap_or_default();
                                                         let art_name = album.artist.clone();
 
@@ -2571,9 +2441,7 @@ pub fn SearchPage() -> Element {
                                                                     download_state: eff_state,
                                                                     download_states,
                                                                     acquire_map: acquire_map.clone(),
-                                                                    folders: current_folders.clone(),
-                                                                    selected_folder_id: current_folder_id.clone(),
-                                                                    active_menu,
+                                                                    has_folder,
                                                                     on_toggle: move |_| toggle_expand_album(aid.clone()),
                                                                     on_artist_click: move |_| open_catalog_artist(art_id.clone(), art_name.clone()),
                                                                     on_search_sources: move |_| {
@@ -2585,15 +2453,8 @@ pub fn SearchPage() -> Element {
                                                                             DownloadQuery::new(vec![]).album(alb_dl.to_album()),
                                                                         );
                                                                     },
-                                                                    on_override_download: move |folder: Folder| {
-                                                                        handle_override_download(
-                                                                            alb_ov.id.clone(),
-                                                                            DownloadQuery::new(vec![]).album(alb_ov.to_album()),
-                                                                            folder,
-                                                                        );
-                                                                    },
                                                                     on_track_acquire: move |t: CatalogTrack| {
-                                                                        let req = build_acquire_request(&t, selected_folder_id());
+                                                                        let req = build_acquire_request(&t);
                                                                         studio.trigger_acquire_and_play(
                                                                             auth,
                                                                             player,
@@ -2609,13 +2470,6 @@ pub fn SearchPage() -> Element {
                                                                     },
                                                                     on_track_download: move |t: CatalogTrack| {
                                                                         handle_auto_download(t.id.clone(), DownloadQuery::from(t.to_track()));
-                                                                    },
-                                                                    on_track_override_download: move |(t, folder): (CatalogTrack, Folder)| {
-                                                                        handle_override_download(
-                                                                            t.id.clone(),
-                                                                            DownloadQuery::from(t.to_track()),
-                                                                            folder,
-                                                                        );
                                                                     },
                                                                 }
                                                             }
@@ -2725,10 +2579,7 @@ fn artist_subtitle(artist: &CatalogArtist) -> Option<String> {
         .map(format_fan_count)
 }
 
-fn build_acquire_request(
-    track: &CatalogTrack,
-    folder_id: Option<String>,
-) -> AcquireAndPlayRequest {
+fn build_acquire_request(track: &CatalogTrack) -> AcquireAndPlayRequest {
     let duration_s = track
         .duration_secs
         .or_else(|| parse_duration_secs(track.duration.as_deref()));
@@ -2739,7 +2590,6 @@ fn build_acquire_request(
         recording_mbid: track.mbid.clone(),
         release_mbid: track.release_mbid.clone(),
         duration_s,
-        folder_id,
         prefer_fast: true,
     }
 }
@@ -2810,16 +2660,12 @@ struct CatalogTrackRowProps {
     track: CatalogTrack,
     acquire_entry: Option<AcquireTrackState>,
     download_state: DownloadRowState,
-    folders: Vec<Folder>,
-    selected_folder_id: Option<String>,
-    active_menu: Signal<Option<String>>,
     on_acquire_and_play: EventHandler<()>,
     on_pick_acquire_source: EventHandler<ManualChoiceModalState>,
     on_artist_click: EventHandler<()>,
     on_album_click: EventHandler<()>,
     on_search_sources: EventHandler<()>,
     on_download: EventHandler<()>,
-    on_override_download: EventHandler<Folder>,
 }
 
 #[component]
@@ -2989,15 +2835,10 @@ fn CatalogTrackRow(props: CatalogTrackRowProps) -> Element {
                     }
                 }
 
-                // Auto-download button (with folder override menu)
+                // Auto-download button
                 DownloadIcon {
-                    item_id: props.track.id.clone(),
                     state: props.download_state.clone(),
-                    folders: props.folders.clone(),
-                    selected_folder_id: props.selected_folder_id.clone(),
-                    active_menu: props.active_menu,
                     on_download: props.on_download,
-                    on_override_download: props.on_override_download,
                 }
             }
 
@@ -3113,19 +2954,15 @@ struct CatalogAlbumRowProps {
     download_state: DownloadRowState,
     download_states: Signal<HashMap<String, DownloadRowState>>,
     acquire_map: HashMap<String, AcquireTrackState>,
-    folders: Vec<Folder>,
-    selected_folder_id: Option<String>,
-    active_menu: Signal<Option<String>>,
+    has_folder: bool,
     on_toggle: EventHandler<()>,
     on_artist_click: EventHandler<()>,
     on_search_sources: EventHandler<()>,
     on_download: EventHandler<()>,
-    on_override_download: EventHandler<Folder>,
     on_track_acquire: EventHandler<CatalogTrack>,
     on_track_pick_acquire: EventHandler<ManualChoiceModalState>,
     on_track_search_sources: EventHandler<CatalogTrack>,
     on_track_download: EventHandler<CatalogTrack>,
-    on_track_override_download: EventHandler<(CatalogTrack, Folder)>,
 }
 
 #[component]
@@ -3133,7 +2970,7 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
     let mut failed_url = use_signal(|| None::<String>);
     let album = &props.album;
     let facts = catalog_album_facts(album);
-    let has_folders = !props.folders.is_empty();
+    let has_folder = props.has_folder;
     let active_cover_url = album
         .cover_url
         .as_deref()
@@ -3143,7 +2980,7 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
 
     rsx! {
         div { class: "space-y-0",
-            // Album header row (keep overflow visible for DownloadIcon FolderDropdown)
+            // Album header row
             div {
                 class: "bg-beet-surface hover:bg-beet-surface-high border transition-colors duration-150 flex items-center gap-3 p-3 group cursor-pointer",
                 class: if props.is_expanded {
@@ -3231,13 +3068,8 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
                     }
 
                     DownloadIcon {
-                        item_id: props.album.id.clone(),
                         state: props.download_state.clone(),
-                        folders: props.folders.clone(),
-                        selected_folder_id: props.selected_folder_id.clone(),
-                        active_menu: props.active_menu,
                         on_download: props.on_download,
-                        on_override_download: props.on_override_download,
                     }
                 }
             }
@@ -3264,14 +3096,13 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
                                         let track_acq = track.clone();
                                         let track_src = track.clone();
                                         let track_dl = track.clone();
-                                        let track_ov = track.clone();
                                         let dl_state = props
                                             .download_states
                                             .read()
                                             .get(&track.id)
                                             .cloned()
                                             .unwrap_or_default();
-                                        let eff_state = if !has_folders {
+                                        let eff_state = if !has_folder {
                                             DownloadRowState::Disabled
                                         } else {
                                             dl_state
@@ -3337,15 +3168,8 @@ fn CatalogAlbumRow(props: CatalogAlbumRowProps) -> Element {
                                                         }
                                                     }
                                                     DownloadIcon {
-                                                        item_id: track.id.clone(),
                                                         state: eff_state,
-                                                        folders: props.folders.clone(),
-                                                        selected_folder_id: props.selected_folder_id.clone(),
-                                                        active_menu: props.active_menu,
                                                         on_download: move |_| props.on_track_download.call(track_dl.clone()),
-                                                        on_override_download: move |folder: Folder| {
-                                                            props.on_track_override_download.call((track_ov.clone(), folder));
-                                                        },
                                                     }
                                                 }
                                                 if in_flight {

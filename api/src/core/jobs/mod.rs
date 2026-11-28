@@ -16,7 +16,6 @@ use crate::ledger::{
     SlotResult, SourceFilters, StoredImport, MCP_UNFINISHED_JOBS_PER_USER,
 };
 use crate::models::folder::Folder;
-use crate::models::user_settings::UserSettings;
 use crate::services::NavidromeLookupError;
 use futures::StreamExt;
 use runner::{spawn_drive, Acquire};
@@ -194,8 +193,7 @@ impl From<Failure> for CallRefused {
     }
 }
 
-/// The folder: `folder_id` when ctx owns it (else `folder_not_found`), else the default one,
-/// else folder_required: with the user's folders to choose from when they have some.
+/// The caller's single personal library folder (optionally matching `folder_id` if passed).
 pub(crate) async fn folder_for(
     db: &SqlitePool,
     ctx: &UserCtx,
@@ -205,42 +203,24 @@ pub(crate) async fn folder_for(
         return Ok(owned_in(db, ctx, id).await?);
     }
     let failed = |e| database_failure(Stage::Input, e);
-    let folders = Folder::get_all_by_user_in(db, &ctx.user_id)
+    if let Some(folder) = Folder::get_for_user_in(db, &ctx.user_id)
         .await
-        .map_err(failed)?;
-    let settings = UserSettings::get_in(db, &ctx.user_id)
-        .await
-        .map_err(failed)?;
-    // An empty stored id is no choice: Settings clears the default so.
-    let default = (settings.default_download_folder_id)
-        .filter(|id| !id.is_empty())
-        .and_then(|id| folders.iter().find(|f| f.id == id));
-    if let Some(folder) = default {
-        return Ok(folder.clone());
+        .map_err(failed)?
+    {
+        return Ok(folder);
     }
-    if folders.is_empty() {
-        let failure = Failure::new(
-            FailureCode::FolderRequired,
-            Stage::Input,
-            RetryAdvice::NeedsUser,
-            "This user has no library folder",
-        )
-        .with_user_action(UserAction::new(
-            UserActionCode::AddFolder,
-            "Add a library folder",
-            "Settings > Library",
-        ));
-        return Err(failure.into());
-    }
-    Err(CallRefused {
-        failure: Failure::new(
-            FailureCode::FolderRequired,
-            Stage::Input,
-            RetryAdvice::NeedsDecision,
-            "No folder_id was given and no default folder is set",
-        ),
-        folders,
-    })
+    let failure = Failure::new(
+        FailureCode::FolderRequired,
+        Stage::Input,
+        RetryAdvice::NeedsUser,
+        "This user has no library folder",
+    )
+    .with_user_action(UserAction::new(
+        UserActionCode::AddFolder,
+        "Set your library folder",
+        "Settings > Library",
+    ));
+    Err(failure.into())
 }
 
 /// Design 11.5. Refuses before anything is looked up or written when the importer is broken, the

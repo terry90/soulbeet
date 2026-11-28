@@ -84,6 +84,15 @@ fn main() {
             api::import_queue::start_library_prune();
 
             api::security::check_seeded_admin().await;
+            api::core::folders::ensure_all_user_folders_on_startup().await;
+            // Sync per-user Navidrome libraries in the background so HTTP startup
+            // never blocks on Navidrome network calls.
+            tokio::spawn(async {
+                let report = api::core::navidrome_libraries::sync_all_user_libraries().await;
+                if let Some(warning) = report.warning {
+                    dioxus::logger::tracing::warn!("{}", warning.message);
+                }
+            });
             api::folder_policy::log_folder_conflicts().await;
             api::models::user::log_username_collisions().await;
             if let Some(problem) = api::config::CONFIG.navidrome_music_path_problem() {

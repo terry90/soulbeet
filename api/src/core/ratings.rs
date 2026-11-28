@@ -227,13 +227,9 @@ async fn rating_refusal(
     rating: u8,
 ) -> Result<(), NotSet> {
     let unreadable = |e: String| NotSet::Refused(database_failure(Stage::Input, e));
-    let settings = UserSettings::get_in(guard.db, &user.to_string())
+    let pending = DiscoveryTrackRow::pending_for_user_in(guard.db, &user.to_string())
         .await
         .map_err(unreadable)?;
-    let mut pending = DiscoveryTrackRow::pending_for_user_in(guard.db, &user.to_string())
-        .await
-        .map_err(unreadable)?;
-    pending.sort_by_key(|t| Some(&t.folder_id) != settings.discovery_folder_id.as_ref());
     let by_id = pending
         .iter()
         .find(|t| t.song_id.as_ref() == Some(&song.id));
@@ -609,9 +605,13 @@ pub(crate) async fn sync_in(
     let settings = (UserSettings::get_in(deps.db, &ctx.user_id).await).map_err(unreadable)?;
     let threshold = settings.discovery_promote_threshold;
     let external_rating_sync = settings.external_rating_sync_enabled;
-    let tracks_of_folder = match &settings.discovery_folder_id {
-        Some(fid) => {
-            (DiscoveryTrackRow::get_pending_by_folder_in(deps.db, fid).await).map_err(unreadable)?
+    let tracks_of_folder = match Folder::get_for_user_in(deps.db, &ctx.user_id)
+        .await
+        .map_err(unreadable)?
+    {
+        Some(folder) => {
+            (DiscoveryTrackRow::get_pending_by_folder_in(deps.db, &folder.id).await)
+                .map_err(unreadable)?
         }
         None => vec![],
     };
@@ -702,7 +702,13 @@ pub(crate) async fn sync_in(
             let listed = run.len();
             run.retain(|t| !t.not_pending());
             not_pending += (listed - run.len()) as u32;
-            let kept_tracks = kept_of(&run);
+            let mut for_kept: Vec<SyncedTrack> = tracks
+                .iter()
+                .filter(|t| t.action == SyncAction::RemoveFromDiscovery && t.failure.is_some())
+                .cloned()
+                .collect();
+            for_kept.extend(run.iter().cloned());
+            let kept_tracks = kept_of(&for_kept);
             if let Err(e) = DeletionBlockRow::replace_in(deps.db, &ctx.user_id, &kept_tracks).await
             {
                 let name = &ctx.username;
@@ -1087,7 +1093,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 discovery_promote_threshold: Some(4),
                 ..Default::default()
             },
@@ -1190,12 +1195,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rating_is_refused_for_a_pending_track_of_any_folder_of_the_user() {
-        // t1 is pending in alice-music while the discovery folder is alice-other: the sync does
-        // not read it now, but would act on it once the folder is alice-music again.
+    async fn a_rating_is_refused_for_a_pending_track_of_the_user() {
         let lib = Library::new().await;
-        lib.folder("alice", "alice-other", "music/alice-other", false)
-            .await;
         let staged = lib.root.join("music/alice/Discovery/Explore/03.flac");
         lib.pending_track("t1", "alice-music", "Explore", &staged, Some(HOLY.0))
             .await;
@@ -1203,11 +1204,6 @@ mod tests {
         let bobs = lib.root.join("music/bob/Discovery/Explore/03.flac");
         lib.pending_track("t2", "bob-music", "Explore", &bobs, Some(HOLY.0))
             .await;
-        let discovery_folder = |id: &str| UpdateUserSettings {
-            discovery_folder_id: Some(id.into()),
-            ..Default::default()
-        };
-        set(&lib.db, discovery_folder("alice-other")).await;
         let navi = NavidromeStub::start();
         navi.answer("/rest/getSong", &[&song_body(HOLY.0, HOLY.1, None, false)]);
         let (guard, holy) = (lib.guard(), Target::Song(HOLY.0.into()));
@@ -1221,23 +1217,9 @@ mod tests {
             rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
             refused("t1")
         );
-        // A track of the same song in the discovery folder is the one named: the next sync acts
-        // on it.
-        let other = lib.root.join("music/alice-other/Discovery/Explore/03.flac");
-        lib.pending_track("t3", "alice-other", "Explore", &other, Some(HOLY.0))
-            .await;
-        assert_eq!(
-            rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
-            refused("t3")
-        );
-        set(&lib.db, discovery_folder("alice-music")).await;
-        assert_eq!(
-            rate(&guard, &navi.client(), &lib.alice(), &holy, 5).await,
-            refused("t1")
-        );
         assert_eq!(navi.posted("/rest/setRating").len(), 0);
-        // With neither pending any more, bob's track is no reason to refuse.
-        sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id IN ('t1', 't3')")
+        // Once no longer pending, bob's track is no reason to refuse.
+        sqlx::query("UPDATE discovery_tracks SET status = 'Removed' WHERE id = 't1'")
             .execute(&lib.db)
             .await
             .unwrap();
@@ -2051,7 +2033,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 ..Default::default()
             },
         )
@@ -2124,7 +2105,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 ..Default::default()
             },
         )
@@ -2193,7 +2173,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 ..Default::default()
             },
         )
@@ -2235,7 +2214,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 ..Default::default()
             },
         )
@@ -2397,7 +2375,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 auto_delete_enabled: Some(true),
                 external_rating_sync_enabled: Some(true),
                 ..Default::default()
@@ -2486,7 +2463,6 @@ mod tests {
         set(
             &lib.db,
             UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
                 auto_delete_enabled: Some(true),
                 external_rating_sync_enabled: Some(false),
                 ..Default::default()

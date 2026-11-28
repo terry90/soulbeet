@@ -17,9 +17,13 @@ impl FolderRoot {
     }
 
     pub async fn add(path: &str) -> Result<(), String> {
+        Self::add_in(&DB, path).await
+    }
+
+    pub(crate) async fn add_in(db: &SqlitePool, path: &str) -> Result<(), String> {
         sqlx::query("INSERT OR IGNORE INTO folder_roots (path) VALUES (?)")
             .bind(path)
-            .execute(&*DB)
+            .execute(db)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())

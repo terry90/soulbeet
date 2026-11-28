@@ -1,8 +1,6 @@
-use api::models::folder::Folder;
 use dioxus::prelude::*;
 use shared::metadata::asks_no_title;
 
-use super::folder_chip::FolderChip;
 use super::search_type_toggle::{SearchType, SearchTypeToggle};
 use crate::{submitted_text, Button, FieldKind, FieldLook, TextInput, FOCUS_RING};
 
@@ -35,10 +33,6 @@ pub struct SearchBarProps {
     pub artist_open: Signal<bool>,
     pub search_type: Signal<SearchType>,
     pub loading: bool,
-    pub folders: Vec<Folder>,
-    pub selected_folder_id: Signal<Option<String>>,
-    pub on_folder_change: EventHandler<Folder>,
-    pub active_menu: Signal<Option<String>>,
     /// Runs on every submit, once the fields' text is in `search` and `artist`.
     pub on_search: EventHandler,
     /// Optional placeholder override (e.g. when Offline Only mode is active).
@@ -50,8 +44,7 @@ pub struct SearchBarProps {
 }
 
 /// The unified Studio search form: query input, optional artist row for
-/// discography & filtered searches, `ALBUM` / `TRACK` segmented radios, and
-/// destination download folder selector.
+/// discography & filtered searches, and `ALBUM` / `TRACK` segmented radios.
 #[component]
 pub fn SearchBar(props: SearchBarProps) -> Element {
     let SearchBarProps {
@@ -63,7 +56,6 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
         on_search,
         placeholder_override,
         show_type_toggle,
-        ..
     } = props;
 
     // Set when a click shows or hides the artist row, so focus moves to
@@ -232,14 +224,6 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
                 "Artist"
               }
             }
-            if props.folders.len() > 1 {
-              FolderChip {
-                folders: props.folders.clone(),
-                selected_folder_id: props.selected_folder_id,
-                on_folder_change: props.on_folder_change,
-                active_menu: props.active_menu,
-              }
-            }
           }
         }
       }
@@ -256,12 +240,10 @@ pub fn SearchBar(props: SearchBarProps) -> Element {
 mod tests {
     use super::*;
     use crate::opening_tag;
-    use crate::search::folder_chip::tests::folder;
 
     #[derive(Props, Clone, PartialEq)]
     struct Setup {
         artist: Option<String>,
-        folders: usize,
         loading: bool,
         search_type: SearchType,
     }
@@ -270,7 +252,6 @@ mod tests {
         fn default() -> Self {
             Self {
                 artist: None,
-                folders: 0,
                 loading: false,
                 search_type: SearchType::Album,
             }
@@ -288,11 +269,6 @@ mod tests {
                 let artist = use_signal(|| setup.artist.clone());
                 let artist_open = use_signal(|| false);
                 let search_type = use_signal(|| setup.search_type);
-                let selected_folder_id = use_signal(|| Some("f0".to_string()));
-                let active_menu = use_signal(|| None);
-                let folders = (0..setup.folders)
-                    .map(|i| folder(&format!("f{i}"), "Lossless archive from the old NAS"))
-                    .collect::<Vec<_>>();
                 rsx! {
                   SearchBar {
                     search,
@@ -300,10 +276,6 @@ mod tests {
                     artist_open,
                     search_type,
                     loading: setup.loading,
-                    folders,
-                    selected_folder_id,
-                    on_folder_change: |_| {},
-                    active_menu,
                     on_search: move |_| SEARCHED.with(|s| s.borrow_mut().push((search(), artist()))),
                   }
                 }
@@ -446,25 +418,6 @@ mod tests {
         let field = opening_tag(&html, &format!("id=\"{ARTIST_ID}\""));
         assert!(field.contains("value=\"The Beatles\""), "{field}");
         assert!(!html.contains("Add artist filter"), "{html}");
-    }
-
-    #[test]
-    fn the_folder_chip_shows_at_every_width_with_several_folders() {
-        let html = render(Setup {
-            folders: 2,
-            ..Setup::default()
-        });
-        assert!(html.contains("Download folder: "), "{html}");
-        // One bar for every width: nothing in it is hidden at one.
-        for class in ["hidden md:", "md:hidden"] {
-            assert!(!html.contains(class), "{class} in {html}");
-        }
-
-        let html = render(Setup {
-            folders: 1,
-            ..Setup::default()
-        });
-        assert!(!html.contains("Download folder: "), "{html}");
     }
 
     #[test]

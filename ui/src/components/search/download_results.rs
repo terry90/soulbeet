@@ -156,7 +156,7 @@ pub struct Props {
     pub is_searching: bool,
     pub is_downloading: Signal<bool>,
     #[props(into)]
-    pub on_download: EventHandler<(Vec<DownloadableItem>, String)>,
+    pub on_download: EventHandler<Vec<DownloadableItem>>,
     #[props(into)]
     pub on_back: EventHandler<()>,
 }
@@ -403,22 +403,16 @@ pub fn DownloadResults(props: Props) -> Element {
     let mut selected_tracks = use_signal(HashSet::<String>::new);
     let mut active_backend_filter = use_signal(|| None::<String>);
     let results = props.results.clone();
-    let mut folders = use_signal(std::vec::Vec::new);
-    let mut selected_folder = use_signal(String::new);
+    let mut has_folder = use_signal(|| true);
+    let mut folder_checked = use_signal(|| false);
     let mut is_downloading = props.is_downloading;
     let auth = use_auth();
 
     use_future(move || async move {
-        if let Ok(user_folders) = auth.call(api::get_user_folders()).await {
-            info!("Fetched {} user folders", user_folders.len());
-
-            // Only select if the user has exactly one folder
-            // It could be error prone to auto-select if there are multiple folders
-            if user_folders.len() == 1 {
-                selected_folder.set(user_folders[0].path.clone());
-            }
-            folders.set(user_folders);
+        if let Ok(folder) = auth.call(api::get_user_folder()).await {
+            has_folder.set(folder.is_some());
         }
+        folder_checked.set(true);
     });
 
     let handle_album_select_all = move |group: DownloadableGroup| {
@@ -473,9 +467,7 @@ pub fn DownloadResults(props: Props) -> Element {
         // Set downloading state immediately to prevent double-clicks
         is_downloading.set(true);
 
-        props
-            .on_download
-            .call((items_to_download, selected_folder()));
+        props.on_download.call(items_to_download);
     };
 
     let filter_entries = backend_filter_entries(&results, &props.backend_statuses);
@@ -590,23 +582,10 @@ pub fn DownloadResults(props: Props) -> Element {
                 }
             }
 
-            // Target folder selector
-            div {
-                label {
-                    r#for: "dl_folder",
-                    class: "block text-[12px] font-medium mb-1.5 text-beet-text-secondary",
-                    "Select Target Folder"
-                }
-                select {
-                    id: "dl_folder",
-                    name: "dl_folder",
-                    class: "w-full h-10 px-3 rounded-[10px] bg-beet-surface-low border border-beet-border-default focus:border-beet-border-strong text-[13px] text-beet-text-primary outline-none transition-colors",
-                    value: "{selected_folder}",
-                    onchange: move |e| selected_folder.set(e.value()),
-                    option { value: "", disabled: true, "Select a folder" }
-                    for folder in folders.read().iter() {
-                        option { value: "{folder.path}", "{folder.name}" }
-                    }
+            // Warning when the user has not configured their personal library folder yet
+            if folder_checked() && !has_folder() {
+                div { class: "rounded-[10px] bg-beet-gold-surface border border-beet-gold/30 px-3 py-2 text-[12px] text-beet-gold",
+                    "No music library folder configured. Set your library folder in Settings > Library before downloading."
                 }
             }
 
@@ -646,7 +625,7 @@ pub fn DownloadResults(props: Props) -> Element {
                     r#type: "button",
                     class: "inline-flex items-center justify-center gap-2 h-12 px-5 rounded-full bg-beet-leaf-solid text-beet-leaf-ink font-semibold text-[14px] shadow-lg hover:brightness-105 transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer",
                     aria_label: "Start download",
-                    disabled: selected_count == 0 || selected_folder.read().is_empty() || *is_downloading.read(),
+                    disabled: selected_count == 0 || !has_folder() || *is_downloading.read(),
                     onclick: handle_download,
                     if *is_downloading.read() {
                         div { class: "animate-spin rounded-full h-5 w-5 border-2 border-beet-leaf-ink/30 border-t-beet-leaf-ink" }

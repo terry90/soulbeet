@@ -15,7 +15,6 @@ pub struct Folder {
     pub user_id: String,
     pub name: String,
     pub path: String,
-    pub shared: bool,
 }
 
 /// A folder with its owner's name and role, as the folder rules read it.
@@ -31,6 +30,15 @@ pub struct OwnedFolder {
 #[cfg(feature = "server")]
 impl Folder {
     pub async fn create(user_id: &str, name: &str, path: &str) -> Result<Folder, String> {
+        Self::create_in(&DB, user_id, name, path).await
+    }
+
+    pub(crate) async fn create_in(
+        db: &SqlitePool,
+        user_id: &str,
+        name: &str,
+        path: &str,
+    ) -> Result<Folder, String> {
         let id = Uuid::new_v4().to_string();
 
         let folder = sqlx::query_as::<_, Folder>(
@@ -40,11 +48,27 @@ impl Folder {
         .bind(user_id)
         .bind(name)
         .bind(path)
-        .fetch_one(&*DB)
+        .fetch_one(db)
         .await
         .map_err(|e| e.to_string())?;
 
         Ok(folder)
+    }
+
+    /// The single library folder owned by `user_id`, if configured.
+    pub async fn get_for_user(user_id: &str) -> Result<Option<Folder>, String> {
+        Self::get_for_user_in(&DB, user_id).await
+    }
+
+    pub(crate) async fn get_for_user_in(
+        db: &SqlitePool,
+        user_id: &str,
+    ) -> Result<Option<Folder>, String> {
+        sqlx::query_as::<_, Folder>("SELECT * FROM folders WHERE user_id = ? LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Every folder with its owner, ordered by owner and name.
@@ -64,8 +88,7 @@ impl Folder {
         Self::get_all_by_user_in(&DB, user_id).await
     }
 
-    /// In the order the folders were added (`rowid`), so a page of them
-    /// has stable offsets.
+    /// Returns the user's single folder (0 or 1 elements) in stable order.
     pub(crate) async fn get_all_by_user_in(
         db: &SqlitePool,
         user_id: &str,
@@ -88,16 +111,6 @@ impl Folder {
             .bind(path)
             .bind(id)
             .execute(db)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub async fn set_shared(id: &str, shared: bool) -> Result<(), String> {
-        sqlx::query("UPDATE folders SET shared = ? WHERE id = ?")
-            .bind(shared)
-            .bind(id)
-            .execute(&*DB)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -149,7 +162,7 @@ impl Folder {
     pub async fn has_discovery_enabled(&self) -> Result<bool, String> {
         use crate::models::user_settings::UserSettings;
         let settings = UserSettings::get(&self.user_id).await?;
-        Ok(settings.discovery_enabled && settings.discovery_folder_id.as_deref() == Some(&self.id))
+        Ok(settings.discovery_enabled)
     }
 }
 
@@ -173,7 +186,6 @@ mod tests {
             user_id: "u".into(),
             name: "n".into(),
             path: p.into(),
-            shared: false,
         };
         let folders = vec![f("/music/rock"), f("/music/jazz/")];
         assert_eq!(
@@ -189,27 +201,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_users_folders_come_in_the_order_they_were_added() {
+    async fn a_user_may_hold_only_one_folder() {
         let db = test_db::migrated().await;
         sqlx::query("INSERT INTO users (id, username, password_hash) VALUES ('u1', 'alice', 'x')")
             .execute(&db)
             .await
             .unwrap();
-        for (id, name) in [("fb", "Music"), ("fa", "Archive")] {
-            sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES (?, 'u1', ?, ?)")
-                .bind(id)
-                .bind(name)
-                .bind(format!("/music/{id}"))
-                .execute(&db)
-                .await
-                .unwrap();
-        }
-        let ids: Vec<String> = Folder::get_all_by_user_in(&db, "u1")
+        Folder::create_in(&db, "u1", "Music", "/music/alice")
             .await
-            .unwrap()
-            .into_iter()
-            .map(|f| f.id)
-            .collect();
-        assert_eq!(ids, ["fb", "fa"]); // neither by id nor by name
+            .unwrap();
+        assert!(Folder::create_in(&db, "u1", "Archive", "/music/alice2")
+            .await
+            .is_err());
+        let folder = Folder::get_for_user_in(&db, "u1").await.unwrap().unwrap();
+        assert_eq!(folder.path, "/music/alice");
     }
 }

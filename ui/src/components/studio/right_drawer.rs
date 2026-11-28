@@ -6,8 +6,8 @@ use shared::client::{DeleteGuardPreview, TrackLyrics};
 use crate::{
     classify_guard_mode, format_discovery_badge, format_duration, protection_kind_label,
     use_player, GuardModalMode, IconCheck, IconInfo, IconListMusic, IconLoader, IconMic2,
-    IconMusic, IconPlay, IconRadio, IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown,
-    IconTrash2, IconX, PlayerTrack, StarStrip, StarStripSize,
+    IconMusic, IconPlay, IconRadio, IconShare2, IconShieldAlert, IconShieldCheck, IconSparkles,
+    IconThumbsDown, IconTrash2, IconX, PlayerTrack, StarStrip, StarStripSize,
 };
 
 use super::LyricsPanel;
@@ -50,6 +50,7 @@ pub fn StudioRightDrawer(
     on_drop: EventHandler<PlayerTrack>,
     on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
+    #[props(default)] on_share: Option<EventHandler<PlayerTrack>>,
 ) -> Element {
     // Hooks MUST run unconditionally before any early return (Dioxus 0.7 Rules of Hooks).
     let player = use_player();
@@ -144,6 +145,7 @@ pub fn StudioRightDrawer(
                             on_drop,
                             on_rate,
                             on_start_radio,
+                            on_share,
                         }
                     },
                 }
@@ -287,6 +289,7 @@ fn InspectorTabBody(
     on_drop: EventHandler<PlayerTrack>,
     on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
+    #[props(default)] on_share: Option<EventHandler<PlayerTrack>>,
 ) -> Element {
     let Some(track) = track else {
         return rsx! {
@@ -306,6 +309,7 @@ fn InspectorTabBody(
     let track_drop = track.clone();
     let track_rate = track.clone();
     let track_radio = track.clone();
+    let track_share = track.clone();
     let track_modal = track.clone();
     let song_id_refresh = track.id.clone();
 
@@ -360,6 +364,17 @@ fn InspectorTabBody(
                         onclick: move |_| on_start_radio.call(track_radio.clone()),
                         IconRadio { size: 13 }
                         span { "Track Radio" }
+                    }
+                    if !track.is_discovery && !track.id.is_empty() {
+                        if let Some(share_cb) = on_share {
+                            button {
+                                r#type: "button",
+                                class: "inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-primary hover:border-beet-leaf-solid/40 hover:text-beet-leaf-text text-[12px] font-medium cursor-pointer transition-colors",
+                                onclick: move |_| share_cb.call(track_share.clone()),
+                                IconShare2 { size: 13 }
+                                span { "Share" }
+                            }
+                        }
                     }
                     if track.is_discovery {
                         button {

@@ -34,7 +34,6 @@ use crate::mcp::status::{FolderFacts, NavidromeFacts, StatusFacts, StatusSource}
 use crate::mcp::sync::RatingSync;
 use crate::mcp::McpCaller;
 use crate::models::folder::Folder;
-use crate::models::user_settings::{UpdateUserSettings, UserSettings};
 use crate::oauth::cimd::{
     client_id_url, parse_document, CimdError, ClientDocument, ClientDocuments,
 };
@@ -507,19 +506,8 @@ pub(crate) async fn add_folder(
         .unwrap();
 }
 
-/// Makes `folder_id` `user_id`'s default folder; None clears the choice, as Settings does.
-pub(crate) async fn set_default_folder(db: &SqlitePool, user_id: &str, folder_id: Option<&str>) {
-    UserSettings::upsert_in(
-        db,
-        user_id,
-        UpdateUserSettings {
-            default_download_folder_id: Some(folder_id.unwrap_or_default().to_string()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-}
+/// No-op kept only if tests still call it; single-folder-per-user has no separate default_download_folder_id.
+pub(crate) async fn set_default_folder(_db: &SqlitePool, _user_id: &str, _folder_id: Option<&str>) {}
 
 /// The jobs of `core::jobs::test_support` are alice's (user id `alice`): a database with her,
 /// the acquisition acting on it, its effects and her access token.
@@ -731,17 +719,16 @@ pub(crate) fn sample_facts() -> StatusFacts {
                 user_id: "u1".into(),
                 name: "Music".into(),
                 path: "/music/alice".into(),
-                shared: false,
             },
             free: Ok(1000),
         }],
         library_roots: vec!["/music".into()],
-        default_folder_id: Some("f1".into()),
         running_batches: vec![RunningBatch {
             batch_id: "b1".into(),
             label: Some("Come Over".into()),
             unfinished_jobs: 2,
         }],
+        navidrome_library_warning: None,
     }
 }
 

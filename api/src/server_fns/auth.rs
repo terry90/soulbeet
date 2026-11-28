@@ -155,6 +155,7 @@ pub async fn register(username: String, password: String) -> Result<(), ServerFn
         .await
         .map_err(super::user::user_change_error)?;
     name_taken_by_account(&user.username);
+    crate::core::folders::ensure_user_folder(&user).await;
     Ok(())
 }
 
@@ -463,6 +464,7 @@ pub(crate) async fn apply_navidrome_login(
                 .map_err(|e| e.to_string())?;
             User::update_navidrome_token_in(db, &user.id, Some(encrypted_password), connected)
                 .await?;
+            crate::core::folders::ensure_user_folder_in(db, &user).await;
             user.id
         }
         LoginPlan::Link(user) => {

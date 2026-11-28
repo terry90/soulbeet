@@ -7,13 +7,12 @@ use shared::failure::{Failure, FailureCode, RetryAdvice, Stage, UserAction, User
 use shared::recommendation::DiscoveryProfile;
 
 use super::args::Args;
-use super::contract::NextCall;
 use super::contract::{answer, failed, invalid_value, success, upstream_error, ToolError};
 use super::keys::{keyed, request_key, Keyed};
 use super::paging::{fit, Page};
 use super::refs::request_key_schema;
 use super::server::{common_codes, ToolSpec};
-use super::status::{chosen_folder, owned_folder_fields, with_free_space};
+use super::status::{owned_folder_fields, with_free_space};
 use super::McpCaller;
 use crate::connection::ConnectionState;
 use crate::core::discovery::parse_profiles;
@@ -25,11 +24,7 @@ use crate::models::folder::Folder;
 use crate::models::user_settings::{UpdateUserSettings, UserSettings, PROMOTE_THRESHOLDS};
 
 /// The settings document (D14): what is saved, never a key or token.
-pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<String, Value> {
-    let default_folder_id = chosen_folder(s.default_download_folder_id.clone());
-    let default_folder_found = default_folder_id
-        .as_deref()
-        .map(|id| folders.iter().any(|f| f.id == id));
+pub(crate) fn settings_fields(s: &UserSettings) -> Map<String, Value> {
     let profiles: Vec<String> = parse_profiles(&s.discovery_profiles)
         .iter()
         .map(ToString::to_string)
@@ -50,13 +45,11 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
         .collect();
     let saved = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.is_empty());
     let Value::Object(fields) = json!({
-        "default_folder_id": default_folder_id,
-        "default_folder_found": default_folder_found,
         "auto_delete_enabled": s.auto_delete_enabled,
+        "accept_shares": s.accept_shares,
         "listenbrainz": {"username": s.listenbrainz_username, "token_saved": saved(&s.listenbrainz_token)},
         "discovery": {
             "enabled": s.discovery_enabled,
-            "folder_id": chosen_folder(s.discovery_folder_id.clone()),
             "profiles": profiles,
             "track_count": s.parse_track_counts(),
             "lifetime_days": s.parse_lifetime_days(),
@@ -72,22 +65,6 @@ pub(crate) fn settings_fields(s: &UserSettings, folders: &[Folder]) -> Map<Strin
     fields
 }
 
-/// The caller's settings and folders, read at once. A failed read can be
-/// tried again with the same call.
-async fn read_rows(
-    state: &ConnectionState,
-    caller: &McpCaller,
-    args: &Args,
-) -> Result<(UserSettings, Vec<Folder>), ToolError> {
-    let (settings, folders) = tokio::join!(
-        settings::get_in(&state.db, &caller.ctx),
-        folders::list_in(&state.db, &caller.ctx),
-    );
-    settings
-        .and_then(|settings| Ok((settings, folders?)))
-        .map_err(|failure| upstream_error(failure, Map::new(), args.same_call()))
-}
-
 /// `get_settings`, which takes no arguments.
 pub(crate) async fn get_settings(
     state: &ConnectionState,
@@ -98,16 +75,18 @@ pub(crate) async fn get_settings(
     answer(
         async {
             args.finish()?;
-            let (settings, folders) = read_rows(state, caller, &args).await?;
-            Ok(settings_fields(&settings, &folders))
+            let s = settings::get_in(&state.db, &caller.ctx)
+                .await
+                .map_err(|failure| upstream_error(failure, Map::new(), args.same_call()))?;
+            Ok(settings_fields(&s))
         }
         .await,
     )
 }
 
-/// `list_folders`, a page of the caller's folders (or all users' folders when admin library
-/// access is enabled and `scope` is `"all"` or omitted). Free space is read for the folders of
-/// the page only.
+/// `list_folders`, a page of the caller's personal library folder (or all users' personal
+/// folders when admin library access is enabled and `scope` is `"all"` or omitted). Free space is
+/// read for the folders of the page only.
 pub(crate) async fn list_folders(
     state: &ConnectionState,
     caller: &McpCaller,
@@ -139,19 +118,9 @@ pub(crate) async fn list_folders(
                 ));
             }
 
-            let (settings, roots) = tokio::try_join!(
-                async {
-                    settings::get_in(&state.db, &caller.ctx)
-                        .await
-                        .map_err(|f| upstream_error(f, Map::new(), args.same_call()))
-                },
-                async {
-                    library_roots_in(&state.db, state.navidrome_music_path.as_deref())
-                        .await
-                        .map_err(|f| upstream_error(f, Map::new(), args.same_call()))
-                },
-            )?;
-            let default = chosen_folder(settings.default_download_folder_id);
+            let roots = library_roots_in(&state.db, state.navidrome_music_path.as_deref())
+                .await
+                .map_err(|f| upstream_error(f, Map::new(), args.same_call()))?;
 
             let owned_list: Vec<(Folder, String, bool)> = if effective_scope == "all" {
                 let all = folders::list_all_with_owners_in(&state.db)
@@ -187,13 +156,10 @@ pub(crate) async fn list_folders(
                 .await
                 .iter()
                 .zip(meta.iter())
-                .map(|(f, (owner, is_own))| {
-                    owned_folder_fields(f, owner, *is_own, default.as_deref(), &roots)
-                })
+                .map(|(f, (owner, is_own))| owned_folder_fields(f, owner, *is_own, &roots))
                 .collect();
             let mut fields = Map::new();
             fields.insert("scope".into(), json!(effective_scope));
-            fields.insert("default_folder_id".into(), json!(default));
             Ok(fit(fields, "folders", items, &page, more))
         }
         .await,
@@ -201,10 +167,9 @@ pub(crate) async fn list_folders(
 }
 
 const UPDATE_SETTINGS_ARGS: &[&str] = &[
-    "default_folder_id",
     "auto_delete",
+    "accept_shares",
     "discovery_enabled",
-    "discovery_folder_id",
     "discovery_profiles",
     "discovery_track_counts",
     "discovery_lifetime_days",
@@ -218,10 +183,10 @@ pub(crate) const UPDATE_SETTINGS: ToolSpec = ToolSpec {
     title: "Change settings",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Changes this user's Soulbeet settings: the default download folder (a folder_id from list_folders), auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulbeet's Settings, since it deletes the files of songs rated 1 star), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The discovery folder and the promote threshold are changed only by the user, in Soulbeet's Settings, whether or not deletion is switched on for this app: the rating sync moves the folder's pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, unknown_handle (a folder that is not this user's), permission_not_granted (auto_delete: true, discovery_folder_id or discovery_promote_threshold), already_running.")
+        format!("Changes this user's Soulbeet settings: auto-delete of 1-star songs at the rating sync (it can only be turned off here: the user turns it on in Soulbeet's Settings, since it deletes the files of songs rated 1 star), accept_shares (whether other household users can share tracks into this user's library), and discovery (on or off, the profiles, per profile track count 1 to 50, lifetime 1 to 90 days and playlist name, all three profiles named in each map). The promote threshold is changed only by the user, in Soulbeet's Settings, whether or not deletion is switched on for this app: the rating sync moves pending tracks rated at or above the threshold into the library, and a promote can replace and delete an earlier library copy outside this app's daily limit. Turning discovery off or dropping a profile deletes that profile's discovery playlist in Navidrome; it deletes no music. Only the settings given change. Returns the settings afterwards as get_settings shows them; credentials are never shown. Failure codes: {common}, permission_not_granted (auto_delete: true or discovery_promote_threshold), already_running.")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "properties": {"default_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "auto_delete": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 50}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 50}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 50}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 90}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 90}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 90}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 1, "maximum": 5}, "#,
+        r#"{"type": "object", "additionalProperties": false, "properties": {"auto_delete": {"type": "boolean"}, "accept_shares": {"type": "boolean"}, "discovery_enabled": {"type": "boolean"}, "discovery_profiles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["Conservative", "Balanced", "Adventurous"]}}, "discovery_track_counts": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 50}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 50}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 50}}}, "discovery_lifetime_days": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "integer", "minimum": 1, "maximum": 90}, "Balanced": {"type": "integer", "minimum": 1, "maximum": 90}, "Adventurous": {"type": "integer", "minimum": 1, "maximum": 90}}}, "discovery_playlist_names": {"type": "object", "additionalProperties": false, "properties": {"Conservative": {"type": "string"}, "Balanced": {"type": "string"}, "Adventurous": {"type": "string"}}}, "discovery_promote_threshold": {"type": "integer", "minimum": 1, "maximum": 5}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -268,23 +233,6 @@ fn promote_threshold_refused() -> Failure {
     ))
 }
 
-/// Moving the discovery folder has the next rating sync promote the pending tracks of the new
-/// one that are rated at or above the threshold, and a promote can replace an earlier library
-/// copy, deleting it. Refused from every app, as the promote threshold is.
-fn discovery_folder_refused() -> Failure {
-    Failure::new(
-        FailureCode::PermissionNotGranted,
-        Stage::Input,
-        RetryAdvice::NeedsUser,
-        "Only you can change the discovery folder, in Soulbeet's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
-    )
-    .with_user_action(UserAction::new(
-        UserActionCode::ChangeDiscoverySettings,
-        "Change the discovery folder yourself",
-        "Soulbeet Settings > Library > Discovery",
-    ))
-}
-
 /// The settings a call changes.
 struct Changes {
     update: UpdateUserSettings,
@@ -299,10 +247,9 @@ fn read_changes(args: &Args) -> Result<Changes, ToolError> {
     };
     let auto_delete = args.opt_bool("auto_delete")?;
     let update = UpdateUserSettings {
-        default_download_folder_id: args.opt_string("default_folder_id")?,
         auto_delete_enabled: auto_delete,
+        accept_shares: args.opt_bool("accept_shares")?,
         discovery_enabled: args.opt_bool("discovery_enabled")?,
-        discovery_folder_id: args.opt_string("discovery_folder_id")?,
         discovery_profiles: args
             .opt_choices("discovery_profiles", profiles)?
             .map(|profiles| profiles.join(",")),
@@ -327,8 +274,6 @@ fn read_changes(args: &Args) -> Result<Changes, ToolError> {
 /// The argument that sets `setting`.
 fn argument_of(setting: Setting) -> &'static str {
     match setting {
-        Setting::DefaultFolder => "default_folder_id",
-        Setting::DiscoveryFolder => "discovery_folder_id",
         Setting::DiscoveryProfiles => "discovery_profiles",
         Setting::DiscoveryTrackCounts => "discovery_track_counts",
         Setting::DiscoveryLifetimes => "discovery_lifetime_days",
@@ -352,7 +297,7 @@ async fn update_settings(
         if changes.update == UpdateUserSettings::default() {
             return Err(invalid_value(
                 args.tool(),
-                "default_folder_id",
+                "discovery_enabled",
                 "given when no other setting is",
             ));
         }
@@ -372,10 +317,6 @@ async fn update_settings(
         if changes.auto_delete_on {
             return refusal(&args, auto_delete_on_refused(), field_facts("auto_delete"));
         }
-        if changes.update.discovery_folder_id.is_some() {
-            let facts = field_facts("discovery_folder_id");
-            return refusal(&args, discovery_folder_refused(), facts);
-        }
         if changes.update.discovery_promote_threshold.is_some() {
             let facts = field_facts("discovery_promote_threshold");
             return refusal(&args, promote_threshold_refused(), facts);
@@ -387,25 +328,13 @@ async fn update_settings(
                     Some(setting) => field_facts(argument_of(setting)),
                     None => Map::new(),
                 };
-                let mut error = upstream_error(not_saved.failure, facts, args.same_call());
-                if error.failure.code == FailureCode::UnknownHandle {
-                    error.next = vec![NextCall::new("list_folders", json!({}))];
-                }
+                let error = upstream_error(not_saved.failure, facts, args.same_call());
                 return Keyed::Released(failed(error));
             }
         };
-        // The settings are saved: a folder list that fails now still keeps the key.
-        match folders::list_in(&db, &ctx).await {
-            Ok(folders) => {
-                let mut fields = Map::new();
-                fields.insert(
-                    "settings".into(),
-                    Value::Object(settings_fields(&saved, &folders)),
-                );
-                Keyed::Kept(success(fields))
-            }
-            Err(failure) => Keyed::Kept(failed(upstream_error(failure, Map::new(), None))),
-        }
+        let mut fields = Map::new();
+        fields.insert("settings".into(), Value::Object(settings_fields(&saved)));
+        Keyed::Kept(success(fields))
     };
     keyed(
         &state.acquire,
@@ -439,22 +368,15 @@ mod tests {
         let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
         s.listenbrainz_username = Some("alice_lb".into());
         s.listenbrainz_token = Some("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d".into());
-        s.default_download_folder_id = Some("f1".into());
         s.deezer_recommendations = true;
-        let folders = vec![Folder {
-            id: "f1".into(),
-            user_id: "u1".into(),
-            name: "Music".into(),
-            path: "/music/alice".into(),
-            shared: false,
-        }];
-        let doc = Value::Object(settings_fields(&s, &folders));
+        let doc = Value::Object(settings_fields(&s));
         assert_eq!(
             doc,
             json!({
-                "default_folder_id": "f1", "default_folder_found": true, "auto_delete_enabled": false,
+                "auto_delete_enabled": false,
+                "accept_shares": true,
                 "listenbrainz": {"username": "alice_lb", "token_saved": true},
-                "discovery": {"enabled": false, "folder_id": null, "profiles": ["Conservative", "Balanced", "Adventurous"],
+                "discovery": {"enabled": false, "profiles": ["Conservative", "Balanced", "Adventurous"],
                     "track_count": {"Conservative": 10, "Balanced": 10, "Adventurous": 10},
                     "lifetime_days": {"Conservative": 7, "Balanced": 7, "Adventurous": 7},
                     "playlist_names": {"Conservative": "Comfort Zone", "Balanced": "Fresh Picks", "Adventurous": "Deep Cuts"},
@@ -466,36 +388,17 @@ mod tests {
             .to_string()
             .contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"));
         assert!(doc.get("lastfm").is_none() && doc.get("default_metadata_provider").is_none());
-        s.default_download_folder_id = Some("gone".into());
-        assert_eq!(settings_fields(&s, &folders)["default_folder_found"], false);
-        s.default_download_folder_id = Some(String::new());
-        let doc = settings_fields(&s, &folders);
-        assert_eq!(
-            (&doc["default_folder_id"], &doc["default_folder_found"]),
-            (&Value::Null, &Value::Null)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_cleared_discovery_folder_is_no_folder() {
-        let db = test_db::migrated().await;
-        let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
-        // How Settings clears a folder choice (core/settings.rs, check_folder_choices).
-        s.discovery_folder_id = Some(String::new());
-        assert_eq!(
-            settings_fields(&s, &[])["discovery"]["folder_id"],
-            Value::Null
-        );
-        s.discovery_folder_id = Some("f1".into());
-        assert_eq!(settings_fields(&s, &[])["discovery"]["folder_id"], "f1");
     }
 
     /// The tool's document when the caller's rows cannot be read: the
-    /// folders table is gone, so sqlx fails as SQLite does on any missing
-    /// table.
+    /// table is gone, so sqlx fails as SQLite does on any missing table.
     async fn unreadable_rows(tool: &str) -> Value {
         let db = test_db::migrated().await;
-        sqlx::query("DROP TABLE folders")
+        let table = match tool {
+            "get_settings" => "user_settings",
+            _ => "folders",
+        };
+        sqlx::query(&format!("DROP TABLE {table}"))
             .execute(&db)
             .await
             .unwrap();
@@ -512,10 +415,15 @@ mod tests {
 
     #[tokio::test]
     async fn settings_and_folders_that_cannot_be_read_offer_the_same_call_again() {
-        for (tool, call) in [
-            ("get_settings", json!({"tool": "get_settings", "args": {}})),
+        for (tool, table, call) in [
+            (
+                "get_settings",
+                "user_settings",
+                json!({"tool": "get_settings", "args": {}}),
+            ),
             (
                 "list_folders",
+                "folders",
                 json!({"tool": "list_folders", "args": {"limit": 5}}),
             ),
         ] {
@@ -539,7 +447,7 @@ mod tests {
             assert_eq!(
                 e["cause"],
                 json!({"service": "database", "status": null,
-                    "raw": "error returned from database: (code: 1) no such table: folders"}),
+                    "raw": format!("error returned from database: (code: 1) no such table: {table}")}),
                 "{tool}"
             );
             assert_eq!(e["next"], json!([call]), "{tool}");
@@ -550,14 +458,13 @@ mod tests {
     async fn discovery_settings_read_as_discovery_reads_them() {
         let db = test_db::migrated().await;
         let mut s = UserSettings::get_in(&db, "u1").await.unwrap();
-        // The forms the Settings page writes (ui/src/components/settings/folder_manager.rs:415,445) and the
-        // playlist sync stores (UserSettings::update_discovery_playlist_id_in, user_settings.rs).
+        // The forms the Settings page writes and the playlist sync stores.
         s.discovery_track_count = r#"{"Conservative":5,"Balanced":10,"Adventurous":15}"#.into();
         s.discovery_playlist_name =
             r#"{"Conservative":"Comfort Zone","Balanced":"Weekly Mix","Adventurous":"Deep Cuts"}"#
                 .into();
         s.discovery_navidrome_playlist_id = Some(r#"{"Balanced":"9fR2kLm4NpQ7sT1vW3xY5z"}"#.into());
-        let doc = settings_fields(&s, &[]);
+        let doc = settings_fields(&s);
         let d = &doc["discovery"];
         assert_eq!(
             (&d["track_count"], &d["playlist_names"], &d["playlist_ids"]),
@@ -646,82 +553,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_promote_threshold_and_the_discovery_folder_are_changed_only_in_soulfuls_settings()
-    {
-        // A lower threshold, or a folder whose pending tracks are rated at or above it, has the
-        // 6 hourly sync promote them as Soulful's own deletion, and a promote can replace an
-        // earlier library copy: outside the app's switch, its daily room and its name in the
-        // history. So no app changes either, whatever its switch.
+    async fn the_promote_threshold_is_changed_only_in_soulfuls_settings() {
+        // A lower threshold has the 6 hourly sync promote pending tracks as Soulful's own
+        // deletion, and a promote can replace an earlier library copy: outside the app's switch,
+        // its daily room and its name in the history. So no app changes it, whatever its switch.
         let (db, app, token) = mcp_app().await;
-        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('f1', 'u1', 'Music', '/music/u1')")
-            .execute(&db)
-            .await
-            .unwrap();
-        let calls = [
-            (
-                "discovery_promote_threshold",
-                json!({"discovery_promote_threshold": 1, "request_key": "k"}),
-                "Only you can change the discovery promote threshold, in Soulbeet's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there",
-                "Change the discovery promote threshold yourself",
-                "Soulbeet Settings > Library",
-            ),
-            (
-                "discovery_folder_id",
-                json!({"discovery_folder_id": "f1", "request_key": "k"}),
-                "Only you can change the discovery folder, in Soulbeet's Settings: the rating sync moves the folder's pending discovery tracks rated at or above the promote threshold into your library, replacing and deleting any earlier copy there",
-                "Change the discovery folder yourself",
-                "Soulbeet Settings > Library > Discovery",
-            ),
-        ];
+        let call = json!({"discovery_promote_threshold": 1, "request_key": "k"});
         for allow_delete in [0, 1] {
             sqlx::query("UPDATE oauth_grants SET allow_delete = ?")
                 .bind(allow_delete)
                 .execute(&db)
                 .await
                 .unwrap();
-            // The same key each time: nothing was saved, so each refusal let it go.
-            for (field, call, message, what, place) in &calls {
-                let result = call_tool(app.clone(), &token, "update_settings", call.clone()).await;
-                let error = &document(&result)["error"];
-                assert_eq!(
-                    (
-                        error["code"].as_str(),
-                        error["stage"].as_str(),
-                        error["retry"].as_str(),
-                        error["message"].as_str()
-                    ),
-                    (
-                        Some("permission_not_granted"),
-                        Some("input"),
-                        Some("needs_user"),
-                        Some(*message)
-                    ),
-                    "{field}, allow_delete {allow_delete}"
-                );
-                assert_eq!(
-                    error["user_action"],
-                    json!({"code": "change_discovery_settings", "what": what, "where": place}),
-                    "{field}, allow_delete {allow_delete}"
-                );
-                assert_eq!(
-                    (&error["facts"], &error["next"]),
-                    (&json!({"field": field}), &json!([])),
-                    "{field}, allow_delete {allow_delete}"
-                );
-            }
+            let result = call_tool(app.clone(), &token, "update_settings", call.clone()).await;
+            let error = &document(&result)["error"];
+            assert_eq!(
+                (
+                    error["code"].as_str(),
+                    error["stage"].as_str(),
+                    error["retry"].as_str(),
+                    error["message"].as_str()
+                ),
+                (
+                    Some("permission_not_granted"),
+                    Some("input"),
+                    Some("needs_user"),
+                    Some("Only you can change the discovery promote threshold, in Soulbeet's Settings: the rating sync moves the pending discovery tracks rated at or above it into your library, replacing and deleting any earlier copy there")
+                ),
+                "allow_delete {allow_delete}"
+            );
+            assert_eq!(
+                error["user_action"],
+                json!({"code": "change_discovery_settings", "what": "Change the discovery promote threshold yourself", "where": "Soulbeet Settings > Library"}),
+                "allow_delete {allow_delete}"
+            );
+            assert_eq!(
+                (&error["facts"], &error["next"]),
+                (&json!({"field": "discovery_promote_threshold"}), &json!([])),
+                "allow_delete {allow_delete}"
+            );
             let saved = UserSettings::get_in(&db, "u1").await.unwrap();
             assert_eq!(
-                (saved.discovery_promote_threshold, saved.discovery_folder_id),
-                (3, None),
+                saved.discovery_promote_threshold, 3,
                 "allow_delete {allow_delete}"
             );
         }
     }
 
     #[tokio::test]
-    async fn another_users_folder_is_not_a_choice_and_credentials_never_show() {
+    async fn accept_shares_updates_and_credentials_never_show() {
         let (db, app, token) = mcp_app().await;
-        let bobs = crate::core::folder_of(&db, "bob").await;
         UserSettings::upsert_in(
             &db,
             "u1",
@@ -732,35 +613,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let error = &document(
-            &call_tool(
-                app.clone(),
-                &token,
-                "update_settings",
-                json!({"default_folder_id": bobs}),
-            )
-            .await,
-        )["error"];
-        assert_eq!(
-            (error["code"].as_str(), error["message"].as_str()),
-            (Some("unknown_handle"), Some("Folder not found"))
-        );
-        assert_eq!(
-            (&error["facts"], &error["next"]),
-            (
-                &json!({"field": "default_folder_id"}),
-                &json!([{"tool": "list_folders", "args": {}}])
-            )
-        );
         let text = call_tool(
             app,
             &token,
             "update_settings",
-            json!({"discovery_enabled": true}),
+            json!({"discovery_enabled": true, "accept_shares": false}),
         )
         .await
         .to_string();
         assert!(text.contains(r#"\"enabled\":true"#), "{text}");
+        assert!(text.contains(r#"\"accept_shares\":false"#), "{text}");
         assert!(
             !text.contains("3f2b9c1e8d7a6b5c4d3e2f1a0b9c8d7e")
                 && !text.contains("5a1c9e7b-3d2f-4a6b-8c0d-1e2f3a4b5c6d"),
@@ -824,7 +686,7 @@ mod tests {
             &document(&call_tool(app.clone(), &token, "update_settings", json!({})).await)["error"];
         assert_eq!(
             error["message"],
-            "update_settings: default_folder_id must be given when no other setting is"
+            "update_settings: discovery_enabled must be given when no other setting is"
         );
         let error = &document(
             &call_tool(
@@ -905,10 +767,10 @@ mod tests {
         let (db, app, user_token) = mcp_app().await;
         add_user(&db, "u2", "wife").await;
         sqlx::query(
-            "INSERT INTO folders (id, user_id, name, path, shared) VALUES \
-             ('f-alice', 'u1', 'Alice Private', '/music/alice', 0), \
-             ('f-wife', 'u2', 'Wife Private', '/music/wife', 0), \
-             ('f-shared', ?, 'Shared Library', '/music/shared', 1)",
+            "INSERT INTO folders (id, user_id, name, path) VALUES \
+             ('f-alice', 'u1', 'Alice', '/music/alice'), \
+             ('f-wife', 'u2', 'Wife', '/music/wife'), \
+             ('f-admin', ?, 'Admin', '/music/admin')",
         )
         .bind(SEEDED_ADMIN_ID)
         .execute(&db)
@@ -974,7 +836,6 @@ mod tests {
         let wife_folder = folders.iter().find(|f| f["folder_id"] == "f-wife").unwrap();
         assert_eq!(wife_folder["owner"], "wife");
         assert_eq!(wife_folder["is_own"], false);
-        assert_eq!(wife_folder["shared"], false);
 
         // Admin can still filter to scope: own explicitly.
         let own_only = document(
@@ -982,6 +843,6 @@ mod tests {
         );
         assert_eq!(own_only["scope"], "own");
         assert_eq!(own_only["folders"].as_array().unwrap().len(), 1);
-        assert_eq!(own_only["folders"][0]["folder_id"], "f-shared");
+        assert_eq!(own_only["folders"][0]["folder_id"], "f-admin");
     }
 }

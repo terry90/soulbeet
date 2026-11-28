@@ -29,8 +29,6 @@ const PENDING_MAX: usize = 150;
 
 const RUN_DISCOVERY_ARGS: &[&str] = &["request_key"];
 
-const PROMOTE_ARGS: &[&str] = &["track_id", "target_folder_id", "request_key"];
-
 const TRACK_ARGS: &[&str] = &["track_id", "request_key"];
 
 pub(crate) const GET_DISCOVERY: ToolSpec = ToolSpec {
@@ -72,10 +70,10 @@ pub(crate) const PROMOTE_DISCOVERY_TRACK: ToolSpec = ToolSpec {
     title: "Keep a discovery track",
     description: |calls_a_minute| {
         let common = common_codes(calls_a_minute);
-        format!("Moves a pending discovery track into this user's library folder (or another folder owned by this user when target_folder_id from list_folders is given, such as a shared folder) through beets, as rating it at the promote threshold would at the next rating sync, except that without file management switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. With the switch on, an earlier copy is replaced without a preview, as this app's deletion: counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle (no pending track of this user has this id, or target_folder_id is not one of this user's folders), expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
+        format!("Moves a pending discovery track into this user's library folder through beets, as rating it at the promote threshold would at the next rating sync, except that without file management switched on for this app an earlier library copy of the song is never replaced: the promote then ends import_already_in_library, the track stays pending, and next offers removing the staged copy. With the switch on, an earlier copy is replaced without a preview, as this app's deletion: counted in the {DAILY_APP_DELETIONS} tracks a day connected apps may delete and named in the deletion history. track_id comes from get_discovery. Takes seconds to a minute. Failure codes: {common}, unknown_handle (no pending track of this user has this id), expired_handle (no longer pending: promoted, removed or being promoted), import_files_gone (the staged file is gone; next offers its removal), the import_* codes, already_running.")
     },
     input_schema: concat!(
-        r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "target_folder_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
+        r#"{"type": "object", "additionalProperties": false, "required": ["track_id"], "properties": {"track_id": {"type": "string", "minLength": 1, "maxLength": 500}, "#,
         request_key_schema!(),
         "}}"
     ),
@@ -298,23 +296,16 @@ fn read_track_call(args: &Args) -> Result<(String, Option<String>), ToolError> {
     Ok((track_id, key))
 }
 
-/// `promote_discovery_track`: the caller's pending track moved into the library (optionally into
-/// `target_folder_id`, owned by the caller). An earlier copy there is replaced only when the app
-/// may manage files, as the app (checked against its switch and the day's room when it is removed,
-/// and named in the history).
+/// `promote_discovery_track`: the caller's pending track moved into their library folder. An
+/// earlier copy there is replaced only when the app may manage files, as the app (checked against
+/// its switch and the day's room when it is removed, and named in the history).
 async fn promote_discovery_track(
     state: &ConnectionState,
     caller: &McpCaller,
     args: Option<JsonObject>,
 ) -> CallToolResult {
-    let args = Args::new(PROMOTE_DISCOVERY_TRACK.name, args, PROMOTE_ARGS);
-    let (track_id, target_folder_id, key) = match (|| {
-        let track_id = args.string("track_id")?;
-        let target_folder_id = args.opt_string("target_folder_id")?;
-        let key = request_key(&args)?;
-        args.finish()?;
-        Ok::<_, ToolError>((track_id, target_folder_id, key))
-    })() {
+    let args = Args::new(PROMOTE_DISCOVERY_TRACK.name, args, TRACK_ARGS);
+    let (track_id, key) = match read_track_call(&args) {
         Ok(read) => read,
         Err(e) => return failed(e),
     };
@@ -328,16 +319,8 @@ async fn promote_discovery_track(
     let (db, effects, user) = (state.db.clone(), state.discovery.clone(), caller.ctx.id());
     let queue = state.acquire.queue.clone();
     let work = async move {
-        let promoted = discovery::promote_to(
-            &db,
-            &effects,
-            &queue,
-            &user,
-            &track_id,
-            target_folder_id.as_deref(),
-            replace,
-        )
-        .await;
+        let promoted =
+            discovery::promote_to(&db, &effects, &queue, &user, &track_id, None, replace).await;
         match promoted {
             Ok((track, folder)) => {
                 let cut = |text: String| cut_json(text, TEXT_MAX_CHARS);
@@ -349,7 +332,6 @@ async fn promote_discovery_track(
                     "folder": {
                         "folder_id": folder.id,
                         "name": cut(folder.name),
-                        "shared": folder.shared,
                     },
                 }) else {
                     unreachable!("an object literal is an object");
@@ -478,7 +460,6 @@ mod tests {
             "alice",
             UpdateUserSettings {
                 discovery_enabled: Some(true),
-                discovery_folder_id: Some("alice-music".into()),
                 ..Default::default()
             },
         )
@@ -585,12 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_callers_own_discovery_folder_is_listed() {
-        // A stored choice of bob's folder, as no check of today allows but an older one did.
         let lib = Library::new().await;
-        UserSettings::upsert_in(&lib.db, "alice", UpdateUserSettings::default())
-            .await
-            .unwrap();
-        sqlx::query("UPDATE user_settings SET discovery_folder_id = 'bob-music'")
+        sqlx::query("DELETE FROM folders WHERE user_id = 'alice'")
             .execute(&lib.db)
             .await
             .unwrap();
@@ -612,13 +589,6 @@ mod tests {
     #[tokio::test]
     async fn at_most_150_pending_tracks_are_listed_and_a_long_list_is_cut_and_counted() {
         let lib = Library::new().await;
-        let folder = UpdateUserSettings {
-            discovery_folder_id: Some("alice-music".into()),
-            ..Default::default()
-        };
-        UserSettings::upsert_in(&lib.db, "alice", folder)
-            .await
-            .unwrap();
         let long = "x".repeat(400);
         for i in 0..151 {
             let id = format!("t{i:03}");
@@ -692,16 +662,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_discovery_refuses_a_cleared_folder() {
+    async fn run_discovery_refuses_when_user_has_no_folder() {
         let lib = Library::new().await;
-        let cleared = UpdateUserSettings {
-            discovery_enabled: Some(true),
-            discovery_folder_id: Some(String::new()),
-            ..Default::default()
-        };
-        UserSettings::upsert_in(&lib.db, "alice", cleared)
+        sqlx::query("DELETE FROM folders WHERE user_id = 'alice'")
+            .execute(&lib.db)
             .await
             .unwrap();
+        UserSettings::upsert_in(
+            &lib.db,
+            "alice",
+            UpdateUserSettings {
+                discovery_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let effects = Arc::new(TestDiscovery::default());
         let (app, token) = discovery_app(&lib, effects.clone()).await;
         let error = &document(&call_tool(app, &token, "run_discovery", json!({})).await)["error"];
@@ -718,6 +694,10 @@ mod tests {
     #[tokio::test]
     async fn run_discovery_says_what_is_missing_or_already_running() {
         let lib = Library::new().await;
+        sqlx::query("DELETE FROM folders WHERE user_id = 'alice'")
+            .execute(&lib.db)
+            .await
+            .unwrap();
         let effects = Arc::new(TestDiscovery::default());
         let (app, token) = discovery_app(&lib, effects.clone()).await;
         let error =
@@ -754,20 +734,15 @@ mod tests {
             ),
             (
                 Some("folder_required"),
-                Some("Settings > Library > Discovery"),
+                Some("Settings > Library"),
                 &json!([{"tool": "list_folders", "args": {}}])
             )
         );
-        UserSettings::upsert_in(
-            &lib.db,
-            "alice",
-            UpdateUserSettings {
-                discovery_folder_id: Some("alice-music".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO folders (id, user_id, name, path) VALUES ('alice-music', 'alice', 'alice-music', ?)")
+            .bind(lib.root.join("music/alice").to_string_lossy().as_ref())
+            .execute(&lib.db)
+            .await
+            .unwrap();
         assert_eq!(
             document(&call_tool(app.clone(), &token, "run_discovery", json!({})).await)["run"]
                 ["status"],
@@ -892,7 +867,7 @@ mod tests {
                 "artist": "Marrow Choir",
                 "title": "t1",
                 "status": "promoted",
-                "folder": {"folder_id": "alice-music", "name": "alice-music", "shared": false}
+                "folder": {"folder_id": "alice-music", "name": "alice-music"}
             })
         );
         sqlx::query("UPDATE oauth_grants SET allow_delete = 1")
@@ -991,56 +966,6 @@ mod tests {
                 Some("expired_handle"),
                 &json!([{"tool": "get_discovery", "args": {}}])
             )
-        );
-    }
-
-    #[tokio::test]
-    async fn promote_discovery_track_can_target_another_owned_folder_and_refuses_others() {
-        let lib = Library::new().await;
-        lib.folder("alice", "shared-music", "music/shared", true)
-            .await;
-        std::fs::create_dir_all(lib.root.join("music/shared")).unwrap();
-        let staged = lib.root.join("music/alice/Discovery/Explore/05.flac");
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"audio").unwrap();
-        lib.pending_track("t1", "alice-music", "Explore", &staged, None)
-            .await;
-
-        let effects = Arc::new(TestDiscovery::default());
-        let (app, token) = discovery_app(&lib, effects.clone()).await;
-
-        // Refuses another user's folder without claiming the track
-        let err = &document(
-            &call_tool(
-                app.clone(),
-                &token,
-                "promote_discovery_track",
-                json!({"track_id": "t1", "target_folder_id": "bob-music"}),
-            )
-            .await,
-        )["error"];
-        assert_eq!(err["code"], "unknown_handle");
-        assert_eq!(lib.track_status("t1").await, "Pending");
-
-        // Promotes directly into alice's shared folder
-        let doc = document(
-            &call_tool(
-                app,
-                &token,
-                "promote_discovery_track",
-                json!({"track_id": "t1", "target_folder_id": "shared-music"}),
-            )
-            .await,
-        );
-        assert_eq!(doc["ok"], true, "{doc}");
-        assert_eq!(doc["status"], "promoted");
-        assert_eq!(
-            doc["folder"],
-            json!({"folder_id": "shared-music", "name": "shared-music", "shared": true})
-        );
-        assert_eq!(
-            effects.imports(),
-            vec![(staged, lib.root.join("music/shared"), Replace::Never)]
         );
     }
 }

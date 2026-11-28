@@ -23,6 +23,7 @@ pub mod insights;
 pub mod jobs;
 pub mod library;
 pub mod metadata;
+pub mod navidrome_libraries;
 pub mod playlists;
 pub mod ratings;
 pub(crate) mod recommend;

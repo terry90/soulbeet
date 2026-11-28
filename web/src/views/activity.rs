@@ -2,13 +2,14 @@
 //! drawer trigger, On-Keep Archival FLAC Upgrade queue (`api::list_archival_upgrades`), and
 //! Deletion Guard history.
 
+use api::models::track_share::{LinkMode, ShareDirection, ShareHistoryEntry, ShareOrigin};
 use dioxus::prelude::*;
 use shared::download::{AcquireAndPlayRequest, ArchivalUpgradeStatus};
 use shared::playlist_import::ImportJobSummary;
 use ui::{
     dashboard::DeletionHistoryTab, friendly_error, use_player, AcquireStageBadge, IconActivity,
-    IconDownload, IconListMusic, IconRefreshCw, IconSparkles, JobDiagnosticsPanel, TrackRow,
-    TrackRowState,
+    IconDownload, IconListMusic, IconLoader, IconRefreshCw, IconShare2, IconSparkles,
+    JobDiagnosticsPanel, TrackRow, TrackRowState,
 };
 
 use crate::auth::use_auth;
@@ -59,6 +60,33 @@ fn is_active_import_state(state: &str) -> bool {
     !matches!(state, "done" | "failed" | "cancelled" | "dismissed")
 }
 
+fn link_mode_badge(mode: LinkMode) -> (&'static str, &'static str) {
+    match mode {
+        LinkMode::Hardlink => (
+            "bg-beet-leaf-surface border-beet-leaf-solid/35 text-beet-leaf-text",
+            "hardlink",
+        ),
+        LinkMode::Reflink => (
+            "bg-beet-accent-surface border-beet-accent/35 text-beet-accent-text",
+            "reflink",
+        ),
+        LinkMode::Copy => (
+            "bg-beet-surface-high border-beet-border-default text-beet-text-secondary",
+            "copy",
+        ),
+    }
+}
+
+fn format_share_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
 #[component]
 pub fn ActivityPage() -> Element {
     let auth = use_auth();
@@ -69,6 +97,38 @@ pub fn ActivityPage() -> Element {
     let mut import_jobs = use_signal(Vec::<ImportJobSummary>::new);
     let mut refreshing_imports = use_signal(|| false);
     let mut resolving_job = use_signal(|| None::<String>);
+
+    // Shared Music history state
+    let mut share_direction = use_signal(|| ShareDirection::All);
+    let mut share_entries = use_signal(Vec::<ShareHistoryEntry>::new);
+    let mut share_loading = use_signal(|| true);
+    let mut share_error = use_signal(|| None::<String>);
+    let mut share_req_id = use_signal(|| 0u64);
+
+    let load_share_history = use_callback(move |dir: ShareDirection| {
+        let req_id = share_req_id.peek().wrapping_add(1);
+        share_req_id.set(req_id);
+        share_loading.set(true);
+        share_error.set(None);
+        spawn(async move {
+            let res = auth
+                .call(api::get_share_history(Some(dir), Some(50), Some(0)))
+                .await;
+            if *share_req_id.peek() != req_id {
+                return;
+            }
+            match res {
+                Ok(page) => share_entries.set(page.entries),
+                Err(e) => share_error.set(Some(friendly_error(&e))),
+            }
+            share_loading.set(false);
+        });
+    });
+
+    use_effect(move || {
+        let dir = share_direction();
+        load_share_history.call(dir);
+    });
 
     let load_import_jobs = use_callback(move |()| {
         if *refreshing_imports.peek() {
@@ -182,7 +242,6 @@ pub fn ActivityPage() -> Element {
                                     recording_mbid: item.recording_mbid.clone(),
                                     release_mbid: None,
                                     duration_s: None,
-                                    folder_id: None,
                                     prefer_fast: true,
                                 };
                                 let manual = item.manual_choice.clone();
@@ -457,7 +516,159 @@ pub fn ActivityPage() -> Element {
                 }
             }
 
-            // 4. Multi-Listener Delete Guard Audit History
+            // 4. Shared Music History
+            section { class: "space-y-3",
+                div { class: "flex flex-wrap items-center justify-between gap-2",
+                    div { class: "flex items-center gap-2",
+                        IconShare2 { size: 16, class: "text-beet-leaf-text".to_string() }
+                        h2 { class: "text-[18px] font-semibold text-beet-text-primary",
+                            "Shared Music"
+                        }
+                        if !share_entries.read().is_empty() {
+                            span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                "{share_entries.read().len()}"
+                            }
+                        }
+                    }
+                    div { class: "flex flex-wrap items-center gap-2",
+                        div { class: "inline-flex items-center gap-1 p-0.5 rounded-full bg-beet-surface-low border border-beet-border-subtle",
+                            for (dir, label) in [
+                                (ShareDirection::All, "All"),
+                                (ShareDirection::Incoming, "Received"),
+                                (ShareDirection::Outgoing, "Sent"),
+                            ] {
+                                {
+                                    let active = share_direction() == dir;
+                                    let cls = if active {
+                                        "bg-beet-accent-surface border-beet-accent/40 text-beet-accent-text"
+                                    } else {
+                                        "border-transparent text-beet-text-secondary hover:text-beet-text-primary"
+                                    };
+                                    rsx! {
+                                        button {
+                                            key: "share-dir-{label}",
+                                            r#type: "button",
+                                            class: "h-7 px-3 rounded-full border text-[12px] font-medium transition-colors cursor-pointer {cls}",
+                                            onclick: move |_| share_direction.set(dir),
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        button {
+                            r#type: "button",
+                            disabled: share_loading(),
+                            class: "inline-flex items-center gap-1.5 h-8 px-3 rounded-full bg-beet-surface-high border border-beet-border-default text-[12px] text-beet-text-secondary hover:text-beet-text-primary cursor-pointer disabled:opacity-50",
+                            onclick: move |_| load_share_history.call(share_direction()),
+                            IconRefreshCw { size: 13 }
+                            span { "Refresh" }
+                        }
+                    }
+                }
+
+                if let Some(err) = share_error() {
+                    div { class: "rounded-[12px] bg-beet-crimson-surface border border-beet-crimson-text/30 p-4 text-[13px] text-beet-crimson-text",
+                        "Could not load shared music history: {err}"
+                    }
+                } else if share_loading() && share_entries.read().is_empty() {
+                    div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-5 flex items-center gap-2 text-[13px] text-beet-text-tertiary",
+                        IconLoader { size: 14 }
+                        span { "Loading share history..." }
+                    }
+                } else if share_entries.read().is_empty() {
+                    div { class: "rounded-[12px] bg-beet-surface border border-beet-border-subtle p-5 text-[13px] text-beet-text-secondary",
+                        match share_direction() {
+                            ShareDirection::All => "No shared tracks yet. Click the Share button on any library track or album to hardlink it into another household user's library.",
+                            ShareDirection::Incoming => "No tracks have been shared with you yet.",
+                            ShareDirection::Outgoing => "You have not shared any tracks yet.",
+                        }
+                    }
+                } else {
+                    {
+                        let current_username = auth.username();
+                        let entries = share_entries.read().clone();
+                        rsx! {
+                            div { class: "space-y-2",
+                                for entry in entries.iter() {
+                                    {
+                                        let is_migration = entry.origin == ShareOrigin::Migration;
+                                        let is_outgoing = current_username
+                                            .as_deref()
+                                            .is_some_and(|u| u.eq_ignore_ascii_case(&entry.sender_username));
+                                        let (direction_label, dir_cls, detail_text) = if is_migration {
+                                            (
+                                                "Migrated".to_string(),
+                                                "bg-beet-surface-high border-beet-border-default text-beet-text-primary",
+                                                Some("Migrated from legacy folder"),
+                                            )
+                                        } else if is_outgoing {
+                                            (
+                                                format!("Sent to {}", entry.recipient_username),
+                                                "bg-beet-accent-surface border-beet-accent/35 text-beet-accent-text",
+                                                None,
+                                            )
+                                        } else {
+                                            (
+                                                format!("Received from {}", entry.sender_username),
+                                                "bg-beet-leaf-surface border-beet-leaf-solid/35 text-beet-leaf-text",
+                                                None,
+                                            )
+                                        };
+                                        let (mode_cls, mode_label) = link_mode_badge(entry.link_mode);
+                                        let timestamp = format_share_timestamp(&entry.created_at);
+                                        let subtitle = match (entry.artist.trim(), entry.album.trim()) {
+                                            ("", "") => None,
+                                            (artist, "") => Some(artist.to_string()),
+                                            ("", album) => Some(album.to_string()),
+                                            (artist, album) => Some(format!("{artist} · {album}")),
+                                        };
+                                        rsx! {
+                                            div {
+                                                key: "share-{entry.id}",
+                                                class: "rounded-[10px] bg-beet-surface border border-beet-border-subtle p-3.5 flex flex-wrap items-center justify-between gap-3",
+                                                div { class: "min-w-0 flex-1 space-y-0.5",
+                                                    p { class: "text-[14px] font-semibold text-beet-text-primary truncate",
+                                                        "{entry.title}"
+                                                    }
+                                                    if let Some(sub) = subtitle {
+                                                        p { class: "text-[12px] text-beet-text-secondary truncate",
+                                                            "{sub}"
+                                                        }
+                                                    }
+                                                    if let Some(detail) = detail_text {
+                                                        p { class: "text-[11px] text-beet-text-secondary",
+                                                            "{detail}"
+                                                        }
+                                                    }
+                                                    p { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary",
+                                                        "{timestamp}"
+                                                    }
+                                                }
+                                                div { class: "flex flex-wrap items-center gap-1.5 shrink-0",
+                                                    span { class: "px-2.5 py-0.5 rounded-full border text-[11px] font-medium {dir_cls}",
+                                                        "{direction_label}"
+                                                    }
+                                                    span { class: "px-2 py-0.5 rounded-full border tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider {mode_cls}",
+                                                        "{mode_label}"
+                                                    }
+                                                    if !is_migration && entry.origin != ShareOrigin::Ui {
+                                                        span { class: "px-2 py-0.5 rounded-full border bg-beet-surface-high border-beet-border-subtle text-beet-text-tertiary tabular-nums-mono text-[10px] uppercase",
+                                                            "{entry.origin.as_str()}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Multi-Listener Delete Guard Audit History
             section { class: "rounded-[12px] bg-beet-surface-low border border-beet-border-subtle p-5",
                 DeletionHistoryTab {}
             }

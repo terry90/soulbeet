@@ -1,9 +1,9 @@
 //! A user's settings.
 
 use crate::auth::UserCtx;
+use crate::core::database_failure;
 use crate::core::index::{NavidromeOf, ServerNavidrome};
 use crate::core::playlists::{discovery_key, lock};
-use crate::core::{database_failure, folders::owned_in};
 use crate::models::user_settings::{
     UpdateUserSettings, UserSettings, LIFETIME_DAYS, PROMOTE_THRESHOLDS, TRACK_COUNTS,
 };
@@ -29,10 +29,9 @@ pub async fn update(ctx: &UserCtx, update: UpdateUserSettings) -> Result<UserSet
 }
 
 /// A setting `update_in` checks, named in its refusal.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Setting {
-    DefaultFolder,
-    DiscoveryFolder,
     DiscoveryProfiles,
     DiscoveryTrackCounts,
     DiscoveryLifetimes,
@@ -187,8 +186,7 @@ fn profile_values<T>(
         .collect()
 }
 
-/// Checks `update`, then the folders it chooses, saves it, and deletes the Navidrome smart
-/// playlists it makes stale. Nothing is saved when a check fails.
+/// Checks `update`, saves it, and deletes any Navidrome smart playlists it makes stale.
 pub(crate) async fn update_in(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -196,7 +194,6 @@ pub(crate) async fn update_in(
     update: UpdateUserSettings,
 ) -> Result<UserSettings, NotSaved> {
     let update = checked(update)?;
-    check_folder_choices(db, ctx, &update).await?;
     let unsaved = |failure| NotSaved {
         failure,
         setting: None,
@@ -210,33 +207,8 @@ pub(crate) async fn update_in(
     Ok(result)
 }
 
-/// Refuses a discovery or default download folder the user does not own,
-/// as "Folder not found", the same as for a folder that does not exist.
-/// Discovery downloads into that folder and deletes files there. An empty
-/// id clears the choice.
-async fn check_folder_choices(
-    db: &SqlitePool,
-    ctx: &UserCtx,
-    update: &UpdateUserSettings,
-) -> Result<(), NotSaved> {
-    let chosen = [
-        (Setting::DefaultFolder, &update.default_download_folder_id),
-        (Setting::DiscoveryFolder, &update.discovery_folder_id),
-    ];
-    for (setting, id) in chosen {
-        if let Some(id) = id.as_deref().filter(|id| !id.is_empty()) {
-            owned_in(db, ctx, id).await.map_err(|failure| {
-                // A database failure is not about the folder.
-                let setting = (failure.code == FailureCode::UnknownHandle).then_some(setting);
-                NotSaved { failure, setting }
-            })?;
-        }
-    }
-    Ok(())
-}
-
 /// Delete Navidrome smart playlists that are no longer valid because
-/// discovery was disabled, the folder changed, or profiles were removed.
+/// discovery was disabled or profiles were removed.
 async fn cleanup_stale_discovery_playlists(
     db: &SqlitePool,
     navidrome: &dyn NavidromeOf,
@@ -247,12 +219,10 @@ async fn cleanup_stale_discovery_playlists(
     use dioxus::logger::tracing::{info, warn};
 
     let discovery_disabled = update.discovery_enabled == Some(false) && old.discovery_enabled;
-    let folder_changed = update.discovery_folder_id.is_some()
-        && update.discovery_folder_id != old.discovery_folder_id;
     let profiles_changed = update.discovery_profiles.is_some()
         && update.discovery_profiles.as_deref() != Some(&old.discovery_profiles);
 
-    if !discovery_disabled && !folder_changed && !profiles_changed {
+    if !discovery_disabled && !profiles_changed {
         return;
     }
 
@@ -281,7 +251,7 @@ async fn cleanup_stale_discovery_playlists(
     };
 
     // Determine which profile playlists to delete
-    let profiles_to_delete: Vec<String> = if discovery_disabled || folder_changed {
+    let profiles_to_delete: Vec<String> = if discovery_disabled {
         // All playlists are stale
         old_ids.keys().cloned().collect()
     } else {
@@ -346,7 +316,6 @@ async fn cleanup_stale_discovery_playlists(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::folders::folder_not_found;
     use crate::core::{folder_of, test_ctx};
     use crate::db::test_db;
     use crate::services::NavidromeLookupError;
@@ -430,22 +399,19 @@ mod tests {
     #[tokio::test]
     async fn a_refused_value_writes_nothing() {
         let db = test_db::migrated().await;
-        let folder = folder_of(&db, "alice").await;
+        folder_of(&db, "alice").await;
         let update = UpdateUserSettings {
-            default_download_folder_id: Some(folder),
+            accept_shares: Some(false),
             discovery_promote_threshold: Some(9),
             ..Default::default()
         };
         assert!(update_in(&db, &NOT_LINKED, &test_ctx("alice"), update)
             .await
             .is_err());
-        assert_eq!(
-            UserSettings::get_in(&db, "alice")
-                .await
-                .unwrap()
-                .default_download_folder_id,
-            None
-        );
+        assert!(UserSettings::get_in(&db, "alice")
+            .await
+            .unwrap()
+            .accept_shares);
     }
 
     #[tokio::test]
@@ -584,78 +550,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn another_users_folder_cannot_be_chosen() {
+    async fn accept_shares_can_be_toggled() {
         let db = test_db::migrated().await;
-        let alice_folder = folder_of(&db, "alice").await;
         folder_of(&db, "bob").await;
-        for update in [
-            UpdateUserSettings {
-                discovery_folder_id: Some(alice_folder.clone()),
-                ..Default::default()
-            },
-            UpdateUserSettings {
-                default_download_folder_id: Some(alice_folder.clone()),
-                ..Default::default()
-            },
-        ] {
-            let setting = match update.discovery_folder_id {
-                Some(_) => Setting::DiscoveryFolder,
-                None => Setting::DefaultFolder,
-            };
-            assert_eq!(
-                check_folder_choices(&db, &test_ctx("bob"), &update).await,
-                Err(NotSaved {
-                    failure: folder_not_found(),
-                    setting: Some(setting)
-                })
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn another_users_shared_folder_cannot_be_the_discovery_folder() {
-        // Discovery removes files in its folder as the folder's owner, so a shared folder of
-        // another user must not be one.
-        let db = test_db::migrated().await;
-        let alice_folder = folder_of(&db, "alice").await;
-        folder_of(&db, "bob").await;
-        sqlx::query("UPDATE folders SET shared = 1 WHERE id = ?")
-            .bind(&alice_folder)
-            .execute(&db)
-            .await
-            .unwrap();
-        let update = UpdateUserSettings {
-            discovery_folder_id: Some(alice_folder),
-            ..Default::default()
-        };
-        assert_eq!(
-            check_folder_choices(&db, &test_ctx("bob"), &update).await,
-            Err(NotSaved {
-                failure: folder_not_found(),
-                setting: Some(Setting::DiscoveryFolder)
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn own_folders_and_an_empty_choice_are_accepted() {
-        let db = test_db::migrated().await;
-        let bob_folder = folder_of(&db, "bob").await;
         let bob = test_ctx("bob");
-        let update = UpdateUserSettings {
-            discovery_folder_id: Some(bob_folder.clone()),
-            default_download_folder_id: Some(bob_folder),
-            ..Default::default()
-        };
-        assert_eq!(check_folder_choices(&db, &bob, &update).await, Ok(()));
-        let cleared = UpdateUserSettings {
-            discovery_folder_id: Some(String::new()),
-            ..Default::default()
-        };
-        assert_eq!(check_folder_choices(&db, &bob, &cleared).await, Ok(()));
-        assert_eq!(
-            check_folder_choices(&db, &bob, &UpdateUserSettings::default()).await,
-            Ok(())
-        );
+        assert!(get_in(&db, &bob).await.unwrap().accept_shares);
+        let saved = update_in(
+            &db,
+            &NOT_LINKED,
+            &bob,
+            UpdateUserSettings {
+                accept_shares: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!saved.accept_shares);
     }
 }

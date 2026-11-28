@@ -3,7 +3,8 @@ use shared::download::AcquireAndPlayStage;
 
 use crate::{
     IconCheck, IconHeart, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
-    IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
+    IconShare2, IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip,
+    StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -160,6 +161,7 @@ pub fn TrackRow(
     #[props(default)] on_rate: Option<EventHandler<u8>>,
     #[props(default)] on_acquire: Option<EventHandler<()>>,
     #[props(default)] on_pick_source: Option<EventHandler<()>>,
+    #[props(default)] on_share: Option<EventHandler<()>>,
     #[props(default)] on_inspect: Option<EventHandler<()>>,
     #[props(default)] class: String,
 ) -> Element {
@@ -603,6 +605,23 @@ pub fn TrackRow(
                     }
                 }
 
+                // Optional Share button (for permanent Owned library tracks)
+                if matches!(state, TrackRowState::Owned { .. }) {
+                    if let Some(share_cb) = on_share {
+                        button {
+                            r#type: "button",
+                            aria_label: format!("Share {title}"),
+                            title: "Share track",
+                            class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-leaf-text hover:bg-beet-surface-high transition-colors duration-150 cursor-pointer",
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                share_cb.call(());
+                            },
+                            IconShare2 { size: 15 }
+                        }
+                    }
+                }
+
                 // Optional Track Inspector button
                 if let Some(inspect_cb) = on_inspect {
                     button {
@@ -836,5 +855,50 @@ mod tests {
         assert!(html_disc.contains("hidden sm:flex items-center"), "{html_disc}");
         assert!(html_disc.contains("Rate Discovery Gem"), "{html_disc}");
         assert!(html_disc.contains("Rated 5 out of 5 stars"), "{html_disc}");
+    }
+
+    #[test]
+    fn renders_share_button_only_for_owned_tracks() {
+        let mut owned_dom = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Owned Song".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::Owned {
+                        is_offline_cached: false,
+                        starred: false,
+                        rating: 0,
+                    },
+                    on_share: |_| {},
+                }
+            }
+        });
+        owned_dom.rebuild_in_place();
+        let owned_html = dioxus_ssr::render(&owned_dom);
+        assert!(
+            owned_html.contains("aria-label=\"Share Owned Song\""),
+            "{owned_html}"
+        );
+
+        let mut disc_dom = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Discovery Song".to_string(),
+                    artist: "Artist".to_string(),
+                    state: TrackRowState::PendingDiscovery {
+                        days_remaining: Some(3),
+                        reason_label: None,
+                        rating: 0,
+                    },
+                    on_share: |_| {},
+                }
+            }
+        });
+        disc_dom.rebuild_in_place();
+        let disc_html = dioxus_ssr::render(&disc_dom);
+        assert!(
+            !disc_html.contains("aria-label=\"Share Discovery Song\""),
+            "{disc_html}"
+        );
     }
 }

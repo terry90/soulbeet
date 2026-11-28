@@ -760,22 +760,39 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 let _ = done.send(outcome);
             }
             Work::ModifyTags { file, edits, done } => {
-                let outcome = AssertUnwindSafe(shared.modify_tags(&key, &file, &edits))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        warn!(
-                            "Modifying tags of {} in {} panicked",
-                            file.display(),
-                            key.display()
-                        );
-                        Err(Failure::new(
-                            shared::failure::FailureCode::RetagFailed,
-                            shared::failure::Stage::Retag,
-                            shared::failure::RetryAdvice::SameSourceLater,
-                            WORKER_STOPPED,
-                        ))
-                    });
+                let cow_file = file.clone();
+                let cow_err = tokio::task::spawn_blocking(move || {
+                    crate::core::tracks::cow::break_hardlink_if_shared(&cow_file)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|r| r)
+                .err();
+                let outcome = if let Some(e) = cow_err {
+                    Err(Failure::new(
+                        shared::failure::FailureCode::RetagFailed,
+                        shared::failure::Stage::Retag,
+                        shared::failure::RetryAdvice::SameSourceLater,
+                        format!("Could not isolate shared file before modifying tags: {e}"),
+                    ))
+                } else {
+                    AssertUnwindSafe(shared.modify_tags(&key, &file, &edits))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            warn!(
+                                "Modifying tags of {} in {} panicked",
+                                file.display(),
+                                key.display()
+                            );
+                            Err(Failure::new(
+                                shared::failure::FailureCode::RetagFailed,
+                                shared::failure::Stage::Retag,
+                                shared::failure::RetryAdvice::SameSourceLater,
+                                WORKER_STOPPED,
+                            ))
+                        })
+                };
                 let _ = done.send(outcome);
             }
             Work::RematchInPlace {
@@ -785,15 +802,37 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
                 pretend,
                 done,
             } => {
-                let outcome = AssertUnwindSafe(
-                    shared.rematch_in_place(&key, &sources, mode, &choice, pretend),
-                )
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    warn!("Re-matching in {} panicked", key.display());
-                    ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
-                });
+                let cow_err = if !pretend {
+                    let paths = sources.clone();
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        for p in &paths {
+                            crate::core::tracks::cow::break_hardlink_if_shared(p)?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .and_then(|r| r)
+                    .err()
+                } else {
+                    None
+                };
+                let outcome = if let Some(e) = cow_err {
+                    ImportResult::failed(
+                        FailKind::Beets,
+                        format!("Could not isolate shared file before re-matching: {e}"),
+                    )
+                } else {
+                    AssertUnwindSafe(
+                        shared.rematch_in_place(&key, &sources, mode, &choice, pretend),
+                    )
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        warn!("Re-matching in {} panicked", key.display());
+                        ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into())
+                    })
+                };
                 let _ = done.send(outcome);
             }
             Work::RelocateFile { file, done } => {

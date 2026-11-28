@@ -1,8 +1,4 @@
-use api::models::folder::Folder;
-use dioxus::dioxus_core::Task;
 use dioxus::prelude::*;
-
-use super::download_options_menu::FolderDropdown;
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub enum DownloadRowState {
@@ -17,110 +13,34 @@ pub enum DownloadRowState {
 
 #[derive(Props, PartialEq, Clone)]
 pub struct DownloadIconProps {
-    pub item_id: String,
     pub state: DownloadRowState,
-    pub folders: Vec<Folder>,
-    pub selected_folder_id: Option<String>,
-    /// Global signal: which item_id has its menu open (None = all closed)
-    pub active_menu: Signal<Option<String>>,
     #[props(into)]
     pub on_download: EventHandler<()>,
-    #[props(into)]
-    pub on_override_download: EventHandler<Folder>,
 }
 
 #[component]
 pub fn DownloadIcon(props: DownloadIconProps) -> Element {
     let state = &props.state;
     let on_download = props.on_download;
-    let on_override_download = props.on_override_download;
-    let mut active_menu = props.active_menu;
-    let item_id = props.item_id.clone();
-
-    let mut press_task = use_signal(|| None::<Task>);
-    let mut suppress_click = use_signal(|| false);
-
     let is_interactive = matches!(state, DownloadRowState::Idle | DownloadRowState::Failed(_));
-    let is_menu_open = active_menu().as_ref() == Some(&item_id);
-
-    let item_id_open = item_id.clone();
-    let item_id_toggle = item_id.clone();
-
-    let mut cancel_timer = move || {
-        if let Some(task) = press_task.write().take() {
-            task.cancel();
-        }
-    };
-
-    // Wrapper z-index: high when this row's menu is open so it paints above other rows
-    let wrapper_class = if is_menu_open {
-        "relative shrink-0 z-[60]"
-    } else {
-        "relative shrink-0"
-    };
 
     rsx! {
-        div { class: "{wrapper_class}",
+        div { class: "relative shrink-0",
             button {
                 r#type: "button",
                 class: "p-2 rounded-full hover:bg-beet-surface-highest transition-colors cursor-pointer group/dl disabled:cursor-not-allowed",
                 aria_label: "Download",
                 disabled: !is_interactive,
-                onpointerdown: move |evt: PointerEvent| {
-                    evt.stop_propagation();
-                    if !is_interactive {
-                        return;
-                    }
-                    cancel_timer();
-                    // Each new gesture starts clean: a long-press on mobile never
-                    // fires the click that would otherwise consume a stale latch.
-                    suppress_click.set(false);
-                    let id_for_timer = item_id_open.clone();
-                    let task = spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(500).await;
-                        suppress_click.set(true);
-                        active_menu.set(Some(id_for_timer));
-                    });
-                    press_task.set(Some(task));
-                },
-                onpointerup: move |_| {
-                    cancel_timer();
-                },
-                onpointerleave: move |_| {
-                    cancel_timer();
-                },
-                // Touch scrolls and system gestures end with pointercancel, not
-                // pointerup; without this the long-press timer keeps running.
-                onpointercancel: move |_| {
-                    cancel_timer();
-                },
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
-                    if suppress_click() {
-                        suppress_click.set(false);
-                        return;
-                    }
                     if is_interactive {
                         on_download.call(());
                     }
                 },
-                oncontextmenu: move |evt: MouseEvent| {
-                    evt.prevent_default();
-                    evt.stop_propagation();
-                    if !is_interactive {
-                        return;
-                    }
-                    // Android long-press fires contextmenu while the 500ms timer
-                    // may already have opened the menu; toggling here would close
-                    // it again. Cancel the timer and ensure the menu is open.
-                    cancel_timer();
-                    suppress_click.set(true);
-                    active_menu.set(Some(item_id_toggle.clone()));
-                },
                 title: match state {
-                    DownloadRowState::Disabled => "Configure a folder in Settings".to_string(),
+                    DownloadRowState::Disabled => "Configure your music library folder in Settings".to_string(),
                     DownloadRowState::Failed(msg) => msg.clone(),
-                    _ => String::new(),
+                    _ => "Auto-download".to_string(),
                 },
 
                 match state {
@@ -185,19 +105,6 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                             }
                         }
                     },
-                }
-            }
-
-            if is_menu_open {
-                FolderDropdown {
-                    folders: props.folders.clone(),
-                    selected_folder_id: props.selected_folder_id.clone(),
-                    on_select_folder: move |folder: Folder| {
-                        active_menu.set(None);
-                        on_override_download.call(folder);
-                    },
-                    align: "right",
-                    show_quality: true,
                 }
             }
         }

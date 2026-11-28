@@ -184,7 +184,6 @@ mod tests {
             user_id: "user-a".into(),
             name: "Music".into(),
             path: path.to_string_lossy().into_owned(),
-            shared: false,
         }
     }
 
@@ -278,7 +277,6 @@ mod tests {
             user_id: "alice".into(),
             name: "f".into(),
             path: dir.path().to_string_lossy().into_owned(),
-            shared: false,
         }
     }
 

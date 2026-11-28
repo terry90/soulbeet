@@ -113,41 +113,9 @@ pub fn partition_backends(
     }
 }
 
-/// Resolves the target folder for Acquire & Play: explicit `folder_id`, else user's
-/// `default_download_folder_id`, else their first owned folder.
-pub async fn resolve_target_folder_in(
-    db: &SqlitePool,
-    ctx: &UserCtx,
-    requested_folder_id: Option<&str>,
-) -> Result<Folder, Failure> {
-    if let Some(folder_id) = requested_folder_id.filter(|id| !id.trim().is_empty()) {
-        return folders::owned_in(db, ctx, folder_id).await;
-    }
-
-    let settings = UserSettings::get_in(db, &ctx.user_id)
-        .await
-        .map_err(|e| database_failure(Stage::Input, e))?;
-    if let Some(default_id) = settings
-        .default_download_folder_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    {
-        if let Ok(folder) = folders::owned_in(db, ctx, default_id).await {
-            return Ok(folder);
-        }
-    }
-
-    let all = Folder::get_all_by_user_in(db, &ctx.user_id)
-        .await
-        .map_err(|e| database_failure(Stage::Input, e))?;
-    all.into_iter().next().ok_or_else(|| {
-        Failure::new(
-            FailureCode::FolderRequired,
-            Stage::Input,
-            RetryAdvice::NeedsUser,
-            "No download folder configured for this user",
-        )
-    })
+/// Resolves the target folder for Acquire & Play: the user's single personal library folder.
+pub async fn resolve_target_folder_in(db: &SqlitePool, ctx: &UserCtx) -> Result<Folder, Failure> {
+    folders::for_user_in(db, &ctx.user_id).await
 }
 
 /// Entry point called by `POST /api/acquire-and-play`.
@@ -265,7 +233,7 @@ pub(crate) async fn acquire_and_play_in(
     //    - `LossyFallback::Ask` + `prefer_fast == true` (the explicit 1-tap fast-play path)
     //      or `LossyFallback::Auto`: lossy-only fast backends may be auto-picked immediately
     //      (and upgraded to archival FLAC later only on explicit Keep/Star/Promote).
-    let folder = resolve_target_folder_in(db, ctx, req.folder_id.as_deref()).await?;
+    let folder = resolve_target_folder_in(db, ctx).await?;
     let settings = UserSettings::get_in(db, &ctx.user_id)
         .await
         .map_err(|e| database_failure(Stage::SourceSearch, e))?;
@@ -1596,7 +1564,6 @@ mod tests {
             user_id: user_id.to_string(),
             name: "Music".to_string(),
             path: dir.path().to_str().unwrap().to_string(),
-            shared: false,
         };
         (ctx, folder, dir)
     }
@@ -1644,7 +1611,6 @@ mod tests {
                 recording_mbid: Some("rec-mbid-1".into()),
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -1715,7 +1681,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -1813,7 +1778,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -2117,7 +2081,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -2392,7 +2355,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -2489,7 +2451,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -2582,7 +2543,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: true,
             },
         )
@@ -2680,7 +2640,6 @@ mod tests {
                 recording_mbid: None,
                 release_mbid: None,
                 duration_s: None,
-                folder_id: None,
                 prefer_fast: false,
             },
         )

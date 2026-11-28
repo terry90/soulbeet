@@ -248,6 +248,7 @@ impl StubImporter {
         *self.tag_edit_answer.lock().unwrap() = Some(answer);
     }
 
+    #[allow(dead_code)]
     pub fn registers(&self) -> Vec<(PathBuf, PathBuf)> {
         self.registers.lock().unwrap().clone()
     }
