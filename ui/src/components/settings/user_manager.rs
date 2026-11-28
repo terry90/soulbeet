@@ -7,8 +7,8 @@ use api::{
 use dioxus::prelude::*;
 
 use super::panel::{
-    ListRow, LoadError, Messages, Panel, SectionTitle, LABEL_CLASS, PRIMARY_BUTTON_CLASS,
-    REMOVE_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
+    ListRow, LoadError, Messages, Panel, SectionTitle, COMPACT_PRIMARY_BUTTON_CLASS,
+    COMPACT_SECONDARY_BUTTON_CLASS, LABEL_CLASS, PRIMARY_BUTTON_CLASS, REMOVE_BUTTON_CLASS,
 };
 use super::sign_in_methods::{NavidromeSection, PasswordSection, SingleSignOnSection};
 use crate::auth::use_auth;
@@ -316,14 +316,16 @@ pub fn UserManager() -> Element {
                                 }
                                 div { class: "flex gap-2 mt-1",
                                   button {
-                                    class: "{PRIMARY_BUTTON_CLASS} h-8 px-3 text-xs",
+                                    r#type: "button",
+                                    class: COMPACT_PRIMARY_BUTTON_CLASS,
                                     onclick: move |_| handle_update_password(id_pw.clone()),
-                                    "[ Save ]"
+                                    "Save"
                                   }
                                   button {
-                                    class: "{SECONDARY_BUTTON_CLASS} h-8 px-3",
+                                    r#type: "button",
+                                    class: COMPACT_SECONDARY_BUTTON_CLASS,
                                     onclick: move |_| editing_user_id.set(None),
-                                    "[ Cancel ]"
+                                    "Cancel"
                                   }
                                 }
                               }

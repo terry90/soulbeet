@@ -69,7 +69,7 @@ pub fn DiscoveryOverview() -> Element {
     // Poll every 2.5s while generation is active
     use_future(move || async move {
         loop {
-            gloo_timers::future::TimeoutFuture::new(2500).await;
+            crate::sleep_ms(2500).await;
             let is_active = progress
                 .read()
                 .as_ref()

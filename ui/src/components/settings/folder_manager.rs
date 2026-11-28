@@ -7,8 +7,8 @@ use serde_json::Value;
 use shared::recommendation::DiscoveryProfile;
 
 use super::panel::{
-    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, LABEL_CLASS, PRIMARY_BUTTON_CLASS,
-    REMOVE_BUTTON_CLASS, SECONDARY_BUTTON_CLASS,
+    ListRow, LoadError, Loading, Messages, Panel, SectionTitle, COMPACT_PRIMARY_BUTTON_CLASS,
+    COMPACT_SECONDARY_BUTTON_CLASS, LABEL_CLASS, PRIMARY_BUTTON_CLASS, REMOVE_BUTTON_CLASS,
 };
 use super::save_setting::{typed_number, SettingSaver};
 use super::toggle::{save_switch, Toggle};
@@ -289,14 +289,16 @@ pub fn FolderManager() -> Element {
                                                 }
                                                 div { class: "flex gap-2 mt-1",
                                                     button {
-                                                        class: "{PRIMARY_BUTTON_CLASS} h-8 px-3 text-xs",
+                                                        r#type: "button",
+                                                        class: COMPACT_PRIMARY_BUTTON_CLASS,
                                                         onclick: move |_| handle_update_folder(id_update.clone()),
-                                                        "[ Save ]"
+                                                        "Save"
                                                     }
                                                     button {
-                                                        class: "{SECONDARY_BUTTON_CLASS} h-8 px-3",
+                                                        r#type: "button",
+                                                        class: COMPACT_SECONDARY_BUTTON_CLASS,
                                                         onclick: move |_| editing_folder_id.set(None),
-                                                        "[ Cancel ]"
+                                                        "Cancel"
                                                     }
                                                 }
                                             }
@@ -308,7 +310,8 @@ pub fn FolderManager() -> Element {
                                                 }
                                                 div { class: "flex gap-3 shrink-0",
                                                     button {
-                                                        class: "text-xs font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors underline decoration-dotted underline-offset-4 cursor-pointer",
+                                                        r#type: "button",
+                                                        class: "text-xs font-medium text-beet-text-secondary hover:text-beet-text-primary transition-colors cursor-pointer",
                                                         onclick: move |_| {
                                                             edit_folder_name.set(folder.name.clone());
                                                             edit_folder_path.set(folder.path.clone());
@@ -477,7 +480,7 @@ pub fn FolderManager() -> Element {
                                                         }
                                                         // Per-profile track count and lifetime
                                                         if active {
-                                                            div { class: "flex gap-3 mt-2 ml-18",
+                                                            div { class: "flex flex-wrap gap-3 mt-2 sm:ml-18",
                                                                 div { class: "flex items-center gap-1.5",
                                                                     span { class: "text-[11px] text-beet-text-tertiary", "Tracks" }
                                                                     input {

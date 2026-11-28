@@ -246,6 +246,29 @@ pub fn LyricsPanel(
         None
     };
 
+    // Auto-scroll active synced line into view on wasm32 whenever the active index changes.
+    let mut last_scrolled_idx = use_signal(|| None::<usize>);
+    #[cfg(target_arch = "wasm32")]
+    {
+        if active_idx != *last_scrolled_idx.peek() {
+            last_scrolled_idx.set(active_idx);
+            if let Some(idx) = active_idx {
+                let elem_id = format!("beet-lyric-line-{idx}");
+                if let Some(el) = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.get_element_by_id(&elem_id))
+                {
+                    let opts = web_sys::ScrollIntoViewOptions::new();
+                    opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+                    opts.set_block(web_sys::ScrollLogicalPosition::Center);
+                    el.scroll_into_view_with_scroll_into_view_options(&opts);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = &mut last_scrolled_idx;
+
     if !has_track {
         return rsx! {
             div { class: "h-full flex flex-col items-center justify-center text-center px-6 py-12 text-beet-text-tertiary space-y-2",
@@ -369,13 +392,14 @@ pub fn LyricsPanel(
                             let line_class = if is_active {
                                 "text-beet-leaf-text font-semibold text-[16px] bg-beet-leaf-surface/70 border-l-2 border-beet-leaf-solid pl-3 py-2"
                             } else if is_past {
-                                "text-beet-text-disabled hover:text-beet-text-secondary text-[14px] pl-3 py-1.5"
+                                "text-beet-text-disabled hover:text-beet-text-secondary text-[14px] border-l-2 border-transparent pl-3 py-1.5"
                             } else {
-                                "text-beet-text-secondary hover:text-beet-text-primary text-[14px] pl-3 py-1.5"
+                                "text-beet-text-secondary hover:text-beet-text-primary text-[14px] border-l-2 border-transparent pl-3 py-1.5"
                             };
                             rsx! {
                                 button {
                                     key: "{idx}-{start_ms}",
+                                    id: "beet-lyric-line-{idx}",
                                     r#type: "button",
                                     class: "w-full text-left rounded-[6px] leading-[1.45] transition-colors duration-150 cursor-pointer {line_class}",
                                     onclick: move |_| player.seek(seek_secs),

@@ -5,9 +5,10 @@ use shared::client::{DeleteGuardPreview, TrackLyrics};
 
 use crate::{
     classify_guard_mode, format_discovery_badge, format_duration, protection_kind_label,
-    use_player, GuardModalMode, IconCheck, IconInfo, IconListMusic, IconLoader, IconMic2,
-    IconMusic, IconPlay, IconRadio, IconShieldAlert, IconShieldCheck, IconSparkles, IconThumbsDown,
-    IconTrash2, IconX, PlayerTrack, StarStrip, StarStripSize,
+    use_player, GuardModalMode, IconCheck, IconChevronDown, IconChevronUp, IconInfo, IconListMusic,
+    IconListPlus, IconLoader, IconMic2, IconMusic, IconPlay, IconRadio, IconShieldAlert,
+    IconShieldCheck, IconSparkles, IconThumbsDown, IconTrash2, IconX, PlayerTrack, StarStrip,
+    StarStripSize,
 };
 
 use super::LyricsPanel;
@@ -50,6 +51,9 @@ pub fn StudioRightDrawer(
     on_drop: EventHandler<PlayerTrack>,
     on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+    #[props(default)] on_album_click: Option<EventHandler<String>>,
+    #[props(default)] on_save_queue_as_playlist: Option<EventHandler<()>>,
 ) -> Element {
     // Hooks MUST run unconditionally before any early return (Dioxus 0.7 Rules of Hooks).
     let player = use_player();
@@ -65,13 +69,15 @@ pub fn StudioRightDrawer(
     rsx! {
         // Mobile/tablet backdrop for overlay mode (< xl)
         div {
-            class: "fixed inset-0 bg-beet-sunken/70 backdrop-blur-xs z-30 xl:hidden",
+            class: "fixed inset-0 bg-beet-sunken/75 backdrop-blur-xs z-40 xl:hidden",
             onclick: move |_| on_close.call(()),
         }
 
         aside {
+            role: "dialog",
+            aria_modal: "true",
             aria_label: "Studio contextual drawer",
-            class: "fixed right-0 top-0 bottom-[84px] z-40 w-[320px] max-w-[92vw] xl:static xl:z-auto xl:bottom-auto xl:h-full bg-beet-sunken border-l border-beet-border-subtle flex flex-col shrink-0",
+            class: "fixed right-0 top-0 bottom-0 lg:bottom-[84px] z-50 w-[320px] max-w-[92vw] xl:static xl:z-auto xl:bottom-auto xl:h-full bg-beet-sunken border-l border-beet-border-subtle flex flex-col shrink-0",
 
             // Segmented Header
             div { class: "h-14 px-3 border-b border-beet-border-subtle flex items-center justify-between gap-2 shrink-0",
@@ -121,7 +127,10 @@ pub fn StudioRightDrawer(
             div { class: "flex-1 overflow-y-auto studio-scrollbar",
                 match tab {
                     DrawerTab::Queue => rsx! {
-                        QueueTabBody {}
+                        QueueTabBody {
+                            on_artist_click,
+                            on_save_queue_as_playlist,
+                        }
                     },
                     DrawerTab::Lyrics => rsx! {
                         LyricsPanel {
@@ -144,6 +153,8 @@ pub fn StudioRightDrawer(
                             on_drop,
                             on_rate,
                             on_start_radio,
+                            on_artist_click,
+                            on_album_click,
                         }
                     },
                 }
@@ -153,7 +164,10 @@ pub fn StudioRightDrawer(
 }
 
 #[component]
-fn QueueTabBody() -> Element {
+fn QueueTabBody(
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+    #[props(default)] on_save_queue_as_playlist: Option<EventHandler<()>>,
+) -> Element {
     let player = use_player();
     let state = player.snapshot();
     let cur_idx = state.queue_index;
@@ -173,104 +187,256 @@ fn QueueTabBody() -> Element {
         };
     }
 
+    let queue_len = state.queue.len();
     let queue_clone = state.queue.clone();
+
+    let now_playing_entry = cur_idx.and_then(|i| state.queue.get(i).map(|t| (i, t.clone())));
+    let up_next_entries: Vec<(usize, PlayerTrack)> = match cur_idx {
+        Some(ci) => state
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > ci)
+            .map(|(i, t)| (i, t.clone()))
+            .collect(),
+        None => state
+            .queue
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.clone()))
+            .collect(),
+    };
+    let earlier_entries: Vec<(usize, PlayerTrack)> = match cur_idx {
+        Some(ci) => state
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i < ci)
+            .map(|(i, t)| (i, t.clone()))
+            .collect(),
+        None => Vec::new(),
+    };
 
     rsx! {
         div { class: "p-3 space-y-4",
-            div { class: "flex items-center justify-between px-1",
+            div { class: "flex items-center justify-between gap-2 px-1",
                 span { class: "tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
-                    "{state.queue.len()} IN QUEUE"
+                    "{queue_len} IN QUEUE"
                 }
-                button {
-                    r#type: "button",
-                    class: "text-[11px] tabular-nums-mono font-semibold uppercase tracking-wider text-beet-text-tertiary hover:text-beet-crimson-text cursor-pointer transition-colors",
-                    onclick: move |_| player.clear_queue(),
-                    "Clear"
+                div { class: "flex items-center gap-2.5",
+                    if let Some(save_cb) = on_save_queue_as_playlist {
+                        button {
+                            r#type: "button",
+                            class: "inline-flex items-center gap-1 text-[11px] tabular-nums-mono font-semibold uppercase tracking-wider text-beet-leaf-text hover:underline cursor-pointer transition-colors",
+                            onclick: move |_| save_cb.call(()),
+                            IconListPlus { size: 12 }
+                            span { "Save" }
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "text-[11px] tabular-nums-mono font-semibold uppercase tracking-wider text-beet-text-tertiary hover:text-beet-crimson-text cursor-pointer transition-colors",
+                        onclick: move |_| player.clear_queue(),
+                        "Clear"
+                    }
                 }
             }
 
-            div { class: "space-y-1", role: "list", aria_label: "Playback queue",
-                for (idx, item) in state.queue.iter().enumerate() {
-                    {
-                        let is_current = cur_idx == Some(idx);
-                        let q_for_jump = queue_clone.clone();
-                        let row_cls = if is_current {
-                            "bg-beet-surface border-beet-leaf-solid/35 hover:bg-beet-surface-high/70 hover:border-beet-leaf-solid/50"
-                        } else {
-                            "bg-transparent border-transparent hover:bg-beet-surface-low"
-                        };
-                        rsx! {
-                            div {
-                                key: "{idx}-{item.id}",
-                                role: "listitem",
-                                class: "group flex items-center gap-3 px-3 py-2 rounded-[8px] border transition-colors {row_cls}",
-                                button {
-                                    r#type: "button",
-                                    class: "flex items-center gap-3 flex-1 min-w-0 text-left cursor-pointer",
-                                    onclick: move |_| player.play_queue(q_for_jump.clone(), idx),
-                                    span { class: "w-7 shrink-0 inline-flex items-center justify-end tabular-nums-mono text-[12px] text-beet-text-tertiary",
-                                        if is_current && is_playing {
-                                            span {
-                                                class: "inline-flex items-end justify-end gap-[2px] h-3.5",
-                                                aria_hidden: "true",
-                                                span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
-                                                span {
-                                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
-                                                    style: "animation-delay: 180ms;",
-                                                }
-                                                span {
-                                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
-                                                    style: "animation-delay: 360ms;",
-                                                }
-                                            }
-                                        } else if is_current {
-                                            IconPlay {
-                                                size: 12,
-                                                filled: true,
-                                                class: "text-beet-leaf-text".to_string(),
-                                            }
-                                        } else {
-                                            "{idx + 1}"
-                                        }
-                                    }
-                                    span { class: "block flex-1 min-w-0",
-                                        span {
-                                            class: if is_current {
-                                                "block text-[13px] font-semibold text-beet-leaf-text truncate"
-                                            } else {
-                                                "block text-[13px] font-medium text-beet-text-primary truncate"
-                                            },
-                                            "{item.title}"
-                                        }
-                                        span { class: "block text-[11px] text-beet-text-secondary truncate",
-                                            "{item.artist}"
-                                        }
-                                    }
-                                }
-                                if item.is_discovery {
-                                    span { class: "px-1.5 py-0.5 rounded bg-beet-accent-surface text-beet-accent-text tabular-nums-mono text-[9px] font-semibold shrink-0",
-                                        "DISC"
-                                    }
-                                } else if item.is_offline_cached {
-                                    span { class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow shrink-0", title: "Available offline" }
-                                }
-                                if let Some(dur) = item.duration_secs {
-                                    span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
-                                        "{format_duration(dur)}"
-                                    }
-                                }
-                                button {
-                                    r#type: "button",
-                                    aria_label: format!("Remove {} from queue", item.title),
-                                    title: "Remove from queue",
-                                    class: "w-6 h-6 rounded inline-flex items-center justify-center text-beet-text-disabled hover:text-beet-crimson-text opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer transition-opacity shrink-0",
-                                    onclick: move |_| player.remove_from_queue(idx),
-                                    IconX { size: 13 }
-                                }
+            if let Some((idx, item)) = now_playing_entry {
+                div { class: "space-y-1.5",
+                    p { class: "px-1 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Now Playing"
+                    }
+                    div { role: "list", aria_label: "Now playing",
+                        QueueRowItem {
+                            idx,
+                            item,
+                            is_current: true,
+                            is_playing,
+                            queue_len,
+                            queue_snapshot: queue_clone.clone(),
+                            can_reorder: false,
+                            on_artist_click,
+                        }
+                    }
+                }
+            }
+
+            if !up_next_entries.is_empty() {
+                div { class: "space-y-1.5",
+                    p { class: "px-1 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Up Next · {up_next_entries.len()}"
+                    }
+                    div { class: "space-y-1", role: "list", aria_label: "Up next",
+                        for (idx, item) in up_next_entries {
+                            QueueRowItem {
+                                key: "next-{idx}-{item.id}",
+                                idx,
+                                item,
+                                is_current: false,
+                                is_playing: false,
+                                queue_len,
+                                queue_snapshot: queue_clone.clone(),
+                                can_reorder: true,
+                                on_artist_click,
                             }
                         }
                     }
                 }
+            }
+
+            if !earlier_entries.is_empty() {
+                div { class: "space-y-1.5",
+                    p { class: "px-1 tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                        "Earlier"
+                    }
+                    div { class: "space-y-1", role: "list", aria_label: "Earlier in queue",
+                        for (idx, item) in earlier_entries {
+                            QueueRowItem {
+                                key: "prev-{idx}-{item.id}",
+                                idx,
+                                item,
+                                is_current: false,
+                                is_playing: false,
+                                queue_len,
+                                queue_snapshot: queue_clone.clone(),
+                                can_reorder: true,
+                                on_artist_click,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QueueRowItem(
+    idx: usize,
+    item: PlayerTrack,
+    is_current: bool,
+    is_playing: bool,
+    queue_len: usize,
+    queue_snapshot: Vec<PlayerTrack>,
+    can_reorder: bool,
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+) -> Element {
+    let player = use_player();
+    let row_cls = if is_current {
+        "bg-beet-surface border-beet-leaf-solid/35 hover:bg-beet-surface-high/70 hover:border-beet-leaf-solid/50"
+    } else {
+        "bg-transparent border-transparent hover:bg-beet-surface-low"
+    };
+    let artist_for_click = item.artist.clone();
+    let queue_for_index = queue_snapshot.clone();
+
+    rsx! {
+        div {
+            role: "listitem",
+            class: "group flex items-center gap-3 px-3 py-2 rounded-[8px] border transition-colors {row_cls}",
+            button {
+                r#type: "button",
+                class: "w-7 shrink-0 inline-flex items-center justify-end tabular-nums-mono text-[12px] text-beet-text-tertiary cursor-pointer",
+                aria_label: format!("Play {}", item.title),
+                onclick: move |_| player.play_queue(queue_for_index.clone(), idx),
+                if is_current && is_playing {
+                    span {
+                        class: "inline-flex items-end justify-end gap-[2px] h-3.5",
+                        aria_hidden: "true",
+                        span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
+                        span {
+                            class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                            style: "animation-delay: 180ms;",
+                        }
+                        span {
+                            class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                            style: "animation-delay: 360ms;",
+                        }
+                    }
+                } else if is_current {
+                    IconPlay {
+                        size: 12,
+                        filled: true,
+                        class: "text-beet-leaf-text ml-0.5".to_string(),
+                    }
+                } else {
+                    "{idx + 1}"
+                }
+            }
+
+            div { class: "flex-1 min-w-0",
+                button {
+                    r#type: "button",
+                    class: if is_current {
+                        "block w-full text-left text-[13px] font-semibold text-beet-leaf-text truncate cursor-pointer"
+                    } else {
+                        "block w-full text-left text-[13px] font-medium text-beet-text-primary truncate cursor-pointer"
+                    },
+                    onclick: move |_| player.play_queue(queue_snapshot.clone(), idx),
+                    "{item.title}"
+                }
+                if let Some(artist_cb) = on_artist_click {
+                    button {
+                        r#type: "button",
+                        class: "block max-w-full text-left text-[11px] text-beet-text-secondary hover:text-beet-text-primary hover:underline truncate cursor-pointer",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            artist_cb.call(artist_for_click.clone());
+                        },
+                        "{item.artist}"
+                    }
+                } else {
+                    span { class: "block text-[11px] text-beet-text-secondary truncate",
+                        "{item.artist}"
+                    }
+                }
+            }
+
+            if item.is_discovery {
+                span { class: "px-1.5 py-0.5 rounded bg-beet-accent-surface text-beet-accent-text tabular-nums-mono text-[9px] font-semibold shrink-0",
+                    "DISC"
+                }
+            } else if item.is_offline_cached {
+                span { class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow shrink-0", title: "Available offline" }
+            }
+
+            if can_reorder {
+                div { class: "flex items-center gap-0.5 shrink-0 opacity-75 sm:opacity-0 sm:group-hover:opacity-100 focus-within:opacity-100 transition-opacity",
+                    if idx > 0 {
+                        button {
+                            r#type: "button",
+                            aria_label: format!("Move {} up", item.title),
+                            title: "Move up",
+                            class: "w-5 h-5 rounded inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer",
+                            onclick: move |_| player.move_queue_item(idx, idx - 1),
+                            IconChevronUp { size: 12 }
+                        }
+                    }
+                    if idx + 1 < queue_len {
+                        button {
+                            r#type: "button",
+                            aria_label: format!("Move {} down", item.title),
+                            title: "Move down",
+                            class: "w-5 h-5 rounded inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high cursor-pointer",
+                            onclick: move |_| player.move_queue_item(idx, idx + 1),
+                            IconChevronDown { size: 12 }
+                        }
+                    }
+                }
+            } else if let Some(dur) = item.duration_secs {
+                span { class: "tabular-nums-mono text-[11px] text-beet-text-tertiary shrink-0",
+                    "{format_duration(dur)}"
+                }
+            }
+
+            button {
+                r#type: "button",
+                aria_label: format!("Remove {} from queue", item.title),
+                title: "Remove from queue",
+                class: "w-6 h-6 rounded inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-crimson-text opacity-75 sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer transition-opacity shrink-0",
+                onclick: move |_| player.remove_from_queue(idx),
+                IconX { size: 13 }
             }
         }
     }
@@ -287,6 +453,8 @@ fn InspectorTabBody(
     on_drop: EventHandler<PlayerTrack>,
     on_rate: EventHandler<(PlayerTrack, u8)>,
     on_start_radio: EventHandler<PlayerTrack>,
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+    #[props(default)] on_album_click: Option<EventHandler<String>>,
 ) -> Element {
     let Some(track) = track else {
         return rsx! {
@@ -330,12 +498,40 @@ fn InspectorTabBody(
                         p { class: "text-[15px] font-semibold text-beet-text-primary leading-snug break-words",
                             "{track.title}"
                         }
-                        p { class: "text-[13px] text-beet-text-secondary truncate",
-                            "{track.artist}"
+                        if let Some(artist_cb) = on_artist_click {
+                            {
+                                let artist_val = track.artist.clone();
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        class: "block max-w-full text-left text-[13px] text-beet-text-secondary hover:text-beet-text-primary hover:underline truncate cursor-pointer",
+                                        onclick: move |_| artist_cb.call(artist_val.clone()),
+                                        "{track.artist}"
+                                    }
+                                }
+                            }
+                        } else {
+                            p { class: "text-[13px] text-beet-text-secondary truncate",
+                                "{track.artist}"
+                            }
                         }
                         if let Some(alb) = track.album.as_deref().filter(|a| !a.is_empty()) {
-                            p { class: "text-[12px] text-beet-text-tertiary truncate",
-                                "{alb}"
+                            if let Some(album_cb) = on_album_click {
+                                {
+                                    let alb_val = alb.to_string();
+                                    rsx! {
+                                        button {
+                                            r#type: "button",
+                                            class: "block max-w-full text-left text-[12px] text-beet-text-tertiary hover:text-beet-text-primary hover:underline truncate cursor-pointer",
+                                            onclick: move |_| album_cb.call(alb_val.clone()),
+                                            "{alb}"
+                                        }
+                                    }
+                                }
+                            } else {
+                                p { class: "text-[12px] text-beet-text-tertiary truncate",
+                                    "{alb}"
+                                }
                             }
                         }
                     }
@@ -450,7 +646,7 @@ fn InspectorTabBody(
                     button {
                         r#type: "button",
                         disabled: guard_loading || track.id.is_empty(),
-                        class: "text-[11px] tabular-nums-mono text-beet-accent-text hover:underline disabled:opacity-50 cursor-pointer",
+                        class: "text-[11px] tabular-nums-mono text-beet-accent-text hover:underline disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                         onclick: move |_| on_refresh_guard.call(song_id_refresh.clone()),
                         if guard_loading { "Checking…" } else { "Audit" }
                     }

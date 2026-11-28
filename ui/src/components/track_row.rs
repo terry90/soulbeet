@@ -2,8 +2,10 @@ use dioxus::prelude::*;
 use shared::download::AcquireAndPlayStage;
 
 use crate::{
-    IconCheck, IconHeart, IconInfo, IconLoader, IconMusic, IconPlay, IconPlus, IconRefreshCw,
-    IconSlidersHorizontal, IconSparkles, IconStar, IconWifiOff, IconX, StarStrip, StarStripSize,
+    IconCheck, IconChevronDown, IconChevronUp, IconDisc3, IconHeart, IconInfo, IconListMusic,
+    IconListPlus, IconLoader, IconMoreHorizontal, IconMusic, IconPlay, IconPlus, IconRefreshCw,
+    IconSlidersHorizontal, IconSparkles, IconStar, IconTrash2, IconUser, IconWifiOff, IconX,
+    StarStrip, StarStripSize,
 };
 
 /// Visual acquisition stage badge for an unowned catalog track undergoing
@@ -37,7 +39,7 @@ impl AcquireStageBadge {
             AcquireAndPlayStage::Importing => Some(Self::Importing),
             AcquireAndPlayStage::Indexing => Some(Self::Indexing),
             AcquireAndPlayStage::NeedsManualChoice { .. } => Some(Self::NeedsManualChoice {
-                message: Some("Best match was ambiguous — pick a source".to_string()),
+                message: Some("Best match was ambiguous: pick a source".to_string()),
             }),
             AcquireAndPlayStage::Failed { failure } => Some(Self::Failed {
                 message: Some(failure.message.clone()),
@@ -161,9 +163,18 @@ pub fn TrackRow(
     #[props(default)] on_acquire: Option<EventHandler<()>>,
     #[props(default)] on_pick_source: Option<EventHandler<()>>,
     #[props(default)] on_inspect: Option<EventHandler<()>>,
+    #[props(default)] on_artist_click: Option<EventHandler<String>>,
+    #[props(default)] on_album_click: Option<EventHandler<String>>,
+    #[props(default)] on_play_next: Option<EventHandler<()>>,
+    #[props(default)] on_add_to_queue: Option<EventHandler<()>>,
+    #[props(default)] on_add_to_playlist: Option<EventHandler<()>>,
+    #[props(default)] on_move_up: Option<EventHandler<()>>,
+    #[props(default)] on_move_down: Option<EventHandler<()>>,
+    #[props(default)] on_remove_from_playlist: Option<EventHandler<()>>,
     #[props(default)] class: String,
 ) -> Element {
     let mut failed_art_url = use_signal(|| None::<String>);
+    let mut menu_open = use_signal(|| false);
 
     let is_offline_unavailable = matches!(state, TrackRowState::OfflineUnavailable);
     let is_acquiring = matches!(
@@ -186,14 +197,16 @@ pub fn TrackRow(
         on_pick_source.is_some(),
     );
 
+    // Put `border-transparent` exclusively in non-playing branches so Tailwind cascade never
+    // overrides `border-beet-leaf-solid/25` on the playing row.
     let row_surface = if is_offline_unavailable {
-        "opacity-[0.42] bg-transparent cursor-not-allowed"
+        "opacity-[0.42] bg-transparent border-transparent cursor-not-allowed"
     } else if is_playing {
         "bg-beet-surface-low border-beet-leaf-solid/25 hover:bg-beet-surface-high/60"
     } else if is_unowned_idle {
-        "opacity-[0.78] hover:opacity-100 hover:bg-beet-surface-low"
+        "opacity-[0.78] border-transparent hover:opacity-100 hover:bg-beet-surface-low"
     } else {
-        "hover:bg-beet-surface-low"
+        "border-transparent hover:bg-beet-surface-low"
     };
 
     let title_class = if is_playing {
@@ -209,10 +222,21 @@ pub fn TrackRow(
         .filter(|url| !url.is_empty() && failed_art_url.read().as_ref() != Some(*url))
         .cloned();
 
-    let subtitle = match album.as_deref().filter(|a| !a.trim().is_empty()) {
-        Some(alb) => format!("{artist} · {alb}"),
-        None => artist.clone(),
-    };
+    let clean_album = album
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
+
+    let has_overflow_menu = on_play_next.is_some()
+        || on_add_to_queue.is_some()
+        || on_add_to_playlist.is_some()
+        || on_move_up.is_some()
+        || on_move_down.is_some()
+        || on_remove_from_playlist.is_some()
+        || on_artist_click.is_some()
+        || (on_album_click.is_some() && clean_album.is_some())
+        || on_rate.is_some();
 
     let play_aria_label = match &state {
         TrackRowState::OfflineUnavailable => {
@@ -228,194 +252,232 @@ pub fn TrackRow(
         _ => format!("Play {title} by {artist}"),
     };
 
+    let state_for_art = state.clone();
+    let state_for_title = state.clone();
+    let trigger_primary = move |st: &TrackRowState| {
+        if !can_primary_click {
+            return;
+        }
+        match st {
+            TrackRowState::UnownedCatalog { acquiring_stage } => match acquiring_stage {
+                Some(AcquireStageBadge::NeedsManualChoice { .. }) => {
+                    if let Some(handler) = &on_pick_source {
+                        handler.call(());
+                    }
+                }
+                None | Some(AcquireStageBadge::Failed { .. }) => {
+                    if let Some(handler) = &on_acquire {
+                        handler.call(());
+                    }
+                }
+                Some(_) => {}
+            },
+            TrackRowState::Owned { .. } | TrackRowState::PendingDiscovery { .. } => {
+                if let Some(handler) = &on_play {
+                    handler.call(());
+                }
+            }
+            TrackRowState::OfflineUnavailable => {}
+        }
+    };
+
+    let current_rating = match &state {
+        TrackRowState::Owned { rating, .. } | TrackRowState::PendingDiscovery { rating, .. } => {
+            (*rating).min(5)
+        }
+        _ => 0,
+    };
+
+    let artist_for_sub = artist.clone();
+    let artist_for_menu = artist.clone();
+    let album_for_sub = clean_album.clone();
+    let album_for_menu = clean_album.clone();
+
     rsx! {
         div {
             role: "listitem",
             aria_disabled: if is_offline_unavailable { "true" } else { "false" },
             title: is_offline_unavailable.then_some("Not cached offline"),
-            class: "group relative flex items-center gap-3 px-3 py-2 min-h-[56px] rounded-[8px] border border-transparent transition-[background-color,border-color,opacity] duration-150 {row_surface} {class}",
+            class: "group relative flex items-center gap-2.5 sm:gap-3 px-2.5 sm:px-3 py-2 min-h-[56px] rounded-[8px] border transition-[background-color,border-color,opacity] duration-150 {row_surface} {class}",
 
             // Optional track number column
             if let Some(num) = track_number {
-                span { class: "w-6 text-right tabular-nums-mono text-[12px] text-beet-text-tertiary shrink-0",
+                span { class: "w-5 sm:w-6 text-right tabular-nums-mono text-[12px] text-beet-text-tertiary shrink-0",
                     "{num}"
                 }
             }
 
-            // Primary clickable area: Artwork + Title/Artist/Provenance.
-            // Uses only phrasing-content `<span>` descendants for valid HTML5 inside `<button>`.
+            // Primary Artwork Thumbnail Button (phrasing-content children only)
             button {
                 r#type: "button",
                 disabled: !can_primary_click,
                 aria_label: "{play_aria_label}",
                 class: if can_primary_click {
-                    "flex items-center gap-3 flex-1 min-w-0 text-left cursor-pointer rounded-[6px]"
+                    "relative w-10 h-10 sm:w-11 sm:h-11 rounded-[6px] overflow-hidden bg-beet-surface shrink-0 flex items-center justify-center cursor-pointer border"
                 } else {
-                    "flex items-center gap-3 flex-1 min-w-0 text-left cursor-default rounded-[6px]"
+                    "relative w-10 h-10 sm:w-11 sm:h-11 rounded-[6px] overflow-hidden bg-beet-surface shrink-0 flex items-center justify-center cursor-default border"
                 },
-                onclick: move |_| {
-                    if !can_primary_click {
-                        return;
-                    }
-                    match &state {
-                        TrackRowState::UnownedCatalog { acquiring_stage } => match acquiring_stage {
-                            Some(AcquireStageBadge::NeedsManualChoice { .. }) => {
-                                if let Some(handler) = &on_pick_source {
-                                    handler.call(());
-                                }
-                            }
-                            None | Some(AcquireStageBadge::Failed { .. }) => {
-                                if let Some(handler) = &on_acquire {
-                                    handler.call(());
-                                }
-                            }
-                            Some(_) => {}
-                        },
-                        TrackRowState::Owned { .. } | TrackRowState::PendingDiscovery { .. } => {
-                            if let Some(handler) = &on_play {
-                                handler.call(());
-                            }
-                        }
-                        TrackRowState::OfflineUnavailable => {}
-                    }
+                class: if is_playing {
+                    "border-beet-leaf-solid/40"
+                } else {
+                    "border-beet-border-subtle"
                 },
-
-                // 44px Artwork Thumbnail
-                span {
-                    class: if is_playing {
-                        "relative w-11 h-11 rounded-[6px] overflow-hidden bg-beet-surface border border-beet-leaf-solid/40 shrink-0 flex items-center justify-center"
-                    } else {
-                        "relative w-11 h-11 rounded-[6px] overflow-hidden bg-beet-surface border border-beet-border-subtle shrink-0 flex items-center justify-center"
-                    },
-                    if let Some(url) = show_art {
-                        img {
-                            src: "{url}",
-                            alt: "Cover for {title}",
-                            class: "w-full h-full object-cover",
-                            loading: "lazy",
-                            decoding: "async",
-                            onerror: move |_| failed_art_url.set(Some(url.clone())),
-                        }
-                    } else {
-                        IconMusic { size: 18, class: "text-beet-text-disabled".to_string() }
+                onclick: move |_| trigger_primary(&state_for_art),
+                if let Some(url) = show_art {
+                    img {
+                        src: "{url}",
+                        alt: "Cover for {title}",
+                        class: "w-full h-full object-cover",
+                        loading: "lazy",
+                        decoding: "async",
+                        onerror: move |_| failed_art_url.set(Some(url.clone())),
                     }
-
-                    // Hover play overlay on playable rows
-                    if can_primary_click || is_playing {
-                        span {
-                            class: if is_playing {
-                                "absolute inset-0 bg-beet-canvas/60 flex items-center justify-center"
-                            } else {
-                                "absolute inset-0 bg-beet-canvas/60 opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center justify-center"
-                            },
-                            if is_playing {
-                                // 3-bar studio equalizer
-                                span {
-                                    class: "flex items-end gap-[2px] h-3.5",
-                                    aria_hidden: "true",
-                                    span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
-                                    span {
-                                        class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
-                                        style: "animation-delay: 180ms;",
-                                    }
-                                    span {
-                                        class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
-                                        style: "animation-delay: 360ms;",
-                                    }
-                                }
-                            } else {
-                                IconPlay {
-                                    size: 16,
-                                    filled: true,
-                                    class: "text-beet-text-primary".to_string(),
-                                }
-                            }
-                        }
-                    }
+                } else {
+                    IconMusic { size: 18, class: "text-beet-text-disabled".to_string() }
                 }
 
-                // Track Title, Artist/Album, and Discovery Reason
-                span { class: "block flex-1 min-w-0",
-                    span { class: "flex items-center gap-2 min-w-0",
-                        span { class: "text-[15px] font-medium leading-[1.35] truncate {title_class}",
-                            "{title}"
-                        }
-                        // Owned offline-cached status dot
-                        if matches!(state, TrackRowState::Owned { is_offline_cached: true, .. }) {
+                if can_primary_click || is_playing {
+                    span {
+                        class: if is_playing {
+                            "absolute inset-0 bg-beet-canvas/60 flex items-center justify-center"
+                        } else {
+                            "absolute inset-0 bg-beet-canvas/60 opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center justify-center"
+                        },
+                        if is_playing {
                             span {
-                                class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow shrink-0",
-                                title: "Available offline",
-                                aria_label: "Available offline",
-                            }
-                        }
-                        // Pending Discovery expiry pill
-                        if let TrackRowState::PendingDiscovery { days_remaining, .. } = &state {
-                            span { class: "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text tabular-nums-mono text-[10px] font-semibold tracking-wider shrink-0",
-                                IconSparkles { size: 11 }
-                                "{format_discovery_badge(*days_remaining)}"
-                            }
-                        }
-                    }
-
-                    span { class: "flex items-center gap-2 mt-0.5 min-w-0",
-                        span { class: "text-[13px] text-beet-text-secondary truncate",
-                            "{subtitle}"
-                        }
-                        if let TrackRowState::PendingDiscovery {
-                            reason_label: Some(reason),
-                            ..
-                        } = &state
-                        {
-                            if !reason.trim().is_empty() {
-                                span { class: "hidden md:inline-flex items-center gap-1 text-[11px] tabular-nums-mono text-beet-accent-text/90 truncate",
-                                    "· {reason}"
+                                class: "flex items-end gap-[2px] h-3.5",
+                                aria_hidden: "true",
+                                span { class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar" }
+                                span {
+                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                                    style: "animation-delay: 180ms;",
                                 }
+                                span {
+                                    class: "w-[3px] h-full rounded-full bg-beet-leaf-glow beet-eq-bar",
+                                    style: "animation-delay: 360ms;",
+                                }
+                            }
+                        } else {
+                            IconPlay {
+                                size: 16,
+                                filled: true,
+                                class: "text-beet-text-primary ml-0.5".to_string(),
                             }
                         }
                     }
                 }
             }
 
-            // Right-side state actions & telemetry
-            div { class: "flex items-center gap-2 shrink-0",
+            // Track Title, Clickable Artist/Album, and Discovery Reason (generous flex-1 min-w-0)
+            div { class: "flex-1 min-w-0",
+                div { class: "flex items-center gap-1.5 min-w-0",
+                    button {
+                        r#type: "button",
+                        disabled: !can_primary_click,
+                        class: if can_primary_click {
+                            "text-[14px] sm:text-[15px] font-medium leading-[1.35] truncate text-left cursor-pointer {title_class}"
+                        } else {
+                            "text-[14px] sm:text-[15px] font-medium leading-[1.35] truncate text-left cursor-default {title_class}"
+                        },
+                        onclick: move |_| trigger_primary(&state_for_title),
+                        "{title}"
+                    }
+                    // Owned offline-cached status dot
+                    if matches!(state, TrackRowState::Owned { is_offline_cached: true, .. }) {
+                        span {
+                            class: "w-1.5 h-1.5 rounded-full bg-beet-leaf-glow shrink-0",
+                            title: "Available offline",
+                            aria_label: "Available offline",
+                        }
+                    }
+                    // Pending Discovery expiry pill (hidden on < sm title line so titles never crush on 390px)
+                    if let TrackRowState::PendingDiscovery { days_remaining, .. } = &state {
+                        span { class: "hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-beet-accent-surface border border-beet-accent/30 text-beet-accent-text tabular-nums-mono text-[10px] font-semibold tracking-wider shrink-0",
+                            IconSparkles { size: 10 }
+                            "{format_discovery_badge(*days_remaining)}"
+                        }
+                    }
+                }
+
+                div { class: "flex items-center gap-1.5 mt-0.5 min-w-0 text-[12px] sm:text-[13px] text-beet-text-secondary",
+                    if let Some(artist_cb) = on_artist_click {
+                        button {
+                            r#type: "button",
+                            class: "truncate hover:text-beet-text-primary hover:underline cursor-pointer text-left max-w-full",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                artist_cb.call(artist_for_sub.clone());
+                            },
+                            "{artist}"
+                        }
+                    } else {
+                        span { class: "truncate", "{artist}" }
+                    }
+
+                    if let Some(ref alb) = album_for_sub {
+                        span { class: "text-beet-text-disabled shrink-0 hidden sm:inline", "·" }
+                        if let Some(album_cb) = on_album_click {
+                            {
+                                let alb_click = alb.clone();
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        class: "hidden sm:inline truncate hover:text-beet-text-primary hover:underline cursor-pointer text-left min-w-0",
+                                        onclick: move |evt: MouseEvent| {
+                                            evt.stop_propagation();
+                                            album_cb.call(alb_click.clone());
+                                        },
+                                        "{alb}"
+                                    }
+                                }
+                            }
+                        } else {
+                            span { class: "hidden sm:inline truncate min-w-0", "{alb}" }
+                        }
+                    }
+
+                    if let TrackRowState::PendingDiscovery {
+                        days_remaining,
+                        reason_label,
+                        ..
+                    } = &state
+                    {
+                        span { class: "sm:hidden inline-flex items-center px-1.5 py-0.5 rounded bg-beet-accent-surface text-beet-accent-text tabular-nums-mono text-[9px] font-semibold shrink-0",
+                            "{format_discovery_badge(*days_remaining)}"
+                        }
+                        if let Some(reason) = reason_label.as_deref().filter(|r| !r.trim().is_empty()) {
+                            span { class: "hidden lg:inline-flex items-center gap-1 text-[11px] tabular-nums-mono text-beet-accent-text/90 truncate",
+                                "· {reason}"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Right-side state actions & telemetry (calm Spotify-grade density)
+            div { class: "flex items-center gap-1.5 sm:gap-2 shrink-0",
                 // Optional codec/bitrate telemetry badge
                 if let Some(badge) = codec_badge.as_deref().filter(|b| !b.trim().is_empty()) {
-                    span { class: "hidden sm:inline-flex items-center px-2 py-0.5 rounded-md bg-beet-surface-high border border-beet-border-subtle text-beet-text-tertiary tabular-nums-mono text-[11px] font-semibold tracking-wider",
+                    span { class: "hidden md:inline-flex items-center px-2 py-0.5 rounded-md bg-beet-surface-high border border-beet-border-subtle text-beet-text-tertiary tabular-nums-mono text-[11px] font-semibold tracking-wider",
                         "{badge}"
+                    }
+                }
+
+                // Compact rating badge only when rated > 0 (full 5-star strip lives in Inspector & `...` menu)
+                if current_rating > 0 {
+                    span {
+                        class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
+                        title: format!("Rated {current_rating} out of 5 stars"),
+                        IconStar { size: 10, filled: true }
+                        span { "{current_rating}" }
                     }
                 }
 
                 // State-specific controls
                 match &state {
-                    TrackRowState::Owned { starred, rating, .. } => {
+                    TrackRowState::Owned { starred, .. } => {
                         let is_starred = *starred;
-                        let current_rating = (*rating).min(5);
                         rsx! {
-                            if let Some(rate_cb) = on_rate {
-                                div { class: "hidden sm:flex items-center",
-                                    StarStrip {
-                                        rating: current_rating,
-                                        size: StarStripSize::Compact,
-                                        on_rate: move |next| rate_cb.call(next),
-                                        aria_label: format!("Rate {title}"),
-                                    }
-                                }
-                                if current_rating > 0 {
-                                    span {
-                                        class: "inline-flex sm:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
-                                        title: format!("Rated {current_rating} out of 5 stars"),
-                                        IconStar { size: 10, filled: true }
-                                        span { "{current_rating}" }
-                                    }
-                                }
-                            } else if current_rating > 0 {
-                                span {
-                                    class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
-                                    title: format!("Rated {current_rating} out of 5 stars"),
-                                    IconStar { size: 10, filled: true }
-                                    span { "{current_rating}" }
-                                }
-                            }
                             if let Some(star_cb) = on_star {
                                 button {
                                     r#type: "button",
@@ -435,52 +497,26 @@ pub fn TrackRow(
                                         evt.stop_propagation();
                                         star_cb.call(!is_starred);
                                     },
-                                    IconHeart { size: 17, filled: is_starred }
+                                    IconHeart { size: 16, filled: is_starred }
                                 }
                             }
                         }
                     }
-                    TrackRowState::PendingDiscovery { rating, .. } => {
-                        let current_rating = (*rating).min(5);
+                    TrackRowState::PendingDiscovery { .. } => {
                         rsx! {
-                            if let Some(rate_cb) = on_rate {
-                                div { class: "hidden sm:flex items-center",
-                                    StarStrip {
-                                        rating: current_rating,
-                                        size: StarStripSize::Compact,
-                                        on_rate: move |next| rate_cb.call(next),
-                                        aria_label: format!("Rate {title}"),
-                                    }
-                                }
-                                if current_rating > 0 {
-                                    span {
-                                        class: "inline-flex sm:hidden items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
-                                        title: format!("Rated {current_rating} out of 5 stars"),
-                                        IconStar { size: 10, filled: true }
-                                        span { "{current_rating}" }
-                                    }
-                                }
-                            } else if current_rating > 0 {
-                                span {
-                                    class: "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-beet-gold-surface border border-beet-gold/30 text-beet-gold tabular-nums-mono text-[10px] font-semibold shrink-0",
-                                    title: format!("Rated {current_rating} out of 5 stars"),
-                                    IconStar { size: 10, filled: true }
-                                    span { "{current_rating}" }
-                                }
-                            }
-                            div { class: "flex items-center gap-2",
+                            div { class: "flex items-center gap-1.5",
                                 if let Some(keep_cb) = on_keep {
                                     button {
                                         r#type: "button",
                                         aria_label: format!("Keep {title} in library"),
                                         title: "Keep in permanent library",
-                                        class: "inline-flex items-center gap-1.5 h-8 px-2.5 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text hover:bg-beet-leaf-solid hover:text-beet-leaf-ink text-[12px] font-semibold transition-colors duration-150 cursor-pointer",
+                                        class: "inline-flex items-center gap-1 h-7 sm:h-8 px-2 sm:px-2.5 rounded-full bg-beet-leaf-surface border border-beet-leaf-solid/35 text-beet-leaf-text hover:bg-beet-leaf-solid hover:text-beet-leaf-ink text-[11px] sm:text-[12px] font-semibold transition-colors duration-150 cursor-pointer",
                                         onclick: move |evt| {
                                             evt.stop_propagation();
                                             keep_cb.call(());
                                         },
-                                        IconCheck { size: 14 }
-                                        span { "Keep" }
+                                        IconCheck { size: 13 }
+                                        span { class: "hidden sm:inline", "Keep" }
                                     }
                                 }
                                 if let Some(drop_cb) = on_drop {
@@ -488,12 +524,12 @@ pub fn TrackRow(
                                         r#type: "button",
                                         aria_label: format!("Drop {title} from discovery"),
                                         title: "Drop from discovery",
-                                        class: "inline-flex items-center gap-1 h-8 px-2.5 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white text-[12px] font-semibold transition-colors duration-150 cursor-pointer",
+                                        class: "inline-flex items-center justify-center gap-1 w-7 h-7 sm:w-auto sm:h-8 sm:px-2.5 rounded-full bg-beet-crimson-surface border border-beet-crimson-text/30 text-beet-crimson-text hover:bg-beet-crimson-solid hover:text-white text-[12px] font-semibold transition-colors duration-150 cursor-pointer",
                                         onclick: move |evt| {
                                             evt.stop_propagation();
                                             drop_cb.call(());
                                         },
-                                        IconX { size: 14 }
+                                        IconX { size: 13 }
                                         span { class: "hidden sm:inline", "Drop" }
                                     }
                                 }
@@ -542,7 +578,7 @@ pub fn TrackRow(
                             Some(AcquireStageBadge::Failed { message }) => {
                                 let tip = message
                                     .as_deref()
-                                    .unwrap_or("Acquisition failed — click to retry");
+                                    .unwrap_or("Acquisition failed: click to retry");
                                 rsx! {
                                     if let Some(acquire_cb) = on_acquire {
                                         button {
@@ -579,7 +615,8 @@ pub fn TrackRow(
                                                 acquire_cb.call(());
                                             },
                                             IconPlus { size: 14 }
-                                            span { "Acquire & Play" }
+                                            span { class: "hidden sm:inline", "Acquire & Play" }
+                                            span { class: "sm:hidden", "Play" }
                                         }
                                     }
                                 }
@@ -598,13 +635,198 @@ pub fn TrackRow(
 
                 // Duration in Commit Mono tabular-nums
                 if let Some(secs) = duration_secs {
-                    span { class: "w-11 text-right tabular-nums-mono text-[12px] text-beet-text-tertiary shrink-0",
+                    span { class: "hidden sm:inline-block w-11 text-right tabular-nums-mono text-[12px] text-beet-text-tertiary shrink-0",
                         "{format_duration(secs)}"
                     }
                 }
 
-                // Optional Track Inspector button
-                if let Some(inspect_cb) = on_inspect {
+                // Unified `...` overflow menu when row actions exist; standalone Info button otherwise
+                if has_overflow_menu {
+                    div { class: "relative",
+                        button {
+                            r#type: "button",
+                            aria_haspopup: "menu",
+                            aria_expanded: if menu_open() { "true" } else { "false" },
+                            aria_label: format!("More actions for {title}"),
+                            title: "More actions",
+                            class: "w-8 h-8 rounded-lg inline-flex items-center justify-center text-beet-text-tertiary hover:text-beet-text-primary hover:bg-beet-surface-high transition-colors duration-150 cursor-pointer",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                menu_open.toggle();
+                            },
+                            onkeydown: move |evt: KeyboardEvent| {
+                                if evt.key() == Key::Escape && menu_open() {
+                                    evt.prevent_default();
+                                    menu_open.set(false);
+                                }
+                            },
+                            IconMoreHorizontal { size: 16 }
+                        }
+
+                        if menu_open() {
+                            div {
+                                class: "fixed inset-0 z-40",
+                                onclick: move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    menu_open.set(false);
+                                },
+                            }
+                            div {
+                                role: "menu",
+                                aria_label: format!("Actions for {title}"),
+                                class: "absolute right-0 top-9 z-50 w-56 rounded-[11px] bg-beet-surface-high border border-beet-border-default shadow-2xl p-1.5 space-y-0.5",
+                                onclick: move |evt: MouseEvent| evt.stop_propagation(),
+
+                                if let Some(rate_cb) = on_rate {
+                                    div { class: "flex items-center justify-between gap-2 px-2.5 py-2 border-b border-beet-border-subtle mb-1",
+                                        span { class: "tabular-nums-mono text-[10px] font-semibold uppercase tracking-wider text-beet-text-tertiary",
+                                            "Rate"
+                                        }
+                                        StarStrip {
+                                            rating: current_rating,
+                                            size: StarStripSize::Compact,
+                                            on_rate: move |next| {
+                                                rate_cb.call(next);
+                                                menu_open.set(false);
+                                            },
+                                            aria_label: format!("Rate {title}"),
+                                        }
+                                    }
+                                }
+
+                                if let Some(play_next_cb) = on_play_next {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            play_next_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconPlay { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Play Next" }
+                                    }
+                                }
+
+                                if let Some(add_q_cb) = on_add_to_queue {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            add_q_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconListMusic { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Add to Queue" }
+                                    }
+                                }
+
+                                if let Some(add_pl_cb) = on_add_to_playlist {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            add_pl_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconListPlus { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Add to playlist..." }
+                                    }
+                                }
+
+                                if let Some(artist_cb) = on_artist_click {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            artist_cb.call(artist_for_menu.clone());
+                                            menu_open.set(false);
+                                        },
+                                        IconUser { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Go to Artist" }
+                                    }
+                                }
+
+                                if let (Some(album_cb), Some(alb)) = (on_album_click, album_for_menu) {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            album_cb.call(alb.clone());
+                                            menu_open.set(false);
+                                        },
+                                        IconDisc3 { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Go to Album" }
+                                    }
+                                }
+
+                                if let Some(inspect_cb) = on_inspect {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            inspect_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconInfo { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Track Inspector" }
+                                    }
+                                }
+
+                                if on_move_up.is_some() || on_move_down.is_some() || on_remove_from_playlist.is_some() {
+                                    div { class: "my-1 border-t border-beet-border-subtle" }
+                                }
+
+                                if let Some(up_cb) = on_move_up {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            up_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconChevronUp { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Move Up" }
+                                    }
+                                }
+
+                                if let Some(down_cb) = on_move_down {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-text-primary hover:bg-beet-surface-highest text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            down_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconChevronDown { size: 14, class: "text-beet-text-secondary".to_string() }
+                                        span { "Move Down" }
+                                    }
+                                }
+
+                                if let Some(rm_cb) = on_remove_from_playlist {
+                                    button {
+                                        r#type: "button",
+                                        role: "menuitem",
+                                        class: "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[7px] text-[13px] text-beet-crimson-text hover:bg-beet-crimson-surface text-left cursor-pointer transition-colors",
+                                        onclick: move |_| {
+                                            rm_cb.call(());
+                                            menu_open.set(false);
+                                        },
+                                        IconTrash2 { size: 14 }
+                                        span { "Remove from playlist" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(inspect_cb) = on_inspect {
                     button {
                         r#type: "button",
                         aria_label: format!("Inspect {title}"),
@@ -833,8 +1055,22 @@ mod tests {
         });
         dom_disc.rebuild_in_place();
         let html_disc = dioxus_ssr::render(&dom_disc);
-        assert!(html_disc.contains("hidden sm:flex items-center"), "{html_disc}");
-        assert!(html_disc.contains("Rate Discovery Gem"), "{html_disc}");
         assert!(html_disc.contains("Rated 5 out of 5 stars"), "{html_disc}");
+        assert!(html_disc.contains("More actions for Discovery Gem"), "{html_disc}");
+
+        // Active playing row must not contain `border-transparent` which would override its active border.
+        let mut dom_playing = VirtualDom::new(|| {
+            rsx! {
+                TrackRow {
+                    title: "Playing Song".to_string(),
+                    artist: "Artist".to_string(),
+                    is_playing: true,
+                }
+            }
+        });
+        dom_playing.rebuild_in_place();
+        let html_playing = dioxus_ssr::render(&dom_playing);
+        assert!(html_playing.contains("border-beet-leaf-solid/25"), "{html_playing}");
+        assert!(!html_playing.contains("border-transparent"), "{html_playing}");
     }
 }

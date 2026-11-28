@@ -172,10 +172,10 @@ pub fn Downloads(mut props: DownloadsProps) -> Element {
           onclick: close_modal,
         }
 
-        // Panel (keeps `bg-beet-panel` class for E2E drawer locator while using stepped Studio low surface)
+        // Panel
         div {
-          class: "relative w-full max-w-md bg-beet-panel border-l border-beet-border-subtle h-full transform transition-transform duration-200 ease-out flex flex-col {panel_translate}",
-          style: "background-color: var(--beet-surface-low);",
+          "data-testid": "downloads-drawer-panel",
+          class: "relative w-full max-w-md bg-beet-surface-low border-l border-beet-border-subtle h-full transform transition-transform duration-200 ease-out flex flex-col {panel_translate}",
           // Header
           div { class: "px-5 py-4 border-b border-beet-border-subtle flex justify-between items-start gap-3 shrink-0",
             div { class: "min-w-0",

@@ -1,20 +1,7 @@
 use dioxus::core::Task;
 use dioxus::prelude::*;
 
-use crate::IconX;
-
-#[cfg(target_arch = "wasm32")]
-async fn sleep_ms(duration_ms: u32) {
-    gloo_timers::future::TimeoutFuture::new(duration_ms).await;
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn sleep_ms(duration_ms: u32) {
-    // Only sleep when running under a Tokio runtime (e.g. dioxus-desktop or tokio tests).
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::time::sleep(std::time::Duration::from_millis(u64::from(duration_ms))).await;
-    }
-}
+use crate::{sleep_ms, IconX};
 
 /// Floating non-blocking Undo toast/snackbar with an automatic dismiss timer and a smooth
 /// linear countdown rail (default 5 seconds, respecting `prefers-reduced-motion`).

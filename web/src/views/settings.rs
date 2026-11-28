@@ -56,7 +56,7 @@ pub fn SettingsPage() -> Element {
     });
 
     rsx! {
-        div { class: "w-full max-w-4xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6 text-beet-text-primary",
+        div { class: "w-full max-w-4xl mx-auto space-y-6 text-beet-text-primary",
             header { class: "space-y-1.5",
                 h1 { class: "text-[24px] font-semibold tracking-tight text-beet-text-primary leading-tight",
                     "Settings"

@@ -249,7 +249,7 @@ pub fn DownloadItem(
               rsx! {
                 button {
                   r#type: "button",
-                  class: "w-6 h-6 rounded-[6px] inline-flex items-center justify-center text-beet-text-tertiary opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-beet-crimson-surface hover:text-beet-crimson-text transition-all cursor-pointer",
+                  class: "w-6 h-6 rounded-[6px] inline-flex items-center justify-center text-beet-text-tertiary opacity-75 sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 hover:bg-beet-crimson-surface hover:text-beet-crimson-text transition-[opacity,color,background-color] cursor-pointer",
                   title: "Cancel download",
                   aria_label: "Cancel download",
                   onclick: move |evt: Event<MouseData>| {

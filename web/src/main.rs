@@ -7,9 +7,10 @@ use ui::{HealthProvider, SettingsProvider};
 #[cfg(test)]
 use views::navidrome_banner;
 use views::{
-    leave_login, ActivityPage, DashboardPage, DiscoverPage, HomePage, LibraryPage, LoginErrorPage,
-    LoginErrorReturnPage, LoginPage, LoginReturnPage, ReturnTo, SearchPage, SettingsPage,
-    SsoLinkResultPage, StudioShell,
+    leave_login, ActivityPage, AlbumDetailPage, ArtistDetailPage, DashboardPage, DiscoverPage,
+    HomePage, LibraryPage, LoginErrorPage, LoginErrorReturnPage, LoginPage, LoginReturnPage,
+    MixDetailPage, PlaylistDetailPage, ReturnTo, SearchPage, SettingsPage, SsoLinkResultPage,
+    StudioShell,
 };
 
 mod auth;
@@ -45,6 +46,14 @@ pub enum Route {
             SearchPage {},
             #[route("/library")]
             LibraryPage {},
+            #[route("/mix/:slug")]
+            MixDetailPage { slug: String },
+            #[route("/playlist/:id")]
+            PlaylistDetailPage { id: String },
+            #[route("/album/:id")]
+            AlbumDetailPage { id: String },
+            #[route("/artist/:id")]
+            ArtistDetailPage { id: String },
             #[route("/activity")]
             ActivityPage {},
             #[route("/dashboard")]

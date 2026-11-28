@@ -12,7 +12,7 @@ use shared::system::NavidromeStatus;
 use ui::{
     format_discovery_badge, format_mix_subtitle, format_mix_title, format_mix_window_badge,
     friendly_error, subsonic_cover_art_url, use_player, IconCheck, IconHeart, IconLoader,
-    IconMusic, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSettings, IconSparkles,
+    IconMusic, IconPause, IconPlay, IconRadio, IconRefreshCw, IconSkipForward, IconSparkles,
     IconThumbsDown, MixSleeveShelves, PlayerTrack, SeasonalHeroCard, StarStrip, StarStripSize,
     TasteDnaBar, TrackRow, TrackRowState,
 };
@@ -112,8 +112,10 @@ pub fn DiscoverPage() -> Element {
     let auth = use_auth();
     let player = use_player();
     let mut studio = use_studio();
+    let nav = use_navigator();
 
     let mut triage_layout = use_signal(|| TriageLayout::Deck);
+    let mut deck_cursor = use_signal(|| 0usize);
     let mut editing_culture = use_signal(|| false);
     let mut country_input = use_signal(String::new);
     let mut langs_input = use_signal(String::new);
@@ -283,10 +285,7 @@ pub fn DiscoverPage() -> Element {
     let hero_slug = seasonal.as_ref().map(|h| h.slug.as_str());
     let other_mixes: Vec<_> = mixes
         .iter()
-        .filter(|m| {
-            Some(m.slug.as_str()) != hero_slug
-                && !(m.kind == ContextualMixKind::Seasonal && m.track_count == 0)
-        })
+        .filter(|m| Some(m.slug.as_str()) != hero_slug && m.kind != ContextualMixKind::Seasonal)
         .cloned()
         .collect();
 
@@ -496,7 +495,7 @@ pub fn DiscoverPage() -> Element {
                         button {
                             r#type: "button",
                             disabled: is_generating || discovery_disabled || nav_unlinked,
-                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed cursor-pointer transition-[filter]",
+                            class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer transition-[filter]",
                             onclick: handle_refresh_discovery,
                             IconRefreshCw {
                                 size: 14,
@@ -505,12 +504,6 @@ pub fn DiscoverPage() -> Element {
                             span {
                                 if is_generating { "Refreshing..." } else { "Refresh Discovery" }
                             }
-                        }
-                        Link {
-                            to: Route::SettingsPage {},
-                            class: "inline-flex items-center gap-1.5 h-9 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium transition-colors",
-                            IconSettings { size: 14 }
-                            span { "Settings" }
                         }
                     }
                 }
@@ -577,6 +570,7 @@ pub fn DiscoverPage() -> Element {
             if let Some(pack) = seasonal {
                 {
                     let slug_play = pack.slug.clone();
+                    let slug_open = pack.slug.clone();
                     let slug_steer = pack.slug.clone();
                     let local_ratio = pack
                         .local_pct
@@ -598,6 +592,9 @@ pub fn DiscoverPage() -> Element {
                             steering: pack.steering.unwrap_or(CultureSteering::Balanced),
                             exclude_from_core_taste: pack.exclude_from_core_taste,
                             on_play: move |_| studio.play_contextual_mix(auth, player, slug_play.clone()),
+                            on_open: move |_| {
+                                nav.push(Route::MixDetailPage { slug: slug_open.clone() });
+                            },
                             on_steer: move |next| studio.steer_seasonal_mix(auth, slug_steer.clone(), next),
                         }
                     }
@@ -652,20 +649,13 @@ pub fn DiscoverPage() -> Element {
                     }
                 } else if triage_layout() == TriageLayout::Deck {
                     {
-                        let active_track_id = player.current_track().map(|t| t.id);
-                        let active_dt = active_track_id
-                            .as_deref()
-                            .filter(|id| !id.is_empty())
-                            .and_then(|id| {
-                                visible_triage
-                                    .iter()
-                                    .find(|dt| dt.song_id.as_deref() == Some(id))
-                            })
-                            .unwrap_or(&visible_triage[0])
-                            .clone();
+                        let deck_len = visible_triage.len();
+                        let active_idx = deck_cursor() % deck_len;
+                        let active_dt = visible_triage[active_idx].clone();
                         let track = studio.track_from_discovery(&active_dt);
                         let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                         let triage_for_play = visible_triage.clone();
+                        let triage_for_skip = visible_triage.clone();
                         let t_play = track.clone();
                         let t_keep = track.clone();
                         let t_star = track.clone();
@@ -769,6 +759,29 @@ pub fn DiscoverPage() -> Element {
                                             IconCheck { size: 16 }
                                             span { "Keep in Library" }
                                         }
+                                        if deck_len > 1 {
+                                            button {
+                                                r#type: "button",
+                                                class: "inline-flex items-center gap-1.5 h-10 px-3.5 rounded-full bg-beet-surface-high border border-beet-border-default text-beet-text-secondary hover:text-beet-text-primary text-[12px] font-medium cursor-pointer transition-colors",
+                                                onclick: move |_| {
+                                                    let next_idx = (active_idx + 1) % deck_len;
+                                                    deck_cursor.set(next_idx);
+                                                    if is_playing {
+                                                        if let Some(next_dt) = triage_for_skip.get(next_idx) {
+                                                            let next_track = studio.track_from_discovery(next_dt);
+                                                            studio.play_or_toggle_triage(
+                                                                player,
+                                                                &triage_for_skip,
+                                                                &next_track,
+                                                                false,
+                                                            );
+                                                        }
+                                                    }
+                                                },
+                                                IconSkipForward { size: 14 }
+                                                span { "Skip for now" }
+                                            }
+                                        }
                                         button {
                                             r#type: "button",
                                             class: "h-10 px-3 rounded-full text-[12px] text-beet-text-tertiary hover:text-beet-text-primary cursor-pointer",
@@ -788,6 +801,9 @@ pub fn DiscoverPage() -> Element {
                                 let is_playing = !track.id.is_empty() && player.is_track_playing(&track.id);
                                 let triage_for_row = visible_triage.clone();
                                 let t_play = track.clone();
+                                let t_next = track.clone();
+                                let t_queue = track.clone();
+                                let t_pl = track.clone();
                                 let t_keep = track.clone();
                                 let t_drop = track.clone();
                                 let t_rate = track.clone();
@@ -813,6 +829,19 @@ pub fn DiscoverPage() -> Element {
                                                 false,
                                             )
                                         },
+                                        on_play_next: move |_| {
+                                            player.enqueue_next(t_next.clone());
+                                            studio.show_toast(format!("Playing \"{}\" next", t_next.title));
+                                        },
+                                        on_add_to_queue: move |_| {
+                                            player.enqueue_last(t_queue.clone());
+                                            studio.show_toast(format!("Added \"{}\" to queue", t_queue.title));
+                                        },
+                                        on_add_to_playlist: move |_| {
+                                            studio.open_add_to_playlist(t_pl.title.clone(), vec![t_pl.id.clone()]);
+                                        },
+                                        on_artist_click: move |artist| studio.navigate_to_artist(nav, artist),
+                                        on_album_click: move |album| studio.navigate_to_album(nav, album),
                                         on_keep: move |_| studio.keep_track(auth, player, t_keep.clone()),
                                         on_drop: move |_| studio.drop_track(auth, player, t_drop.clone()),
                                         on_rate: move |r| studio.rate_track(auth, player, t_rate.clone(), r),
@@ -938,7 +967,7 @@ pub fn DiscoverPage() -> Element {
                                 button {
                                     r#type: "button",
                                     disabled: saving_culture(),
-                                    class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-50 cursor-pointer",
+                                    class: "inline-flex items-center gap-1.5 h-9 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer",
                                     onclick: save_culture,
                                     if saving_culture() {
                                         IconLoader { size: 14 }
@@ -979,7 +1008,7 @@ pub fn DiscoverPage() -> Element {
                         button {
                             r#type: "submit",
                             disabled: radio_loading() || radio_artist().trim().is_empty(),
-                            class: "inline-flex items-center gap-1.5 h-10 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 cursor-pointer shrink-0",
+                            class: "inline-flex items-center gap-1.5 h-10 px-4 rounded-full bg-beet-leaf-solid text-beet-leaf-ink text-[13px] font-semibold hover:brightness-105 disabled:opacity-45 disabled:cursor-not-allowed disabled:pointer-events-none cursor-pointer shrink-0",
                             if radio_loading() {
                                 IconLoader { size: 14 }
                                 span { "Starting…" }
@@ -998,6 +1027,9 @@ pub fn DiscoverPage() -> Element {
                     mixes: other_mixes,
                     id_prefix: "disc".to_string(),
                     on_play: move |slug| studio.play_contextual_mix(auth, player, slug),
+                    on_open: move |slug| {
+                        nav.push(Route::MixDetailPage { slug });
+                    },
                 }
             }
         }

@@ -339,6 +339,23 @@ textarea {
     }
 }
 
+/* Hide browser native search cancel `x` so our custom clear button is the sole clear control. */
+input[type="search"]::-webkit-search-decoration,
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-results-button,
+input[type="search"]::-webkit-search-results-decoration {
+    -webkit-appearance: none;
+    appearance: none;
+}
+
+/* Inputs embedded inside a focus-within pill container suppress the inner focus-visible ring
+   to avoid rendering a double border inside the rounded pill. */
+.beet-pill-input:focus,
+.beet-pill-input:focus-visible {
+    outline: none;
+    box-shadow: none;
+}
+
 /* Accessible WCAG 2.2 focus-visible ring across interactive elements.
    Excludes programmatic focus containers (`tabindex="-1"`, e.g. modal bodies) and keeps
    a transparent outline so Windows forced-colors mode still paints a visible ring. */

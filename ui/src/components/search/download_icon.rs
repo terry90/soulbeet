@@ -77,7 +77,7 @@ pub fn DownloadIcon(props: DownloadIconProps) -> Element {
                     suppress_click.set(false);
                     let id_for_timer = item_id_open.clone();
                     let task = spawn(async move {
-                        gloo_timers::future::TimeoutFuture::new(500).await;
+                        crate::sleep_ms(500).await;
                         suppress_click.set(true);
                         active_menu.set(Some(id_for_timer));
                     });

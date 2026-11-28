@@ -13,6 +13,8 @@ use ui::{use_player, DrawerTab};
 use crate::auth::use_auth;
 #[cfg(feature = "web")]
 use crate::web_player::use_studio;
+#[cfg(feature = "web")]
+use crate::Route;
 
 /// Installs the window-level keyboard shortcut listener for the Studio shell.
 #[cfg(feature = "web")]
@@ -20,6 +22,7 @@ pub fn use_studio_shortcuts() {
     let auth = use_auth();
     let player = use_player();
     let mut studio = use_studio();
+    let nav = use_navigator();
 
     use_hook(move || {
         use wasm_bindgen::closure::Closure;
@@ -67,6 +70,9 @@ pub fn use_studio_shortcuts() {
                     } else if *studio.downloads_drawer_open.peek() {
                         evt.prevent_default();
                         studio.downloads_drawer_open.set(false);
+                    } else if studio.drawer_tab.peek().is_some() {
+                        evt.prevent_default();
+                        studio.drawer_tab.set(None);
                     }
                     return;
                 }
@@ -77,9 +83,31 @@ pub fn use_studio_shortcuts() {
                 }
 
                 match key.as_str() {
+                    "/" => {
+                        evt.prevent_default();
+                        if let Some(el) = win_for_cb
+                            .document()
+                            .and_then(|d| d.query_selector("input[type=\"search\"]").ok().flatten())
+                            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                        {
+                            let _ = el.focus();
+                        } else {
+                            nav.push(Route::SearchPage {});
+                        }
+                    }
                     " " => {
                         evt.prevent_default();
                         player.toggle_play_pause();
+                    }
+                    "ArrowUp" => {
+                        evt.prevent_default();
+                        let cur = player.state_signal().peek().volume;
+                        player.set_volume((cur + 0.05).clamp(0.0, 1.0));
+                    }
+                    "ArrowDown" => {
+                        evt.prevent_default();
+                        let cur = player.state_signal().peek().volume;
+                        player.set_volume((cur - 0.05).clamp(0.0, 1.0));
                     }
                     "ArrowLeft" => {
                         evt.prevent_default();

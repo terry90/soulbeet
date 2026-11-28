@@ -395,6 +395,67 @@ impl PlayerState {
         }
     }
 
+    pub fn remove_queue_index_public(
+        &mut self,
+        idx: usize,
+        position_secs: &mut f64,
+        duration_secs: &mut f64,
+    ) {
+        self.remove_queue_index(idx, position_secs, duration_secs);
+    }
+
+    /// Moves a queued track from `from` to `to` while preserving `queue_index` and
+    /// `shuffle_order` invariants cleanly.
+    pub fn move_queue_item(&mut self, from: usize, to: usize) {
+        if from >= self.queue.len() || to >= self.queue.len() || from == to {
+            return;
+        }
+        let track = self.queue.remove(from);
+        self.queue.insert(to, track);
+
+        if let Some(cur) = self.queue_index {
+            self.queue_index = Some(if cur == from {
+                to
+            } else if from < cur && cur <= to {
+                cur - 1
+            } else if to <= cur && cur < from {
+                cur + 1
+            } else {
+                cur
+            });
+        }
+
+        if self.shuffle && !self.shuffle_order.is_empty() {
+            for entry in &mut self.shuffle_order {
+                if *entry == from {
+                    *entry = to;
+                } else if from < *entry && *entry <= to {
+                    *entry -= 1;
+                } else if to <= *entry && *entry < from {
+                    *entry += 1;
+                }
+            }
+            self.shuffle_cursor = self
+                .queue_index
+                .and_then(|q| self.shuffle_order.iter().position(|&i| i == q));
+        } else {
+            self.sync_shuffle_order();
+        }
+    }
+
+    /// Re-inserts a track into the queue at `index` (clamped to `0..=queue.len()`),
+    /// shifting `queue_index` and `shuffle_order` accordingly without interrupting playback.
+    pub fn insert_track_at(&mut self, index: usize, track: PlayerTrack) {
+        let clamped = index.min(self.queue.len());
+        self.queue.insert(clamped, track);
+        if let Some(cur) = self.queue_index {
+            if clamped <= cur {
+                self.queue_index = Some(cur + 1);
+            }
+        }
+        self.sync_shuffle_order();
+    }
+
     fn remove_queue_index(
         &mut self,
         idx: usize,
@@ -955,6 +1016,18 @@ impl PlayerContext {
         self.dispatch(PlayerCommand::RemoveFromQueue(index));
     }
 
+    /// Moves a queued item from `from` to `to` directly in reactive queue state.
+    pub fn move_queue_item(&self, from: usize, to: usize) {
+        let mut state = self.state;
+        state.write().move_queue_item(from, to);
+    }
+
+    /// Inserts `track` at `index` in the playback queue without interrupting current playback.
+    pub fn insert_track_at(&self, index: usize, track: PlayerTrack) {
+        let mut state = self.state;
+        state.write().insert_track_at(index, track);
+    }
+
     /// Atomically removes every occurrence of `track_id` from the playback queue.
     /// When `track_id` is the active track, removing it immediately advances to the next
     /// queued track (or stops cleanly if it was the last track under `Repeat::Off`).
@@ -1473,5 +1546,79 @@ mod tests {
         assert!(!cur.is_discovery);
         assert_eq!(cur.discovery_track_id, None);
         assert_eq!(cur.days_remaining, None);
+    }
+
+    #[test]
+    fn move_queue_item_preserves_current_track_and_shuffle_order() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("b", 100), track("c", 100), track("d", 100)],
+                start_index: 1, // "b"
+            },
+            &mut pos,
+            &mut dur,
+        );
+
+        // Move active item "b" from 1 to 3
+        state.move_queue_item(1, 3);
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "d", "b"]);
+        assert_eq!(state.queue_index, Some(3));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+
+        // Move "a" (index 0, before active 3) to index 2 (still before active 3)
+        state.move_queue_item(0, 2);
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "d", "a", "b"]);
+        assert_eq!(state.queue_index, Some(3));
+
+        // Move "c" (index 0) past active (index 3) -> active shifts left to 2
+        state.move_queue_item(0, 3);
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["d", "a", "b", "c"]);
+        assert_eq!(state.queue_index, Some(2));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("b"));
+
+        // Move "c" (index 3) before active (index 2) to index 1 -> active shifts right to 3
+        state.move_queue_item(3, 1);
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["d", "c", "a", "b"]);
+        assert_eq!(state.queue_index, Some(3));
+
+        // Out-of-bounds or no-op moves do not panic or corrupt state
+        state.move_queue_item(2, 2);
+        state.move_queue_item(99, 0);
+        assert_eq!(state.queue_index, Some(3));
+    }
+
+    #[test]
+    fn insert_track_at_shifts_active_index_without_interrupting_playback() {
+        let mut state = PlayerState::default();
+        let (mut pos, mut dur) = (0.0, 0.0);
+        state.apply_local_command(
+            &PlayerCommand::PlayQueue {
+                tracks: vec![track("a", 100), track("c", 100)],
+                start_index: 1, // "c"
+            },
+            &mut pos,
+            &mut dur,
+        );
+        state.status = PlaybackStatus::Playing;
+
+        // Inserting before current shifts queue_index from 1 -> 2
+        state.insert_track_at(1, track("b", 100));
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(state.queue_index, Some(2));
+        assert_eq!(state.current_track.as_ref().map(|t| t.id.as_str()), Some("c"));
+        assert_eq!(state.status, PlaybackStatus::Playing);
+
+        // Inserting after current leaves queue_index unchanged
+        state.insert_track_at(99, track("d", 100));
+        let ids: Vec<&str> = state.queue.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        assert_eq!(state.queue_index, Some(2));
     }
 }
