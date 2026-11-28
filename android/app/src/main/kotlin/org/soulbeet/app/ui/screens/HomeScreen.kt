@@ -1,7 +1,6 @@
 package org.soulbeet.app.ui.screens
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -17,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
@@ -58,6 +58,7 @@ fun HomeScreen(
     artAuthority: String,
     bottomContentPadding: PaddingValues,
     onPlayContainer: (mediaId: String, title: String) -> Unit,
+    onOpenMix: (ContextualMixUi) -> Unit,
     onPlayMix: (ContextualMixUi) -> Unit,
     onOpenTriage: () -> Unit,
     onSteerMix: (slug: String, option: CultureSteeringOption) -> Unit,
@@ -65,6 +66,7 @@ fun HomeScreen(
     onOpenPlaylist: (FfiPlaylist) -> Unit,
     onPlayTrack: (FfiTrack) -> Unit,
     onStarTrack: (FfiTrack) -> Unit,
+    onAddToPlaylist: (FfiTrack) -> Unit,
     onTriggerSync: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -131,6 +133,7 @@ fun HomeScreen(
                     mix = hero,
                     isPinned = isPinned,
                     steeringInFlight = state.steeringInFlight,
+                    onOpenDetail = { onOpenMix(hero) },
                     onPlay = { onPlayMix(hero) },
                     onTogglePin = { onTogglePin(pinTarget, hero.title) },
                     onSteer = { option -> onSteerMix(hero.slug, option) },
@@ -142,13 +145,13 @@ fun HomeScreen(
         if (state.pendingDiscoveryCount > 0) {
             item(key = "triage_banner") {
                 Surface(
+                    onClick = onOpenTriage,
                     color = colors.accentSurface,
                     shape = SoulbeetShapes.md,
                     border = BorderStroke(1.dp, colors.accentText.copy(alpha = 0.35f)),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 56.dp)
-                        .clickable(onClick = onOpenTriage),
+                        .heightIn(min = 56.dp),
                 ) {
                     Row(
                         modifier = Modifier
@@ -197,6 +200,7 @@ fun HomeScreen(
             rightNowMixes = rightNowMixes,
             collectionMixes = collectionMixes,
             keyPrefix = "home",
+            onOpenMix = onOpenMix,
             onPlayMix = onPlayMix,
         )
 
@@ -218,12 +222,11 @@ fun HomeScreen(
                             val pinned = state.pinnedTargets.any { it.target == FfiPinTarget.Playlist(pl.id) }
                             val isSmartMix = pl.kind != "user" || pl.isSmart
                             Surface(
+                                onClick = { onOpenPlaylist(pl) },
                                 color = colors.surface,
                                 shape = SoulbeetShapes.md,
                                 border = BorderStroke(1.dp, colors.borderSubtle),
-                                modifier = Modifier
-                                    .width(148.dp)
-                                    .clickable { onOpenPlaylist(pl) },
+                                modifier = Modifier.width(148.dp),
                             ) {
                                 Column(
                                     modifier = Modifier.padding(10.dp),
@@ -324,6 +327,7 @@ fun HomeScreen(
                     userRating = track.userRating.toInt(),
                     onClick = { onPlayTrack(track) },
                     onStarClick = { onStarTrack(track) },
+                    onAddToPlaylistClick = { onAddToPlaylist(track) },
                 )
             }
         }
@@ -386,12 +390,11 @@ private fun QuickResumeTile(
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     Surface(
+        onClick = onClick,
         color = colors.surface,
         shape = SoulbeetShapes.sm,
         border = BorderStroke(1.dp, colors.borderSubtle),
-        modifier = modifier
-            .height(56.dp)
-            .clickable(onClick = onClick),
+        modifier = modifier.height(56.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxSize(),
@@ -402,7 +405,8 @@ private fun QuickResumeTile(
                 artAuthority = artAuthority,
                 fallbackTitle = item.title,
                 size = 56.dp,
-                shape = SoulbeetShapes.sm,
+                shape = RoundedCornerShape(topStart = 8.dp, bottomStart = 8.dp),
+                showBorder = false,
             )
             Column(
                 modifier = Modifier

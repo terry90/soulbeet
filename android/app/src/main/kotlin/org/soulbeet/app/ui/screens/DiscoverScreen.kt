@@ -5,7 +5,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -83,6 +82,7 @@ fun DiscoverScreen(
     state: AppUiState,
     artAuthority: String,
     bottomContentPadding: PaddingValues,
+    onOpenMix: (ContextualMixUi) -> Unit,
     onPlayMix: (ContextualMixUi) -> Unit,
     onTogglePin: (target: FfiPinTarget, label: String) -> Unit,
     onSteerMix: (slug: String, option: CultureSteeringOption) -> Unit,
@@ -139,6 +139,7 @@ fun DiscoverScreen(
                     mix = hero,
                     isPinned = isPinned,
                     steeringInFlight = state.steeringInFlight,
+                    onOpenDetail = { onOpenMix(hero) },
                     onPlay = { onPlayMix(hero) },
                     onTogglePin = { onTogglePin(pinTarget, hero.title) },
                     onSteer = { option -> onSteerMix(hero.slug, option) },
@@ -151,6 +152,7 @@ fun DiscoverScreen(
             rightNowMixes = rightNowMixes,
             collectionMixes = collectionMixes,
             keyPrefix = "discover",
+            onOpenMix = onOpenMix,
             onPlayMix = onPlayMix,
         )
 
@@ -314,27 +316,34 @@ private fun SwipeableTriageCard(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Surface(
-                    color = colors.accentSurface,
-                    shape = SoulbeetShapes.full,
+                Box(
+                    modifier = Modifier.weight(1f),
+                    contentAlignment = Alignment.CenterStart,
                 ) {
-                    Text(
-                        text = reasonText.uppercase(),
-                        style = type.monoXs,
-                        color = colors.accentText,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                    )
+                    Surface(
+                        color = colors.accentSurface,
+                        shape = SoulbeetShapes.full,
+                    ) {
+                        Text(
+                            text = reasonText.uppercase(),
+                            style = type.monoXs,
+                            color = colors.accentText,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        )
+                    }
                 }
                 if (expiryText != null) {
                     Text(
                         text = expiryText,
                         style = type.monoXs,
                         color = colors.textMuted,
+                        maxLines = 1,
+                        softWrap = false,
                     )
                 }
             }
@@ -352,11 +361,10 @@ private fun SwipeableTriageCard(
                         shape = SoulbeetShapes.md,
                     )
                     Surface(
+                        onClick = onPreview,
                         color = colors.scrim,
                         shape = CircleShape,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clickable(onClick = onPreview),
+                        modifier = Modifier.size(48.dp),
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
@@ -422,12 +430,13 @@ private fun SwipeableTriageCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Surface(
+                    onClick = onDrop,
+                    enabled = !isActionInFlight,
                     color = colors.crimsonSurface,
                     shape = SoulbeetShapes.full,
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 48.dp)
-                        .clickable(enabled = !isActionInFlight, onClick = onDrop),
+                        .heightIn(min = 48.dp),
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
@@ -505,12 +514,11 @@ private fun TasteDnaCard(
     }
 
     Surface(
+        onClick = onEditClick,
         color = colors.surface,
         shape = SoulbeetShapes.lg,
         border = BorderStroke(1.dp, colors.borderSubtle),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onEditClick),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Column(
             modifier = Modifier
