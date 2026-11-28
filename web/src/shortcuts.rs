@@ -34,6 +34,9 @@ pub fn use_studio_shortcuts() {
         let scope_id = dioxus::core::current_scope_id();
 
         let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |evt: web_sys::KeyboardEvent| {
+            if evt.default_prevented() {
+                return;
+            }
             runtime.in_scope(scope_id, || {
                 let key = evt.key();
                 let ctrl_or_meta = evt.ctrl_key() || evt.meta_key();

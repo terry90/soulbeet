@@ -102,13 +102,22 @@ pub fn StudioSelect(props: StudioSelectProps) -> Element {
     let mut open = use_signal(|| false);
     let mut highlighted_idx = use_signal(|| 0usize);
 
-    let is_open = open() && !props.disabled;
+    let total_options = props.options.len();
+    use_effect(use_reactive(
+        &(props.disabled, total_options),
+        move |(disabled, count)| {
+            if disabled || count == 0 {
+                open.set(false);
+            }
+        },
+    ));
+
+    let is_open = open() && !props.disabled && total_options > 0;
     let selected_idx = find_selected_index(&props.options, &props.value);
     let selected_label = selected_idx
         .and_then(|idx| props.options.get(idx))
         .map(|opt| opt.label.clone());
 
-    let total_options = props.options.len();
     let clamped_highlight = if total_options == 0 {
         0
     } else {
@@ -257,7 +266,7 @@ pub fn StudioSelect(props: StudioSelectProps) -> Element {
                 role: "combobox",
                 aria_haspopup: "listbox",
                 aria_expanded: if is_open { "true" } else { "false" },
-                aria_controls: "{listbox_id}",
+                aria_controls: is_open.then(|| listbox_id.clone()),
                 aria_activedescendant: active_descendant,
                 aria_label: props.aria_label.clone(),
                 disabled,
@@ -324,6 +333,7 @@ pub fn StudioSelect(props: StudioSelectProps) -> Element {
                                     tabindex: "-1",
                                     aria_selected: if is_selected { "true" } else { "false" },
                                     class: "w-full flex items-center justify-between gap-3 px-3 py-2 rounded-[8px] border text-left transition-colors duration-100 cursor-pointer {row_cls}",
+                                    onmousedown: move |evt: MouseEvent| evt.prevent_default(),
                                     onmouseenter: move |_| highlighted_idx.set(idx),
                                     onclick: move |evt: MouseEvent| {
                                         evt.stop_propagation();
@@ -425,6 +435,7 @@ mod tests {
         assert!(html.contains(r#"role="combobox""#), "{html}");
         assert!(html.contains(r#"aria-haspopup="listbox""#), "{html}");
         assert!(html.contains(r#"aria-expanded="false""#), "{html}");
+        assert!(!html.contains("aria-controls="), "{html}");
         assert!(
             html.contains(r#"aria-label="When only YouTube Music has it""#),
             "{html}"
@@ -464,6 +475,7 @@ mod tests {
         let opened_clicks = click_and_find(&mut dom, initial_clicks[0], "click");
         let open_html = dioxus_ssr::render(&dom);
         assert!(open_html.contains(r#"aria-expanded="true""#), "{open_html}");
+        assert!(open_html.contains("aria-controls="), "{open_html}");
         assert!(open_html.contains(r#"role="listbox""#), "{open_html}");
         assert!(open_html.contains("Prompt before lossy downloads"), "{open_html}");
         assert!(open_html.contains("rotate-180"), "{open_html}");
@@ -571,5 +583,44 @@ mod tests {
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("disabled"), "{html}");
         assert!(!html.contains(r#"role="listbox""#), "{html}");
+    }
+
+    #[test]
+    fn disabling_an_open_select_resets_open_state_so_reenabling_stays_closed() {
+        let mut dom = VirtualDom::new(|| {
+            let mut is_disabled = use_signal(|| false);
+            rsx! {
+                button {
+                    id: "toggle-disabled",
+                    onclick: move |_| is_disabled.toggle(),
+                    "Toggle disabled"
+                }
+                StudioSelect {
+                    value: "ask",
+                    options: sample_options(),
+                    disabled: is_disabled(),
+                    on_change: |_| {},
+                }
+            }
+        });
+
+        let initial_clicks = listeners(&mut dom, "click");
+        assert_eq!(initial_clicks.len(), 2);
+        let toggle_btn = initial_clicks[0];
+        let trigger_btn = initial_clicks[1];
+
+        // Open the dropdown.
+        click(&mut dom, trigger_btn);
+        assert!(dioxus_ssr::render(&dom).contains(r#"role="listbox""#));
+
+        // Disable while open: listbox disappears and open state resets.
+        click(&mut dom, toggle_btn);
+        assert!(!dioxus_ssr::render(&dom).contains(r#"role="listbox""#));
+
+        // Re-enable: dropdown must stay closed instead of spontaneously popping back open.
+        click(&mut dom, toggle_btn);
+        let html = dioxus_ssr::render(&dom);
+        assert!(!html.contains(r#"role="listbox""#), "{html}");
+        assert!(html.contains(r#"aria-expanded="false""#), "{html}");
     }
 }
