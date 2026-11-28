@@ -9,6 +9,7 @@ import { expect, test } from '@playwright/test';
 import {
   freshSession,
   openDownloadsPanel,
+  openLibraryTab,
   openServiceStatus,
   openSettings,
   performSearch,
@@ -102,7 +103,7 @@ test('an album only YouTube Music has is offered as lossy, and the pick imports'
 test('a user who never takes lossy files is not offered them', async ({ context, page }) => {
   await freshSession(context, page, 'ytdlp-never');
   await openSettings(page);
-  await page.getByRole('button', { name: 'Library' }).click();
+  await openLibraryTab(page);
   const choice = page.locator('select[name="lossy_fallback"]');
   await expect(choice).toBeVisible();
   const saved = page.waitForResponse(
