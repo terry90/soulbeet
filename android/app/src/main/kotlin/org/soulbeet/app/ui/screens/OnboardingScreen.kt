@@ -36,6 +36,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -121,6 +122,7 @@ fun OnboardingScreen(
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 48.dp)
+                            .clip(SoulbeetShapes.full)
                             .background(
                                 color = if (selected) colors.surfaceHigh else colors.surfaceLow,
                                 shape = SoulbeetShapes.full,
@@ -200,6 +202,7 @@ fun OnboardingScreen(
                         listOf(false to "Cookie (auth_token)", true to "Bearer Token").forEach { (isBearerOpt, label) ->
                             val selected = tokenIsBearer == isBearerOpt
                             Surface(
+                                onClick = { tokenIsBearer = isBearerOpt },
                                 color = if (selected) colors.leafSurface else colors.surfaceLow,
                                 shape = SoulbeetShapes.full,
                                 border = BorderStroke(
@@ -208,8 +211,7 @@ fun OnboardingScreen(
                                 ),
                                 modifier = Modifier
                                     .weight(1f)
-                                    .heightIn(min = 48.dp)
-                                    .clickable { tokenIsBearer = isBearerOpt },
+                                    .heightIn(min = 48.dp),
                             ) {
                                 Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 10.dp)) {
                                     Text(

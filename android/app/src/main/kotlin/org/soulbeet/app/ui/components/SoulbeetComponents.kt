@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,13 +25,16 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
@@ -40,6 +44,8 @@ import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -66,6 +72,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -142,6 +149,7 @@ fun TrackArtwork(
     size: Dp,
     modifier: Modifier = Modifier,
     shape: Shape = SoulbeetShapes.xs,
+    showBorder: Boolean = true,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -152,7 +160,7 @@ fun TrackArtwork(
         }
     }
 
-    val placeholder: @Composable () -> Unit = {
+    val placeholder: @Composable (Boolean) -> Unit = { drawBorder ->
         Box(
             modifier = Modifier
                 .size(size)
@@ -164,7 +172,9 @@ fun TrackArtwork(
                         end = Offset(120f, 120f),
                     ),
                 )
-                .border(1.dp, colors.borderSubtle, shape),
+                .then(
+                    if (drawBorder) Modifier.border(1.dp, colors.borderSubtle, shape) else Modifier,
+                ),
             contentAlignment = Alignment.Center,
         ) {
             val initial = fallbackTitle.trim().firstOrNull()?.uppercaseChar()?.toString()
@@ -186,7 +196,7 @@ fun TrackArtwork(
     }
 
     if (uri == null) {
-        Box(modifier = modifier) { placeholder() }
+        Box(modifier = modifier) { placeholder(showBorder) }
     } else {
         SubcomposeAsyncImage(
             model = ImageRequest.Builder(context)
@@ -195,12 +205,14 @@ fun TrackArtwork(
                 .build(),
             contentDescription = fallbackTitle,
             contentScale = ContentScale.Crop,
-            loading = { placeholder() },
-            error = { placeholder() },
+            loading = { placeholder(false) },
+            error = { placeholder(false) },
             modifier = modifier
                 .size(size)
                 .clip(shape)
-                .border(1.dp, colors.borderSubtle, shape),
+                .then(
+                    if (showBorder) Modifier.border(1.dp, colors.borderSubtle, shape) else Modifier,
+                ),
         )
     }
 }
@@ -277,6 +289,9 @@ fun TrackRow(
     onKeepClick: (() -> Unit)? = null,
     onDropClick: (() -> Unit)? = null,
     onRemoveClick: (() -> Unit)? = null,
+    removeLabel: String = "Remove from library",
+    removeIcon: ImageVector = Icons.Filled.DeleteOutline,
+    onAddToPlaylistClick: (() -> Unit)? = null,
 ) {
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
@@ -411,40 +426,35 @@ fun TrackRow(
 
                 when {
                     isUnownedCatalog -> {
-                        Box(
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .clickable(enabled = !isAcquiring, onClick = onClick),
-                            contentAlignment = Alignment.Center,
+                        Surface(
+                            onClick = onClick,
+                            enabled = !isAcquiring,
+                            modifier = Modifier.height(32.dp),
+                            color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
+                            shape = SoulbeetShapes.full,
+                            border = BorderStroke(
+                                1.dp,
+                                if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
+                            ),
                         ) {
-                            Surface(
-                                modifier = Modifier.height(32.dp),
-                                color = if (isAcquiring) colors.accentSurface else colors.surfaceHigh,
-                                shape = SoulbeetShapes.full,
-                                border = BorderStroke(
-                                    1.dp,
-                                    if (isAcquiring) colors.accentText.copy(alpha = 0.45f) else colors.borderDefault,
-                                ),
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.CloudDownload,
-                                        contentDescription = "Acquire and Play",
-                                        tint = if (isAcquiring) colors.accentText else colors.leafText,
-                                        modifier = Modifier.size(14.dp),
-                                    )
-                                    Text(
-                                        text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING…") else "ACQUIRE",
-                                        style = type.monoXs,
-                                        color = if (isAcquiring) colors.accentText else colors.textPrimary,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                    )
-                                }
+                                Icon(
+                                    imageVector = Icons.Filled.CloudDownload,
+                                    contentDescription = "Acquire and Play",
+                                    tint = if (isAcquiring) colors.accentText else colors.leafText,
+                                    modifier = Modifier.size(14.dp),
+                                )
+                                Text(
+                                    text = if (isAcquiring) (acquiringLabel ?: "ACQUIRING…") else "ACQUIRE",
+                                    style = type.monoXs,
+                                    color = if (isAcquiring) colors.accentText else colors.textPrimary,
+                                    maxLines = 1,
+                                    softWrap = false,
+                                )
                             }
                         }
                     }
@@ -496,14 +506,77 @@ fun TrackRow(
                                 )
                             }
                         }
-                        if (onRemoveClick != null) {
+                        if (onAddToPlaylistClick != null) {
+                            var menuExpanded by remember { mutableStateOf(false) }
+                            Box {
+                                IconButton(
+                                    onClick = { menuExpanded = true },
+                                    modifier = Modifier.size(48.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.MoreVert,
+                                        contentDescription = "Track options",
+                                        tint = colors.textMuted,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = menuExpanded,
+                                    onDismissRequest = { menuExpanded = false },
+                                    containerColor = colors.surfaceHigh,
+                                ) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = "Add to playlist",
+                                                style = type.bodySm,
+                                                color = colors.textPrimary,
+                                            )
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                                contentDescription = null,
+                                                tint = colors.leafText,
+                                            )
+                                        },
+                                        onClick = {
+                                            menuExpanded = false
+                                            onAddToPlaylistClick()
+                                        },
+                                    )
+                                    if (onRemoveClick != null) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    text = removeLabel,
+                                                    style = type.bodySm,
+                                                    color = colors.crimsonText,
+                                                )
+                                            },
+                                            leadingIcon = {
+                                                Icon(
+                                                    imageVector = removeIcon,
+                                                    contentDescription = null,
+                                                    tint = colors.crimsonText,
+                                                )
+                                            },
+                                            onClick = {
+                                                menuExpanded = false
+                                                onRemoveClick()
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        } else if (onRemoveClick != null) {
                             IconButton(
                                 onClick = onRemoveClick,
                                 modifier = Modifier.size(48.dp),
                             ) {
                                 Icon(
-                                    imageVector = Icons.Filled.DeleteOutline,
-                                    contentDescription = "Remove from library",
+                                    imageVector = removeIcon,
+                                    contentDescription = removeLabel,
                                     tint = colors.textMuted,
                                     modifier = Modifier.size(20.dp),
                                 )
@@ -689,6 +762,7 @@ fun SeasonalHeroCard(
     onTogglePin: () -> Unit,
     onSteer: (CultureSteeringOption) -> Unit,
     modifier: Modifier = Modifier,
+    onOpenDetail: (() -> Unit)? = null,
     artworkUrl: String? = null,
 ) {
     val colors = LocalSoulbeetColors.current
@@ -723,6 +797,8 @@ fun SeasonalHeroCard(
     }
 
     Surface(
+        onClick = { onOpenDetail?.invoke() },
+        enabled = onOpenDetail != null,
         modifier = modifier.fillMaxWidth(),
         color = colors.surface,
         shape = SoulbeetShapes.lg,
@@ -824,6 +900,9 @@ fun SeasonalHeroCard(
 
                 if (mix.kind == "seasonal" || localPct != null) {
                     Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -835,15 +914,15 @@ fun SeasonalHeroCard(
                                 CultureSteeringOption.MORE_INTERNATIONAL -> "More Intl"
                             }
                             Surface(
+                                onClick = { onSteer(option) },
+                                enabled = !steeringInFlight,
                                 color = if (selected) colors.accentSurface else colors.surfaceHigh,
                                 shape = SoulbeetShapes.full,
                                 border = BorderStroke(
                                     1.dp,
                                     if (selected) colors.accentText.copy(alpha = 0.5f) else colors.borderSubtle,
                                 ),
-                                modifier = Modifier
-                                    .heightIn(min = 48.dp)
-                                    .clickable(enabled = !steeringInFlight) { onSteer(option) },
+                                modifier = Modifier.heightIn(min = 48.dp),
                             ) {
                                 Box(
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
@@ -853,6 +932,8 @@ fun SeasonalHeroCard(
                                         text = label,
                                         style = type.monoXs,
                                         color = if (selected) colors.accentText else colors.textSecondary,
+                                        maxLines = 1,
+                                        softWrap = false,
                                     )
                                 }
                             }

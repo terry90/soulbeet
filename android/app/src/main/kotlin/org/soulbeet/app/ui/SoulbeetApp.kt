@@ -55,7 +55,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -73,10 +72,12 @@ import org.soulbeet.app.ui.components.SeamLightBar
 import org.soulbeet.app.ui.components.SoulbeetPixelLogo
 import org.soulbeet.app.ui.components.TrackArtwork
 import org.soulbeet.app.ui.components.UndoDropSnackbar
+import org.soulbeet.app.ui.screens.AddToPlaylistSheet
 import org.soulbeet.app.ui.screens.ContainerDetailSheet
 import org.soulbeet.app.ui.screens.DiscoverScreen
 import org.soulbeet.app.ui.screens.HomeScreen
 import org.soulbeet.app.ui.screens.LibraryScreen
+import org.soulbeet.app.ui.screens.MixDetailSheet
 import org.soulbeet.app.ui.screens.NowPlayingSheet
 import org.soulbeet.app.ui.screens.OnboardingScreen
 import org.soulbeet.app.ui.screens.RemoteAlbumDetailSheet
@@ -142,7 +143,6 @@ private fun MainStudioShell(
     val colors = LocalSoulbeetColors.current
     val type = LocalSoulbeetTypography.current
     val hasActiveTrack = state.playback.currentTrackId != null
-    val miniPlayerExtraBottom = if (hasActiveTrack) 80.dp else 0.dp
 
     Scaffold(
         containerColor = colors.canvas,
@@ -244,7 +244,7 @@ private fun MainStudioShell(
             }
         },
     ) { innerPadding ->
-        val contentPadding = PaddingValues(bottom = miniPlayerExtraBottom)
+        val contentPadding = PaddingValues(0.dp)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -256,6 +256,7 @@ private fun MainStudioShell(
                     artAuthority = viewModel.artAuthority,
                     bottomContentPadding = contentPadding,
                     onPlayContainer = viewModel::playContainer,
+                    onOpenMix = viewModel::openMixDetail,
                     onPlayMix = viewModel::playContextualMix,
                     onOpenTriage = { viewModel.selectTab(AppTab.DISCOVER) },
                     onSteerMix = viewModel::steerSeasonalPack,
@@ -263,6 +264,7 @@ private fun MainStudioShell(
                     onOpenPlaylist = viewModel::openPlaylistDetail,
                     onPlayTrack = { track -> viewModel.playTrack(track, sourceLabel = "Quick Play") },
                     onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
+                    onAddToPlaylist = viewModel::openAddToPlaylist,
                     onTriggerSync = { viewModel.triggerManualSync() },
                 )
 
@@ -270,6 +272,7 @@ private fun MainStudioShell(
                     state = state,
                     artAuthority = viewModel.artAuthority,
                     bottomContentPadding = contentPadding,
+                    onOpenMix = viewModel::openMixDetail,
                     onPlayMix = viewModel::playContextualMix,
                     onTogglePin = viewModel::togglePin,
                     onSteerMix = viewModel::steerSeasonalPack,
@@ -310,6 +313,7 @@ private fun MainStudioShell(
                     onSelectFilter = viewModel::setSearchFilter,
                     onPlayTrack = { track -> viewModel.playTrack(track, sourceLabel = "Search") },
                     onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
+                    onAddToPlaylist = viewModel::openAddToPlaylist,
                     onOpenAlbum = viewModel::openAlbumDetail,
                     onOpenArtist = viewModel::openArtistDetail,
                     onOpenPlaylist = viewModel::openPlaylistDetail,
@@ -335,6 +339,8 @@ private fun MainStudioShell(
                     onRemoveTrack = { track ->
                         viewModel.requestLibraryTrackRemoval(track.id, track.title, track.artistName)
                     },
+                    onAddToPlaylist = viewModel::openAddToPlaylist,
+                    onCreatePlaylist = { name, comment -> viewModel.createPlaylist(name, comment) },
                     onKeepDiscovery = { disc ->
                         val songId = disc.songId ?: return@LibraryScreen
                         viewModel.keepDiscoveryTrack(songId, disc.id, disc.title)
@@ -390,12 +396,26 @@ private fun MainStudioShell(
                 val id = pb.currentTrackId ?: return@NowPlayingSheet
                 viewModel.requestLibraryTrackRemoval(id, pb.title, pb.artist)
             },
+            onAddToPlaylist = {
+                val track = state.currentTrackDetails ?: state.queueTracks.getOrNull(state.playback.currentIndex)
+                if (track != null) {
+                    viewModel.openAddToPlaylist(track)
+                } else {
+                    viewModel.showMessage("Track metadata is still loading")
+                }
+            },
             onStartRadio = viewModel::startTrackRadio,
+            onClickPlayingFrom = viewModel::navigateFromNowPlayingSource,
+            onClickTitleOrAlbum = viewModel::navigateFromNowPlayingAlbum,
+            onClickArtist = viewModel::navigateFromNowPlayingArtist,
             onToggleLyrics = { viewModel.setShowLyricsPanel(!state.showLyricsPanel) },
             onFetchLyrics = viewModel::fetchCurrentTrackLyrics,
             onOpenQueue = { viewModel.setShowQueueSheet(true) },
             onDismissQueue = { viewModel.setShowQueueSheet(false) },
             onPlayQueueIndex = viewModel::playQueueIndex,
+            onRemoveQueueIndex = viewModel::removeQueueItemAt,
+            onMoveQueueItem = viewModel::moveQueueItem,
+            onClearQueue = viewModel::clearQueue,
             onOpenConnect = { viewModel.setShowConnectSheet(true) },
             onDismissConnect = { viewModel.setShowConnectSheet(false) },
             onReconnectConnect = { viewModel.reconnectConnect(force = true) },
@@ -418,6 +438,28 @@ private fun MainStudioShell(
         )
     }
 
+    state.selectedMixDetail?.let { mixDetail ->
+        MixDetailSheet(
+            detail = mixDetail,
+            state = state,
+            artAuthority = viewModel.artAuthority,
+            onDismiss = viewModel::closeMixDetail,
+            onPlayAll = {
+                if (mixDetail.tracks.isNotEmpty()) {
+                    viewModel.playQueue(mixDetail.tracks, 0, mixDetail.mix.title)
+                } else {
+                    viewModel.playContextualMix(mixDetail.mix)
+                }
+            },
+            onShuffle = { viewModel.playMixShuffled(mixDetail.mix, mixDetail.tracks) },
+            onPlayIndex = { idx -> viewModel.playQueue(mixDetail.tracks, idx, mixDetail.mix.title) },
+            onSteer = { option -> viewModel.steerSeasonalPack(mixDetail.mix.slug, option) },
+            onTogglePin = viewModel::togglePin,
+            onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
+            onAddToPlaylist = viewModel::openAddToPlaylist,
+        )
+    }
+
     state.selectedContainer?.let { detail ->
         ContainerDetailSheet(
             detail = detail,
@@ -430,8 +472,32 @@ private fun MainStudioShell(
                 detail.pinTarget?.let { target -> viewModel.togglePin(target, detail.title) }
             },
             onStarTrack = { track -> viewModel.toggleStarTrack(track.id, track.starred) },
-            onRemoveTrack = { track ->
+            onAddToPlaylist = viewModel::openAddToPlaylist,
+            onRemoveFromPlaylist = { track ->
+                viewModel.removeTrackFromPlaylist(detail.id, track)
+            },
+            onRemoveFromLibrary = { track ->
                 viewModel.requestLibraryTrackRemoval(track.id, track.title, track.artistName)
+            },
+            onRenamePlaylist = { name, comment ->
+                viewModel.updatePlaylist(detail.id, name, comment)
+            },
+            onDeletePlaylist = {
+                viewModel.deletePlaylist(detail.id, detail.title)
+            },
+        )
+    }
+
+    state.addToPlaylistTrack?.let { track ->
+        AddToPlaylistSheet(
+            track = track,
+            playlists = state.userPlaylists,
+            artAuthority = viewModel.artAuthority,
+            isBusy = state.playlistMutationInFlight,
+            onDismiss = viewModel::dismissAddToPlaylist,
+            onSelectPlaylist = { playlist -> viewModel.addTrackToPlaylist(playlist, track) },
+            onCreatePlaylistWithTrack = { name, comment ->
+                viewModel.createPlaylist(name = name, comment = comment, initialTrack = track)
             },
         )
     }
@@ -549,58 +615,52 @@ private fun SoulbeetTopAppBar(
                     }
                 }
 
-                // Global Online / Offline Only Pill (>= 48dp touch target, 32dp visual height)
-                val offlineAmber = Color(0xFFF59E0B)
-                val offlineAmberSurface = Color(0x26F59E0B)
-                val offlineAmberBorder = Color(0x73F59E0B)
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .clickable(onClick = onToggleOffline),
-                    contentAlignment = Alignment.Center,
+                // Global Online / Offline Only Pill (clipped pill ripple, Material3 48dp minimum touch target)
+                val offlineGold = colors.gold
+                val offlineGoldSurface = colors.goldSurface
+                val offlineGoldBorder = colors.gold.copy(alpha = 0.45f)
+                Surface(
+                    onClick = onToggleOffline,
+                    modifier = Modifier.height(32.dp),
+                    color = if (offlineOnly) offlineGoldSurface else colors.surface,
+                    shape = SoulbeetShapes.full,
+                    border = BorderStroke(
+                        1.dp,
+                        if (offlineOnly) offlineGoldBorder else colors.borderDefault,
+                    ),
                 ) {
-                    Surface(
-                        modifier = Modifier.height(32.dp),
-                        color = if (offlineOnly) offlineAmberSurface else colors.surface,
-                        shape = SoulbeetShapes.full,
-                        border = BorderStroke(
-                            1.dp,
-                            if (offlineOnly) offlineAmberBorder else colors.borderDefault,
-                        ),
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                        ) {
-                            if (offlineOnly) {
-                                Icon(
-                                    imageVector = Icons.Filled.CloudOff,
-                                    contentDescription = "Offline Only",
-                                    tint = offlineAmber,
-                                    modifier = Modifier.size(14.dp),
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier.size(14.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(7.dp)
-                                            .clip(CircleShape)
-                                            .background(colors.leafGlow),
-                                    )
-                                }
-                            }
-                            Text(
-                                text = if (offlineOnly) "Offline Only" else "Online",
-                                style = type.monoXs,
-                                color = if (offlineOnly) offlineAmber else colors.textPrimary,
-                                maxLines = 1,
-                                softWrap = false,
+                        if (offlineOnly) {
+                            Icon(
+                                imageVector = Icons.Filled.CloudOff,
+                                contentDescription = "Offline Only",
+                                tint = offlineGold,
+                                modifier = Modifier.size(14.dp),
                             )
+                        } else {
+                            Box(
+                                modifier = Modifier.size(14.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(colors.leafGlow),
+                                )
+                            }
                         }
+                        Text(
+                            text = if (offlineOnly) "Offline Only" else "Online",
+                            style = type.monoXs,
+                            color = if (offlineOnly) offlineGold else colors.textPrimary,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
                     }
                 }
 
@@ -646,6 +706,7 @@ private fun FloatingMiniPlayer(
     Surface(
         modifier = modifier
             .fillMaxWidth()
+            .clip(SoulbeetShapes.md)
             .pointerInput(pb.currentTrackId) {
                 detectDragGestures(
                     onDragEnd = {

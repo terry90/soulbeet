@@ -1092,4 +1092,42 @@ class FormattingAndThemeTest {
         assertEquals(0.48f, photoScrim.horizontalStops.last().second, 0.001f)
         assertTrue(photoScrim.verticalStops != null && photoScrim.verticalStops!!.last().second >= 0.90f)
     }
+
+    @Test
+    fun playlistMutationResultParsingAndContainerKindGuards() {
+        val client = SoulbeetApiClient()
+        val parsed = client.parsePlaylistMutationResult(
+            JSONObject(
+                """{"id":"pl-42","name":"Late Night","comment":"Chill beats","public":false,"song_count":14,"duration":3210}""",
+            ),
+        )
+        assertEquals("pl-42", parsed.id)
+        assertEquals("Late Night", parsed.name)
+        assertEquals("Chill beats", parsed.comment)
+        assertFalse(parsed.public)
+        assertEquals(14, parsed.songCount)
+        assertEquals(3210, parsed.duration)
+
+        val userPlaylist = ContainerDetailUi(
+            id = "pl-42",
+            kind = ContainerKind.USER_PLAYLIST,
+            title = "Late Night",
+            subtitle = "14 tracks",
+            comment = "Chill beats",
+            coverArtId = null,
+            pinTarget = null,
+            isPinned = false,
+            tracks = emptyList(),
+        )
+        assertTrue(userPlaylist.isStaticUserPlaylist)
+        assertFalse(userPlaylist.isSmartOrSystemPlaylist)
+
+        val smartPlaylist = userPlaylist.copy(kind = ContainerKind.SMART_PLAYLIST)
+        assertFalse(smartPlaylist.isStaticUserPlaylist)
+        assertTrue(smartPlaylist.isSmartOrSystemPlaylist)
+
+        val albumContainer = userPlaylist.copy(kind = ContainerKind.ALBUM)
+        assertFalse(albumContainer.isStaticUserPlaylist)
+        assertFalse(albumContainer.isSmartOrSystemPlaylist)
+    }
 }

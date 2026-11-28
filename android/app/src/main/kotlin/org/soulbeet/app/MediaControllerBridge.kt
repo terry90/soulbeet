@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Bundle
 import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -281,6 +282,64 @@ class MediaControllerBridge(
             active.play()
             _playbackPositionMs.value = 0L
         }
+    }
+
+    /**
+     * Removes a single item from the active Media3 queue by its queue index.
+     * When removing the currently playing item, advances cleanly to the next item if one exists.
+     */
+    fun removeQueueItemAt(index: Int) {
+        val active = controller ?: return
+        if (index !in 0 until active.mediaItemCount) return
+        val curIdx = active.currentMediaItemIndex
+        if (index == curIdx) {
+            val nextIdx = active.nextMediaItemIndex
+            val wasPlaying = active.playWhenReady || active.isPlaying
+            if (active.mediaItemCount > 1 && nextIdx != C.INDEX_UNSET && nextIdx != curIdx) {
+                active.seekToNextMediaItem()
+                active.removeMediaItem(curIdx)
+                if (wasPlaying) {
+                    if (active.playbackState == Player.STATE_IDLE) {
+                        active.prepare()
+                    }
+                    active.play()
+                }
+            } else if (active.mediaItemCount > 1) {
+                active.removeMediaItem(curIdx)
+                if (wasPlaying) {
+                    if (active.playbackState == Player.STATE_IDLE) {
+                        active.prepare()
+                    }
+                    active.play()
+                }
+            } else {
+                active.pause()
+                active.removeMediaItem(curIdx)
+                SoulbeetMediaRepository.shared.clearActiveTrack()
+            }
+            _playbackPositionMs.value = 0L
+        } else {
+            active.removeMediaItem(index)
+        }
+    }
+
+    /**
+     * Reorders a single item in the active Media3 queue from [fromIndex] to [toIndex].
+     */
+    fun moveQueueItem(fromIndex: Int, toIndex: Int) {
+        val active = controller ?: return
+        if (fromIndex !in 0 until active.mediaItemCount) return
+        if (toIndex !in 0 until active.mediaItemCount) return
+        if (fromIndex == toIndex) return
+        active.moveMediaItem(fromIndex, toIndex)
+    }
+
+    /**
+     * Stops playback and clears all queued items cleanly.
+     */
+    fun clearQueue() {
+        stopAndClear()
+        SoulbeetMediaRepository.shared.clearActiveTrack()
     }
 
     fun toggleShuffle() {
